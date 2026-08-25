@@ -13,6 +13,7 @@ use crate::{
         MigrationInputError, MigrationItem, MigrationItemPage, MigrationMergePolicy, MigrationUser,
         MigrationUserData, StoredItemState, merge_item_state,
     },
+    application::plugin_runtime::PluginRuntimeError,
     application::plugins::PluginServiceError,
     auth::users::{UserStore, UserStoreError, UserUpdate},
     storage::{
@@ -681,18 +682,20 @@ impl EmbyMigrationService {
                         &user.id,
                         start_index,
                         500,
-                        total,
                         MigrationPageKind::UserState,
                     )
                     .await?;
-                if recovered_page.invalid_item_count > 0 {
-                    processed += recovered_page.invalid_item_count;
-                    failed += recovered_page.invalid_item_count;
+                if !recovered_page.invalid_items.is_empty() {
+                    self.record_invalid_migration_items(job_id, &recovered_page.invalid_items)
+                        .await?;
+                    let invalid_item_count = recovered_page.invalid_items.len() as i64;
+                    processed += invalid_item_count;
+                    failed += invalid_item_count;
                     tracing::warn!(
                         job_id = %job_id,
                         user_id = %user.id,
                         start_index,
-                        invalid_items = recovered_page.invalid_item_count,
+                        invalid_items = invalid_item_count,
                         "skipping invalid Emby migration items and continuing"
                     );
                 }
@@ -830,18 +833,20 @@ impl EmbyMigrationService {
                         &user.id,
                         start_index,
                         500,
-                        total,
                         MigrationPageKind::PersonFavorites,
                     )
                     .await?;
-                if recovered_page.invalid_item_count > 0 {
-                    processed += recovered_page.invalid_item_count;
-                    failed += recovered_page.invalid_item_count;
+                if !recovered_page.invalid_items.is_empty() {
+                    self.record_invalid_migration_items(job_id, &recovered_page.invalid_items)
+                        .await?;
+                    let invalid_item_count = recovered_page.invalid_items.len() as i64;
+                    processed += invalid_item_count;
+                    failed += invalid_item_count;
                     tracing::warn!(
                         job_id = %job_id,
                         user_id = %user.id,
                         start_index,
-                        invalid_items = recovered_page.invalid_item_count,
+                        invalid_items = invalid_item_count,
                         "skipping invalid Emby migration items and continuing"
                     );
                 }
@@ -1088,12 +1093,11 @@ impl EmbyMigrationService {
         user_id: &str,
         start_index: u32,
         limit: u32,
-        known_total: i64,
         kind: MigrationPageKind,
     ) -> Result<RecoveredMigrationPage, EmbyMigrationServiceError> {
         let mut pending_ranges = vec![(start_index, limit)];
         let mut pages = Vec::new();
-        let mut invalid_item_count = 0_i64;
+        let mut invalid_items = Vec::new();
 
         while let Some((range_start, range_limit)) = pending_ranges.pop() {
             let result = match kind {
@@ -1110,7 +1114,7 @@ impl EmbyMigrationService {
             };
             match result {
                 Ok(page) => pages.push((range_start, page)),
-                Err(PluginServiceError::InvalidResponse) if range_limit > 1 => {
+                Err(error) if is_invalid_migration_response(&error) && range_limit > 1 => {
                     if let Some(((left_start, left_limit), (right_start, right_limit))) =
                         split_migration_page_range(range_start, range_limit)
                     {
@@ -1118,9 +1122,13 @@ impl EmbyMigrationService {
                         pending_ranges.push((left_start, left_limit));
                     }
                 }
-                Err(PluginServiceError::InvalidResponse) => {
-                    invalid_item_count += 1;
-                    pages.push((range_start, empty_migration_page(range_start, known_total)));
+                Err(error) if is_invalid_migration_response(&error) => {
+                    invalid_items.push(InvalidMigrationItem {
+                        user_id: user_id.to_owned(),
+                        start_index: range_start,
+                        kind,
+                    });
+                    pages.push((range_start, empty_migration_page(range_start)));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -1130,8 +1138,32 @@ impl EmbyMigrationService {
             start_index,
             limit,
             pages,
-            invalid_item_count,
+            invalid_items,
         ))
+    }
+
+    async fn record_invalid_migration_items(
+        &self,
+        job_id: &str,
+        invalid_items: &[InvalidMigrationItem],
+    ) -> Result<(), EmbyMigrationServiceError> {
+        for invalid in invalid_items {
+            let report_id = invalid_item_report_id(invalid);
+            let detail_json = invalid_item_report_detail(invalid);
+            self.database
+                .upsert_emby_migration_item_match(&NewEmbyMigrationItemMatch {
+                    job_id,
+                    emby_item_id: &report_id,
+                    emby_item_type: "UNKNOWN",
+                    lux_item_id: None,
+                    match_method: "UNMATCHED",
+                    confidence: None,
+                    status: "SKIPPED",
+                    detail_json: &detail_json,
+                })
+                .await?;
+        }
+        Ok(())
     }
 
     async fn match_person(
@@ -1233,22 +1265,38 @@ impl EmbyMigrationService {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MigrationPageKind {
     UserState,
     PersonFavorites,
 }
 
+impl MigrationPageKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::UserState => "USER_STATE",
+            Self::PersonFavorites => "PERSON_FAVORITES",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct InvalidMigrationItem {
+    user_id: String,
+    start_index: u32,
+    kind: MigrationPageKind,
+}
+
 struct RecoveredMigrationPage {
     page: MigrationItemPage,
-    invalid_item_count: i64,
+    invalid_items: Vec<InvalidMigrationItem>,
 }
 
 fn assemble_recovered_migration_page(
     start_index: u32,
     requested_limit: u32,
     mut pages: Vec<(u32, MigrationItemPage)>,
-    invalid_item_count: i64,
+    invalid_items: Vec<InvalidMigrationItem>,
 ) -> RecoveredMigrationPage {
     pages.sort_unstable_by_key(|(page_start, _)| *page_start);
     let total_record_count = pages.iter().find_map(|(_, page)| page.total_record_count);
@@ -1258,7 +1306,8 @@ fn assemble_recovered_migration_page(
         None => pages
             .iter()
             .filter_map(|(_, page)| page.next_start_index)
-            .max(),
+            .max()
+            .or_else(|| (requested_end > start_index).then_some(requested_end)),
     };
     let history_capability = pages
         .first()
@@ -1274,21 +1323,45 @@ fn assemble_recovered_migration_page(
             next_start_index,
             history_capability,
         },
-        invalid_item_count,
+        invalid_items,
     }
 }
 
-fn empty_migration_page(start_index: u32, known_total: i64) -> MigrationItemPage {
-    let total_record_count = u32::try_from(known_total).ok().filter(|total| *total > 0);
-    let next_start_index = total_record_count.and_then(|total| {
-        let next = start_index.saturating_add(1);
-        (next < total).then_some(next)
-    });
+fn is_invalid_migration_response(error: &PluginServiceError) -> bool {
+    match error {
+        PluginServiceError::InvalidResponse => true,
+        PluginServiceError::Runtime(PluginRuntimeError::Plugin { code, .. }) => {
+            code.eq_ignore_ascii_case("PLUGIN_INVALID_RESPONSE")
+        }
+        _ => false,
+    }
+}
+
+fn invalid_item_report_id(invalid: &InvalidMigrationItem) -> String {
+    format!(
+        "invalid:{}:{}:{}",
+        invalid.kind.as_str(),
+        invalid.user_id,
+        invalid.start_index
+    )
+}
+
+fn invalid_item_report_detail(invalid: &InvalidMigrationItem) -> String {
+    serde_json::to_string(&json!({
+        "reason": "PLUGIN_INVALID_RESPONSE",
+        "pageKind": invalid.kind.as_str(),
+        "sourceUserId": invalid.user_id,
+        "sourceStartIndex": invalid.start_index,
+    }))
+    .unwrap_or_else(|_| "{}".to_owned())
+}
+
+fn empty_migration_page(start_index: u32) -> MigrationItemPage {
     MigrationItemPage {
         items: Vec::new(),
         start_index,
-        total_record_count,
-        next_start_index,
+        total_record_count: None,
+        next_start_index: None,
         history_capability: HistoryCapability::ItemState,
     }
 }
@@ -1540,8 +1613,48 @@ fn history_capability_name(capability: HistoryCapability) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use crate::application::plugin_runtime::PluginRuntimeError;
+
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn plugin_invalid_response_is_recoverable_when_returned_by_rpc() {
+        assert!(is_invalid_migration_response(
+            &PluginServiceError::InvalidResponse
+        ));
+        assert!(is_invalid_migration_response(&PluginServiceError::Runtime(
+            PluginRuntimeError::Plugin {
+                code: "PLUGIN_INVALID_RESPONSE".to_owned(),
+                message: "invalid item".to_owned(),
+            }
+        )));
+        assert!(!is_invalid_migration_response(
+            &PluginServiceError::Runtime(PluginRuntimeError::Plugin {
+                code: "PLUGIN_AUTH_FAILED".to_owned(),
+                message: "authentication failed".to_owned(),
+            })
+        ));
+    }
+
+    #[test]
+    fn invalid_migration_item_report_has_stable_source_metadata() {
+        let invalid = InvalidMigrationItem {
+            user_id: "emby-user".to_owned(),
+            start_index: 27365,
+            kind: MigrationPageKind::UserState,
+        };
+
+        assert_eq!(
+            invalid_item_report_id(&invalid),
+            "invalid:USER_STATE:emby-user:27365"
+        );
+        let detail: serde_json::Value =
+            serde_json::from_str(&invalid_item_report_detail(&invalid)).expect("valid JSON");
+        assert_eq!(detail["reason"], "PLUGIN_INVALID_RESPONSE");
+        assert_eq!(detail["sourceStartIndex"], 27365);
+        assert_eq!(detail["pageKind"], "USER_STATE");
+    }
 
     fn identity(id: &str, provider_ids: &str) -> StoredMigrationMediaIdentity {
         StoredMigrationMediaIdentity {
@@ -1661,7 +1774,11 @@ mod tests {
                 ),
                 (103, migration_page_with_items(&["item-103"], 103, 104)),
             ],
-            1,
+            vec![InvalidMigrationItem {
+                user_id: "emby-user".to_owned(),
+                start_index: 102,
+                kind: MigrationPageKind::UserState,
+            }],
         );
 
         assert_eq!(
@@ -1674,7 +1791,46 @@ mod tests {
         );
         assert_eq!(page.page.start_index, 100);
         assert_eq!(page.page.next_start_index, None);
-        assert_eq!(page.invalid_item_count, 1);
+        assert_eq!(page.invalid_items.len(), 1);
+    }
+
+    #[test]
+    fn recovered_migration_page_advances_when_all_requested_items_are_invalid() {
+        let page = assemble_recovered_migration_page(
+            100,
+            4,
+            vec![
+                (100, empty_migration_page(100)),
+                (101, empty_migration_page(101)),
+                (102, empty_migration_page(102)),
+                (103, empty_migration_page(103)),
+            ],
+            vec![
+                InvalidMigrationItem {
+                    user_id: "emby-user".to_owned(),
+                    start_index: 100,
+                    kind: MigrationPageKind::UserState,
+                },
+                InvalidMigrationItem {
+                    user_id: "emby-user".to_owned(),
+                    start_index: 101,
+                    kind: MigrationPageKind::UserState,
+                },
+                InvalidMigrationItem {
+                    user_id: "emby-user".to_owned(),
+                    start_index: 102,
+                    kind: MigrationPageKind::UserState,
+                },
+                InvalidMigrationItem {
+                    user_id: "emby-user".to_owned(),
+                    start_index: 103,
+                    kind: MigrationPageKind::UserState,
+                },
+            ],
+        );
+
+        assert_eq!(page.page.total_record_count, None);
+        assert_eq!(page.page.next_start_index, Some(104));
     }
 
     #[test]

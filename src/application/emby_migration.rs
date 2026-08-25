@@ -254,7 +254,9 @@ impl EmbyMigrationPluginClient {
         &self,
         source: &EmbyMigrationSource,
     ) -> Result<MigrationUserPage, PluginServiceError> {
-        self.call(MIGRATION_LIST_USERS_METHOD, source).await
+        self.call(MIGRATION_LIST_USERS_METHOD, source)
+            .await
+            .map(normalize_migration_user_page)
     }
 
     pub async fn list_items(
@@ -264,16 +266,18 @@ impl EmbyMigrationPluginClient {
         start_index: u32,
         limit: u32,
     ) -> Result<MigrationItemPage, PluginServiceError> {
-        self.call_with(
-            MIGRATION_LIST_ITEMS_METHOD,
-            serde_json::json!({
-                "source": source,
-                "userId": validate_id(user_id)?,
-                "startIndex": start_index,
-                "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
-            }),
-        )
-        .await
+        let page = self
+            .call_with(
+                MIGRATION_LIST_ITEMS_METHOD,
+                serde_json::json!({
+                    "source": source,
+                    "userId": validate_id(user_id)?,
+                    "startIndex": start_index,
+                    "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
+                }),
+            )
+            .await?;
+        Ok(normalize_migration_item_page(page))
     }
 
     pub async fn user_state(
@@ -283,16 +287,18 @@ impl EmbyMigrationPluginClient {
         start_index: u32,
         limit: u32,
     ) -> Result<MigrationItemPage, PluginServiceError> {
-        self.call_with(
-            MIGRATION_USER_STATE_METHOD,
-            serde_json::json!({
-                "source": source,
-                "userId": validate_id(user_id)?,
-                "startIndex": start_index,
-                "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
-            }),
-        )
-        .await
+        let page = self
+            .call_with(
+                MIGRATION_USER_STATE_METHOD,
+                serde_json::json!({
+                    "source": source,
+                    "userId": validate_id(user_id)?,
+                    "startIndex": start_index,
+                    "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
+                }),
+            )
+            .await?;
+        Ok(normalize_migration_item_page(page))
     }
 
     pub async fn person_favorites(
@@ -302,16 +308,18 @@ impl EmbyMigrationPluginClient {
         start_index: u32,
         limit: u32,
     ) -> Result<MigrationItemPage, PluginServiceError> {
-        self.call_with(
-            MIGRATION_PERSON_FAVORITES_METHOD,
-            serde_json::json!({
-                "source": source,
-                "userId": validate_id(user_id)?,
-                "startIndex": start_index,
-                "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
-            }),
-        )
-        .await
+        let page = self
+            .call_with(
+                MIGRATION_PERSON_FAVORITES_METHOD,
+                serde_json::json!({
+                    "source": source,
+                    "userId": validate_id(user_id)?,
+                    "startIndex": start_index,
+                    "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
+                }),
+            )
+            .await?;
+        Ok(normalize_migration_item_page(page))
     }
 
     pub async fn authenticate_user(
@@ -358,6 +366,35 @@ impl EmbyMigrationPluginClient {
         let value = self.plugins.call_migration(method, params).await?;
         serde_json::from_value(value).map_err(|_| PluginServiceError::InvalidResponse)
     }
+}
+
+fn normalize_migration_user_page(mut page: MigrationUserPage) -> MigrationUserPage {
+    for user in &mut page.items {
+        user.name = normalize_migration_text(&user.name);
+    }
+    page
+}
+
+fn normalize_migration_item_page(mut page: MigrationItemPage) -> MigrationItemPage {
+    for item in &mut page.items {
+        item.name = normalize_migration_text(&item.name);
+    }
+    page
+}
+
+fn normalize_migration_text(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>()
+        .trim()
+        .to_owned()
 }
 
 fn emby_migration_source_from_values(
@@ -429,6 +466,14 @@ fn is_private_or_reserved(address: IpAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_text_normalization_replaces_control_characters() {
+        assert_eq!(
+            normalize_migration_text("  现在\t要做\n决定\u{0000}  "),
+            "现在 要做 决定"
+        );
+    }
 
     #[test]
     fn configured_source_uses_plugin_values_and_private_network_flag() {
