@@ -29,3 +29,11 @@ test("registered task actions share the compact button height", () => {
   assert.match(editRule, /height:\s*var\(--lux-button-height-compact\)/);
   assert.match(editRule, /margin-top:\s*0/);
 });
+
+test("mobile registered task details keep the action row from narrowing the lower copy", () => {
+  const mobileRules = stylesheet.match(/@media \(max-width: 900px\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+
+  assert.match(mobileRules, /\.lux-registered-task-row\s*\{[^}]*position:\s*relative;[^}]*grid-template-columns:\s*38px\s+minmax\(0,\s*1fr\)/);
+  assert.match(mobileRules, /\.lux-registered-task-row:not\(.is-editing\) \.lux-registered-task-heading\s*\{[^}]*padding-right:\s*148px/);
+  assert.match(mobileRules, /\.lux-registered-task-actions\s*\{[^}]*position:\s*absolute;[^}]*top:\s*17px;[^}]*right:\s*15px;/);
+});

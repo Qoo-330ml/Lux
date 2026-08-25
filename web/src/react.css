@@ -1307,6 +1307,9 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-admin-nav-link { flex: 0 0 auto; }
 .lux-admin-back { display: none; }
   .lux-admin-content { padding: 24px 20px 64px; }
+  .lux-registered-task-row { position: relative; grid-template-columns: 38px minmax(0, 1fr); }
+  .lux-registered-task-row:not(.is-editing) .lux-registered-task-heading { padding-right: 148px; }
+  .lux-registered-task-actions { position: absolute; top: 17px; right: 15px; }
   .lux-admin-dashboard-grid { grid-template-columns: 1fr; }
   .lux-admin-overview-top { grid-template-columns: minmax(0, 1fr) auto auto; gap: 16px; }
   .lux-admin-overview-identity { grid-column: 1 / -1; }
