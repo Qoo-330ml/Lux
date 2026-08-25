@@ -30,6 +30,21 @@ test("registered task actions share the compact button height", () => {
   assert.match(editRule, /margin-top:\s*0/);
 });
 
+test("task schedule editing keeps the field and actions in one aligned row", () => {
+  const editorRule = rule(".lux-registered-task-editor");
+  const actionRule = rule(".lux-registered-task-editor-actions");
+  const actionIconRule = rule(".lux-registered-task-editor-actions .lux-icon-button-small");
+  const helpRule = rule(".lux-registered-task-editor-help");
+
+  assert.match(editorRule, /grid-template-columns:\s*minmax\(180px,\s*1fr\)\s+auto\s+auto/);
+  assert.match(editorRule, /align-items:\s*end/);
+  assert.match(actionRule, /height:\s*var\(--lux-button-height\)/);
+  assert.match(actionIconRule, /min-width:\s*var\(--lux-button-height\)/);
+  assert.match(actionIconRule, /width:\s*var\(--lux-button-height\)/);
+  assert.match(actionIconRule, /height:\s*var\(--lux-button-height\)/);
+  assert.match(helpRule, /grid-column:\s*1\s*\/\s*-1/);
+});
+
 test("mobile registered task details keep the action row from narrowing the lower copy", () => {
   const mobileRules = stylesheet.match(/@media \(max-width: 900px\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
 
