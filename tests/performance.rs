@@ -137,6 +137,11 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
         "catalog search",
     )
     .await?;
+    let catalog_search_p95 = percentile(&catalog_search_ms, 95);
+    assert!(
+        catalog_search_p95 < 500,
+        "catalog search p95 must stay below 500ms, got {catalog_search_p95}ms"
+    );
     let (unchanged, unchanged_ms) = unchanged_handle.await??;
     assert_eq!(unchanged.discovered_files, file_count);
     assert_eq!(unchanged.created_items, 0);
@@ -193,7 +198,7 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
             "catalogListP95Ms": percentile(&catalog_list_ms, 95),
             "catalogSearchSingleMs": catalog_search_single_ms,
             "catalogSearchP50Ms": percentile(&catalog_search_ms, 50),
-            "catalogSearchP95Ms": percentile(&catalog_search_ms, 95),
+            "catalogSearchP95Ms": catalog_search_p95,
             "foregroundErrors": 0,
             "nonPendingProbeCount": non_pending_probe_count,
             "metadataFingerprintCount": metadata_fingerprint_count,

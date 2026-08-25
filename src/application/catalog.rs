@@ -8,7 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
@@ -50,11 +50,100 @@ pub struct CatalogService {
     database: Database,
     access: MediaAccessService,
     library_page_cache: Arc<LibraryPageCache>,
+    search_flights: Arc<SearchFlightRegistry>,
 }
 
 const LIBRARY_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const LIBRARY_PAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const MAX_LIBRARY_PAGE_CACHE_ENTRIES: usize = 256;
+const MAX_SEARCH_FLIGHTS: usize = 256;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct SearchFlightKey {
+    user_id: String,
+    is_admin: bool,
+    library_ids: Option<Vec<String>>,
+    query: String,
+    like_query: String,
+    offset: i64,
+    limit: i64,
+}
+
+struct SearchFlight {
+    result: Mutex<Option<Arc<CatalogPage>>>,
+    notify: Notify,
+}
+
+struct SearchFlightRegistry {
+    flights: Mutex<HashMap<SearchFlightKey, Arc<SearchFlight>>>,
+}
+
+enum SearchFlightHandle {
+    Leader(Arc<SearchFlight>),
+    Waiter(Arc<SearchFlight>),
+    Bypass,
+}
+
+impl SearchFlightRegistry {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            flights: Mutex::new(HashMap::new()),
+        })
+    }
+
+    async fn begin(&self, key: SearchFlightKey) -> (SearchFlightKey, SearchFlightHandle) {
+        let mut flights = self.flights.lock().await;
+        if let Some(flight) = flights.get(&key) {
+            return (key, SearchFlightHandle::Waiter(flight.clone()));
+        }
+        if flights.len() >= MAX_SEARCH_FLIGHTS {
+            return (key, SearchFlightHandle::Bypass);
+        }
+        let flight = Arc::new(SearchFlight {
+            result: Mutex::new(None),
+            notify: Notify::new(),
+        });
+        flights.insert(key.clone(), flight.clone());
+        (key, SearchFlightHandle::Leader(flight))
+    }
+
+    async fn finish(
+        &self,
+        key: &SearchFlightKey,
+        flight: &Arc<SearchFlight>,
+        page: Option<Arc<CatalogPage>>,
+    ) {
+        *flight.result.lock().await = page;
+        flight.notify.notify_waiters();
+        let mut flights = self.flights.lock().await;
+        if flights
+            .get(key)
+            .is_some_and(|current| Arc::ptr_eq(current, flight))
+        {
+            flights.remove(key);
+        }
+    }
+}
+
+impl SearchFlight {
+    async fn wait(&self) -> Option<Arc<CatalogPage>> {
+        {
+            let result = self.result.lock().await;
+            if result.is_some() {
+                return result.clone();
+            }
+        }
+        let notified = self.notify.notified();
+        {
+            let result = self.result.lock().await;
+            if result.is_some() {
+                return result.clone();
+            }
+        }
+        notified.await;
+        self.result.lock().await.clone()
+    }
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct LibraryPageCacheKey {
@@ -94,7 +183,11 @@ struct LibraryPageCache {
 }
 
 impl LibraryPageCache {
-    fn new(database: Database, access: MediaAccessService) -> Arc<Self> {
+    fn new(
+        database: Database,
+        access: MediaAccessService,
+        search_flights: Arc<SearchFlightRegistry>,
+    ) -> Arc<Self> {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let cache = Arc::new(Self {
             generation: AtomicU64::new(0),
@@ -115,6 +208,7 @@ impl LibraryPageCache {
                     database: database.clone(),
                     access: access.clone(),
                     library_page_cache: cache.clone(),
+                    search_flights: search_flights.clone(),
                 };
                 cache.refresh_entries(&service).await;
             }
@@ -249,11 +343,14 @@ pub struct CatalogItemCounts {
 
 impl CatalogService {
     pub fn new(database: Database, access: MediaAccessService) -> Self {
-        let library_page_cache = LibraryPageCache::new(database.clone(), access.clone());
+        let search_flights = SearchFlightRegistry::new();
+        let library_page_cache =
+            LibraryPageCache::new(database.clone(), access.clone(), search_flights.clone());
         Self {
             database,
             access,
             library_page_cache,
+            search_flights,
         }
     }
 
@@ -931,10 +1028,74 @@ impl CatalogService {
         } else {
             Some(self.access.accessible_library_ids(principal).await?)
         };
-        let library_filter = library_ids.as_deref();
+        let key = SearchFlightKey {
+            user_id: principal.user_id.to_string(),
+            is_admin: principal.is_admin,
+            library_ids: library_ids.clone(),
+            query: query.to_owned(),
+            like_query: like_query.to_owned(),
+            offset,
+            limit,
+        };
+        let (key, flight) = self.search_flights.begin(key).await;
+        match flight {
+            SearchFlightHandle::Leader(flight) => {
+                let service = self.clone();
+                let registry = self.search_flights.clone();
+                let task_key = key.clone();
+                let task_flight = flight.clone();
+                let task_query = query.to_owned();
+                let task_like_query = like_query.to_owned();
+                let task_library_ids = library_ids.clone();
+                let task = tokio::spawn(async move {
+                    let result = service
+                        .search_items_uncached(
+                            &task_query,
+                            &task_like_query,
+                            task_library_ids.as_deref(),
+                            offset,
+                            limit,
+                        )
+                        .await;
+                    let page = result.as_ref().ok().map(|page| Arc::new(page.clone()));
+                    registry.finish(&task_key, &task_flight, page).await;
+                    result
+                });
+                match task.await {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.search_flights.finish(&key, &flight, None).await;
+                        Err(CatalogError::Storage(StorageError::Serialization(format!(
+                            "search worker stopped: {error}"
+                        ))))
+                    }
+                }
+            }
+            SearchFlightHandle::Waiter(flight) => {
+                if let Some(page) = flight.wait().await {
+                    return Ok((*page).clone());
+                }
+                self.search_items_uncached(query, like_query, library_ids.as_deref(), offset, limit)
+                    .await
+            }
+            SearchFlightHandle::Bypass => {
+                self.search_items_uncached(query, like_query, library_ids.as_deref(), offset, limit)
+                    .await
+            }
+        }
+    }
+
+    async fn search_items_uncached(
+        &self,
+        query: &str,
+        like_query: &str,
+        library_ids: Option<&[String]>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
         let (ids, total) = self
             .database
-            .search_catalog_item_ids(query, like_query, library_filter, offset, limit)
+            .search_catalog_item_ids(query, like_query, library_ids, offset, limit)
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&ids).await?;
         let items_by_id = assemble_items(rows)
