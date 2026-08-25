@@ -45,6 +45,7 @@ const PERSON_MANIFEST: &str = "person.json";
 const PERSON_IMAGE: &str = "folder";
 const PEOPLE_RELATION_SCHEMA_VERSION: u32 = 4;
 const PERSON_MANIFEST_SCHEMA_VERSION: u32 = 3;
+const LEGACY_PERSON_MIGRATION_SCHEMA_VERSION: i64 = 1;
 const PENDING_PERSON_DIRECTORY: &str = "personDirectory";
 const PENDING_PERSON_NFO: &str = "personNfo";
 const PENDING_PERSON_MANIFEST: &str = "personManifest";
@@ -2538,15 +2539,26 @@ impl PeopleService {
                 "people database index is unavailable".to_owned(),
             ));
         };
+        let should_migrate_legacy_people = database
+            .legacy_person_migration_needed(LEGACY_PERSON_MIGRATION_SCHEMA_VERSION)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        if should_migrate_legacy_people {
+            let restored_legacy_people = self.restore_legacy_person_directories(database).await?;
+            if restored_legacy_people > 0 {
+                tracing::info!(restored_legacy_people, "legacy people directories migrated");
+            }
+            database
+                .mark_legacy_person_migration_completed(LEGACY_PERSON_MIGRATION_SCHEMA_VERSION)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
+
         let should_restore_people = database
             .person_manifest_restore_needed(PERSON_MANIFEST_SCHEMA_VERSION as i64)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
         if should_restore_people {
-            let restored_legacy_people = self.restore_legacy_person_directories(database).await?;
-            if restored_legacy_people > 0 {
-                tracing::info!(restored_legacy_people, "legacy people directories migrated");
-            }
             let restore_report = self.restore_person_manifests(database).await?;
             if restore_report.restored > 0 {
                 tracing::info!(
@@ -5702,8 +5714,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
 
     use super::{
-        ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PeopleError, PeopleService,
-        PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest, PersonMetadata,
+        ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError,
+        PeopleService, PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest,
+        PersonMetadata,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
@@ -5803,6 +5816,59 @@ mod tests {
             .fetch_one(database.pool())
             .await?;
         assert!(updated_at > 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn legacy_person_migration_stays_completed_when_manifest_restore_requeues()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let legacy_dir = people_directory(&config.config_dir, "旧人物", "tmdb", "57975")?;
+        tokio::fs::create_dir_all(&legacy_dir).await?;
+        tokio::fs::write(
+            legacy_dir.join(PERSON_NFO),
+            r#"<?xml version="1.0"?><person><name>旧人物</name><uniqueid type="tmdb">57975</uniqueid></person>"#
+                .as_bytes(),
+        )
+        .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+
+        service.rebuild_person_credit_index().await?;
+        let migration_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM legacy_person_migration_state WHERE id = 1")
+                .fetch_optional(database.pool())
+                .await?;
+        assert_eq!(migration_status.as_deref(), Some("COMPLETED"));
+
+        let later_legacy_dir = people_directory(&config.config_dir, "后来人物", "tmdb", "57976")?;
+        tokio::fs::create_dir_all(&later_legacy_dir).await?;
+        tokio::fs::write(
+            later_legacy_dir.join(PERSON_NFO),
+            r#"<?xml version="1.0"?><person><name>后来人物</name><uniqueid type="tmdb">57976</uniqueid></person>"#
+                .as_bytes(),
+        )
+        .await?;
+        database
+            .mark_person_manifest_restore_pending(PERSON_MANIFEST_SCHEMA_VERSION as i64)
+            .await?;
+        service.rebuild_person_credit_index().await?;
+
+        let migration_status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM legacy_person_migration_state WHERE id = 1")
+                .fetch_optional(database.pool())
+                .await?;
+        assert_eq!(migration_status.as_deref(), Some("COMPLETED"));
+        assert!(
+            database
+                .find_canonical_person_by_identity("tmdb", "57976")
+                .await?
+                .is_none()
+        );
         Ok(())
     }
 

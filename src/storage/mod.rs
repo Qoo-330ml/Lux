@@ -2853,6 +2853,48 @@ impl Database {
         Ok(status.as_deref() != Some("COMPLETED"))
     }
 
+    pub(crate) async fn legacy_person_migration_needed(
+        &self,
+        schema_version: i64,
+    ) -> Result<bool, StorageError> {
+        let status = self
+            .query_scalar::<String>(
+                "SELECT status FROM legacy_person_migration_state
+                 WHERE id = 1 AND schema_version = ?",
+            )
+            .bind(schema_version)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(status.as_deref() != Some("COMPLETED"))
+    }
+
+    pub(crate) async fn mark_legacy_person_migration_completed(
+        &self,
+        schema_version: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO legacy_person_migration_state (id, status, schema_version, updated_at)
+             VALUES (1, 'COMPLETED', ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                schema_version = excluded.schema_version,
+                updated_at = excluded.updated_at",
+        )
+        .bind(schema_version)
+        .bind(current_unix_timestamp())
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
     pub(crate) async fn mark_person_manifest_restore_pending(
         &self,
         schema_version: i64,
