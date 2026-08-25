@@ -34,7 +34,7 @@ use crate::{
 };
 
 const MAX_LIBRARY_COUNT: usize = 64;
-const MAX_CONCURRENCY: i64 = 64;
+const MAX_CONCURRENCY: i64 = 128;
 const SOURCE_PAGE_SIZE: i64 = 500;
 const JOB_ERROR: &str = "one or more STRM media sources failed";
 const MAX_STRM_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;

@@ -123,8 +123,28 @@ impl ThumbnailService {
             let mut seen_items = HashSet::new();
             self.generate_sources(candidates, &mut seen_items, &mut report)
                 .await;
+            let failed_item_ids = report.failed_item_ids.clone();
             self.database
-                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "THUMBNAIL", "DONE")
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &failed_item_ids,
+                    "THUMBNAIL",
+                    "FAILED",
+                )
+                .await?;
+            let completed_item_ids = item_ids
+                .into_iter()
+                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                .collect::<Vec<_>>();
+            self.database
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &completed_item_ids,
+                    "THUMBNAIL",
+                    "DONE",
+                )
                 .await?;
         }
         Ok(report)
@@ -150,6 +170,7 @@ impl ThumbnailService {
                 Ok(ThumbnailOutcome::Reused) => report.reused += 1,
                 Err(error) => {
                     report.failed += 1;
+                    report.mark_item_failed(&candidate.item_id);
                     tracing::warn!(
                         item_id = %candidate.item_id,
                         error = %error,
@@ -285,6 +306,15 @@ pub struct ThumbnailReport {
     pub reused: usize,
     pub failed: usize,
     pub skipped_strm: usize,
+    pub(crate) failed_item_ids: Vec<String>,
+}
+
+impl ThumbnailReport {
+    fn mark_item_failed(&mut self, item_id: &str) {
+        if !self.failed_item_ids.iter().any(|failed| failed == item_id) {
+            self.failed_item_ids.push(item_id.to_owned());
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

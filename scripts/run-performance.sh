@@ -15,4 +15,4 @@ python3 tools/catalog-fixture/generate.py \
 
 LUX_PERF_MEDIA_ROOT="$work_dir/catalog" \
 LUX_PERF_FILE_COUNT="${LUX_PERF_FILE_COUNT:-60000}" \
-cargo test --release --locked --test performance -- --ignored --nocapture
+cargo test --release --locked --test performance -- --ignored --nocapture --test-threads=1

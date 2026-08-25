@@ -94,7 +94,48 @@ async fn new_libraries_enable_realtime_indexing_by_default()
         .await?;
 
     assert!(library.realtime_watch_enabled);
-    assert_eq!(library.probe_concurrency, 32);
+    assert_eq!(library.probe_concurrency, 64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn library_probe_concurrency_accepts_128_without_raising_scan_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let service = LibraryService::new(database.clone());
+    let library = service
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+
+    let updated = service
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                scan_concurrency: Some(64),
+                probe_concurrency: Some(128),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert_eq!(updated.library.scan_concurrency, 64);
+    assert_eq!(updated.library.probe_concurrency, 128);
+
+    let error = service
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                scan_concurrency: Some(65),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("scan concurrency must remain bounded separately");
+    assert!(matches!(error, LibraryServiceError::InvalidConcurrency));
     Ok(())
 }
 

@@ -109,6 +109,9 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
             items
                 .iter()
                 .any(|item| item["eventCode"] == "JOB_COMPLETED")
+                && items
+                    .iter()
+                    .any(|item| item["eventCode"] == "POSTPROCESSING_FAILED")
         }) {
             break;
         }
@@ -141,7 +144,7 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
         .send()
         .await?;
     assert_eq!(errors.status(), reqwest::StatusCode::OK);
-    assert_eq!(errors.json::<Value>().await?["total"], 0);
+    assert_eq!(errors.json::<Value>().await?["total"], 1);
 
     let invalid = client
         .get(format!(

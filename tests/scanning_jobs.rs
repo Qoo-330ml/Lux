@@ -5,10 +5,12 @@ use luxd::{
         access::{AccessPrincipal, MediaAccessService},
         catalog::{CatalogFilter, CatalogService},
         libraries::LibraryService,
+        nfo::LocalNfoMetadataStore,
         probe::{FfprobeRunner, MediaProbeService},
         reidentify::MetadataReidentifyService,
         scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
         scraper::ScraperProvider,
+        thumbnails::ThumbnailService,
         tmdb::{TmdbClient, TmdbClientConfig},
         watch::ChangeKind,
         webhooks::WebhookService,
@@ -201,6 +203,56 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
+async fn cancelling_postprocessing_keeps_targets_for_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Cancel.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&job.id, 100).await?.completed {
+            break;
+        }
+    }
+    jobs.cancel(&job.id).await?;
+    let cancelled = jobs.run_batch(&job.id, 100).await?;
+    assert_eq!(cancelled.status, "CANCELLED");
+    let target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(target_count > 0);
+
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.status, "RUNNING");
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let final_target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_target_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_scan_enqueues_new_media_once_for_webhook_destinations()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -276,8 +328,9 @@ async fn unchanged_reconciliation_skips_index_targets() -> Result<(), Box<dyn st
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
     let root = temp_dir.path().join("Movies");
-    tokio::fs::create_dir_all(&root).await?;
-    tokio::fs::write(root.join("Stable.Movie.2024.mkv"), b"fixture").await?;
+    let stable_directory = root.join("Stable Movie (2024)");
+    tokio::fs::create_dir_all(&stable_directory).await?;
+    tokio::fs::write(stable_directory.join("Stable.Movie.2024.mkv"), b"fixture").await?;
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
@@ -309,6 +362,103 @@ async fn unchanged_reconciliation_skips_index_targets() -> Result<(), Box<dyn st
             .fetch_one(database.pool())
             .await?;
     assert_eq!(second_target_count, 0);
+    jobs.run_to_completion(&second.id, 100, None).await?;
+
+    let movie_item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query("UPDATE media_items SET parent_id = NULL WHERE id = ?")
+        .bind(&movie_item_id)
+        .execute(database.pool())
+        .await?;
+    let third = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&third.id, 100, None).await?;
+    let parent_after_unchanged_rescan: Option<String> =
+        sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?")
+            .bind(&movie_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        parent_after_unchanged_rescan, None,
+        "an unchanged reconciliation must not enter the index repair path"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reconciliation_persists_removed_media_and_sidecar_targets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let kept = root.join("Kept.Movie.2024.mkv");
+    let kept_nfo = root.join("Kept.Movie.2024.nfo");
+    let removed = root.join("Removed.Movie.2023.mkv");
+    tokio::fs::write(&kept, b"kept").await?;
+    tokio::fs::write(&kept_nfo, b"<movie />").await?;
+    tokio::fs::write(&removed, b"removed").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first.id, 100, None).await?;
+    tokio::fs::remove_file(&kept_nfo).await?;
+    tokio::fs::remove_file(&removed).await?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&second.id, 100).await?.completed {
+            break;
+        }
+    }
+    let targets: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT target_type, target_id, change_kind, metadata_state, thumbnail_state
+         FROM scan_job_targets WHERE job_id = ? ORDER BY target_type, target_id",
+    )
+    .bind(&second.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(targets.len(), 3);
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|target| target.0 == "ITEM" && target.2 == "SIDECAR")
+            .count(),
+        1
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|target| target.0 == "SOURCE" && target.2 == "REMOVED")
+            .count(),
+        1
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .filter(|target| target.0 == "ITEM" && target.2 == "REMOVED")
+            .count(),
+        1
+    );
+    assert!(targets.iter().all(|target| {
+        if target.2 == "SIDECAR" {
+            target.3 == "PENDING" && target.4 == "PENDING"
+        } else {
+            target.3 == "SKIPPED" && target.4 == "SKIPPED"
+        }
+    }));
     Ok(())
 }
 
@@ -1191,6 +1341,190 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
     .fetch_all(database.pool())
     .await?;
     assert!(event_codes.iter().any(|code| code == "PROBE_COMPLETED"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn failed_postprocessing_targets_make_scan_retryable()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Retry Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Retry.Movie.2024.mp4"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    fs::write(&fake_ffprobe, "#!/bin/sh\nexit 1\n")?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let failing_probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(&fake_ffprobe, Duration::from_secs(5)),
+    );
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, Some(failing_probe))
+        .await?;
+
+    let status: (String, String, Option<String>) =
+        sqlx::query_as("SELECT status, scan_phase, error FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(status.0, "FAILED");
+    assert_eq!(status.1, "IDLE");
+    assert!(
+        status
+            .2
+            .as_deref()
+            .is_some_and(|error| error.contains("postprocessing"))
+    );
+    let target_state: String = sqlx::query_scalar(
+        "SELECT probe_state FROM scan_job_targets WHERE job_id = ? AND target_type = 'SOURCE'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(target_state, "FAILED");
+
+    fs::write(
+        &fake_ffprobe,
+        "#!/bin/sh\nprintf '%s' '{\"format\":{\"format_name\":\"mp4\"},\"streams\":[]}'\n",
+    )?;
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.status, "RUNNING");
+    let succeeding_probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    jobs.run_to_completion(&job.id, 100, Some(succeeding_probe))
+        .await?;
+    let final_status: (String, String) =
+        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(final_status, ("COMPLETED".to_owned(), "IDLE".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn pending_postprocessing_targets_make_scan_retryable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Pending.Movie.2024.mp4"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&job.id, 100).await?.completed {
+            break;
+        }
+    }
+    sqlx::query(
+        "UPDATE filesystem_entries SET is_missing = 1
+         WHERE relative_path = 'Pending.Movie.2024.mp4'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE scan_job_targets
+         SET probe_state = 'SKIPPED', metadata_state = 'PENDING', thumbnail_state = 'SKIPPED'
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(status, "FAILED");
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn metadata_and_thumbnail_failures_are_persisted_per_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Broken Metadata Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Broken.Metadata.Movie.2024.mp4"), b"fixture").await?;
+    tokio::fs::write(movie_dir.join("Broken.Metadata.Movie.2024.nfo"), b"<movie").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+    let thumbnails =
+        ThumbnailService::with_runner(database.clone(), "false", Duration::from_secs(5));
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion_with_metadata_and_thumbnails(&job.id, 100, None, None, Some(thumbnails))
+        .await?;
+
+    let states: (String, String, String) = sqlx::query_as(
+        "SELECT status, metadata_state, thumbnail_state
+         FROM scan_jobs sj
+         JOIN scan_job_targets t ON t.job_id = sj.id
+         WHERE sj.id = ? AND t.target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        states,
+        (
+            "FAILED".to_owned(),
+            "FAILED".to_owned(),
+            "FAILED".to_owned()
+        )
+    );
     Ok(())
 }
 

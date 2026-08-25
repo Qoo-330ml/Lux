@@ -24,8 +24,8 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
-const DEFAULT_PROBE_CONCURRENCY: usize = 32;
-const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 64;
+pub(crate) const DEFAULT_PROBE_CONCURRENCY: usize = 64;
+pub(crate) const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 128;
 static GLOBAL_PROBE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -892,7 +892,7 @@ impl MediaProbeService {
             .await?
             .and_then(|library| usize::try_from(library.probe_concurrency).ok())
             .unwrap_or(DEFAULT_PROBE_CONCURRENCY)
-            .clamp(1, 64))
+            .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY))
     }
 
     async fn effective_concurrency(&self, configured: usize) -> usize {

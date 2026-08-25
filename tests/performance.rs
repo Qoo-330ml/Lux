@@ -1,8 +1,16 @@
-use std::{env, path::PathBuf, time::Instant};
+use std::{env, fs, path::PathBuf, time::Instant};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        libraries::LibraryService,
+        probe::{FfprobeRunner, MediaProbeService},
+        scanner::LibraryScanner,
+        setup::SetupService,
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
@@ -194,6 +202,110 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     );
 
     server.abort();
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with scripts/run-performance.sh for the LUX-197 ffprobe gate"]
+async fn lux_197_ffprobe_concurrency_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("FFprobe benchmark", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let media_dir = media_root.join("Benchmark Movie (2024)");
+    tokio::fs::create_dir_all(&media_dir).await?;
+    for index in 0..128 {
+        tokio::fs::write(
+            media_dir.join(format!("Benchmark.Movie.{index:03}.2024.mkv")),
+            b"LUX FFPROBE BENCHMARK FIXTURE\n",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    let script = concat!(
+        "#!/bin/sh\n",
+        "state_dir=\"$(dirname \"$0\")/state\"\n",
+        "mkdir -p \"$state_dir\"\n",
+        "while ! mkdir \"$state_dir/lock\" 2>/dev/null; do sleep 0.001; done\n",
+        "current=$(cat \"$state_dir/current\" 2>/dev/null || printf '0')\n",
+        "current=$((current + 1))\n",
+        "printf '%s' \"$current\" > \"$state_dir/current\"\n",
+        "maximum=$(cat \"$state_dir/maximum\" 2>/dev/null || printf '0')\n",
+        "if [ \"$current\" -gt \"$maximum\" ]; then printf '%s' \"$current\" > \"$state_dir/maximum\"; fi\n",
+        "rmdir \"$state_dir/lock\"\n",
+        "sleep 0.05\n",
+        "while ! mkdir \"$state_dir/lock\" 2>/dev/null; do sleep 0.001; done\n",
+        "current=$(cat \"$state_dir/current\")\n",
+        "printf '%s' \"$((current - 1))\" > \"$state_dir/current\"\n",
+        "rmdir \"$state_dir/lock\"\n",
+        "printf '%s' '{\"format\":{\"format_name\":\"matroska\"},\"streams\":[]}'\n",
+    );
+    fs::write(&fake_ffprobe, script)?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let state_dir = fake_ffprobe
+        .parent()
+        .ok_or("missing benchmark parent")?
+        .join("state");
+    let mut results = Vec::new();
+    for requested in [32_i64, 64, 96, 128] {
+        let _ = fs::remove_dir_all(&state_dir);
+        sqlx::query("UPDATE libraries SET probe_concurrency = ? WHERE id = ?")
+            .bind(requested)
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "UPDATE media_sources
+             SET probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()",
+        )
+        .execute(database.pool())
+        .await?;
+        let started = Instant::now();
+        let report = MediaProbeService::new(
+            database.clone(),
+            FfprobeRunner::new(&fake_ffprobe, std::time::Duration::from_secs(30)),
+        )
+        .probe_movie_library(library.id)
+        .await?;
+        let elapsed_ms = started.elapsed().as_millis();
+        let maximum = tokio::fs::read_to_string(state_dir.join("maximum"))
+            .await?
+            .trim()
+            .parse::<usize>()?;
+        assert_eq!(report.ready, 128);
+        assert!(maximum > 0 && maximum <= requested as usize);
+        results.push(serde_json::json!({
+            "requested": requested,
+            "observed": maximum,
+            "elapsedMs": elapsed_ms,
+        }));
+    }
+    println!(
+        "LUX-197 FFPROBE RESULT {}",
+        serde_json::to_string(&serde_json::json!({
+            "architecture": std::env::consts::ARCH,
+            "fileCount": 128,
+            "levels": results,
+        }))?
+    );
     Ok(())
 }
 

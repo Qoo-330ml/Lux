@@ -6069,6 +6069,26 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_unseen_filesystem_entry_paths(
+        &self,
+        library_root_id: &str,
+        generation: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT relative_path FROM filesystem_entries
+             WHERE library_root_id = ? AND last_seen_generation != ? AND is_missing = 0
+             ORDER BY relative_path",
+        )
+        .bind(library_root_id)
+        .bind(generation)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn create_strm_probe_job(
         &self,
         job: NewStrmProbeJob<'_>,
@@ -6705,6 +6725,78 @@ impl Database {
                     .bind(directory);
             }
             statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn record_scan_job_removed_targets(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        relative_paths: &[String],
+    ) -> Result<(), StorageError> {
+        if relative_paths.is_empty() {
+            return Ok(());
+        }
+        for paths in relative_paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let source_query = format!(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, source_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'SOURCE', ms.id, ms.id, ms.item_id, 'REMOVED',
+                        'SKIPPED', 'SKIPPED', 'SKIPPED'
+                 FROM media_sources ms
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                   AND fe.relative_path IN ({placeholders})
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
+            );
+            let mut source_statement = self
+                .query(sqlx::AssertSqlSafe(source_query))
+                .bind(job_id)
+                .bind(library_root_id);
+            for path in paths {
+                source_statement = source_statement.bind(path);
+            }
+            source_statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+            let item_query = format!(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'ITEM', ms.item_id, ms.item_id, 'REMOVED',
+                        'SKIPPED', 'SKIPPED', 'SKIPPED'
+                 FROM media_sources ms
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                   AND fe.relative_path IN ({placeholders})
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
+            );
+            let mut item_statement = self
+                .query(sqlx::AssertSqlSafe(item_query))
+                .bind(job_id)
+                .bind(library_root_id);
+            for path in paths {
+                item_statement = item_statement.bind(path);
+            }
+            item_statement
                 .execute(&self.pool)
                 .await
                 .map_err(|source| StorageError::Sqlx {
@@ -8382,6 +8474,88 @@ impl Database {
                          )
                    )",
             )
+            .bind(id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn fail_scan_job_postprocessing(
+        &self,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE scan_jobs
+                 SET status = 'FAILED', error = 'postprocessing target failed',
+                     current_item = NULL, scan_phase = 'IDLE',
+                     finished_at = unixepoch(), updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'
+                   AND scan_phase = 'POSTPROCESSING'
+                   AND EXISTS (
+                       SELECT 1 FROM scan_job_targets
+                       WHERE job_id = ?
+                         AND (
+                             probe_state IN ('PENDING', 'FAILED')
+                             OR metadata_state IN ('PENDING', 'FAILED')
+                             OR thumbnail_state IN ('PENDING', 'FAILED')
+                         )
+                   )",
+            )
+            .bind(id)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn has_scan_job_targets(&self, job_id: &str) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM scan_job_targets WHERE job_id = ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn retry_scan_job_postprocessing(
+        &self,
+        id: &str,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "UPDATE scan_jobs
+                 SET status = 'RUNNING', cancel_requested = 0, error = NULL,
+                     current_item = NULL, scan_phase = 'POSTPROCESSING',
+                     started_at = COALESCE(started_at, unixepoch()),
+                     finished_at = NULL, updated_at = unixepoch()
+                 WHERE id = ? AND status IN ('FAILED', 'CANCELLED')
+                   AND job_type = 'RECONCILE_LIBRARY'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM reconciliation_scan_entries
+                       WHERE job_id = ?
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM scan_job_targets WHERE job_id = ?
+                   )",
+            )
+            .bind(id)
             .bind(id)
             .bind(id)
             .execute(&self.pool)

@@ -5,8 +5,12 @@ use std::{
 };
 
 use crate::{
-    application::schedule::{
-        DEFAULT_METADATA_SCHEDULE, DEFAULT_RECONCILIATION_SCHEDULE, validate_cron,
+    application::{
+        probe::{
+            DEFAULT_PROBE_CONCURRENCY as DEFAULT_PROBE_CONCURRENCY_USIZE,
+            MAX_EFFECTIVE_PROBE_CONCURRENCY,
+        },
+        schedule::{DEFAULT_METADATA_SCHEDULE, DEFAULT_RECONCILIATION_SCHEDULE, validate_cron},
     },
     domain::ids::{LibraryId, LibraryRootId},
     library::{
@@ -20,8 +24,9 @@ use crate::{
 };
 
 const DEFAULT_SCAN_CONCURRENCY: i64 = 2;
-const DEFAULT_PROBE_CONCURRENCY: i64 = 32;
-const MAX_LIBRARY_CONCURRENCY: i64 = 64;
+const DEFAULT_PROBE_CONCURRENCY: i64 = DEFAULT_PROBE_CONCURRENCY_USIZE as i64;
+const MAX_SCAN_CONCURRENCY: i64 = 64;
+const MAX_PROBE_CONCURRENCY: i64 = MAX_EFFECTIVE_PROBE_CONCURRENCY as i64;
 const MAX_SCHEDULE_LENGTH: usize = 128;
 const MAX_LIBRARY_SCRAPERS: usize = 16;
 
@@ -264,8 +269,8 @@ impl LibraryService {
         library_id: LibraryId,
         settings: LibrarySettingsPatch,
     ) -> Result<LibraryView, LibraryServiceError> {
-        validate_concurrency(settings.scan_concurrency)?;
-        validate_concurrency(settings.probe_concurrency)?;
+        validate_scan_concurrency(settings.scan_concurrency)?;
+        validate_probe_concurrency(settings.probe_concurrency)?;
         let reconciliation_schedule = normalize_schedule(settings.reconciliation_schedule)?;
         let metadata_schedule = normalize_schedule(settings.metadata_schedule)?;
         let name = settings
@@ -538,7 +543,7 @@ impl fmt::Display for LibraryServiceError {
             Self::InvalidConcurrency => {
                 write!(
                     formatter,
-                    "library concurrency must be between 1 and {MAX_LIBRARY_CONCURRENCY}"
+                    "library scan concurrency must be between 1 and {MAX_SCAN_CONCURRENCY}; probe concurrency must be between 1 and {MAX_PROBE_CONCURRENCY}"
                 )
             }
             Self::InvalidLibraryId(error) => write!(formatter, "invalid library ID: {error}"),
@@ -615,8 +620,15 @@ fn order_library_views(views: &mut [LibraryView], saved_order: &[String]) {
     });
 }
 
-fn validate_concurrency(value: Option<i64>) -> Result<(), LibraryServiceError> {
-    if value.is_some_and(|value| !(1..=MAX_LIBRARY_CONCURRENCY).contains(&value)) {
+fn validate_scan_concurrency(value: Option<i64>) -> Result<(), LibraryServiceError> {
+    if value.is_some_and(|value| !(1..=MAX_SCAN_CONCURRENCY).contains(&value)) {
+        return Err(LibraryServiceError::InvalidConcurrency);
+    }
+    Ok(())
+}
+
+fn validate_probe_concurrency(value: Option<i64>) -> Result<(), LibraryServiceError> {
+    if value.is_some_and(|value| !(1..=MAX_PROBE_CONCURRENCY).contains(&value)) {
         return Err(LibraryServiceError::InvalidConcurrency);
     }
     Ok(())

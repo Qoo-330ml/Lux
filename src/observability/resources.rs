@@ -13,12 +13,14 @@ const MEDIA_PATH: &str = "/media";
 const HOME_LATENCY_SAMPLE_CAPACITY: usize = 64;
 const HOME_P95_DEGRADED_MS: u64 = 300;
 const HOME_P95_TARGET_MS: u64 = 400;
+const PROBE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Clone)]
 pub struct ResourceMetrics {
     started_at: Instant,
     cpu_sample: Arc<Mutex<Option<CpuSample>>>,
     home_latency_ms: Arc<Mutex<VecDeque<u64>>>,
+    probe_state: Arc<Mutex<ProbeConcurrencyState>>,
 }
 
 impl Default for ResourceMetrics {
@@ -35,6 +37,7 @@ impl ResourceMetrics {
             home_latency_ms: Arc::new(Mutex::new(VecDeque::with_capacity(
                 HOME_LATENCY_SAMPLE_CAPACITY,
             ))),
+            probe_state: Arc::new(Mutex::new(ProbeConcurrencyState::default())),
         }
     }
 
@@ -88,7 +91,7 @@ impl ResourceMetrics {
             cpu_snapshot(Arc::clone(&self.cpu_sample)),
             memory_snapshot(),
         );
-        recommended_probe_concurrency(
+        let target = recommended_probe_concurrency(
             configured,
             available_parallelism,
             self.home_latency_p95_ms(),
@@ -96,6 +99,16 @@ impl ResourceMetrics {
             memory.usage_percent,
             cpu.usage_percent,
             hard_cap,
+        );
+        let Ok(mut state) = self.probe_state.lock() else {
+            return target;
+        };
+        stabilize_probe_concurrency(
+            &mut state,
+            target,
+            hard_cap,
+            Instant::now(),
+            PROBE_RECOVERY_COOLDOWN,
         )
     }
 
@@ -488,6 +501,47 @@ pub fn recommended_background_concurrency(
     }
 }
 
+#[derive(Default)]
+struct ProbeConcurrencyState {
+    effective: Option<usize>,
+    last_change_at: Option<Instant>,
+}
+
+fn stabilize_probe_concurrency(
+    state: &mut ProbeConcurrencyState,
+    target: usize,
+    hard_cap: usize,
+    now: Instant,
+    recovery_cooldown: Duration,
+) -> usize {
+    let target = target.clamp(1, hard_cap.max(1));
+    let Some(current) = state.effective else {
+        state.effective = Some(target);
+        return target;
+    };
+    if target < current {
+        state.effective = Some(target);
+        state.last_change_at = Some(now);
+        return target;
+    }
+    if target == current {
+        return current;
+    }
+    if state
+        .last_change_at
+        .is_some_and(|last_change| now.duration_since(last_change) < recovery_cooldown)
+    {
+        return current;
+    }
+    let next = current
+        .saturating_mul(2)
+        .max(current.saturating_add(1))
+        .min(target);
+    state.effective = Some(next);
+    state.last_change_at = (next < target).then_some(now);
+    next
+}
+
 pub fn recommended_probe_concurrency(
     configured: usize,
     available_parallelism: usize,
@@ -507,7 +561,7 @@ pub fn recommended_probe_concurrency(
         .max(1);
     // ffprobe spends a meaningful amount of time waiting on media storage, so
     // it gets an I/O-oriented cap instead of reserving one worker per CPU.
-    let io_cap = container_parallelism.saturating_mul(8).clamp(1, hard_cap);
+    let io_cap = container_parallelism.saturating_mul(16).clamp(1, hard_cap);
     let base = configured.min(io_cap);
     let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
         || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
@@ -622,32 +676,98 @@ mod tests {
     #[test]
     fn probe_concurrency_uses_io_parallelism_before_backing_off() {
         assert_eq!(
-            recommended_probe_concurrency(32, 4, None, None, None, None, 64),
-            32
+            recommended_probe_concurrency(64, 4, None, None, None, None, 128),
+            64
         );
         assert_eq!(
-            recommended_probe_concurrency(64, 4, None, None, None, None, 64),
-            32
+            recommended_probe_concurrency(128, 4, None, None, None, None, 128),
+            64
         );
         assert_eq!(
-            recommended_probe_concurrency(64, 4, None, Some(2.0), None, None, 64),
-            16
+            recommended_probe_concurrency(128, 8, None, None, None, None, 128),
+            128
         );
     }
 
     #[test]
     fn probe_concurrency_backs_off_for_cpu_memory_and_frontend_pressure() {
         assert_eq!(
-            recommended_probe_concurrency(64, 4, Some(1_000), None, None, None, 64),
+            recommended_probe_concurrency(128, 4, Some(1_000), None, None, None, 128),
+            32
+        );
+        assert_eq!(
+            recommended_probe_concurrency(128, 4, None, None, Some(90.0), None, 128),
+            32
+        );
+        assert_eq!(
+            recommended_probe_concurrency(128, 4, None, None, None, Some(90.0), 128),
+            16
+        );
+    }
+
+    #[test]
+    fn probe_concurrency_recovers_in_steps_after_a_cooldown() {
+        let mut state = super::ProbeConcurrencyState::default();
+        let start = std::time::Instant::now();
+        assert_eq!(
+            super::stabilize_probe_concurrency(
+                &mut state,
+                128,
+                128,
+                start,
+                Duration::from_secs(30),
+            ),
+            128
+        );
+        assert_eq!(
+            super::stabilize_probe_concurrency(
+                &mut state,
+                16,
+                64,
+                start + Duration::from_secs(1),
+                Duration::from_secs(30),
+            ),
             16
         );
         assert_eq!(
-            recommended_probe_concurrency(64, 4, None, None, Some(90.0), None, 64),
+            super::stabilize_probe_concurrency(
+                &mut state,
+                128,
+                128,
+                start + Duration::from_secs(2),
+                Duration::from_secs(30),
+            ),
             16
         );
         assert_eq!(
-            recommended_probe_concurrency(64, 4, None, None, None, Some(90.0), 64),
-            8
+            super::stabilize_probe_concurrency(
+                &mut state,
+                128,
+                128,
+                start + Duration::from_secs(31),
+                Duration::from_secs(30),
+            ),
+            32
+        );
+        assert_eq!(
+            super::stabilize_probe_concurrency(
+                &mut state,
+                128,
+                128,
+                start + Duration::from_secs(62),
+                Duration::from_secs(30),
+            ),
+            64
+        );
+        assert_eq!(
+            super::stabilize_probe_concurrency(
+                &mut state,
+                128,
+                128,
+                start + Duration::from_secs(93),
+                Duration::from_secs(30),
+            ),
+            128
         );
     }
 }

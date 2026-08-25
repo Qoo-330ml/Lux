@@ -596,9 +596,31 @@ impl MetadataEnricher {
                 .iter()
                 .map(|source| source.item_id.clone())
                 .collect::<Vec<_>>();
-            self.enrich_movie_sources(sources, &mut report).await;
+            let mut batch_report = MetadataReport::default();
+            self.enrich_movie_sources(sources, &mut batch_report).await;
+            let failed_item_ids = batch_report.failed_item_ids.clone();
+            report.merge(batch_report);
             self.database
-                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "METADATA", "DONE")
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &failed_item_ids,
+                    "METADATA",
+                    "FAILED",
+                )
+                .await?;
+            let completed_item_ids = item_ids
+                .into_iter()
+                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                .collect::<Vec<_>>();
+            self.database
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &completed_item_ids,
+                    "METADATA",
+                    "DONE",
+                )
                 .await?;
         }
 
@@ -621,10 +643,11 @@ impl MetadataEnricher {
                 .iter()
                 .map(|source| source.episode_id.clone())
                 .collect::<Vec<_>>();
+            let mut batch_report = MetadataReport::default();
             if let Err(error) = self
                 .enrich_series_sources(
                     sources,
-                    &mut report,
+                    &mut batch_report,
                     last_series_id.as_mut(),
                     last_season_id.as_mut(),
                     last_episode_id.as_mut(),
@@ -642,8 +665,29 @@ impl MetadataEnricher {
                     .await?;
                 return Err(error);
             }
+            let failed_item_ids = batch_report.failed_item_ids.clone();
+            report.merge(batch_report);
             self.database
-                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "METADATA", "DONE")
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &failed_item_ids,
+                    "METADATA",
+                    "FAILED",
+                )
+                .await?;
+            let completed_item_ids = item_ids
+                .into_iter()
+                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                .collect::<Vec<_>>();
+            self.database
+                .mark_scan_job_target_stage(
+                    scan_job_id,
+                    "ITEM",
+                    &completed_item_ids,
+                    "METADATA",
+                    "DONE",
+                )
                 .await?;
         }
         Ok(report)
@@ -683,7 +727,13 @@ impl MetadataEnricher {
         for source in sources {
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
             match self.enrich_movie_nfo(&source.item_id, &media_path).await {
-                Ok(nfo_report) => report.merge(nfo_report),
+                Ok(nfo_report) => {
+                    let failed = nfo_report.nfo_failed > 0;
+                    report.merge(nfo_report);
+                    if failed {
+                        report.mark_item_failed(&source.item_id);
+                    }
+                }
                 Err(error) => {
                     tracing::warn!(
                         item_id = %source.item_id,
@@ -691,6 +741,7 @@ impl MetadataEnricher {
                         "local movie NFO failed; continuing with images and remaining items"
                     );
                     report.nfo_failed += 1;
+                    report.mark_item_failed(&source.item_id);
                 }
             }
 
@@ -702,6 +753,7 @@ impl MetadataEnricher {
                         %error,
                         "local movie image directory failed; continuing with remaining items"
                     );
+                    report.mark_item_failed(&source.item_id);
                 }
             }
         }
@@ -959,7 +1011,13 @@ impl MetadataEnricher {
         nfo_path: &Path,
     ) {
         match self.enrich_nfo_item(item_id, nfo_path).await {
-            Ok(nfo_report) => report.merge(nfo_report),
+            Ok(nfo_report) => {
+                let failed = nfo_report.nfo_failed > 0;
+                report.merge(nfo_report);
+                if failed {
+                    report.mark_item_failed(item_id);
+                }
+            }
             Err(error) => {
                 tracing::warn!(
                     item_id,
@@ -968,6 +1026,7 @@ impl MetadataEnricher {
                     "local NFO enrichment failed; continuing with remaining metadata"
                 );
                 report.nfo_failed += 1;
+                report.mark_item_failed(item_id);
             }
         }
     }
@@ -1236,6 +1295,7 @@ pub struct MetadataReport {
     pub nfo_failed: usize,
     pub nfo_skipped: usize,
     pub images_found: usize,
+    pub(crate) failed_item_ids: Vec<String>,
 }
 
 impl MetadataReport {
@@ -1244,6 +1304,15 @@ impl MetadataReport {
         self.nfo_failed += other.nfo_failed;
         self.nfo_skipped += other.nfo_skipped;
         self.images_found += other.images_found;
+        for item_id in other.failed_item_ids {
+            self.mark_item_failed(&item_id);
+        }
+    }
+
+    fn mark_item_failed(&mut self, item_id: &str) {
+        if !self.failed_item_ids.iter().any(|failed| failed == item_id) {
+            self.failed_item_ids.push(item_id.to_owned());
+        }
     }
 }
 

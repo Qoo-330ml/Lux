@@ -1265,6 +1265,29 @@ impl LibraryScanner {
         )))
     }
 
+    async fn scan_file_if_fingerprint_unchanged(
+        &self,
+        root_path: &Path,
+        path: &Path,
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+    ) -> Result<Option<(String, ScanReport)>, ScannerError> {
+        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
+        let Some(existing_entry) = existing_entries.get(&relative_path) else {
+            return Ok(None);
+        };
+        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+            return Ok(None);
+        }
+        Ok(Some((
+            existing_entry.id.clone(),
+            ScanReport {
+                discovered_files: 1,
+                skipped_files: 1,
+                ..ScanReport::default()
+            },
+        )))
+    }
+
     async fn scan_episode_file_if_unchanged(
         &self,
         root: &StoredLibraryRoot,
@@ -2220,6 +2243,12 @@ impl ScanJobService {
             cancellation.store(true, Ordering::Release);
         }
         if job.scan_phase == "POSTPROCESSING" {
+            if self
+                .cancellation_requested(job_id, job.cancel_requested, &cancellation)
+                .await?
+            {
+                return self.cancel_running_job(job_id).await;
+            }
             return Ok(ScanBatchReport {
                 status: "COMPLETED".to_owned(),
                 processed: 0,
@@ -2438,6 +2467,26 @@ impl ScanJobService {
                         .await?;
                     continue;
                 }
+                let missing_paths = self
+                    .database
+                    .list_unseen_filesystem_entry_paths(&root.id, &job.generation)
+                    .await?;
+                let removed_media_paths = missing_paths
+                    .iter()
+                    .filter(|path| is_supported_movie_file(Path::new(path)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let removed_sidecar_paths = missing_paths
+                    .iter()
+                    .filter(|path| is_supported_sidecar_file(Path::new(path)))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.database
+                    .record_scan_job_removed_targets(&job.id, &root.id, &removed_media_paths)
+                    .await?;
+                self.database
+                    .record_scan_job_sidecar_targets(&job.id, &root.id, &removed_sidecar_paths)
+                    .await?;
                 removed_count = removed_count.saturating_add(
                     usize::try_from(
                         self.database
@@ -2569,9 +2618,6 @@ impl ScanJobService {
                         .await?;
                     continue;
                 }
-                self.database
-                    .mark_filesystem_entry_missing_by_path(&root.id, &entry.relative_path)
-                    .await?;
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
                 completed_entries.push(entry.clone());
@@ -2609,56 +2655,15 @@ impl ScanJobService {
             let existing_entries = existing_entries_by_root
                 .get(&root.id)
                 .ok_or_else(|| ScannerError::LibraryNotFound)?;
-            let quick_result = match library_kind {
-                "SERIES" => {
-                    self.scanner
-                        .scan_episode_file_if_unchanged(
-                            root,
-                            Path::new(&root.canonical_path),
-                            &path,
-                            existing_entries,
-                        )
-                        .await?
-                }
-                "MIXED" => {
-                    match classify_mixed_file(Path::new(&root.canonical_path), &path).await {
-                        MixedClassification::Movie => {
-                            self.scanner
-                                .scan_movie_file_if_unchanged(
-                                    &job.library_id,
-                                    &root.id,
-                                    Path::new(&root.canonical_path),
-                                    &path,
-                                    existing_entries,
-                                )
-                                .await?
-                        }
-                        MixedClassification::Episode => {
-                            self.scanner
-                                .scan_episode_file_if_unchanged(
-                                    root,
-                                    Path::new(&root.canonical_path),
-                                    &path,
-                                    existing_entries,
-                                )
-                                .await?
-                        }
-                        MixedClassification::Unresolved => {
-                            self.scanner
-                                .scan_unresolved_file_if_unchanged(
-                                    &job.library_id,
-                                    root,
-                                    Path::new(&root.canonical_path),
-                                    &path,
-                                    existing_entries,
-                                )
-                                .await?
-                        }
-                    }
-                }
-                _ => None,
-            };
-            if let Some((entry_id, quick_report)) = quick_result {
+            if let Some((entry_id, quick_report)) = self
+                .scanner
+                .scan_file_if_fingerprint_unchanged(
+                    Path::new(&root.canonical_path),
+                    &path,
+                    existing_entries,
+                )
+                .await?
+            {
                 quick_seen_entry_ids.push(entry_id);
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
@@ -2883,9 +2888,6 @@ impl ScanJobService {
                         .await?;
                     continue;
                 }
-                self.database
-                    .mark_filesystem_entry_missing_by_path(&root.id, &entry.relative_path)
-                    .await?;
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
                 completed_entries.push((index, entry.clone()));
@@ -2920,32 +2922,26 @@ impl ScanJobService {
                 continue;
             }
 
-            if existing_entries_by_root
+            let existing_entries = existing_entries_by_root
                 .get(&root.id)
-                .and_then(|entries| entries.get(&entry.relative_path))
-                .is_some()
+                .ok_or_else(|| ScannerError::LibraryNotFound)?;
+            if let Some((entry_id, quick_report)) = self
+                .scanner
+                .scan_file_if_fingerprint_unchanged(
+                    Path::new(&root.canonical_path),
+                    &path,
+                    existing_entries,
+                )
+                .await?
             {
-                let existing_entries = existing_entries_by_root
-                    .get(&root.id)
-                    .ok_or_else(|| ScannerError::LibraryNotFound)?;
-                if let Some((entry_id, quick_report)) = self
-                    .scanner
-                    .scan_movie_file_if_unchanged(
-                        &job.library_id,
-                        &root.id,
-                        Path::new(&root.canonical_path),
-                        &path,
-                        existing_entries,
-                    )
-                    .await?
-                {
-                    quick_seen_entry_ids.push(entry_id);
-                    next_count = next_count.saturating_add(1);
-                    processed = processed.saturating_add(1);
-                    completed_entries.push((index, entry.clone()));
-                    created_items = created_items.saturating_add(quick_report.created_items);
-                    continue;
-                }
+                quick_seen_entry_ids.push(entry_id);
+                next_count = next_count.saturating_add(1);
+                processed = processed.saturating_add(1);
+                completed_entries.push((index, entry.clone()));
+                created_items = created_items.saturating_add(quick_report.created_items);
+                continue;
+            }
+            if existing_entries.contains_key(&entry.relative_path) {
                 changed_paths_by_root
                     .entry(root.id.clone())
                     .or_default()
@@ -3552,9 +3548,23 @@ impl ScanJobService {
                 self.database
                     .clear_completed_scan_job_targets(job_id)
                     .await?;
-                self.database
+                let completed = self
+                    .database
                     .complete_scan_job_postprocessing(job_id)
                     .await?;
+                if !completed {
+                    if self.database.fail_scan_job_postprocessing(job_id).await? {
+                        self.record_event(
+                            job_id,
+                            "ERROR",
+                            "POSTPROCESSING_FAILED",
+                            "扫描后处理失败，可重试未完成目标",
+                            "{}",
+                        )
+                        .await;
+                    }
+                    return Ok(());
+                }
                 self.run_auto_library_cover_after_scan(job_id).await?;
                 if completed_job.auto_metadata_match {
                     if let Some(metadata) = metadata {
@@ -4137,11 +4147,6 @@ impl ScanJobService {
         let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
             return Err(ScanJobError::LibraryNotFound);
         };
-        if job.status == "CANCELLED" {
-            return self
-                .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
-                .await;
-        }
         if let Some(active) = self
             .database
             .find_active_scan_job(&job.library_id, &job.job_type)
@@ -4149,12 +4154,23 @@ impl ScanJobService {
         {
             return Err(ScanJobError::AlreadyActive(active.id));
         }
-        if job.job_type == "RECONCILE_LIBRARY"
-            && !self
+        if job.job_type == "RECONCILE_LIBRARY" {
+            let has_reconciliation_entries = self
                 .database
                 .has_reconciliation_scan_entries(&job.id)
-                .await?
-        {
+                .await?;
+            if !has_reconciliation_entries {
+                if self.database.has_scan_job_targets(&job.id).await?
+                    && self.database.retry_scan_job_postprocessing(&job.id).await?
+                {
+                    return self.get_job(&job.id).await;
+                }
+                return self
+                    .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
+                    .await;
+            }
+        }
+        if job.status == "CANCELLED" {
             return self
                 .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
                 .await;
