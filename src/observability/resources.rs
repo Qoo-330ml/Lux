@@ -80,6 +80,25 @@ impl ResourceMetrics {
         )
     }
 
+    pub async fn probe_concurrency(&self, configured: usize, hard_cap: usize) -> usize {
+        let available_parallelism = std::thread::available_parallelism()
+            .map(|value| value.get())
+            .unwrap_or(1);
+        let (cpu, memory) = tokio::join!(
+            cpu_snapshot(Arc::clone(&self.cpu_sample)),
+            memory_snapshot(),
+        );
+        recommended_probe_concurrency(
+            configured,
+            available_parallelism,
+            self.home_latency_p95_ms(),
+            cpu.limit_cores,
+            memory.usage_percent,
+            cpu.usage_percent,
+            hard_cap,
+        )
+    }
+
     pub async fn snapshot(&self) -> ResourceSnapshot {
         let (cpu, memory, media_storage) = tokio::join!(
             cpu_snapshot(Arc::clone(&self.cpu_sample)),
@@ -469,12 +488,48 @@ pub fn recommended_background_concurrency(
     }
 }
 
+pub fn recommended_probe_concurrency(
+    configured: usize,
+    available_parallelism: usize,
+    home_p95_ms: Option<u64>,
+    container_cpu_limit: Option<f64>,
+    container_memory_usage_percent: Option<f64>,
+    cpu_usage_percent: Option<f64>,
+    hard_cap: usize,
+) -> usize {
+    let hard_cap = hard_cap.max(1);
+    let configured = configured.clamp(1, hard_cap);
+    let container_parallelism = container_cpu_limit
+        .filter(|limit| limit.is_finite() && *limit > 0.0)
+        .map_or(available_parallelism, |limit| {
+            limit.ceil().min(usize::MAX as f64) as usize
+        })
+        .max(1);
+    // ffprobe spends a meaningful amount of time waiting on media storage, so
+    // it gets an I/O-oriented cap instead of reserving one worker per CPU.
+    let io_cap = container_parallelism.saturating_mul(4).clamp(1, hard_cap);
+    let base = configured.min(io_cap);
+    let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
+        || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
+        || home_p95_ms.is_some_and(|value| value >= 2_000);
+    if severe_pressure {
+        return base.div_ceil(4).max(1);
+    }
+    let degraded = cpu_usage_percent.is_some_and(|value| value >= 75.0)
+        || container_memory_usage_percent.is_some_and(|value| value >= 85.0)
+        || home_p95_ms.is_some_and(|value| value >= 1_000);
+    if degraded {
+        return base.div_ceil(2).max(1);
+    }
+    base.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ResourceMetrics, calculate_cpu_usage_cores, calculate_cpu_usage_percent,
         memory_usage_percent, parse_cgroup_limit, parse_media_storage_values, process_is_member,
-        recommended_background_concurrency, select_cpu_capacity,
+        recommended_background_concurrency, recommended_probe_concurrency, select_cpu_capacity,
     };
     use std::time::Duration;
 
@@ -561,6 +616,38 @@ mod tests {
         assert_eq!(
             recommended_background_concurrency(8, 8, None, None, Some(85.0)),
             1
+        );
+    }
+
+    #[test]
+    fn probe_concurrency_uses_io_parallelism_before_backing_off() {
+        assert_eq!(
+            recommended_probe_concurrency(16, 4, None, None, None, None, 32),
+            16
+        );
+        assert_eq!(
+            recommended_probe_concurrency(64, 4, None, None, None, None, 32),
+            16
+        );
+        assert_eq!(
+            recommended_probe_concurrency(32, 4, None, Some(2.0), None, None, 32),
+            8
+        );
+    }
+
+    #[test]
+    fn probe_concurrency_backs_off_for_cpu_memory_and_frontend_pressure() {
+        assert_eq!(
+            recommended_probe_concurrency(32, 4, Some(1_000), None, None, None, 32),
+            8
+        );
+        assert_eq!(
+            recommended_probe_concurrency(32, 4, None, None, Some(90.0), None, 32),
+            8
+        );
+        assert_eq!(
+            recommended_probe_concurrency(32, 4, None, None, None, Some(90.0), 32),
+            4
         );
     }
 }

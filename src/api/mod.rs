@@ -279,10 +279,10 @@ impl AppState {
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone())
             .with_database(database.clone());
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
-        let probe = Some(MediaProbeService::new(
-            database.clone(),
-            FfprobeRunner::default(),
-        ));
+        let probe = Some(
+            MediaProbeService::new(database.clone(), FfprobeRunner::default())
+                .with_resource_metrics(resources.clone()),
+        );
         let thumbnails = Some(ThumbnailService::new(database.clone()));
         let scan_jobs = {
             let service = ScanJobService::new(database.clone())

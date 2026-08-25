@@ -3,16 +3,20 @@ use std::{
     fmt,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use quick_xml::{events::Event, reader::Reader};
 use serde_json::Value;
-use tokio::{fs, io::AsyncWriteExt, process::Command, time::timeout};
+use tokio::{
+    fs, io::AsyncWriteExt, process::Command, sync::Semaphore, task::JoinSet, time::timeout,
+};
 
 use crate::{
     domain::{ids::LibraryId, time::duration_to_ticks},
-    storage::{Database, MediaProbeUpdate, MediaStreamUpdate, StorageError},
+    observability::resources::ResourceMetrics,
+    storage::{Database, MediaProbeUpdate, MediaStreamUpdate, StorageError, StoredMediaSourcePath},
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -20,6 +24,9 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
+const DEFAULT_PROBE_CONCURRENCY: usize = 16;
+const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 32;
+static GLOBAL_PROBE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaProbeResult {
@@ -761,11 +768,32 @@ fn truncate(bytes: &[u8]) -> String {
 pub struct MediaProbeService {
     database: Database,
     runner: FfprobeRunner,
+    resources: ResourceMetrics,
+    global_slots: Arc<Semaphore>,
 }
+
+type ProbeTaskResult = (
+    StoredMediaSourcePath,
+    PathBuf,
+    Result<Option<MediaProbeResult>, ProbeError>,
+);
 
 impl MediaProbeService {
     pub fn new(database: Database, runner: FfprobeRunner) -> Self {
-        Self { database, runner }
+        Self {
+            database,
+            runner,
+            resources: ResourceMetrics::new(),
+            global_slots: Arc::clone(
+                GLOBAL_PROBE_SLOTS
+                    .get_or_init(|| Arc::new(Semaphore::new(MAX_EFFECTIVE_PROBE_CONCURRENCY))),
+            ),
+        }
+    }
+
+    pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub async fn probe_movie_library(
@@ -774,6 +802,13 @@ impl MediaProbeService {
     ) -> Result<ProbeReport, ProbeServiceError> {
         let mut report = ProbeReport::default();
         let library_id = library_id.to_string();
+        let configured = self
+            .database
+            .find_library(&library_id)
+            .await?
+            .and_then(|library| usize::try_from(library.probe_concurrency).ok())
+            .unwrap_or(DEFAULT_PROBE_CONCURRENCY)
+            .clamp(1, 64);
         let mut offset = 0_i64;
         loop {
             let sources = self
@@ -785,6 +820,12 @@ impl MediaProbeService {
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
+            let concurrency = self
+                .resources
+                .probe_concurrency(configured, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+                .await
+                .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY);
+            let mut inputs = Vec::with_capacity(sources.len());
             for source in sources {
                 if source.probe_status != "PENDING" {
                     report.skipped += 1;
@@ -792,93 +833,22 @@ impl MediaProbeService {
                 }
                 report.attempted += 1;
                 let path = safe_media_path(&source.root_path, &source.relative_path)?;
-                match self.probe_source(&path).await {
-                    Ok(Some(result)) => {
-                        let detail_json = result
-                            .streams
-                            .iter()
-                            .map(|stream| {
-                                if stream.details.is_empty() {
-                                    None
-                                } else {
-                                    serde_json::to_string(&stream.details).ok()
-                                }
-                            })
-                            .collect::<Vec<_>>();
-                        let streams = result
-                            .streams
-                            .iter()
-                            .zip(detail_json.iter())
-                            .map(|(stream, details)| MediaStreamUpdate {
-                                stream_index: stream.stream_index,
-                                stream_type: stream.stream_type.as_str(),
-                                codec: stream.codec.as_deref(),
-                                language: stream.language.as_deref(),
-                                title: stream.title.as_deref(),
-                                details_json: details.as_deref(),
-                                external_path: None,
-                                is_external: false,
-                                is_default: stream.is_default,
-                                is_forced: stream.is_forced,
-                            })
-                            .collect::<Vec<_>>();
-                        let external_subtitles =
-                            discover_external_subtitles(&path, &source.root_path).await;
-                        let next_stream_index = result
-                            .streams
-                            .iter()
-                            .map(|stream| stream.stream_index)
-                            .max()
-                            .unwrap_or(-1)
-                            .saturating_add(1);
-                        let mut streams = streams;
-                        for (offset, subtitle) in external_subtitles.iter().enumerate() {
-                            streams.push(MediaStreamUpdate {
-                                stream_index: next_stream_index
-                                    .saturating_add(i64::try_from(offset).unwrap_or(i64::MAX)),
-                                stream_type: "SUBTITLE",
-                                codec: subtitle.codec.as_deref(),
-                                language: subtitle.language.as_deref(),
-                                title: subtitle.title.as_deref(),
-                                details_json: None,
-                                external_path: Some(subtitle.relative_path.as_str()),
-                                is_external: true,
-                                is_default: subtitle.is_default,
-                                is_forced: subtitle.is_forced,
-                            });
-                        }
-                        self.database
-                            .save_media_probe(MediaProbeUpdate {
-                                source_id: &source.source_id,
-                                container: result.container.as_deref(),
-                                source_size: result.source_size,
-                                duration_ticks: result.duration_ticks,
-                                bitrate: result.bitrate,
-                                streams: &streams,
-                            })
-                            .await?;
-                        report.ready += 1;
-                    }
-                    Ok(None) => {
-                        // A STRM without a sidecar is owned by the STRM plugin;
-                        // leave it pending instead of making SKIP suppress it.
-                        report.skipped += 1;
-                    }
-                    Err(error) => {
-                        if matches!(error, ProbeError::Timeout) {
-                            report.timed_out += 1;
-                        } else {
-                            report.failed += 1;
-                        }
-                        self.database
-                            .mark_media_probe_failed(
-                                &source.source_id,
-                                error.failure_status(),
-                                &error.to_string(),
-                            )
-                            .await?;
-                    }
+                inputs.push((source, path));
+            }
+
+            let mut pending = JoinSet::<ProbeTaskResult>::new();
+            for (source, path) in inputs {
+                while pending.len() >= concurrency {
+                    self.collect_probe_task(&mut pending, &mut report).await?;
                 }
+                let service = self.clone();
+                pending.spawn(async move {
+                    let result = service.probe_source_with_slot(&path).await;
+                    (source, path, result)
+                });
+            }
+            while !pending.is_empty() {
+                self.collect_probe_task(&mut pending, &mut report).await?;
             }
             if last_page {
                 break;
@@ -886,6 +856,131 @@ impl MediaProbeService {
             offset = offset.saturating_add(LIBRARY_SOURCE_PAGE_SIZE as i64);
         }
         Ok(report)
+    }
+
+    async fn collect_probe_task(
+        &self,
+        pending: &mut JoinSet<ProbeTaskResult>,
+        report: &mut ProbeReport,
+    ) -> Result<(), ProbeServiceError> {
+        let task = pending
+            .join_next()
+            .await
+            .ok_or_else(|| ProbeServiceError::Worker("probe task set was empty".to_owned()))?
+            .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
+        self.persist_probe_attempt(&task.0, &task.1, task.2, report)
+            .await
+    }
+
+    async fn persist_probe_attempt(
+        &self,
+        source: &StoredMediaSourcePath,
+        path: &Path,
+        result: Result<Option<MediaProbeResult>, ProbeError>,
+        report: &mut ProbeReport,
+    ) -> Result<(), ProbeServiceError> {
+        match result {
+            Ok(Some(result)) => {
+                let detail_json = result
+                    .streams
+                    .iter()
+                    .map(|stream| {
+                        if stream.details.is_empty() {
+                            None
+                        } else {
+                            serde_json::to_string(&stream.details).ok()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let streams = result
+                    .streams
+                    .iter()
+                    .zip(detail_json.iter())
+                    .map(|(stream, details)| MediaStreamUpdate {
+                        stream_index: stream.stream_index,
+                        stream_type: stream.stream_type.as_str(),
+                        codec: stream.codec.as_deref(),
+                        language: stream.language.as_deref(),
+                        title: stream.title.as_deref(),
+                        details_json: details.as_deref(),
+                        external_path: None,
+                        is_external: false,
+                        is_default: stream.is_default,
+                        is_forced: stream.is_forced,
+                    })
+                    .collect::<Vec<_>>();
+                let external_subtitles = discover_external_subtitles(path, &source.root_path).await;
+                let next_stream_index = result
+                    .streams
+                    .iter()
+                    .map(|stream| stream.stream_index)
+                    .max()
+                    .unwrap_or(-1)
+                    .saturating_add(1);
+                let mut streams = streams;
+                for (offset, subtitle) in external_subtitles.iter().enumerate() {
+                    streams.push(MediaStreamUpdate {
+                        stream_index: next_stream_index
+                            .saturating_add(i64::try_from(offset).unwrap_or(i64::MAX)),
+                        stream_type: "SUBTITLE",
+                        codec: subtitle.codec.as_deref(),
+                        language: subtitle.language.as_deref(),
+                        title: subtitle.title.as_deref(),
+                        details_json: None,
+                        external_path: Some(subtitle.relative_path.as_str()),
+                        is_external: true,
+                        is_default: subtitle.is_default,
+                        is_forced: subtitle.is_forced,
+                    });
+                }
+                self.database
+                    .save_media_probe(MediaProbeUpdate {
+                        source_id: &source.source_id,
+                        container: result.container.as_deref(),
+                        source_size: result.source_size,
+                        duration_ticks: result.duration_ticks,
+                        bitrate: result.bitrate,
+                        streams: &streams,
+                    })
+                    .await?;
+                report.ready += 1;
+            }
+            Ok(None) => {
+                // A STRM without a sidecar is owned by the STRM plugin;
+                // leave it pending instead of making SKIP suppress it.
+                report.skipped += 1;
+            }
+            Err(error) => {
+                if matches!(error, ProbeError::Timeout) {
+                    report.timed_out += 1;
+                } else {
+                    report.failed += 1;
+                }
+                self.database
+                    .mark_media_probe_failed(
+                        &source.source_id,
+                        error.failure_status(),
+                        &error.to_string(),
+                    )
+                    .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn probe_source_with_slot(
+        &self,
+        path: &Path,
+    ) -> Result<Option<MediaProbeResult>, ProbeError> {
+        let permit = self
+            .global_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| ProbeError::Io(std::io::Error::other(error.to_string())))?;
+        let result = self.probe_source(path).await;
+        drop(permit);
+        result
     }
 
     async fn probe_source(&self, path: &Path) -> Result<Option<MediaProbeResult>, ProbeError> {
@@ -1118,6 +1213,7 @@ pub enum ProbeServiceError {
         relative_path: String,
     },
     Storage(StorageError),
+    Worker(String),
 }
 
 impl fmt::Display for ProbeServiceError {
@@ -1132,6 +1228,7 @@ impl fmt::Display for ProbeServiceError {
                 relative_path, root_path
             ),
             Self::Storage(error) => error.fmt(formatter),
+            Self::Worker(error) => write!(formatter, "probe worker failed: {error}"),
         }
     }
 }
@@ -1139,7 +1236,7 @@ impl fmt::Display for ProbeServiceError {
 impl std::error::Error for ProbeServiceError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::InvalidSourcePath { .. } => None,
+            Self::InvalidSourcePath { .. } | Self::Worker(_) => None,
             Self::Storage(error) => Some(error),
         }
     }

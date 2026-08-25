@@ -314,6 +314,77 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"12.5","bit_rate":"5
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn probe_service_runs_multiple_ffprobe_processes_at_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = config_for(&temp_dir);
+    let media_root = temp_dir.path().join("Movies");
+    for index in 0..4 {
+        let movie_dir = media_root.join(format!("Probe Movie {index} (2024)"));
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Probe.Movie.{index}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let script = executable_script(
+        temp_dir.path(),
+        r#"#!/bin/sh
+state_dir="$(dirname "$0")/probe-state"
+mkdir -p "$state_dir"
+while ! mkdir "$state_dir/lock" 2>/dev/null; do sleep 0.001; done
+current=$(cat "$state_dir/current" 2>/dev/null || printf '0')
+current=$((current + 1))
+printf '%s' "$current" > "$state_dir/current"
+maximum=$(cat "$state_dir/maximum" 2>/dev/null || printf '0')
+if [ "$current" -gt "$maximum" ]; then printf '%s' "$current" > "$state_dir/maximum"; fi
+rmdir "$state_dir/lock"
+sleep 0.25
+while ! mkdir "$state_dir/lock" 2>/dev/null; do sleep 0.001; done
+current=$(cat "$state_dir/current")
+printf '%s' "$((current - 1))" > "$state_dir/current"
+rmdir "$state_dir/lock"
+printf '%s' '{"format":{"format_name":"matroska"},"streams":[]}'
+"#,
+    )?;
+    let service = MediaProbeService::new(
+        database,
+        FfprobeRunner::new(script.clone(), Duration::from_secs(5)),
+    );
+
+    let report = service.probe_movie_library(library.id).await?;
+    assert_eq!(report.ready, 4);
+    let state_file = script
+        .parent()
+        .ok_or("missing fake ffprobe parent")?
+        .join("probe-state/maximum");
+    let maximum = tokio::fs::read_to_string(state_file)
+        .await?
+        .trim()
+        .parse::<usize>()?;
+    assert!(
+        maximum >= 2,
+        "expected overlapping ffprobe processes, saw {maximum}"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn strm_probe_uses_media_info_sidecar_without_running_ffprobe()
 -> Result<(), Box<dyn std::error::Error>> {
