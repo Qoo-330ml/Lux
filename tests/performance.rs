@@ -237,24 +237,41 @@ async fn lux_197_ffprobe_concurrency_benchmark() -> Result<(), Box<dyn std::erro
         .await?;
 
     let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
-    let script = concat!(
-        "#!/bin/sh\n",
-        "state_dir=\"$(dirname \"$0\")/state\"\n",
-        "mkdir -p \"$state_dir\"\n",
-        "while ! mkdir \"$state_dir/lock\" 2>/dev/null; do sleep 0.001; done\n",
-        "current=$(cat \"$state_dir/current\" 2>/dev/null || printf '0')\n",
-        "current=$((current + 1))\n",
-        "printf '%s' \"$current\" > \"$state_dir/current\"\n",
-        "maximum=$(cat \"$state_dir/maximum\" 2>/dev/null || printf '0')\n",
-        "if [ \"$current\" -gt \"$maximum\" ]; then printf '%s' \"$current\" > \"$state_dir/maximum\"; fi\n",
-        "rmdir \"$state_dir/lock\"\n",
-        "sleep 0.05\n",
-        "while ! mkdir \"$state_dir/lock\" 2>/dev/null; do sleep 0.001; done\n",
-        "current=$(cat \"$state_dir/current\")\n",
-        "printf '%s' \"$((current - 1))\" > \"$state_dir/current\"\n",
-        "rmdir \"$state_dir/lock\"\n",
-        "printf '%s' '{\"format\":{\"format_name\":\"matroska\"},\"streams\":[]}'\n",
-    );
+    let script = r##"#!/usr/bin/env python3
+import fcntl
+from pathlib import Path
+import time
+
+state_dir = Path(__file__).resolve().parent / "state"
+state_dir.mkdir(parents=True, exist_ok=True)
+lock_path = state_dir / "lock"
+current_path = state_dir / "current"
+maximum_path = state_dir / "maximum"
+
+def update_current(delta):
+    with lock_path.open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            current = int(current_path.read_text() or "0") + delta
+        except (FileNotFoundError, ValueError):
+            current = max(delta, 0)
+        current_path.write_text(str(current))
+        if delta > 0:
+            try:
+                maximum = int(maximum_path.read_text() or "0")
+            except (FileNotFoundError, ValueError):
+                maximum = 0
+            if current > maximum:
+                maximum_path.write_text(str(current))
+        fcntl.flock(lock, fcntl.LOCK_UN)
+
+update_current(1)
+try:
+    time.sleep(0.05)
+finally:
+    update_current(-1)
+print('{"format":{"format_name":"matroska"},"streams":[]}', end="")
+"##;
     fs::write(&fake_ffprobe, script)?;
     let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
     permissions.set_mode(0o755);
@@ -289,6 +306,7 @@ async fn lux_197_ffprobe_concurrency_benchmark() -> Result<(), Box<dyn std::erro
         .probe_movie_library(library.id)
         .await?;
         let elapsed_ms = started.elapsed().as_millis();
+        eprintln!("LUX-197 probe requested={requested} report={report:?}");
         let maximum = tokio::fs::read_to_string(state_dir.join("maximum"))
             .await?
             .trim()
