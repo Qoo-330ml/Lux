@@ -28,22 +28,23 @@
 | 2026-08-21 | 7e0578a5 | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 确定性 60,000 MKV / 600 目录 | `./scripts/run-performance.sh` | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 4,676 / 6,383 / 1,331 ms；35 / 3,120 ms | 4,676 / 6,383 / 1,331 ms；40 / 4,172 ms | 0% | - | release；电影身份与目录预取、filesystem/media_items/media_sources 批量写入；扫描期间前台 p95 154 ms，`foregroundErrors=0`；`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；仅代表本机 ARM64，不外推 NAS/x86_64 性能 |
 | 2026-08-21 | 60f3028c | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 同上 | `./scripts/run-performance.sh` | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 4,687 / 6,406 / 1,393 ms；38 / 2,721 ms | 4,687 / 6,406 / 1,393 ms；44 / 4,219 ms | 0% | - | release；有界文件准备并发、目录 provider ID 批内复用、后台默认批次 100；扫描期间前台 p95 150 ms，`foregroundErrors=0`；`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；与前一阶段同量级，说明优化保持稳定；仅代表本机 ARM64，不外推 NAS/x86_64 性能 |
 | 2026-08-25 | 04b73f5d | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 确定性 60,000 MKV / 600 目录 | `LUX_PERF_FILE_COUNT=60000 ./scripts/run-performance.sh` | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 4,524 / 6,854 / 1,599 ms；39 / 2,653 ms | 4,524 / 6,854 / 1,599 ms；44 / 4,396 ms | 0% | - | release；变化集后处理与默认 ffprobe 并发 64；扫描期间前台 p95 194 ms，`foregroundErrors=0`；`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；搜索 p95 约 4.4 s，仍高于 500 ms 目标；仅代表本机 ARM64，不外推 NAS/x86_64 性能 |
+| 2026-08-25 | 33fe9db4 | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 确定性 60,000 MKV / 600 目录 | `LUX_PERF_FILE_COUNT=60000 ./scripts/run-performance.sh` | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 4,360 / 5,776 / 1,402 ms；40 / 2,643 ms | 4,360 / 5,776 / 1,402 ms；45 / 4,457 ms | 0% | - | release；fingerprint 命中时跳过逐文件索引修复查询；ffprobe 默认配置 128，扫描期间前台 p95 166 ms，`foregroundErrors=0`；`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；搜索 p95 约 4.5 s，仍高于 500 ms 目标；仅代表本机 ARM64，不外推 NAS/x86_64 性能 |
 
 ## LUX-197 ffprobe 并发记录
 
-同一条命令同时运行 60,000 文件扫描基准和以下 ffprobe 合成基准；ffprobe 夹具包含 128 个文件，`observed`
+同一条命令同时运行 60,000 文件扫描基准和以下 ffprobe 合成基准；ffprobe 夹具包含 256 个文件，`observed`
 是 fake ffprobe 进程的最大重叠数。资源背压会根据本机 CPU、内存和前台压力把实际值压低，因此
 `requested` 是配置值，不是强制启动数。
 
 | 日期 | 提交 | 架构 | 请求并发 | 实测最大并发 | 耗时 | 命令 |
 |---|---|---|---:|---:|---:|---|
-| 2026-08-25 | 04b73f5d | macOS ARM64 (`uname -m=arm64`) | 32 | 21 | 6,433 ms | `LUX_PERF_FILE_COUNT=60000 ./scripts/run-performance.sh` |
-| 2026-08-25 | 04b73f5d | macOS ARM64 (`uname -m=arm64`) | 64 | 33 | 10,807 ms | 同上 |
-| 2026-08-25 | 04b73f5d | macOS ARM64 (`uname -m=arm64`) | 96 | 50 | 13,601 ms | 同上 |
-| 2026-08-25 | 04b73f5d | macOS ARM64 (`uname -m=arm64`) | 128 | 55 | 17,700 ms | 同上 |
+| 2026-08-25 | 33fe9db4 | macOS ARM64 (`uname -m=arm64`) | 64 | 40 | 19,370 ms | `LUX_PERF_FILE_COUNT=60000 ./scripts/run-performance.sh` |
+| 2026-08-25 | 33fe9db4 | macOS ARM64 (`uname -m=arm64`) | 128 | 70 | 33,563 ms | 同上 |
+| 2026-08-25 | 33fe9db4 | macOS ARM64 (`uname -m=arm64`) | 192 | 82 | 40,379 ms | 同上 |
+| 2026-08-25 | 33fe9db4 | macOS ARM64 (`uname -m=arm64`) | 256 | 82 | 43,791 ms | 同上 |
 
-这组结果证明 128 路配置可被接受且全局 semaphore 没有超过硬上限；当前开发机观察值受动态背压和进程启动开销影响，
-不能据此声称目标 NAS 的实际吞吐。ffprobe 默认值为 64，4 核环境的正常目标为 64，压力升高时会降档。
+这组结果证明 256 路配置可被接受且全局 semaphore 没有超过硬上限；当前开发机观察值受动态背压和进程启动开销影响，
+不能据此声称目标 NAS 的实际吞吐。ffprobe 默认配置为 128；4/8/16 核环境的正常有效目标分别为 64/128/256，压力升高时会降档。本次 256 个源均成功完成。
 
 ## Web 首屏资源记录
 
