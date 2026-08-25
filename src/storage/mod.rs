@@ -8669,9 +8669,18 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         self.query(
-            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id,
+                    CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
+                        AS parent_identity_key,
+                    item.item_type AS item_type,
+                    CASE WHEN item.removed_at IS NULL THEN item.identity_key END
+                        AS item_identity_key,
+                    series.provider_ids_json AS series_provider_ids_json
              FROM filesystem_entries fe
              LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+             LEFT JOIN media_items item ON item.id = ms.item_id
+             LEFT JOIN media_items parent ON parent.id = item.parent_id
+             LEFT JOIN media_items series ON series.id = item.series_id
              WHERE fe.library_root_id = ? AND fe.relative_path = ?",
         )
         .bind(library_root_id)
@@ -8699,9 +8708,18 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id,
+                        CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
+                            AS parent_identity_key,
+                        item.item_type AS item_type,
+                        CASE WHEN item.removed_at IS NULL THEN item.identity_key END
+                            AS item_identity_key,
+                        series.provider_ids_json AS series_provider_ids_json
                  FROM filesystem_entries fe
                  LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                 LEFT JOIN media_items item ON item.id = ms.item_id
+                 LEFT JOIN media_items parent ON parent.id = item.parent_id
+                 LEFT JOIN media_items series ON series.id = item.series_id
                  WHERE fe.library_root_id = ? AND fe.relative_path IN ({placeholders})"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_root_id);
@@ -8733,10 +8751,19 @@ impl Database {
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         let rows = self
             .query(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id,
+                        CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
+                            AS parent_identity_key,
+                        item.item_type AS item_type,
+                        CASE WHEN item.removed_at IS NULL THEN item.identity_key END
+                            AS item_identity_key,
+                        series.provider_ids_json AS series_provider_ids_json
                  FROM filesystem_entries fe
                  JOIN library_roots lr ON lr.id = fe.library_root_id
                  LEFT JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                 LEFT JOIN media_items item ON item.id = ms.item_id
+                 LEFT JOIN media_items parent ON parent.id = item.parent_id
+                 LEFT JOIN media_items series ON series.id = item.series_id
                  WHERE lr.library_id = ? AND fe.inode = ?
                    AND NOT (fe.library_root_id = ? AND fe.relative_path = ?)
                  LIMIT 2",
@@ -16450,6 +16477,10 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
     pub(crate) item_id: Option<String>,
+    pub(crate) parent_identity_key: Option<String>,
+    pub(crate) item_type: Option<String>,
+    pub(crate) item_identity_key: Option<String>,
+    pub(crate) series_provider_ids_json: Option<String>,
 }
 
 #[derive(Debug)]
@@ -16478,6 +16509,10 @@ fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
         relative_path: row.get("relative_path"),
         fingerprint: row.get("fingerprint"),
         item_id: row.get("item_id"),
+        parent_identity_key: row.get("parent_identity_key"),
+        item_type: row.get("item_type"),
+        item_identity_key: row.get("item_identity_key"),
+        series_provider_ids_json: row.get("series_provider_ids_json"),
     }
 }
 
@@ -17185,7 +17220,10 @@ fn catalog_filter_where_clause<'a>(
     (where_clause, binds)
 }
 
-fn movie_parent_folder_identity(library_root_id: &str, relative_path: &str) -> Option<String> {
+pub(crate) fn movie_parent_folder_identity(
+    library_root_id: &str,
+    relative_path: &str,
+) -> Option<String> {
     let directory = relative_path
         .rsplit_once('/')
         .map(|(directory, _)| directory)

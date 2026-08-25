@@ -676,31 +676,35 @@ mod tests {
     #[test]
     fn probe_concurrency_uses_io_parallelism_before_backing_off() {
         assert_eq!(
-            recommended_probe_concurrency(64, 4, None, None, None, None, 128),
+            recommended_probe_concurrency(128, 4, None, None, None, None, 256),
             64
         );
         assert_eq!(
-            recommended_probe_concurrency(128, 4, None, None, None, None, 128),
+            recommended_probe_concurrency(256, 4, None, None, None, None, 256),
             64
         );
         assert_eq!(
-            recommended_probe_concurrency(128, 8, None, None, None, None, 128),
+            recommended_probe_concurrency(256, 8, None, None, None, None, 256),
             128
+        );
+        assert_eq!(
+            recommended_probe_concurrency(256, 16, None, None, None, None, 256),
+            256
         );
     }
 
     #[test]
     fn probe_concurrency_backs_off_for_cpu_memory_and_frontend_pressure() {
         assert_eq!(
-            recommended_probe_concurrency(128, 4, Some(1_000), None, None, None, 128),
+            recommended_probe_concurrency(256, 4, Some(1_000), None, None, None, 256),
             32
         );
         assert_eq!(
-            recommended_probe_concurrency(128, 4, None, None, Some(90.0), None, 128),
+            recommended_probe_concurrency(256, 4, None, None, Some(90.0), None, 256),
             32
         );
         assert_eq!(
-            recommended_probe_concurrency(128, 4, None, None, None, Some(90.0), 128),
+            recommended_probe_concurrency(256, 4, None, None, None, Some(90.0), 256),
             16
         );
     }
@@ -712,12 +716,12 @@ mod tests {
         assert_eq!(
             super::stabilize_probe_concurrency(
                 &mut state,
-                128,
-                128,
+                256,
+                256,
                 start,
                 Duration::from_secs(30),
             ),
-            128
+            256
         );
         assert_eq!(
             super::stabilize_probe_concurrency(
@@ -732,8 +736,8 @@ mod tests {
         assert_eq!(
             super::stabilize_probe_concurrency(
                 &mut state,
-                128,
-                128,
+                256,
+                256,
                 start + Duration::from_secs(2),
                 Duration::from_secs(30),
             ),
@@ -742,8 +746,8 @@ mod tests {
         assert_eq!(
             super::stabilize_probe_concurrency(
                 &mut state,
-                128,
-                128,
+                256,
+                256,
                 start + Duration::from_secs(31),
                 Duration::from_secs(30),
             ),
@@ -752,8 +756,8 @@ mod tests {
         assert_eq!(
             super::stabilize_probe_concurrency(
                 &mut state,
-                128,
-                128,
+                256,
+                256,
                 start + Duration::from_secs(62),
                 Duration::from_secs(30),
             ),
@@ -762,12 +766,22 @@ mod tests {
         assert_eq!(
             super::stabilize_probe_concurrency(
                 &mut state,
-                128,
-                128,
+                256,
+                256,
                 start + Duration::from_secs(93),
                 Duration::from_secs(30),
             ),
             128
+        );
+        assert_eq!(
+            super::stabilize_probe_concurrency(
+                &mut state,
+                256,
+                256,
+                start + Duration::from_secs(124),
+                Duration::from_secs(30),
+            ),
+            256
         );
     }
 }

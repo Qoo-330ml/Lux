@@ -45,6 +45,7 @@ use crate::{
         NewMediaSource, NewMovieFile, NewScanJobEvent, StorageError,
         StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
+        movie_parent_folder_identity,
     },
 };
 
@@ -185,7 +186,6 @@ impl LibraryScanner {
                 for path in files {
                     if let Some((entry_id, quick_report)) = self
                         .scan_movie_file_if_unchanged(
-                            &library_id_text,
                             &root.id,
                             &root_path,
                             &path,
@@ -402,7 +402,6 @@ impl LibraryScanner {
                     let quick_report = match classification {
                         MixedClassification::Movie => {
                             self.scan_movie_file_if_unchanged(
-                                &library_id_text,
                                 &root.id,
                                 &root_path,
                                 &path,
@@ -421,7 +420,6 @@ impl LibraryScanner {
                         }
                         MixedClassification::Unresolved => {
                             self.scan_unresolved_file_if_unchanged(
-                                &library_id_text,
                                 &root,
                                 &root_path,
                                 &path,
@@ -582,19 +580,13 @@ impl LibraryScanner {
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
         let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
         let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
-        let current_identity_item = if existing_entry.is_some() {
-            self.database
-                .find_media_item_by_identity(&episode_identity)
-                .await?
-        } else {
-            None
-        };
         if let Some(existing_item_id) = existing_entry
             .as_ref()
             .and_then(|entry| entry.item_id.as_deref())
-            && current_identity_item
+            && existing_entry
                 .as_ref()
-                .is_none_or(|item| item.id.as_str() != existing_item_id)
+                .and_then(|entry| entry.item_identity_key.as_deref())
+                != Some(episode_identity.as_str())
         {
             self.database
                 .repair_episode_hierarchy_identities(
@@ -608,18 +600,19 @@ impl LibraryScanner {
         let fingerprint_unchanged = existing_entry
             .as_ref()
             .is_some_and(|entry| entry.fingerprint.as_deref() == Some(fingerprint.as_slice()));
-        let episode_is_current = if fingerprint_unchanged {
-            current_identity_item.as_ref().is_some_and(|item| {
-                existing_entry
-                    .as_ref()
-                    .and_then(|entry| entry.item_id.as_deref())
-                    == Some(item.id.as_str())
-            })
-        } else {
-            false
-        };
+        let episode_is_current = fingerprint_unchanged
+            && existing_entry
+                .as_ref()
+                .and_then(|entry| entry.item_identity_key.as_deref())
+                == Some(episode_identity.as_str());
         let should_refresh_series_provider_ids = episode_is_current
             && !hierarchy.provider_ids.is_empty()
+            && existing_entry.as_ref().is_some_and(|entry| {
+                entry
+                    .series_provider_ids_json
+                    .as_deref()
+                    .is_none_or(|value| value.is_empty() || value == "{}")
+            })
             && refreshed_series
                 .as_ref()
                 .is_none_or(|series| !series.contains(&series_identity));
@@ -821,7 +814,12 @@ impl LibraryScanner {
             .await?
         {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
-                if let Some(item_id) = existing_entry.item_id.as_deref() {
+                let expected_parent_identity =
+                    movie_parent_folder_identity(&root.id, &relative_path);
+                if existing_entry.parent_identity_key.as_deref()
+                    != expected_parent_identity.as_deref()
+                    && let Some(item_id) = existing_entry.item_id.as_deref()
+                {
                     self.database
                         .repair_movie_parent_folder(
                             library_id_text,
@@ -1185,7 +1183,6 @@ impl LibraryScanner {
 
     async fn scan_movie_file_if_unchanged(
         &self,
-        library_id_text: &str,
         library_root_id: &str,
         root_path: &Path,
         path: &Path,
@@ -1226,34 +1223,14 @@ impl LibraryScanner {
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
             return Ok(None);
         }
-        if let Some(item_id) = existing_entry.item_id.as_deref() {
-            self.database
-                .repair_movie_parent_folder(
-                    library_id_text,
-                    library_root_id,
-                    &relative_path,
-                    item_id,
-                )
-                .await?;
+        let expected_parent_identity =
+            movie_parent_folder_identity(library_root_id, &relative_path);
+        if existing_entry.parent_identity_key.as_deref() != expected_parent_identity.as_deref() {
+            return Ok(None);
         }
+        // CD-part entries need the regular path to preserve the legacy merge repair.
         if has_multi_part_marker(file_name) {
-            let Some(parsed_name) = parse_movie_filename(file_name) else {
-                return Ok(None);
-            };
-            let target_item = self
-                .database
-                .find_media_item(
-                    library_id_text,
-                    &parsed_name.sort_title,
-                    parsed_name.production_year.map(i64::from),
-                )
-                .await?;
-            if target_item
-                .as_ref()
-                .is_none_or(|item| existing_entry.item_id.as_deref() != Some(item.id.as_str()))
-            {
-                return Ok(None);
-            }
+            return Ok(None);
         }
         Ok(Some((
             existing_entry.id.clone(),
@@ -1311,32 +1288,20 @@ impl LibraryScanner {
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
             return Ok(None);
         }
-        let Some(item_id) = existing_entry.item_id.as_deref() else {
-            return Ok(None);
-        };
-        let hierarchy = episode_hierarchy(&relative_path, &parsed);
-        let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
-        let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
-        let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
-        let Some(current_identity_item) = self
-            .database
-            .find_media_item_by_identity(&episode_identity)
-            .await?
-        else {
-            return Ok(None);
-        };
-        if current_identity_item.id != item_id {
+        if existing_entry.item_id.is_none() {
             return Ok(None);
         }
-        self.database
-            .repair_episode_hierarchy_identities(
-                item_id,
-                &series_identity,
-                &season_identity,
-                &episode_identity,
-            )
-            .await?;
-        if !hierarchy.provider_ids.is_empty() {
+        let hierarchy = episode_hierarchy(&relative_path, &parsed);
+        let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
+        let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
+        if existing_entry.item_identity_key.as_deref() != Some(episode_identity.as_str()) {
+            return Ok(None);
+        }
+        let series_provider_ids_missing = existing_entry
+            .series_provider_ids_json
+            .as_deref()
+            .is_none_or(|value| value.is_empty() || value == "{}");
+        if !hierarchy.provider_ids.is_empty() && series_provider_ids_missing {
             let provider_ids_json = provider_ids_json(&hierarchy.provider_ids);
             if let Some(provider_ids_json) = provider_ids_json.as_deref() {
                 self.database
@@ -1359,7 +1324,6 @@ impl LibraryScanner {
 
     async fn scan_unresolved_file_if_unchanged(
         &self,
-        library_id_text: &str,
         root: &StoredLibraryRoot,
         root_path: &Path,
         path: &Path,
@@ -1375,10 +1339,11 @@ impl LibraryScanner {
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
             return Ok(None);
         }
-        if let Some(item_id) = existing_entry.item_id.as_deref() {
-            self.database
-                .repair_movie_parent_folder(library_id_text, &root.id, &relative_path, item_id)
-                .await?;
+        let expected_parent_identity = movie_parent_folder_identity(&root.id, &relative_path);
+        if existing_entry.item_type.as_deref() == Some("MOVIE")
+            && existing_entry.parent_identity_key.as_deref() != expected_parent_identity.as_deref()
+        {
+            return Ok(None);
         }
         Ok(Some((
             existing_entry.id.clone(),
@@ -1673,7 +1638,10 @@ impl LibraryScanner {
             .database
             .find_filesystem_entry(&root.id, &relative_path)
             .await?;
+        let expected_parent_identity = movie_parent_folder_identity(&root.id, &relative_path);
         if let Some(existing_entry) = existing_entry.as_ref()
+            && existing_entry.item_type.as_deref() == Some("MOVIE")
+            && existing_entry.parent_identity_key.as_deref() != expected_parent_identity.as_deref()
             && let Some(item_id) = existing_entry.item_id.as_deref()
         {
             self.database
