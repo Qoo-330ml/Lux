@@ -141,6 +141,46 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).toContain("未提供可识别的错误码");
   });
 
+  it("filters completed-with-issues runs without querying unsupported job endpoints", async () => {
+    const unsupportedStatusError = (status?: string) => status === "COMPLETED_WITH_ISSUES"
+      ? Promise.reject(new Error("任务状态无效"))
+      : Promise.resolve({ jobs: [] });
+    vi.spyOn(api, "adminJobs").mockImplementation(unsupportedStatusError);
+    vi.spyOn(api, "adminStrmProbeJobs").mockImplementation(unsupportedStatusError);
+    vi.spyOn(api, "adminChapterDetectionJobs").mockImplementation(unsupportedStatusError);
+    vi.spyOn(api, "adminDanmakuMatchJobs").mockImplementation(unsupportedStatusError);
+    vi.spyOn(api, "adminLibraryCoverJobs").mockImplementation(unsupportedStatusError);
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({
+      jobs: [{
+        id: "metadata-job-issues",
+        status: "COMPLETED_WITH_ISSUES",
+        mode: "FILL_MISSING",
+        processedCount: 2,
+        totalCount: 2,
+        error: "ITEM_ISSUES",
+        createdAt: 1_700_000_000,
+        libraryId: "library-1",
+      }],
+    });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="运行记录状态"]')?.click());
+    act(() => document.querySelector<HTMLButtonElement>('button[data-value="COMPLETED_WITH_ISSUES"]')?.click());
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已完成，有问题"));
+    });
+    expect(container.querySelector("h1")?.textContent).not.toBe("任务数据加载失败");
+    expect(container.textContent).toContain("元数据仅补全");
+    expect(container.textContent).toContain("部分条目处理失败");
+  });
+
   it("puts the newest runtime record first when timestamps are ISO strings", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-1",

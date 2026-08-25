@@ -148,6 +148,7 @@ export function AdminOperationsPage() {
   const jobs = useQuery({
     queryKey: queryKeys.adminJobs(status),
     queryFn: () => api.adminJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
   });
   const metadataJobs = useQuery({
     queryKey: queryKeys.adminMetadataJobs(status),
@@ -156,21 +157,25 @@ export function AdminOperationsPage() {
   const strmJobs = useQuery({
     queryKey: queryKeys.adminStrmProbeJobs(status),
     queryFn: () => api.adminStrmProbeJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const chapterJobs = useQuery({
     queryKey: queryKeys.adminChapterDetectionJobs(status),
     queryFn: () => api.adminChapterDetectionJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const danmakuJobs = useQuery({
     queryKey: queryKeys.adminDanmakuMatchJobs(status),
     queryFn: () => api.adminDanmakuMatchJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const libraryCoverJobs = useQuery({
     queryKey: queryKeys.adminLibraryCoverJobs(status),
     queryFn: () => api.adminLibraryCoverJobs(status || undefined),
+    enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
@@ -253,7 +258,7 @@ export function AdminOperationsPage() {
     });
   }, [logLevel, logSearch, logs.data?.events]);
 
-  if (tasks.isPending || libraries.isPending || jobs.isPending || metadataJobs.isPending || strmJobs.isPending || chapterJobs.isPending || danmakuJobs.isPending || libraryCoverJobs.isPending || logs.isPending) {
+  if (tasks.isLoading || libraries.isLoading || jobs.isLoading || metadataJobs.isLoading || strmJobs.isLoading || chapterJobs.isLoading || danmakuJobs.isLoading || libraryCoverJobs.isLoading || logs.isLoading) {
     return <AdminOperationsState label="正在读取注册任务、运行记录与日志…" />;
   }
   if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error || logs.error) {
@@ -597,6 +602,10 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
 
 function metadataStatusFilter(status: string) {
   return status === "PENDING" ? "QUEUED" : status || undefined;
+}
+
+function isMetadataOnlyJobStatus(status: string) {
+  return status === "COMPLETED_WITH_ISSUES" || status === "DEFERRED";
 }
 
 function jobTypeForMetadataJob(job: AdminMetadataReidentifyJob) {
