@@ -16471,7 +16471,7 @@ fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
     pub(crate) relative_path: String,

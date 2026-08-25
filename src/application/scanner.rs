@@ -53,6 +53,7 @@ const FILE_BATCH_SIZE: usize = 500;
 pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 100;
 const DISCOVERY_BATCH_SIZE: usize = 16;
 const MOVIE_PREPARATION_CONCURRENCY: usize = 8;
+const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -183,16 +184,11 @@ impl LibraryScanner {
                     .await?;
                 let mut pending_new_files = Vec::with_capacity(FILE_BATCH_SIZE);
                 let mut new_paths = Vec::new();
-                for path in files {
-                    if let Some((entry_id, quick_report)) = self
-                        .scan_movie_file_if_unchanged(
-                            &root.id,
-                            &root_path,
-                            &path,
-                            &existing_entries,
-                        )
-                        .await?
-                    {
+                let quick_results = self
+                    .scan_movie_files_if_unchanged(&root.id, &root_path, &files, &existing_entries)
+                    .await?;
+                for (path, quick_result) in files.into_iter().zip(quick_results) {
+                    if let Some((entry_id, quick_report)) = quick_result {
                         seen_entry_ids.push(entry_id);
                         report.merge(quick_report);
                     } else {
@@ -401,13 +397,25 @@ impl LibraryScanner {
                     let classification = classify_mixed_file(&root_path, &path).await;
                     let quick_report = match classification {
                         MixedClassification::Movie => {
-                            self.scan_movie_file_if_unchanged(
-                                &root.id,
-                                &root_path,
-                                &path,
-                                &existing_entries,
-                            )
-                            .await?
+                            let relative_path = path
+                                .strip_prefix(&root_path)
+                                .map_err(|error| {
+                                    ScannerError::InvalidRelativePath(error.to_string())
+                                })?
+                                .to_str()
+                                .ok_or(ScannerError::NonUtf8Path)?;
+                            match existing_entries.get(relative_path) {
+                                Some(existing_entry) => {
+                                    self.scan_movie_file_if_unchanged(
+                                        &root.id,
+                                        &root_path,
+                                        &path,
+                                        existing_entry,
+                                    )
+                                    .await?
+                                }
+                                None => None,
+                            }
                         }
                         MixedClassification::Episode => {
                             self.scan_episode_file_if_unchanged(
@@ -1186,7 +1194,7 @@ impl LibraryScanner {
         library_root_id: &str,
         root_path: &Path,
         path: &Path,
-        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+        existing_entry: &StoredFilesystemEntry,
     ) -> Result<Option<(String, ScanReport)>, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
@@ -1200,9 +1208,6 @@ impl LibraryScanner {
             .to_str()
             .ok_or(ScannerError::NonUtf8Path)?
             .to_owned();
-        let Some(existing_entry) = existing_entries.get(&relative_path) else {
-            return Ok(None);
-        };
         let metadata = fs::metadata(path)
             .await
             .map_err(|source| ScannerError::Io {
@@ -1240,6 +1245,49 @@ impl LibraryScanner {
                 ..ScanReport::default()
             },
         )))
+    }
+
+    async fn scan_movie_files_if_unchanged(
+        &self,
+        library_root_id: &str,
+        root_path: &Path,
+        paths: &[PathBuf],
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+    ) -> Result<Vec<Option<(String, ScanReport)>>, ScannerError> {
+        let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
+        let mut tasks: JoinSet<MovieFingerprintTask> = JoinSet::new();
+        for (index, path) in paths.iter().enumerate() {
+            let relative_path = path
+                .strip_prefix(root_path)
+                .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                .to_str()
+                .ok_or(ScannerError::NonUtf8Path)?;
+            let Some(existing_entry) = existing_entries.get(relative_path).cloned() else {
+                continue;
+            };
+            while tasks.len() >= FINGERPRINT_CHECK_CONCURRENCY {
+                collect_movie_fingerprint_task(&mut tasks, &mut results).await?;
+            }
+            let scanner = self.clone();
+            let root_path = root_path.to_owned();
+            let path = path.clone();
+            let library_root_id = library_root_id.to_owned();
+            tasks.spawn(async move {
+                let result = scanner
+                    .scan_movie_file_if_unchanged(
+                        &library_root_id,
+                        &root_path,
+                        &path,
+                        &existing_entry,
+                    )
+                    .await?;
+                Ok((index, result))
+            });
+        }
+        while !tasks.is_empty() {
+            collect_movie_fingerprint_task(&mut tasks, &mut results).await?;
+        }
+        Ok(results)
     }
 
     async fn scan_file_if_fingerprint_unchanged(
@@ -4188,6 +4236,32 @@ type MoviePreparationOutput = (
     Option<NewMovieFile>,
 );
 type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
+type MovieFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
+
+async fn collect_movie_fingerprint_task(
+    tasks: &mut JoinSet<MovieFingerprintTask>,
+    results: &mut [Option<(String, ScanReport)>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-fingerprint-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<movie-fingerprint-task>"),
+                source: std::io::Error::other("movie fingerprint task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
+    Ok(())
+}
 
 async fn join_movie_preparation(
     tasks: &mut JoinSet<MoviePreparationTask>,
