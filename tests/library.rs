@@ -94,12 +94,12 @@ async fn new_libraries_enable_realtime_indexing_by_default()
         .await?;
 
     assert!(library.realtime_watch_enabled);
-    assert_eq!(library.probe_concurrency, 128);
+    assert_eq!(library.probe_concurrency, 256);
     Ok(())
 }
 
 #[tokio::test]
-async fn library_probe_concurrency_accepts_256_without_raising_scan_limit()
+async fn library_probe_concurrency_accepts_512_without_raising_scan_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -117,13 +117,13 @@ async fn library_probe_concurrency_accepts_256_without_raising_scan_limit()
             library.id,
             LibrarySettingsPatch {
                 scan_concurrency: Some(64),
-                probe_concurrency: Some(256),
+                probe_concurrency: Some(512),
                 ..Default::default()
             },
         )
         .await?;
     assert_eq!(updated.library.scan_concurrency, 64);
-    assert_eq!(updated.library.probe_concurrency, 256);
+    assert_eq!(updated.library.probe_concurrency, 512);
 
     let error = service
         .update_settings(
@@ -135,6 +135,18 @@ async fn library_probe_concurrency_accepts_256_without_raising_scan_limit()
         )
         .await
         .expect_err("scan concurrency must remain bounded separately");
+    assert!(matches!(error, LibraryServiceError::InvalidConcurrency));
+
+    let error = service
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                probe_concurrency: Some(513),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("probe concurrency above 512 must be rejected");
     assert!(matches!(error, LibraryServiceError::InvalidConcurrency));
     Ok(())
 }

@@ -222,7 +222,7 @@ async fn lux_197_ffprobe_concurrency_benchmark() -> Result<(), Box<dyn std::erro
     let media_root = temp_dir.path().join("Movies");
     let media_dir = media_root.join("Benchmark Movie (2024)");
     tokio::fs::create_dir_all(&media_dir).await?;
-    for index in 0..256 {
+    for index in 0..512 {
         tokio::fs::write(
             media_dir.join(format!("Benchmark.Movie.{index:03}.2024.mkv")),
             b"LUX FFPROBE BENCHMARK FIXTURE\n",
@@ -265,7 +265,7 @@ async fn lux_197_ffprobe_concurrency_benchmark() -> Result<(), Box<dyn std::erro
         .ok_or("missing benchmark parent")?
         .join("state");
     let mut results = Vec::new();
-    for requested in [64_i64, 128, 192, 256] {
+    for requested in [128_i64, 256, 384, 512] {
         let _ = fs::remove_dir_all(&state_dir);
         sqlx::query("UPDATE libraries SET probe_concurrency = ? WHERE id = ?")
             .bind(requested)
@@ -293,7 +293,7 @@ async fn lux_197_ffprobe_concurrency_benchmark() -> Result<(), Box<dyn std::erro
             .await?
             .trim()
             .parse::<usize>()?;
-        assert_eq!(report.ready, 256);
+        assert_eq!(report.ready, 512);
         assert!(maximum > 0 && maximum <= requested as usize);
         results.push(serde_json::json!({
             "requested": requested,
@@ -305,7 +305,7 @@ async fn lux_197_ffprobe_concurrency_benchmark() -> Result<(), Box<dyn std::erro
         "LUX-197 FFPROBE RESULT {}",
         serde_json::to_string(&serde_json::json!({
             "architecture": std::env::consts::ARCH,
-            "fileCount": 256,
+            "fileCount": 512,
             "levels": results,
         }))?
     );
