@@ -94,6 +94,7 @@ async fn new_libraries_enable_realtime_indexing_by_default()
         .await?;
 
     assert!(library.realtime_watch_enabled);
+    assert_eq!(library.probe_concurrency, 32);
     Ok(())
 }
 

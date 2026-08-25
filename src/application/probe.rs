@@ -24,8 +24,8 @@ const MAX_OUTPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_ERROR_BYTES: usize = 8 * 1024;
 const MAX_XML_EVENTS: usize = 20_000;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
-const DEFAULT_PROBE_CONCURRENCY: usize = 16;
-const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 32;
+const DEFAULT_PROBE_CONCURRENCY: usize = 32;
+const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 64;
 static GLOBAL_PROBE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]

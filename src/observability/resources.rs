@@ -507,7 +507,7 @@ pub fn recommended_probe_concurrency(
         .max(1);
     // ffprobe spends a meaningful amount of time waiting on media storage, so
     // it gets an I/O-oriented cap instead of reserving one worker per CPU.
-    let io_cap = container_parallelism.saturating_mul(4).clamp(1, hard_cap);
+    let io_cap = container_parallelism.saturating_mul(8).clamp(1, hard_cap);
     let base = configured.min(io_cap);
     let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
         || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
@@ -622,32 +622,32 @@ mod tests {
     #[test]
     fn probe_concurrency_uses_io_parallelism_before_backing_off() {
         assert_eq!(
-            recommended_probe_concurrency(16, 4, None, None, None, None, 32),
-            16
+            recommended_probe_concurrency(32, 4, None, None, None, None, 64),
+            32
         );
         assert_eq!(
-            recommended_probe_concurrency(64, 4, None, None, None, None, 32),
-            16
+            recommended_probe_concurrency(64, 4, None, None, None, None, 64),
+            32
         );
         assert_eq!(
-            recommended_probe_concurrency(32, 4, None, Some(2.0), None, None, 32),
-            8
+            recommended_probe_concurrency(64, 4, None, Some(2.0), None, None, 64),
+            16
         );
     }
 
     #[test]
     fn probe_concurrency_backs_off_for_cpu_memory_and_frontend_pressure() {
         assert_eq!(
-            recommended_probe_concurrency(32, 4, Some(1_000), None, None, None, 32),
-            8
+            recommended_probe_concurrency(64, 4, Some(1_000), None, None, None, 64),
+            16
         );
         assert_eq!(
-            recommended_probe_concurrency(32, 4, None, None, Some(90.0), None, 32),
-            8
+            recommended_probe_concurrency(64, 4, None, None, Some(90.0), None, 64),
+            16
         );
         assert_eq!(
-            recommended_probe_concurrency(32, 4, None, None, None, Some(90.0), 32),
-            4
+            recommended_probe_concurrency(64, 4, None, None, None, Some(90.0), 64),
+            8
         );
     }
 }
