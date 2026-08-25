@@ -70,7 +70,7 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 
 ### Docker Hub 镜像
 
-`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送或 `v*.*.*` 标签推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。主分支构建会更新 `test` 标签，不会自动覆盖 `latest`。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
+`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送或 `v*.*.*` 标签推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。每个架构先构建并发布固定版本的 `lux-runtime:trixie-ffmpeg-v2-<arch>`，应用镜像再引用该 runtime 层；runtime 只有在 Debian/FFmpeg 依赖变化并提升版本时才应替换。主分支构建会更新 `test` 标签，不会自动覆盖 `latest`。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`，runtime 镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux-runtime`。
 
 确认测试镜像可发布后，在 GitHub Actions 手动运行 `.github/workflows/promote-dockerhub.yml`，它会把 Docker Hub 上的 `test` 多架构 manifest 晋级为 `latest`。语义化版本标签仍由构建 workflow 单独发布，部署时应优先使用版本标签或 digest。
 
@@ -137,10 +137,16 @@ http://127.0.0.1:8097
 
 ## 升级与回滚边界
 
-发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识：
+发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识。应用镜像的 runtime 依赖层来自固定的 `lux-runtime:trixie-ffmpeg-v2`；普通应用更新只会产生新的 `luxd` 和 Web 层，Docker 会按 layer digest 复用 runtime 层：
 
 ```bash
-docker build --build-arg LUX_VERSION=0.2.7 -t lux:0.2.7 .
+docker build --platform linux/arm64 \
+  -f runtime/Dockerfile \
+  -t lux-runtime:trixie-ffmpeg-v2 .
+docker build --platform linux/arm64 \
+  --build-arg LUX_RUNTIME_IMAGE=lux-runtime:trixie-ffmpeg-v2 \
+  --build-arg LUX_VERSION=0.2.7 \
+  -t lux:0.2.7 .
 docker compose up -d
 ```
 
@@ -149,7 +155,13 @@ docker compose up -d
 插件兼容性：运行时镜像使用 Debian Trixie，以满足当前官方 Linux 插件包的 glibc 要求。只替换 `/config/plugins` 中的插件包不会升级容器运行时；升级到包含此修复的 Lux 镜像后，应重新创建容器并确认插件进程能够启动：
 
 ```bash
-docker build --build-arg LUX_VERSION=0.2.7-plugin-runtime -t pdzhou/lux:0.2.7-plugin-runtime .
+docker build --platform linux/arm64 \
+  -f runtime/Dockerfile \
+  -t lux-runtime:trixie-ffmpeg-v2 .
+docker build --platform linux/arm64 \
+  --build-arg LUX_RUNTIME_IMAGE=lux-runtime:trixie-ffmpeg-v2 \
+  --build-arg LUX_VERSION=0.2.7-plugin-runtime \
+  -t pdzhou/lux:0.2.7-plugin-runtime .
 # 将 compose.yaml 中 lux.image 临时改为 pdzhou/lux:0.2.7-plugin-runtime
 docker compose up -d --force-recreate lux
 docker exec lux sh -c 'uname -m; command -v ffprobe; command -v ffmpeg'

@@ -7,6 +7,7 @@
 - [x] compose 提供 `/config` 宿主机持久化目录、`/media` 媒体挂载、端口和 TMDb 配置入口。
 - [x] compose 媒体挂载使用读写模式，满足 NFO/图片回写要求。
 - [x] Docker 启动时自动创建 `/config/plugins`，复制镜像内置 TMDb 插件，并自动标记为已安装、已启用。
+- [x] 将 Debian Trixie、FFmpeg、curl 和 CA 证书拆为固定 digest 的 `lux-runtime:trixie-ffmpeg-v2` 基础镜像；应用镜像只复制 `luxd`、Web 静态资源和入口脚本，普通应用更新可复用 runtime 层。
 
 ## 已验证
 
@@ -18,6 +19,7 @@
 - [x] 当前 ARM64 镜像受控媒体挂载不可访问/恢复演练：`scripts/mount-loss-smoke.sh` 验证 root 不可用时的扫描隔离、已有条目保留以及恢复后的重新探测；镜像 revision `fc677a5`。
 - [x] 当前 ARM64 本机 Nginx HTTPS 反代补充烟测：`scripts/proxy-smoke.sh` 验证自签名 TLS、转发公网地址和 Range 响应头保留；镜像 revision `fc677a5`；真实 Tailscale/HTTPS 实机验证仍保持待办。
 - [x] 当前 ARM64 容器扫描后 ffprobe/PlaybackInfo 烟测：`scripts/probe-smoke.sh` 验证有效 MP4 扫描后自动进入 `READY`，返回 `RunTimeTicks` 和 2 条媒体流，并记录 `PROBE_COMPLETED`；镜像 revision `fc677a5`；真实 NAS 长期运行仍保持待办。
+- [x] 本机 ARM64 验证 runtime 分层：`lux-runtime:trixie-ffmpeg-v2` 提供 `ffmpeg`/`ffprobe` 且不再包含未使用的 `fonts-noto-cjk`；应用镜像 history 中 runtime 依赖层约 417 MiB、`luxd` 层约 51 MiB、Web 层约 2.45 MiB，容器 `/health/live` 通过。
 
 ## 未完成的发布门
 
