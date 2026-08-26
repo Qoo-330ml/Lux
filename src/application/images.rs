@@ -2,6 +2,7 @@ use std::{
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -38,6 +39,14 @@ const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
 const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
 const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
 const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
+
+static IMAGE_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn global_image_permits() -> Arc<Semaphore> {
+    IMAGE_GLOBAL_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
+        .clone()
+}
 
 pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
     let path = path.to_owned();
@@ -89,7 +98,7 @@ pub struct ImageWriteService {
     http: Client,
     max_bytes: u64,
     config_dir: Option<PathBuf>,
-    permits: std::sync::Arc<Semaphore>,
+    permits: Arc<Semaphore>,
     resources: Option<ResourceMetrics>,
 }
 
@@ -151,12 +160,12 @@ impl ImageWriteService {
         proxy_url: Option<String>,
         config_dir: Option<PathBuf>,
     ) -> Result<Self, ImageWriteError> {
-        Self::with_proxy_config_and_concurrency(
+        Self::with_proxy_config_and_permits(
             database,
             config,
             proxy_url,
             config_dir,
-            IMAGE_GLOBAL_CONCURRENCY,
+            global_image_permits(),
         )
     }
 
@@ -167,14 +176,30 @@ impl ImageWriteService {
         config_dir: Option<PathBuf>,
         concurrency: usize,
     ) -> Result<Self, ImageWriteError> {
-        if config.max_bytes == 0 {
-            return Err(ImageWriteError::InvalidConfiguration(
-                "image maximum size must be positive".to_owned(),
-            ));
-        }
         if concurrency == 0 {
             return Err(ImageWriteError::InvalidConfiguration(
                 "image concurrency must be positive".to_owned(),
+            ));
+        }
+        Self::with_proxy_config_and_permits(
+            database,
+            config,
+            proxy_url,
+            config_dir,
+            Arc::new(Semaphore::new(concurrency)),
+        )
+    }
+
+    fn with_proxy_config_and_permits(
+        database: Database,
+        config: ImageDownloadConfig,
+        proxy_url: Option<String>,
+        config_dir: Option<PathBuf>,
+        permits: Arc<Semaphore>,
+    ) -> Result<Self, ImageWriteError> {
+        if config.max_bytes == 0 {
+            return Err(ImageWriteError::InvalidConfiguration(
+                "image maximum size must be positive".to_owned(),
             ));
         }
         let http = client_builder_from_env_or(proxy_url.as_deref())
@@ -187,7 +212,7 @@ impl ImageWriteService {
             http,
             max_bytes: config.max_bytes,
             config_dir,
-            permits: std::sync::Arc::new(Semaphore::new(concurrency)),
+            permits,
             resources: None,
         })
     }
@@ -1773,8 +1798,9 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, image_download_retry_delay,
-        is_allowed_scraper_image_url, retryable_image_status,
+        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY,
+        global_image_permits, image_download_retry_delay, is_allowed_scraper_image_url,
+        retryable_image_status,
     };
 
     #[test]
@@ -1791,6 +1817,14 @@ mod tests {
         assert_eq!(image_download_retry_delay(1), IMAGE_RETRY_BASE_DELAY);
         assert_eq!(image_download_retry_delay(2), IMAGE_RETRY_BASE_DELAY * 2);
         assert_eq!(image_download_retry_delay(99), IMAGE_RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn default_image_services_share_the_process_quota() {
+        let first = global_image_permits();
+        let second = global_image_permits();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(first.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
     }
 
     #[test]
