@@ -225,7 +225,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
+        format!("/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}")
     );
 
     let playback = client
@@ -243,7 +243,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
     assert_eq!(
         body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{remote_item_id}/{remote_source_id}/stream")
+        format!("/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}")
     );
 
     let path_playback = client
@@ -260,7 +260,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(path_body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(
         path_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{path_item_id}/{path_source_id}/stream")
+        format!("/Videos/{path_item_id}/stream?MediaSourceId={path_source_id}")
     );
 
     let no_redirect_client = reqwest::Client::builder()
@@ -374,6 +374,31 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(
         source_id_body["Items"][0]["MediaSources"][0]["Path"],
         remote_target
+    );
+    let source_id_detail = no_redirect_client
+        .get(format!("http://{address}/Items/{remote_source_id}"))
+        .query(&[("Fields", "MediaSources"), ("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(source_id_detail.status(), reqwest::StatusCode::OK);
+    let source_id_detail_body = source_id_detail.json::<Value>().await?;
+    assert_eq!(source_id_detail_body["Id"], remote_item_id);
+    assert_eq!(
+        source_id_detail_body["MediaSources"][0]["Id"],
+        remote_source_id
+    );
+    assert_eq!(
+        source_id_detail_body["MediaSources"][0]["Path"],
+        remote_target
+    );
+    let unknown_source_detail = no_redirect_client
+        .get(format!("http://{address}/emby/Items/unknown-source"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(
+        unknown_source_detail.status(),
+        reqwest::StatusCode::NOT_FOUND
     );
     tokio::fs::write(
         root.join("Path.Movie.2026.strm"),

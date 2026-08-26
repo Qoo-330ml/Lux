@@ -927,6 +927,21 @@ impl CatalogService {
         Ok(Some(item))
     }
 
+    pub async fn find_item_by_media_source_id(
+        &self,
+        principal: AccessPrincipal,
+        media_source_id: &str,
+    ) -> Result<Option<CatalogItem>, CatalogError> {
+        let Some(item_id) = self
+            .database
+            .find_item_id_by_media_source_id(media_source_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        self.find_item(principal, &item_id).await
+    }
+
     pub async fn populate_chapters(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
         let source_ids = items
             .iter()

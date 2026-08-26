@@ -1416,6 +1416,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 
 - UserId、ParentId、Ids。
 - `GET /Items` 的 `Ids` 严格匹配条目 ID；为兼容使用媒体源 ID 查询路径的 Emby 代理，也可匹配 `MediaSourceId` 并返回其所属条目。完全未知的 ID 返回空列表，不得回退为未过滤目录页。
+- `GET /Items/{Id}` 的 `Id` 正常匹配媒体条目；为兼容使用媒体源 ID 获取详情的 Emby 代理，也可将 `MediaSourceId` 解析到所属条目并返回该条目的 `MediaSources`。完全未知的 ID 返回 404，不得返回其他条目。
 - IncludeItemTypes、ExcludeItemTypes。
 - Recursive。
 - StartIndex、Limit。
@@ -1947,6 +1948,7 @@ services:
 | LUX-195 | src/application/scraper.rs、src/application/tmdb_plugin.rs、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/images.rs、src/application/collections.rs、tests/、docs/ |
 | LUX-196 | migrations/、migrations-postgres/、src/library.rs、src/storage/mod.rs、src/application/libraries.rs、src/application/scraper.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/metadata.rs、src/api/mod.rs、web/src/features/admin/、tests/、web/tests/、docs/ |
 | LUX-198 | runtime/Dockerfile、Dockerfile、docker-bake.hcl、src/application/playback/、src/api/lux/、src/storage/、migrations/、migrations-postgres/、web/src/features/player/、web/src/lib/api/、tests/、web/tests/、docs/ |
+| LUX-199 | src/application/catalog.rs、src/storage/mod.rs、src/api/mod.rs、tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4593,6 +4595,38 @@ Web API：
 `docs/LUX-198-PLAN.md` 和 `docs/COMPATIBILITY.md`。
 
 依赖：LUX-184、LUX-185、LUX-189。
+
+#### LUX-199：Emby 媒体源代理兼容
+
+范围：补齐第三方 Emby 反向代理读取媒体源所依赖的标准请求形状，使路径型 `.strm` 可以由外部代理（例如
+Redia）根据 `MediaSources[].Path` 执行自己的路径映射并返回云盘直链。Lux 只提供 Emby 元数据和受保护的视频入口，
+不识别具体云盘、不执行路径映射、不请求 115，也不代理媒体字节。
+
+兼容合同：
+
+- `MediaSource.DirectStreamUrl` 使用标准 Emby 形状 `/Videos/{ItemId}/stream[.Container]?MediaSourceId={MediaSourceId}`；
+  原有 `/Videos/{ItemId}/{MediaSourceId}/stream[.Container]` 入口继续接受，以免破坏已有客户端。
+- `GET /Items/{MediaSourceId}` 和 `/emby/Items/{MediaSourceId}` 在媒体源属于当前用户可见条目时，返回该条目详情；未知
+  媒体源仍返回 404。
+- 路径型 `.strm` 的 `MediaSources[].Path` 保留原始路径；其 `Protocol=File`、`IsRemote=false` 仍表示 Lux 自身按本地文件
+  语义处理，外部代理是否接管由外部代理决定，不通过伪造远程标志触发。
+- Emby 查询参数和请求头中的 API token 继续兼容；播放 URL 可由客户端编码为路径中的 `%3F` 形式时，视频入口仍解析其中的
+  `MediaSourceId` 和 token。
+
+验收：
+
+- [x] PlaybackInfo 和 Emby 条目详情给出可由代理关联的 ItemId、MediaSourceId 和原始 `MediaSources[].Path`。
+- [x] 标准查询参数播放 URL 与历史媒体源路径 URL 都能播放本地文件或对 URL 型 `.strm` 返回有限重定向。
+- [x] `GET /Items/{MediaSourceId}` 仅返回所属且可见条目；未知 ID、无权限条目不会泄露其他条目。
+- [x] 路径型 `.strm` 不启动外部请求、不改变 `Protocol`/`IsRemote` 语义、不产生 Lux 侧代理媒体流量。
+- [ ] 通过专项 Rust 测试、格式化、Clippy，并记录本机 ARM 架构；真实 Redia/VidHub 复测结果写入兼容性记录。
+
+明确不做：
+
+- 不实现 Redia 或其他第三方工具的路径映射、115 API、直链缓存或媒体字节代理。
+- 不把路径型 `.strm` 改报为 `Protocol=Http` 或 `IsRemote=true`，不改变 Harbor 的本地直读行为。
+
+依赖：LUX-159、LUX-161、LUX-198。
 
 ## 26. 风险与缓解
 

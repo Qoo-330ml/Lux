@@ -132,8 +132,18 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     );
     assert_eq!(
         playback_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{item_id}/{source_id}/stream.mkv")
+        format!("/Videos/{item_id}/stream.mkv?MediaSourceId={source_id}")
     );
+    let standard_stream = client
+        .get(format!("{base_url}/Videos/{item_id}/stream.mkv"))
+        .query(&[
+            ("MediaSourceId", source_id.as_str()),
+            ("api_key", token.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(standard_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(standard_stream.bytes().await?.as_ref(), b"0123456789");
     let selected_playback = client
         .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
         .query(&[

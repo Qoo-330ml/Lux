@@ -4127,8 +4127,25 @@ async fn emby_item_response(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match catalog.find_item(principal, item_id).await {
-        Ok(Some(mut item)) => {
+    let catalog_item = match catalog.find_item(principal, item_id).await {
+        Ok(Some(item)) => Some(item),
+        Ok(None) => match catalog
+            .find_item_by_media_source_id(principal, item_id)
+            .await
+        {
+            Ok(item) => item,
+            Err(CatalogError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => None,
+        },
+        Err(CatalogError::Storage(_)) => {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => None,
+    };
+    match catalog_item {
+        Some(mut item) => {
             let Some(database) = state.database.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
@@ -4141,7 +4158,7 @@ async fn emby_item_response(
             }
             let nfo = read_local_nfo_details(state, &item.id).await;
             let user_id = principal.user_id.to_string();
-            let user_state = match database.find_user_item_state(&user_id, item_id).await {
+            let user_state = match database.find_user_item_state(&user_id, &item.id).await {
                 Ok(state) => state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
@@ -4184,7 +4201,7 @@ async fn emby_item_response(
             }
             Json(item_json).into_response()
         }
-        Ok(None) => {
+        None => {
             let Some(access) = state.access.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
@@ -4208,10 +4225,6 @@ async fn emby_item_response(
                 Err(PeopleError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
-        }
-        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-            unreachable!("inaccessible item is returned as not found")
         }
     }
 }
@@ -7057,7 +7070,7 @@ fn emby_media_source_json_with_resolver_and_chapters(
         || is_resolver_target
     {
         Some(format!(
-            "/Videos/{item_id}/{}/stream{stream_suffix}",
+            "/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={}",
             source.id
         ))
     } else {
@@ -20884,7 +20897,7 @@ mod tests {
         assert_eq!(body["SupportsDirectStream"], true);
         assert_eq!(
             body["DirectStreamUrl"],
-            "/Videos/item-1/source-1/stream.mkv"
+            "/Videos/item-1/stream.mkv?MediaSourceId=source-1"
         );
         assert_eq!(body["DefaultAudioStreamIndex"], -1);
         assert!(body.get("Chapters").is_none());
@@ -21041,7 +21054,7 @@ mod tests {
         assert_eq!(body["SupportsDirectPlay"], true);
         assert_eq!(
             body["DirectStreamUrl"],
-            "/Videos/item-1/source-1/stream.mkv"
+            "/Videos/item-1/stream.mkv?MediaSourceId=source-1"
         );
         assert_eq!(body["Path"], "/cloud/library/movie.mp4");
     }

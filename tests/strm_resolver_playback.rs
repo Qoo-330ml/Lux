@@ -123,7 +123,7 @@ fi
     let playback_body = playback.json::<Value>().await?;
     assert_eq!(
         playback_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{item_id}/{source_id}/stream")
+        format!("/Videos/{item_id}/stream?MediaSourceId={source_id}")
     );
     assert_eq!(playback_body["MediaSources"][0]["Protocol"], "Http");
     assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
