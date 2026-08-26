@@ -317,11 +317,25 @@ impl HlsManager {
 async fn stop_process(process: Arc<HlsProcess>) {
     let mut child = process.child.lock().await;
     if let Some(mut child) = child.take() {
+        #[cfg(unix)]
+        if let Some(pid) = child.id() {
+            kill_process_group(pid);
+        }
         let _ = child.kill().await;
         let _ = child.wait().await;
     }
     drop(child);
     let _ = fs::remove_dir_all(&process.directory).await;
+}
+
+#[cfg(unix)]
+fn kill_process_group(pid: u32) {
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return;
+    };
+    // FFmpeg is started in its own process group so helper processes cannot
+    // outlive a stopped Web playback session.
+    let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
 }
 
 fn ffmpeg_executable() -> String {
@@ -554,6 +568,45 @@ mod tests {
         assert!(
             !PathBuf::from(temp_dir.path())
                 .join("config/web-playback/session-1")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_stops_the_entire_process_group() {
+        use std::{os::unix::fs::PermissionsExt, path::PathBuf};
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let marker = temp_dir.path().join("child-marker");
+        let marker_literal = marker.to_string_lossy().replace('\'', "'\\''");
+        let script = temp_dir.path().join("fake-ffmpeg-process-group");
+        let script_body = format!(
+            "#!/bin/sh\nset -eu\nmanifest=\"\"\nsegment=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -hls_segment_filename) segment=\"$2\"; shift 2 ;;\n    *.m3u8) manifest=\"$1\"; shift ;;\n    *) shift ;;\n  esac\ndone\ndirectory=$(dirname \"$manifest\")\nmkdir -p \"$directory\"\nprintf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' > \"$manifest\"\nprintf init > \"$directory/init.mp4\"\nprintf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"\n(sleep 0.5; printf child > '{marker_literal}') &\nwhile :; do sleep 1; done\n"
+        );
+        tokio::fs::write(&script, script_body).await.unwrap();
+        let mut permissions = tokio::fs::metadata(&script).await.unwrap().permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&script, permissions)
+            .await
+            .unwrap();
+        let manager = super::HlsManager::new_with_executable(
+            temp_dir.path().join("config"),
+            script.to_string_lossy().into_owned(),
+        );
+
+        manager
+            .start("process-group", ServerTier::Remux, Path::new("input.mkv"))
+            .await
+            .unwrap();
+        manager.wait_for_manifest("process-group").await.unwrap();
+        manager.stop("process-group").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        assert!(!marker.exists());
+        assert!(
+            !PathBuf::from(temp_dir.path())
+                .join("config/web-playback/process-group")
                 .exists()
         );
     }
