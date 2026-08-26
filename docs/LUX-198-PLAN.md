@@ -21,7 +21,6 @@
 - `docs/LUX-198-PLAN.md`
 - `runtime/Dockerfile`
 - `Dockerfile`
-- `docker-bake.hcl`
 
 本切片不改变 Rust/Web 行为。运行时使用 GitHub Release 固定资产：
 
