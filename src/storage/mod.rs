@@ -186,6 +186,20 @@ impl Database {
         }
     }
 
+    async fn begin_metadata_write_transaction(
+        &self,
+    ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        let transaction = if self.backend == DatabaseBackend::Sqlite {
+            self.pool.begin_with("BEGIN IMMEDIATE").await
+        } else {
+            self.pool.begin().await
+        };
+        transaction.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub async fn test_configuration(
         configuration: &DatabaseConfiguration,
     ) -> Result<(), StorageError> {
@@ -1684,15 +1698,9 @@ impl Database {
         credits: &[NewPersonCredit],
         source_fingerprint: Option<&str>,
     ) -> Result<(), StorageError> {
+        let _metadata_write_guard = self.acquire_metadata_write_lock().await;
         let _write_guard = self.person_credits_write_lock.lock().await;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query("DELETE FROM person_credits WHERE item_id = ?")
             .bind(item_id)
             .execute(&mut *transaction)
@@ -1811,14 +1819,9 @@ impl Database {
     }
 
     pub(crate) async fn clear_person_credits(&self, item_id: &str) -> Result<u64, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let _metadata_write_guard = self.acquire_metadata_write_lock().await;
+        let _write_guard = self.person_credits_write_lock.lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let result = self
             .query("DELETE FROM person_credits WHERE item_id = ?")
             .bind(item_id)
@@ -7715,14 +7718,8 @@ impl Database {
         item_ids: &[String],
         mode: &str,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "INSERT INTO metadata_reidentify_jobs (
                 id, status, total_count, mode, library_id, job_scope
@@ -7789,6 +7786,7 @@ impl Database {
         item_ids: &[String],
         mode: &str,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
         self.query(
             "INSERT INTO metadata_reidentify_jobs (
                 id, status, total_count, mode, library_id, job_scope
@@ -7806,14 +7804,7 @@ impl Database {
         })?;
 
         for chunk in item_ids.chunks(500) {
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            let mut transaction = self.begin_metadata_write_transaction().await?;
             for item_id in chunk {
                 self.query(
                     "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
@@ -7995,20 +7986,30 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE metadata_reidentify_jobs
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE metadata_reidentify_jobs
              SET status = 'RUNNING', started_at = COALESCE(started_at, unixepoch()),
                  updated_at = unixepoch()
              WHERE id = ? AND status = 'QUEUED' AND cancel_requested = 0",
-        )
-        .bind(job_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn next_metadata_reidentify_item(
@@ -8053,8 +8054,11 @@ impl Database {
         job_id: &str,
         item_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE metadata_reidentify_job_items
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE metadata_reidentify_job_items
              SET status = 'RUNNING', updated_at = unixepoch()
              WHERE job_id = ? AND item_id = ? AND status = 'PENDING'
                AND EXISTS (
@@ -8062,17 +8066,24 @@ impl Database {
                    WHERE id = ? AND status IN ('QUEUED', 'RUNNING')
                      AND cancel_requested = 0
                )",
-        )
-        .bind(job_id)
-        .bind(item_id)
-        .bind(job_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(job_id)
+            .bind(item_id)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn finish_metadata_reidentify_item(
@@ -8083,14 +8094,8 @@ impl Database {
         candidate_count: i64,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE metadata_reidentify_job_items
              SET status = ?, candidate_count = ?, error = ?, updated_at = unixepoch()
@@ -8133,14 +8138,8 @@ impl Database {
         job_id: &str,
         error: &str,
     ) -> Result<i64, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let result = self
             .query(
                 "UPDATE metadata_reidentify_job_items
@@ -8185,19 +8184,29 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<u64, StorageError> {
-        self.query(
-            "UPDATE metadata_reidentify_job_items
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE metadata_reidentify_job_items
              SET status = 'PENDING', error = NULL, updated_at = unixepoch()
              WHERE job_id = ? AND status = 'RUNNING'",
-        )
-        .bind(job_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
     }
 
     pub(crate) async fn finish_metadata_reidentify_job(
@@ -8206,6 +8215,8 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
@@ -8216,13 +8227,20 @@ impl Database {
         .bind(status)
         .bind(error)
         .bind(job_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn metadata_reidentify_job_cancel_requested(
@@ -8244,33 +8262,37 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE metadata_reidentify_jobs
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE metadata_reidentify_jobs
              SET cancel_requested = 1, updated_at = unixepoch()
              WHERE id = ? AND status IN ('QUEUED', 'RUNNING')",
-        )
-        .bind(job_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn retry_metadata_reidentify_job(
         &self,
         job_id: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let result = self
             .query(
                 "UPDATE metadata_reidentify_jobs
@@ -10982,6 +11004,7 @@ impl Database {
         candidate: NewMetadataCandidate<'_>,
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "INSERT INTO metadata_candidates (
                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
@@ -11012,13 +11035,20 @@ impl Database {
         .bind(candidate.candidate_json)
         .bind(candidate.score)
         .bind(candidate.expires_at)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_metadata_capability_attempts(
@@ -11089,14 +11119,7 @@ impl Database {
             return Ok(());
         }
         let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         for result in results {
             let status = if result.has_data {
                 "AVAILABLE"
@@ -11150,6 +11173,7 @@ impl Database {
         now: i64,
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let previous_attempt_count = self
             .query_scalar::<i64>(
                 "SELECT attempt_count
@@ -11160,7 +11184,7 @@ impl Database {
             .bind(provider)
             .bind(provider_id)
             .bind(capability)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -11192,13 +11216,19 @@ impl Database {
         .bind(now)
         .bind(next_retry_at)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_pending_metadata_candidates(
@@ -11364,18 +11394,11 @@ impl Database {
         update: SelectedMetadataUpdate<'_>,
     ) -> Result<bool, StorageError> {
         let sort_title = update.title.to_lowercase();
+        let _write_guard = self.acquire_metadata_write_lock().await;
         // SQLite WAL can reject a deferred read-to-write upgrade with
         // SQLITE_BUSY_SNAPSHOT; reserve the single writer before this short
         // metadata transaction performs its updates.
-        let mut transaction = (if self.backend == DatabaseBackend::Sqlite {
-            self.pool.begin_with("BEGIN IMMEDIATE").await
-        } else {
-            self.pool.begin().await
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
              SET title = ?, sort_title = ?, original_title = ?, overview = ?, production_year = ?,
@@ -15409,6 +15432,8 @@ impl Database {
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
         let sort_title = update.title.to_lowercase();
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
              SET title = ?,
@@ -15430,13 +15455,20 @@ impl Database {
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
         .bind(update.item_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn media_item_metadata_fingerprint(
@@ -15505,6 +15537,8 @@ impl Database {
         nfo_metadata_json: Option<&str>,
         source_fingerprint: Option<&[u8]>,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
              SET nfo_metadata_json = ?, nfo_metadata_fingerprint = ?
@@ -15513,13 +15547,20 @@ impl Database {
         .bind(nfo_metadata_json)
         .bind(source_fingerprint)
         .bind(item_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn clear_media_item_nfo_metadata_if_json(
@@ -15527,6 +15568,8 @@ impl Database {
         item_id: &str,
         expected_json: &str,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
              SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL
@@ -15534,13 +15577,20 @@ impl Database {
         )
         .bind(item_id)
         .bind(expected_json)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn invalidate_media_item_nfo_metadata_if_source_changed(
@@ -15548,6 +15598,8 @@ impl Database {
         item_id: &str,
         source_fingerprint: &[u8],
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
              SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL
@@ -15556,13 +15608,20 @@ impl Database {
         )
         .bind(item_id)
         .bind(source_fingerprint)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn mark_media_item_metadata_checked(
@@ -15570,12 +15629,21 @@ impl Database {
         item_id: &str,
         metadata_fingerprint: &[u8],
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query("UPDATE media_items SET metadata_fingerprint = ? WHERE id = ?")
             .bind(metadata_fingerprint)
             .bind(item_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
@@ -15591,8 +15659,11 @@ impl Database {
         claimed_until: i64,
         force: bool,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "INSERT INTO metadata_image_attempts (
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "INSERT INTO metadata_image_attempts (
                 item_id, image_type, candidate_key, status, attempt_count,
                 last_attempt_at, next_retry_at, claimed_until, error_code, updated_at
             ) VALUES (?, ?, ?, 'RUNNING', 1, ?, NULL, ?, NULL, ?)
@@ -15619,23 +15690,30 @@ impl Database {
                         )
                     )
                )",
-        )
-        .bind(item_id)
-        .bind(image_type)
-        .bind(candidate_key)
-        .bind(now)
-        .bind(claimed_until)
-        .bind(now)
-        .bind(now)
-        .bind(database_flag(force))
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(item_id)
+            .bind(image_type)
+            .bind(candidate_key)
+            .bind(now)
+            .bind(claimed_until)
+            .bind(now)
+            .bind(now)
+            .bind(database_flag(force))
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn metadata_image_attempt_count(
@@ -15670,6 +15748,8 @@ impl Database {
         candidate_key: &str,
         now: i64,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "INSERT INTO metadata_image_attempts (
                 item_id, image_type, candidate_key, status, attempt_count,
@@ -15692,40 +15772,57 @@ impl Database {
         .bind(candidate_key)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn finish_metadata_image_attempt(
         &self,
         update: MetadataImageAttemptUpdate<'_>,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE metadata_image_attempts
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE metadata_image_attempts
              SET status = ?, next_retry_at = ?, claimed_until = NULL,
                  error_code = ?, updated_at = ?
              WHERE item_id = ? AND image_type = ? AND candidate_key = ?
                AND status = 'RUNNING'",
-        )
-        .bind(update.status)
-        .bind(update.next_retry_at)
-        .bind(update.error_code)
-        .bind(update.now)
-        .bind(update.item_id)
-        .bind(update.image_type)
-        .bind(update.candidate_key)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(update.status)
+            .bind(update.next_retry_at)
+            .bind(update.error_code)
+            .bind(update.now)
+            .bind(update.item_id)
+            .bind(update.image_type)
+            .bind(update.candidate_key)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn insert_item_image(
@@ -15736,8 +15833,11 @@ impl Database {
         metadata: ItemImageMetadata<'_>,
     ) -> Result<bool, StorageError> {
         let id = Uuid::now_v7().to_string();
-        self.query(
-            "INSERT INTO item_images (
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, width, height,
                 file_size, content_tag, source
             ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
@@ -15755,23 +15855,30 @@ impl Database {
                OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
                OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
                OR item_images.source <> excluded.source",
-        )
-        .bind(id)
-        .bind(item_id)
-        .bind(image_type)
-        .bind(local_path.to_string_lossy().as_ref())
-        .bind(metadata.width)
-        .bind(metadata.height)
-        .bind(metadata.file_size)
-        .bind(metadata.content_tag)
-        .bind(metadata.source)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(id)
+            .bind(item_id)
+            .bind(image_type)
+            .bind(local_path.to_string_lossy().as_ref())
+            .bind(metadata.width)
+            .bind(metadata.height)
+            .bind(metadata.file_size)
+            .bind(metadata.content_tag)
+            .bind(metadata.source)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn set_poster_fallback_required(
@@ -15779,6 +15886,8 @@ impl Database {
         item_id: &str,
         required: bool,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
              SET poster_fallback_required = ?
@@ -15786,13 +15895,20 @@ impl Database {
         )
         .bind(database_flag(required))
         .bind(item_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn upsert_item_image(
@@ -15803,6 +15919,8 @@ impl Database {
         metadata: ItemImageMetadata<'_>,
     ) -> Result<String, StorageError> {
         let id = Uuid::now_v7().to_string();
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, width, height,
@@ -15827,13 +15945,20 @@ impl Database {
         .bind(metadata.file_size)
         .bind(metadata.content_tag)
         .bind(metadata.source)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| id)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(id)
     }
 
     pub(crate) async fn list_item_image_candidates(
@@ -15924,6 +16049,8 @@ impl Database {
         width: i32,
         height: i32,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE item_images
              SET width = ?, height = ?, updated_at = unixepoch()
@@ -15934,13 +16061,20 @@ impl Database {
         .bind(item_id)
         .bind(image_type)
         .bind(image_index)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_catalog_image_tags_by_ids(
@@ -16097,16 +16231,26 @@ impl Database {
         item_id: &str,
         image_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query("DELETE FROM item_images WHERE item_id = ? AND id = ?")
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query("DELETE FROM item_images WHERE item_id = ? AND id = ?")
             .bind(item_id)
             .bind(image_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map(|result| result.rows_affected() == 1)
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn create_access_token(
@@ -18863,6 +19007,60 @@ mod tests {
         config::{Config, PostgresConnection},
         library::LibraryKind,
     };
+
+    #[tokio::test]
+    async fn concurrent_metadata_capability_writes_are_serialized() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let item_id = "metadata-write-item";
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Metadata', 'metadata', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..32 {
+            let database = database.clone();
+            tasks.spawn(async move {
+                let results = std::iter::repeat_with(|| MetadataCapabilityResult {
+                    capability: "CREDITS",
+                    has_data: true,
+                })
+                .take(128)
+                .collect::<Vec<_>>();
+                database
+                    .record_metadata_capability_results(
+                        item_id,
+                        "tmdb",
+                        &format!("{index}"),
+                        &results,
+                        1_000 + index,
+                    )
+                    .await
+            });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            result
+                .expect("metadata writer task should not panic")
+                .expect("metadata writes should not fail under concurrency");
+        }
+        database.close().await;
+    }
 
     #[tokio::test]
     async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
