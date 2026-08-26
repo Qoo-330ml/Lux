@@ -392,6 +392,16 @@ impl WebPlaybackSessionService {
             .database
             .find_web_playback_session(event.session_id)
             .await?;
+        if claim == WebPlaybackEventClaim::Accepted
+            && event.state == "STOPPED"
+            && let Err(error) = self.hls.stop(event.session_id).await
+        {
+            tracing::warn!(
+                session_id = %event.session_id,
+                %error,
+                "failed to release stopped Web HLS session"
+            );
+        }
         Ok((claim, session))
     }
 }
@@ -457,8 +467,24 @@ fn signed_message(session_id: &str, resource: &str, expires_at: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
+
     use super::{ResourceSigner, apply_server_capabilities, unix_timestamp};
-    use crate::application::playback::decision::PlaybackCapabilities;
+    use crate::{
+        application::{
+            libraries::LibraryService,
+            playback::{
+                decision::{PlaybackCapabilities, ServerTier},
+                hls::HlsManager,
+                session::{WebPlaybackEvent, WebPlaybackSessionService},
+            },
+            setup::SetupService,
+        },
+        config::Config,
+        library::LibraryKind,
+        storage::{NewWebPlaybackSession, WebPlaybackEventClaim},
+    };
+    use uuid::Uuid;
 
     #[test]
     fn signatures_are_bound_to_the_session_resource_and_expiry() {
@@ -520,5 +546,88 @@ mod tests {
         );
 
         assert!(normalized.hardware_transcode);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopped_events_release_server_hls_resources() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let script = temp_dir.path().join("fake-ffmpeg");
+        tokio::fs::write(
+            &script,
+            "#!/bin/sh\nset -eu\nmanifest=\"\"\nsegment=\"\"\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in\n    -hls_segment_filename) segment=\"$2\"; shift 2 ;;\n    *.m3u8) manifest=\"$1\"; shift ;;\n    *) shift ;;\n  esac\ndone\ndirectory=$(dirname \"$manifest\")\nmkdir -p \"$directory\"\nprintf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' > \"$manifest\"\nprintf init > \"$directory/init.mp4\"\nprintf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"\n",
+        )
+        .await?;
+        let mut permissions = tokio::fs::metadata(&script).await?.permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&script, permissions).await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(
+                config.config_dir.clone(),
+                script.to_string_lossy().into_owned(),
+            ),
+        };
+        let user_id = user.id.to_string();
+        service
+            .database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "session-1",
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:session-1",
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: true,
+                expires_at: unix_timestamp() + 900,
+                now: unix_timestamp(),
+            })
+            .await?;
+        service
+            .start_hls("session-1", ServerTier::Remux, Path::new("input.mkv"))
+            .await?;
+        service.wait_for_hls_manifest("session-1").await?;
+
+        let (claim, _) = service
+            .claim_event(WebPlaybackEvent {
+                session_id: "session-1",
+                user_id: &user_id,
+                event_id: "stop-1",
+                sequence: 1,
+                state: "STOPPED",
+                position_ticks: 100,
+                duration_ticks: Some(1_000),
+            })
+            .await?;
+
+        assert_eq!(claim, WebPlaybackEventClaim::Accepted);
+        assert!(!config.config_dir.join("web-playback/session-1").exists());
+        Ok(())
     }
 }

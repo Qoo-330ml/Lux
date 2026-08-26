@@ -203,4 +203,49 @@ describe("PlayerPage playback synchronization", () => {
       false,
     );
   });
+
+  it("releases the web playback session when media reaches the end", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-3",
+      title: "播放结束清理测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-3", isDefault: true, durationTicks: 120_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-3"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 12 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12 });
+
+    await act(async () => video.dispatchEvent(new Event("play")));
+    await act(async () => video.dispatchEvent(new Event("ended")));
+
+    expect(api.stopWebPlaybackSession).toHaveBeenCalledWith("web-source-3", false);
+  });
 });

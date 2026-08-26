@@ -833,7 +833,9 @@ export function PlayerPage() {
             onTimeUpdate={handleTimeUpdate}
             onEnded={() => {
               setPlaying(false);
-              reportPlayback("STOPPED", true);
+              void Promise.resolve(reportPlayback("STOPPED", true)).finally(() => {
+                void stopActiveSession();
+              });
             }}
             aria-label={`播放 ${mediaTitle(media)}`}
           />

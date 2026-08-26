@@ -88,6 +88,11 @@ impl HlsManager {
         Self::new_with_limits(config_dir, ffmpeg_executable, DEFAULT_MIN_FREE_BYTES)
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_for_tests(config_dir: PathBuf, ffmpeg_executable: String) -> Self {
+        Self::new_with_executable(config_dir, ffmpeg_executable)
+    }
+
     fn new_with_limits(
         config_dir: PathBuf,
         ffmpeg_executable: String,
