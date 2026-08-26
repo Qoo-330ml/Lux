@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -11,7 +11,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
     application::{
-        images::{ImageWriteError, ImageWriteService},
+        images::{ImageWriteError, ImageWriteService, image_no_candidate_key},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
         nfo::{MovieNfoCredit, MovieNfoMetadata, NfoWriteError, NfoWriteService},
@@ -34,6 +34,16 @@ use crate::application::tmdb::TmdbCastMember;
 const MAX_MOVIE_NFO_ACTORS: usize = 30;
 const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
 const IMAGE_ITEM_CONCURRENCY: usize = 4;
+const SCRAPER_IMAGE_TYPES: [&str; 8] = [
+    "POSTER",
+    "FANART",
+    "LOGO",
+    "THUMB",
+    "BANNER",
+    "DISC",
+    "ART",
+    "WALLPAPER",
+];
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataRequestPlan {
@@ -452,9 +462,12 @@ impl MetadataCandidateService {
                 .or_else(|| details.as_ref().and_then(|value| value.title.clone()))
                 .or_else(|| result.original_title.clone())
                 .unwrap_or_else(|| query.to_owned());
-            let (images, credits, external_ids, trailers) = if let Some(bundle) = bundle {
+            let (images, credits, external_ids, trailers, images_response) = if let Some(bundle) =
+                bundle
+            {
+                let bundle_images = bundle.images;
                 (
-                    bundle.images,
+                    bundle_images.clone(),
                     bundle.credits,
                     Some(bundle.external_ids),
                     bundle
@@ -463,9 +476,10 @@ impl MetadataCandidateService {
                         .into_iter()
                         .filter_map(|trailer| trailer.url)
                         .collect(),
+                    Some(bundle_images),
                 )
             } else {
-                tokio::join!(
+                let (images_response, credits, external_ids, trailers) = tokio::join!(
                     async {
                         if plan.needs_images {
                             scraper
@@ -477,9 +491,9 @@ impl MetadataCandidateService {
                                     ),
                                 )
                                 .await
-                                .unwrap_or_default()
+                                .ok()
                         } else {
-                            crate::application::scraper::ScraperImagesResponse::default()
+                            None
                         }
                     },
                     async {
@@ -541,8 +555,22 @@ impl MetadataCandidateService {
                             Vec::new()
                         }
                     }
+                );
+                (
+                    images_response.clone().unwrap_or_default(),
+                    credits,
+                    external_ids,
+                    trailers,
+                    images_response,
                 )
             };
+            if images_response
+                .as_ref()
+                .is_some_and(|response| response.images.is_empty())
+            {
+                self.record_explicitly_unavailable_images(item_id, scraper, &provider_id)
+                    .await?;
+            }
             let actors = generic_candidate_actors(&credits.cast);
             let mut provider_ids = details
                 .as_ref()
@@ -733,23 +761,32 @@ impl MetadataCandidateService {
             else {
                 continue;
             };
-            let images = if plan.needs_images {
+            let images_response = if plan.needs_images {
                 let mut image_request =
                     ScraperImageRequest::new(item_type, &parent.provider_id, "zh-CN");
                 image_request.season_number = Some(season_number);
                 image_request.episode_number = episode_number;
-                scraper
-                    .images_generic(image_request)
-                    .await
-                    .unwrap_or_default()
+                scraper.images_generic(image_request).await.ok()
             } else {
-                crate::application::scraper::ScraperImagesResponse::default()
+                None
             };
+            if images_response
+                .as_ref()
+                .is_some_and(|response| response.images.is_empty())
+            {
+                self.record_explicitly_unavailable_images(item_id, scraper, &parent.provider_id)
+                    .await?;
+            }
+            let images = images_response.unwrap_or_default();
             let title = metadata
                 .title
                 .clone()
                 .or_else(|| metadata.original_title.clone())
                 .unwrap_or_else(|| current.title.clone());
+            let mut provider_ids = metadata.provider_ids;
+            provider_ids
+                .entry(parent.provider.clone())
+                .or_insert_with(|| parent.provider_id.clone());
             self.store_candidate(
                 item_id,
                 current,
@@ -775,7 +812,7 @@ impl MetadataCandidateService {
                     countries: metadata.countries,
                     genres: metadata.genres,
                     studios: metadata.studios,
-                    provider_ids: metadata.provider_ids,
+                    provider_ids,
                     directors: Vec::new(),
                     writers: Vec::new(),
                     trailers: Vec::new(),
@@ -918,6 +955,28 @@ impl MetadataCandidateService {
             .await
             .map_err(MetadataCandidateError::Storage)
     }
+
+    async fn record_explicitly_unavailable_images(
+        &self,
+        item_id: &str,
+        scraper: &ScraperProvider,
+        provider_id: &str,
+    ) -> Result<(), MetadataCandidateError> {
+        let source = scraper.plugin_id().unwrap_or(scraper.provider_key());
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+            .unwrap_or_default();
+        for image_type in SCRAPER_IMAGE_TYPES {
+            let candidate_key = image_no_candidate_key(source, image_type, provider_id);
+            self.database
+                .mark_metadata_image_unavailable(item_id, image_type, &candidate_key, now)
+                .await
+                .map_err(MetadataCandidateError::Storage)?;
+        }
+        Ok(())
+    }
 }
 
 struct CandidateMetadata {
@@ -1025,6 +1084,27 @@ fn current_provider_ids(current: &StoredMediaMetadata) -> BTreeMap<String, Strin
         .as_deref()
         .and_then(|value| serde_json::from_str(value).ok())
         .unwrap_or_default()
+}
+
+fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, String)> {
+    let provider_ids = current_provider_ids(current);
+    let mut sources = BTreeSet::new();
+    for source in [
+        current.metadata_scraper_id.as_deref(),
+        current.scraper_id.as_deref(),
+    ] {
+        if let Some(source) = source.map(str::trim).filter(|value| !value.is_empty()) {
+            sources.insert(source.to_owned());
+        }
+    }
+    sources.extend(provider_ids.keys().cloned());
+    sources
+        .into_iter()
+        .filter_map(|source| {
+            let provider_id = provider_id_for_key(&provider_ids, &source)?.trim();
+            (!provider_id.is_empty()).then(|| (source, provider_id.to_owned()))
+        })
+        .collect()
 }
 
 fn selected_scraper_provider_id(
@@ -1451,9 +1531,24 @@ impl MetadataSelectionService {
             return Ok(MetadataRequestPlan::full());
         }
         let image_policy = self.image_selection_policy(item_id).await?;
+        let image_attempt_identities = image_attempt_identities(current);
         let mut images_missing = false;
         for image_type in image_policy.enabled_types() {
-            if !self.images.has_local_image(item_id, image_type).await? {
+            if self.images.has_local_image(item_id, image_type).await? {
+                continue;
+            }
+            let mut explicitly_unavailable = false;
+            for (source, provider_id) in &image_attempt_identities {
+                if self
+                    .images
+                    .has_unavailable_image_candidate(item_id, image_type, source, provider_id)
+                    .await?
+                {
+                    explicitly_unavailable = true;
+                    break;
+                }
+            }
+            if !explicitly_unavailable {
                 images_missing = true;
                 break;
             }

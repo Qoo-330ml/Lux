@@ -484,6 +484,22 @@ impl ImageWriteService {
         self.local_image_exists(item_id, image_type).await
     }
 
+    pub(crate) async fn has_unavailable_image_candidate(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        source: &str,
+        provider_id: &str,
+    ) -> Result<bool, ImageWriteError> {
+        let image_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        let candidate_key = image_no_candidate_key(source, image_type, provider_id);
+        self.database
+            .metadata_image_attempt_is_unavailable(item_id, image_type, &candidate_key)
+            .await
+            .map_err(ImageWriteError::Storage)
+    }
+
     pub async fn download_item_image(
         &self,
         item_id: &str,
@@ -1369,9 +1385,13 @@ fn current_unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
-fn image_candidate_key(source: &str, image_type: &str, image_url: &str) -> String {
+pub(crate) fn image_candidate_key(source: &str, image_type: &str, image_url: &str) -> String {
     let material = format!("{source}\0{image_type}\0{image_url}");
     content_tag(material.as_bytes())
+}
+
+pub(crate) fn image_no_candidate_key(source: &str, image_type: &str, provider_id: &str) -> String {
+    image_candidate_key(source, image_type, &format!("__NO_IMAGE__\0{provider_id}"))
 }
 
 fn image_retry_delay_seconds(attempt_count: u32) -> i64 {

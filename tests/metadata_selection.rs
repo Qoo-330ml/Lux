@@ -1339,6 +1339,141 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
 }
 
 #[tokio::test]
+async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let nfo_details = json!({
+        "rating": 8.0,
+        "releaseDate": "2020-01-01",
+        "originalLanguage": "en",
+        "directors": [{"provider_id": "director-1", "name": "Director"}],
+        "writers": [{"provider_id": "writer-1", "name": "Writer"}],
+        "trailers": ["https://example.invalid/trailer"]
+    });
+    PeopleService::new(fixture.config.config_dir.clone())
+        .with_database(fixture.database.clone())
+        .persist_item_actors(&fixture.item_id, "tmdb", &[])
+        .await?;
+    sqlx::query(
+        "UPDATE libraries
+         SET scraper_id = 'tmdb'
+         WHERE id = (SELECT library_id FROM media_items WHERE id = ?)",
+    )
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET
+            original_title = 'Example Movie', overview = 'Overview', production_year = 2020,
+            premiere_date = '2020-01-01', original_language = 'en', rating = 8.0,
+            provider_ids_json = ?, metadata_scraper_id = 'tmdb',
+            metadata_provenance_json = ?, nfo_metadata_json = ?
+         WHERE id = ?",
+    )
+    .bind(json!({"Tmdb": "1", "Imdb": "tt1"}).to_string())
+    .bind(
+        json!({
+            "title": "LOCAL_NFO",
+            "originalTitle": "LOCAL_NFO",
+            "overview": "LOCAL_NFO",
+            "productionYear": "LOCAL_NFO"
+        })
+        .to_string(),
+    )
+    .bind(nfo_details.to_string())
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let handler_calls = Arc::clone(&calls);
+    let tmdb_app = Router::new().fallback(any(move |request: Request<Body>| {
+        let calls = Arc::clone(&handler_calls);
+        async move {
+            let path = request.uri().path().to_owned();
+            calls
+                .lock()
+                .expect("request call list should not be poisoned")
+                .push(path.clone());
+            if path == "/3/movie/1/images" {
+                Json(json!({"id": 1, "backdrops": [], "posters": []})).into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+    }));
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb_config = TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    };
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::new_with_config_dir(
+            fixture.database.clone(),
+            fixture.config.config_dir.clone(),
+        )?,
+        fixture.config.config_dir.clone(),
+    );
+    let selection_for_second_run = selection.clone();
+    let service = MetadataReidentifyService::with_selection(
+        fixture.database.clone(),
+        ScraperProvider::from(TmdbClient::new(tmdb_config.clone())?),
+        Some(selection),
+    );
+    let first_job = service
+        .create_item_refresh_job(&fixture.item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    service.run(&first_job.id).await;
+    assert_eq!(
+        calls
+            .lock()
+            .expect("request call list should not be poisoned")
+            .as_slice(),
+        ["/3/movie/1/images"]
+    );
+    PeopleService::new(fixture.config.config_dir.clone())
+        .with_database(fixture.database.clone())
+        .persist_item_actors(&fixture.item_id, "tmdb", &[])
+        .await?;
+    sqlx::query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
+        .bind(nfo_details.to_string())
+        .bind(&fixture.item_id)
+        .execute(fixture.database.pool())
+        .await?;
+
+    let second_service = MetadataReidentifyService::with_selection(
+        fixture.database.clone(),
+        ScraperProvider::from(TmdbClient::new(tmdb_config)?),
+        Some(selection_for_second_run),
+    );
+    let second_job = second_service
+        .create_item_refresh_job(&fixture.item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    second_service.run(&second_job.id).await;
+    assert_eq!(
+        calls
+            .lock()
+            .expect("request call list should not be poisoned")
+            .as_slice(),
+        ["/3/movie/1/images"]
+    );
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_scan_automatically_matches_and_writes_metadata()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

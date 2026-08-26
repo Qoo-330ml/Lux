@@ -15466,6 +15466,64 @@ impl Database {
         Ok(u32::try_from(count.max(1)).unwrap_or(u32::MAX))
     }
 
+    pub(crate) async fn metadata_image_attempt_is_unavailable(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        candidate_key: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar::<String>(
+            "SELECT status
+             FROM metadata_image_attempts
+             WHERE item_id = ? AND image_type = ? AND candidate_key = ?",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .bind(candidate_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|status| status.as_deref() == Some("UNAVAILABLE"))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_metadata_image_unavailable(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        candidate_key: &str,
+        now: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO metadata_image_attempts (
+                item_id, image_type, candidate_key, status, attempt_count,
+                last_attempt_at, next_retry_at, claimed_until, error_code, updated_at
+            ) VALUES (?, ?, ?, 'UNAVAILABLE', 1, ?, NULL, NULL, 'NO_IMAGE', ?)
+            ON CONFLICT(item_id, image_type, candidate_key) DO UPDATE SET
+                status = 'UNAVAILABLE',
+                attempt_count = MAX(metadata_image_attempts.attempt_count, 1),
+                last_attempt_at = excluded.last_attempt_at,
+                next_retry_at = NULL,
+                claimed_until = NULL,
+                error_code = 'NO_IMAGE',
+                updated_at = excluded.updated_at",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .bind(candidate_key)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn finish_metadata_image_attempt(
         &self,
         update: MetadataImageAttemptUpdate<'_>,
