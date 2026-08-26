@@ -146,6 +146,67 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/watch/episode-2");
   });
 
+  it("continues to the first playable episode after play was requested while episodes load", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "series-1",
+      title: "示例剧集",
+      itemType: "SERIES",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+
+    let resolveEpisodes: ((value: { items: MediaItem[]; total: number; page: number; pageSize: number }) => void) | undefined;
+    const episodeResponse = new Promise<{ items: MediaItem[]; total: number; page: number; pageSize: number }>((resolve) => {
+      resolveEpisodes = resolve;
+    });
+    vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => {
+      if (options?.itemType === "SEASON") {
+        return { items: [{ id: "season-1", title: "第一季", itemType: "SEASON" }], total: 1, page: 1, pageSize: 60 };
+      }
+      return episodeResponse;
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/series-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+              <Route path="watch/:itemId" element={<div data-route="watch" />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const playButton = container.querySelector<HTMLButtonElement>(".lux-detail-copy button.lux-button-primary");
+    expect(playButton).not.toBeNull();
+
+    await act(async () => playButton?.click());
+    expect(container.textContent).toContain("正在查找可播放单集，请稍候。");
+
+    await act(async () => {
+      resolveEpisodes?.({
+        items: [{ id: "episode-1", title: "第一集", itemType: "EPISODE", mediaSources: [{ id: "source-1" }] }],
+        total: 1,
+        page: 1,
+        pageSize: 60,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector('[data-route="watch"]')).not.toBeNull();
+  });
+
   it("starts the first unplayed playable episode from a season detail", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "season-1",

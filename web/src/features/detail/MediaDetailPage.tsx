@@ -52,6 +52,7 @@ export function MediaDetailPage() {
   const [actionNotice, setActionNotice] = useState<string>();
   const [confirmingMetadata, setConfirmingMetadata] = useState(false);
   const [pendingPlaybackAction, setPendingPlaybackAction] = useState<"favorite" | "played">();
+  const [playRequested, setPlayRequested] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const isSeries = item.data?.itemType === "SERIES";
   const isSeason = item.data?.itemType === "SEASON";
@@ -86,10 +87,30 @@ export function MediaDetailPage() {
     enabled: Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode),
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
+  const episodeQueryEnabled = Boolean(episodeSeriesId) && Boolean(episodeSeasonId) && Boolean(isSeries || isSeason || isEpisode);
+  const episodeLookupPending = (isSeries && seasons.isPending) || (episodes.isPending && episodeQueryEnabled);
+  const sources = item.data?.mediaSources ?? [];
+  const source = sources.find((entry) => entry.id === selectedSourceId)
+    ?? sources.find((entry) => entry.isDefault)
+    ?? sources[0];
+  const nextPlayableEpisodeId = !source && (isSeries || isSeason)
+    ? selectNextPlayableEpisode(episodes.data?.items ?? [])?.id
+    : undefined;
 
   useEffect(() => {
     setSelectedSourceId(undefined);
+    setPlayRequested(false);
   }, [itemId]);
+
+  useEffect(() => {
+    if (!playRequested || episodeLookupPending) return;
+    if (nextPlayableEpisodeId) {
+      navigate(`/watch/${nextPlayableEpisodeId}`);
+    } else {
+      setPlayRequested(false);
+      setActionNotice("没有可播放的单集。");
+    }
+  }, [episodeLookupPending, navigate, nextPlayableEpisodeId, playRequested]);
 
   if (item.isPending) return <section className="lux-page-state"><p>正在加载媒体详情…</p></section>;
   if (item.error) return <section className="lux-page-state"><h1>媒体详情加载失败</h1><p>{item.error.message}</p></section>;
@@ -117,17 +138,10 @@ export function MediaDetailPage() {
     : isEpisode
       ? episodeTitle(media)
       : undefined;
-  const sources = media.mediaSources ?? [];
-  const source = sources.find((entry) => entry.id === selectedSourceId)
-    ?? sources.find((entry) => entry.isDefault)
-    ?? sources[0];
-  const nextPlayableEpisode = !source && (isSeries || isSeason)
-    ? selectNextPlayableEpisode(episodes.data?.items ?? [])
-    : undefined;
   const watchHref = source
     ? `/watch/${media.id}?sourceId=${encodeURIComponent(source.id)}`
-    : nextPlayableEpisode
-      ? `/watch/${nextPlayableEpisode.id}`
+    : nextPlayableEpisodeId
+      ? `/watch/${nextPlayableEpisodeId}`
       : undefined;
   const pendingReviewItems = pendingItems.data?.items ?? [];
   const pendingIndex = pendingReviewItems.findIndex((entry) => entry.id === media.id);
@@ -264,7 +278,16 @@ export function MediaDetailPage() {
                 <button
                   className="lux-button lux-button-large lux-button-primary"
                   type="button"
-                  onClick={() => setActionNotice(episodes.isPending ? "正在查找可播放单集，请稍候。" : "没有可播放的单集。")}
+                  onClick={() => {
+                    if (episodeLookupPending) {
+                      setPlayRequested(true);
+                      setActionNotice("正在查找可播放单集，请稍候。");
+                    } else if (nextPlayableEpisodeId) {
+                      navigate(`/watch/${nextPlayableEpisodeId}`);
+                    } else {
+                      setActionNotice("没有可播放的单集。");
+                    }
+                  }}
                 >
                   <Play size={17} fill="currentColor" /> 播放
                 </button>
