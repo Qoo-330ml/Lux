@@ -75,11 +75,12 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
             "description": "从 TMDb 提供 Emby 风格电影、剧集和图片元数据。",
             "version": "0.1.5",
             "apiVersion": 1,
-        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
-        "type": "metadata",
-        "category": "SCRAPER",
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "metadata",
+            "category": "SCRAPER",
             "providerKey": "tmdb",
-        "supportedItemTypes": ["Movie"],
+            "aliases": ["tmdb"],
+            "supportedItemTypes": ["Movie"],
             "capabilities": ["metadata.search"],
             "configFields": [{
                 "key": "apiKey",
@@ -87,6 +88,59 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
                 "type": "password",
                 "required": false,
                 "sensitive": true
+            }, {
+                "key": "readAccessToken",
+                "label": "TMDb Read Access Token",
+                "type": "password",
+                "required": false,
+                "sensitive": true
+            }, {
+                "key": "preferredLanguage",
+                "label": "首选语言",
+                "type": "text",
+                "required": false,
+                "sensitive": false,
+                "defaultValue": "zh-CN"
+            }, {
+                "key": "languageFallbackEnabled",
+                "label": "语言回退",
+                "type": "toggle",
+                "required": false,
+                "sensitive": false,
+                "defaultValue": false
+            }, {
+                "key": "fallbackLanguages",
+                "label": "备选语言顺序",
+                "type": "select",
+                "multiple": true,
+                "required": false,
+                "sensitive": false,
+                "options": [
+                    {"value": "zh-SG", "label": "zh-SG"},
+                    {"value": "zh-HK", "label": "zh-HK"},
+                    {"value": "zh-TW", "label": "zh-TW"}
+                ]
+            }, {
+                "key": "alternateApiEnabled",
+                "label": "启用替代 API 地址",
+                "type": "toggle",
+                "required": false,
+                "sensitive": false,
+                "defaultValue": false
+            }, {
+                "key": "apiBaseUrl",
+                "label": "TMDb API 地址",
+                "type": "text",
+                "required": false,
+                "sensitive": false,
+                "defaultValue": "https://api.themoviedb.org"
+            }, {
+                "key": "titleAliasReplacementEnabled",
+                "label": "标题别名替换",
+                "type": "toggle",
+                "required": false,
+                "sensitive": false,
+                "defaultValue": false
             }],
             "permissions": {"network": [], "filesystem": []},
             "files": []
@@ -142,6 +196,13 @@ fn plugin_by_id<'a>(body: &'a Value, plugin_id: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("plugin {plugin_id} is missing from the response"))
 }
 
+fn config_field<'a>(plugin: &'a Value, key: &str) -> &'a Value {
+    plugin["configFields"]
+        .as_array()
+        .and_then(|fields| fields.iter().find(|field| field["key"] == key))
+        .unwrap_or_else(|| panic!("config field {key} is missing"))
+}
+
 #[tokio::test]
 async fn admin_can_install_tmdb_and_select_it_for_a_library()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -152,7 +213,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     tokio::fs::create_dir_all(config_dir.join("plugin-config")).await?;
     tokio::fs::write(
         config_dir.join("plugin-config/org.lux.tmdb.json"),
-        br#"{"preferredLanguage":"zh-CN"}"#,
+        br#"{"preferredLanguage":"zh-CN","languageFallbackEnabled":false,"fallbackLanguages":["zh-SG","zh-HK","zh-TW"],"alternateApiEnabled":false,"apiBaseUrl":"https://api.themoviedb.org","titleAliasReplacementEnabled":false}"#,
     )
     .await?;
     tokio::fs::write(config_dir.join("tmdb_api_key"), "test-key").await?;
@@ -200,11 +261,14 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(tmdb["installed"], false);
     assert_eq!(tmdb["configured"], true);
     assert_eq!(tmdb["configurable"], true);
-    assert_eq!(tmdb["configSource"], "CUSTOM");
-    assert_eq!(tmdb["configFields"][0]["key"], "apiKey");
-    assert_eq!(tmdb["configFields"][1]["key"], "preferredLanguage");
-    assert_eq!(tmdb["configFields"][1]["options"][0]["value"], "zh-CN");
-    assert_eq!(tmdb["configFields"][3]["multiple"], true);
+    assert_eq!(tmdb["configSource"], "PLUGIN_CONFIG");
+    assert_eq!(config_field(tmdb, "apiKey")["type"], "password");
+    assert_eq!(config_field(tmdb, "preferredLanguage")["type"], "text");
+    assert_eq!(
+        config_field(tmdb, "preferredLanguage")["defaultValue"],
+        "zh-CN"
+    );
+    assert_eq!(config_field(tmdb, "fallbackLanguages")["multiple"], true);
     assert_eq!(tmdb["configValues"]["preferredLanguage"], "zh-CN");
     assert_eq!(
         tmdb["configValues"]["fallbackLanguages"],
@@ -216,14 +280,11 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         tmdb["configValues"]["apiBaseUrl"],
         "https://api.themoviedb.org"
     );
-    assert_eq!(tmdb["configFields"][4]["key"], "alternateApiEnabled");
+    assert_eq!(config_field(tmdb, "alternateApiEnabled")["type"], "toggle");
+    assert_eq!(config_field(tmdb, "apiBaseUrl")["type"], "text");
     assert_eq!(
-        tmdb["configFields"][5]["options"][1]["label"],
-        "https://api.tmdb.org"
-    );
-    assert_eq!(
-        tmdb["configFields"][6]["key"],
-        "titleAliasReplacementEnabled"
+        config_field(tmdb, "titleAliasReplacementEnabled")["type"],
+        "toggle"
     );
     assert!(tmdb.get("apiKey").is_none());
 
@@ -576,7 +637,7 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
         .await?;
     assert_eq!(configured.status(), reqwest::StatusCode::OK);
     let configured_body: Value = configured.json().await?;
-    assert_eq!(configured_body["plugin"]["configSource"], "CUSTOM");
+    assert_eq!(configured_body["plugin"]["configSource"], "PLUGIN_CONFIG");
     assert_eq!(
         configured_body["plugin"]["configValues"]["preferredLanguage"],
         "zh-SG"
@@ -602,10 +663,11 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
         "https://api.tmdb.org"
     );
     assert!(!configured_body.to_string().contains(custom_key));
-    assert_eq!(
-        tokio::fs::read_to_string(temp_dir.path().join("config/tmdb_api_key")).await?,
-        format!("{custom_key}\n")
-    );
+    let stored_config: Value = serde_json::from_slice(
+        &tokio::fs::read(temp_dir.path().join("config/plugin-config/org.lux.tmdb.json"))
+            .await?,
+    )?;
+    assert_eq!(stored_config["apiKey"], custom_key);
 
     let reset = client
         .put(format!("{base_url}/api/v1/admin/plugins/tmdb/config"))
@@ -617,9 +679,13 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
     assert_eq!(reset.status(), reqwest::StatusCode::OK);
     assert_eq!(
         reset.json::<Value>().await?["plugin"]["configSource"],
-        "PLUGIN_DEFAULT"
+        "PLUGIN_CONFIG"
     );
-    assert!(!temp_dir.path().join("config/tmdb_api_key").exists());
+    let reset_config: Value = serde_json::from_slice(
+        &tokio::fs::read(temp_dir.path().join("config/plugin-config/org.lux.tmdb.json"))
+            .await?,
+    )?;
+    assert_eq!(reset_config["apiKey"], "");
 
     let created = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
