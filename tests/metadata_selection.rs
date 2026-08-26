@@ -1339,6 +1339,104 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
 }
 
 #[tokio::test]
+async fn metadata_candidate_refresh_counts_all_capabilities_and_reuses_cache()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let handler_calls = Arc::clone(&calls);
+    let tmdb_app = Router::new().fallback(any(move |request: Request<Body>| {
+        let calls = Arc::clone(&handler_calls);
+        async move {
+            let path = request.uri().path().to_owned();
+            calls
+                .lock()
+                .expect("request call list should not be poisoned")
+                .push(path.clone());
+            let body = match path.as_str() {
+                "/3/search/movie" => json!({
+                    "page": 1,
+                    "total_pages": 1,
+                    "total_results": 1,
+                    "results": [{
+                        "id": 7,
+                        "title": "Example Movie",
+                        "original_title": "Example Movie",
+                        "overview": "Search overview",
+                        "release_date": "2020-01-01",
+                        "original_language": "en"
+                    }]
+                }),
+                "/3/movie/7" => json!({
+                    "id": 7,
+                    "title": "Example Movie",
+                    "original_title": "Example Movie",
+                    "overview": "Movie overview",
+                    "release_date": "2020-01-01",
+                    "original_language": "en"
+                }),
+                "/3/movie/7/release_dates" => json!({"results": []}),
+                "/3/movie/7/images" => json!({"posters": [], "backdrops": []}),
+                "/3/movie/7/credits" => json!({"cast": [], "crew": []}),
+                "/3/movie/7/external_ids" => json!({"imdb_id": "tt7"}),
+                "/3/movie/7/videos" => json!({"results": []}),
+                _ => return StatusCode::NOT_FOUND.into_response(),
+            };
+            Json(body).into_response()
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let candidates = MetadataCandidateService::new(fixture.database.clone());
+    let scraper = ScraperProvider::from(tmdb);
+
+    candidates
+        .search_and_store(&fixture.item_id, "Example Movie", Some(2020), &scraper)
+        .await?;
+    let mut first_calls = calls
+        .lock()
+        .expect("request call list should not be poisoned")
+        .clone();
+    first_calls.sort();
+    assert_eq!(
+        first_calls,
+        vec![
+            "/3/movie/7".to_owned(),
+            "/3/movie/7/credits".to_owned(),
+            "/3/movie/7/external_ids".to_owned(),
+            "/3/movie/7/images".to_owned(),
+            "/3/movie/7/release_dates".to_owned(),
+            "/3/movie/7/videos".to_owned(),
+            "/3/search/movie".to_owned(),
+        ]
+    );
+
+    candidates
+        .search_and_store(&fixture.item_id, "Example Movie", Some(2020), &scraper)
+        .await?;
+    let second_calls = calls
+        .lock()
+        .expect("request call list should not be poisoned")
+        .clone();
+    assert_eq!(second_calls.len(), first_calls.len());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

@@ -441,9 +441,15 @@ async fn tmdb_client_coalesces_and_reuses_cached_requests() -> Result<(), Box<dy
 {
     let (base_url, state, server) = start_stub(vec![StatusCode::OK; 2], None, false, false).await;
     let client = TmdbClient::new(client_config(base_url, Duration::from_secs(1), 0))?;
-    let first = client.search_movies("stub", Some(2020), "en-US").await?;
-    let second = client.search_movies("stub", Some(2020), "en-US").await?;
+    let (first, second) = tokio::join!(
+        client.search_movies("stub", Some(2020), "en-US"),
+        client.search_movies("stub", Some(2020), "en-US"),
+    );
+    let first = first?;
+    let second = second?;
     assert_eq!(first.results[0].id, second.results[0].id);
+    let cached = client.search_movies("stub", Some(2020), "en-US").await?;
+    assert_eq!(cached.results[0].id, first.results[0].id);
     assert_eq!(state.attempts.load(Ordering::Relaxed), 1);
 
     server.abort();
