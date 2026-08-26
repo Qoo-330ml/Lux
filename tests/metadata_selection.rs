@@ -1202,7 +1202,7 @@ async fn automatic_candidate_search_expands_only_the_best_result()
 }
 
 #[tokio::test]
-async fn fill_missing_only_requests_the_missing_image_capability()
+async fn fill_missing_requests_the_missing_credits_capability_without_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
     tokio::fs::write(
@@ -1219,13 +1219,9 @@ async fn fill_missing_only_requests_the_missing_image_capability()
         .await?;
     let metadata_dir = library_item_directory(&fixture.config.config_dir, &fixture.item_id)?;
     tokio::fs::create_dir_all(&metadata_dir).await?;
-    for image_type in ["fanart", "logo", "thumb"] {
+    for image_type in ["poster", "fanart", "logo", "thumb"] {
         tokio::fs::write(metadata_dir.join(format!("{image_type}.png")), PNG_1X1).await?;
     }
-    PeopleService::new(fixture.config.config_dir.clone())
-        .with_database(fixture.database.clone())
-        .persist_item_actors(&fixture.item_id, "tmdb", &[])
-        .await?;
     sqlx::query(
         "UPDATE libraries
          SET scraper_id = 'tmdb'
@@ -1277,8 +1273,8 @@ async fn fill_missing_only_requests_the_missing_image_capability()
                 .lock()
                 .expect("request call list should not be poisoned")
                 .push(path.clone());
-            if path == "/3/movie/1/images" {
-                Json(json!({"id": 1, "backdrops": [], "posters": []})).into_response()
+            if path == "/3/movie/1/credits" {
+                Json(json!({"cast": [], "crew": []})).into_response()
             } else {
                 StatusCode::NOT_FOUND.into_response()
             }
@@ -1322,7 +1318,8 @@ async fn fill_missing_only_requests_the_missing_image_capability()
         .lock()
         .expect("request call list should not be poisoned")
         .clone();
-    assert_eq!(first_calls, vec!["/3/movie/1/images"]);
+    assert_eq!(first_calls.len(), 1);
+    assert!(first_calls.iter().any(|path| path == "/3/movie/1/credits"));
     let finished = service.get_job(&job.id).await?;
     assert_eq!(finished.status, "COMPLETED");
     tokio::fs::write(metadata_dir.join("poster.png"), PNG_1X1).await?;
@@ -1334,7 +1331,7 @@ async fn fill_missing_only_requests_the_missing_image_capability()
         .lock()
         .expect("request call list should not be poisoned")
         .clone();
-    assert_eq!(calls_after_complete, vec!["/3/movie/1/images"]);
+    assert_eq!(calls_after_complete, vec!["/3/movie/1/credits"]);
     assert_eq!(service.get_job(&second_job.id).await?.status, "COMPLETED");
 
     tmdb_server.abort();

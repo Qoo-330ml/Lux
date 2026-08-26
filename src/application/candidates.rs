@@ -1458,14 +1458,6 @@ impl MetadataSelectionService {
                 break;
             }
         }
-        let state = metadata_state(current);
-        let base_metadata_complete = fill_missing_fields(&current.item_type)
-            .is_some_and(|fields| state.has_complete_fill_values(fields))
-            && fill_missing_scalar_values_complete(current)
-            && has_selected_provider_id(current);
-        if base_metadata_complete && !images_missing {
-            return Ok(MetadataRequestPlan::default());
-        }
         let details = current.nfo_metadata_json.as_deref().and_then(|value| {
             serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
         });
