@@ -825,7 +825,9 @@ async fn library_metadata_job_processes_items_concurrently()
     let completed = metadata.get_job(&job.id).await?;
     assert_eq!(completed.total_count, 24);
     assert_eq!(completed.status, "COMPLETED");
-    assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
+    let maximum_upstream_concurrency = tracker.maximum.load(Ordering::SeqCst);
+    assert!(maximum_upstream_concurrency > 1);
+    assert!(maximum_upstream_concurrency <= 4);
     let mut progress_events = Vec::new();
     while let Ok(scope) = event_receiver.try_recv() {
         progress_events.push(scope);

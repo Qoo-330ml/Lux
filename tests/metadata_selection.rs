@@ -318,6 +318,79 @@ async fn full_refresh_keeps_nfo_when_image_download_fails() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn one_media_image_selection_is_bounded_to_four_concurrent_downloads()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    configure_image_strategy(&fixture.database, &fixture.item_id).await?;
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_active = Arc::clone(&active);
+    let handler_maximum = Arc::clone(&maximum);
+    let handler_requests = Arc::clone(&requests);
+    let app = Router::new().route(
+        "/{image_type}",
+        get(move || {
+            let active = Arc::clone(&handler_active);
+            let maximum = Arc::clone(&handler_maximum);
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Response::builder()
+                    .header(CONTENT_TYPE, "image/png")
+                    .body(Body::from(PNG_1X1.to_vec()))
+                    .expect("test image response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let image_url = format!("http://{address}");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Movie",
+            "overview": "Online overview",
+            "productionYear": 2020,
+            "providerIds": {"Tmdb": "603"},
+            "images": {
+                "POSTER": [format!("{image_url}/poster")],
+                "FANART": [format!("{image_url}/fanart")],
+                "LOGO": [format!("{image_url}/logo")],
+                "THUMB": [format!("{image_url}/thumb")],
+                "DISC": [format!("{image_url}/disc")]
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    assert_eq!(report.image_types.len(), 5);
+    assert_eq!(requests.load(Ordering::SeqCst), 5);
+    assert!(maximum.load(Ordering::SeqCst) <= 4);
+    assert!(maximum.load(Ordering::SeqCst) > 1);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn fill_missing_selection_preserves_existing_actor_relation_without_credits()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(true).await?;
