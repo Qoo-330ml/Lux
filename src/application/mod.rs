@@ -26,6 +26,7 @@ pub mod network_diagnostics;
 pub mod nfo;
 pub mod people;
 pub mod playback;
+pub mod plugin_compat;
 pub mod plugin_protocol;
 pub mod plugin_runtime;
 pub mod plugin_store;
