@@ -108,8 +108,9 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 
 LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resources.metadata` 暴露。计数器只使用固定低基数标签：
 `search`、`bundle`、`get`、`images`、`credits`、`external_ids`、`trailers`，以及
-`queue_wait`、`item_total`、`image_download`、`image_write`、`nfo_write` 阶段；不会包含用户 ID、完整 URL、token 或原始错误文本。
+`queue_wait`、`item_total`、`image_download`、`image_write`、`cache_persist`、`nfo_write` 阶段；不会包含用户 ID、完整 URL、token 或原始错误文本。
 `stageP95Ms` 使用有界的最近样本窗口。缓存和 singleflight 分别记录 `cache.hit.count` 与 `cache.miss.count`，刮削器重试记录对应 capability 的 `retry.*.count`，图片累计字节记录在 `image.bytes`。
+缓存落盘另记录 `cache.persist.success.count`、`cache.persist.error.count` 和 `stageP95Ms.cache_persist`，用于区分缓存命中收益与落盘背压。
 
 | 日期 | 提交 | 验证 | 结果 | 限制 |
 |---|---|---|---|---|

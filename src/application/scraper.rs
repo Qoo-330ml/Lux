@@ -871,6 +871,7 @@ impl ScraperPluginClient {
     }
 
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.response_cache.with_resource_metrics(resources.clone());
         self.resources = Some(resources);
         self
     }

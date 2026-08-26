@@ -141,6 +141,19 @@ impl ResourceMetrics {
         *current = current.saturating_add(bytes);
     }
 
+    pub fn record_metadata_cache_persist(&self, duration: Duration, success: bool) {
+        self.record_metadata_stage("cache_persist", duration);
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        let counter = if success {
+            "cache.persist.success.count"
+        } else {
+            "cache.persist.error.count"
+        };
+        increment_counter(&mut metrics.counters, counter, 1);
+    }
+
     pub async fn cpu_limit_cores(&self) -> Option<f64> {
         read_cpu_usage().await.and_then(|(_, limit)| limit)
     }
@@ -269,6 +282,7 @@ fn metadata_stage_name(value: &str) -> Option<&'static str> {
         "item_total" => Some("item_total"),
         "image_download" => Some("image_download"),
         "image_write" => Some("image_write"),
+        "cache_persist" => Some("cache_persist"),
         "nfo_write" => Some("nfo_write"),
         _ => metadata_capability_name(value),
     }
@@ -808,6 +822,8 @@ mod tests {
         metrics.record_metadata_retry("metadata.images");
         metrics.record_metadata_image_retry();
         metrics.record_metadata_image_bytes(42);
+        metrics.record_metadata_cache_persist(Duration::from_millis(8), true);
+        metrics.record_metadata_cache_persist(Duration::from_millis(12), false);
 
         let snapshot = metrics.snapshot().await;
         assert_eq!(snapshot.metadata.counters["request.images.count"], 2);
@@ -816,7 +832,10 @@ mod tests {
         assert_eq!(snapshot.metadata.counters["retry.images.count"], 1);
         assert_eq!(snapshot.metadata.counters["retry.image_download.count"], 1);
         assert_eq!(snapshot.metadata.counters["image.bytes"], 42);
+        assert_eq!(snapshot.metadata.counters["cache.persist.success.count"], 1);
+        assert_eq!(snapshot.metadata.counters["cache.persist.error.count"], 1);
         assert_eq!(snapshot.metadata.stage_p95_ms["images"], 20);
+        assert_eq!(snapshot.metadata.stage_p95_ms["cache_persist"], 12);
     }
 
     #[test]

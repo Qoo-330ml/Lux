@@ -212,6 +212,7 @@ impl TmdbClient {
         &self,
         resources: crate::observability::resources::ResourceMetrics,
     ) {
+        self.response_cache.with_resource_metrics(resources.clone());
         if let Ok(mut current) = self.resources.lock() {
             *current = Some(resources);
         }
