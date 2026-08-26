@@ -5963,6 +5963,27 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_item_id_by_media_source_id(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT ms.item_id
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE ms.id = ? AND mi.removed_at IS NULL
+             LIMIT 1",
+        )
+        .bind(source_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn insert_library_root(
         &self,
         root: NewLibraryRoot<'_>,
