@@ -1,3 +1,11 @@
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
+
+const MAX_STRM_ALLOWED_ROOTS: usize = 64;
+const MAX_STRM_ALLOWED_ROOT_LENGTH: usize = 4096;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StrmTargetKind {
     Empty,
@@ -19,11 +27,83 @@ pub enum StrmLocalPathError {
     Forbidden,
 }
 
+impl fmt::Display for StrmLocalPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "STRM local target is missing",
+            Self::Forbidden => "STRM local target is outside the allowed roots",
+        })
+    }
+}
+
+impl std::error::Error for StrmLocalPathError {}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrmAllowedRootsError {
+    TooMany,
+    Empty,
+    TooLong,
+    NotAbsolute,
+    Root,
+    ParentTraversal,
+    ControlCharacter,
+}
+
+pub fn normalize_strm_allowed_roots(
+    values: &[String],
+) -> Result<Vec<String>, StrmAllowedRootsError> {
+    if values.len() > MAX_STRM_ALLOWED_ROOTS {
+        return Err(StrmAllowedRootsError::TooMany);
+    }
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(StrmAllowedRootsError::Empty);
+        }
+        if value.chars().count() > MAX_STRM_ALLOWED_ROOT_LENGTH {
+            return Err(StrmAllowedRootsError::TooLong);
+        }
+        if value.chars().any(char::is_control) {
+            return Err(StrmAllowedRootsError::ControlCharacter);
+        }
+        let path = Path::new(value);
+        if !path.is_absolute() {
+            return Err(StrmAllowedRootsError::NotAbsolute);
+        }
+        if path
+            .components()
+            .any(|component| matches!(component, std::path::Component::ParentDir))
+        {
+            return Err(StrmAllowedRootsError::ParentTraversal);
+        }
+        if !path
+            .components()
+            .any(|component| matches!(component, std::path::Component::Normal(_)))
+        {
+            return Err(StrmAllowedRootsError::Root);
+        }
+        if !normalized.iter().any(|existing| existing == value) {
+            normalized.push(value.to_owned());
+        }
+    }
+    Ok(normalized)
+}
+
 pub async fn canonical_local_strm_target(
     root_path: &str,
     strm_relative_path: &str,
     target: &str,
 ) -> Result<std::path::PathBuf, StrmLocalPathError> {
+    canonical_local_strm_target_with_allowed_roots(root_path, strm_relative_path, target, &[]).await
+}
+
+pub async fn canonical_local_strm_target_with_allowed_roots(
+    root_path: &str,
+    strm_relative_path: &str,
+    target: &str,
+    additional_allowed_roots: &[PathBuf],
+) -> Result<PathBuf, StrmLocalPathError> {
     let root = tokio::fs::canonicalize(root_path)
         .await
         .map_err(|_| StrmLocalPathError::Missing)?;
@@ -45,8 +125,36 @@ pub async fn canonical_local_strm_target(
     let path = tokio::fs::canonicalize(requested)
         .await
         .map_err(|_| StrmLocalPathError::Missing)?;
-    if !path.starts_with(&root) || path == root {
+
+    let mut allowed_roots = vec![root];
+    for configured_root in additional_allowed_roots {
+        if !configured_root.is_absolute() {
+            continue;
+        }
+        let Ok(configured_root) = tokio::fs::canonicalize(configured_root).await else {
+            continue;
+        };
+        if configured_root == Path::new("/") {
+            continue;
+        }
+        let Ok(metadata) = tokio::fs::metadata(&configured_root).await else {
+            continue;
+        };
+        if metadata.is_dir() {
+            allowed_roots.push(configured_root);
+        }
+    }
+    if !allowed_roots
+        .iter()
+        .any(|allowed_root| path.starts_with(allowed_root) && path != *allowed_root)
+    {
         return Err(StrmLocalPathError::Forbidden);
+    }
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| StrmLocalPathError::Missing)?;
+    if !metadata.is_file() {
+        return Err(StrmLocalPathError::Missing);
     }
     Ok(path)
 }
