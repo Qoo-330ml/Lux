@@ -21,6 +21,7 @@ use luxd::{
 };
 use reqwest::header::CONTENT_TYPE;
 use tokio::net::TcpListener;
+use tokio::time::{Duration, sleep};
 
 const PNG_1X1: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
@@ -99,6 +100,113 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
 
     server.abort();
     let _ = root;
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_downloads_respect_the_global_concurrency_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
+    let active = Arc::new(AtomicUsize::new(0));
+    let maximum = Arc::new(AtomicUsize::new(0));
+    let handler_active = Arc::clone(&active);
+    let handler_maximum = Arc::clone(&maximum);
+    let app = Router::new().route(
+        "/{name}",
+        get(move || {
+            let active = Arc::clone(&handler_active);
+            let maximum = Arc::clone(&handler_maximum);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(current, Ordering::SeqCst);
+                sleep(Duration::from_millis(40)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Response::builder()
+                    .header(CONTENT_TYPE, "image/png")
+                    .body(Body::from(PNG_1X1.to_vec()))
+                    .expect("test image response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::with_config_and_concurrency(
+        database,
+        ImageDownloadConfig::default(),
+        2,
+    )?;
+
+    let mut tasks = Vec::new();
+    for image_type in ["POSTER", "FANART", "LOGO", "BANNER", "DISC", "ART"] {
+        let service = service.clone();
+        let item_id = item_id.clone();
+        let url = format!("http://{address}/{image_type}");
+        tasks.push(tokio::spawn(async move {
+            service
+                .download_item_image(&item_id, image_type, &url)
+                .await
+        }));
+    }
+    for task in tasks {
+        task.await??;
+    }
+
+    assert!(maximum.load(Ordering::SeqCst) <= 2);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn concurrent_downloads_claim_one_attempt_for_the_same_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = Arc::clone(&requests);
+    let app = Router::new().route(
+        "/poster",
+        get(move || {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(40)).await;
+                Response::builder()
+                    .header(CONTENT_TYPE, "image/png")
+                    .body(Body::from(PNG_1X1.to_vec()))
+                    .expect("test image response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::with_config(database, ImageDownloadConfig::default())?;
+    let image_url = format!("http://{address}/poster");
+    let first = service.clone();
+    let second = service.clone();
+    let first_item_id = item_id.clone();
+    let second_item_id = item_id;
+    let first_url = image_url.clone();
+    let second_url = image_url;
+    let (first, second) = tokio::join!(
+        tokio::spawn(async move {
+            first
+                .download_item_image_if_missing(&first_item_id, "poster", &first_url)
+                .await
+        }),
+        tokio::spawn(async move {
+            second
+                .download_item_image_if_missing(&second_item_id, "poster", &second_url)
+                .await
+        }),
+    );
+
+    let first = first??;
+    let second = second??;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(first.is_some() ^ second.is_some());
+
+    server.abort();
     Ok(())
 }
 
@@ -212,6 +320,49 @@ async fn transient_image_failure_is_skipped_until_retry_deadline()
             .is_err()
     );
     assert!(requests.load(Ordering::SeqCst) > after_first);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn permanent_image_failure_is_not_retried_automatically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = Arc::clone(&requests);
+    let app = Router::new().route(
+        "/invalid",
+        get(move || {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .header(CONTENT_TYPE, "image/png")
+                    .body(Body::from(b"broken".to_vec()))
+                    .expect("invalid image response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::with_config(database, ImageDownloadConfig::default())?;
+    let image_url = format!("http://{address}/invalid");
+
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await?
+            .is_none()
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
 
     server.abort();
     Ok(())

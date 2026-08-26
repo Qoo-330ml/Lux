@@ -1,6 +1,6 @@
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
@@ -36,6 +36,7 @@ use luxd::{
 };
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use uuid::Uuid;
@@ -268,6 +269,166 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(fallback_required, 0);
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn full_refresh_keeps_nfo_when_image_download_fails() -> Result<(), Box<dyn std::error::Error>>
+{
+    let fixture = prepare_fixture(true).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "overview": "Online Overview",
+            "posterUrl": format!("{image_url}/missing")
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+        fixture.config.config_dir.clone(),
+    );
+
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+
+    assert_eq!(report.status, "ONLINE_CONFIRMED");
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<plot>Online Overview</plot>"));
+    let candidate_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
+            .bind(&candidate_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(candidate_status, "SELECTED");
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_selection_preserves_existing_actor_relation_without_credits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(true).await?;
+    let people = PeopleService::new(fixture.config.config_dir.clone())
+        .with_database(fixture.database.clone());
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+        fixture.config.config_dir.clone(),
+    );
+    let first_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Initial Title",
+            "actors": [{
+                "id": "9",
+                "name": "Existing Actor",
+                "character": "Existing Role",
+                "order": 0
+            }]
+        }),
+    )
+    .await?;
+    selection
+        .select(
+            &fixture.item_id,
+            &first_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    MetadataEnricher::new(fixture.database.clone())
+        .enrich_movie_library(library_id.parse()?)
+        .await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "Online Title", "overview": "Online Overview" }),
+    )
+    .await?;
+
+    selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    let actors = people.list_item_actors(&fixture.item_id).await?;
+    assert_eq!(actors.len(), 1);
+    assert_eq!(actors[0].name, "Existing Actor");
+    assert_eq!(actors[0].character.as_deref(), Some("Existing Role"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_skips_a_backoff_image_and_uses_the_next_candidate()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let failed_url = format!("{image_url}/poster-second");
+    let usable_url = format!("{image_url}/poster");
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "images": { "POSTER": [failed_url, usable_url] }
+        }),
+    )
+    .await?;
+    let candidate_key =
+        Sha256::digest(format!("TMDB\0POSTER\0{image_url}/poster-second").as_bytes())
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+    sqlx::query(
+        "INSERT INTO metadata_image_attempts
+         (item_id, image_type, candidate_key, status, attempt_count, next_retry_at)
+         VALUES (?, 'POSTER', ?, 'FAILED', 1, 9223372036854775807)",
+    )
+    .bind(&fixture.item_id)
+    .bind(candidate_key)
+    .execute(fixture.database.pool())
+    .await?;
+
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::new_with_config_dir(
+            fixture.database.clone(),
+            fixture.config.config_dir.clone(),
+        )?,
+        fixture.config.config_dir.clone(),
+    );
+    let report = selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    assert_eq!(report.image_types, vec!["POSTER"]);
+    let poster =
+        library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("poster.png");
+    assert_eq!(tokio::fs::read(poster).await?, PNG_1X1);
 
     image_server.abort();
     Ok(())
@@ -655,7 +816,7 @@ async fn admin_selection_writes_only_configured_candidate_image_types()
 }
 
 #[tokio::test]
-async fn failed_selection_stays_pending_and_can_be_retried()
+async fn image_failure_does_not_block_selection_or_nfo_writeback()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
     let (image_url, image_server) = start_image_stub().await?;
@@ -683,40 +844,7 @@ async fn failed_selection_stays_pending_and_can_be_retried()
         .json(&json!({ "mode": "refreshUnlocked" }))
         .send()
         .await?;
-    assert!(failed.status().is_server_error());
-    let status: String =
-        sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
-            .bind(&item_id)
-            .fetch_one(fixture.database.pool())
-            .await?;
-    assert_eq!(status, "LOCAL_CONFIRMED");
-    let candidate_status: String =
-        sqlx::query_scalar("SELECT status FROM metadata_candidates WHERE id = ?")
-            .bind(&candidate_id)
-            .fetch_one(fixture.database.pool())
-            .await?;
-    assert_eq!(candidate_status, "PENDING");
-    assert!(!fixture.movie_dir.join("movie.nfo").exists());
-
-    sqlx::query("UPDATE metadata_candidates SET candidate_json = ? WHERE id = ?")
-        .bind(
-            json!({
-                "title": "Retry Title",
-                "posterUrl": format!("{image_url}/poster")
-            })
-            .to_string(),
-        )
-        .bind(&candidate_id)
-        .execute(fixture.database.pool())
-        .await?;
-    let retried = client
-        .post(&path)
-        .header(COOKIE, &cookies)
-        .header("x-csrf-token", &csrf)
-        .json(&json!({ "mode": "refreshUnlocked" }))
-        .send()
-        .await?;
-    assert_eq!(retried.status(), StatusCode::OK);
+    assert_eq!(failed.status(), StatusCode::OK);
     let status: String =
         sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
             .bind(&item_id)
@@ -729,6 +857,23 @@ async fn failed_selection_stays_pending_and_can_be_retried()
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(candidate_status, "SELECTED");
+    let image_attempt: (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, next_retry_at
+         FROM metadata_image_attempts
+         WHERE item_id = ?",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(image_attempt.0, "UNAVAILABLE");
+    assert!(image_attempt.1.is_none());
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<title>Retry Title</title>"));
+    let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    assert_eq!(image_count, 0);
 
     lux_server.abort();
     image_server.abort();
@@ -1051,6 +1196,146 @@ async fn automatic_candidate_search_expands_only_the_best_result()
     .fetch_one(fixture.database.pool())
     .await?;
     assert_eq!(stored_count, 2);
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_only_requests_the_missing_image_capability()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    tokio::fs::write(
+        fixture.movie_dir.join("movie.nfo"),
+        "<movie><title>Example Movie</title><originaltitle>Example Movie</originaltitle><plot>Overview</plot><year>2020</year><rating>8.0</rating><premiered>2020-01-01</premiered><language>en</language><director tmdbid=\"director-1\">Director</director><writer tmdbid=\"writer-1\">Writer</writer><trailer>https://example.invalid/trailer</trailer></movie>",
+    )
+    .await?;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    MetadataEnricher::new(fixture.database.clone())
+        .enrich_movie_library(library_id.parse()?)
+        .await?;
+    let metadata_dir = library_item_directory(&fixture.config.config_dir, &fixture.item_id)?;
+    tokio::fs::create_dir_all(&metadata_dir).await?;
+    for image_type in ["fanart", "logo", "thumb"] {
+        tokio::fs::write(metadata_dir.join(format!("{image_type}.png")), PNG_1X1).await?;
+    }
+    PeopleService::new(fixture.config.config_dir.clone())
+        .with_database(fixture.database.clone())
+        .persist_item_actors(&fixture.item_id, "tmdb", &[])
+        .await?;
+    sqlx::query(
+        "UPDATE libraries
+         SET scraper_id = 'tmdb'
+         WHERE id = (SELECT library_id FROM media_items WHERE id = ?)",
+    )
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET
+            original_title = 'Example Movie', overview = 'Overview', production_year = 2020,
+            premiere_date = '2020-01-01', original_language = 'en', rating = 8.0,
+            provider_ids_json = ?, metadata_scraper_id = 'tmdb',
+            metadata_provenance_json = ?, nfo_metadata_json = ?
+         WHERE id = ?",
+    )
+    .bind(json!({"Tmdb": "1", "Imdb": "tt1"}).to_string())
+    .bind(
+        json!({
+            "title": "LOCAL_NFO",
+            "originalTitle": "LOCAL_NFO",
+            "overview": "LOCAL_NFO",
+            "productionYear": "LOCAL_NFO"
+        })
+        .to_string(),
+    )
+    .bind(
+        json!({
+            "rating": 8.0,
+            "releaseDate": "2020-01-01",
+            "originalLanguage": "en",
+            "directors": [{"provider_id": "director-1", "name": "Director"}],
+            "writers": [{"provider_id": "writer-1", "name": "Writer"}],
+            "trailers": ["https://example.invalid/trailer"]
+        })
+        .to_string(),
+    )
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+
+    let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+    let handler_calls = Arc::clone(&calls);
+    let tmdb_app = Router::new().fallback(any(move |request: Request<Body>| {
+        let calls = Arc::clone(&handler_calls);
+        async move {
+            let path = request.uri().path().to_owned();
+            calls
+                .lock()
+                .expect("request call list should not be poisoned")
+                .push(path.clone());
+            if path == "/3/movie/1/images" {
+                Json(json!({"id": 1, "backdrops": [], "posters": []})).into_response()
+            } else {
+                StatusCode::NOT_FOUND.into_response()
+            }
+        }
+    }));
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let images = ImageWriteService::new_with_config_dir(
+        fixture.database.clone(),
+        fixture.config.config_dir.clone(),
+    )?;
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        images,
+        fixture.config.config_dir.clone(),
+    );
+    let service = MetadataReidentifyService::with_selection(
+        fixture.database.clone(),
+        ScraperProvider::from(tmdb),
+        Some(selection),
+    );
+    let job = service
+        .create_item_refresh_job(&fixture.item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    service.run(&job.id).await;
+
+    let first_calls = calls
+        .lock()
+        .expect("request call list should not be poisoned")
+        .clone();
+    assert_eq!(first_calls, vec!["/3/movie/1/images"]);
+    let finished = service.get_job(&job.id).await?;
+    assert_eq!(finished.status, "COMPLETED");
+    tokio::fs::write(metadata_dir.join("poster.png"), PNG_1X1).await?;
+    let second_job = service
+        .create_item_refresh_job(&fixture.item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    service.run(&second_job.id).await;
+    let calls_after_complete = calls
+        .lock()
+        .expect("request call list should not be poisoned")
+        .clone();
+    assert_eq!(calls_after_complete, vec!["/3/movie/1/images"]);
+    assert_eq!(service.get_job(&second_job.id).await?.status, "COMPLETED");
 
     tmdb_server.abort();
     Ok(())

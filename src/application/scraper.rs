@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc};
+use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time::Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,6 +15,7 @@ use crate::{
         plugins::{PluginService, PluginServiceError},
     },
     library::LibraryScraperRole,
+    observability::resources::ResourceMetrics,
     storage::{Database, StorageError},
 };
 
@@ -134,6 +135,15 @@ impl ScraperProvider {
         match self {
             Self::Adapter(adapter) => adapter.provider_key(),
             Self::Generic(client) => client.provider_key(),
+        }
+    }
+
+    pub(crate) fn with_resource_metrics(self, resources: ResourceMetrics) -> Self {
+        match self {
+            Self::Adapter(adapter) => Self::Adapter(adapter),
+            Self::Generic(client) => {
+                Self::Generic(Box::new((*client).with_resource_metrics(resources)))
+            }
         }
     }
 
@@ -804,6 +814,7 @@ pub struct ScraperPluginClient {
     provider_key: String,
     capabilities: Option<Vec<String>>,
     response_cache: ProviderResponseCache,
+    resources: Option<ResourceMetrics>,
 }
 
 impl ScraperPluginClient {
@@ -835,6 +846,7 @@ impl ScraperPluginClient {
             provider_key: provider_key.into(),
             capabilities,
             response_cache,
+            resources: None,
         }
     }
 
@@ -844,6 +856,11 @@ impl ScraperPluginClient {
 
     pub fn provider_key(&self) -> &str {
         &self.provider_key
+    }
+
+    pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = Some(resources);
+        self
     }
 
     pub(crate) async fn clear_response_cache(&self) {
@@ -929,13 +946,20 @@ impl ScraperPluginClient {
                 return Err(ScraperError::UnsupportedCapability(capability.to_owned()));
             }
         }
+        let started = Instant::now();
         let Some(cache_key) = cache_key(&self.plugin_id, method, &params) else {
-            return self.call_scraper_with_retry(method, params).await;
+            let result = self.call_scraper_with_retry(method, params).await;
+            self.record_metadata_call(method, false, started);
+            return result;
         };
         let cache_owner = loop {
             match self.response_cache.begin(&cache_key).await {
-                CacheLookup::Hit(value) => return Ok(value),
+                CacheLookup::Hit(value) => {
+                    self.record_metadata_call(method, true, started);
+                    return Ok(value);
+                }
                 CacheLookup::Negative => {
+                    self.record_metadata_call(method, true, started);
                     return Err(ScraperError::Provider(
                         "cached scraper result was not found".to_owned(),
                     ));
@@ -945,6 +969,7 @@ impl ScraperPluginClient {
             }
         };
         let result = self.call_scraper_with_retry(method, params).await;
+        self.record_metadata_call(method, false, started);
         if let Ok(value) = &result {
             self.response_cache
                 .store(&cache_key, value, ttl_for_method(method))
@@ -975,11 +1000,22 @@ impl ScraperPluginClient {
                     if retry_count < SCRAPER_MAX_RETRIES && retryable_scraper_error(&error) =>
                 {
                     retry_count += 1;
+                    if let Some(resources) = &self.resources {
+                        resources.record_metadata_retry(method);
+                    }
                     sleep(SCRAPER_RETRY_DELAY * retry_count).await;
                 }
                 result => return result,
             }
         }
+    }
+
+    fn record_metadata_call(&self, method: &str, cache_hit: bool, started: Instant) {
+        let Some(resources) = &self.resources else {
+            return;
+        };
+        resources.record_metadata_request(method, cache_hit);
+        resources.record_metadata_stage(method, started.elapsed());
     }
 }
 
@@ -1017,6 +1053,7 @@ fn is_negative_scraper_error(error: &ScraperError) -> bool {
 pub struct ScraperResolver {
     database: Database,
     plugins: PluginService,
+    resources: Option<ResourceMetrics>,
 }
 
 #[derive(Clone)]
@@ -1028,7 +1065,16 @@ pub struct ResolvedScraper {
 
 impl ScraperResolver {
     pub fn new(database: Database, plugins: PluginService) -> Self {
-        Self { database, plugins }
+        Self {
+            database,
+            plugins,
+            resources: None,
+        }
+    }
+
+    pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = Some(resources);
+        self
     }
 
     pub async fn for_item(
@@ -1057,7 +1103,13 @@ impl ScraperResolver {
                 .parse::<LibraryScraperRole>()
                 .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
             let client = match self.plugins.scraper_client(&scraper.scraper_id).await {
-                Ok(client) => client,
+                Ok(client) => {
+                    if let Some(resources) = &self.resources {
+                        client.with_resource_metrics(resources.clone())
+                    } else {
+                        client
+                    }
+                }
                 Err(error) => {
                     if first_error.is_none() {
                         first_error = Some(ScraperError::Plugin(error));
@@ -1078,6 +1130,11 @@ impl ScraperResolver {
             if !scraper_id.is_empty()
                 && let Ok(client) = self.plugins.scraper_client(scraper_id).await
             {
+                let client = if let Some(resources) = &self.resources {
+                    client.with_resource_metrics(resources.clone())
+                } else {
+                    client
+                };
                 resolved.push(ResolvedScraper {
                     scraper_id: scraper_id.to_owned(),
                     role: LibraryScraperRole::Primary,

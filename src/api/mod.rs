@@ -222,7 +222,8 @@ impl AppState {
             config.config_dir.clone(),
             network_proxy_url.clone(),
         )
-        .ok();
+        .ok()
+        .map(|service| service.with_resource_metrics(resources.clone()));
         let library_covers = Some(
             LibraryCoverService::new(database.clone(), config.config_dir.join("library-covers"))
                 .with_metadata_directory(config.config_dir.join("metadata")),

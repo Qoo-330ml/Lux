@@ -538,7 +538,7 @@ const DEFAULT_PLUGIN_INDEX_JSON: &str = r#"
 {
   "formatVersion": 1,
   "plugins": [
-    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.5","runtime":"process","providerKey":"tmdb","capabilities":["metadata.search","metadata.get","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.tmdb-0.1.5-linux-aarch64.zip","sha256":"88e4683d6668fa75ec4accf355bd7edb176e50bf2e748a36aba99971a7c285fe"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.tmdb-0.1.5-linux-x86_64.zip","sha256":"fb2f07c5aaaa627dd89d68fbe5ccd5995c11475f7a9a933ee9dcc3b41367a4fb"}]},
+    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.8","runtime":"process","providerKey":"tmdb","capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.8-linux-aarch64.zip","sha256":"3984d879572d17f6ae6aeb360baeb7b4d52488f00aafad3cbfedde6d31fd0514"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.8-linux-x86_64.zip","sha256":"85d82e4811406e37f8600a64c3a2370f210a3eef96a3be2ca6c1ab1f8b3914c3"}]},
     {"id":"org.lux.strm-media-info","name":"strm媒体信息提取","description":"使用 ffprobe 提取媒体信息，并使用 ffmpeg 生成同时作为海报和缩略图的 STRM 截图。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["media.probe"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-aarch64.zip","sha256":"22977b5f23ab94c22c4e5be83888099f03079570e6b4953e5aea238735fabf82"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-x86_64.zip","sha256":"65411be32c8566a511d21a02ebd54e326f79f1225750d496fcae85c1302bc50c"}]},
     {"id":"org.lux.ip-hiofd","name":"IP归属地查询增强","description":"通过 Hiofd 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-aarch64.zip","sha256":"f2e93e49e9b3507cd400720fe0a6480e16e146a1fd15abf945ba861a53255db9"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-x86_64.zip","sha256":"d734697e3fafa490a1ade0698f2d1ca74d93d894d3ac23d3098564046bfdaab6"}]},
     {"id":"org.lux.qoo-ip138","name":"ip138 IP归属地查询","description":"通过 ipshudi.com 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-aarch64.zip","sha256":"8b7879c4d6e82b823f476f8672b878b3aa127ab76c164492317a23a243632bd7"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-x86_64.zip","sha256":"9423cfd53247ba55b6ec64fdbc0d9066ae73599c0fd35df8bf609446ca4a971f"}]},
@@ -610,6 +610,13 @@ mod tests {
         assert_eq!(index.format_version, 1);
         assert_eq!(index.plugins.len(), 6);
         assert_eq!(index.plugins[0].id, "org.lux.tmdb");
+        assert_eq!(index.plugins[0].version, "0.1.8");
+        assert!(
+            index.plugins[0]
+                .capabilities
+                .iter()
+                .any(|capability| capability == "metadata.bundle")
+        );
         assert_eq!(index.plugins[0].packages.len(), 2);
     }
 

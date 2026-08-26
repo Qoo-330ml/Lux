@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
+    sync::Semaphore,
     time::sleep,
 };
 use uuid::Uuid;
@@ -25,7 +26,8 @@ use crate::{
         },
     },
     network::client_builder_from_env_or,
-    storage::{Database, ItemImageMetadata, StorageError},
+    observability::resources::ResourceMetrics,
+    storage::{Database, ItemImageMetadata, MetadataImageAttemptUpdate, StorageError},
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
@@ -34,6 +36,7 @@ const IMAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
 const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
 const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
 const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
+const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
 
 pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
     let path = path.to_owned();
@@ -85,6 +88,8 @@ pub struct ImageWriteService {
     http: Client,
     max_bytes: u64,
     config_dir: Option<PathBuf>,
+    permits: std::sync::Arc<Semaphore>,
+    resources: Option<ResourceMetrics>,
 }
 
 impl ImageWriteService {
@@ -131,15 +136,44 @@ impl ImageWriteService {
         Self::with_proxy_config(database, config, None, None)
     }
 
+    pub fn with_config_and_concurrency(
+        database: Database,
+        config: ImageDownloadConfig,
+        concurrency: usize,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config_and_concurrency(database, config, None, None, concurrency)
+    }
+
     fn with_proxy_config(
         database: Database,
         config: ImageDownloadConfig,
         proxy_url: Option<String>,
         config_dir: Option<PathBuf>,
     ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config_and_concurrency(
+            database,
+            config,
+            proxy_url,
+            config_dir,
+            IMAGE_GLOBAL_CONCURRENCY,
+        )
+    }
+
+    fn with_proxy_config_and_concurrency(
+        database: Database,
+        config: ImageDownloadConfig,
+        proxy_url: Option<String>,
+        config_dir: Option<PathBuf>,
+        concurrency: usize,
+    ) -> Result<Self, ImageWriteError> {
         if config.max_bytes == 0 {
             return Err(ImageWriteError::InvalidConfiguration(
                 "image maximum size must be positive".to_owned(),
+            ));
+        }
+        if concurrency == 0 {
+            return Err(ImageWriteError::InvalidConfiguration(
+                "image concurrency must be positive".to_owned(),
             ));
         }
         let http = client_builder_from_env_or(proxy_url.as_deref())
@@ -152,7 +186,14 @@ impl ImageWriteService {
             http,
             max_bytes: config.max_bytes,
             config_dir,
+            permits: std::sync::Arc::new(Semaphore::new(concurrency)),
+            resources: None,
         })
+    }
+
+    pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = Some(resources);
+        self
     }
 
     pub async fn download_item_image_if_missing(
@@ -161,18 +202,18 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        self.download_item_image_if_missing_impl(item_id, image_type, image_url, "TMDB", false)
+        self.download_item_image_if_missing_impl(item_id, image_type, image_url, "TMDB")
             .await
     }
 
-    pub(crate) async fn download_item_image_if_missing_from_scraper(
+    pub(crate) async fn try_download_item_image_if_missing_from_scraper(
         &self,
         item_id: &str,
         image_type: &str,
         image_url: &str,
         source: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        self.download_item_image_if_missing_impl(item_id, image_type, image_url, source, true)
+        self.download_item_image_if_missing_impl(item_id, image_type, image_url, source)
             .await
     }
 
@@ -182,7 +223,6 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
         source: &str,
-        suppress_download_errors: bool,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
         if self.local_image_exists(item_id, image_type).await? {
             if image_type.eq_ignore_ascii_case("THUMB")
@@ -193,20 +233,26 @@ impl ImageWriteService {
                     .is_some_and(|value| value.eq_ignore_ascii_case("STRM_FFMPEG"))
             {
                 return self
-                    .download_item_image_from_scraper(item_id, image_type, image_url, source)
-                    .await
-                    .map(Some);
+                    .download_item_image_attempt(item_id, image_type, image_url, source, true)
+                    .await;
             }
             return Ok(None);
         }
 
+        self.download_item_image_attempt(item_id, image_type, image_url, source, false)
+            .await
+    }
+
+    async fn download_item_image_attempt(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+        force: bool,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
         let normalized_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
-        if suppress_download_errors && !is_allowed_scraper_image_url(image_url) {
-            return Err(ImageWriteError::InvalidUrl(
-                "selected image URL must be a valid HTTPS scraper image URL".to_owned(),
-            ));
-        }
         let now = current_unix_timestamp();
         let claimed_until = now.saturating_add(IMAGE_ATTEMPT_LEASE.as_secs() as i64);
         let candidate_key = image_candidate_key(source, normalized_type, image_url);
@@ -218,7 +264,7 @@ impl ImageWriteService {
                 &candidate_key,
                 now,
                 claimed_until,
-                false,
+                force,
             )
             .await?
         {
@@ -231,26 +277,22 @@ impl ImageWriteService {
         match result {
             Ok(report) => {
                 self.database
-                    .finish_metadata_image_attempt(
+                    .finish_metadata_image_attempt(MetadataImageAttemptUpdate {
                         item_id,
-                        normalized_type,
-                        &candidate_key,
-                        "AVAILABLE",
-                        None,
-                        None,
-                        current_unix_timestamp(),
-                    )
+                        image_type: normalized_type,
+                        candidate_key: &candidate_key,
+                        status: "AVAILABLE",
+                        next_retry_at: None,
+                        error_code: None,
+                        now: current_unix_timestamp(),
+                    })
                     .await?;
                 Ok(Some(report))
             }
             Err(error) => {
                 self.record_image_attempt_failure(item_id, normalized_type, &candidate_key, &error)
                     .await?;
-                if suppress_download_errors {
-                    Ok(None)
-                } else {
-                    Err(error)
-                }
+                Err(error)
             }
         }
     }
@@ -271,15 +313,15 @@ impl ImageWriteService {
                 .await?,
         );
         self.database
-            .finish_metadata_image_attempt(
+            .finish_metadata_image_attempt(MetadataImageAttemptUpdate {
                 item_id,
                 image_type,
                 candidate_key,
                 status,
                 next_retry_at,
-                Some(error_code),
+                error_code: Some(error_code),
                 now,
-            )
+            })
             .await?;
         Ok(())
     }
@@ -448,7 +490,15 @@ impl ImageWriteService {
             ));
         }
 
-        let response = self.fetch_image(&url).await?;
+        let _permit = self.permits.clone().acquire_owned().await.map_err(|_| {
+            ImageWriteError::InvalidConfiguration("image semaphore closed".to_owned())
+        })?;
+        let download_started = std::time::Instant::now();
+        let response = self.fetch_image(&url).await;
+        if let Some(resources) = &self.resources {
+            resources.record_metadata_stage("image_download", download_started.elapsed());
+        }
+        let response = response?;
         let status = response.status();
         if !status.is_success() {
             return Err(ImageWriteError::UpstreamStatus {
@@ -517,6 +567,7 @@ impl ImageWriteService {
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
         }
+        let write_started = std::time::Instant::now();
         write_image_atomically(&target, &body).await?;
 
         let file_size = i64::try_from(body.len()).map_err(|_| ImageWriteError::TooLarge {
@@ -540,6 +591,10 @@ impl ImageWriteService {
                 },
             )
             .await?;
+        if let Some(resources) = &self.resources {
+            resources.record_metadata_stage("image_write", write_started.elapsed());
+            resources.record_metadata_image_bytes(size);
+        }
         Ok(ImageWriteReport {
             id,
             image_type: image_type.to_owned(),
@@ -628,13 +683,13 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
         source: &str,
-    ) -> Result<ImageWriteReport, ImageWriteError> {
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
         if !is_allowed_scraper_image_url(image_url) {
             return Err(ImageWriteError::InvalidUrl(
                 "scraper image URL must be a valid HTTPS URL".to_owned(),
             ));
         }
-        self.download_item_image_impl(item_id, image_type, image_url, source, true)
+        self.download_item_image_attempt(item_id, image_type, image_url, source, true)
             .await
     }
 

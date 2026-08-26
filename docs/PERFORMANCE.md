@@ -104,6 +104,20 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 
 这里的 p90/p95 是请求耗时分布的位置：例如 p95=4.196 ms 表示 50 次请求中约 95% 不超过 4.196 ms，剩余约 5% 更慢；它们用于观察尾部延迟，不是平均值。由于本次样本只有 50 次，百分位数仅作开发机基线，不能替代目标数据集上的正式验收。
 
+### LUX-200 阶段指标与回归验证
+
+LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resources.metadata` 暴露。计数器只使用固定低基数标签：
+`search`、`bundle`、`get`、`images`、`credits`、`external_ids`、`trailers`，以及
+`queue_wait`、`item_total`、`image_download`、`image_write`、`nfo_write` 阶段；不会包含用户 ID、完整 URL、token 或原始错误文本。
+`stageP95Ms` 使用有界的最近样本窗口。缓存和 singleflight 分别记录 `cache.hit.count` 与 `cache.miss.count`，刮削器重试记录对应 capability 的 `retry.*.count`，图片累计字节记录在 `image.bytes`。
+
+| 日期 | 提交 | 验证 | 结果 | 限制 |
+|---|---|---|---|---|
+| 2026-08-26 | 工作树（`uname -m=arm64`） | `cargo test --locked --test metadata_selection fill_missing_only_requests_the_missing_image_capability` | 只缺 poster 时仅命中 `/3/movie/1/images`；补齐 poster 后第二次 `FILL_MISSING` 上游请求数为 0 | 本地 TMDb stub，非真实 TMDb/NAS 延迟 |
+| 2026-08-26 | 工作树（`uname -m=arm64`） | `cargo test --locked --test image_writer image_downloads_respect_the_global_concurrency_limit` | 6 个并发图片写入在测试 semaphore=2 时最大并发不超过 2 | 证明配额边界，不代表上游吞吐 |
+
+本机架构需以 `uname -m` 记录；ARM64 测试结果不能外推到目标 NAS/x86_64。
+
 ## ARM 开发机检查
 
 - 架构：后续记录 `uname -m` 输出（当前为 `arm64`）。

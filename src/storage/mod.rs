@@ -10483,6 +10483,7 @@ impl Database {
                     mi.premiere_date, mi.last_air_date, mi.status, mi.original_language, mi.rating,
                     mi.provider_ids_json, mi.metadata_scraper_id,
                     mi.metadata_provenance_json, mi.locked_fields_json,
+                    mi.nfo_metadata_json,
                     mi.series_id, mi.season_number, mi.episode_number,
                     series.title AS series_title,
                     series.production_year AS series_production_year,
@@ -10524,6 +10525,7 @@ impl Database {
                     scraper_id,
                     provenance_json: row.get("metadata_provenance_json"),
                     locked_fields_json: row.get("locked_fields_json"),
+                    nfo_metadata_json: row.get("nfo_metadata_json"),
                     series_item_id: row.get("series_id"),
                     series_title: row.get("series_title"),
                     series_production_year: row.get("series_production_year"),
@@ -15405,18 +15407,19 @@ impl Database {
                 claimed_until = excluded.claimed_until,
                 error_code = NULL,
                 updated_at = excluded.updated_at
-            WHERE ? = 1
-               OR (
-                    metadata_image_attempts.status <> 'UNAVAILABLE'
-                    AND (
-                        metadata_image_attempts.status <> 'FAILED'
-                        OR metadata_image_attempts.next_retry_at IS NULL
-                        OR metadata_image_attempts.next_retry_at <= ?
-                    )
-                    AND (
-                        metadata_image_attempts.status <> 'RUNNING'
-                        OR metadata_image_attempts.claimed_until IS NULL
-                        OR metadata_image_attempts.claimed_until <= ?
+             WHERE (
+                    metadata_image_attempts.status <> 'RUNNING'
+                    OR metadata_image_attempts.claimed_until IS NULL
+                    OR metadata_image_attempts.claimed_until <= ?
+               )
+               AND (
+                    ? = 1
+                    OR (
+                        metadata_image_attempts.status <> 'UNAVAILABLE'
+                        AND (
+                            metadata_image_attempts.status <> 'FAILED'
+                            OR metadata_image_attempts.next_retry_at <= ?
+                        )
                     )
                )",
         )
@@ -15426,8 +15429,8 @@ impl Database {
         .bind(now)
         .bind(claimed_until)
         .bind(now)
-        .bind(database_flag(force))
         .bind(now)
+        .bind(database_flag(force))
         .bind(now)
         .execute(&self.pool)
         .await
@@ -15465,13 +15468,7 @@ impl Database {
 
     pub(crate) async fn finish_metadata_image_attempt(
         &self,
-        item_id: &str,
-        image_type: &str,
-        candidate_key: &str,
-        status: &str,
-        next_retry_at: Option<i64>,
-        error_code: Option<&str>,
-        now: i64,
+        update: MetadataImageAttemptUpdate<'_>,
     ) -> Result<bool, StorageError> {
         self.query(
             "UPDATE metadata_image_attempts
@@ -15480,13 +15477,13 @@ impl Database {
              WHERE item_id = ? AND image_type = ? AND candidate_key = ?
                AND status = 'RUNNING'",
         )
-        .bind(status)
-        .bind(next_retry_at)
-        .bind(error_code)
-        .bind(now)
-        .bind(item_id)
-        .bind(image_type)
-        .bind(candidate_key)
+        .bind(update.status)
+        .bind(update.next_retry_at)
+        .bind(update.error_code)
+        .bind(update.now)
+        .bind(update.item_id)
+        .bind(update.image_type)
+        .bind(update.candidate_key)
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
@@ -17188,6 +17185,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) scraper_id: Option<String>,
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
+    pub(crate) nfo_metadata_json: Option<String>,
     pub(crate) series_item_id: Option<String>,
     pub(crate) series_title: Option<String>,
     pub(crate) series_production_year: Option<i64>,
@@ -17526,6 +17524,16 @@ pub(crate) struct ItemImageMetadata<'a> {
     pub(crate) height: Option<i32>,
     pub(crate) content_tag: &'a str,
     pub(crate) source: &'a str,
+}
+
+pub(crate) struct MetadataImageAttemptUpdate<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) image_type: &'a str,
+    pub(crate) candidate_key: &'a str,
+    pub(crate) status: &'a str,
+    pub(crate) next_retry_at: Option<i64>,
+    pub(crate) error_code: Option<&'a str>,
+    pub(crate) now: i64,
 }
 
 #[derive(Debug)]
