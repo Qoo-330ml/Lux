@@ -1202,6 +1202,143 @@ async fn automatic_candidate_search_expands_only_the_best_result()
 }
 
 #[tokio::test]
+async fn automatic_matching_reuses_an_unexpired_pending_candidate_without_search()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Pending Movie",
+            "productionYear": 2020,
+            "providerIds": {"Tmdb": "603"},
+            "metadataFetched": true
+        }),
+    )
+    .await?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = Arc::clone(&requests);
+    let tmdb_app = Router::new().fallback(any(move |_request: Request<Body>| {
+        let requests = Arc::clone(&handler_requests);
+        async move {
+            requests.fetch_add(1, Ordering::SeqCst);
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
+    let scraper = ScraperProvider::from(TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?);
+
+    let page = MetadataCandidateService::new(fixture.database.clone())
+        .search_and_store_for_automatic_match(
+            &fixture.item_id,
+            "Example Movie",
+            Some(2020),
+            &scraper,
+        )
+        .await?;
+
+    assert_eq!(page.items.len(), 1);
+    assert_eq!(page.items[0].provider_id, "603");
+    assert_eq!(requests.load(Ordering::SeqCst), 0);
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_matching_expands_only_the_best_pending_candidate_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Pending Movie",
+            "productionYear": 2020,
+            "providerIds": {"Tmdb": "603"}
+        }),
+    )
+    .await?;
+    let detail_requests = Arc::new(AtomicUsize::new(0));
+    let handler_detail_requests = Arc::clone(&detail_requests);
+    let tmdb_app = Router::new().fallback(any(move |request: Request<Body>| {
+        let detail_requests = Arc::clone(&handler_detail_requests);
+        async move {
+            if request.uri().path() == "/3/movie/603" {
+                detail_requests.fetch_add(1, Ordering::SeqCst);
+                return Json(json!({
+                    "id": 603,
+                    "title": "Hydrated Movie",
+                    "overview": "Hydrated overview",
+                    "release_date": "2020-01-01",
+                    "original_language": "en"
+                }))
+                .into_response();
+            }
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
+    let config = TmdbClientConfig {
+        base_url: format!("http://{address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    };
+    let first_scraper = ScraperProvider::from(TmdbClient::new(config.clone())?);
+    let candidates = MetadataCandidateService::new(fixture.database.clone());
+    let first_page = candidates
+        .search_and_store_for_automatic_match(
+            &fixture.item_id,
+            "Example Movie",
+            Some(2020),
+            &first_scraper,
+        )
+        .await?;
+    assert_eq!(
+        first_page.items[0].candidate["overview"],
+        "Hydrated overview"
+    );
+
+    let second_scraper = ScraperProvider::from(TmdbClient::new(config)?);
+    let second_page = candidates
+        .search_and_store_for_automatic_match(
+            &fixture.item_id,
+            "Example Movie",
+            Some(2020),
+            &second_scraper,
+        )
+        .await?;
+    assert_eq!(
+        second_page.items[0].candidate["overview"],
+        "Hydrated overview"
+    );
+    assert_eq!(detail_requests.load(Ordering::SeqCst), 1);
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn fill_missing_requests_the_missing_credits_capability_without_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

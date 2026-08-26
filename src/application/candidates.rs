@@ -242,8 +242,26 @@ impl MetadataCandidateService {
             query,
             year,
             scraper,
-            CandidateSearchMode::Automatic,
+            CandidateSearchMode::AutomaticReuse,
             plan,
+        )
+        .await
+    }
+
+    pub(crate) async fn search_and_store_for_automatic_match_fresh(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        scraper: &ScraperProvider,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_with_mode(
+            item_id,
+            query,
+            year,
+            scraper,
+            CandidateSearchMode::AutomaticFresh,
+            MetadataRequestPlan::full(),
         )
         .await
     }
@@ -262,6 +280,13 @@ impl MetadataCandidateService {
             .find_media_item_metadata(item_id)
             .await?
             .ok_or(MetadataCandidateError::ItemNotFound)?;
+        if matches!(mode, CandidateSearchMode::AutomaticReuse)
+            && let Some(page) = self
+                .reuse_unexpired_automatic_candidates(item_id, &current, scraper, plan)
+                .await?
+        {
+            return Ok(page);
+        }
         let kind = match current.item_type.as_str() {
             "MOVIE" => MediaKind::Movie,
             "SERIES" => MediaKind::Series,
@@ -366,7 +391,10 @@ impl MetadataCandidateService {
         };
         let expires_at = candidate_expiry();
         let mut results = response.items.into_iter().take(20).collect::<Vec<_>>();
-        if matches!(mode, CandidateSearchMode::Automatic) {
+        if matches!(
+            mode,
+            CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
+        ) {
             results.sort_by(|left, right| {
                 search_result_score(&current, left)
                     .total_cmp(&search_result_score(&current, right))
@@ -380,7 +408,11 @@ impl MetadataCandidateService {
             };
             let provider = provider.to_owned();
             let provider_id = provider_id.to_owned();
-            if matches!(mode, CandidateSearchMode::Automatic) && result_index > 0 {
+            if matches!(
+                mode,
+                CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
+            ) && result_index > 0
+            {
                 let score = search_result_score(&current, &result);
                 let mut provider_ids = result.provider_ids.clone();
                 provider_ids
@@ -423,6 +455,7 @@ impl MetadataCandidateService {
                         provider_id,
                         images: BTreeMap::new(),
                         actors: Vec::new(),
+                        metadata_fetched: false,
                         score: Some(score),
                     },
                     expires_at,
@@ -756,6 +789,7 @@ impl MetadataCandidateService {
                     provider_id,
                     images: generic_candidate_images(&images.images, item_type),
                     actors,
+                    metadata_fetched: details.is_some(),
                     score: direct_provider_id.as_ref().map(|_| 100.0),
                 },
                 expires_at,
@@ -763,6 +797,125 @@ impl MetadataCandidateService {
             .await?;
         }
         self.list_for_item(item_id, None, 0, 50).await
+    }
+
+    async fn reuse_unexpired_automatic_candidates(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+        scraper: &ScraperProvider,
+        plan: MetadataRequestPlan,
+    ) -> Result<Option<MetadataCandidatePage>, MetadataCandidateError> {
+        let provider_key = provider_key_from_plugin_id(scraper.provider_key());
+        let mut rows = self
+            .database
+            .list_unexpired_pending_metadata_candidates_for_item(item_id, 50)
+            .await?;
+        rows.retain(|row| provider_key_from_plugin_id(&row.provider) == provider_key);
+        rows.truncate(2);
+        let Some(best) = rows.first_mut() else {
+            return Ok(None);
+        };
+        if plan.needs_metadata && !Self::candidate_metadata_was_fetched(&best.candidate_json)? {
+            let item_type = match current.item_type.as_str() {
+                "MOVIE" => ScraperItemType::Movie,
+                "SERIES" => ScraperItemType::Series,
+                _ => return Ok(None),
+            };
+            let details = scraper
+                .get_generic(ScraperGetRequest::new(
+                    item_type,
+                    best.provider_id.clone(),
+                    "zh-CN",
+                ))
+                .await
+                .map_err(MetadataCandidateError::Scraper)?;
+            let candidate_json =
+                Self::merge_scraper_metadata_into_candidate(&best.candidate_json, &details)?;
+            if !self
+                .database
+                .update_pending_metadata_candidate_json(item_id, &best.id, &candidate_json)
+                .await?
+            {
+                return Ok(None);
+            }
+            best.candidate_json = candidate_json;
+        }
+        let items = rows
+            .into_iter()
+            .map(|row| candidate_view(row, Some(current)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        Ok(Some(MetadataCandidatePage {
+            items,
+            total,
+            offset: 0,
+            limit: 50,
+        }))
+    }
+
+    fn candidate_metadata_was_fetched(
+        candidate_json: &str,
+    ) -> Result<bool, MetadataCandidateError> {
+        let value = serde_json::from_str::<Value>(candidate_json)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+        Ok(value
+            .get("metadataFetched")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    fn merge_scraper_metadata_into_candidate(
+        candidate_json: &str,
+        details: &ScraperMetadata,
+    ) -> Result<String, MetadataCandidateError> {
+        let mut value = serde_json::from_str::<Value>(candidate_json)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+        let mut provider_ids = candidate_provider_ids(&value)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+        provider_ids.extend(details.provider_ids.clone());
+        let object = value.as_object_mut().ok_or_else(|| {
+            MetadataCandidateError::InvalidCandidateJson("candidate must be an object".to_owned())
+        })?;
+
+        macro_rules! set_optional {
+            ($field:ident, $key:literal) => {
+                if let Some(value) = details.$field.as_ref() {
+                    object.insert($key.to_owned(), json!(value));
+                }
+            };
+        }
+        set_optional!(title, "title");
+        set_optional!(original_title, "originalTitle");
+        set_optional!(overview, "overview");
+        set_optional!(tagline, "tagline");
+        set_optional!(website, "website");
+        set_optional!(production_year, "productionYear");
+        set_optional!(rating, "rating");
+        set_optional!(votes, "votes");
+        set_optional!(runtime, "runtime");
+        set_optional!(premiere_date, "premiereDate");
+        set_optional!(original_language, "originalLanguage");
+        set_optional!(end_date, "endDate");
+        set_optional!(status, "status");
+        set_optional!(set_name, "setName");
+        set_optional!(set_id, "setId");
+        set_optional!(poster_url, "posterUrl");
+        set_optional!(backdrop_url, "backdropUrl");
+        set_optional!(certification, "certification");
+        if !details.genres.is_empty() {
+            object.insert("genres".to_owned(), json!(details.genres));
+        }
+        if !details.countries.is_empty() {
+            object.insert("countries".to_owned(), json!(details.countries));
+        }
+        if !details.studios.is_empty() {
+            object.insert("studios".to_owned(), json!(details.studios));
+        }
+        object.insert("providerIds".to_owned(), json!(provider_ids));
+        object.insert("metadataFetched".to_owned(), Value::Bool(true));
+        serde_json::to_string(&value)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))
     }
 
     async fn search_child_and_store(
@@ -866,6 +1019,7 @@ impl MetadataCandidateService {
                     ..ScraperMetadata::default()
                 }
             };
+            let metadata_fetched = plan.needs_metadata || selected_child_provider_id.is_none();
             let Some(provider_id) = selected_child_provider_id
                 .or_else(|| selected_metadata_provider_id(&metadata, &parent.provider))
             else {
@@ -930,6 +1084,7 @@ impl MetadataCandidateService {
                     provider_id,
                     images: generic_candidate_images(&images.images, item_type),
                     actors: Vec::new(),
+                    metadata_fetched,
                     score: Some(parent.score),
                 },
                 expires_at,
@@ -1048,6 +1203,7 @@ impl MetadataCandidateService {
             "originalLanguage": candidate.original_language,
             "images": candidate.images,
             "actors": candidate.actors,
+            "metadataFetched": candidate.metadata_fetched,
         })
         .to_string();
         let id = uuid::Uuid::now_v7().to_string();
@@ -1127,13 +1283,15 @@ struct CandidateMetadata {
     provider_id: String,
     images: BTreeMap<String, Vec<String>>,
     actors: Vec<ActorCredit>,
+    metadata_fetched: bool,
     score: Option<f64>,
 }
 
 #[derive(Clone, Copy)]
 enum CandidateSearchMode {
     Manual,
-    Automatic,
+    AutomaticReuse,
+    AutomaticFresh,
 }
 
 struct ParentProvider {

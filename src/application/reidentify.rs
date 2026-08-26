@@ -958,7 +958,7 @@ impl MetadataReidentifyService {
                 .map_err(MetadataReidentifyError::Candidate)?
         } else {
             self.candidates
-                .search_and_store_for_automatic_match(
+                .search_and_store_for_automatic_match_fresh(
                     item_id,
                     &item.title,
                     item.production_year

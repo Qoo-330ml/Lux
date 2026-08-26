@@ -11051,6 +11051,39 @@ impl Database {
             })
     }
 
+    pub(crate) async fn update_pending_metadata_candidate_json(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        candidate_json: &str,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE metadata_candidates
+                 SET candidate_json = ?, updated_at = unixepoch()
+                 WHERE id = ? AND item_id = ? AND status = 'PENDING'",
+            )
+            .bind(candidate_json)
+            .bind(candidate_id)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn list_metadata_capability_attempts(
         &self,
         item_id: &str,
@@ -11383,6 +11416,34 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_metadata_candidate))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_unexpired_pending_metadata_candidates_for_item(
+        &self,
+        item_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredMetadataCandidate>, StorageError> {
+        self.query(
+            "SELECT mc.id, mc.item_id, mc.provider, mc.provider_id,
+                    mc.candidate_json, mc.score, mc.status, mc.expires_at,
+                    mi.title AS item_title
+             FROM metadata_candidates mc
+             JOIN media_items mi ON mi.id = mc.item_id
+             WHERE mc.item_id = ? AND mc.status = 'PENDING'
+               AND mi.removed_at IS NULL
+               AND (mc.expires_at IS NULL OR mc.expires_at > unixepoch())
+             ORDER BY mc.score DESC, mc.created_at, mc.id
+             LIMIT ?",
+        )
+        .bind(item_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
