@@ -2,7 +2,7 @@ use std::{
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
-    time::{Duration, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{Client, Url, header::CONTENT_TYPE};
@@ -31,6 +31,9 @@ use crate::{
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
 const IMAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
+const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
+const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
 
 pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
     let path = path.to_owned();
@@ -158,12 +161,8 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        if self.local_image_exists(item_id, image_type).await? {
-            return Ok(None);
-        }
-        self.download_item_image_with_source(item_id, image_type, image_url, "TMDB")
+        self.download_item_image_if_missing_impl(item_id, image_type, image_url, "TMDB", false)
             .await
-            .map(Some)
     }
 
     pub(crate) async fn download_item_image_if_missing_from_scraper(
@@ -172,6 +171,18 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
         source: &str,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
+        self.download_item_image_if_missing_impl(item_id, image_type, image_url, source, true)
+            .await
+    }
+
+    async fn download_item_image_if_missing_impl(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+        suppress_download_errors: bool,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
         if self.local_image_exists(item_id, image_type).await? {
             if image_type.eq_ignore_ascii_case("THUMB")
@@ -188,9 +199,89 @@ impl ImageWriteService {
             }
             return Ok(None);
         }
-        self.download_item_image_from_scraper(item_id, image_type, image_url, source)
-            .await
-            .map(Some)
+
+        let normalized_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        if suppress_download_errors && !is_allowed_scraper_image_url(image_url) {
+            return Err(ImageWriteError::InvalidUrl(
+                "selected image URL must be a valid HTTPS scraper image URL".to_owned(),
+            ));
+        }
+        let now = current_unix_timestamp();
+        let claimed_until = now.saturating_add(IMAGE_ATTEMPT_LEASE.as_secs() as i64);
+        let candidate_key = image_candidate_key(source, normalized_type, image_url);
+        if !self
+            .database
+            .claim_metadata_image_attempt(
+                item_id,
+                normalized_type,
+                &candidate_key,
+                now,
+                claimed_until,
+                false,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let result = self
+            .download_item_image_impl(item_id, normalized_type, image_url, source, true)
+            .await;
+        match result {
+            Ok(report) => {
+                self.database
+                    .finish_metadata_image_attempt(
+                        item_id,
+                        normalized_type,
+                        &candidate_key,
+                        "AVAILABLE",
+                        None,
+                        None,
+                        current_unix_timestamp(),
+                    )
+                    .await?;
+                Ok(Some(report))
+            }
+            Err(error) => {
+                self.record_image_attempt_failure(item_id, normalized_type, &candidate_key, &error)
+                    .await?;
+                if suppress_download_errors {
+                    Ok(None)
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn record_image_attempt_failure(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        candidate_key: &str,
+        error: &ImageWriteError,
+    ) -> Result<(), ImageWriteError> {
+        let now = current_unix_timestamp();
+        let (status, next_retry_at, error_code) = image_attempt_failure(
+            error,
+            now,
+            self.database
+                .metadata_image_attempt_count(item_id, image_type, candidate_key)
+                .await?,
+        );
+        self.database
+            .finish_metadata_image_attempt(
+                item_id,
+                image_type,
+                candidate_key,
+                status,
+                next_retry_at,
+                Some(error_code),
+                now,
+            )
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn list_item_images(
@@ -1178,6 +1269,58 @@ fn content_tag(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn image_candidate_key(source: &str, image_type: &str, image_url: &str) -> String {
+    let material = format!("{source}\0{image_type}\0{image_url}");
+    content_tag(material.as_bytes())
+}
+
+fn image_retry_delay_seconds(attempt_count: u32) -> i64 {
+    let exponent = attempt_count.saturating_sub(1).min(8);
+    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
+    IMAGE_RETRY_BASE_SECONDS
+        .saturating_mul(multiplier)
+        .min(IMAGE_RETRY_MAX_SECONDS)
+}
+
+fn image_attempt_failure(
+    error: &ImageWriteError,
+    now: i64,
+    attempt_count: u32,
+) -> (&'static str, Option<i64>, &'static str) {
+    match error {
+        ImageWriteError::UpstreamStatus { status: 404 | 410 } => {
+            ("UNAVAILABLE", None, "UPSTREAM_NOT_FOUND")
+        }
+        ImageWriteError::InvalidUrl(_)
+        | ImageWriteError::UnsupportedContentType { .. }
+        | ImageWriteError::InvalidContent { .. }
+        | ImageWriteError::TooLarge { .. } => ("UNAVAILABLE", None, "INVALID_IMAGE"),
+        ImageWriteError::UpstreamStatus { .. }
+        | ImageWriteError::Download(_)
+        | ImageWriteError::ConcurrentModification(_)
+        | ImageWriteError::Io { .. } => (
+            "FAILED",
+            Some(now.saturating_add(image_retry_delay_seconds(attempt_count))),
+            "TRANSIENT_FAILURE",
+        ),
+        ImageWriteError::InvalidConfiguration(_)
+        | ImageWriteError::InvalidImageType(_)
+        | ImageWriteError::ClientBuild(_)
+        | ImageWriteError::ItemNotFound
+        | ImageWriteError::PathOutsideRoot(_)
+        | ImageWriteError::SymlinkTarget(_)
+        | ImageWriteError::Storage(_) => ("FAILED", None, "PERMANENT_FAILURE"),
+    }
 }
 
 fn image_io_error(path: &Path, source: std::io::Error) -> ImageWriteError {

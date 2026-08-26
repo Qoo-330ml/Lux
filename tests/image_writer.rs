@@ -1,4 +1,10 @@
-use std::path::PathBuf;
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
 
 use axum::extract::Path as AxumPath;
 use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
@@ -93,6 +99,121 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
 
     server.abort();
     let _ = root;
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_image_not_found_is_not_requested_again_on_next_attempt()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = Arc::clone(&requests);
+    let app = Router::new().route(
+        "/missing",
+        get(move || {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .status(StatusCode::NOT_FOUND)
+                    .body(Body::empty())
+                    .expect("not-found response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::with_config(database, ImageDownloadConfig::default())?;
+    let image_url = format!("http://{address}/missing");
+
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await
+            .is_err()
+    );
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await?
+            .is_none()
+    );
+
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_image_failure_is_skipped_until_retry_deadline()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = Arc::clone(&requests);
+    let app = Router::new().route(
+        "/temporary",
+        get(move || {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(Body::empty())
+                    .expect("temporary failure response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::with_config(database.clone(), ImageDownloadConfig::default())?;
+    let image_url = format!("http://{address}/temporary");
+
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await
+            .is_err()
+    );
+    let after_first = requests.load(Ordering::SeqCst);
+    assert!(after_first > 0);
+    let attempt: (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, next_retry_at
+         FROM metadata_image_attempts
+         WHERE item_id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(attempt.0, "FAILED");
+    assert!(attempt.1.is_some());
+
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await?
+            .is_none()
+    );
+    assert_eq!(requests.load(Ordering::SeqCst), after_first);
+
+    sqlx::query(
+        "UPDATE metadata_image_attempts
+         SET next_retry_at = 0
+         WHERE item_id = ?",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await
+            .is_err()
+    );
+    assert!(requests.load(Ordering::SeqCst) > after_first);
+
+    server.abort();
     Ok(())
 }
 

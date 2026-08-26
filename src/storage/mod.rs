@@ -15383,6 +15383,119 @@ impl Database {
             })
     }
 
+    pub(crate) async fn claim_metadata_image_attempt(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        candidate_key: &str,
+        now: i64,
+        claimed_until: i64,
+        force: bool,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "INSERT INTO metadata_image_attempts (
+                item_id, image_type, candidate_key, status, attempt_count,
+                last_attempt_at, next_retry_at, claimed_until, error_code, updated_at
+            ) VALUES (?, ?, ?, 'RUNNING', 1, ?, NULL, ?, NULL, ?)
+            ON CONFLICT(item_id, image_type, candidate_key) DO UPDATE SET
+                status = 'RUNNING',
+                attempt_count = metadata_image_attempts.attempt_count + 1,
+                last_attempt_at = excluded.last_attempt_at,
+                next_retry_at = NULL,
+                claimed_until = excluded.claimed_until,
+                error_code = NULL,
+                updated_at = excluded.updated_at
+            WHERE ? = 1
+               OR (
+                    metadata_image_attempts.status <> 'UNAVAILABLE'
+                    AND (
+                        metadata_image_attempts.status <> 'FAILED'
+                        OR metadata_image_attempts.next_retry_at IS NULL
+                        OR metadata_image_attempts.next_retry_at <= ?
+                    )
+                    AND (
+                        metadata_image_attempts.status <> 'RUNNING'
+                        OR metadata_image_attempts.claimed_until IS NULL
+                        OR metadata_image_attempts.claimed_until <= ?
+                    )
+               )",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .bind(candidate_key)
+        .bind(now)
+        .bind(claimed_until)
+        .bind(now)
+        .bind(database_flag(force))
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn metadata_image_attempt_count(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        candidate_key: &str,
+    ) -> Result<u32, StorageError> {
+        let count = self
+            .query_scalar::<i64>(
+                "SELECT attempt_count
+                 FROM metadata_image_attempts
+                 WHERE item_id = ? AND image_type = ? AND candidate_key = ?",
+            )
+            .bind(item_id)
+            .bind(image_type)
+            .bind(candidate_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .unwrap_or(1);
+        Ok(u32::try_from(count.max(1)).unwrap_or(u32::MAX))
+    }
+
+    pub(crate) async fn finish_metadata_image_attempt(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        candidate_key: &str,
+        status: &str,
+        next_retry_at: Option<i64>,
+        error_code: Option<&str>,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE metadata_image_attempts
+             SET status = ?, next_retry_at = ?, claimed_until = NULL,
+                 error_code = ?, updated_at = ?
+             WHERE item_id = ? AND image_type = ? AND candidate_key = ?
+               AND status = 'RUNNING'",
+        )
+        .bind(status)
+        .bind(next_retry_at)
+        .bind(error_code)
+        .bind(now)
+        .bind(item_id)
+        .bind(image_type)
+        .bind(candidate_key)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn insert_item_image(
         &self,
         item_id: &str,
