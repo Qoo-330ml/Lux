@@ -962,18 +962,26 @@ impl MetadataCandidateService {
         scraper: &ScraperProvider,
         provider_id: &str,
     ) -> Result<(), MetadataCandidateError> {
-        let source = scraper.plugin_id().unwrap_or(scraper.provider_key());
+        let sources = [
+            scraper.plugin_id().unwrap_or(scraper.provider_key()),
+            scraper.provider_key(),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()
             .and_then(|duration| i64::try_from(duration.as_secs()).ok())
             .unwrap_or_default();
-        for image_type in SCRAPER_IMAGE_TYPES {
-            let candidate_key = image_no_candidate_key(source, image_type, provider_id);
-            self.database
-                .mark_metadata_image_unavailable(item_id, image_type, &candidate_key, now)
-                .await
-                .map_err(MetadataCandidateError::Storage)?;
+        for source in sources {
+            for image_type in SCRAPER_IMAGE_TYPES {
+                let candidate_key = image_no_candidate_key(&source, image_type, provider_id);
+                self.database
+                    .mark_metadata_image_unavailable(item_id, image_type, &candidate_key, now)
+                    .await
+                    .map_err(MetadataCandidateError::Storage)?;
+            }
         }
         Ok(())
     }
@@ -1095,9 +1103,13 @@ fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, Strin
     ] {
         if let Some(source) = source.map(str::trim).filter(|value| !value.is_empty()) {
             sources.insert(source.to_owned());
+            sources.insert(source.to_ascii_lowercase());
         }
     }
-    sources.extend(provider_ids.keys().cloned());
+    for source in provider_ids.keys() {
+        sources.insert(source.clone());
+        sources.insert(source.to_ascii_lowercase());
+    }
     sources
         .into_iter()
         .filter_map(|source| {

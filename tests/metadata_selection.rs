@@ -1468,6 +1468,14 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
             .as_slice(),
         ["/3/movie/1/images"]
     );
+    let unavailable_images: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metadata_image_attempts
+         WHERE item_id = ? AND status = 'UNAVAILABLE' AND error_code = 'NO_IMAGE'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert!(unavailable_images >= 8);
 
     tmdb_server.abort();
     Ok(())
