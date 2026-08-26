@@ -1835,11 +1835,14 @@ services:
 - 决定：Emby 路由/DTO 与 Lux API/领域模型分离。
 - 原因：兼容怪癖不能反向污染核心设计。
 
-### ADR-004：首版只直放
+### ADR-004：直放优先的 Web 播放
 
-- 状态：已由需求确认。
-- 决定：不实现转码或 remux。
-- 后果：部分浏览器文件无法播放，明确提示。
+- 状态：已接受；服务端播放细节由 ADR-026 补充。
+- 决定：Web 播放使用 0～4 档，始终先尝试档位 0 原始 Range 直放；本地媒体必要时按顺序使用档位 1 Remux、
+  档位 2 音频转码、档位 3 硬件转码或档位 4 软件转码。服务端 HLS 只使用会话级临时资源，不生成永久副本。
+- `.strm` 永远只允许档位 0；直连失败时返回明确错误，不进入服务端 Remux、转码、HLS 或媒体字节代理。
+- 运行时统一使用 Jellyfin 官方 `jellyfin-ffmpeg` FFmpeg 7 正式版，普通 Debian `ffmpeg` 不安装。
+- 后果：本地媒体覆盖更多浏览器格式，但服务端需要会话签名、进程组、并发、磁盘配额和生命周期回收治理。
 
 ### ADR-005：本地元数据为默认来源
 
@@ -4546,18 +4549,19 @@ Web API：
 
 验收：
 
-- [ ] 空 SQLite 和 PostgreSQL 均能运行新增迁移；播放会话、幂等事件和临时资源状态约束有效。
-- [ ] 本地 MP4/H.264/AAC 在档位 0 使用 Range 直放；MKV 等容器在需要时使用档位 1 HLS，视频和音频质量不改变。
-- [ ] 不兼容音频可选择档位 2；无可用硬件且策略允许时才选择档位 4；硬件能力不可用时不会伪造档位 3。
-- [ ] `.strm` 直放成功时只产生档位 0；直放失败时没有 ffmpeg 子进程、临时 HLS 目录或服务器代理流量。
-- [ ] HLS 播放可以取得 manifest、init segment 和媒体 segment，首次播放不需要等待整部媒体处理完成；seek、暂停、停止和断线回收正常。
-- [ ] 事件重复、乱序、页面关闭和心跳超时不会造成进度倒退或会话泄漏。
-- [ ] 无权限 source、过期签名、路径穿越、错误用户 session 和跨会话 segment 请求均被拒绝。
-- [ ] Web 播放器支持原生 Direct、Safari 原生 HLS、MSE/HLS.js 和现有客户端 fallback，并显示可诊断的失败原因。
-- [ ] `ffmpeg`、`ffprobe` 和所有现有媒体工具实际来自 `/usr/lib/jellyfin-ffmpeg`，版本为 `7.1.4-Jellyfin`。
+- [x] 空 SQLite 和 PostgreSQL 均能运行新增迁移；播放会话、幂等事件和临时资源状态约束有效。
+- [x] 本地 MP4/H.264/AAC 在档位 0 使用 Range 直放；MKV 等容器在需要时使用档位 1 HLS，视频和音频质量不改变。
+- [x] 不兼容音频可选择档位 2；无可用硬件且策略允许时才选择档位 4；硬件能力不可用时不会伪造档位 3。
+- [x] `.strm` 直放成功时只产生档位 0；直放失败时没有 ffmpeg 子进程、临时 HLS 目录或服务器代理流量。
+- [x] HLS 播放可以取得 manifest、init segment 和媒体 segment，首次播放不需要等待整部媒体处理完成；seek、暂停、停止和断线回收正常。
+- [x] 事件重复、乱序、页面关闭和心跳超时不会造成进度倒退或会话泄漏。
+- [x] 无权限 source、过期签名、路径穿越、错误用户 session 和跨会话 segment 请求均被拒绝。
+- [x] Web 播放器支持原生 Direct、Safari 原生 HLS、MSE/HLS.js 和现有客户端 fallback，并显示可诊断的失败原因。
+- [x] `ffmpeg`、`ffprobe` 和所有现有媒体工具实际来自 `/usr/lib/jellyfin-ffmpeg`，版本为 `7.1.4-Jellyfin`。
 
 验证：Rust 单元/集成测试、SQLite/PostgreSQL migration 测试、容器 ARM64/AMD64 smoke test、Web 单测和构建、
-真实浏览器 manifest/segment/seek/停止测试；记录 `uname -m`，不以本机 ARM 结果宣称 NAS/x86 性能。
+真实浏览器 manifest/segment/seek/停止测试；本机 `uname -m=arm64`，不以本机 ARM 结果宣称 NAS/x86 性能。验证记录见
+`docs/LUX-198-PLAN.md` 和 `docs/COMPATIBILITY.md`。
 
 依赖：LUX-184、LUX-185、LUX-189。
 

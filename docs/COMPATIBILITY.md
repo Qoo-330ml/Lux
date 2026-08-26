@@ -65,6 +65,24 @@ High@5.1 (`avc1.640033`) 探测，避免 4K 错误使用 High@4.0 (`avc1.640028`
 记录探针结果时必须包含浏览器版本、平台/设备、Lux 提交、`uname -m`、样本校验值、metadata 结果、实际
 播放时长、VideoFrame 数量、丢帧和音画同步观察。不得写入完整媒体 URL、令牌、Cookie 或用户数据。
 
+## Lux Web LUX-198 网页播放实测（2026-08-26）
+
+本次验证使用本地临时媒体和隔离容器；没有把密码、Cookie、签名 URL 或用户数据写入记录。宿主机
+`uname -m=arm64`，因此以下 ARM 结果不外推为 NAS/x86_64 性能结论。
+
+| 路径 | 结果 | 证据 |
+|---|---|---|
+| Direct | 通过 | 本地有效媒体的签名 Direct 请求支持 Range 并返回 206；篡改签名、停止会话后的旧 URL 均被拒绝 |
+| 服务端 HLS | 通过 | 本地媒体在服务端取得 `index.m3u8`、`init.mp4` 和多个 `.m4s`；首个分片生成前无需等待整部媒体完成，seek/暂停可用 |
+| 会话事件 | 通过 | `PLAYING`、`PAUSED`、`STOPPED` 上报可用；重复 `eventId` 返回 `duplicate`，旧 `sequence` 返回 `stale`，播放位置不倒退 |
+| 生命周期 | 通过 | 页面关闭、自然结束、心跳超时和服务重启后的孤儿目录均完成 HLS 进程/临时目录回收 |
+| `.strm` | 通过 | 不支持 Direct 时响应为 `tier=0`、`UNSUPPORTED`、`STRM_REQUIRES_DIRECT_PLAY`；未创建 HLS 目录或 FFmpeg 进程，Lux 不代理媒体字节 |
+| 浏览器引擎 | 通过 | Direct 原生 video、HLS.js/MSE 和 Safari 原生 HLS 路径均有单测；真实浏览器验证了 manifest、init、segment、seek、暂停和停止 |
+
+运行时使用官方 [jellyfin-ffmpeg `v7.1.4-3`](https://github.com/jellyfin/jellyfin-ffmpeg/releases/tag/v7.1.4-3)
+正式版。ARM64 与 AMD64 runtime/application 镜像均按固定 SHA-256 构建；容器内 `ffmpeg`、`ffprobe` 来自
+`/usr/lib/jellyfin-ffmpeg`，未安装普通 Debian `ffmpeg`。该记录只证明构建与版本选择，不代表 AMD64/NAS 的转码性能。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。
