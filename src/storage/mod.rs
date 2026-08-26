@@ -15503,7 +15503,10 @@ impl Database {
             ) VALUES (?, ?, ?, 'UNAVAILABLE', 1, ?, NULL, NULL, 'NO_IMAGE', ?)
             ON CONFLICT(item_id, image_type, candidate_key) DO UPDATE SET
                 status = 'UNAVAILABLE',
-                attempt_count = MAX(metadata_image_attempts.attempt_count, 1),
+                attempt_count = CASE
+                    WHEN metadata_image_attempts.attempt_count < 1 THEN 1
+                    ELSE metadata_image_attempts.attempt_count
+                END,
                 last_attempt_at = excluded.last_attempt_at,
                 next_retry_at = NULL,
                 claimed_until = NULL,
