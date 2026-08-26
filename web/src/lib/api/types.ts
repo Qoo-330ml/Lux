@@ -799,6 +799,7 @@ export type AdminSettings = {
   resumePlayedPercent: number;
   resumeMinTicks: number;
   mediaStrategy: MediaStrategySettings;
+  strmAllowedRoots?: string[];
   networkProxy?: AdminNetworkProxySettings;
 };
 
