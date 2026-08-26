@@ -82,7 +82,11 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回当前插件商店目录和 `/config/plugins` 本地发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、非敏感 `configValues`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 包含输入类型、是否多选、默认值、数值范围和选项来源；`media-libraries` 选项由当前媒体库动态填充。TMDb 的 `configValues` 返回非敏感设置，不返回 API Key 或 Token。目录不可用时，已发现的本地插件仍可用于已安装管理页。
 - `POST /api/v1/admin/plugins/{pluginId}/install`：安装本地发现的插件，或下载当前插件商店目录声明的 `.zip` 包并校验大小、路径、manifest、平台入口和 SHA-256 后原子写入 `/config/plugins`，默认启用。首次安装返回 201，重复请求返回 200；下载失败或未知插件返回相应错误，不改变安装状态。
 - `PATCH /api/v1/admin/plugins/{pluginId}/enabled`：更新已安装插件的启用状态，请求体为 `{ "enabled": true }` 或 `{ "enabled": false }`。禁用只改变运行/选择状态，不删除安装记录；已安装管理列表仍会返回该插件。未安装或未知插件返回相应错误，成功返回更新后的插件状态。
- - `PUT /api/v1/admin/plugins/{pluginId}/config`：替换或更新插件配置。TMDb 请求体可包含 `{ "apiKey": "...", "preferredLanguage": "zh-CN", "languageFallbackEnabled": false, "fallbackLanguages": ["zh-SG", "zh-HK", "zh-TW"], "alternateApiEnabled": true, "apiBaseUrl": "https://api.tmdb.org" }`；`org.lux.strm-media-info` 请求体为 `{ "libraryIds": ["..."], "concurrency": 2, "mediaInfoEnabled": true, "thumbnailEnabled": false, "thumbnailPositionPercent": 30, "existingInfoPolicy": "SKIP", "writeSidecars": true, "schedule": "0 3 * * *" }`，其中 `thumbnailPositionPercent` 范围为 1-99，也支持 `OVERWRITE` 覆盖已有媒体信息。媒体信息和缩略图开关独立；启用截图时，没有本地或在线 `POSTER`/`THUMB` 的 STRM 也会截图，且同一截图同时作为 `POSTER` 和 `THUMB` 登记。媒体插件配置按 manifest 校验并保存到插件专属配置文件；成功返回不含明文凭据的插件状态。
+ - `PUT /api/v1/admin/plugins/{pluginId}/config`：按该插件 manifest 的 `configFields` 替换或更新配置；宿主将
+  配置保存到插件专属文件，并在 metadata 插件启动时只传递 `LUX_PLUGIN_CONFIG_PATH`。TMDb、豆瓣等 provider
+  的上游字段由插件自己解释，Lux API 不再定义 TMDb 专用请求结构或读取 TMDb 配置文件；敏感字段仍不在响应中
+  返回。`org.lux.strm-media-info` 仍接受其 manifest 声明的媒体信息和缩略图配置，其中
+  `thumbnailPositionPercent` 范围为 1-99。
 - `POST /api/v1/admin/plugins/org.lux.strm-media-info/run`：按已保存的 strm-media-info 插件配置创建 STRM 探测任务，返回 202；不接受媒体库、并发等宿主覆盖参数。
 - 插件包必须是 `.zip` 或开发用解压目录，根目录包含 `manifest.json`。Lux 启动时校验包格式、协议版本、平台架构、文件哈希和签名；校验失败的包不会运行。
 - 插件通过独立进程和 JSON-RPC 风格协议提供 `plugin.hello`、`plugin.health`、`metadata.search`、`metadata.get`、`metadata.images`、`metadata.externalIds`、`metadata.trailers` 和 `plugin.shutdown`。

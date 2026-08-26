@@ -1866,6 +1866,18 @@ services:
   关系和查询，媒体目录中的 NFO/本地图片仍按 ADR-005 作为字段级来源。
 - 后果：新布局必须支持旧 `/config/people` 只读兼容、原子写入、路径校验和可重建迁移。
 
+### ADR-028：元数据 provider 与宿主实现彻底解耦
+
+- 状态：已接受；由 LUX-201 实施。
+- 决定：Lux 主程序只依赖 provider-neutral 的 metadata RPC 和插件目录契约；TMDb、豆瓣以及其他上游
+  服务的 HTTP client、endpoint DTO、凭据读取、语言策略和图片 URL 转换全部属于各自的外置插件。
+- 兼容：`tmdb`、`douban` 等 provider namespace 可以继续出现在 NFO、Emby DTO、历史 provider ID 和
+  旧 `scraperId` 中，但只能由通用兼容层按字符串处理；它们不是主程序的 client、配置或网络探针依赖。
+- 配置：宿主为每个插件生成并传递专属 `LUX_PLUGIN_CONFIG_PATH`，metadata 插件不得获得整个 Lux 配置根目录。
+  旧共享配置在首次发现/启动时迁移到对应插件配置文件，迁移成功后不再由宿主读取上游专属字段。
+- 版本：协议 v1 的 metadata 方法保持不变；TMDb 与豆瓣插件分别在解耦发布中增加一个 patch 版本。
+- 原因：避免新增 provider 时修改核心依赖、数据库模型和应用服务，也避免插件读取无关凭据。
+
 ---
 
 ## 24. 全局完成标准
@@ -4677,6 +4689,39 @@ SQLite 空库 migration、NFO/图片优先级、锁定字段和人物关系回�
 验证：参见 `docs/decisions/027-metadata-refresh-resource-pipeline.md` 和 `docs/PERFORMANCE.md`。
 
 依赖：LUX-169、LUX-189、LUX-196。
+
+#### LUX-201：TMDb/豆瓣与 Lux 主程序彻底解耦
+
+范围：在不改变 metadata RPC v1、NFO/Emby provider namespace 和现有元数据性能优化结果的前提下，移除
+Lux 主程序编译的 TMDb client/adapter、TMDb endpoint/凭据/图片 URL 逻辑和 TMDb 专用配置分支；TMDb 与
+豆瓣的实现、配置读取和上游访问全部由 `Lux-plugins` 独立插件负责。
+
+契约：
+
+- metadata 插件必须通过 manifest 声明 `providerKey`；`pluginId` 只表示安装和运行时身份，aliases 只用于
+  旧 `scraperId` 的通用解析。provider ID 在 Lux 业务层始终是不透明字符串。
+- metadata RPC 继续使用 `metadata.search`、`metadata.get`、`metadata.bundle`、`metadata.images`、
+  `metadata.credits`、`metadata.externalIds` 和 `metadata.trailers`，不增加 TMDb 专用方法。
+- 宿主对 metadata 插件只传递其专属配置文件路径 `LUX_PLUGIN_CONFIG_PATH`，不传递 `LUX_CONFIG_DIR`；
+  其他插件的配置隔离策略不因本任务改变。
+- 旧 `/config/tmdb_*` 和其他历史 TMDb 设置只允许做一次性迁移，迁移结果写入 `plugin-config/org.lux.tmdb.json`；
+  迁移过程不记录凭据，迁移后主程序不再解释这些字段。
+- `tmdb` 和 `douban` 仅作为兼容 namespace/alias 保留，不能触发主程序的 provider 特判或外部网络请求。
+
+验收：
+
+- [ ] Lux 主程序源码和二进制不包含 `TmdbClient`、`tmdb_plugin`、TMDb API endpoint、TMDb 凭据读取或
+      TMDb 图片 CDN 转换实现。
+- [ ] TMDb `0.1.9` 和豆瓣 `0.1.4` 插件独立完成 metadata RPC v1，并只读取各自专属配置路径。
+- [ ] 旧 TMDb 配置、旧 `scraperId: "tmdb"`、NFO/Emby provider ID 和 TheIntroDB 所需外部 ID 均可兼容，
+      且 provider ID 不丢失、不被强制转换为数字。
+- [ ] metadata 插件进程无法读取整个 Lux 配置目录；配置 API 不返回敏感值，日志不包含凭据和完整外部 URL。
+- [ ] 现有 LUX-200 元数据请求数、吞吐和 Rust/Web 质量门不退化；补充插件仓库构建、manifest、RPC、
+      Linux x86_64/aarch64 包验证。
+
+依赖：LUX-142、LUX-169、LUX-200。
+
+验证：`docs/LUX-201-PLAN.md`。
 
 ## 26. 风险与缓解
 

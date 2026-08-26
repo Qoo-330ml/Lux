@@ -127,6 +127,25 @@ Lux 默认从 `https://github.com/Qoo-330ml/Lux-plugins` 读取插件目录；Gi
 
 `formatVersion` 是包格式；`apiVersion` 是 RPC 契约；`version` 是插件自身版本。三者不能混用。
 
+metadata 插件还应声明稳定的 `providerKey`，并可声明用于旧配置兼容的 `aliases`：
+
+```json
+{
+  "id": "org.lux.tmdb",
+  "type": "metadata",
+  "category": "SCRAPER",
+  "providerKey": "tmdb",
+  "aliases": ["tmdb"]
+}
+```
+
+`pluginId` 只表示安装/运行时实现身份，不能代替 provider namespace。provider ID 是不透明字符串，不能
+要求所有 provider 都使用数字 ID。Lux 主程序只实现 metadata RPC v1，不编译上游 provider 的 HTTP client。
+
+metadata 插件启动时只通过 `LUX_PLUGIN_CONFIG_PATH` 获得自己的配置文件路径；该进程不会收到
+`LUX_CONFIG_DIR`。缺少专属配置文件时，插件应使用自身默认值。`LUX_CONFIG_DIR` 只适用于仍有明确兼容
+需求的非 metadata 插件，不能被 metadata 插件依赖。
+
 `type` 当前允许 `metadata`、`media_probe`、`ip_location`、`strm_resolver`、`chapter_detector` 和
 `data_migration`。媒体探测插件必须同时声明
 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如商店中的
