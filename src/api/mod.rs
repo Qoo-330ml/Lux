@@ -3726,6 +3726,11 @@ async fn emby_list_items(
             Err(status) => status.into_response(),
         };
     }
+    if let Some(response) =
+        emby_single_id_lookup_response(state, principal, can_download, query).await
+    {
+        return response;
+    }
     match emby_catalog_page_from_query(state, principal, query).await {
         Ok(page) => {
             let preferred_source_id = emby_compat_media_source_id(query.ids.as_deref(), &page);
@@ -3742,6 +3747,145 @@ async fn emby_list_items(
         }
         Err(status) => status.into_response(),
     }
+}
+
+fn emby_single_id_lookup(query: &EmbyItemsQuery) -> Option<&str> {
+    if query.start_index.unwrap_or(0) != 0
+        || query.limit.is_some_and(|limit| !(1..=100).contains(&limit))
+        || query.user_id.is_some()
+        || query.series_id.is_some()
+        || query.parent_id.is_some()
+        || query.include_item_types.is_some()
+        || query.exclude_item_types.is_some()
+        || query.season_id.is_some()
+        || query.search_term.is_some()
+        || query.is_played.is_some()
+        || query.is_favorite.is_some()
+        || query.years.is_some()
+        || query.sort_by.is_some()
+        || query.sort_order.is_some()
+        || query.group_items.is_some()
+        || query.recursive.is_some()
+    {
+        return None;
+    }
+    let mut ids = query
+        .ids
+        .as_deref()?
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let id = ids.next()?;
+    ids.next().is_none().then_some(id)
+}
+
+async fn emby_single_id_lookup_response(
+    state: &AppState,
+    principal: AccessPrincipal,
+    can_download: bool,
+    query: &EmbyItemsQuery,
+) -> Option<Response> {
+    let requested_id = emby_single_id_lookup(query)?;
+    let catalog = state.catalog.as_ref()?;
+    let (item, preferred_source_id) = match catalog.find_item(principal, requested_id).await {
+        Ok(Some(item)) => (Some(item), None),
+        Ok(None) => match catalog
+            .find_item_by_media_source_id(principal, requested_id)
+            .await
+        {
+            Ok(item) => (item, Some(requested_id)),
+            Err(CatalogError::Storage(_)) => {
+                return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, None),
+        },
+        Err(CatalogError::Storage(_)) => {
+            return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, None),
+    };
+    let mut item = item?;
+    if preferred_source_id.is_some()
+        && emby_fields_include(query.fields.as_deref(), "Chapters")
+        && catalog
+            .populate_chapters(std::slice::from_mut(&mut item))
+            .await
+            .is_err()
+    {
+        return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let work_plan = emby_item_detail_work_plan(query.fields.as_deref());
+    if work_plan.populate_image_tags
+        && catalog
+            .populate_image_tags(std::slice::from_mut(&mut item))
+            .await
+            .is_err()
+    {
+        return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let database = state.database.as_ref()?;
+    let nfo = if emby_nfo_fields_requested(query.fields.as_deref()) {
+        read_local_nfo_details(state, &item.id).await
+    } else {
+        None
+    };
+    let user_state = match database
+        .find_user_item_state(&principal.user_id.to_string(), &item.id)
+        .await
+    {
+        Ok(state) => state,
+        Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    };
+    let mut item_json = emby_catalog_item_json_with_state(
+        &item,
+        &state.server_id,
+        user_state.as_ref(),
+        nfo.as_ref(),
+        can_download,
+        query.fields.as_deref(),
+    );
+    if let Some(source_id) = preferred_source_id
+        && let Some(Value::Array(sources)) = item_json.get_mut("MediaSources")
+        && let Some(index) = sources
+            .iter()
+            .position(|source| source.get("Id").and_then(Value::as_str) == Some(source_id))
+    {
+        let source = sources.remove(index);
+        sources.insert(0, source);
+    }
+    if emby_fields_include(query.fields.as_deref(), "People") {
+        let actors = match state.people.as_ref() {
+            Some(people) => match people.list_item_actors(&item.id).await {
+                Ok(actors) => actors,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %item.id,
+                        %error,
+                        "derived actor relation is unavailable for Emby ID lookup"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        if let Value::Object(object) = &mut item_json {
+            let mut people = actors
+                .into_iter()
+                .map(|actor| emby_person_json(actor, &state.server_id))
+                .collect::<Vec<_>>();
+            if let Some(nfo) = nfo.as_ref() {
+                people.extend(emby_nfo_crew_json(nfo));
+            }
+            object.insert("People".to_owned(), Value::Array(people));
+        }
+    }
+    Some(
+        Json(json!({
+            "Items": [item_json],
+            "TotalRecordCount": 1,
+        }))
+        .into_response(),
+    )
 }
 
 async fn emby_query_requests_series_children(
@@ -20650,14 +20794,14 @@ mod tests {
         MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
         catalog_filter_from_emby, emby_collection_type, emby_item_detail_work_plan,
         emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
-        emby_media_stream_json, emby_playback_info_item_id, emby_source_needs_strm_resolver,
-        filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
-        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        normalize_filmly_null_languages, normalize_strm_http_location, playback_client_label,
-        playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, validate_media_strategy,
+        emby_media_stream_json, emby_playback_info_item_id, emby_single_id_lookup,
+        emby_source_needs_strm_resolver, filmly_image_compat_mode_from_env_value,
+        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
+        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
+        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
+        metadata_candidate_failure_kind, normalize_filmly_null_languages,
+        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
+        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -20804,6 +20948,31 @@ mod tests {
             filter.media_source_ids,
             Some(vec!["item-1".to_owned(), "source-2".to_owned()])
         );
+    }
+
+    #[test]
+    fn single_ids_lookup_is_limited_to_unfiltered_first_pages() {
+        let query = super::EmbyItemsQuery {
+            ids: Some("item-1".to_owned()),
+            ..super::EmbyItemsQuery::default()
+        };
+        assert_eq!(emby_single_id_lookup(&query), Some("item-1"));
+
+        let mut query = query;
+        query.ids = Some("item-1,source-2".to_owned());
+        assert_eq!(emby_single_id_lookup(&query), None);
+
+        query.ids = Some("item-1".to_owned());
+        query.parent_id = Some("library-1".to_owned());
+        assert_eq!(emby_single_id_lookup(&query), None);
+
+        query.parent_id = None;
+        query.start_index = Some(1);
+        assert_eq!(emby_single_id_lookup(&query), None);
+
+        query.start_index = Some(0);
+        query.limit = Some(0);
+        assert_eq!(emby_single_id_lookup(&query), None);
     }
 
     #[test]

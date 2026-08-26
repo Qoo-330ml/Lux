@@ -665,6 +665,37 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         alpha_source_id
     );
 
+    let unprojected_item_lookup = client
+        .get(format!("{base_url}/Items?Ids={item_id}&Limit=1"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(unprojected_item_lookup.status(), reqwest::StatusCode::OK);
+    let unprojected_item_lookup_body: Value = unprojected_item_lookup.json().await?;
+    assert_eq!(unprojected_item_lookup_body["TotalRecordCount"], 1);
+    assert_eq!(unprojected_item_lookup_body["Items"][0]["Id"], item_id);
+
+    let unprojected_media_source_lookup = client
+        .get(format!("{base_url}/Items?Ids={alpha_source_id}&Limit=1"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        unprojected_media_source_lookup.status(),
+        reqwest::StatusCode::OK
+    );
+    let unprojected_media_source_lookup_body: Value =
+        unprojected_media_source_lookup.json().await?;
+    assert_eq!(unprojected_media_source_lookup_body["TotalRecordCount"], 1);
+    assert_eq!(
+        unprojected_media_source_lookup_body["Items"][0]["Id"],
+        item_id
+    );
+    assert_eq!(
+        unprojected_media_source_lookup_body["Items"][0]["MediaSources"][0]["Id"],
+        alpha_source_id
+    );
+
     let filtered_by_unknown_id = client
         .get(format!(
             "{base_url}/Items?Ids=00000000-0000-0000-0000-000000000000&Limit=1"
