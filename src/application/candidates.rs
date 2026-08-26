@@ -2880,6 +2880,57 @@ mod tests {
     }
 
     #[test]
+    fn locked_missing_fields_do_not_keep_metadata_requests_pending() {
+        let current = StoredMediaMetadata {
+            item_type: "MOVIE".to_owned(),
+            title: "Example Movie".to_owned(),
+            original_title: Some("Example Movie".to_owned()),
+            overview: None,
+            production_year: Some(2020),
+            premiere_date: Some("2020-01-01".to_owned()),
+            last_air_date: None,
+            status: None,
+            original_language: Some("en".to_owned()),
+            rating: Some(8.0),
+            provider_ids_json: Some(json!({"tmdb": "1", "imdb": "tt1"}).to_string()),
+            metadata_scraper_id: Some("tmdb".to_owned()),
+            scraper_id: Some("tmdb".to_owned()),
+            provenance_json: Some(
+                json!({
+                    "title": "LOCAL_NFO",
+                    "originalTitle": "LOCAL_NFO",
+                    "productionYear": "LOCAL_NFO"
+                })
+                .to_string(),
+            ),
+            locked_fields_json: Some(json!(["overview"]).to_string()),
+            nfo_metadata_json: None,
+            series_item_id: None,
+            series_title: None,
+            series_production_year: None,
+            series_provider_name: None,
+            series_provider_id: None,
+            season_number: None,
+            episode_number: None,
+        };
+        let details = crate::application::nfo::LocalNfoDetails {
+            directors: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "Director".to_owned(),
+            }],
+            writers: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "writer-1".to_owned(),
+                name: "Writer".to_owned(),
+            }],
+            trailers: vec!["https://example.invalid/trailer".to_owned()],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
+
+        let plan = metadata_request_plan(&current, false, false, Some(&details));
+        assert!(!plan.needs_metadata);
+    }
+
+    #[test]
     fn fill_missing_fetches_credits_when_one_crew_list_is_missing() {
         let details = crate::application::nfo::LocalNfoDetails {
             directors: vec![crate::application::nfo::LocalNfoCredit {

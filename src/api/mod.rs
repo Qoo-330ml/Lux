@@ -18345,6 +18345,13 @@ fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> Response {
             "图片操作暂时失败",
         )
         .into_response(),
+        ImageWriteError::AttemptInProgress => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "该图片正在下载，请稍后重试",
+        )
+        .into_response(),
         _ => api_error(
             headers,
             StatusCode::BAD_REQUEST,

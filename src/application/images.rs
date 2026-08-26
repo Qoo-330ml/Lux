@@ -673,8 +673,9 @@ impl ImageWriteService {
             .and_then(|identity| identity.provider_name)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "SCRAPER".to_owned());
-        self.download_item_image_with_source(item_id, image_type, image_url, &source)
-            .await
+        self.download_item_image_attempt(item_id, image_type, image_url, &source, true)
+            .await?
+            .ok_or(ImageWriteError::AttemptInProgress)
     }
 
     pub(crate) async fn download_item_image_from_scraper(
@@ -1374,6 +1375,7 @@ fn image_attempt_failure(
         | ImageWriteError::ItemNotFound
         | ImageWriteError::PathOutsideRoot(_)
         | ImageWriteError::SymlinkTarget(_)
+        | ImageWriteError::AttemptInProgress
         | ImageWriteError::Storage(_) => ("FAILED", None, "PERMANENT_FAILURE"),
     }
 }
@@ -1634,6 +1636,7 @@ pub enum ImageWriteError {
     PathOutsideRoot(PathBuf),
     SymlinkTarget(PathBuf),
     ConcurrentModification(PathBuf),
+    AttemptInProgress,
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -1686,6 +1689,7 @@ impl fmt::Display for ImageWriteError {
                     path.display()
                 )
             }
+            Self::AttemptInProgress => formatter.write_str("image download is already in progress"),
             Self::Io { path, source } => {
                 write!(formatter, "image path '{}': {source}", path.display())
             }
@@ -1711,7 +1715,8 @@ impl std::error::Error for ImageWriteError {
             | Self::ItemNotFound
             | Self::PathOutsideRoot(_)
             | Self::SymlinkTarget(_)
-            | Self::ConcurrentModification(_) => None,
+            | Self::ConcurrentModification(_)
+            | Self::AttemptInProgress => None,
         }
     }
 }

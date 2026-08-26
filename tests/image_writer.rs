@@ -211,6 +211,66 @@ async fn concurrent_downloads_claim_one_attempt_for_the_same_image()
 }
 
 #[tokio::test]
+async fn manual_scraper_image_selection_claims_one_attempt_for_the_same_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let handler_requests = Arc::clone(&requests);
+    let app = Router::new().route(
+        "/poster",
+        get(move || {
+            let requests = Arc::clone(&handler_requests);
+            async move {
+                requests.fetch_add(1, Ordering::SeqCst);
+                sleep(Duration::from_millis(40)).await;
+                Response::builder()
+                    .header(CONTENT_TYPE, "image/png")
+                    .body(Body::from(PNG_1X1.to_vec()))
+                    .expect("test image response should be valid")
+            }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::new(database)?;
+    let image_url = format!("http://{address}/poster");
+    let first = service.clone();
+    let second = service;
+    let first_item_id = item_id.clone();
+    let second_item_id = item_id;
+    let first_url = image_url.clone();
+    let second_url = image_url;
+    let (first, second) = tokio::join!(
+        tokio::spawn(async move {
+            first
+                .download_item_image_from_scraper_candidate(&first_item_id, "poster", &first_url)
+                .await
+        }),
+        tokio::spawn(async move {
+            second
+                .download_item_image_from_scraper_candidate(&second_item_id, "poster", &second_url)
+                .await
+        }),
+    );
+
+    let first = first?;
+    let second = second?;
+    assert_eq!(requests.load(Ordering::SeqCst), 1);
+    assert!(first.is_ok() ^ second.is_ok());
+    assert!(
+        first
+            .as_ref()
+            .err()
+            .or_else(|| second.as_ref().err())
+            .is_some_and(|error| matches!(error, ImageWriteError::AttemptInProgress))
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn missing_image_not_found_is_not_requested_again_on_next_attempt()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
