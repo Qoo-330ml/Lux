@@ -41,10 +41,17 @@ const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
 const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
 const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
 
-static IMAGE_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
-fn global_image_permits() -> Arc<Semaphore> {
-    IMAGE_GLOBAL_PERMITS
+fn global_image_download_permits() -> Arc<Semaphore> {
+    IMAGE_GLOBAL_DOWNLOAD_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
+        .clone()
+}
+
+fn global_image_write_permits() -> Arc<Semaphore> {
+    IMAGE_GLOBAL_WRITE_PERMITS
         .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
         .clone()
 }
@@ -99,7 +106,8 @@ pub struct ImageWriteService {
     http: Client,
     max_bytes: u64,
     config_dir: Option<PathBuf>,
-    permits: Arc<Semaphore>,
+    download_permits: Arc<Semaphore>,
+    write_permits: Arc<Semaphore>,
     resources: Option<ResourceMetrics>,
 }
 
@@ -166,7 +174,8 @@ impl ImageWriteService {
             config,
             proxy_url,
             config_dir,
-            global_image_permits(),
+            global_image_download_permits(),
+            global_image_write_permits(),
         )
     }
 
@@ -188,6 +197,7 @@ impl ImageWriteService {
             proxy_url,
             config_dir,
             Arc::new(Semaphore::new(concurrency)),
+            Arc::new(Semaphore::new(concurrency)),
         )
     }
 
@@ -196,7 +206,8 @@ impl ImageWriteService {
         config: ImageDownloadConfig,
         proxy_url: Option<String>,
         config_dir: Option<PathBuf>,
-        permits: Arc<Semaphore>,
+        download_permits: Arc<Semaphore>,
+        write_permits: Arc<Semaphore>,
     ) -> Result<Self, ImageWriteError> {
         if config.max_bytes == 0 {
             return Err(ImageWriteError::InvalidConfiguration(
@@ -213,7 +224,8 @@ impl ImageWriteService {
             http,
             max_bytes: config.max_bytes,
             config_dir,
-            permits,
+            download_permits,
+            write_permits,
             resources: None,
         })
     }
@@ -569,9 +581,14 @@ impl ImageWriteService {
             ));
         }
 
-        let _permit = self.permits.clone().acquire_owned().await.map_err(|_| {
-            ImageWriteError::InvalidConfiguration("image semaphore closed".to_owned())
-        })?;
+        let _download_permit = self
+            .download_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                ImageWriteError::InvalidConfiguration("image semaphore closed".to_owned())
+            })?;
         let download_started = std::time::Instant::now();
         let response = self.fetch_image(&url).await;
         if let Some(resources) = &self.resources {
@@ -620,6 +637,7 @@ impl ImageWriteService {
             });
         }
         validate_image_payload(format, &body)?;
+        drop(_download_permit);
 
         let (root, directory, movie_stem, episode_stem) = if let Some(config_dir) =
             self.config_dir.as_ref()
@@ -646,6 +664,14 @@ impl ImageWriteService {
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
         }
+        let _write_permit = self
+            .write_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                ImageWriteError::InvalidConfiguration("image write semaphore closed".to_owned())
+            })?;
         let write_started = std::time::Instant::now();
         write_image_atomically(&target, &body).await?;
 
@@ -1922,8 +1948,8 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
-        global_image_permits, image_attempt_failure, image_download_retry_delay,
-        is_allowed_scraper_image_url, retryable_image_status,
+        global_image_download_permits, global_image_write_permits, image_attempt_failure,
+        image_download_retry_delay, is_allowed_scraper_image_url, retryable_image_status,
     };
 
     #[test]
@@ -1953,11 +1979,15 @@ mod tests {
     }
 
     #[test]
-    fn default_image_services_share_the_process_quota() {
-        let first = global_image_permits();
-        let second = global_image_permits();
+    fn image_download_and_write_quotas_are_independent() {
+        let first = global_image_download_permits();
+        let second = global_image_download_permits();
         assert!(std::sync::Arc::ptr_eq(&first, &second));
         assert_eq!(first.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
+
+        let write = global_image_write_permits();
+        assert!(!std::sync::Arc::ptr_eq(&first, &write));
+        assert_eq!(write.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
     }
 
     #[test]
