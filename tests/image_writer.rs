@@ -20,6 +20,7 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::CONTENT_TYPE;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, sleep};
 
@@ -380,6 +381,59 @@ async fn transient_image_failure_is_skipped_until_retry_deadline()
             .is_err()
     );
     assert!(requests.load(Ordering::SeqCst) > after_first);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_image_retry_clears_the_backoff_state() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (database, item_id, _root, _movie_dir) = prepared_movie().await?;
+    let app = Router::new().route(
+        "/poster",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_1X1.to_vec()))
+                .expect("test image response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let image_url = format!("http://{address}/poster");
+    let candidate_key = Sha256::digest(format!("TMDB\0POSTER\0{image_url}").as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    sqlx::query(
+        "INSERT INTO metadata_image_attempts
+         (item_id, image_type, candidate_key, status, attempt_count, next_retry_at)
+         VALUES (?, 'POSTER', ?, 'FAILED', 1, 0)",
+    )
+    .bind(&item_id)
+    .bind(candidate_key)
+    .execute(database.pool())
+    .await?;
+
+    let service = ImageWriteService::with_config(database.clone(), ImageDownloadConfig::default())?;
+    assert!(
+        service
+            .download_item_image_if_missing(&item_id, "poster", &image_url)
+            .await?
+            .is_some()
+    );
+    let attempt: (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, next_retry_at
+         FROM metadata_image_attempts
+         WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(attempt.0, "AVAILABLE");
+    assert_eq!(attempt.1, None);
 
     server.abort();
     Ok(())
