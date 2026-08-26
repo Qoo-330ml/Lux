@@ -42,10 +42,10 @@ async fn strm_absolute_path_enables_web_and_emby_local_playback_without_extra_se
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
     let library_root = temp_dir.path().join("library");
-    let allowed_root = temp_dir.path().join("allowed");
+    let external_root = temp_dir.path().join("external");
     tokio::fs::create_dir_all(&library_root).await?;
-    tokio::fs::create_dir_all(&allowed_root).await?;
-    let external_media = allowed_root.join("External.Movie.2026.mp4");
+    tokio::fs::create_dir_all(&external_root).await?;
+    let external_media = external_root.join("External.Movie.2026.mp4");
     tokio::fs::write(&external_media, b"external-media").await?;
     tokio::fs::write(
         library_root.join("External.Movie.2026.strm"),
@@ -92,7 +92,7 @@ async fn strm_absolute_path_enables_web_and_emby_local_playback_without_extra_se
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
             AUTHORIZATION,
-            r#"Emby Client="StrmAllowedRootTest", Device="Mac", DeviceId="strm-allowed-root", Version="1""#,
+            r#"Emby Client="StrmExternalPathTest", Device="Mac", DeviceId="strm-external-path", Version="1""#,
         )
         .json(&json!({"Username": "admin", "Pw": "correct password"}))
         .send()

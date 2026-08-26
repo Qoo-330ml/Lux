@@ -3717,11 +3717,11 @@ HTTP/SMB/FTP 目标。
 
 验收：
 
-- [ ] 任意存在且可读的本地绝对 `.strm` 目标，即使位于媒体库根目录之外，Lux Web 和 Emby 视频入口均按
+- [x] 任意存在且可读的本地绝对 `.strm` 目标，即使位于媒体库根目录之外，Lux Web 和 Emby 视频入口均按
       本地文件返回 Range 响应；`.strm` 原始文本无需改写。
-- [ ] 相对目标仍相对于 `.strm` 所在目录解析；目录、失效路径和另一个 `.strm` 不作为视频返回。
-- [ ] 通过路径 canonicalize、普通文件检查和共享视频入口回归；不主动读取远程目标。
-- [ ] 通过专项 Rust/Web 测试、格式化、Clippy、Web 构建，并记录本机 ARM 架构。
+- [x] 相对目标仍相对于 `.strm` 所在目录解析；目录、失效路径和另一个 `.strm` 不作为视频返回。
+- [x] 通过路径 canonicalize、普通文件检查和共享视频入口回归；不主动读取远程目标。
+- [x] 通过专项 Rust/Web 测试、格式化、Clippy、Web 构建，并记录本机 ARM 架构（`uname -m`: `arm64`）。
 
 验证：`cargo test --locked --test strm_target --test strm_allowed_roots`、相关 API 测试、
 `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
