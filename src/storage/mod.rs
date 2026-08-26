@@ -72,6 +72,7 @@ pub struct Database {
     server_id: String,
     backend: DatabaseBackend,
     person_credits_write_lock: Arc<AsyncMutex<()>>,
+    metadata_write_lock: Arc<AsyncMutex<()>>,
 }
 
 impl Database {
@@ -171,7 +172,18 @@ impl Database {
             server_id,
             backend,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
+            metadata_write_lock: Arc::new(AsyncMutex::new(())),
         })
+    }
+
+    pub(crate) async fn acquire_metadata_write_lock(
+        &self,
+    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.backend == DatabaseBackend::Sqlite {
+            Some(self.metadata_write_lock.clone().lock_owned().await)
+        } else {
+            None
+        }
     }
 
     pub async fn test_configuration(
@@ -10969,6 +10981,7 @@ impl Database {
         &self,
         candidate: NewMetadataCandidate<'_>,
     ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
         self.query(
             "INSERT INTO metadata_candidates (
                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
@@ -10999,6 +11012,186 @@ impl Database {
         .bind(candidate.candidate_json)
         .bind(candidate.score)
         .bind(candidate.expires_at)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_metadata_capability_attempts(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<StoredMetadataCapabilityAttempt>, StorageError> {
+        self.query(
+            "SELECT provider, provider_id, capability, status, next_retry_at
+             FROM metadata_capability_attempts
+             WHERE item_id = ?",
+        )
+        .bind(item_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMetadataCapabilityAttempt {
+                    provider: row.get("provider"),
+                    provider_id: row.get("provider_id"),
+                    capability: row.get("capability"),
+                    status: row.get("status"),
+                    next_retry_at: row.get("next_retry_at"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_metadata_image_attempts(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<StoredMetadataImageAttempt>, StorageError> {
+        self.query(
+            "SELECT image_type, candidate_key, status
+             FROM metadata_image_attempts
+             WHERE item_id = ?",
+        )
+        .bind(item_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMetadataImageAttempt {
+                    image_type: row.get("image_type"),
+                    candidate_key: row.get("candidate_key"),
+                    status: row.get("status"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn record_metadata_capability_results(
+        &self,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        results: &[MetadataCapabilityResult<'_>],
+        now: i64,
+    ) -> Result<(), StorageError> {
+        if results.is_empty() {
+            return Ok(());
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for result in results {
+            let status = if result.has_data {
+                "AVAILABLE"
+            } else {
+                "UNAVAILABLE"
+            };
+            let error_code = (!result.has_data).then_some("NO_DATA");
+            self.query(
+                "INSERT INTO metadata_capability_attempts (
+                    item_id, provider, provider_id, capability, status, attempt_count,
+                    last_attempt_at, next_retry_at, error_code, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 1, ?, NULL, ?, ?)
+                ON CONFLICT(item_id, provider, provider_id, capability) DO UPDATE SET
+                    status = excluded.status,
+                    attempt_count = 1,
+                    last_attempt_at = excluded.last_attempt_at,
+                    next_retry_at = NULL,
+                    error_code = excluded.error_code,
+                    updated_at = excluded.updated_at",
+            )
+            .bind(item_id)
+            .bind(provider)
+            .bind(provider_id)
+            .bind(result.capability)
+            .bind(status)
+            .bind(now)
+            .bind(error_code)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn record_metadata_capability_failure(
+        &self,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        capability: &str,
+        now: i64,
+    ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let previous_attempt_count = self
+            .query_scalar::<i64>(
+                "SELECT attempt_count
+                 FROM metadata_capability_attempts
+                 WHERE item_id = ? AND provider = ? AND provider_id = ? AND capability = ?",
+            )
+            .bind(item_id)
+            .bind(provider)
+            .bind(provider_id)
+            .bind(capability)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .unwrap_or_default();
+        let exponent = previous_attempt_count.clamp(0, 5) as u32;
+        let delay = 300_i64
+            .saturating_mul(1_i64.checked_shl(exponent).unwrap_or(i64::MAX))
+            .min(86_400);
+        let next_retry_at = now.saturating_add(delay);
+        self.query(
+            "INSERT INTO metadata_capability_attempts (
+                item_id, provider, provider_id, capability, status, attempt_count,
+                last_attempt_at, next_retry_at, error_code, updated_at
+            ) VALUES (?, ?, ?, ?, 'FAILED', 1, ?, ?, 'TRANSIENT_FAILURE', ?)
+            ON CONFLICT(item_id, provider, provider_id, capability) DO UPDATE SET
+                status = 'FAILED',
+                attempt_count = metadata_capability_attempts.attempt_count + 1,
+                last_attempt_at = excluded.last_attempt_at,
+                next_retry_at = excluded.next_retry_at,
+                error_code = excluded.error_code,
+                updated_at = excluded.updated_at",
+        )
+        .bind(item_id)
+        .bind(provider)
+        .bind(provider_id)
+        .bind(capability)
+        .bind(now)
+        .bind(next_retry_at)
+        .bind(now)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -15470,29 +15663,6 @@ impl Database {
         Ok(u32::try_from(count.max(1)).unwrap_or(u32::MAX))
     }
 
-    pub(crate) async fn metadata_image_attempt_is_unavailable(
-        &self,
-        item_id: &str,
-        image_type: &str,
-        candidate_key: &str,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar::<String>(
-            "SELECT status
-             FROM metadata_image_attempts
-             WHERE item_id = ? AND image_type = ? AND candidate_key = ?",
-        )
-        .bind(item_id)
-        .bind(image_type)
-        .bind(candidate_key)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|status| status.as_deref() == Some("UNAVAILABLE"))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn mark_metadata_image_unavailable(
         &self,
         item_id: &str,
@@ -17273,6 +17443,27 @@ pub(crate) struct StoredMetadataCandidate {
     pub(crate) item_title: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredMetadataCapabilityAttempt {
+    pub(crate) provider: String,
+    pub(crate) provider_id: String,
+    pub(crate) capability: String,
+    pub(crate) status: String,
+    pub(crate) next_retry_at: Option<i64>,
+}
+
+pub(crate) struct MetadataCapabilityResult<'a> {
+    pub(crate) capability: &'a str,
+    pub(crate) has_data: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredMetadataImageAttempt {
+    pub(crate) image_type: String,
+    pub(crate) candidate_key: String,
+    pub(crate) status: String,
+}
+
 pub(crate) struct NewMetadataCandidate<'a> {
     pub(crate) id: &'a str,
     pub(crate) item_id: &'a str,
@@ -18779,6 +18970,7 @@ mod tests {
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
+            metadata_write_lock: Arc::new(AsyncMutex::new(())),
         };
         let jobs = database
             .list_metadata_reidentify_jobs(None, 0, 1)
@@ -19776,6 +19968,7 @@ mod tests {
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
+            metadata_write_lock: Arc::new(AsyncMutex::new(())),
         };
         assert!(database.probe_write().await.is_err());
         database.close().await;
@@ -19832,6 +20025,7 @@ mod tests {
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
+            metadata_write_lock: Arc::new(AsyncMutex::new(())),
         };
 
         assert_eq!(
@@ -19917,6 +20111,7 @@ mod tests {
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
+            metadata_write_lock: Arc::new(AsyncMutex::new(())),
         };
 
         let reconciled = database

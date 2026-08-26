@@ -17,9 +17,9 @@ use crate::{
         actor_enrichment::ActorEnrichmentQueue,
         admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
-            MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
-            MetadataCandidateView, MetadataRequestPlan, MetadataSelectionError,
-            MetadataSelectionMode, MetadataSelectionService,
+            ImageSelectionPolicy, MetadataCandidateError, MetadataCandidatePage,
+            MetadataCandidateService, MetadataCandidateView, MetadataRequestPlan,
+            MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
         },
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
         webhooks::{WebhookEventType, WebhookService},
@@ -131,6 +131,7 @@ struct RefreshItemOptions {
     scraper_id: Option<String>,
     supplemental: bool,
     request_plan: Option<MetadataRequestPlan>,
+    image_policy: Option<ImageSelectionPolicy>,
 }
 
 impl Drop for MetadataJobOwnerGuard {
@@ -849,6 +850,7 @@ impl MetadataReidentifyService {
                         scraper_id: Some(scraper.scraper_id.clone()),
                         supplemental: false,
                         request_plan,
+                        image_policy: request_plan.and_then(|plan| plan.image_policy),
                     },
                 )
                 .await
@@ -910,6 +912,7 @@ impl MetadataReidentifyService {
                             scraper_id: None,
                             supplemental: true,
                             request_plan: supplemental_plan,
+                            image_policy: supplemental_plan.and_then(|plan| plan.image_policy),
                         },
                     )
                     .await
@@ -987,22 +990,24 @@ impl MetadataReidentifyService {
         };
         if needs_review {
             selection
-                .select_for_review_with_scraper(
+                .select_for_review_with_scraper_and_policy(
                     item_id,
                     &candidate.id,
                     selection_mode,
                     options.scraper_id.as_deref(),
                     options.supplemental,
+                    options.image_policy,
                 )
                 .await
         } else {
             selection
-                .select_with_scraper(
+                .select_with_scraper_and_policy(
                     item_id,
                     &candidate.id,
                     selection_mode,
                     options.scraper_id.as_deref(),
                     options.supplemental,
+                    options.image_policy,
                 )
                 .await
         }

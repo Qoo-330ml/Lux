@@ -2,22 +2,32 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, futures::OwnedNotified};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Notify, OnceCell, futures::OwnedNotified},
+    time::{Duration, sleep},
+};
 
 const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4096;
+const CACHE_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct ProviderResponseCache {
     state: Arc<Mutex<CacheState>>,
     load_once: Arc<OnceCell<()>>,
     persist_lock: Arc<AsyncMutex<()>>,
+    persist_notify: Arc<Notify>,
+    persist_task: Arc<OnceCell<()>>,
+    persist_dirty: Arc<AtomicBool>,
     path: Option<PathBuf>,
 }
 
@@ -90,6 +100,9 @@ impl ProviderResponseCache {
             })),
             load_once: Arc::new(OnceCell::new()),
             persist_lock: Arc::new(AsyncMutex::new(())),
+            persist_notify: Arc::new(Notify::new()),
+            persist_task: Arc::new(OnceCell::new()),
+            persist_dirty: Arc::new(AtomicBool::new(false)),
             path,
         }
     }
@@ -144,7 +157,7 @@ impl ProviderResponseCache {
                 },
             );
         }
-        self.persist().await;
+        self.schedule_persist().await;
     }
 
     pub(crate) async fn store_negative(&self, key: &str, ttl_seconds: i64) {
@@ -165,13 +178,26 @@ impl ProviderResponseCache {
                 },
             );
         }
-        self.persist().await;
+        self.schedule_persist().await;
     }
 
     pub(crate) async fn clear(&self) {
         self.ensure_loaded().await;
         lock_state(&self.state).entries.clear();
-        self.persist().await;
+        self.schedule_persist().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush(&self) {
+        if self.path.is_none() {
+            return;
+        }
+        self.ensure_loaded().await;
+        self.persist_dirty.store(false, Ordering::Release);
+        self.persist_now().await;
+        if self.persist_dirty.load(Ordering::Acquire) {
+            self.persist_notify.notify_one();
+        }
     }
 
     async fn ensure_loaded(&self) {
@@ -200,7 +226,36 @@ impl ProviderResponseCache {
             .await;
     }
 
-    async fn persist(&self) {
+    async fn schedule_persist(&self) {
+        if self.path.is_none() {
+            return;
+        }
+        self.persist_dirty.store(true, Ordering::Release);
+        self.persist_notify.notify_one();
+        let cache = self.clone();
+        let _ = self
+            .persist_task
+            .get_or_init(|| async move {
+                tokio::spawn(async move { cache.persist_loop().await });
+            })
+            .await;
+    }
+
+    async fn persist_loop(&self) {
+        loop {
+            self.persist_notify.notified().await;
+            sleep(CACHE_PERSIST_DEBOUNCE).await;
+            if !self.persist_dirty.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            self.persist_now().await;
+            if self.persist_dirty.load(Ordering::Acquire) {
+                self.persist_notify.notify_one();
+            }
+        }
+    }
+
+    async fn persist_now(&self) {
         let Some(path) = self.path.as_ref() else {
             return;
         };
@@ -401,6 +456,7 @@ mod tests {
         };
         cache.store("persisted", &json!({"id": 9}), 60).await;
         owner.finish();
+        cache.flush().await;
 
         let restored = ProviderResponseCache::new(Some(path));
         assert!(

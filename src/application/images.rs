@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -484,20 +485,56 @@ impl ImageWriteService {
         self.local_image_exists(item_id, image_type).await
     }
 
-    pub(crate) async fn has_unavailable_image_candidate(
+    pub(crate) async fn local_image_types(
         &self,
         item_id: &str,
-        image_type: &str,
-        source: &str,
-        provider_id: &str,
-    ) -> Result<bool, ImageWriteError> {
-        let image_type = normalize_image_type(image_type)
-            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
-        let candidate_key = image_no_candidate_key(source, image_type, provider_id);
-        self.database
-            .metadata_image_attempt_is_unavailable(item_id, image_type, &candidate_key)
-            .await
-            .map_err(ImageWriteError::Storage)
+        image_types: &[&str],
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
+        let image_types = image_types
+            .iter()
+            .map(|image_type| {
+                normalize_image_type(image_type)
+                    .ok_or_else(|| ImageWriteError::InvalidImageType((*image_type).to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut found = BTreeSet::new();
+
+        if let Some(config_dir) = self.config_dir.as_ref() {
+            let root = metadata_root(config_dir);
+            let directory = library_item_directory(config_dir, item_id)
+                .map_err(|error| ImageWriteError::InvalidConfiguration(error.to_string()))?;
+            reject_metadata_symlinks(&root).await?;
+            reject_metadata_symlinks(&directory).await?;
+            let paths = read_image_directory_entries(&directory).await?;
+            for image_type in &image_types {
+                let (_, generic_stem) = image_file_stems(image_type, None, None)?;
+                if let Some(path) = find_existing_image_path_in_paths(&paths, &[generic_stem])
+                    && image_file_stamp(&path).await?.is_some()
+                {
+                    found.insert((*image_type).to_owned());
+                }
+            }
+        }
+
+        let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let paths = read_image_directory_entries(&directory).await?;
+        for image_type in &image_types {
+            if found.contains(*image_type) {
+                continue;
+            }
+            let (prefixed_stem, generic_stem) =
+                image_file_stems(image_type, movie_stem.as_deref(), episode_stem.as_deref())?;
+            let stems = prefixed_stem
+                .into_iter()
+                .chain(std::iter::once(generic_stem))
+                .collect::<Vec<_>>();
+            if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
+                && image_file_stamp(&path).await?.is_some()
+            {
+                found.insert((*image_type).to_owned());
+            }
+        }
+        Ok(found)
     }
 
     pub async fn download_item_image(
@@ -1154,6 +1191,67 @@ async fn find_any_image_path(
         }
     }
     find_existing_image_path(directory, &[generic_stem], None).await
+}
+
+fn find_existing_image_path_in_paths(paths: &[PathBuf], stems: &[String]) -> Option<PathBuf> {
+    let mut candidates = paths
+        .iter()
+        .filter(|path| {
+            let matches_stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| stems.iter().any(|stem| value.eq_ignore_ascii_case(stem)));
+            let known_extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "jpg" | "jpeg" | "png" | "webp"
+                    )
+                });
+            matches_stem && known_extension
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    stems.iter().find_map(|stem| {
+        candidates.iter().find_map(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(stem))
+                .then(|| path.clone())
+        })
+    })
+}
+
+async fn read_image_directory_entries(directory: &Path) -> Result<Vec<PathBuf>, ImageWriteError> {
+    let metadata = match fs::symlink_metadata(directory).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(image_io_error(directory, source)),
+    };
+    if !metadata.is_dir() {
+        return Err(ImageWriteError::Io {
+            path: directory.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "image path is not a directory",
+            ),
+        });
+    }
+    let mut entries = fs::read_dir(directory)
+        .await
+        .map_err(|source| image_io_error(directory, source))?;
+    let mut paths = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| image_io_error(directory, source))?
+    {
+        paths.push(entry.path());
+    }
+    Ok(paths)
 }
 
 fn image_file_stems(

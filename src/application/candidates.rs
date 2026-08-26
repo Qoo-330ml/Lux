@@ -19,12 +19,14 @@ use crate::{
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
             ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
+            provider_key_from_plugin_id,
         },
     },
     observability::resources::ResourceMetrics,
     storage::{
-        Database, NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
-        StoredMetadataCandidate,
+        Database, MetadataCapabilityResult, NewMetadataCandidate, SelectedMetadataUpdate,
+        StorageError, StoredMediaMetadata, StoredMetadataCandidate,
+        StoredMetadataCapabilityAttempt,
     },
 };
 
@@ -44,6 +46,9 @@ const SCRAPER_IMAGE_TYPES: [&str; 8] = [
     "ART",
     "WALLPAPER",
 ];
+const CAPABILITY_CREDITS: &str = "CREDITS";
+const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
+const CAPABILITY_TRAILERS: &str = "TRAILERS";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataRequestPlan {
@@ -52,6 +57,7 @@ pub(crate) struct MetadataRequestPlan {
     pub(crate) needs_credits: bool,
     pub(crate) needs_external_ids: bool,
     pub(crate) needs_trailers: bool,
+    pub(crate) image_policy: Option<ImageSelectionPolicy>,
 }
 
 impl MetadataRequestPlan {
@@ -62,6 +68,7 @@ impl MetadataRequestPlan {
             needs_credits: true,
             needs_external_ids: true,
             needs_trailers: true,
+            image_policy: None,
         }
     }
 
@@ -97,6 +104,7 @@ fn metadata_request_plan(
         needs_external_ids: current.item_type == "MOVIE" && !has_complete_external_ids(current),
         needs_trailers: matches!(current.item_type.as_str(), "MOVIE" | "SERIES")
             && details.is_none_or(|details| details.trailers.is_empty()),
+        image_policy: None,
     }
 }
 
@@ -462,10 +470,29 @@ impl MetadataCandidateService {
                 .or_else(|| details.as_ref().and_then(|value| value.title.clone()))
                 .or_else(|| result.original_title.clone())
                 .unwrap_or_else(|| query.to_owned());
+            let mut capability_results = Vec::new();
+            let mut capability_failures = Vec::new();
             let (images, credits, external_ids, trailers, images_response) = if let Some(bundle) =
                 bundle
             {
                 let bundle_images = bundle.images;
+                capability_results.extend([
+                    MetadataCapabilityResult {
+                        capability: CAPABILITY_CREDITS,
+                        has_data: !bundle.credits.cast.is_empty()
+                            || !bundle.credits.crew.is_empty(),
+                    },
+                    MetadataCapabilityResult {
+                        capability: CAPABILITY_EXTERNAL_IDS,
+                        has_data: !bundle.external_ids.provider_ids.is_empty(),
+                    },
+                    MetadataCapabilityResult {
+                        capability: CAPABILITY_TRAILERS,
+                        has_data: bundle.trailers.trailers.iter().any(|trailer| {
+                            trailer.url.as_deref().is_some_and(|url| !url.is_empty())
+                        }),
+                    },
+                ]);
                 (
                     bundle_images.clone(),
                     bundle.credits,
@@ -479,7 +506,7 @@ impl MetadataCandidateService {
                     Some(bundle_images),
                 )
             } else {
-                let (images_response, credits, external_ids, trailers) = tokio::join!(
+                let (images_response, credits_result, external_ids_result, trailers_result) = tokio::join!(
                     async {
                         if plan.needs_images {
                             scraper
@@ -504,30 +531,32 @@ impl MetadataCandidateService {
                                     | crate::application::scraper::ScraperItemType::Series
                             )
                         {
-                            scraper
-                                .credits_generic(
-                                    crate::application::scraper::ScraperGetRequest::new(
-                                        item_type,
-                                        provider_id.clone(),
-                                        "zh-CN",
-                                    ),
-                                )
-                                .await
-                                .unwrap_or_default()
+                            Some(
+                                scraper
+                                    .credits_generic(
+                                        crate::application::scraper::ScraperGetRequest::new(
+                                            item_type,
+                                            provider_id.clone(),
+                                            "zh-CN",
+                                        ),
+                                    )
+                                    .await,
+                            )
                         } else {
-                            crate::application::scraper::ScraperCreditsResponse::default()
+                            None
                         }
                     },
                     async {
                         if plan.needs_external_ids && item_type == ScraperItemType::Movie {
-                            scraper
-                                .external_ids_generic(ScraperGetRequest::new(
-                                    item_type,
-                                    provider_id.clone(),
-                                    "zh-CN",
-                                ))
-                                .await
-                                .ok()
+                            Some(
+                                scraper
+                                    .external_ids_generic(ScraperGetRequest::new(
+                                        item_type,
+                                        provider_id.clone(),
+                                        "zh-CN",
+                                    ))
+                                    .await,
+                            )
                         } else {
                             None
                         }
@@ -536,26 +565,67 @@ impl MetadataCandidateService {
                         if plan.needs_trailers
                             && matches!(item_type, ScraperItemType::Movie | ScraperItemType::Series)
                         {
-                            scraper
-                                .trailers_generic(ScraperGetRequest::new(
-                                    item_type,
-                                    provider_id.clone(),
-                                    "zh-CN",
-                                ))
-                                .await
-                                .map(|response| {
-                                    response
-                                        .trailers
-                                        .into_iter()
-                                        .filter_map(|trailer| trailer.url)
-                                        .collect()
-                                })
-                                .unwrap_or_default()
+                            Some(
+                                scraper
+                                    .trailers_generic(ScraperGetRequest::new(
+                                        item_type,
+                                        provider_id.clone(),
+                                        "zh-CN",
+                                    ))
+                                    .await,
+                            )
                         } else {
-                            Vec::new()
+                            None
                         }
                     }
                 );
+                let credits = match credits_result {
+                    Some(Ok(value)) => {
+                        capability_results.push(MetadataCapabilityResult {
+                            capability: CAPABILITY_CREDITS,
+                            has_data: !value.cast.is_empty() || !value.crew.is_empty(),
+                        });
+                        value
+                    }
+                    Some(Err(error)) => {
+                        capability_failures.push((CAPABILITY_CREDITS, error));
+                        crate::application::scraper::ScraperCreditsResponse::default()
+                    }
+                    None => crate::application::scraper::ScraperCreditsResponse::default(),
+                };
+                let external_ids = match external_ids_result {
+                    Some(Ok(value)) => {
+                        capability_results.push(MetadataCapabilityResult {
+                            capability: CAPABILITY_EXTERNAL_IDS,
+                            has_data: !value.provider_ids.is_empty(),
+                        });
+                        Some(value)
+                    }
+                    Some(Err(error)) => {
+                        capability_failures.push((CAPABILITY_EXTERNAL_IDS, error));
+                        None
+                    }
+                    None => None,
+                };
+                let trailers = match trailers_result {
+                    Some(Ok(response)) => {
+                        let trailers = response
+                            .trailers
+                            .into_iter()
+                            .filter_map(|trailer| trailer.url)
+                            .collect::<Vec<_>>();
+                        capability_results.push(MetadataCapabilityResult {
+                            capability: CAPABILITY_TRAILERS,
+                            has_data: !trailers.is_empty(),
+                        });
+                        trailers
+                    }
+                    Some(Err(error)) => {
+                        capability_failures.push((CAPABILITY_TRAILERS, error));
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                };
                 (
                     images_response.clone().unwrap_or_default(),
                     credits,
@@ -564,6 +634,45 @@ impl MetadataCandidateService {
                     images_response,
                 )
             };
+            let now = current_unix_timestamp();
+            self.database
+                .record_metadata_capability_results(
+                    item_id,
+                    scraper.provider_key(),
+                    &provider_id,
+                    &capability_results,
+                    now,
+                )
+                .await
+                .map_err(MetadataCandidateError::Storage)?;
+            for (capability, error) in capability_failures {
+                if capability_error_is_permanent(&error) {
+                    self.database
+                        .record_metadata_capability_results(
+                            item_id,
+                            scraper.provider_key(),
+                            &provider_id,
+                            &[MetadataCapabilityResult {
+                                capability,
+                                has_data: false,
+                            }],
+                            now,
+                        )
+                        .await
+                        .map_err(MetadataCandidateError::Storage)?;
+                } else {
+                    self.database
+                        .record_metadata_capability_failure(
+                            item_id,
+                            scraper.provider_key(),
+                            &provider_id,
+                            capability,
+                            now,
+                        )
+                        .await
+                        .map_err(MetadataCandidateError::Storage)?;
+                }
+            }
             if plan.needs_images
                 && images_response
                     .as_ref()
@@ -1075,6 +1184,25 @@ fn candidate_expiry() -> Option<i64> {
         .and_then(|now| now.checked_add(24 * 60 * 60))
 }
 
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn capability_error_is_permanent(error: &ScraperError) -> bool {
+    match error {
+        ScraperError::UnsupportedCapability(_) => true,
+        ScraperError::Provider(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("not found") || message.contains("404")
+        }
+        _ => false,
+    }
+}
+
 fn selected_metadata_provider_id(metadata: &ScraperMetadata, provider: &str) -> Option<String> {
     let short_provider = provider.rsplit(['.', ':', '/']).next().unwrap_or(provider);
     metadata
@@ -1097,27 +1225,57 @@ fn current_provider_ids(current: &StoredMediaMetadata) -> BTreeMap<String, Strin
 
 fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, String)> {
     let provider_ids = current_provider_ids(current);
-    let mut sources = BTreeSet::new();
-    for source in [
-        current.metadata_scraper_id.as_deref(),
-        current.scraper_id.as_deref(),
-    ] {
-        if let Some(source) = source.map(str::trim).filter(|value| !value.is_empty()) {
-            sources.insert(source.to_owned());
-            sources.insert(source.to_ascii_lowercase());
-        }
+    let Some(source) = current
+        .metadata_scraper_id
+        .as_deref()
+        .or(current.scraper_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Some(provider_id) = provider_id_for_key(&provider_ids, source)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    vec![(provider_key_from_plugin_id(source), provider_id.to_owned())]
+}
+
+fn selected_capability_identity(current: &StoredMediaMetadata) -> Option<(String, String)> {
+    let provider = current
+        .metadata_scraper_id
+        .as_deref()
+        .or(current.scraper_id.as_deref())?
+        .trim();
+    let provider_ids = current_provider_ids(current);
+    let provider_id = provider_id_for_key(&provider_ids, provider)?.trim();
+    (!provider_id.is_empty()).then(|| (provider.to_owned(), provider_id.to_owned()))
+}
+
+fn capability_needs_request(
+    states: &[StoredMetadataCapabilityAttempt],
+    identity: Option<&(String, String)>,
+    capability: &str,
+) -> bool {
+    let Some((provider, provider_id)) = identity else {
+        return true;
+    };
+    let Some(state) = states.iter().find(|state| {
+        state.capability.eq_ignore_ascii_case(capability)
+            && state.provider_id == *provider_id
+            && provider_key_from_plugin_id(&state.provider) == provider_key_from_plugin_id(provider)
+    }) else {
+        return true;
+    };
+    match state.status.as_str() {
+        "AVAILABLE" | "UNAVAILABLE" => false,
+        "FAILED" => state
+            .next_retry_at
+            .is_none_or(|retry_at| retry_at <= current_unix_timestamp()),
+        _ => true,
     }
-    for source in provider_ids.keys() {
-        sources.insert(source.clone());
-        sources.insert(source.to_ascii_lowercase());
-    }
-    sources
-        .into_iter()
-        .filter_map(|source| {
-            let provider_id = provider_id_for_key(&provider_ids, &source)?.trim();
-            (!provider_id.is_empty()).then(|| (source, provider_id.to_owned()))
-        })
-        .collect()
 }
 
 fn selected_scraper_provider_id(
@@ -1488,6 +1646,13 @@ pub struct MetadataSelectionReport {
     pub actor_count: usize,
 }
 
+struct MetadataSelectionOptions<'a> {
+    keep_pending: bool,
+    scraper_id: Option<&'a str>,
+    supplemental: bool,
+    image_policy: Option<ImageSelectionPolicy>,
+}
+
 #[derive(Clone)]
 pub struct MetadataSelectionService {
     database: Database,
@@ -1545,23 +1710,33 @@ impl MetadataSelectionService {
             return Ok(MetadataRequestPlan::full());
         }
         let image_policy = self.image_selection_policy(item_id).await?;
+        let capability_states = self
+            .database
+            .list_metadata_capability_attempts(item_id)
+            .await?;
+        let image_attempts = self.database.list_metadata_image_attempts(item_id).await?;
+        let unavailable_image_attempts = image_attempts
+            .into_iter()
+            .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
+            .map(|attempt| (attempt.image_type, attempt.candidate_key))
+            .collect::<BTreeSet<_>>();
         let image_attempt_identities = image_attempt_identities(current);
+        let image_types = image_policy.enabled_types().collect::<Vec<_>>();
+        let local_image_types = self.images.local_image_types(item_id, &image_types).await?;
         let mut images_missing = false;
-        for image_type in image_policy.enabled_types() {
-            if self.images.has_local_image(item_id, image_type).await? {
+        for image_type in image_types {
+            if local_image_types.contains(image_type) {
                 continue;
             }
-            let mut explicitly_unavailable = false;
-            for (source, provider_id) in &image_attempt_identities {
-                if self
-                    .images
-                    .has_unavailable_image_candidate(item_id, image_type, source, provider_id)
-                    .await?
-                {
-                    explicitly_unavailable = true;
-                    break;
-                }
-            }
+            let explicitly_unavailable = !image_attempt_identities.is_empty()
+                && image_attempt_identities
+                    .iter()
+                    .all(|(source, provider_id)| {
+                        unavailable_image_attempts.contains(&(
+                            image_type.to_owned(),
+                            image_no_candidate_key(source, image_type, provider_id),
+                        ))
+                    });
             if !explicitly_unavailable {
                 images_missing = true;
                 break;
@@ -1591,6 +1766,26 @@ impl MetadataSelectionService {
         };
         let mut plan =
             metadata_request_plan(current, images_missing, credits_missing, details.as_ref());
+        plan.image_policy = Some(image_policy);
+        let capability_identity = selected_capability_identity(current);
+        plan.needs_credits = plan.needs_credits
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_CREDITS,
+            );
+        plan.needs_external_ids = plan.needs_external_ids
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_EXTERNAL_IDS,
+            );
+        plan.needs_trailers = plan.needs_trailers
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_TRAILERS,
+            );
         if !has_selected_provider_id(current) {
             plan.needs_metadata = true;
         }
@@ -1603,8 +1798,18 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, false, None, false)
-            .await
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: false,
+                scraper_id: None,
+                supplemental: false,
+                image_policy: None,
+            },
+        )
+        .await
     }
 
     pub async fn select_with_scraper(
@@ -1615,20 +1820,61 @@ impl MetadataSelectionService {
         scraper_id: Option<&str>,
         supplemental: bool,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, false, scraper_id, supplemental)
-            .await
+        self.select_with_scraper_and_policy(
+            item_id,
+            candidate_id,
+            mode,
+            scraper_id,
+            supplemental,
+            None,
+        )
+        .await
     }
 
-    pub(crate) async fn select_for_review_with_scraper(
+    pub(crate) async fn select_with_scraper_and_policy(
         &self,
         item_id: &str,
         candidate_id: &str,
         mode: MetadataSelectionMode,
         scraper_id: Option<&str>,
         supplemental: bool,
+        image_policy: Option<ImageSelectionPolicy>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, true, scraper_id, supplemental)
-            .await
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: false,
+                scraper_id,
+                supplemental,
+                image_policy,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn select_for_review_with_scraper_and_policy(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        mode: MetadataSelectionMode,
+        scraper_id: Option<&str>,
+        supplemental: bool,
+        image_policy: Option<ImageSelectionPolicy>,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: true,
+                scraper_id,
+                supplemental,
+                image_policy,
+            },
+        )
+        .await
     }
 
     pub async fn select_for_review(
@@ -1637,8 +1883,18 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, true, None, false)
-            .await
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: true,
+                scraper_id: None,
+                supplemental: false,
+                image_policy: None,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn enrich_selected_actors(
@@ -1686,9 +1942,7 @@ impl MetadataSelectionService {
         item_id: &str,
         candidate_id: &str,
         mode: MetadataSelectionMode,
-        keep_pending: bool,
-        scraper_id: Option<&str>,
-        supplemental: bool,
+        options: MetadataSelectionOptions<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         let current = self
             .database
@@ -1713,16 +1967,19 @@ impl MetadataSelectionService {
             }
         }
         payload.movie_nfo.actors = payload.actors.clone();
-        if matches!(mode, MetadataSelectionMode::FillMissing) || supplemental {
+        if matches!(mode, MetadataSelectionMode::FillMissing) || options.supplemental {
             let projection = self.nfo.read_item_projection(item_id).await?;
             merge_supplemental_movie_nfo(&mut payload.movie_nfo, projection.as_ref());
             payload.actors = payload.movie_nfo.actors.clone();
-            if supplemental {
+            if options.supplemental {
                 preserve_supplemental_scalar_values(&mut payload, &current);
             }
         }
-        let image_source = scraper_id.unwrap_or(candidate.provider.as_str());
-        let image_policy = self.image_selection_policy(item_id).await?;
+        let image_source = options.scraper_id.unwrap_or(candidate.provider.as_str());
+        let image_policy = match options.image_policy {
+            Some(image_policy) => image_policy,
+            None => self.image_selection_policy(item_id).await?,
+        };
         let mut state = metadata_state(&current);
         let metadata_candidate = MetadataCandidate {
             source: MetadataSource::ScraperLocalized,
@@ -1758,7 +2015,7 @@ impl MetadataSelectionService {
             .record_metadata_stage("nfo_write", nfo_started.elapsed());
         let mut provider_ids = current_provider_ids(&current);
         provider_ids.extend(movie_nfo.provider_ids.clone());
-        if supplemental {
+        if options.supplemental {
             if !provider_ids
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case(&candidate.provider))
@@ -1792,14 +2049,14 @@ impl MetadataSelectionService {
                 rating: payload.rating,
                 rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
                 provider_ids_json: &provider_ids_json,
-                metadata_scraper_id: (!supplemental && !keep_pending)
-                    .then_some(scraper_id)
+                metadata_scraper_id: (!options.supplemental && !options.keep_pending)
+                    .then_some(options.scraper_id)
                     .flatten(),
                 metadata_fingerprint: &nfo_report.fingerprint,
                 provenance_json: &state.provenance_json(),
                 locked_fields_json: &state.locked_fields_json(),
                 poster_fallback_required: !has_primary_artwork,
-                keep_pending,
+                keep_pending: options.keep_pending,
             })
             .await?;
         if !selected {
@@ -1811,7 +2068,7 @@ impl MetadataSelectionService {
             item_id: item_id.to_owned(),
             candidate_id: candidate_id.to_owned(),
             mode,
-            status: if keep_pending {
+            status: if options.keep_pending {
                 "PENDING"
             } else {
                 "ONLINE_CONFIRMED"
@@ -2186,8 +2443,8 @@ struct CandidatePayload {
     actors: Vec<ActorCredit>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct ImageSelectionPolicy {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ImageSelectionPolicy {
     poster: bool,
     artwork: bool,
     banner: bool,

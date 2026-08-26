@@ -1307,7 +1307,7 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
     let service = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
         ScraperProvider::from(tmdb),
-        Some(selection),
+        Some(selection.clone()),
     );
     let job = service
         .create_item_refresh_job(&fixture.item_id, MetadataRefreshMode::FillMissing)
@@ -1333,6 +1333,44 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
         .clone();
     assert_eq!(calls_after_complete, vec!["/3/movie/1/credits"]);
     assert_eq!(service.get_job(&second_job.id).await?.status, "COMPLETED");
+
+    let capability_status: String = sqlx::query_scalar(
+        "SELECT status FROM metadata_capability_attempts
+         WHERE item_id = ? AND capability = 'CREDITS'",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(capability_status, "UNAVAILABLE");
+
+    let fresh_tmdb = TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let fresh_service = MetadataReidentifyService::with_selection(
+        fixture.database.clone(),
+        ScraperProvider::from(fresh_tmdb),
+        Some(selection),
+    );
+    let third_job = fresh_service
+        .create_item_refresh_job(&fixture.item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+    fresh_service.run(&third_job.id).await;
+    assert_eq!(
+        calls
+            .lock()
+            .expect("request call list should not be poisoned")
+            .as_slice(),
+        ["/3/movie/1/credits"]
+    );
 
     tmdb_server.abort();
     Ok(())
