@@ -330,12 +330,7 @@ impl PluginService {
         let mut listed_ids = HashSet::new();
         for entry in &store_index.plugins {
             let local_plugin = catalog.get(&entry.id);
-            let status_id = if is_tmdb_plugin_id(&entry.id) {
-                TMDB_DYNAMIC_PLUGIN_ID
-            } else {
-                entry.id.as_str()
-            };
-            let status = self.database.plugin_installation_status(status_id).await?;
+            let status = self.database.plugin_installation_status(&entry.id).await?;
             let installed = local_plugin.is_some() && status.is_some();
             let enabled = installed && status == Some(true);
             if installed_only && !installed {
@@ -353,7 +348,7 @@ impl PluginService {
             listed_ids.insert(entry.id.clone());
         }
         for plugin in &catalog.plugins {
-            if listed_ids.contains(&plugin.manifest.id) || is_tmdb_plugin_id(&plugin.manifest.id) {
+            if listed_ids.contains(&plugin.manifest.id) {
                 continue;
             }
             let status = self
@@ -380,21 +375,26 @@ impl PluginService {
     pub async fn install(&self, plugin_id: &str) -> Result<PluginInstall, PluginServiceError> {
         let requested_id = plugin_id.trim().to_owned();
         let catalog = self.catalog_snapshot().await;
-        let plugin_id = if requested_id == TMDB_PLUGIN_ID
-            && catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_none()
-            && self
-                .store_index()
+        let plugin_id = self.canonical_plugin_id(&requested_id, &catalog);
+        let plugin_id = if catalog.get(&plugin_id).is_none() {
+            self.store_index()
                 .await
                 .plugins
                 .iter()
-                .any(|entry| entry.id == TMDB_DYNAMIC_PLUGIN_ID)
-        {
-            TMDB_DYNAMIC_PLUGIN_ID.to_owned()
+                .find(|entry| {
+                    entry.id == plugin_id
+                        || entry
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(&plugin_id))
+                })
+                .map(|entry| entry.id.clone())
+                .unwrap_or(plugin_id)
         } else {
-            self.canonical_plugin_id(&requested_id, &catalog)
+            plugin_id
         };
         let was_installed = self.database.has_plugin_installation(&plugin_id).await?;
-        if plugin_id != TMDB_PLUGIN_ID && catalog.get(&plugin_id).is_none() {
+        if catalog.get(&plugin_id).is_none() {
             let entry = self
                 .store_index()
                 .await
@@ -1731,9 +1731,6 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(scraper_id, &catalog);
         self.ensure_known_plugin(&plugin_id, &catalog)?;
-        if plugin_id == TMDB_PLUGIN_ID {
-            return Err(PluginServiceError::Unavailable(plugin_id));
-        }
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         let view = self.view_for_id(&plugin_id, installed, enabled).await?;
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
@@ -2053,7 +2050,7 @@ impl PluginService {
         plugin_id: &str,
         catalog: &PluginCatalog,
     ) -> Result<(), PluginServiceError> {
-        if plugin_id == TMDB_PLUGIN_ID || catalog.get(plugin_id).is_some() {
+        if catalog.get(plugin_id).is_some() {
             Ok(())
         } else {
             Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()))
@@ -2064,8 +2061,10 @@ impl PluginService {
         let plugin_id = plugin_id.trim();
         if plugin_id == MEDIA_INFO_LEGACY_PLUGIN_ID {
             MEDIA_INFO_PLUGIN_ID.to_owned()
-        } else if plugin_id == TMDB_PLUGIN_ID && catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some() {
-            TMDB_DYNAMIC_PLUGIN_ID.to_owned()
+        } else if catalog.get(plugin_id).is_some() {
+            plugin_id.to_owned()
+        } else if let Some(plugin) = catalog.get_by_alias(plugin_id) {
+            plugin.manifest.id.clone()
         } else {
             plugin_id.to_owned()
         }

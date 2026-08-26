@@ -29,6 +29,13 @@ const MAX_PLUGIN_FILES: usize = 512;
 const MAX_PLUGIN_INFLIGHT: usize = 16;
 
 #[derive(Clone, Debug)]
+enum PluginConfigAccess {
+    Shared(PathBuf),
+    Dedicated(PathBuf),
+    None,
+}
+
+#[derive(Clone, Debug)]
 pub struct DiscoveredPlugin {
     pub manifest: PluginManifest,
     pub source_path: PathBuf,
@@ -133,6 +140,16 @@ impl PluginCatalog {
         self.plugins
             .iter()
             .find(|plugin| plugin.manifest.id == plugin_id)
+    }
+
+    pub fn get_by_alias(&self, alias: &str) -> Option<&DiscoveredPlugin> {
+        self.plugins.iter().find(|plugin| {
+            plugin
+                .manifest
+                .aliases
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(alias))
+        })
     }
 }
 
@@ -271,9 +288,7 @@ impl PluginSupervisor {
                 processes.remove(plugin_id);
                 let process = match spawn_process(
                     &plugin,
-                    allow_config_access
-                        .then_some(self.config_dir.as_deref())
-                        .flatten(),
+                    self.config_access(&plugin, allow_config_access),
                     self.network_proxy_url.as_deref(),
                 ) {
                     Ok(process) => process,
@@ -332,7 +347,7 @@ impl PluginSupervisor {
             .ok_or_else(|| PluginRuntimeError::UnknownPlugin(plugin_id.to_owned()))?;
         let process = match spawn_process(
             &plugin,
-            self.config_dir.as_deref(),
+            self.config_access(&plugin, true),
             self.network_proxy_url.as_deref(),
         ) {
             Ok(process) => process,
@@ -389,6 +404,28 @@ impl PluginSupervisor {
             .lock()
             .await
             .insert(plugin_id.to_owned(), error.to_string());
+    }
+
+    fn config_access(
+        &self,
+        plugin: &DiscoveredPlugin,
+        allow_config_access: bool,
+    ) -> PluginConfigAccess {
+        if !allow_config_access {
+            return PluginConfigAccess::None;
+        }
+        let Some(config_dir) = self.config_dir.as_ref() else {
+            return PluginConfigAccess::None;
+        };
+        if plugin.manifest.plugin_type == "metadata" {
+            PluginConfigAccess::Dedicated(
+                config_dir
+                    .join("plugin-config")
+                    .join(format!("{}.json", plugin.manifest.id)),
+            )
+        } else {
+            PluginConfigAccess::Shared(config_dir.clone())
+        }
     }
 }
 
@@ -601,15 +638,11 @@ fn response_result(response: PluginResponse) -> Result<serde_json::Value, Plugin
 
 fn spawn_process(
     plugin: &DiscoveredPlugin,
-    config_dir: Option<&Path>,
+    config_access: PluginConfigAccess,
     network_proxy_url: Option<&str>,
 ) -> Result<Arc<PluginProcess>, PluginRuntimeError> {
     let entrypoint = absolute_runtime_path(&plugin.entrypoint).map_err(PluginRuntimeError::Io)?;
     let root_path = absolute_runtime_path(&plugin.root_path).map_err(PluginRuntimeError::Io)?;
-    let config_dir = config_dir
-        .map(absolute_runtime_path)
-        .transpose()
-        .map_err(PluginRuntimeError::Io)?;
     let mut command = Command::new(entrypoint);
     command
         .current_dir(root_path)
@@ -621,8 +654,24 @@ fn spawn_process(
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    if let Some(config_dir) = config_dir {
-        command.env("LUX_CONFIG_DIR", config_dir);
+    match config_access {
+        PluginConfigAccess::Shared(config_dir) => {
+            command.env_remove("LUX_PLUGIN_CONFIG_PATH").env(
+                "LUX_CONFIG_DIR",
+                absolute_runtime_path(&config_dir).map_err(PluginRuntimeError::Io)?,
+            );
+        }
+        PluginConfigAccess::Dedicated(config_path) => {
+            command.env_remove("LUX_CONFIG_DIR").env(
+                "LUX_PLUGIN_CONFIG_PATH",
+                absolute_runtime_path(&config_path).map_err(PluginRuntimeError::Io)?,
+            );
+        }
+        PluginConfigAccess::None => {
+            command
+                .env_remove("LUX_CONFIG_DIR")
+                .env_remove("LUX_PLUGIN_CONFIG_PATH");
+        }
     }
     if let Some(proxy_url) = network_proxy_url {
         command.env("LUX_PROXY_URL", proxy_url);

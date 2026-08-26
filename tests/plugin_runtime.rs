@@ -20,6 +20,7 @@ fn signed_manifest_value_with_version(entrypoint: &str, version: &str) -> Value 
         "apiVersion": 1,
         "runtime": {"kind": "process", "entrypoint": entrypoint},
         "type": "metadata",
+        "aliases": ["legacy-example"],
         "supportedItemTypes": ["Movie"],
         "capabilities": ["metadata.search"],
         "configFields": [],
@@ -98,6 +99,24 @@ fn discovers_an_exploded_plugin_directory() {
     assert_eq!(
         catalog.plugins[0].entrypoint,
         plugin.join("binaries/plugin")
+    );
+}
+
+#[test]
+fn resolves_a_manifest_alias_to_the_installed_plugin() {
+    let root = tempdir().expect("temp dir should be created");
+    let plugin = root.path().join("example");
+    fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
+    fs::write(plugin.join("binaries/plugin"), b"plugin").expect("entrypoint should be written");
+    write_manifest(&plugin, "binaries/plugin");
+
+    let catalog = PluginCatalog::discover(root.path());
+
+    assert_eq!(
+        catalog
+            .get_by_alias("legacy-example")
+            .map(|plugin| plugin.manifest.id.as_str()),
+        Some("org.lux.example")
     );
 }
 
@@ -400,7 +419,7 @@ async fn supervises_a_plugin_process_when_catalog_paths_are_relative()
     let entrypoint = plugin.join("binaries/plugin");
     fs::write(
         &entrypoint,
-        b"#!/bin/sh\ncase \"${LUX_CONFIG_DIR:-}\" in /*) config_absolute=true;; *) config_absolute=false;; esac\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"id\":\"%s\",\"result\":{\"ok\":true,\"configAbsolute\":%s}}\\n' \"$id\" \"$config_absolute\"; done\n",
+        b"#!/bin/sh\ncase \"$LUX_PLUGIN_CONFIG_PATH\" in /*) config_absolute=true;; *) config_absolute=false;; esac\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"id\":\"%s\",\"result\":{\"ok\":true,\"configAbsolute\":%s}}\\n' \"$id\" \"$config_absolute\"; done\n",
     )?;
     fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700))?;
     write_manifest(&plugin, "binaries/plugin");
@@ -414,6 +433,37 @@ async fn supervises_a_plugin_process_when_catalog_paths_are_relative()
 
     assert_eq!(result["ok"], true);
     assert_eq!(result["configAbsolute"], true);
+    supervisor.stop_all().await;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn metadata_plugins_receive_only_their_dedicated_config_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    use luxd::application::plugin_runtime::PluginSupervisor;
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = tempdir()?;
+    let plugin = root.path().join("example");
+    fs::create_dir_all(plugin.join("binaries"))?;
+    let entrypoint = plugin.join("binaries/plugin");
+    fs::write(
+        &entrypoint,
+        b"#!/bin/sh\ncase \"$LUX_PLUGIN_CONFIG_PATH\" in\n  */org.lux.example.json) plugin_path=true ;;\n  *) plugin_path=false ;;\nesac\nif printenv LUX_CONFIG_DIR >/dev/null 2>&1; then shared_root=true; else shared_root=false; fi\nwhile IFS= read -r line; do id=$(printf '%s' \"$line\" | sed -n 's/.*\"id\":\"\\([^\"]*\\)\".*/\\1/p'); printf '{\"id\":\"%s\",\"result\":{\"pluginPath\":%s,\"sharedRoot\":%s}}\\n' \"$id\" \"$plugin_path\" \"$shared_root\"; done\n",
+    )?;
+    fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700))?;
+    write_manifest(&plugin, "binaries/plugin");
+    write_trusted_keys(root.path());
+
+    let catalog = PluginCatalog::discover(root.path());
+    let supervisor = PluginSupervisor::new(catalog).with_config_dir(root.path().join("config"));
+    let result = supervisor
+        .call("org.lux.example", "plugin.health", json!({}))
+        .await?;
+
+    assert_eq!(result["pluginPath"], true);
+    assert_eq!(result["sharedRoot"], false);
     supervisor.stop_all().await;
     Ok(())
 }
