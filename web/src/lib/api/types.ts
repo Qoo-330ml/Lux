@@ -599,6 +599,7 @@ export type AdminJob = {
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;
+  startedAt?: string | number | null;
   finishedAt?: string | number | null;
   currentItem?: string | null;
   scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "IDLE" | string;
@@ -680,6 +681,7 @@ export type AdminStrmProbeJob = {
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;
+  startedAt?: string | number | null;
   finishedAt?: string | number | null;
 };
 
@@ -693,6 +695,7 @@ export type AdminChapterDetectionJob = {
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;
+  startedAt?: string | number | null;
   finishedAt?: string | number | null;
 };
 
@@ -708,6 +711,7 @@ export type AdminDanmakuMatchJob = {
   cancelRequested?: boolean;
   error?: string | null;
   createdAt?: string | number;
+  startedAt?: string | number | null;
   finishedAt?: string | number | null;
 };
 

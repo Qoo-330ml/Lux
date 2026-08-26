@@ -29,7 +29,8 @@ describe("AdminOperationsPage", () => {
       processedCount: 1,
         totalCount: 1,
         createdAt: 1_700_000_001,
-        finishedAt: 1_700_000_002,
+        startedAt: 1_700_000_001,
+        finishedAt: 1_700_000_061,
     }] });
     const cancelMetadata = vi.spyOn(api, "cancelMetadataReidentify").mockResolvedValue(undefined);
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({
@@ -67,6 +68,10 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).toContain("整库元数据匹配");
     expect(container.textContent).toContain("运行中");
     expect(container.textContent).toContain("低匹配 2 项");
+    expect(container.textContent).toContain("总耗时：1 分钟");
+    const metadataRow = [...container.querySelectorAll<HTMLElement>(".lux-admin-job-row")]
+      .find((row) => row.textContent?.includes("整库元数据匹配"));
+    expect(metadataRow?.textContent).not.toContain("总耗时");
     expect(container.querySelector<HTMLAnchorElement>('a[href="/libraries/library-1?metadataStatus=pending"]')).not.toBeNull();
     expect(container.textContent).toContain("完成时间");
     const runList = container.querySelector<HTMLElement>(".lux-admin-job-list");

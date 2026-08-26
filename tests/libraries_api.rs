@@ -149,6 +149,10 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
     assert_eq!(root_body["root"]["isWritable"], true);
     assert_eq!(root_body["warnings"], json!([]));
     assert!(root_body["scanJob"]["id"].is_string());
+    let scan_job_id = root_body["scanJob"]["id"]
+        .as_str()
+        .ok_or("missing scan job ID")?
+        .to_owned();
     let root_id = root_body["root"]["id"].as_str().ok_or("missing root ID")?;
     for _ in 0..80 {
         let jobs: Value = client
@@ -167,6 +171,19 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    let completed_jobs: Value = client
+        .get(format!("{base_url}/api/v1/admin/jobs?page=1&pageSize=50"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let completed_scan = completed_jobs["jobs"]
+        .as_array()
+        .and_then(|jobs| jobs.iter().find(|job| job["id"] == scan_job_id))
+        .ok_or("missing completed scan job")?;
+    assert!(completed_scan["startedAt"].is_number());
+    assert!(completed_scan["finishedAt"].is_number());
 
     let edited = client
         .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))

@@ -577,6 +577,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   });
   const failedItems = details.data?.job.items?.filter((item) => item.status === "FAILED") ?? [];
   const jobLabel = formatJobType(job.jobType);
+  const duration = formatJobDuration(job);
   return <article className="lux-admin-job-row">
     <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" || job.status === "COMPLETED_WITH_ISSUES" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
     <div className="lux-admin-job-main">
@@ -589,6 +590,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
         {details.data ? <><strong>问题条目 {failedItems.length} 个</strong>{failedItems.length ? <ul>{failedItems.map((item) => <li key={item.itemId}><code>{item.itemId}</code><span>{formatJobError(item.error) || "未记录具体原因"}</span></li>)}</ul> : <p>任务未记录逐条问题信息。</p>}</> : null}
       </div> : null}
       <time className="lux-admin-job-finished-at">完成时间：{job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>
+      {duration ? <span className="lux-admin-job-duration">{duration}</span> : null}
       {active && (progress !== null || discovering) ? <div className={`lux-job-progress${discovering && progress === null ? " is-indeterminate" : ""}`}><span style={progress === null ? undefined : { width: `${progress}%` }} /></div> : null}
       {pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}
     </div>
@@ -649,6 +651,21 @@ function formatJobError(error?: string | null) {
   if (!error) return "";
   const knownLabel = Object.prototype.hasOwnProperty.call(ERROR_LABELS, error) ? ERROR_LABELS[error] : undefined;
   return knownLabel || (/^[A-Z][A-Z0-9_]{1,127}$/.test(error) ? `任务处理失败（${error}）` : "任务处理失败（未提供可识别的错误码）");
+}
+
+function formatJobDuration(job: OperationsJob) {
+  if (isActiveJob(job.status)) return "";
+  const startedAt = adminTimestamp(job.startedAt);
+  const finishedAt = adminTimestamp(job.finishedAt);
+  if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt) || finishedAt < startedAt) return "";
+  const seconds = Math.floor((finishedAt - startedAt) / 1000);
+  if (seconds < 60) return `总耗时：${seconds} 秒`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  if (minutes < 60) return `总耗时：${minutes} 分钟${remainingSeconds ? ` ${remainingSeconds} 秒` : ""}`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return `总耗时：${hours} 小时${remainingMinutes ? ` ${remainingMinutes} 分钟` : ""}`;
 }
 
 function formatAuditEvent(eventType: string) {
