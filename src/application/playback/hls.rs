@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
+
 use tokio::{
     fs,
     io::AsyncReadExt,
@@ -21,6 +24,7 @@ const MAX_REMUX_SESSIONS: usize = 4;
 const MAX_HARDWARE_SESSIONS: usize = 2;
 const MAX_SOFTWARE_SESSIONS: usize = 1;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const MANIFEST_WAIT_ATTEMPTS: usize = 50;
 
 #[derive(Debug)]
@@ -72,6 +76,7 @@ pub(crate) struct HlsManager {
     software_slots: Arc<Semaphore>,
     hardware_encoder: Option<String>,
     ffmpeg_executable: String,
+    min_free_bytes: u64,
 }
 
 impl HlsManager {
@@ -80,6 +85,14 @@ impl HlsManager {
     }
 
     fn new_with_executable(config_dir: PathBuf, ffmpeg_executable: String) -> Self {
+        Self::new_with_limits(config_dir, ffmpeg_executable, DEFAULT_MIN_FREE_BYTES)
+    }
+
+    fn new_with_limits(
+        config_dir: PathBuf,
+        ffmpeg_executable: String,
+        min_free_bytes: u64,
+    ) -> Self {
         let hardware_encoder = std::env::var("LUX_HLS_HW_ENCODER")
             .ok()
             .filter(|value| is_allowed_hardware_encoder(value));
@@ -91,6 +104,7 @@ impl HlsManager {
             software_slots: Arc::new(Semaphore::new(MAX_SOFTWARE_SESSIONS)),
             hardware_encoder,
             ffmpeg_executable,
+            min_free_bytes,
         }
     }
 
@@ -108,6 +122,9 @@ impl HlsManager {
         fs::create_dir_all(&self.base_directory)
             .await
             .map_err(HlsError::Io)?;
+        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes) {
+            return Err(HlsError::Limit);
+        }
         let directory = self.base_directory.join(session_id);
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
         let args = ffmpeg_args(input, &directory, tier, self.hardware_encoder.as_deref())?;
@@ -422,6 +439,33 @@ fn is_allowed_hardware_encoder(value: &str) -> bool {
     )
 }
 
+fn has_sufficient_free_space(path: &Path, minimum: u64) -> bool {
+    available_free_bytes(path).is_ok_and(|available| available >= minimum)
+}
+
+#[cfg(unix)]
+fn available_free_bytes(path: &Path) -> Result<u64, std::io::Error> {
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::other("free-space path contains a NUL byte"))?;
+    let mut statistics = MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `statistics` points to writable memory for libc to initialize and
+    // the C string is NUL-terminated for the duration of the call.
+    let result = unsafe { libc::statvfs(path.as_ptr(), statistics.as_mut_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: statvfs returned success, so libc initialized `statistics`.
+    let statistics = unsafe { statistics.assume_init() };
+    (statistics.f_bavail as u64)
+        .checked_mul(statistics.f_frsize as u64)
+        .ok_or_else(|| std::io::Error::other("free-space value overflowed"))
+}
+
+#[cfg(not(unix))]
+fn available_free_bytes(_path: &Path) -> Result<u64, std::io::Error> {
+    Ok(u64::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -505,6 +549,30 @@ mod tests {
         assert!(
             !PathBuf::from(temp_dir.path())
                 .join("config/web-playback/session-1")
+                .exists()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn manager_rejects_new_sessions_below_the_free_space_watermark() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_with_limits(
+            temp_dir.path().join("config"),
+            "/bin/true".to_owned(),
+            u64::MAX,
+        );
+
+        let error = manager
+            .start("low-space", ServerTier::Remux, Path::new("input.mkv"))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, super::HlsError::Limit));
+        assert!(
+            !temp_dir
+                .path()
+                .join("config/web-playback/low-space")
                 .exists()
         );
     }

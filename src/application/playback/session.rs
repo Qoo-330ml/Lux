@@ -1,7 +1,7 @@
 use std::{
     fmt,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -25,6 +25,7 @@ use super::hls::{HlsError, HlsManager};
 type HmacSha256 = Hmac<Sha256>;
 
 pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
+const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WebPlaybackPlan {
@@ -152,9 +153,32 @@ impl WebPlaybackSessionService {
     pub(crate) fn new(database: Database, config_dir: std::path::PathBuf) -> Self {
         let hls = HlsManager::new(config_dir);
         let cleanup = hls.clone();
+        let database_cleanup = database.clone();
         tokio::spawn(async move {
             if let Err(error) = cleanup.cleanup_orphans().await {
                 tracing::warn!(%error, "failed to clean orphaned Web HLS directories");
+            }
+            let mut interval = tokio::time::interval(WEB_PLAYBACK_CLEANUP_INTERVAL);
+            loop {
+                interval.tick().await;
+                let now = unix_timestamp();
+                let sessions = match database_cleanup
+                    .take_expired_web_playback_sessions(now)
+                    .await
+                {
+                    Ok(sessions) => sessions,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to expire Web playback sessions");
+                        continue;
+                    }
+                };
+                for session in sessions {
+                    if session.plan == "SERVER_HLS"
+                        && let Err(error) = cleanup.stop(&session.id).await
+                    {
+                        tracing::warn!(session_id = %session.id, %error, "failed to clean expired Web HLS session");
+                    }
+                }
             }
         });
         Self {

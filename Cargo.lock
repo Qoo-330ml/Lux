@@ -1522,6 +1522,7 @@ dependencies = [
  "httpdate",
  "image",
  "imageproc",
+ "libc",
  "md-5",
  "notify",
  "quick-xml",

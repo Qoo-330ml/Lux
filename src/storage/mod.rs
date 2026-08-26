@@ -5743,6 +5743,52 @@ impl Database {
         })
     }
 
+    pub(crate) async fn take_expired_web_playback_sessions(
+        &self,
+        now: i64,
+    ) -> Result<Vec<StoredWebPlaybackSession>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                        last_sequence, created_at, updated_at
+                 FROM web_playback_sessions
+                 WHERE state = 'ACTIVE' AND expires_at < ?
+                 ORDER BY expires_at ASC, id ASC
+                 LIMIT 128",
+            )
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut expired = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session = stored_web_playback_session(row);
+            let updated = self
+                .query(
+                    "UPDATE web_playback_sessions
+                     SET state = 'STOPPED', updated_at = ?
+                     WHERE id = ? AND state = 'ACTIVE' AND expires_at < ?",
+                )
+                .bind(now)
+                .bind(&session.id)
+                .bind(now)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if updated.rows_affected() == 1 {
+                expired.push(session);
+            }
+        }
+        Ok(expired)
+    }
+
     pub(crate) async fn set_web_playback_temp_dir(
         &self,
         session_id: &str,
@@ -18415,7 +18461,7 @@ impl std::error::Error for StorageError {
 mod tests {
     use super::*;
     use crate::{
-        application::{libraries::LibraryService, scanner::LibraryScanner},
+        application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
         config::{Config, PostgresConnection},
         library::LibraryKind,
     };
@@ -20102,5 +20148,70 @@ mod tests {
                 .await
                 .expect("confirmed candidate status");
         assert_eq!(candidate_status, "SELECTED");
+    }
+
+    #[tokio::test]
+    async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let setup = SetupService::new(database.clone()).expect("setup service");
+        setup
+            .complete("Admin", "Admin", "correct password")
+            .await
+            .expect("setup");
+        let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("user");
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback cleanup", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback cleanup', 'playback cleanup', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "expired-session",
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:expired-session",
+                tier: 1,
+                plan: "SERVER_HLS",
+                temp_dir: Some("/config/web-playback/expired-session"),
+                is_admin: true,
+                expires_at: 99,
+                now: 1,
+            })
+            .await
+            .expect("web playback session");
+
+        let expired = database
+            .take_expired_web_playback_sessions(100)
+            .await
+            .expect("expired sessions");
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "expired-session");
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM web_playback_sessions WHERE id = 'expired-session'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("session state");
+        assert_eq!(state, "STOPPED");
     }
 }
