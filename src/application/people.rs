@@ -734,6 +734,112 @@ impl PeopleService {
             .await
     }
 
+    pub(crate) async fn update_item_actor_metadata(
+        &self,
+        item_id: &str,
+        provider: &str,
+        actors: &[ActorCredit],
+    ) -> Result<usize, PeopleError> {
+        let new_path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        let relation_path = if read_relation(&new_path).await?.is_some() {
+            new_path
+        } else {
+            legacy_path
+        };
+        let lock_path = relation_path.with_file_name(".people.json.lock");
+        acquire_exclusive_file_lock(&lock_path).await?;
+        let result = self
+            .update_item_actor_metadata_locked(item_id, &relation_path, provider, actors)
+            .await;
+        let _ = fs::remove_file(&lock_path).await;
+        result
+    }
+
+    async fn update_item_actor_metadata_locked(
+        &self,
+        item_id: &str,
+        relation_path: &Path,
+        provider: &str,
+        actors: &[ActorCredit],
+    ) -> Result<usize, PeopleError> {
+        let Some(mut relation) = read_relation(relation_path).await? else {
+            return Ok(0);
+        };
+        let mut changed_indices = Vec::new();
+        for (index, stored_actor) in relation.actors.iter_mut().enumerate() {
+            let Some(enriched) = actors.iter().find(|actor| {
+                !actor.id.trim().is_empty()
+                    && actor.id.trim() == actor_id_from_stored_actor(stored_actor)
+                    && actor_provider_matches(stored_actor, actor, provider)
+            }) else {
+                continue;
+            };
+            let Some(person) = enriched.person.clone() else {
+                continue;
+            };
+            let merged = stored_actor
+                .person
+                .take()
+                .unwrap_or_default()
+                .supplement_missing_from(person);
+            if stored_actor.person.as_ref() != Some(&merged) {
+                stored_actor.person = Some(merged);
+                changed_indices.push(index);
+            }
+        }
+        if changed_indices.is_empty() {
+            return Ok(0);
+        }
+
+        for index in &changed_indices {
+            let actor = &relation.actors[*index];
+            self.write_person_nfo_for_actor(actor).await?;
+            if let Some(person_key) = actor
+                .person_key
+                .as_deref()
+                .filter(|key| key.starts_with("lux-"))
+            {
+                let actor_provider = actor_provider_from_stored_actor(actor)
+                    .unwrap_or_else(|| provider.trim().to_ascii_lowercase());
+                self.persist_person_manifest(
+                    &lux_person_directory(&self.config_dir, &actor.name, person_key)
+                        .map_err(PeopleError::from)?,
+                    person_key,
+                    &actor.name,
+                    &actor_provider,
+                    &actor.identities,
+                    actor.person.as_ref(),
+                )
+                .await?;
+            }
+        }
+        let bytes = serde_json::to_vec_pretty(&relation)
+            .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        write_atomically(relation_path, &bytes).await?;
+        if let Some(database) = &self.database {
+            let credits = relation
+                .actors
+                .iter()
+                .map(person_credit_from_stored_actor)
+                .collect::<Vec<_>>();
+            database
+                .replace_person_credits_with_fingerprint(
+                    item_id,
+                    &credits,
+                    relation.source_fingerprint.as_deref(),
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        }
+        Ok(changed_indices.len())
+    }
+
     async fn persist_item_actors_with_source(
         &self,
         item_id: &str,
@@ -4932,6 +5038,20 @@ fn actor_provider_from_stored_actor(actor: &StoredActor) -> Option<String> {
         .iter()
         .find(|identity| is_valid_person_id(&identity.provider) && is_valid_person_id(&identity.id))
         .map(|identity| identity.provider.clone())
+}
+
+fn actor_provider_matches(
+    stored: &StoredActor,
+    enriched: &ActorCredit,
+    fallback_provider: &str,
+) -> bool {
+    let enriched_provider = enriched
+        .provider
+        .as_deref()
+        .unwrap_or(fallback_provider)
+        .trim();
+    actor_provider_from_stored_actor(stored)
+        .is_none_or(|stored_provider| stored_provider.eq_ignore_ascii_case(enriched_provider))
 }
 
 fn person_credit_from_stored_actor(actor: &StoredActor) -> NewPersonCredit {

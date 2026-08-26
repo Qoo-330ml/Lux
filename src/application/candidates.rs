@@ -1,15 +1,17 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fmt,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
     application::{
-        images::{ImageWriteError, ImageWriteService},
+        images::{ImageWriteError, ImageWriteService, image_no_candidate_key},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
         nfo::{MovieNfoCredit, MovieNfoMetadata, NfoWriteError, NfoWriteService},
@@ -17,11 +19,14 @@ use crate::{
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
             ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
+            provider_key_from_plugin_id,
         },
     },
+    observability::resources::ResourceMetrics,
     storage::{
-        Database, NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
-        StoredMetadataCandidate,
+        Database, MetadataCapabilityResult, NewMetadataCandidate, SelectedMetadataUpdate,
+        StorageError, StoredMediaMetadata, StoredMetadataCandidate,
+        StoredMetadataCapabilityAttempt,
     },
 };
 
@@ -29,6 +34,96 @@ use crate::{
 use crate::application::tmdb::TmdbCastMember;
 
 const MAX_MOVIE_NFO_ACTORS: usize = 30;
+const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
+const IMAGE_ITEM_CONCURRENCY: usize = 4;
+const SCRAPER_IMAGE_TYPES: [&str; 8] = [
+    "POSTER",
+    "FANART",
+    "LOGO",
+    "THUMB",
+    "BANNER",
+    "DISC",
+    "ART",
+    "WALLPAPER",
+];
+const CAPABILITY_CREDITS: &str = "CREDITS";
+const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
+const CAPABILITY_TRAILERS: &str = "TRAILERS";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct MetadataRequestPlan {
+    pub(crate) needs_metadata: bool,
+    pub(crate) needs_images: bool,
+    pub(crate) needs_credits: bool,
+    pub(crate) needs_external_ids: bool,
+    pub(crate) needs_trailers: bool,
+    pub(crate) image_policy: Option<ImageSelectionPolicy>,
+}
+
+impl MetadataRequestPlan {
+    pub(crate) const fn full() -> Self {
+        Self {
+            needs_metadata: true,
+            needs_images: true,
+            needs_credits: true,
+            needs_external_ids: true,
+            needs_trailers: true,
+            image_policy: None,
+        }
+    }
+
+    fn capability_count(self) -> usize {
+        [
+            self.needs_metadata,
+            self.needs_images,
+            self.needs_credits,
+            self.needs_external_ids,
+            self.needs_trailers,
+        ]
+        .into_iter()
+        .filter(|needed| *needed)
+        .count()
+    }
+}
+
+fn metadata_request_plan(
+    current: &StoredMediaMetadata,
+    images_missing: bool,
+    credits_missing: bool,
+    details: Option<&crate::application::nfo::LocalNfoDetails>,
+) -> MetadataRequestPlan {
+    let Some(fields) = fill_missing_fields(&current.item_type) else {
+        return MetadataRequestPlan::full();
+    };
+    let state = metadata_state(current);
+    MetadataRequestPlan {
+        needs_metadata: !state.has_complete_fill_values(fields)
+            || !fill_missing_scalar_values_complete(current),
+        needs_images: images_missing,
+        needs_credits: credits_missing,
+        needs_external_ids: current.item_type == "MOVIE" && !has_complete_external_ids(current),
+        needs_trailers: matches!(current.item_type.as_str(), "MOVIE" | "SERIES")
+            && details.is_none_or(|details| details.trailers.is_empty()),
+        image_policy: None,
+    }
+}
+
+fn credits_are_missing(
+    actor_relation_exists: bool,
+    details: Option<&crate::application::nfo::LocalNfoDetails>,
+) -> bool {
+    !actor_relation_exists
+        || details.is_none_or(|value| value.directors.is_empty() || value.writers.is_empty())
+}
+
+fn has_complete_external_ids(current: &StoredMediaMetadata) -> bool {
+    let Some(raw) = current.provider_ids_json.as_deref() else {
+        return false;
+    };
+    serde_json::from_str::<BTreeMap<String, String>>(raw)
+        .ok()
+        .is_some_and(|ids| ids.values().filter(|id| !id.trim().is_empty()).count() > 1)
+}
 
 #[derive(Clone)]
 pub struct MetadataCandidateService {
@@ -106,11 +201,54 @@ impl MetadataCandidateService {
         year: Option<i32>,
         scraper: &ScraperProvider,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        self.search_and_store_with_mode(item_id, query, year, scraper, CandidateSearchMode::Manual)
-            .await
+        self.search_and_store_with_mode(
+            item_id,
+            query,
+            year,
+            scraper,
+            CandidateSearchMode::Manual,
+            MetadataRequestPlan::full(),
+        )
+        .await
     }
 
     pub async fn search_and_store_for_automatic_match(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        scraper: &ScraperProvider,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_for_automatic_match_with_plan(
+            item_id,
+            query,
+            year,
+            scraper,
+            MetadataRequestPlan::full(),
+        )
+        .await
+    }
+
+    pub(crate) async fn search_and_store_for_automatic_match_with_plan(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        scraper: &ScraperProvider,
+        plan: MetadataRequestPlan,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_with_mode(
+            item_id,
+            query,
+            year,
+            scraper,
+            CandidateSearchMode::AutomaticReuse,
+            plan,
+        )
+        .await
+    }
+
+    pub(crate) async fn search_and_store_for_automatic_match_fresh(
         &self,
         item_id: &str,
         query: &str,
@@ -122,7 +260,8 @@ impl MetadataCandidateService {
             query,
             year,
             scraper,
-            CandidateSearchMode::Automatic,
+            CandidateSearchMode::AutomaticFresh,
+            MetadataRequestPlan::full(),
         )
         .await
     }
@@ -134,18 +273,26 @@ impl MetadataCandidateService {
         year: Option<i32>,
         scraper: &ScraperProvider,
         mode: CandidateSearchMode,
+        plan: MetadataRequestPlan,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let current = self
             .database
             .find_media_item_metadata(item_id)
             .await?
             .ok_or(MetadataCandidateError::ItemNotFound)?;
+        if matches!(mode, CandidateSearchMode::AutomaticReuse)
+            && let Some(page) = self
+                .reuse_unexpired_automatic_candidates(item_id, &current, scraper, plan)
+                .await?
+        {
+            return Ok(page);
+        }
         let kind = match current.item_type.as_str() {
             "MOVIE" => MediaKind::Movie,
             "SERIES" => MediaKind::Series,
             "SEASON" | "EPISODE" => {
                 return self
-                    .search_child_and_store(item_id, query, year, &current, scraper)
+                    .search_child_and_store(item_id, query, year, &current, scraper, plan)
                     .await;
             }
             _ => return Err(MetadataCandidateError::InvalidSearch),
@@ -169,6 +316,9 @@ impl MetadataCandidateService {
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
         let direct_provider_id = selected_scraper_provider_id(&current, scraper).filter(|_| {
+            if plan != MetadataRequestPlan::full() {
+                return true;
+            }
             let same_title = crate::application::media_matching::normalize_title(query)
                 == crate::application::media_matching::normalize_title(&current.title);
             let same_year =
@@ -176,29 +326,60 @@ impl MetadataCandidateService {
             same_title && same_year
         });
         let (response, direct_details) = if let Some(provider_id) = direct_provider_id.as_deref() {
-            let details = scraper
-                .get_generic(ScraperGetRequest::new(item_type, provider_id, "zh-CN"))
-                .await
-                .map_err(MetadataCandidateError::Scraper)?;
-            let mut provider_ids = details.provider_ids.clone();
+            let details = if plan.needs_metadata || plan == MetadataRequestPlan::full() {
+                Some(
+                    scraper
+                        .get_generic(ScraperGetRequest::new(item_type, provider_id, "zh-CN"))
+                        .await
+                        .map_err(MetadataCandidateError::Scraper)?,
+                )
+            } else {
+                None
+            };
+            let mut provider_ids = current_provider_ids(&current);
+            if let Some(details) = details.as_ref() {
+                provider_ids.extend(details.provider_ids.clone());
+            }
             provider_ids
                 .entry(scraper.provider_key().to_owned())
                 .or_insert_with(|| provider_id.to_owned());
             (
                 ScraperSearchResponse {
                     items: vec![ScraperSearchResult {
-                        item_type: details.item_type.clone(),
-                        title: details.title.clone(),
-                        original_title: details.original_title.clone(),
-                        overview: details.overview.clone(),
-                        production_year: details.production_year,
-                        premiere_date: details.premiere_date.clone(),
-                        original_language: details.original_language.clone(),
+                        item_type: Some(item_type.as_str().to_owned()),
+                        title: details
+                            .as_ref()
+                            .and_then(|value| value.title.clone())
+                            .or_else(|| Some(current.title.clone())),
+                        original_title: details
+                            .as_ref()
+                            .and_then(|value| value.original_title.clone())
+                            .or_else(|| current.original_title.clone()),
+                        overview: details
+                            .as_ref()
+                            .and_then(|value| value.overview.clone())
+                            .or_else(|| current.overview.clone()),
+                        production_year: details
+                            .as_ref()
+                            .and_then(|value| value.production_year)
+                            .or_else(|| {
+                                current
+                                    .production_year
+                                    .and_then(|value| i32::try_from(value).ok())
+                            }),
+                        premiere_date: details
+                            .as_ref()
+                            .and_then(|value| value.premiere_date.clone())
+                            .or_else(|| current.premiere_date.clone()),
+                        original_language: details
+                            .as_ref()
+                            .and_then(|value| value.original_language.clone())
+                            .or_else(|| current.original_language.clone()),
                         provider_ids,
                         ..ScraperSearchResult::default()
                     }],
                 },
-                Some(details),
+                details,
             )
         } else {
             (
@@ -210,7 +391,10 @@ impl MetadataCandidateService {
         };
         let expires_at = candidate_expiry();
         let mut results = response.items.into_iter().take(20).collect::<Vec<_>>();
-        if matches!(mode, CandidateSearchMode::Automatic) {
+        if matches!(
+            mode,
+            CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
+        ) {
             results.sort_by(|left, right| {
                 search_result_score(&current, left)
                     .total_cmp(&search_result_score(&current, right))
@@ -224,7 +408,11 @@ impl MetadataCandidateService {
             };
             let provider = provider.to_owned();
             let provider_id = provider_id.to_owned();
-            if matches!(mode, CandidateSearchMode::Automatic) && result_index > 0 {
+            if matches!(
+                mode,
+                CandidateSearchMode::AutomaticReuse | CandidateSearchMode::AutomaticFresh
+            ) && result_index > 0
+            {
                 let score = search_result_score(&current, &result);
                 let mut provider_ids = result.provider_ids.clone();
                 provider_ids
@@ -267,6 +455,7 @@ impl MetadataCandidateService {
                         provider_id,
                         images: BTreeMap::new(),
                         actors: Vec::new(),
+                        metadata_fetched: false,
                         score: Some(score),
                     },
                     expires_at,
@@ -275,6 +464,7 @@ impl MetadataCandidateService {
                 continue;
             }
             let bundle = if direct_details.is_none()
+                && plan.capability_count() > 1
                 && matches!(
                     item_type,
                     crate::application::scraper::ScraperItemType::Movie
@@ -295,11 +485,7 @@ impl MetadataCandidateService {
                 direct_details.clone()
             } else if let Some(bundle) = bundle.as_ref() {
                 Some(bundle.metadata.clone())
-            } else if matches!(
-                item_type,
-                crate::application::scraper::ScraperItemType::Movie
-                    | crate::application::scraper::ScraperItemType::Series
-            ) {
+            } else if plan.needs_metadata {
                 scraper
                     .get_generic(crate::application::scraper::ScraperGetRequest::new(
                         item_type,
@@ -317,9 +503,31 @@ impl MetadataCandidateService {
                 .or_else(|| details.as_ref().and_then(|value| value.title.clone()))
                 .or_else(|| result.original_title.clone())
                 .unwrap_or_else(|| query.to_owned());
-            let (images, credits, external_ids, trailers) = if let Some(bundle) = bundle {
+            let mut capability_results = Vec::new();
+            let mut capability_failures = Vec::new();
+            let (images, credits, external_ids, trailers, images_response) = if let Some(bundle) =
+                bundle
+            {
+                let bundle_images = bundle.images;
+                capability_results.extend([
+                    MetadataCapabilityResult {
+                        capability: CAPABILITY_CREDITS,
+                        has_data: !bundle.credits.cast.is_empty()
+                            || !bundle.credits.crew.is_empty(),
+                    },
+                    MetadataCapabilityResult {
+                        capability: CAPABILITY_EXTERNAL_IDS,
+                        has_data: !bundle.external_ids.provider_ids.is_empty(),
+                    },
+                    MetadataCapabilityResult {
+                        capability: CAPABILITY_TRAILERS,
+                        has_data: bundle.trailers.trailers.iter().any(|trailer| {
+                            trailer.url.as_deref().is_some_and(|url| !url.is_empty())
+                        }),
+                    },
+                ]);
                 (
-                    bundle.images,
+                    bundle_images.clone(),
                     bundle.credits,
                     Some(bundle.external_ids),
                     bundle
@@ -328,47 +536,20 @@ impl MetadataCandidateService {
                         .into_iter()
                         .filter_map(|trailer| trailer.url)
                         .collect(),
+                    Some(bundle_images),
                 )
             } else {
-                tokio::join!(
+                let (images_response, credits_result, external_ids_result, trailers_result) = tokio::join!(
                     async {
-                        scraper
-                            .images_generic(crate::application::scraper::ScraperImageRequest::new(
-                                item_type,
-                                provider_id.clone(),
-                                "zh-CN",
-                            ))
-                            .await
-                            .unwrap_or_default()
-                    },
-                    async {
-                        if matches!(
-                            item_type,
-                            crate::application::scraper::ScraperItemType::Movie
-                                | crate::application::scraper::ScraperItemType::Series
-                        ) {
+                        if plan.needs_images {
                             scraper
-                                .credits_generic(
-                                    crate::application::scraper::ScraperGetRequest::new(
+                                .images_generic(
+                                    crate::application::scraper::ScraperImageRequest::new(
                                         item_type,
                                         provider_id.clone(),
                                         "zh-CN",
                                     ),
                                 )
-                                .await
-                                .unwrap_or_default()
-                        } else {
-                            crate::application::scraper::ScraperCreditsResponse::default()
-                        }
-                    },
-                    async {
-                        if item_type == ScraperItemType::Movie {
-                            scraper
-                                .external_ids_generic(ScraperGetRequest::new(
-                                    item_type,
-                                    provider_id.clone(),
-                                    "zh-CN",
-                                ))
                                 .await
                                 .ok()
                         } else {
@@ -376,32 +557,164 @@ impl MetadataCandidateService {
                         }
                     },
                     async {
-                        if item_type == ScraperItemType::Movie {
-                            scraper
-                                .trailers_generic(ScraperGetRequest::new(
-                                    item_type,
-                                    provider_id.clone(),
-                                    "zh-CN",
-                                ))
-                                .await
-                                .map(|response| {
-                                    response
-                                        .trailers
-                                        .into_iter()
-                                        .filter_map(|trailer| trailer.url)
-                                        .collect()
-                                })
-                                .unwrap_or_default()
+                        if plan.needs_credits
+                            && matches!(
+                                item_type,
+                                crate::application::scraper::ScraperItemType::Movie
+                                    | crate::application::scraper::ScraperItemType::Series
+                            )
+                        {
+                            Some(
+                                scraper
+                                    .credits_generic(
+                                        crate::application::scraper::ScraperGetRequest::new(
+                                            item_type,
+                                            provider_id.clone(),
+                                            "zh-CN",
+                                        ),
+                                    )
+                                    .await,
+                            )
                         } else {
-                            Vec::new()
+                            None
+                        }
+                    },
+                    async {
+                        if plan.needs_external_ids && item_type == ScraperItemType::Movie {
+                            Some(
+                                scraper
+                                    .external_ids_generic(ScraperGetRequest::new(
+                                        item_type,
+                                        provider_id.clone(),
+                                        "zh-CN",
+                                    ))
+                                    .await,
+                            )
+                        } else {
+                            None
+                        }
+                    },
+                    async {
+                        if plan.needs_trailers
+                            && matches!(item_type, ScraperItemType::Movie | ScraperItemType::Series)
+                        {
+                            Some(
+                                scraper
+                                    .trailers_generic(ScraperGetRequest::new(
+                                        item_type,
+                                        provider_id.clone(),
+                                        "zh-CN",
+                                    ))
+                                    .await,
+                            )
+                        } else {
+                            None
                         }
                     }
+                );
+                let credits = match credits_result {
+                    Some(Ok(value)) => {
+                        capability_results.push(MetadataCapabilityResult {
+                            capability: CAPABILITY_CREDITS,
+                            has_data: !value.cast.is_empty() || !value.crew.is_empty(),
+                        });
+                        value
+                    }
+                    Some(Err(error)) => {
+                        capability_failures.push((CAPABILITY_CREDITS, error));
+                        crate::application::scraper::ScraperCreditsResponse::default()
+                    }
+                    None => crate::application::scraper::ScraperCreditsResponse::default(),
+                };
+                let external_ids = match external_ids_result {
+                    Some(Ok(value)) => {
+                        capability_results.push(MetadataCapabilityResult {
+                            capability: CAPABILITY_EXTERNAL_IDS,
+                            has_data: !value.provider_ids.is_empty(),
+                        });
+                        Some(value)
+                    }
+                    Some(Err(error)) => {
+                        capability_failures.push((CAPABILITY_EXTERNAL_IDS, error));
+                        None
+                    }
+                    None => None,
+                };
+                let trailers = match trailers_result {
+                    Some(Ok(response)) => {
+                        let trailers = response
+                            .trailers
+                            .into_iter()
+                            .filter_map(|trailer| trailer.url)
+                            .collect::<Vec<_>>();
+                        capability_results.push(MetadataCapabilityResult {
+                            capability: CAPABILITY_TRAILERS,
+                            has_data: !trailers.is_empty(),
+                        });
+                        trailers
+                    }
+                    Some(Err(error)) => {
+                        capability_failures.push((CAPABILITY_TRAILERS, error));
+                        Vec::new()
+                    }
+                    None => Vec::new(),
+                };
+                (
+                    images_response.clone().unwrap_or_default(),
+                    credits,
+                    external_ids,
+                    trailers,
+                    images_response,
                 )
             };
-            let mut actors = generic_candidate_actors(&credits.cast);
-            if matches!(mode, CandidateSearchMode::Manual) {
-                enrich_actor_metadata(scraper, &mut actors).await;
+            let now = current_unix_timestamp();
+            self.database
+                .record_metadata_capability_results(
+                    item_id,
+                    scraper.provider_key(),
+                    &provider_id,
+                    &capability_results,
+                    now,
+                )
+                .await
+                .map_err(MetadataCandidateError::Storage)?;
+            for (capability, error) in capability_failures {
+                if capability_error_is_permanent(&error) {
+                    self.database
+                        .record_metadata_capability_results(
+                            item_id,
+                            scraper.provider_key(),
+                            &provider_id,
+                            &[MetadataCapabilityResult {
+                                capability,
+                                has_data: false,
+                            }],
+                            now,
+                        )
+                        .await
+                        .map_err(MetadataCandidateError::Storage)?;
+                } else {
+                    self.database
+                        .record_metadata_capability_failure(
+                            item_id,
+                            scraper.provider_key(),
+                            &provider_id,
+                            capability,
+                            now,
+                        )
+                        .await
+                        .map_err(MetadataCandidateError::Storage)?;
+                }
             }
+            if plan.needs_images
+                && images_response
+                    .as_ref()
+                    .is_some_and(|response| response.images.is_empty())
+            {
+                self.record_explicitly_unavailable_images(item_id, scraper, &provider_id)
+                    .await?;
+            }
+            let actors = generic_candidate_actors(&credits.cast);
             let mut provider_ids = details
                 .as_ref()
                 .map(|value| value.provider_ids.clone())
@@ -476,6 +789,7 @@ impl MetadataCandidateService {
                     provider_id,
                     images: generic_candidate_images(&images.images, item_type),
                     actors,
+                    metadata_fetched: details.is_some(),
                     score: direct_provider_id.as_ref().map(|_| 100.0),
                 },
                 expires_at,
@@ -485,6 +799,125 @@ impl MetadataCandidateService {
         self.list_for_item(item_id, None, 0, 50).await
     }
 
+    async fn reuse_unexpired_automatic_candidates(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+        scraper: &ScraperProvider,
+        plan: MetadataRequestPlan,
+    ) -> Result<Option<MetadataCandidatePage>, MetadataCandidateError> {
+        let provider_key = provider_key_from_plugin_id(scraper.provider_key());
+        let mut rows = self
+            .database
+            .list_unexpired_pending_metadata_candidates_for_item(item_id, 50)
+            .await?;
+        rows.retain(|row| provider_key_from_plugin_id(&row.provider) == provider_key);
+        rows.truncate(2);
+        let Some(best) = rows.first_mut() else {
+            return Ok(None);
+        };
+        if plan.needs_metadata && !Self::candidate_metadata_was_fetched(&best.candidate_json)? {
+            let item_type = match current.item_type.as_str() {
+                "MOVIE" => ScraperItemType::Movie,
+                "SERIES" => ScraperItemType::Series,
+                _ => return Ok(None),
+            };
+            let details = scraper
+                .get_generic(ScraperGetRequest::new(
+                    item_type,
+                    best.provider_id.clone(),
+                    "zh-CN",
+                ))
+                .await
+                .map_err(MetadataCandidateError::Scraper)?;
+            let candidate_json =
+                Self::merge_scraper_metadata_into_candidate(&best.candidate_json, &details)?;
+            if !self
+                .database
+                .update_pending_metadata_candidate_json(item_id, &best.id, &candidate_json)
+                .await?
+            {
+                return Ok(None);
+            }
+            best.candidate_json = candidate_json;
+        }
+        let items = rows
+            .into_iter()
+            .map(|row| candidate_view(row, Some(current)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let total = i64::try_from(items.len()).unwrap_or(i64::MAX);
+        Ok(Some(MetadataCandidatePage {
+            items,
+            total,
+            offset: 0,
+            limit: 50,
+        }))
+    }
+
+    fn candidate_metadata_was_fetched(
+        candidate_json: &str,
+    ) -> Result<bool, MetadataCandidateError> {
+        let value = serde_json::from_str::<Value>(candidate_json)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+        Ok(value
+            .get("metadataFetched")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+    }
+
+    fn merge_scraper_metadata_into_candidate(
+        candidate_json: &str,
+        details: &ScraperMetadata,
+    ) -> Result<String, MetadataCandidateError> {
+        let mut value = serde_json::from_str::<Value>(candidate_json)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+        let mut provider_ids = candidate_provider_ids(&value)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))?;
+        provider_ids.extend(details.provider_ids.clone());
+        let object = value.as_object_mut().ok_or_else(|| {
+            MetadataCandidateError::InvalidCandidateJson("candidate must be an object".to_owned())
+        })?;
+
+        macro_rules! set_optional {
+            ($field:ident, $key:literal) => {
+                if let Some(value) = details.$field.as_ref() {
+                    object.insert($key.to_owned(), json!(value));
+                }
+            };
+        }
+        set_optional!(title, "title");
+        set_optional!(original_title, "originalTitle");
+        set_optional!(overview, "overview");
+        set_optional!(tagline, "tagline");
+        set_optional!(website, "website");
+        set_optional!(production_year, "productionYear");
+        set_optional!(rating, "rating");
+        set_optional!(votes, "votes");
+        set_optional!(runtime, "runtime");
+        set_optional!(premiere_date, "premiereDate");
+        set_optional!(original_language, "originalLanguage");
+        set_optional!(end_date, "endDate");
+        set_optional!(status, "status");
+        set_optional!(set_name, "setName");
+        set_optional!(set_id, "setId");
+        set_optional!(poster_url, "posterUrl");
+        set_optional!(backdrop_url, "backdropUrl");
+        set_optional!(certification, "certification");
+        if !details.genres.is_empty() {
+            object.insert("genres".to_owned(), json!(details.genres));
+        }
+        if !details.countries.is_empty() {
+            object.insert("countries".to_owned(), json!(details.countries));
+        }
+        if !details.studios.is_empty() {
+            object.insert("studios".to_owned(), json!(details.studios));
+        }
+        object.insert("providerIds".to_owned(), json!(provider_ids));
+        object.insert("metadataFetched".to_owned(), Value::Bool(true));
+        serde_json::to_string(&value)
+            .map_err(|error| MetadataCandidateError::InvalidCandidateJson(error.to_string()))
+    }
+
     async fn search_child_and_store(
         &self,
         item_id: &str,
@@ -492,6 +925,7 @@ impl MetadataCandidateService {
         year: Option<i32>,
         current: &StoredMediaMetadata,
         scraper: &ScraperProvider,
+        plan: MetadataRequestPlan,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let item_type = match current.item_type.as_str() {
             "SEASON" => ScraperItemType::Season,
@@ -561,30 +995,62 @@ impl MetadataCandidateService {
                 ),
                 _ => continue,
             };
-            let metadata = match scraper.get_generic(request).await {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    last_error = Some(error.to_string());
-                    continue;
+            let selected_child_provider_id = selected_scraper_provider_id(current, scraper);
+            let metadata = if plan.needs_metadata || selected_child_provider_id.is_none() {
+                match scraper.get_generic(request).await {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        last_error = Some(error.to_string());
+                        continue;
+                    }
+                }
+            } else {
+                ScraperMetadata {
+                    item_type: Some(item_type.as_str().to_owned()),
+                    title: Some(current.title.clone()),
+                    original_title: current.original_title.clone(),
+                    overview: current.overview.clone(),
+                    production_year: current
+                        .production_year
+                        .and_then(|value| i32::try_from(value).ok()),
+                    premiere_date: current.premiere_date.clone(),
+                    original_language: current.original_language.clone(),
+                    provider_ids: current_provider_ids(current),
+                    ..ScraperMetadata::default()
                 }
             };
-            let Some(provider_id) = selected_metadata_provider_id(&metadata, &parent.provider)
+            let metadata_fetched = plan.needs_metadata || selected_child_provider_id.is_none();
+            let Some(provider_id) = selected_child_provider_id
+                .or_else(|| selected_metadata_provider_id(&metadata, &parent.provider))
             else {
                 continue;
             };
-            let mut image_request =
-                ScraperImageRequest::new(item_type, &parent.provider_id, "zh-CN");
-            image_request.season_number = Some(season_number);
-            image_request.episode_number = episode_number;
-            let images = scraper
-                .images_generic(image_request)
-                .await
-                .unwrap_or_default();
+            let images_response = if plan.needs_images {
+                let mut image_request =
+                    ScraperImageRequest::new(item_type, &parent.provider_id, "zh-CN");
+                image_request.season_number = Some(season_number);
+                image_request.episode_number = episode_number;
+                scraper.images_generic(image_request).await.ok()
+            } else {
+                None
+            };
+            if images_response
+                .as_ref()
+                .is_some_and(|response| response.images.is_empty())
+            {
+                self.record_explicitly_unavailable_images(item_id, scraper, &parent.provider_id)
+                    .await?;
+            }
+            let images = images_response.unwrap_or_default();
             let title = metadata
                 .title
                 .clone()
                 .or_else(|| metadata.original_title.clone())
                 .unwrap_or_else(|| current.title.clone());
+            let mut provider_ids = metadata.provider_ids;
+            provider_ids
+                .entry(parent.provider.clone())
+                .or_insert_with(|| parent.provider_id.clone());
             self.store_candidate(
                 item_id,
                 current,
@@ -610,7 +1076,7 @@ impl MetadataCandidateService {
                     countries: metadata.countries,
                     genres: metadata.genres,
                     studios: metadata.studios,
-                    provider_ids: metadata.provider_ids,
+                    provider_ids,
                     directors: Vec::new(),
                     writers: Vec::new(),
                     trailers: Vec::new(),
@@ -618,6 +1084,7 @@ impl MetadataCandidateService {
                     provider_id,
                     images: generic_candidate_images(&images.images, item_type),
                     actors: Vec::new(),
+                    metadata_fetched,
                     score: Some(parent.score),
                 },
                 expires_at,
@@ -736,6 +1203,7 @@ impl MetadataCandidateService {
             "originalLanguage": candidate.original_language,
             "images": candidate.images,
             "actors": candidate.actors,
+            "metadataFetched": candidate.metadata_fetched,
         })
         .to_string();
         let id = uuid::Uuid::now_v7().to_string();
@@ -752,6 +1220,36 @@ impl MetadataCandidateService {
             })
             .await
             .map_err(MetadataCandidateError::Storage)
+    }
+
+    async fn record_explicitly_unavailable_images(
+        &self,
+        item_id: &str,
+        scraper: &ScraperProvider,
+        provider_id: &str,
+    ) -> Result<(), MetadataCandidateError> {
+        let sources = [
+            scraper.plugin_id().unwrap_or(scraper.provider_key()),
+            scraper.provider_key(),
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+            .unwrap_or_default();
+        for source in sources {
+            for image_type in SCRAPER_IMAGE_TYPES {
+                let candidate_key = image_no_candidate_key(&source, image_type, provider_id);
+                self.database
+                    .mark_metadata_image_unavailable(item_id, image_type, &candidate_key, now)
+                    .await
+                    .map_err(MetadataCandidateError::Storage)?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -785,13 +1283,15 @@ struct CandidateMetadata {
     provider_id: String,
     images: BTreeMap<String, Vec<String>>,
     actors: Vec<ActorCredit>,
+    metadata_fetched: bool,
     score: Option<f64>,
 }
 
 #[derive(Clone, Copy)]
 enum CandidateSearchMode {
     Manual,
-    Automatic,
+    AutomaticReuse,
+    AutomaticFresh,
 }
 
 struct ParentProvider {
@@ -842,6 +1342,25 @@ fn candidate_expiry() -> Option<i64> {
         .and_then(|now| now.checked_add(24 * 60 * 60))
 }
 
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+fn capability_error_is_permanent(error: &ScraperError) -> bool {
+    match error {
+        ScraperError::UnsupportedCapability(_) => true,
+        ScraperError::Provider(message) => {
+            let message = message.to_ascii_lowercase();
+            message.contains("not found") || message.contains("404")
+        }
+        _ => false,
+    }
+}
+
 fn selected_metadata_provider_id(metadata: &ScraperMetadata, provider: &str) -> Option<String> {
     let short_provider = provider.rsplit(['.', ':', '/']).next().unwrap_or(provider);
     metadata
@@ -852,6 +1371,69 @@ fn selected_metadata_provider_id(metadata: &ScraperMetadata, provider: &str) -> 
                 .flatten()
         })
         .map(str::to_owned)
+}
+
+fn current_provider_ids(current: &StoredMediaMetadata) -> BTreeMap<String, String> {
+    current
+        .provider_ids_json
+        .as_deref()
+        .and_then(|value| serde_json::from_str(value).ok())
+        .unwrap_or_default()
+}
+
+fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, String)> {
+    let provider_ids = current_provider_ids(current);
+    let Some(source) = current
+        .metadata_scraper_id
+        .as_deref()
+        .or(current.scraper_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    let Some(provider_id) = provider_id_for_key(&provider_ids, source)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Vec::new();
+    };
+    vec![(provider_key_from_plugin_id(source), provider_id.to_owned())]
+}
+
+fn selected_capability_identity(current: &StoredMediaMetadata) -> Option<(String, String)> {
+    let provider = current
+        .metadata_scraper_id
+        .as_deref()
+        .or(current.scraper_id.as_deref())?
+        .trim();
+    let provider_ids = current_provider_ids(current);
+    let provider_id = provider_id_for_key(&provider_ids, provider)?.trim();
+    (!provider_id.is_empty()).then(|| (provider.to_owned(), provider_id.to_owned()))
+}
+
+fn capability_needs_request(
+    states: &[StoredMetadataCapabilityAttempt],
+    identity: Option<&(String, String)>,
+    capability: &str,
+) -> bool {
+    let Some((provider, provider_id)) = identity else {
+        return true;
+    };
+    let Some(state) = states.iter().find(|state| {
+        state.capability.eq_ignore_ascii_case(capability)
+            && state.provider_id == *provider_id
+            && provider_key_from_plugin_id(&state.provider) == provider_key_from_plugin_id(provider)
+    }) else {
+        return true;
+    };
+    match state.status.as_str() {
+        "AVAILABLE" | "UNAVAILABLE" => false,
+        "FAILED" => state
+            .next_retry_at
+            .is_none_or(|retry_at| retry_at <= current_unix_timestamp()),
+        _ => true,
+    }
 }
 
 fn selected_scraper_provider_id(
@@ -1096,13 +1678,32 @@ fn generic_candidate_actors(
 }
 
 async fn enrich_actor_metadata(scraper: &ScraperProvider, actors: &mut [ActorCredit]) {
-    for actor in actors.iter_mut() {
-        let provider_id = actor.id.trim();
-        if provider_id.is_empty() {
-            continue;
+    let requests = actors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, actor)| {
+            let provider_id = actor.id.trim();
+            (!provider_id.is_empty()).then(|| (index, provider_id.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    let mut next_request = 0;
+    let mut pending = JoinSet::new();
+    while next_request < requests.len() || !pending.is_empty() {
+        while next_request < requests.len() && pending.len() < ACTOR_METADATA_FETCH_CONCURRENCY {
+            let (index, provider_id) = &requests[next_request];
+            let index = *index;
+            let scraper = scraper.clone();
+            let provider_id = provider_id.clone();
+            pending.spawn(async move {
+                let request = ScraperGetRequest::new(ScraperItemType::Person, provider_id, "zh-CN");
+                (index, scraper.get_generic(request).await.ok())
+            });
+            next_request += 1;
         }
-        let request = ScraperGetRequest::new(ScraperItemType::Person, provider_id, "zh-CN");
-        let Ok(metadata) = scraper.get_generic(request).await else {
+        let Some(result) = pending.join_next().await else {
+            break;
+        };
+        let Ok((index, Some(metadata))) = result else {
             continue;
         };
         let person = crate::application::people::PersonMetadata {
@@ -1125,7 +1726,7 @@ async fn enrich_actor_metadata(scraper: &ScraperProvider, actors: &mut [ActorCre
             || person.known_for_department.is_some()
             || person.place_of_birth.is_some()
         {
-            actor.person = Some(person);
+            actors[index].person = Some(person);
         }
     }
 }
@@ -1203,12 +1804,20 @@ pub struct MetadataSelectionReport {
     pub actor_count: usize,
 }
 
+struct MetadataSelectionOptions<'a> {
+    keep_pending: bool,
+    scraper_id: Option<&'a str>,
+    supplemental: bool,
+    image_policy: Option<ImageSelectionPolicy>,
+}
+
 #[derive(Clone)]
 pub struct MetadataSelectionService {
     database: Database,
     nfo: NfoWriteService,
     images: ImageWriteService,
     people: crate::application::people::PeopleService,
+    resources: ResourceMetrics,
 }
 
 impl MetadataSelectionService {
@@ -1227,35 +1836,118 @@ impl MetadataSelectionService {
             images,
             people: crate::application::people::PeopleService::new(config_dir)
                 .with_database(database.clone()),
+            resources: ResourceMetrics::new(),
         }
     }
 
-    pub(crate) async fn is_fill_missing_complete(
+    pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.images = self.images.clone().with_resource_metrics(resources.clone());
+        self.resources = resources;
+        self
+    }
+
+    pub(crate) async fn fill_missing_request_plan(
         &self,
         item_id: &str,
-    ) -> Result<bool, MetadataSelectionError> {
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
         let current = self
             .database
             .find_media_item_metadata(item_id)
             .await?
             .ok_or(MetadataSelectionError::ItemNotFound)?;
-        let Some(fields) = fill_missing_fields(&current.item_type) else {
-            return Ok(false);
-        };
-        let state = metadata_state(&current);
-        if !state.has_complete_fill_values(fields)
-            || !fill_missing_scalar_values_complete(&current)
-            || !has_selected_provider_id(&current)
-        {
-            return Ok(false);
+        self.fill_missing_request_plan_for_current(item_id, &current)
+            .await
+    }
+
+    pub(crate) async fn fill_missing_request_plan_for_current(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+        if fill_missing_fields(&current.item_type).is_none() {
+            return Ok(MetadataRequestPlan::full());
         }
         let image_policy = self.image_selection_policy(item_id).await?;
-        for image_type in image_policy.enabled_types() {
-            if !self.images.has_local_image(item_id, image_type).await? {
-                return Ok(false);
+        let capability_states = self
+            .database
+            .list_metadata_capability_attempts(item_id)
+            .await?;
+        let image_attempts = self.database.list_metadata_image_attempts(item_id).await?;
+        let unavailable_image_attempts = image_attempts
+            .into_iter()
+            .filter(|attempt| attempt.status.eq_ignore_ascii_case("UNAVAILABLE"))
+            .map(|attempt| (attempt.image_type, attempt.candidate_key))
+            .collect::<BTreeSet<_>>();
+        let image_attempt_identities = image_attempt_identities(current);
+        let image_types = image_policy.enabled_types().collect::<Vec<_>>();
+        let local_image_types = self.images.local_image_types(item_id, &image_types).await?;
+        let mut images_missing = false;
+        for image_type in image_types {
+            if local_image_types.contains(image_type) {
+                continue;
+            }
+            let explicitly_unavailable = !image_attempt_identities.is_empty()
+                && image_attempt_identities
+                    .iter()
+                    .all(|(source, provider_id)| {
+                        unavailable_image_attempts.contains(&(
+                            image_type.to_owned(),
+                            image_no_candidate_key(source, image_type, provider_id),
+                        ))
+                    });
+            if !explicitly_unavailable {
+                images_missing = true;
+                break;
             }
         }
-        Ok(true)
+        let details = current.nfo_metadata_json.as_deref().and_then(|value| {
+            serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
+        });
+        let details = if details.is_some() {
+            details
+        } else {
+            self.nfo
+                .read_item_projection(item_id)
+                .await?
+                .map(|projection| projection.details)
+        };
+        let credits_missing = match current.item_type.as_str() {
+            "MOVIE" | "SERIES" => {
+                let actor_relation_exists = self
+                    .people
+                    .item_actor_relation_exists(item_id)
+                    .await
+                    .map_err(MetadataSelectionError::People)?;
+                credits_are_missing(actor_relation_exists, details.as_ref())
+            }
+            _ => false,
+        };
+        let mut plan =
+            metadata_request_plan(current, images_missing, credits_missing, details.as_ref());
+        plan.image_policy = Some(image_policy);
+        let capability_identity = selected_capability_identity(current);
+        plan.needs_credits = plan.needs_credits
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_CREDITS,
+            );
+        plan.needs_external_ids = plan.needs_external_ids
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_EXTERNAL_IDS,
+            );
+        plan.needs_trailers = plan.needs_trailers
+            && capability_needs_request(
+                &capability_states,
+                capability_identity.as_ref(),
+                CAPABILITY_TRAILERS,
+            );
+        if !has_selected_provider_id(current) {
+            plan.needs_metadata = true;
+        }
+        Ok(plan)
     }
 
     pub async fn select(
@@ -1264,8 +1956,18 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, false, None, false)
-            .await
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: false,
+                scraper_id: None,
+                supplemental: false,
+                image_policy: None,
+            },
+        )
+        .await
     }
 
     pub async fn select_with_scraper(
@@ -1276,20 +1978,61 @@ impl MetadataSelectionService {
         scraper_id: Option<&str>,
         supplemental: bool,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, false, scraper_id, supplemental)
-            .await
+        self.select_with_scraper_and_policy(
+            item_id,
+            candidate_id,
+            mode,
+            scraper_id,
+            supplemental,
+            None,
+        )
+        .await
     }
 
-    pub(crate) async fn select_for_review_with_scraper(
+    pub(crate) async fn select_with_scraper_and_policy(
         &self,
         item_id: &str,
         candidate_id: &str,
         mode: MetadataSelectionMode,
         scraper_id: Option<&str>,
         supplemental: bool,
+        image_policy: Option<ImageSelectionPolicy>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, true, scraper_id, supplemental)
-            .await
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: false,
+                scraper_id,
+                supplemental,
+                image_policy,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn select_for_review_with_scraper_and_policy(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        mode: MetadataSelectionMode,
+        scraper_id: Option<&str>,
+        supplemental: bool,
+        image_policy: Option<ImageSelectionPolicy>,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: true,
+                scraper_id,
+                supplemental,
+                image_policy,
+            },
+        )
+        .await
     }
 
     pub async fn select_for_review(
@@ -1298,8 +2041,18 @@ impl MetadataSelectionService {
         candidate_id: &str,
         mode: MetadataSelectionMode,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        self.select_internal(item_id, candidate_id, mode, true, None, false)
-            .await
+        self.select_internal(
+            item_id,
+            candidate_id,
+            mode,
+            MetadataSelectionOptions {
+                keep_pending: true,
+                scraper_id: None,
+                supplemental: false,
+                image_policy: None,
+            },
+        )
+        .await
     }
 
     pub(crate) async fn enrich_selected_actors(
@@ -1324,7 +2077,7 @@ impl MetadataSelectionService {
             }
         }
         self.people
-            .persist_item_actors(item_id, &candidate.provider, &actors)
+            .update_item_actor_metadata(item_id, &candidate.provider, &actors)
             .await
             .map_err(MetadataSelectionError::People)
     }
@@ -1347,9 +2100,7 @@ impl MetadataSelectionService {
         item_id: &str,
         candidate_id: &str,
         mode: MetadataSelectionMode,
-        keep_pending: bool,
-        scraper_id: Option<&str>,
-        supplemental: bool,
+        options: MetadataSelectionOptions<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         let current = self
             .database
@@ -1374,17 +2125,23 @@ impl MetadataSelectionService {
             }
         }
         payload.movie_nfo.actors = payload.actors.clone();
-        if supplemental {
+        if matches!(mode, MetadataSelectionMode::FillMissing) || options.supplemental {
             let projection = self.nfo.read_item_projection(item_id).await?;
             merge_supplemental_movie_nfo(&mut payload.movie_nfo, projection.as_ref());
-            preserve_supplemental_scalar_values(&mut payload, &current);
+            payload.actors = payload.movie_nfo.actors.clone();
+            if options.supplemental {
+                preserve_supplemental_scalar_values(&mut payload, &current);
+            }
         }
-        let image_source = scraper_id.unwrap_or(candidate.provider.as_str());
-        let image_policy = self.image_selection_policy(item_id).await?;
+        let image_source = options.scraper_id.unwrap_or(candidate.provider.as_str());
+        let image_policy = match options.image_policy {
+            Some(image_policy) => image_policy,
+            None => self.image_selection_policy(item_id).await?,
+        };
         let mut state = metadata_state(&current);
         let metadata_candidate = MetadataCandidate {
             source: MetadataSource::ScraperLocalized,
-            metadata: payload.metadata,
+            metadata: payload.metadata.clone(),
         };
         match mode {
             MetadataSelectionMode::FillMissing => state.apply_fill_missing(&metadata_candidate),
@@ -1394,40 +2151,9 @@ impl MetadataSelectionService {
         }
         let mut movie_nfo = payload.movie_nfo.clone();
         movie_nfo.base = state.metadata.clone();
-        let mut image_types = Vec::new();
-        if payload.typed_images_present {
-            for image_type in image_policy.enabled_types() {
-                let Some(url) = payload.images.get(image_type).and_then(|urls| urls.first()) else {
-                    continue;
-                };
-                if self
-                    .write_selected_image(item_id, image_type, url, image_source, mode)
-                    .await?
-                    .is_some()
-                {
-                    image_types.push(image_type);
-                }
-            }
-        } else {
-            if let Some(url) = payload.poster_url.as_deref() {
-                if self
-                    .write_selected_image(item_id, "POSTER", url, image_source, mode)
-                    .await?
-                    .is_some()
-                {
-                    image_types.push("POSTER");
-                }
-            }
-            if let Some(url) = payload.fanart_url.as_deref() {
-                if self
-                    .write_selected_image(item_id, "FANART", url, image_source, mode)
-                    .await?
-                    .is_some()
-                {
-                    image_types.push("FANART");
-                }
-            }
-        }
+        let image_types = self
+            .write_selected_images(item_id, &payload, image_policy, image_source, mode)
+            .await?;
         let has_primary_artwork = image_types
             .iter()
             .any(|image_type| matches!(*image_type, "POSTER" | "THUMB"))
@@ -1437,13 +2163,17 @@ impl MetadataSelectionService {
             .people
             .persist_item_actors(item_id, &candidate.provider, &payload.actors)
             .await?;
+        let nfo_started = std::time::Instant::now();
         let nfo_report = if current.item_type == "MOVIE" {
             self.nfo.write_item_movie_nfo(item_id, &movie_nfo).await?
         } else {
             self.nfo.write_item_nfo(item_id, &state.metadata).await?
         };
-        let mut provider_ids = movie_nfo.provider_ids.clone();
-        if supplemental {
+        self.resources
+            .record_metadata_stage("nfo_write", nfo_started.elapsed());
+        let mut provider_ids = current_provider_ids(&current);
+        provider_ids.extend(movie_nfo.provider_ids.clone());
+        if options.supplemental {
             if !provider_ids
                 .keys()
                 .any(|key| key.eq_ignore_ascii_case(&candidate.provider))
@@ -1477,14 +2207,14 @@ impl MetadataSelectionService {
                 rating: payload.rating,
                 rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
                 provider_ids_json: &provider_ids_json,
-                metadata_scraper_id: (!supplemental && !keep_pending)
-                    .then_some(scraper_id)
+                metadata_scraper_id: (!options.supplemental && !options.keep_pending)
+                    .then_some(options.scraper_id)
                     .flatten(),
                 metadata_fingerprint: &nfo_report.fingerprint,
                 provenance_json: &state.provenance_json(),
                 locked_fields_json: &state.locked_fields_json(),
                 poster_fallback_required: !has_primary_artwork,
-                keep_pending,
+                keep_pending: options.keep_pending,
             })
             .await?;
         if !selected {
@@ -1496,7 +2226,7 @@ impl MetadataSelectionService {
             item_id: item_id.to_owned(),
             candidate_id: candidate_id.to_owned(),
             mode,
-            status: if keep_pending {
+            status: if options.keep_pending {
                 "PENDING"
             } else {
                 "ONLINE_CONFIRMED"
@@ -1506,26 +2236,96 @@ impl MetadataSelectionService {
         })
     }
 
-    async fn write_selected_image(
+    async fn write_selected_images(
         &self,
         item_id: &str,
-        image_type: &str,
-        url: &str,
+        payload: &CandidatePayload,
+        image_policy: ImageSelectionPolicy,
         source: &str,
         mode: MetadataSelectionMode,
-    ) -> Result<Option<crate::application::images::ImageWriteReport>, ImageWriteError> {
-        match mode {
-            MetadataSelectionMode::FillMissing => {
-                self.images
-                    .download_item_image_if_missing_from_scraper(item_id, image_type, url, source)
-                    .await
-            }
-            MetadataSelectionMode::RefreshUnlocked => self
-                .images
-                .download_item_image_from_scraper(item_id, image_type, url, source)
-                .await
-                .map(Some),
+    ) -> Result<Vec<&'static str>, MetadataSelectionError> {
+        let specs = if payload.typed_images_present {
+            image_policy
+                .enabled_types()
+                .filter_map(|image_type| {
+                    let urls = payload.images.get(image_type)?.clone();
+                    (!urls.is_empty()).then_some((image_type, urls))
+                })
+                .collect::<Vec<_>>()
+        } else {
+            [
+                ("POSTER", payload.poster_url.clone()),
+                ("FANART", payload.fanart_url.clone()),
+            ]
+            .into_iter()
+            .filter_map(|(image_type, url)| url.map(|url| (image_type, vec![url])))
+            .collect::<Vec<_>>()
+        };
+        let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
+        let mut tasks = JoinSet::new();
+        for (index, (image_type, urls)) in specs.into_iter().enumerate() {
+            let permit = item_permits.clone().acquire_owned().await.map_err(|_| {
+                MetadataSelectionError::InvalidCandidate("image semaphore closed".to_owned())
+            })?;
+            let images = self.images.clone();
+            let item_id = item_id.to_owned();
+            let source = source.to_owned();
+            tasks.spawn(async move {
+                let _permit = permit;
+                let mut last_error = None;
+                for url in urls.into_iter().take(4) {
+                    let result = match mode {
+                        MetadataSelectionMode::FillMissing => {
+                            images
+                                .try_download_item_image_if_missing_from_scraper(
+                                    &item_id, image_type, &url, &source,
+                                )
+                                .await
+                        }
+                        MetadataSelectionMode::RefreshUnlocked => {
+                            images
+                                .download_item_image_from_scraper(
+                                    &item_id, image_type, &url, &source,
+                                )
+                                .await
+                        }
+                    };
+                    match result {
+                        Ok(Some(report)) => {
+                            let _ = report;
+                            return Ok(Some((index, image_type)));
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            last_error = Some(error);
+                        }
+                    }
+                }
+                if last_error.is_some() {
+                    tracing::warn!(
+                        item_id,
+                        image_type,
+                        "metadata image candidates were unavailable"
+                    );
+                }
+                Ok(None)
+            });
         }
+        let mut image_types = Vec::new();
+        while let Some(result) = tasks.join_next().await {
+            match result.map_err(|_| {
+                MetadataSelectionError::InvalidCandidate("image task failed".to_owned())
+            })? {
+                Ok(Some(image_type)) => image_types.push(image_type),
+                Ok(None) => {}
+                Err(error) => return Err(MetadataSelectionError::Image(error)),
+            }
+        }
+        image_types.sort_unstable_by_key(|(index, _)| *index);
+        Ok(image_types
+            .into_iter()
+            .map(|(_, image_type)| image_type)
+            .collect())
     }
 
     async fn image_selection_policy(
@@ -1801,8 +2601,8 @@ struct CandidatePayload {
     actors: Vec<ActorCredit>,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct ImageSelectionPolicy {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ImageSelectionPolicy {
     poster: bool,
     artwork: bool,
     banner: bool,
@@ -2387,11 +3187,129 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TmdbCastMember, candidate_actors, default_image_selection_policy, generic_candidate_images,
-        metadata_match_score, tmdb_candidate_actors,
+        ACTOR_METADATA_FETCH_CONCURRENCY, TmdbCastMember, candidate_actors, credits_are_missing,
+        default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
+        metadata_match_score, metadata_request_plan, tmdb_candidate_actors,
     };
-    use crate::application::scraper::{ScraperImage, ScraperItemType};
+    use crate::application::scraper::{
+        ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
+        ScraperFuture, ScraperGetRequest, ScraperImage, ScraperImageRequest, ScraperImagesResponse,
+        ScraperItemType, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
+        ScraperSearchRequest, ScraperSearchResponse, ScraperTrailersResponse,
+    };
+    use crate::storage::StoredMediaMetadata;
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::time::{Duration, sleep};
+
+    #[derive(Clone)]
+    struct DelayedActorAdapter {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    }
+
+    impl ScraperAdapter for DelayedActorAdapter {
+        fn provider_key(&self) -> &str {
+            "tmdb"
+        }
+
+        fn search(
+            &self,
+            _request: ScraperSearchRequest,
+        ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperSearchResponse::default())))
+        }
+
+        fn get(
+            &self,
+            request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+            let active = Arc::clone(&self.active);
+            let maximum = Arc::clone(&self.maximum);
+            Box::pin(async move {
+                let active_count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(active_count, Ordering::SeqCst);
+                sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ScraperMetadata {
+                    item_type: Some("Person".to_owned()),
+                    title: Some(request.provider_id),
+                    overview: Some("Biography".to_owned()),
+                    ..ScraperMetadata::default()
+                })
+            })
+        }
+
+        fn bundle(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+            Box::pin(std::future::ready(Err(
+                ScraperError::UnsupportedCapability("metadata.bundle".to_owned()),
+            )))
+        }
+
+        fn images(
+            &self,
+            _request: ScraperImageRequest,
+        ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperImagesResponse::default())))
+        }
+
+        fn credits(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperCreditsResponse::default())))
+        }
+
+        fn external_ids(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+            Box::pin(std::future::ready(
+                Ok(ScraperExternalIdsResponse::default()),
+            ))
+        }
+
+        fn trailers(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperTrailersResponse::default())))
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_metadata_fetches_are_bounded_and_parallel() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let scraper = ScraperProvider::from_adapter(DelayedActorAdapter {
+            active: Arc::clone(&active),
+            maximum: Arc::clone(&maximum),
+        });
+        let mut actors = (0..8)
+            .map(|index| super::ActorCredit {
+                id: index.to_string(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: format!("Actor {index}"),
+                character: None,
+                order: Some(index),
+                profile_url: None,
+                person: None,
+            })
+            .collect::<Vec<_>>();
+
+        enrich_actor_metadata(&scraper, &mut actors).await;
+
+        assert!(actors.iter().all(|actor| actor.person.is_some()));
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+        assert!(maximum.load(Ordering::SeqCst) <= ACTOR_METADATA_FETCH_CONCURRENCY);
+    }
 
     #[test]
     fn metadata_refresh_keeps_backdrop_images_as_fanart() {
@@ -2419,6 +3337,126 @@ mod tests {
         );
         assert!(!images.contains_key("THUMB"));
         assert!(!images.contains_key("BANNER"));
+    }
+
+    #[test]
+    fn fill_missing_request_plan_only_keeps_missing_capabilities() {
+        let current = StoredMediaMetadata {
+            item_type: "MOVIE".to_owned(),
+            title: "Example Movie".to_owned(),
+            original_title: Some("Example Movie".to_owned()),
+            overview: Some("Overview".to_owned()),
+            production_year: Some(2020),
+            premiere_date: Some("2020-01-01".to_owned()),
+            last_air_date: None,
+            status: None,
+            original_language: Some("en".to_owned()),
+            rating: Some(8.0),
+            provider_ids_json: Some(json!({"tmdb": "1", "imdb": "tt1"}).to_string()),
+            metadata_scraper_id: Some("tmdb".to_owned()),
+            scraper_id: Some("tmdb".to_owned()),
+            provenance_json: Some(
+                json!({
+                    "title": "LOCAL_NFO",
+                    "originalTitle": "LOCAL_NFO",
+                    "overview": "LOCAL_NFO",
+                    "productionYear": "LOCAL_NFO"
+                })
+                .to_string(),
+            ),
+            locked_fields_json: Some("[]".to_owned()),
+            nfo_metadata_json: Some(
+                json!({
+                    "rating": 8.0,
+                    "releaseDate": "2020-01-01",
+                    "originalLanguage": "en",
+                    "trailers": ["https://example.invalid/trailer"]
+                })
+                .to_string(),
+            ),
+            series_item_id: None,
+            series_title: None,
+            series_production_year: None,
+            series_provider_name: None,
+            series_provider_id: None,
+            season_number: None,
+            episode_number: None,
+        };
+
+        let details = crate::application::nfo::LocalNfoDetails {
+            trailers: vec!["https://example.invalid/trailer".to_owned()],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
+        let plan = metadata_request_plan(&current, true, false, Some(&details));
+        assert!(!plan.needs_metadata);
+        assert!(plan.needs_images);
+        assert!(!plan.needs_credits);
+        assert!(!plan.needs_external_ids);
+        assert!(!plan.needs_trailers);
+    }
+
+    #[test]
+    fn locked_missing_fields_do_not_keep_metadata_requests_pending() {
+        let current = StoredMediaMetadata {
+            item_type: "MOVIE".to_owned(),
+            title: "Example Movie".to_owned(),
+            original_title: Some("Example Movie".to_owned()),
+            overview: None,
+            production_year: Some(2020),
+            premiere_date: Some("2020-01-01".to_owned()),
+            last_air_date: None,
+            status: None,
+            original_language: Some("en".to_owned()),
+            rating: Some(8.0),
+            provider_ids_json: Some(json!({"tmdb": "1", "imdb": "tt1"}).to_string()),
+            metadata_scraper_id: Some("tmdb".to_owned()),
+            scraper_id: Some("tmdb".to_owned()),
+            provenance_json: Some(
+                json!({
+                    "title": "LOCAL_NFO",
+                    "originalTitle": "LOCAL_NFO",
+                    "productionYear": "LOCAL_NFO"
+                })
+                .to_string(),
+            ),
+            locked_fields_json: Some(json!(["overview"]).to_string()),
+            nfo_metadata_json: None,
+            series_item_id: None,
+            series_title: None,
+            series_production_year: None,
+            series_provider_name: None,
+            series_provider_id: None,
+            season_number: None,
+            episode_number: None,
+        };
+        let details = crate::application::nfo::LocalNfoDetails {
+            directors: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "Director".to_owned(),
+            }],
+            writers: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "writer-1".to_owned(),
+                name: "Writer".to_owned(),
+            }],
+            trailers: vec!["https://example.invalid/trailer".to_owned()],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
+
+        let plan = metadata_request_plan(&current, false, false, Some(&details));
+        assert!(!plan.needs_metadata);
+    }
+
+    #[test]
+    fn fill_missing_fetches_credits_when_one_crew_list_is_missing() {
+        let details = crate::application::nfo::LocalNfoDetails {
+            directors: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "Director".to_owned(),
+            }],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
+
+        assert!(credits_are_missing(true, Some(&details)));
     }
 
     #[test]

@@ -15,6 +15,8 @@ use luxd::{
         images::ImageWriteService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
+        nfo::LocalNfoMetadataStore,
+        people::PeopleService,
         reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
         scanner::LibraryScanner,
         scraper::ScraperProvider,
@@ -641,7 +643,7 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
     tokio::fs::write(movie_dir.join("Complete.Movie.2024.mkv"), b"fixture").await?;
     tokio::fs::write(
         movie_dir.join("movie.nfo"),
-        "<movie><title>Complete Movie</title><originaltitle>Complete Movie Original</originaltitle><year>2024</year><plot>Complete movie overview.</plot></movie>",
+        "<movie><title>Complete Movie</title><originaltitle>Complete Movie Original</originaltitle><year>2024</year><plot>Complete movie overview.</plot><rating>8.0</rating><premiered>2024-04-01</premiered><language>en</language><director tmdbid=\"100\">Director</director><writer tmdbid=\"101\">Writer</writer><trailer>https://example.invalid/trailer</trailer><actor><name>Actor</name><role>Role</role><tmdbid>102</tmdbid></actor></movie>",
     )
     .await?;
     for image in ["poster", "fanart", "logo", "thumb"] {
@@ -660,6 +662,8 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
         .scan_movie_library(library.id)
         .await?;
     MetadataEnricher::new(database.clone())
+        .with_people(PeopleService::new(config.config_dir.clone()))
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
         .enrich_movie_library(library.id)
         .await?;
     let item_id: String = sqlx::query_scalar(
@@ -670,7 +674,8 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
     sqlx::query(
         "UPDATE media_items
          SET premiere_date = '2024-04-01', original_language = 'en', rating = 8.0,
-             provider_ids_json = '{\"tmdb\":\"999\"}', identification_status = 'ONLINE_CONFIRMED'
+             provider_ids_json = '{\"tmdb\":\"999\",\"imdb\":\"tt999\"}',
+             identification_status = 'ONLINE_CONFIRMED'
          WHERE id = ?",
     )
     .bind(&item_id)
@@ -678,8 +683,11 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
     .await?;
 
     let images = ImageWriteService::new(database.clone())?;
-    let selection =
-        luxd::application::candidates::MetadataSelectionService::new(database.clone(), images);
+    let selection = luxd::application::candidates::MetadataSelectionService::with_config_dir(
+        database.clone(),
+        images,
+        config.config_dir.clone(),
+    );
     let tracker = RequestTracker {
         requests: Arc::new(AtomicUsize::new(0)),
     };
@@ -817,7 +825,9 @@ async fn library_metadata_job_processes_items_concurrently()
     let completed = metadata.get_job(&job.id).await?;
     assert_eq!(completed.total_count, 24);
     assert_eq!(completed.status, "COMPLETED");
-    assert!(tracker.maximum.load(Ordering::SeqCst) > 1);
+    let maximum_upstream_concurrency = tracker.maximum.load(Ordering::SeqCst);
+    assert!(maximum_upstream_concurrency > 1);
+    assert!(maximum_upstream_concurrency <= 4);
     let mut progress_events = Vec::new();
     while let Ok(scope) = event_receiver.try_recv() {
         progress_events.push(scope);

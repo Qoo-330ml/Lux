@@ -1,8 +1,10 @@
 use std::{
+    collections::BTreeSet,
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
-    time::{Duration, UNIX_EPOCH},
+    sync::{Arc, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{Client, Url, header::CONTENT_TYPE};
@@ -10,6 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
+    sync::Semaphore,
     time::sleep,
 };
 use uuid::Uuid;
@@ -25,12 +28,33 @@ use crate::{
         },
     },
     network::client_builder_from_env_or,
-    storage::{Database, ItemImageMetadata, StorageError},
+    observability::resources::ResourceMetrics,
+    storage::{Database, ItemImageMetadata, MetadataImageAttemptUpdate, StorageError},
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
-const IMAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const IMAGE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const IMAGE_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
+const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
+const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
+const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
+const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
+
+static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn global_image_download_permits() -> Arc<Semaphore> {
+    IMAGE_GLOBAL_DOWNLOAD_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
+        .clone()
+}
+
+fn global_image_write_permits() -> Arc<Semaphore> {
+    IMAGE_GLOBAL_WRITE_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
+        .clone()
+}
 
 pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
     let path = path.to_owned();
@@ -82,6 +106,9 @@ pub struct ImageWriteService {
     http: Client,
     max_bytes: u64,
     config_dir: Option<PathBuf>,
+    download_permits: Arc<Semaphore>,
+    write_permits: Arc<Semaphore>,
+    resources: Option<ResourceMetrics>,
 }
 
 impl ImageWriteService {
@@ -128,11 +155,59 @@ impl ImageWriteService {
         Self::with_proxy_config(database, config, None, None)
     }
 
+    pub fn with_config_and_concurrency(
+        database: Database,
+        config: ImageDownloadConfig,
+        concurrency: usize,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config_and_concurrency(database, config, None, None, concurrency)
+    }
+
     fn with_proxy_config(
         database: Database,
         config: ImageDownloadConfig,
         proxy_url: Option<String>,
         config_dir: Option<PathBuf>,
+    ) -> Result<Self, ImageWriteError> {
+        Self::with_proxy_config_and_permits(
+            database,
+            config,
+            proxy_url,
+            config_dir,
+            global_image_download_permits(),
+            global_image_write_permits(),
+        )
+    }
+
+    fn with_proxy_config_and_concurrency(
+        database: Database,
+        config: ImageDownloadConfig,
+        proxy_url: Option<String>,
+        config_dir: Option<PathBuf>,
+        concurrency: usize,
+    ) -> Result<Self, ImageWriteError> {
+        if concurrency == 0 {
+            return Err(ImageWriteError::InvalidConfiguration(
+                "image concurrency must be positive".to_owned(),
+            ));
+        }
+        Self::with_proxy_config_and_permits(
+            database,
+            config,
+            proxy_url,
+            config_dir,
+            Arc::new(Semaphore::new(concurrency)),
+            Arc::new(Semaphore::new(concurrency)),
+        )
+    }
+
+    fn with_proxy_config_and_permits(
+        database: Database,
+        config: ImageDownloadConfig,
+        proxy_url: Option<String>,
+        config_dir: Option<PathBuf>,
+        download_permits: Arc<Semaphore>,
+        write_permits: Arc<Semaphore>,
     ) -> Result<Self, ImageWriteError> {
         if config.max_bytes == 0 {
             return Err(ImageWriteError::InvalidConfiguration(
@@ -149,7 +224,15 @@ impl ImageWriteService {
             http,
             max_bytes: config.max_bytes,
             config_dir,
+            download_permits,
+            write_permits,
+            resources: None,
         })
+    }
+
+    pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = Some(resources);
+        self
     }
 
     pub async fn download_item_image_if_missing(
@@ -158,15 +241,22 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        if self.local_image_exists(item_id, image_type).await? {
-            return Ok(None);
-        }
-        self.download_item_image_with_source(item_id, image_type, image_url, "TMDB")
+        self.download_item_image_if_missing_impl(item_id, image_type, image_url, "TMDB")
             .await
-            .map(Some)
     }
 
-    pub(crate) async fn download_item_image_if_missing_from_scraper(
+    pub(crate) async fn try_download_item_image_if_missing_from_scraper(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
+        self.download_item_image_if_missing_impl(item_id, image_type, image_url, source)
+            .await
+    }
+
+    async fn download_item_image_if_missing_impl(
         &self,
         item_id: &str,
         image_type: &str,
@@ -182,15 +272,97 @@ impl ImageWriteService {
                     .is_some_and(|value| value.eq_ignore_ascii_case("STRM_FFMPEG"))
             {
                 return self
-                    .download_item_image_from_scraper(item_id, image_type, image_url, source)
-                    .await
-                    .map(Some);
+                    .download_item_image_attempt(item_id, image_type, image_url, source, true)
+                    .await;
             }
             return Ok(None);
         }
-        self.download_item_image_from_scraper(item_id, image_type, image_url, source)
+
+        self.download_item_image_attempt(item_id, image_type, image_url, source, false)
             .await
-            .map(Some)
+    }
+
+    async fn download_item_image_attempt(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+        force: bool,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
+        let normalized_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        let now = current_unix_timestamp();
+        let claimed_until = now.saturating_add(IMAGE_ATTEMPT_LEASE.as_secs() as i64);
+        let candidate_key = image_candidate_key(source, normalized_type, image_url);
+        if !self
+            .database
+            .claim_metadata_image_attempt(
+                item_id,
+                normalized_type,
+                &candidate_key,
+                now,
+                claimed_until,
+                force,
+            )
+            .await?
+        {
+            return Ok(None);
+        }
+
+        let result = self
+            .download_item_image_impl(item_id, normalized_type, image_url, source, true)
+            .await;
+        match result {
+            Ok(report) => {
+                self.database
+                    .finish_metadata_image_attempt(MetadataImageAttemptUpdate {
+                        item_id,
+                        image_type: normalized_type,
+                        candidate_key: &candidate_key,
+                        status: "AVAILABLE",
+                        next_retry_at: None,
+                        error_code: None,
+                        now: current_unix_timestamp(),
+                    })
+                    .await?;
+                Ok(Some(report))
+            }
+            Err(error) => {
+                self.record_image_attempt_failure(item_id, normalized_type, &candidate_key, &error)
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn record_image_attempt_failure(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        candidate_key: &str,
+        error: &ImageWriteError,
+    ) -> Result<(), ImageWriteError> {
+        let now = current_unix_timestamp();
+        let (status, next_retry_at, error_code) = image_attempt_failure(
+            error,
+            now,
+            self.database
+                .metadata_image_attempt_count(item_id, image_type, candidate_key)
+                .await?,
+        );
+        self.database
+            .finish_metadata_image_attempt(MetadataImageAttemptUpdate {
+                item_id,
+                image_type,
+                candidate_key,
+                status,
+                next_retry_at,
+                error_code: Some(error_code),
+                now,
+            })
+            .await?;
+        Ok(())
     }
 
     pub(crate) async fn list_item_images(
@@ -325,6 +497,58 @@ impl ImageWriteService {
         self.local_image_exists(item_id, image_type).await
     }
 
+    pub(crate) async fn local_image_types(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
+        let image_types = image_types
+            .iter()
+            .map(|image_type| {
+                normalize_image_type(image_type)
+                    .ok_or_else(|| ImageWriteError::InvalidImageType((*image_type).to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut found = BTreeSet::new();
+
+        if let Some(config_dir) = self.config_dir.as_ref() {
+            let root = metadata_root(config_dir);
+            let directory = library_item_directory(config_dir, item_id)
+                .map_err(|error| ImageWriteError::InvalidConfiguration(error.to_string()))?;
+            reject_metadata_symlinks(&root).await?;
+            reject_metadata_symlinks(&directory).await?;
+            let paths = read_image_directory_entries(&directory).await?;
+            for image_type in &image_types {
+                let (_, generic_stem) = image_file_stems(image_type, None, None)?;
+                if let Some(path) = find_existing_image_path_in_paths(&paths, &[generic_stem])
+                    && image_file_stamp(&path).await?.is_some()
+                {
+                    found.insert((*image_type).to_owned());
+                }
+            }
+        }
+
+        let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
+        let paths = read_image_directory_entries(&directory).await?;
+        for image_type in &image_types {
+            if found.contains(*image_type) {
+                continue;
+            }
+            let (prefixed_stem, generic_stem) =
+                image_file_stems(image_type, movie_stem.as_deref(), episode_stem.as_deref())?;
+            let stems = prefixed_stem
+                .into_iter()
+                .chain(std::iter::once(generic_stem))
+                .collect::<Vec<_>>();
+            if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
+                && image_file_stamp(&path).await?.is_some()
+            {
+                found.insert((*image_type).to_owned());
+            }
+        }
+        Ok(found)
+    }
+
     pub async fn download_item_image(
         &self,
         item_id: &str,
@@ -357,7 +581,20 @@ impl ImageWriteService {
             ));
         }
 
-        let response = self.fetch_image(&url).await?;
+        let _download_permit = self
+            .download_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                ImageWriteError::InvalidConfiguration("image semaphore closed".to_owned())
+            })?;
+        let download_started = std::time::Instant::now();
+        let response = self.fetch_image(&url).await;
+        if let Some(resources) = &self.resources {
+            resources.record_metadata_stage("image_download", download_started.elapsed());
+        }
+        let response = response?;
         let status = response.status();
         if !status.is_success() {
             return Err(ImageWriteError::UpstreamStatus {
@@ -400,6 +637,7 @@ impl ImageWriteService {
             });
         }
         validate_image_payload(format, &body)?;
+        drop(_download_permit);
 
         let (root, directory, movie_stem, episode_stem) = if let Some(config_dir) =
             self.config_dir.as_ref()
@@ -426,6 +664,15 @@ impl ImageWriteService {
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
         }
+        let _write_permit = self
+            .write_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| {
+                ImageWriteError::InvalidConfiguration("image write semaphore closed".to_owned())
+            })?;
+        let write_started = std::time::Instant::now();
         write_image_atomically(&target, &body).await?;
 
         let file_size = i64::try_from(body.len()).map_err(|_| ImageWriteError::TooLarge {
@@ -449,6 +696,10 @@ impl ImageWriteService {
                 },
             )
             .await?;
+        if let Some(resources) = &self.resources {
+            resources.record_metadata_stage("image_write", write_started.elapsed());
+            resources.record_metadata_image_bytes(size);
+        }
         Ok(ImageWriteReport {
             id,
             image_type: image_type.to_owned(),
@@ -469,7 +720,8 @@ impl ImageWriteService {
                         && retryable_image_status(response.status().as_u16()) =>
                 {
                     retry_count += 1;
-                    sleep(IMAGE_RETRY_DELAY * retry_count).await;
+                    self.record_image_retry();
+                    sleep(image_download_retry_delay(retry_count)).await;
                 }
                 Ok(response) => return Ok(response),
                 Err(error)
@@ -477,10 +729,17 @@ impl ImageWriteService {
                         && (error.is_timeout() || error.is_connect()) =>
                 {
                     retry_count += 1;
-                    sleep(IMAGE_RETRY_DELAY * retry_count).await;
+                    self.record_image_retry();
+                    sleep(image_download_retry_delay(retry_count)).await;
                 }
                 Err(error) => return Err(ImageWriteError::Download(error.to_string())),
             }
+        }
+    }
+
+    fn record_image_retry(&self) {
+        if let Some(resources) = &self.resources {
+            resources.record_metadata_image_retry();
         }
     }
 
@@ -527,8 +786,9 @@ impl ImageWriteService {
             .and_then(|identity| identity.provider_name)
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| "SCRAPER".to_owned());
-        self.download_item_image_with_source(item_id, image_type, image_url, &source)
-            .await
+        self.download_item_image_attempt(item_id, image_type, image_url, &source, true)
+            .await?
+            .ok_or(ImageWriteError::AttemptInProgress)
     }
 
     pub(crate) async fn download_item_image_from_scraper(
@@ -537,13 +797,13 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
         source: &str,
-    ) -> Result<ImageWriteReport, ImageWriteError> {
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
         if !is_allowed_scraper_image_url(image_url) {
             return Err(ImageWriteError::InvalidUrl(
                 "scraper image URL must be a valid HTTPS URL".to_owned(),
             ));
         }
-        self.download_item_image_impl(item_id, image_type, image_url, source, true)
+        self.download_item_image_attempt(item_id, image_type, image_url, source, true)
             .await
     }
 
@@ -959,6 +1219,67 @@ async fn find_any_image_path(
     find_existing_image_path(directory, &[generic_stem], None).await
 }
 
+fn find_existing_image_path_in_paths(paths: &[PathBuf], stems: &[String]) -> Option<PathBuf> {
+    let mut candidates = paths
+        .iter()
+        .filter(|path| {
+            let matches_stem = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| stems.iter().any(|stem| value.eq_ignore_ascii_case(stem)));
+            let known_extension = path
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| {
+                    matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "jpg" | "jpeg" | "png" | "webp"
+                    )
+                });
+            matches_stem && known_extension
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| left.to_string_lossy().cmp(&right.to_string_lossy()));
+    stems.iter().find_map(|stem| {
+        candidates.iter().find_map(|path| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case(stem))
+                .then(|| path.clone())
+        })
+    })
+}
+
+async fn read_image_directory_entries(directory: &Path) -> Result<Vec<PathBuf>, ImageWriteError> {
+    let metadata = match fs::symlink_metadata(directory).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(source) => return Err(image_io_error(directory, source)),
+    };
+    if !metadata.is_dir() {
+        return Err(ImageWriteError::Io {
+            path: directory.to_owned(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotADirectory,
+                "image path is not a directory",
+            ),
+        });
+    }
+    let mut entries = fs::read_dir(directory)
+        .await
+        .map_err(|source| image_io_error(directory, source))?;
+    let mut paths = Vec::new();
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|source| image_io_error(directory, source))?
+    {
+        paths.push(entry.path());
+    }
+    Ok(paths)
+}
+
 fn image_file_stems(
     image_type: &str,
     movie_stem: Option<&str>,
@@ -1178,6 +1499,68 @@ fn content_tag(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+fn current_unix_timestamp() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or_default()
+}
+
+pub(crate) fn image_candidate_key(source: &str, image_type: &str, image_url: &str) -> String {
+    let material = format!("{source}\0{image_type}\0{image_url}");
+    content_tag(material.as_bytes())
+}
+
+pub(crate) fn image_no_candidate_key(source: &str, image_type: &str, provider_id: &str) -> String {
+    image_candidate_key(source, image_type, &format!("__NO_IMAGE__\0{provider_id}"))
+}
+
+fn image_retry_delay_seconds(attempt_count: u32) -> i64 {
+    let exponent = attempt_count.saturating_sub(1).min(8);
+    let multiplier = 1_i64.checked_shl(exponent).unwrap_or(i64::MAX);
+    IMAGE_RETRY_BASE_SECONDS
+        .saturating_mul(multiplier)
+        .min(IMAGE_RETRY_MAX_SECONDS)
+}
+
+fn image_attempt_failure(
+    error: &ImageWriteError,
+    now: i64,
+    attempt_count: u32,
+) -> (&'static str, Option<i64>, &'static str) {
+    match error {
+        ImageWriteError::UpstreamStatus { status } if retryable_image_status(*status) => (
+            "FAILED",
+            Some(now.saturating_add(image_retry_delay_seconds(attempt_count))),
+            "TRANSIENT_FAILURE",
+        ),
+        ImageWriteError::UpstreamStatus { status: 404 | 410 } => {
+            ("UNAVAILABLE", None, "UPSTREAM_NOT_FOUND")
+        }
+        ImageWriteError::UpstreamStatus { .. } => ("UNAVAILABLE", None, "UPSTREAM_PERMANENT"),
+        ImageWriteError::InvalidUrl(_)
+        | ImageWriteError::UnsupportedContentType { .. }
+        | ImageWriteError::InvalidContent { .. }
+        | ImageWriteError::TooLarge { .. } => ("UNAVAILABLE", None, "INVALID_IMAGE"),
+        ImageWriteError::Download(_)
+        | ImageWriteError::ConcurrentModification(_)
+        | ImageWriteError::Io { .. } => (
+            "FAILED",
+            Some(now.saturating_add(image_retry_delay_seconds(attempt_count))),
+            "TRANSIENT_FAILURE",
+        ),
+        ImageWriteError::InvalidConfiguration(_)
+        | ImageWriteError::InvalidImageType(_)
+        | ImageWriteError::ClientBuild(_)
+        | ImageWriteError::ItemNotFound
+        | ImageWriteError::PathOutsideRoot(_)
+        | ImageWriteError::SymlinkTarget(_)
+        | ImageWriteError::AttemptInProgress
+        | ImageWriteError::Storage(_) => ("FAILED", None, "PERMANENT_FAILURE"),
+    }
 }
 
 fn image_io_error(path: &Path, source: std::io::Error) -> ImageWriteError {
@@ -1436,6 +1819,7 @@ pub enum ImageWriteError {
     PathOutsideRoot(PathBuf),
     SymlinkTarget(PathBuf),
     ConcurrentModification(PathBuf),
+    AttemptInProgress,
     Io {
         path: PathBuf,
         source: std::io::Error,
@@ -1488,6 +1872,7 @@ impl fmt::Display for ImageWriteError {
                     path.display()
                 )
             }
+            Self::AttemptInProgress => formatter.write_str("image download is already in progress"),
             Self::Io { path, source } => {
                 write!(formatter, "image path '{}': {source}", path.display())
             }
@@ -1513,7 +1898,8 @@ impl std::error::Error for ImageWriteError {
             | Self::ItemNotFound
             | Self::PathOutsideRoot(_)
             | Self::SymlinkTarget(_)
-            | Self::ConcurrentModification(_) => None,
+            | Self::ConcurrentModification(_)
+            | Self::AttemptInProgress => None,
         }
     }
 }
@@ -1549,9 +1935,22 @@ fn retryable_image_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
+fn image_download_retry_delay(retry_count: u32) -> Duration {
+    let exponent = retry_count.saturating_sub(1).min(31);
+    let factor = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    IMAGE_RETRY_BASE_DELAY
+        .checked_mul(factor)
+        .unwrap_or(IMAGE_RETRY_MAX_DELAY)
+        .min(IMAGE_RETRY_MAX_DELAY)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_scraper_image_url, retryable_image_status};
+    use super::{
+        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
+        global_image_download_permits, global_image_write_permits, image_attempt_failure,
+        image_download_retry_delay, is_allowed_scraper_image_url, retryable_image_status,
+    };
 
     #[test]
     fn image_retries_only_transient_upstream_statuses() {
@@ -1560,6 +1959,35 @@ mod tests {
         assert!(retryable_image_status(503));
         assert!(!retryable_image_status(200));
         assert!(!retryable_image_status(404));
+    }
+
+    #[test]
+    fn image_retries_use_bounded_exponential_backoff() {
+        assert_eq!(image_download_retry_delay(1), IMAGE_RETRY_BASE_DELAY);
+        assert_eq!(image_download_retry_delay(2), IMAGE_RETRY_BASE_DELAY * 2);
+        assert_eq!(image_download_retry_delay(99), IMAGE_RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn permanent_upstream_status_does_not_schedule_image_retry() {
+        let (status, next_retry_at, error_code) =
+            image_attempt_failure(&ImageWriteError::UpstreamStatus { status: 403 }, 100, 1);
+
+        assert_eq!(status, "UNAVAILABLE");
+        assert_eq!(next_retry_at, None);
+        assert_eq!(error_code, "UPSTREAM_PERMANENT");
+    }
+
+    #[test]
+    fn image_download_and_write_quotas_are_independent() {
+        let first = global_image_download_permits();
+        let second = global_image_download_permits();
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+        assert_eq!(first.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
+
+        let write = global_image_write_permits();
+        assert!(!std::sync::Arc::ptr_eq(&first, &write));
+        assert_eq!(write.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
     }
 
     #[test]

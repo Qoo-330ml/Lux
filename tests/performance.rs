@@ -1,19 +1,43 @@
-use std::{env, fs, path::PathBuf, time::Instant};
+use std::{
+    collections::BTreeMap,
+    env, fs,
+    path::PathBuf,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use axum::{
+    Router,
+    body::Body,
+    extract::{Path as AxumPath, State as AxumState},
+    response::Response,
+    routing::get,
+};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
+        candidates::MetadataSelectionService,
+        images::ImageWriteService,
         libraries::LibraryService,
         probe::{FfprobeRunner, MediaProbeService},
+        reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
+        scraper::{
+            ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
+            ScraperFuture, ScraperGetRequest, ScraperImage, ScraperImageRequest,
+            ScraperImagesResponse, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
+            ScraperSearchRequest, ScraperSearchResponse, ScraperSearchResult,
+            ScraperTrailersResponse,
+        },
         setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
+    observability::resources::ResourceMetrics,
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -22,6 +46,14 @@ use tokio::net::TcpListener;
 
 const FOREGROUND_REQUESTS: usize = 50;
 const INCREMENTAL_FILES: usize = 100;
+const METADATA_BENCHMARK_ITEMS: usize = 32;
+const METADATA_BENCHMARK_PNG: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with scripts/run-performance.sh for the LUX-045 ARM64 gate"]
@@ -333,6 +365,388 @@ print('{"format":{"format_name":"matroska"},"streams":[]}', end="")
         }))?
     );
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with scripts/run-metadata-performance.sh for the LUX-200 metadata gate"]
+async fn lux_200_metadata_pipeline_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("LUX-200 metadata benchmark", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    for index in 0..METADATA_BENCHMARK_ITEMS {
+        let movie_dir = media_root.join(format!("Benchmark Movie {index:03} (2024)"));
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Benchmark.Movie.{index:03}.2024.mkv")),
+            b"LUX-200 METADATA BENCHMARK FIXTURE\n",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(
+            library.id,
+            media_root
+                .to_str()
+                .ok_or("non-utf8 metadata fixture path")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let image_state = MetadataBenchmarkImageState::default();
+    let image_server = Router::new()
+        .route("/image/{name}", get(metadata_benchmark_image))
+        .with_state(image_state);
+    let image_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let image_address = image_listener.local_addr()?;
+    let image_server_task = tokio::spawn(async move {
+        axum::serve(image_listener, image_server)
+            .await
+            .map_err(|error| std::io::Error::other(error.to_string()))
+    });
+
+    let scraper = ScraperProvider::from_adapter(MetadataBenchmarkScraper::new(format!(
+        "http://{image_address}/image"
+    )));
+    let selection = MetadataSelectionService::with_config_dir(
+        database.clone(),
+        ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+        config.config_dir.clone(),
+    );
+    let resources = ResourceMetrics::new();
+    let metadata =
+        MetadataReidentifyService::with_selection(database.clone(), scraper, Some(selection))
+            .with_resource_metrics(resources.clone());
+    let job = metadata
+        .create_library_refresh_job(&library.id.to_string(), MetadataRefreshMode::FillMissing)
+        .await?;
+    let started = Instant::now();
+    metadata.run(&job.id).await;
+    let elapsed = started.elapsed();
+    let completed = metadata.get_job(&job.id).await?;
+    assert_eq!(
+        completed.status, "COMPLETED",
+        "metadata benchmark item results: {:?}",
+        completed.items
+    );
+    assert_eq!(completed.total_count, METADATA_BENCHMARK_ITEMS as i64);
+
+    let image_attempt_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT item_id) FROM metadata_image_attempts
+         WHERE status IN ('AVAILABLE', 'UNAVAILABLE', 'FAILED')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let image_available_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT item_id) FROM metadata_image_attempts
+         WHERE status = 'AVAILABLE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let image_unavailable_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT item_id) FROM metadata_image_attempts
+         WHERE status = 'UNAVAILABLE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let snapshot = resources.snapshot().await;
+    let counters = snapshot.metadata.counters;
+    let stage_p95_ms = snapshot.metadata.stage_p95_ms;
+    assert_eq!(
+        counters.get("request.search.count"),
+        Some(&(METADATA_BENCHMARK_ITEMS as u64))
+    );
+    assert_eq!(
+        counters.get("request.bundle.count"),
+        Some(&(METADATA_BENCHMARK_ITEMS as u64))
+    );
+    assert!(counters.contains_key("stage.item_total.count"));
+    assert!(stage_p95_ms.contains_key("item_total"));
+    assert_eq!(image_available_items, (METADATA_BENCHMARK_ITEMS - 4) as i64);
+    assert_eq!(image_unavailable_items, 4);
+    assert_eq!(counters.get("retry.image_download.count"), Some(&1));
+    assert_eq!(image_attempt_items, METADATA_BENCHMARK_ITEMS as i64);
+
+    let image_unavailable_ratio = image_unavailable_items as f64 / image_attempt_items as f64;
+    let image_retry_count = counters
+        .get("retry.image_download.count")
+        .copied()
+        .unwrap_or_default();
+    let image_retry_ratio = image_retry_count as f64 / image_attempt_items as f64;
+    let elapsed_seconds = elapsed.as_secs_f64().max(0.001);
+    println!(
+        "LUX-200 METADATA RESULT {}",
+        serde_json::to_string(&json!({
+            "commit": luxd::COMMIT,
+            "architecture": std::env::consts::ARCH,
+            "itemCount": METADATA_BENCHMARK_ITEMS,
+            "elapsedMs": elapsed.as_millis(),
+            "itemsPerSecond": METADATA_BENCHMARK_ITEMS as f64 / elapsed_seconds,
+            "requestCounters": counters,
+            "stageP95Ms": stage_p95_ms,
+            "scraperRetryCount": counters
+                .iter()
+                .filter(|(key, _)| key.starts_with("retry.") && !key.ends_with("image_download.count"))
+                .map(|(_, value)| *value)
+                .sum::<u64>(),
+            "imageRetryCount": image_retry_count,
+            "imageRetryRatio": image_retry_ratio,
+            "imageAttemptItems": image_attempt_items,
+            "imageAvailableItems": image_available_items,
+            "imageUnavailableItems": image_unavailable_items,
+            "imageUnavailableRatio": image_unavailable_ratio,
+            "imageBytes": counters.get("image.bytes").copied().unwrap_or_default(),
+        }))?
+    );
+
+    image_server_task.abort();
+    Ok(())
+}
+
+#[derive(Clone)]
+struct MetadataBenchmarkScraper {
+    image_base_url: String,
+    resources: Arc<Mutex<Option<ResourceMetrics>>>,
+}
+
+impl MetadataBenchmarkScraper {
+    fn new(image_base_url: String) -> Self {
+        Self {
+            image_base_url,
+            resources: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn record(&self, capability: &'static str, started: Instant) {
+        let Ok(resources) = self.resources.lock() else {
+            return;
+        };
+        if let Some(resources) = resources.as_ref() {
+            resources.record_metadata_request(capability, false);
+            resources.record_metadata_stage(capability, started.elapsed());
+        }
+    }
+
+    fn provider_id(requested: &str) -> String {
+        requested
+            .parse::<u64>()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|_| "10000".to_owned())
+    }
+
+    fn index(provider_id: &str) -> usize {
+        provider_id
+            .parse::<usize>()
+            .ok()
+            .and_then(|value| value.checked_sub(10_000))
+            .unwrap_or_default()
+    }
+
+    fn metadata(provider_id: &str) -> ScraperMetadata {
+        let index = Self::index(provider_id);
+        ScraperMetadata {
+            item_type: Some("Movie".to_owned()),
+            title: Some(format!("Benchmark Movie {index:03}")),
+            overview: Some(format!("Benchmark overview {index}")),
+            production_year: Some(2024),
+            premiere_date: Some("2024-01-01".to_owned()),
+            original_language: Some("en".to_owned()),
+            provider_ids: BTreeMap::from([("Benchmark".to_owned(), provider_id.to_owned())]),
+            ..ScraperMetadata::default()
+        }
+    }
+
+    fn images(&self, provider_id: &str) -> ScraperImagesResponse {
+        if Self::index(provider_id) % 8 == 0 {
+            return ScraperImagesResponse::default();
+        }
+        ScraperImagesResponse {
+            images: vec![ScraperImage {
+                image_type: "Primary".to_owned(),
+                url: format!("{}/poster-{provider_id}", self.image_base_url),
+                ..ScraperImage::default()
+            }],
+        }
+    }
+}
+
+impl ScraperAdapter for MetadataBenchmarkScraper {
+    fn provider_key(&self) -> &str {
+        "benchmark"
+    }
+
+    fn search(
+        &self,
+        request: ScraperSearchRequest,
+    ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+        let scraper = self.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let index = request
+                .name
+                .rsplit(' ')
+                .next()
+                .and_then(|value| value.parse::<usize>().ok())
+                .unwrap_or_default();
+            let provider_id = (10_000 + index).to_string();
+            scraper.record("metadata.search", started);
+            Ok(ScraperSearchResponse {
+                items: vec![ScraperSearchResult {
+                    item_type: Some("Movie".to_owned()),
+                    title: Some(request.name),
+                    overview: Some(format!("Benchmark overview {index}")),
+                    production_year: request.year,
+                    provider_ids: BTreeMap::from([("Benchmark".to_owned(), provider_id)]),
+                    ..ScraperSearchResult::default()
+                }],
+            })
+        })
+    }
+
+    fn get(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+        let scraper = self.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let provider_id = Self::provider_id(&request.provider_id);
+            let metadata = Self::metadata(&provider_id);
+            scraper.record("metadata.get", started);
+            Ok(metadata)
+        })
+    }
+
+    fn bundle(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+        let scraper = self.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let provider_id = Self::provider_id(&request.provider_id);
+            let images = scraper.images(&provider_id);
+            let result = ScraperMetadataBundle {
+                metadata: Self::metadata(&provider_id),
+                images,
+                credits: ScraperCreditsResponse::default(),
+                external_ids: ScraperExternalIdsResponse {
+                    provider_ids: BTreeMap::from([("Imdb".to_owned(), format!("tt{provider_id}"))]),
+                },
+                trailers: ScraperTrailersResponse::default(),
+            };
+            scraper.record("metadata.bundle", started);
+            Ok(result)
+        })
+    }
+
+    fn images(
+        &self,
+        request: ScraperImageRequest,
+    ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+        let scraper = self.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let provider_id = Self::provider_id(&request.provider_id);
+            let result = scraper.images(&provider_id);
+            scraper.record("metadata.images", started);
+            Ok(result)
+        })
+    }
+
+    fn credits(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+        let scraper = self.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let _ = request;
+            scraper.record("metadata.credits", started);
+            Ok(ScraperCreditsResponse::default())
+        })
+    }
+
+    fn external_ids(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+        let scraper = self.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let provider_id = Self::provider_id(&request.provider_id);
+            scraper.record("metadata.externalIds", started);
+            Ok(ScraperExternalIdsResponse {
+                provider_ids: BTreeMap::from([("Imdb".to_owned(), format!("tt{provider_id}"))]),
+            })
+        })
+    }
+
+    fn trailers(
+        &self,
+        request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+        let scraper = self.clone();
+        Box::pin(async move {
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            let _ = request;
+            scraper.record("metadata.trailers", started);
+            Ok(ScraperTrailersResponse::default())
+        })
+    }
+
+    fn with_resource_metrics(&self, resources: ResourceMetrics) {
+        if let Ok(mut current) = self.resources.lock() {
+            *current = Some(resources);
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct MetadataBenchmarkImageState {
+    retries: Arc<Mutex<BTreeMap<String, usize>>>,
+}
+
+async fn metadata_benchmark_image(
+    AxumState(state): AxumState<MetadataBenchmarkImageState>,
+    AxumPath(name): AxumPath<String>,
+) -> Response {
+    if name == "poster-10001" {
+        let Ok(mut retries) = state.retries.lock() else {
+            return Response::builder()
+                .status(500)
+                .body(Body::empty())
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        };
+        let attempts = retries.entry(name.clone()).or_default();
+        if *attempts == 0 {
+            *attempts += 1;
+            return Response::builder()
+                .status(503)
+                .body(Body::empty())
+                .unwrap_or_else(|_| Response::new(Body::empty()));
+        }
+    }
+    Response::builder()
+        .header("content-type", "image/png")
+        .body(Body::from(METADATA_BENCHMARK_PNG.to_vec()))
+        .unwrap_or_else(|_| Response::new(Body::empty()))
 }
 
 async fn measure_get_requests(

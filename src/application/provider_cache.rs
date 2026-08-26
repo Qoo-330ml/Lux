@@ -2,22 +2,35 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell, futures::OwnedNotified};
+use tokio::{
+    sync::{Mutex as AsyncMutex, Notify, OnceCell, futures::OwnedNotified},
+    time::{Duration, sleep},
+};
+
+use crate::observability::resources::ResourceMetrics;
 
 const MAX_ENTRY_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CACHE_ENTRIES: usize = 4096;
+const CACHE_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct ProviderResponseCache {
     state: Arc<Mutex<CacheState>>,
     load_once: Arc<OnceCell<()>>,
     persist_lock: Arc<AsyncMutex<()>>,
+    persist_notify: Arc<Notify>,
+    persist_task: Arc<OnceCell<()>>,
+    persist_dirty: Arc<AtomicBool>,
+    resources: Arc<Mutex<Option<ResourceMetrics>>>,
     path: Option<PathBuf>,
 }
 
@@ -90,7 +103,17 @@ impl ProviderResponseCache {
             })),
             load_once: Arc::new(OnceCell::new()),
             persist_lock: Arc::new(AsyncMutex::new(())),
+            persist_notify: Arc::new(Notify::new()),
+            persist_task: Arc::new(OnceCell::new()),
+            persist_dirty: Arc::new(AtomicBool::new(false)),
+            resources: Arc::new(Mutex::new(None)),
             path,
+        }
+    }
+
+    pub(crate) fn with_resource_metrics(&self, resources: ResourceMetrics) {
+        if let Ok(mut current) = self.resources.lock() {
+            *current = Some(resources);
         }
     }
 
@@ -144,7 +167,7 @@ impl ProviderResponseCache {
                 },
             );
         }
-        self.persist().await;
+        self.schedule_persist().await;
     }
 
     pub(crate) async fn store_negative(&self, key: &str, ttl_seconds: i64) {
@@ -165,13 +188,26 @@ impl ProviderResponseCache {
                 },
             );
         }
-        self.persist().await;
+        self.schedule_persist().await;
     }
 
     pub(crate) async fn clear(&self) {
         self.ensure_loaded().await;
         lock_state(&self.state).entries.clear();
-        self.persist().await;
+        self.schedule_persist().await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn flush(&self) {
+        if self.path.is_none() {
+            return;
+        }
+        self.ensure_loaded().await;
+        self.persist_dirty.store(false, Ordering::Release);
+        self.persist_now().await;
+        if self.persist_dirty.load(Ordering::Acquire) {
+            self.persist_notify.notify_one();
+        }
     }
 
     async fn ensure_loaded(&self) {
@@ -200,31 +236,74 @@ impl ProviderResponseCache {
             .await;
     }
 
-    async fn persist(&self) {
-        let Some(path) = self.path.as_ref() else {
+    async fn schedule_persist(&self) {
+        if self.path.is_none() {
             return;
+        }
+        self.persist_dirty.store(true, Ordering::Release);
+        self.persist_notify.notify_one();
+        let cache = self.clone();
+        let _ = self
+            .persist_task
+            .get_or_init(|| async move {
+                tokio::spawn(async move { cache.persist_loop().await });
+            })
+            .await;
+    }
+
+    async fn persist_loop(&self) {
+        loop {
+            self.persist_notify.notified().await;
+            sleep(CACHE_PERSIST_DEBOUNCE).await;
+            if !self.persist_dirty.swap(false, Ordering::AcqRel) {
+                continue;
+            }
+            self.persist_now().await;
+            if self.persist_dirty.load(Ordering::Acquire) {
+                self.persist_notify.notify_one();
+            }
+        }
+    }
+
+    async fn persist_now(&self) -> bool {
+        let Some(path) = self.path.as_ref() else {
+            return false;
         };
+        let started = std::time::Instant::now();
+        let success = self.persist_now_to_path(path).await;
+        if let Ok(resources) = self.resources.lock()
+            && let Some(resources) = resources.as_ref()
+        {
+            resources.record_metadata_cache_persist(started.elapsed(), success);
+        }
+        success
+    }
+
+    async fn persist_now_to_path(&self, path: &Path) -> bool {
         let _guard = self.persist_lock.lock().await;
         let entries = {
             let state = lock_state(&self.state);
             state.entries.clone()
         };
         let Ok(bytes) = serde_json::to_vec(&entries) else {
-            return;
+            return false;
         };
         let Some(parent) = path.parent() else {
-            return;
+            return false;
         };
         if tokio::fs::create_dir_all(parent).await.is_err() {
-            return;
+            return false;
         }
         let temporary = path.with_extension("json.tmp");
         if tokio::fs::write(&temporary, bytes).await.is_err() {
-            return;
+            let _ = tokio::fs::remove_file(&temporary).await;
+            return false;
         }
         if tokio::fs::rename(&temporary, path).await.is_err() {
             let _ = tokio::fs::remove_file(&temporary).await;
+            return false;
         }
+        true
     }
 }
 
@@ -401,10 +480,31 @@ mod tests {
         };
         cache.store("persisted", &json!({"id": 9}), 60).await;
         owner.finish();
+        cache.flush().await;
 
         let restored = ProviderResponseCache::new(Some(path));
         assert!(
             matches!(restored.begin("persisted").await, CacheLookup::Hit(value) if value["id"] == 9)
         );
+    }
+
+    #[tokio::test]
+    async fn cache_persistence_records_a_bounded_duration_metric() {
+        let directory = tempfile::tempdir().expect("temporary cache directory");
+        let path = directory.path().join("provider-cache.json");
+        let resources = crate::observability::resources::ResourceMetrics::new();
+        let cache = ProviderResponseCache::new(Some(path));
+        cache.with_resource_metrics(resources.clone());
+
+        let CacheLookup::Owner(owner) = cache.begin("persisted").await else {
+            panic!("first cache lookup must own the key");
+        };
+        cache.store("persisted", &json!({"id": 9}), 60).await;
+        owner.finish();
+        cache.flush().await;
+
+        let snapshot = resources.snapshot().await;
+        assert_eq!(snapshot.metadata.counters["cache.persist.success.count"], 1);
+        assert!(snapshot.metadata.stage_p95_ms.contains_key("cache_persist"));
     }
 }

@@ -665,6 +665,37 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         alpha_source_id
     );
 
+    let unprojected_item_lookup = client
+        .get(format!("{base_url}/Items?Ids={item_id}&Limit=1"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(unprojected_item_lookup.status(), reqwest::StatusCode::OK);
+    let unprojected_item_lookup_body: Value = unprojected_item_lookup.json().await?;
+    assert_eq!(unprojected_item_lookup_body["TotalRecordCount"], 1);
+    assert_eq!(unprojected_item_lookup_body["Items"][0]["Id"], item_id);
+
+    let unprojected_media_source_lookup = client
+        .get(format!("{base_url}/Items?Ids={alpha_source_id}&Limit=1"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        unprojected_media_source_lookup.status(),
+        reqwest::StatusCode::OK
+    );
+    let unprojected_media_source_lookup_body: Value =
+        unprojected_media_source_lookup.json().await?;
+    assert_eq!(unprojected_media_source_lookup_body["TotalRecordCount"], 1);
+    assert_eq!(
+        unprojected_media_source_lookup_body["Items"][0]["Id"],
+        item_id
+    );
+    assert_eq!(
+        unprojected_media_source_lookup_body["Items"][0]["MediaSources"][0]["Id"],
+        alpha_source_id
+    );
+
     let filtered_by_unknown_id = client
         .get(format!(
             "{base_url}/Items?Ids=00000000-0000-0000-0000-000000000000&Limit=1"
@@ -809,6 +840,25 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .as_str()
             .unwrap_or_default()
             .is_empty()
+    );
+
+    let path_media_source_detail = client
+        .get(format!(
+            "{base_url}/Items/{item_id}?Fields=Path,MediaSources"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(path_media_source_detail.status(), reqwest::StatusCode::OK);
+    let path_media_source_detail_body: Value = path_media_source_detail.json().await?;
+    assert!(path_media_source_detail_body["MediaSources"].is_array());
+    assert_eq!(
+        path_media_source_detail_body["Path"],
+        format!("/media/{}/Alpha Movie.mkv", library.id)
+    );
+    assert!(
+        path_media_source_detail_body.get("People").is_none(),
+        "path/media-source detail lookups should not build the heavy cast payload"
     );
 
     // Filmly/网易爆米花 sends ShareLevel as a capability hint, while still

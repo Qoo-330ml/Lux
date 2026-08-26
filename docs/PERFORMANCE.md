@@ -104,6 +104,28 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 
 这里的 p90/p95 是请求耗时分布的位置：例如 p95=4.196 ms 表示 50 次请求中约 95% 不超过 4.196 ms，剩余约 5% 更慢；它们用于观察尾部延迟，不是平均值。由于本次样本只有 50 次，百分位数仅作开发机基线，不能替代目标数据集上的正式验收。
 
+### LUX-200 阶段指标与回归验证
+
+LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resources.metadata` 暴露。计数器只使用固定低基数标签：
+`search`、`bundle`、`get`、`images`、`credits`、`external_ids`、`trailers`，以及
+`queue_wait`、`item_total`、`image_download`、`image_write`、`cache_persist`、`nfo_write` 阶段；不会包含用户 ID、完整 URL、token 或原始错误文本。
+`stageP95Ms` 使用有界的最近样本窗口。缓存和 singleflight 分别记录 `cache.hit.count` 与 `cache.miss.count`，刮削器重试记录对应 capability 的 `retry.*.count`，图片累计字节记录在 `image.bytes`。
+缓存落盘另记录 `cache.persist.success.count`、`cache.persist.error.count` 和 `stageP95Ms.cache_persist`，用于区分缓存命中收益与落盘背压。
+
+| 日期 | 提交 | 验证 | 结果 | 限制 |
+|---|---|---|---|---|
+| 2026-08-26 | 工作树（`uname -m=arm64`） | `cargo test --locked --test metadata_selection fill_missing_only_requests_the_missing_image_capability` | 只缺 poster 时仅命中 `/3/movie/1/images`；补齐 poster 后第二次 `FILL_MISSING` 上游请求数为 0 | 本地 TMDb stub，非真实 TMDb/NAS 延迟 |
+| 2026-08-26 | 工作树（`uname -m=arm64`） | `cargo test --locked --test image_writer image_downloads_respect_the_global_concurrency_limit` | 6 个并发图片写入在测试 semaphore=2 时最大并发不超过 2 | 证明配额边界，不代表上游吞吐 |
+| 2026-08-27 | `8ab96ce7`（`uname -m=arm64`） | `cargo test --locked --test reidentify fill_missing_skips_complete_movie_without_scraper_request` | 完整电影 `FILL_MISSING` 上游请求数为 0；删海报后补全会重新产生请求 | 完整夹具包含 NFO rich details、人物关系和多 provider ID；本地 TMDb stub |
+| 2026-08-27 | `de7aad98`、`118260b7`（`uname -m=arm64`） | `cargo test --locked --lib application::images::tests::permanent_upstream_status_does_not_schedule_image_retry`；`cargo test --locked --test image_writer successful_image_retry_clears_the_backoff_state` | 403 不安排 `next_retry_at`；临时失败到期后的成功下载将状态置为 `AVAILABLE` 并清除退避 | 状态机回归验证，不代表真实上游延迟或吞吐 |
+| 2026-08-27 | `1eb460d2`（`uname -m=arm64`） | `./scripts/run-metadata-performance.sh`（连续 5 次） | 每次 32/32 条目成功；吞吐 30.9–37.0 条/秒；每次 32 次 search、32 次 bundle；图片 28 条可用、4 条明确不可用、1 次临时重试；代表性一次 `elapsed=918ms`、`stageP95Ms={bundle:4,image_download:0,image_write:78,item_total:469,nfo_write:147,queue_wait:31,search:3}`、`imageBytes=1876` | SQLite 最终元数据选择事务使用 `BEGIN IMMEDIATE`；修复前并发基准偶发 `SQLITE_BUSY`/`SQLITE_BUSY_SNAPSHOT`；仅代表本机 ARM64，不外推 NAS/x86_64 |
+| 2026-08-27 | `1be3f59e`（`uname -m=arm64`） | `./scripts/run-metadata-performance.sh`（release，单次复测） | 32/32 条目成功；`elapsed=772ms`、吞吐 41.4 条/秒；32 次 search、32 次 bundle；图片 28 条可用、4 条明确不可用、1 次临时重试；`stageP95Ms={bundle:3,image_download:0,image_write:44,item_total:215,nfo_write:60,queue_wait:18,search:3}`；`imageBytes=1876` | 本次拆分下载/写入配额后未见基准退化；该 benchmark 使用 adapter stub，不触发持久化 provider cache，`cache_persist` 由独立指标测试覆盖；仅代表本机 ARM64，不外推 NAS/x86_64 |
+| 2026-08-27 | `00b7a472`（`uname -m=arm64`） | `./scripts/run-metadata-performance.sh`（release，连续 5 次） | 32/32 条目均成功；耗时 849–895 ms，吞吐 35.7–37.7 条/秒；每次 32 次 search、32 次 bundle；图片每次 28 条可用、4 条明确不可用、1 次临时重试；`stageP95Ms` 代表性范围为 `bundle:3–4,image_download:0,image_write:27–33,item_total:119–131,nfo_write:32–37,queue_wait:6–11,search:3–4`；`imageBytes=1876` | SQLite 默认 4 路元数据 worker，进程级硬上限 16；本机 ARM64，不能外推 NAS/x86_64；adapter stub 不触发持久化 provider cache |
+| 2026-08-27 | `1c1c52e9`（`uname -m=arm64`） | `./scripts/run-metadata-performance.sh`（release，单次最终复测） | 32/32 条目成功；`elapsed=875ms`、吞吐 36.6 条/秒；32 次 search、32 次 bundle；图片 28 条可用、4 条明确不可用、1 次临时重试；`stageP95Ms={bundle:4,image_download:0,image_write:30,item_total:114,nfo_write:34,queue_wait:7,search:4}`；`imageBytes=1876` | 最终并发/压力降档实现复测；结果与前一组连续 5 次基准同量级；adapter stub 不触发持久化 provider cache；仅代表本机 ARM64，不外推 NAS/x86_64 |
+| 2026-08-27 | `00b7a472`（`uname -m=arm64`） | `cargo test --locked --test postgres_database -- --ignored --nocapture`（临时 `postgres:16-alpine`） | PostgreSQL 空库迁移、核心状态、元数据优先级/锁定字段/图片/人物关系、重扫布尔投影和 STRM 配置共 4/4 通过 | 临时本地容器，测试完成后已删除；不代表生产 NAS 连接池或远程磁盘延迟 |
+
+本机架构需以 `uname -m` 记录；ARM64 测试结果不能外推到目标 NAS/x86_64。
+
 ## ARM 开发机检查
 
 - 架构：后续记录 `uname -m` 输出（当前为 `arm64`）。

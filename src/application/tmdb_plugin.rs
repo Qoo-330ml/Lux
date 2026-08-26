@@ -16,6 +16,7 @@ use crate::application::{
         TmdbSeriesDetails, TmdbTvSearchResponse,
     },
 };
+use crate::observability::resources::ResourceMetrics;
 
 impl From<TmdbClient> for ScraperProvider {
     fn from(client: TmdbClient) -> Self {
@@ -83,6 +84,10 @@ impl ScraperAdapter for TmdbClient {
         Box::pin(async move {
             self.set_api_key(api_key.as_deref()).await;
         })
+    }
+
+    fn with_resource_metrics(&self, resources: ResourceMetrics) {
+        TmdbClient::with_resource_metrics(self, resources);
     }
 
     fn clear_response_cache(&self) -> ScraperFuture<'_, ()> {

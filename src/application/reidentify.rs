@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -14,25 +14,37 @@ use uuid::Uuid;
 
 use crate::{
     application::{
+        actor_enrichment::ActorEnrichmentQueue,
         admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
-            MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
-            MetadataCandidateView, MetadataSelectionError, MetadataSelectionMode,
-            MetadataSelectionService,
+            ImageSelectionPolicy, MetadataCandidateError, MetadataCandidatePage,
+            MetadataCandidateService, MetadataCandidateView, MetadataRequestPlan,
+            MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
         },
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
         webhooks::{WebhookEventType, WebhookService},
     },
+    config::DatabaseBackend,
     observability::resources::ResourceMetrics,
     storage::{Database, StorageError, StoredMetadataReidentifyItem},
 };
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
-const METADATA_GLOBAL_WORKER_LIMIT: usize = 8;
+const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
+const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
+const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 const AUTO_MATCH_MIN_MARGIN: f64 = 5.0;
+
+static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn metadata_global_permits() -> Arc<Semaphore> {
+    METADATA_GLOBAL_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)))
+        .clone()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataRefreshMode {
@@ -65,6 +77,7 @@ pub struct MetadataReidentifyService {
     worker_permits: Arc<Semaphore>,
     running_jobs: MetadataJobOwners,
     library_job_creation: Arc<AsyncMutex<()>>,
+    actor_enrichment: ActorEnrichmentQueue,
 }
 
 #[derive(Clone, Default)]
@@ -125,6 +138,13 @@ enum RefreshItemOutcome {
     NeedsReview(i64),
 }
 
+struct RefreshItemOptions {
+    scraper_id: Option<String>,
+    supplemental: bool,
+    request_plan: Option<MetadataRequestPlan>,
+    image_policy: Option<ImageSelectionPolicy>,
+}
+
 impl Drop for MetadataJobOwnerGuard {
     fn drop(&mut self) {
         if let Ok(mut active) = self.active.lock() {
@@ -148,9 +168,10 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
-            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            worker_permits: metadata_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
+            actor_enrichment: ActorEnrichmentQueue::new(),
         }
     }
 
@@ -179,9 +200,10 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
-            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            worker_permits: metadata_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
+            actor_enrichment: ActorEnrichmentQueue::new(),
         }
     }
 
@@ -204,9 +226,10 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
-            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            worker_permits: metadata_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
+            actor_enrichment: ActorEnrichmentQueue::new(),
         }
     }
 
@@ -216,6 +239,18 @@ impl MetadataReidentifyService {
     }
 
     pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.selection = self
+            .selection
+            .clone()
+            .map(|selection| selection.with_resource_metrics(resources.clone()));
+        self.scraper = self
+            .scraper
+            .clone()
+            .with_resource_metrics(resources.clone());
+        self.resolver = self
+            .resolver
+            .clone()
+            .map(|resolver| resolver.with_resource_metrics(resources.clone()));
         self.resources = resources;
         self
     }
@@ -257,6 +292,50 @@ impl MetadataReidentifyService {
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         self.create_job_with_mode(item_ids, MetadataRefreshMode::FillMissing)
             .await
+    }
+
+    pub async fn enqueue_selected_actor_enrichment(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+    ) -> Result<(), MetadataReidentifyError> {
+        let Some(selection) = self.selection.as_ref() else {
+            return Ok(());
+        };
+        let candidate = self
+            .database
+            .find_metadata_candidate(item_id, candidate_id)
+            .await?
+            .ok_or(MetadataReidentifyError::Selection(
+                MetadataSelectionError::CandidateNotFound,
+            ))?;
+        let scrapers = self
+            .providers_for_item(item_id, false)
+            .await
+            .map_err(MetadataReidentifyError::Scraper)?
+            .unwrap_or_default();
+        let scraper = scrapers
+            .into_iter()
+            .find(|scraper| {
+                scraper
+                    .provider
+                    .provider_key()
+                    .eq_ignore_ascii_case(&candidate.provider)
+            })
+            .map(|scraper| scraper.provider)
+            .unwrap_or_else(|| self.scraper.clone());
+        if !self
+            .actor_enrichment
+            .enqueue(item_id, candidate_id, selection.clone(), scraper)
+            .await
+        {
+            tracing::warn!(
+                item_id,
+                candidate_id,
+                "actor metadata enrichment queue is full"
+            );
+        }
+        Ok(())
     }
 
     async fn create_job_with_mode(
@@ -422,9 +501,11 @@ impl MetadataReidentifyService {
         let mut workers = JoinSet::new();
         let mut last_concurrency = None;
         loop {
+            let configured_concurrency =
+                metadata_worker_default_concurrency(self.database.backend());
             let concurrency = metadata_worker_concurrency(
                 self.resources
-                    .background_concurrency(METADATA_MATCH_CONCURRENCY)
+                    .metadata_concurrency(configured_concurrency)
                     .await,
             );
             if last_concurrency != Some(concurrency) {
@@ -437,6 +518,7 @@ impl MetadataReidentifyService {
             }
             let mut queue_exhausted = false;
             while workers.len() < concurrency {
+                let queue_wait_started = Instant::now();
                 let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
                 else {
                     queue_exhausted = true;
@@ -466,6 +548,8 @@ impl MetadataReidentifyService {
                 }
                 let service = self.clone();
                 let job_id = job_id.to_owned();
+                self.resources
+                    .record_metadata_stage("queue_wait", queue_wait_started.elapsed());
                 workers.spawn(async move {
                     let _worker_permit = worker_permit;
                     service.process_item(&job_id, &item_id, mode).await;
@@ -567,6 +651,7 @@ impl MetadataReidentifyService {
     }
 
     async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
+        let item_started = Instant::now();
         let result = match self.database.find_media_item_metadata(item_id).await {
             Ok(Some(item)) => {
                 if !matches!(
@@ -577,21 +662,22 @@ impl MetadataReidentifyService {
                 } else if item.title.trim().is_empty() {
                     Err(MetadataReidentifyError::InvalidSearch)
                 } else {
-                    let skip = if matches!(mode, MetadataRefreshMode::FillMissing) {
+                    let request_plan = if matches!(mode, MetadataRefreshMode::FillMissing) {
                         if let Some(selection) = self.selection.as_ref() {
                             selection
-                                .is_fill_missing_complete(item_id)
+                                .fill_missing_request_plan_for_current(item_id, &item)
                                 .await
                                 .map_err(MetadataReidentifyError::Selection)
+                                .map(Some)
                         } else {
-                            Ok(false)
+                            Ok(None)
                         }
                     } else {
-                        Ok(false)
+                        Ok(None)
                     };
-                    match skip {
-                        Ok(true) => Ok(0),
-                        Ok(false) => {
+                    match request_plan {
+                        Ok(Some(plan)) if metadata_request_plan_is_complete(plan) => Ok(0),
+                        Ok(request_plan) => {
                             match self
                                 .providers_for_item(
                                     item_id,
@@ -601,7 +687,11 @@ impl MetadataReidentifyService {
                             {
                                 Ok(Some(providers)) => {
                                     self.refresh_with_scraper_roles(
-                                        item_id, &item, mode, &providers,
+                                        item_id,
+                                        &item,
+                                        mode,
+                                        &providers,
+                                        request_plan,
                                     )
                                     .await
                                 }
@@ -616,6 +706,8 @@ impl MetadataReidentifyService {
             Ok(None) => Err(MetadataReidentifyError::ItemNotFound(item_id.to_owned())),
             Err(error) => Err(MetadataReidentifyError::Storage(error)),
         };
+        self.resources
+            .record_metadata_stage("item_total", item_started.elapsed());
         match result {
             Ok(candidate_count) => {
                 let _ = self
@@ -747,6 +839,7 @@ impl MetadataReidentifyService {
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
         scrapers: &[ResolvedScraper],
+        request_plan: Option<MetadataRequestPlan>,
     ) -> Result<i64, MetadataReidentifyError> {
         let mut candidate_count = 0_i64;
         let mut selected_scraper_id = None;
@@ -766,8 +859,12 @@ impl MetadataReidentifyService {
                     item,
                     mode,
                     &scraper.provider,
-                    Some(scraper.scraper_id.as_str()),
-                    false,
+                    RefreshItemOptions {
+                        scraper_id: Some(scraper.scraper_id.clone()),
+                        supplemental: false,
+                        request_plan,
+                        image_policy: request_plan.and_then(|plan| plan.image_policy),
+                    },
                 )
                 .await
             {
@@ -801,8 +898,36 @@ impl MetadataReidentifyService {
                         | crate::library::LibraryScraperRole::Both
                 )
             }) {
+                let supplemental_plan = if matches!(mode, MetadataRefreshMode::FillMissing) {
+                    if let Some(selection) = self.selection.as_ref() {
+                        Some(
+                            selection
+                                .fill_missing_request_plan(item_id)
+                                .await
+                                .map_err(MetadataReidentifyError::Selection)?,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if supplemental_plan.is_some_and(metadata_request_plan_is_complete) {
+                    break;
+                }
                 match self
-                    .refresh_item(item_id, item, mode, &scraper.provider, None, true)
+                    .refresh_item(
+                        item_id,
+                        item,
+                        mode,
+                        &scraper.provider,
+                        RefreshItemOptions {
+                            scraper_id: None,
+                            supplemental: true,
+                            request_plan: supplemental_plan,
+                            image_policy: supplemental_plan.and_then(|plan| plan.image_policy),
+                        },
+                    )
                     .await
                 {
                     Ok(
@@ -828,20 +953,34 @@ impl MetadataReidentifyService {
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
         provider: &ScraperProvider,
-        scraper_id: Option<&str>,
-        supplemental: bool,
+        options: RefreshItemOptions,
     ) -> Result<RefreshItemOutcome, MetadataReidentifyError> {
-        let page = self
-            .candidates
-            .search_and_store_for_automatic_match(
-                item_id,
-                &item.title,
-                item.production_year
-                    .and_then(|year| i32::try_from(year).ok()),
-                provider,
-            )
-            .await
-            .map_err(MetadataReidentifyError::Candidate)?;
+        let page = if matches!(mode, MetadataRefreshMode::FillMissing) {
+            self.candidates
+                .search_and_store_for_automatic_match_with_plan(
+                    item_id,
+                    &item.title,
+                    item.production_year
+                        .and_then(|year| i32::try_from(year).ok()),
+                    provider,
+                    options
+                        .request_plan
+                        .unwrap_or_else(MetadataRequestPlan::full),
+                )
+                .await
+                .map_err(MetadataReidentifyError::Candidate)?
+        } else {
+            self.candidates
+                .search_and_store_for_automatic_match_fresh(
+                    item_id,
+                    &item.title,
+                    item.production_year
+                        .and_then(|year| i32::try_from(year).ok()),
+                    provider,
+                )
+                .await
+                .map_err(MetadataReidentifyError::Candidate)?
+        };
         if matches!(mode, MetadataRefreshMode::Reidentify) {
             return Ok(RefreshItemOutcome::Confirmed(
                 i64::try_from(page.items.len()).unwrap_or(i64::MAX),
@@ -854,7 +993,7 @@ impl MetadataReidentifyService {
             return Err(MetadataReidentifyError::LowConfidence);
         };
         let needs_review = best_automatic_candidate(&page).is_none();
-        if supplemental && needs_review {
+        if options.supplemental && needs_review {
             return Err(MetadataReidentifyError::LowConfidence);
         }
         let selection_mode = match mode {
@@ -864,48 +1003,38 @@ impl MetadataReidentifyService {
         };
         if needs_review {
             selection
-                .select_for_review_with_scraper(
+                .select_for_review_with_scraper_and_policy(
                     item_id,
                     &candidate.id,
                     selection_mode,
-                    scraper_id,
-                    supplemental,
+                    options.scraper_id.as_deref(),
+                    options.supplemental,
+                    options.image_policy,
                 )
                 .await
         } else {
             selection
-                .select_with_scraper(
+                .select_with_scraper_and_policy(
                     item_id,
                     &candidate.id,
                     selection_mode,
-                    scraper_id,
-                    supplemental,
+                    options.scraper_id.as_deref(),
+                    options.supplemental,
+                    options.image_policy,
                 )
                 .await
         }
         .map_err(MetadataReidentifyError::Selection)?;
-        // Actor assets remain part of this persisted item worker: cancellation
-        // stops new claims and drains claimed items, job completion waits for
-        // this attempt, and a process exit cannot orphan a detached task.
-        match selection
-            .enrich_selected_actors(item_id, &candidate.id, provider)
+        if !self
+            .actor_enrichment
+            .enqueue(item_id, &candidate.id, selection.clone(), provider.clone())
             .await
         {
-            Ok(actor_count) if actor_count > 0 => {
-                tracing::debug!(
-                    item_id,
-                    candidate_id = %candidate.id,
-                    actor_count,
-                    "actor metadata enrichment completed"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
+            tracing::warn!(
                 item_id,
                 candidate_id = %candidate.id,
-                %error,
-                "actor metadata enrichment failed"
-            ),
+                "actor metadata enrichment queue is full"
+            );
         }
         let candidate_count = i64::try_from(page.items.len()).unwrap_or(i64::MAX);
         Ok(if needs_review {
@@ -1186,14 +1315,34 @@ fn metadata_worker_concurrency(recommended: usize) -> usize {
     recommended.clamp(1, METADATA_GLOBAL_WORKER_LIMIT)
 }
 
+fn metadata_worker_default_concurrency(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_METADATA_DEFAULT_CONCURRENCY,
+        DatabaseBackend::Postgres => POSTGRES_METADATA_DEFAULT_CONCURRENCY,
+    }
+}
+
+fn metadata_request_plan_is_complete(plan: MetadataRequestPlan) -> bool {
+    !plan.needs_metadata
+        && !plan.needs_images
+        && !plan.needs_credits
+        && !plan.needs_external_ids
+        && !plan.needs_trailers
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::Value;
 
     use super::{
-        AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
-        best_automatic_candidate, metadata_worker_concurrency,
+        AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT,
+        MetadataCandidatePage, MetadataCandidateView, MetadataRequestPlan,
+        best_automatic_candidate, metadata_global_permits, metadata_request_plan_is_complete,
+        metadata_worker_concurrency, metadata_worker_default_concurrency,
     };
+    use crate::config::DatabaseBackend;
 
     fn candidate(id: &str, score: f64) -> MetadataCandidateView {
         MetadataCandidateView {
@@ -1285,8 +1434,39 @@ mod tests {
 
     #[test]
     fn metadata_worker_concurrency_is_bounded_without_overthrottling() {
-        assert_eq!(metadata_worker_concurrency(16), 8);
+        assert_eq!(metadata_worker_concurrency(16), 16);
         assert_eq!(metadata_worker_concurrency(2), 2);
         assert_eq!(metadata_worker_concurrency(0), 1);
+    }
+
+    #[test]
+    fn metadata_worker_defaults_match_database_write_capacity() {
+        assert_eq!(
+            metadata_worker_default_concurrency(DatabaseBackend::Sqlite),
+            4
+        );
+        assert_eq!(
+            metadata_worker_default_concurrency(DatabaseBackend::Postgres),
+            8
+        );
+    }
+
+    #[test]
+    fn metadata_worker_permits_are_process_global_and_hard_capped() {
+        let first = metadata_global_permits();
+        let second = metadata_global_permits();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.available_permits(), METADATA_GLOBAL_WORKER_LIMIT);
+    }
+
+    #[test]
+    fn complete_metadata_request_plans_stop_supplemental_work() {
+        assert!(metadata_request_plan_is_complete(
+            MetadataRequestPlan::default()
+        ));
+        assert!(!metadata_request_plan_is_complete(MetadataRequestPlan {
+            needs_images: true,
+            ..MetadataRequestPlan::default()
+        }));
     }
 }

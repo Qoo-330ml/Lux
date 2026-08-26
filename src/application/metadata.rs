@@ -257,11 +257,12 @@ impl MetadataState {
 
     pub fn has_complete_fill_values(&self, fields: &[MetadataField]) -> bool {
         fields.iter().all(|field| {
-            self.has_value(*field)
-                && self
-                    .provenance
-                    .get(field)
-                    .is_some_and(|source| *source != MetadataSource::Fallback)
+            self.locked_fields.contains(field)
+                || (self.has_value(*field)
+                    && self
+                        .provenance
+                        .get(field)
+                        .is_some_and(|source| *source != MetadataSource::Fallback))
         })
     }
 

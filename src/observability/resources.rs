@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -14,6 +14,9 @@ const HOME_LATENCY_SAMPLE_CAPACITY: usize = 64;
 const HOME_P95_DEGRADED_MS: u64 = 300;
 const HOME_P95_TARGET_MS: u64 = 400;
 const PROBE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
+const METADATA_METRIC_SAMPLE_CAPACITY: usize = 128;
+const METADATA_GLOBAL_HARD_CAP: usize = 16;
+const METADATA_P95_SEVERE_MS: u64 = 1_000;
 
 #[derive(Clone)]
 pub struct ResourceMetrics {
@@ -21,6 +24,7 @@ pub struct ResourceMetrics {
     cpu_sample: Arc<Mutex<Option<CpuSample>>>,
     home_latency_ms: Arc<Mutex<VecDeque<u64>>>,
     probe_state: Arc<Mutex<ProbeConcurrencyState>>,
+    metadata: Arc<Mutex<MetadataMetricState>>,
 }
 
 impl Default for ResourceMetrics {
@@ -38,6 +42,7 @@ impl ResourceMetrics {
                 HOME_LATENCY_SAMPLE_CAPACITY,
             ))),
             probe_state: Arc::new(Mutex::new(ProbeConcurrencyState::default())),
+            metadata: Arc::new(Mutex::new(MetadataMetricState::default())),
         }
     }
 
@@ -65,6 +70,92 @@ impl ResourceMetrics {
         sorted.get(index).copied()
     }
 
+    pub fn record_metadata_stage(&self, stage: &str, duration: Duration) {
+        let Some(stage) = metadata_stage_name(stage) else {
+            return;
+        };
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        increment_counter(&mut metrics.counters, &format!("stage.{stage}.count"), 1);
+        let samples = metrics
+            .durations_ms
+            .entry(stage.to_owned())
+            .or_insert_with(|| VecDeque::with_capacity(METADATA_METRIC_SAMPLE_CAPACITY));
+        if samples.len() == METADATA_METRIC_SAMPLE_CAPACITY {
+            samples.pop_front();
+        }
+        samples.push_back(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    }
+
+    pub fn record_metadata_request(&self, capability: &str, cache_hit: bool) {
+        let Some(capability) = metadata_capability_name(capability) else {
+            return;
+        };
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        increment_counter(
+            &mut metrics.counters,
+            &format!("request.{capability}.count"),
+            1,
+        );
+        increment_counter(
+            &mut metrics.counters,
+            if cache_hit {
+                "cache.hit.count"
+            } else {
+                "cache.miss.count"
+            },
+            1,
+        );
+    }
+
+    pub fn record_metadata_retry(&self, capability: &str) {
+        let Some(capability) = metadata_capability_name(capability) else {
+            return;
+        };
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        increment_counter(
+            &mut metrics.counters,
+            &format!("retry.{capability}.count"),
+            1,
+        );
+    }
+
+    pub fn record_metadata_image_retry(&self) {
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        increment_counter(&mut metrics.counters, "retry.image_download.count", 1);
+    }
+
+    pub fn record_metadata_image_bytes(&self, bytes: u64) {
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        let current = metrics
+            .counters
+            .entry("image.bytes".to_owned())
+            .or_default();
+        *current = current.saturating_add(bytes);
+    }
+
+    pub fn record_metadata_cache_persist(&self, duration: Duration, success: bool) {
+        self.record_metadata_stage("cache_persist", duration);
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        let counter = if success {
+            "cache.persist.success.count"
+        } else {
+            "cache.persist.error.count"
+        };
+        increment_counter(&mut metrics.counters, counter, 1);
+    }
+
     pub async fn cpu_limit_cores(&self) -> Option<f64> {
         read_cpu_usage().await.and_then(|(_, limit)| limit)
     }
@@ -80,6 +171,20 @@ impl ResourceMetrics {
             self.home_latency_p95_ms(),
             cpu_limit,
             memory.usage_percent,
+        )
+    }
+
+    pub async fn metadata_concurrency(&self, configured: usize) -> usize {
+        let (cpu, memory) = tokio::join!(
+            cpu_snapshot(Arc::clone(&self.cpu_sample)),
+            memory_snapshot(),
+        );
+        recommended_metadata_concurrency(
+            configured,
+            self.home_latency_p95_ms(),
+            memory.usage_percent,
+            cpu.usage_percent,
+            METADATA_GLOBAL_HARD_CAP,
         )
     }
 
@@ -118,11 +223,30 @@ impl ResourceMetrics {
             memory_snapshot(),
             media_storage_snapshot(),
         );
+        let metadata = self.metadata_snapshot();
         ResourceSnapshot {
             runtime_seconds: self.started_at.elapsed().as_secs(),
             cpu,
             memory,
             media_storage,
+            metadata,
+        }
+    }
+
+    fn metadata_snapshot(&self) -> MetadataPerformanceSnapshot {
+        let Ok(metrics) = self.metadata.lock() else {
+            return MetadataPerformanceSnapshot::default();
+        };
+        let stage_p95_ms = metrics
+            .durations_ms
+            .iter()
+            .filter_map(|(stage, samples)| {
+                percentile95(samples).map(|value| (stage.clone(), value))
+            })
+            .collect();
+        MetadataPerformanceSnapshot {
+            counters: metrics.counters.clone(),
+            stage_p95_ms,
         }
     }
 }
@@ -134,6 +258,61 @@ pub struct ResourceSnapshot {
     pub memory: MemorySnapshot,
     #[serde(rename = "mediaStorage")]
     pub media_storage: MediaStorageSnapshot,
+    pub metadata: MetadataPerformanceSnapshot,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct MetadataPerformanceSnapshot {
+    pub counters: BTreeMap<String, u64>,
+    #[serde(rename = "stageP95Ms")]
+    pub stage_p95_ms: BTreeMap<String, u64>,
+}
+
+#[derive(Default)]
+struct MetadataMetricState {
+    counters: BTreeMap<String, u64>,
+    durations_ms: BTreeMap<String, VecDeque<u64>>,
+}
+
+fn increment_counter(counters: &mut BTreeMap<String, u64>, key: &str, amount: u64) {
+    let value = counters.entry(key.to_owned()).or_default();
+    *value = value.saturating_add(amount);
+}
+
+fn metadata_capability_name(value: &str) -> Option<&'static str> {
+    Some(match value {
+        "metadata.search" => "search",
+        "metadata.get" => "get",
+        "metadata.bundle" => "bundle",
+        "metadata.images" => "images",
+        "metadata.credits" => "credits",
+        "metadata.externalIds" => "external_ids",
+        "metadata.trailers" => "trailers",
+        _ => return None,
+    })
+}
+
+fn metadata_stage_name(value: &str) -> Option<&'static str> {
+    match value {
+        "queue_wait" => Some("queue_wait"),
+        "item_total" => Some("item_total"),
+        "image_download" => Some("image_download"),
+        "image_write" => Some("image_write"),
+        "cache_persist" => Some("cache_persist"),
+        "nfo_write" => Some("nfo_write"),
+        _ => metadata_capability_name(value),
+    }
+}
+
+fn percentile95(samples: &VecDeque<u64>) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut sorted = samples.iter().copied().collect::<Vec<_>>();
+    sorted.sort_unstable();
+    sorted
+        .get((sorted.len() * 95).div_ceil(100).saturating_sub(1))
+        .copied()
 }
 
 #[derive(Debug, Serialize)]
@@ -501,6 +680,29 @@ pub fn recommended_background_concurrency(
     }
 }
 
+pub fn recommended_metadata_concurrency(
+    configured: usize,
+    home_p95_ms: Option<u64>,
+    container_memory_usage_percent: Option<f64>,
+    cpu_usage_percent: Option<f64>,
+    hard_cap: usize,
+) -> usize {
+    let base = configured.clamp(1, hard_cap.max(1));
+    let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
+        || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
+        || home_p95_ms.is_some_and(|value| value >= METADATA_P95_SEVERE_MS);
+    if severe_pressure {
+        return base.div_ceil(4).max(1);
+    }
+    let degraded = cpu_usage_percent.is_some_and(|value| value >= 75.0)
+        || container_memory_usage_percent.is_some_and(|value| value >= 85.0)
+        || home_p95_ms.is_some_and(|value| value >= HOME_P95_TARGET_MS);
+    if degraded {
+        return base.div_ceil(2).max(1);
+    }
+    base
+}
+
 #[derive(Default)]
 struct ProbeConcurrencyState {
     effective: Option<usize>,
@@ -583,7 +785,8 @@ mod tests {
     use super::{
         ResourceMetrics, calculate_cpu_usage_cores, calculate_cpu_usage_percent,
         memory_usage_percent, parse_cgroup_limit, parse_media_storage_values, process_is_member,
-        recommended_background_concurrency, recommended_probe_concurrency, select_cpu_capacity,
+        recommended_background_concurrency, recommended_metadata_concurrency,
+        recommended_probe_concurrency, select_cpu_capacity,
     };
     use std::time::Duration;
 
@@ -649,6 +852,32 @@ mod tests {
         assert_eq!(metrics.home_latency_p95_ms(), Some(62));
     }
 
+    #[tokio::test]
+    async fn metadata_metrics_keep_bounded_stage_and_request_data() {
+        let metrics = ResourceMetrics::new();
+        metrics.record_metadata_stage("metadata.images", Duration::from_millis(10));
+        metrics.record_metadata_stage("metadata.images", Duration::from_millis(20));
+        metrics.record_metadata_request("metadata.images", false);
+        metrics.record_metadata_request("metadata.images", true);
+        metrics.record_metadata_retry("metadata.images");
+        metrics.record_metadata_image_retry();
+        metrics.record_metadata_image_bytes(42);
+        metrics.record_metadata_cache_persist(Duration::from_millis(8), true);
+        metrics.record_metadata_cache_persist(Duration::from_millis(12), false);
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.metadata.counters["request.images.count"], 2);
+        assert_eq!(snapshot.metadata.counters["cache.hit.count"], 1);
+        assert_eq!(snapshot.metadata.counters["cache.miss.count"], 1);
+        assert_eq!(snapshot.metadata.counters["retry.images.count"], 1);
+        assert_eq!(snapshot.metadata.counters["retry.image_download.count"], 1);
+        assert_eq!(snapshot.metadata.counters["image.bytes"], 42);
+        assert_eq!(snapshot.metadata.counters["cache.persist.success.count"], 1);
+        assert_eq!(snapshot.metadata.counters["cache.persist.error.count"], 1);
+        assert_eq!(snapshot.metadata.stage_p95_ms["images"], 20);
+        assert_eq!(snapshot.metadata.stage_p95_ms["cache_persist"], 12);
+    }
+
     #[test]
     fn background_concurrency_reserves_home_capacity_and_honors_limits() {
         assert_eq!(
@@ -670,6 +899,28 @@ mod tests {
         assert_eq!(
             recommended_background_concurrency(8, 8, None, None, Some(85.0)),
             1
+        );
+    }
+
+    #[test]
+    fn metadata_concurrency_uses_io_defaults_and_backs_off_under_pressure() {
+        assert_eq!(recommended_metadata_concurrency(4, None, None, None, 16), 4);
+        assert_eq!(recommended_metadata_concurrency(8, None, None, None, 16), 8);
+        assert_eq!(
+            recommended_metadata_concurrency(4, Some(400), None, None, 16),
+            2
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(8, None, Some(90.0), None, 16),
+            4
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(8, None, None, Some(95.0), 16),
+            2
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(16, None, None, None, 16),
+            16
         );
     }
 

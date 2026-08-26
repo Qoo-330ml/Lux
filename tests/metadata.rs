@@ -237,6 +237,21 @@ fn fill_missing_completeness_rejects_fallback_values() {
 }
 
 #[test]
+fn fill_missing_completeness_treats_locked_missing_fields_as_complete() {
+    let fields = [MetadataField::Title, MetadataField::Overview];
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("标题".to_owned()),
+        ..NfoMetadata::default()
+    });
+    state
+        .provenance
+        .insert(MetadataField::Title, MetadataSource::LocalNfo);
+    state.lock(MetadataField::Overview);
+
+    assert!(state.has_complete_fill_values(&fields));
+}
+
+#[test]
 fn fill_missing_replaces_scanner_fallback_with_online_episode_title() {
     let mut state = MetadataState::from_metadata(NfoMetadata {
         title: Some("暗夜与黎明".to_owned()),

@@ -222,7 +222,8 @@ impl AppState {
             config.config_dir.clone(),
             network_proxy_url.clone(),
         )
-        .ok();
+        .ok()
+        .map(|service| service.with_resource_metrics(resources.clone()));
         let library_covers = Some(
             LibraryCoverService::new(database.clone(), config.config_dir.join("library-covers"))
                 .with_metadata_directory(config.config_dir.join("metadata")),
@@ -3726,6 +3727,11 @@ async fn emby_list_items(
             Err(status) => status.into_response(),
         };
     }
+    if let Some(response) =
+        emby_single_id_lookup_response(state, principal, can_download, query).await
+    {
+        return response;
+    }
     match emby_catalog_page_from_query(state, principal, query).await {
         Ok(page) => {
             let preferred_source_id = emby_compat_media_source_id(query.ids.as_deref(), &page);
@@ -3742,6 +3748,145 @@ async fn emby_list_items(
         }
         Err(status) => status.into_response(),
     }
+}
+
+fn emby_single_id_lookup(query: &EmbyItemsQuery) -> Option<&str> {
+    if query.start_index.unwrap_or(0) != 0
+        || query.limit.is_some_and(|limit| !(1..=100).contains(&limit))
+        || query.user_id.is_some()
+        || query.series_id.is_some()
+        || query.parent_id.is_some()
+        || query.include_item_types.is_some()
+        || query.exclude_item_types.is_some()
+        || query.season_id.is_some()
+        || query.search_term.is_some()
+        || query.is_played.is_some()
+        || query.is_favorite.is_some()
+        || query.years.is_some()
+        || query.sort_by.is_some()
+        || query.sort_order.is_some()
+        || query.group_items.is_some()
+        || query.recursive.is_some()
+    {
+        return None;
+    }
+    let mut ids = query
+        .ids
+        .as_deref()?
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty());
+    let id = ids.next()?;
+    ids.next().is_none().then_some(id)
+}
+
+async fn emby_single_id_lookup_response(
+    state: &AppState,
+    principal: AccessPrincipal,
+    can_download: bool,
+    query: &EmbyItemsQuery,
+) -> Option<Response> {
+    let requested_id = emby_single_id_lookup(query)?;
+    let catalog = state.catalog.as_ref()?;
+    let (item, preferred_source_id) = match catalog.find_item(principal, requested_id).await {
+        Ok(Some(item)) => (Some(item), None),
+        Ok(None) => match catalog
+            .find_item_by_media_source_id(principal, requested_id)
+            .await
+        {
+            Ok(item) => (item, Some(requested_id)),
+            Err(CatalogError::Storage(_)) => {
+                return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, None),
+        },
+        Err(CatalogError::Storage(_)) => {
+            return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, None),
+    };
+    let mut item = item?;
+    if preferred_source_id.is_some()
+        && emby_fields_include(query.fields.as_deref(), "Chapters")
+        && catalog
+            .populate_chapters(std::slice::from_mut(&mut item))
+            .await
+            .is_err()
+    {
+        return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let work_plan = emby_item_detail_work_plan(query.fields.as_deref());
+    if work_plan.populate_image_tags
+        && catalog
+            .populate_image_tags(std::slice::from_mut(&mut item))
+            .await
+            .is_err()
+    {
+        return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    }
+    let database = state.database.as_ref()?;
+    let nfo = if emby_nfo_fields_requested(query.fields.as_deref()) {
+        read_local_nfo_details(state, &item.id).await
+    } else {
+        None
+    };
+    let user_state = match database
+        .find_user_item_state(&principal.user_id.to_string(), &item.id)
+        .await
+    {
+        Ok(state) => state,
+        Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+    };
+    let mut item_json = emby_catalog_item_json_with_state(
+        &item,
+        &state.server_id,
+        user_state.as_ref(),
+        nfo.as_ref(),
+        can_download,
+        query.fields.as_deref(),
+    );
+    if let Some(source_id) = preferred_source_id
+        && let Some(Value::Array(sources)) = item_json.get_mut("MediaSources")
+        && let Some(index) = sources
+            .iter()
+            .position(|source| source.get("Id").and_then(Value::as_str) == Some(source_id))
+    {
+        let source = sources.remove(index);
+        sources.insert(0, source);
+    }
+    if emby_fields_include(query.fields.as_deref(), "People") {
+        let actors = match state.people.as_ref() {
+            Some(people) => match people.list_item_actors(&item.id).await {
+                Ok(actors) => actors,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %item.id,
+                        %error,
+                        "derived actor relation is unavailable for Emby ID lookup"
+                    );
+                    Vec::new()
+                }
+            },
+            None => Vec::new(),
+        };
+        if let Value::Object(object) = &mut item_json {
+            let mut people = actors
+                .into_iter()
+                .map(|actor| emby_person_json(actor, &state.server_id))
+                .collect::<Vec<_>>();
+            if let Some(nfo) = nfo.as_ref() {
+                people.extend(emby_nfo_crew_json(nfo));
+            }
+            object.insert("People".to_owned(), Value::Array(people));
+        }
+    }
+    Some(
+        Json(json!({
+            "Items": [item_json],
+            "TotalRecordCount": 1,
+        }))
+        .into_response(),
+    )
 }
 
 async fn emby_query_requests_series_children(
@@ -4165,20 +4310,56 @@ async fn emby_item_response(
             let Some(database) = state.database.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
-            if catalog
-                .populate_image_tags(std::slice::from_mut(&mut item))
-                .await
-                .is_err()
+            let work_plan = emby_item_detail_work_plan(fields);
+            if work_plan.populate_image_tags
+                && catalog
+                    .populate_image_tags(std::slice::from_mut(&mut item))
+                    .await
+                    .is_err()
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            let nfo = read_local_nfo_details(state, &item.id).await;
             let user_id = principal.user_id.to_string();
-            let user_state = match database.find_user_item_state(&user_id, &item.id).await {
+            let (nfo, user_state, aspect_ratio, actors) = tokio::join!(
+                async {
+                    if work_plan.read_nfo {
+                        read_local_nfo_details(state, &item.id).await
+                    } else {
+                        None
+                    }
+                },
+                database.find_user_item_state(&user_id, &item.id),
+                async {
+                    if work_plan.read_primary_image_aspect_ratio {
+                        emby_primary_image_aspect_ratio(state, principal, &item.id).await
+                    } else {
+                        None
+                    }
+                },
+                async {
+                    if !work_plan.read_people {
+                        return Vec::new();
+                    }
+                    match state.people.as_ref() {
+                        Some(people) => match people.list_item_actors(&item.id).await {
+                            Ok(actors) => actors,
+                            Err(error) => {
+                                tracing::warn!(
+                                    item_id = %item.id,
+                                    %error,
+                                    "derived actor relation is unavailable; returning an empty cast"
+                                );
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    }
+                },
+            );
+            let user_state = match user_state {
                 Ok(state) => state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            let aspect_ratio = emby_primary_image_aspect_ratio(state, principal, &item.id).await;
             let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
@@ -4191,21 +4372,9 @@ async fn emby_item_response(
                     include_top_level_media_streams: true,
                 },
             );
-            let actors = match state.people.as_ref() {
-                Some(people) => match people.list_item_actors(&item.id).await {
-                    Ok(actors) => actors,
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id = %item.id,
-                            %error,
-                            "derived actor relation is unavailable; returning an empty cast"
-                        );
-                        Vec::new()
-                    }
-                },
-                None => Vec::new(),
-            };
-            if let Value::Object(object) = &mut item_json {
+            if work_plan.read_people
+                && let Value::Object(object) = &mut item_json
+            {
                 let mut people = actors
                     .into_iter()
                     .map(|actor| emby_person_json(actor, &state.server_id))
@@ -4474,6 +4643,54 @@ fn emby_nfo_fields_requested(fields: Option<&str>) -> bool {
     })
 }
 
+#[derive(Debug, Eq, PartialEq)]
+struct EmbyItemDetailWorkPlan {
+    populate_image_tags: bool,
+    read_nfo: bool,
+    read_primary_image_aspect_ratio: bool,
+    read_people: bool,
+}
+
+fn emby_item_detail_work_plan(fields: Option<&str>) -> EmbyItemDetailWorkPlan {
+    // ShareLevel is a compatibility hint used by Filmly rather than a real
+    // field projection. Keep its existing full-detail behavior here too, so
+    // callers that pass the raw query cannot accidentally get a partial DTO.
+    let normalized_fields = emby_detail_fields(fields);
+    let fields = normalized_fields.as_deref();
+    let lightweight_media_source_lookup =
+        fields.is_some_and(is_lightweight_media_source_lookup_fields);
+    EmbyItemDetailWorkPlan {
+        populate_image_tags: !lightweight_media_source_lookup
+            && (fields.is_none()
+                || emby_fields_include(fields, "ImageTags")
+                || emby_fields_include(fields, "BackdropImageTags")
+                || emby_fields_include(fields, "PrimaryImageItemId")),
+        read_nfo: !lightweight_media_source_lookup && emby_nfo_fields_requested(fields),
+        read_primary_image_aspect_ratio: !lightweight_media_source_lookup
+            && (fields.is_none() || emby_fields_include(fields, "PrimaryImageAspectRatio")),
+        // Existing Emby detail responses include People even when the caller's
+        // field list omits it. Preserve that compatibility behavior except for
+        // the narrowly-scoped Redia media-source lookup.
+        read_people: !lightweight_media_source_lookup,
+    }
+}
+
+fn is_lightweight_media_source_lookup_fields(fields: &str) -> bool {
+    let mut has_media_sources = false;
+    for field in fields
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+    {
+        match field.to_ascii_lowercase().as_str() {
+            "mediasources" => has_media_sources = true,
+            "path" => {}
+            _ => return false,
+        }
+    }
+    has_media_sources
+}
+
 fn emby_person_image_tag(person_id: &str) -> String {
     Sha256::digest(person_id.as_bytes())
         .iter()
@@ -4518,12 +4735,19 @@ async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
-    let strm_resolver_available = match state.plugins.as_ref() {
-        Some(plugins) => match plugins.has_available_strm_resolver().await {
-            Ok(available) => available,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        },
-        None => false,
+    let strm_resolver_available = if sources
+        .iter()
+        .any(|source| emby_source_needs_strm_resolver(source))
+    {
+        match state.plugins.as_ref() {
+            Some(plugins) => match plugins.has_available_strm_resolver().await {
+                Ok(available) => available,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            },
+            None => false,
+        }
+    } else {
+        false
     };
     Json(json!({
         "PlaySessionId": Uuid::now_v7().to_string(),
@@ -7156,6 +7380,16 @@ fn emby_media_source_json_with_resolver_and_chapters(
         );
     }
     value
+}
+
+fn emby_source_needs_strm_resolver(source: &crate::application::catalog::CatalogSource) -> bool {
+    source.source_kind == "STRM_URL"
+        && source.external_url.as_deref().is_some_and(|target| {
+            matches!(
+                classify_strm_target(target).kind,
+                StrmTargetKind::Smb | StrmTargetKind::Ftp
+            )
+        })
 }
 
 fn emby_media_source_stream_url(
@@ -18009,6 +18243,18 @@ async fn admin_select_candidate(
         .await
     {
         Ok(report) => {
+            if let Some(reidentify) = state.metadata_reidentify.as_ref()
+                && let Err(error) = reidentify
+                    .enqueue_selected_actor_enrichment(&report.item_id, &report.candidate_id)
+                    .await
+            {
+                tracing::warn!(
+                    item_id = %report.item_id,
+                    candidate_id = %report.candidate_id,
+                    %error,
+                    "selected actor metadata could not be queued"
+                );
+            }
             record_audit_event(
                 &state,
                 &headers,
@@ -18097,6 +18343,13 @@ fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> Response {
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
             "图片操作暂时失败",
+        )
+        .into_response(),
+        ImageWriteError::AttemptInProgress => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "该图片正在下载，请稍后重试",
         )
         .into_response(),
         _ => api_error(
@@ -20545,17 +20798,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CatalogSort, EmbyClientCompatibility, FilmlyImageCompatMode, MediaStrategySettings,
-        MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby, emby_collection_type,
+        CatalogSort, EmbyClientCompatibility, EmbyItemDetailWorkPlan, FilmlyImageCompatMode,
+        MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
+        catalog_filter_from_emby, emby_collection_type, emby_item_detail_work_plan,
         emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
-        emby_media_stream_json, emby_playback_info_item_id,
-        filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
-        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        normalize_filmly_null_languages, normalize_strm_http_location, playback_client_label,
-        playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, validate_media_strategy,
+        emby_media_stream_json, emby_playback_info_item_id, emby_single_id_lookup,
+        emby_source_needs_strm_resolver, filmly_image_compat_mode_from_env_value,
+        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
+        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
+        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
+        metadata_candidate_failure_kind, normalize_filmly_null_languages,
+        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
+        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -20702,6 +20956,31 @@ mod tests {
             filter.media_source_ids,
             Some(vec!["item-1".to_owned(), "source-2".to_owned()])
         );
+    }
+
+    #[test]
+    fn single_ids_lookup_is_limited_to_unfiltered_first_pages() {
+        let query = super::EmbyItemsQuery {
+            ids: Some("item-1".to_owned()),
+            ..super::EmbyItemsQuery::default()
+        };
+        assert_eq!(emby_single_id_lookup(&query), Some("item-1"));
+
+        let mut query = query;
+        query.ids = Some("item-1,source-2".to_owned());
+        assert_eq!(emby_single_id_lookup(&query), None);
+
+        query.ids = Some("item-1".to_owned());
+        query.parent_id = Some("library-1".to_owned());
+        assert_eq!(emby_single_id_lookup(&query), None);
+
+        query.parent_id = None;
+        query.start_index = Some(1);
+        assert_eq!(emby_single_id_lookup(&query), None);
+
+        query.start_index = Some(0);
+        query.limit = Some(0);
+        assert_eq!(emby_single_id_lookup(&query), None);
     }
 
     #[test]
@@ -21091,6 +21370,73 @@ mod tests {
             "/Videos/item-1/stream.mkv?MediaSourceId=source-1"
         );
         assert_eq!(body["Path"], "/cloud/library/movie.mp4");
+    }
+
+    #[test]
+    fn playback_info_only_needs_a_strm_resolver_for_smb_or_ftp_targets() {
+        let mut source = CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "STRM_URL".to_owned(),
+            container: Some("mkv".to_owned()),
+            size: None,
+            external_url: Some("/cloud/library/movie.mkv".to_owned()),
+            edition_name: None,
+            quality_label: None,
+            bitrate: None,
+            duration_ticks: None,
+            is_default: true,
+            probe_status: "PENDING".to_owned(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+        };
+
+        assert!(!emby_source_needs_strm_resolver(&source));
+        source.external_url = Some("https://media.example.test/movie.mkv".to_owned());
+        assert!(!emby_source_needs_strm_resolver(&source));
+        source.external_url = Some("smb://nas/media/movie.mkv".to_owned());
+        assert!(emby_source_needs_strm_resolver(&source));
+        source.external_url = Some("ftp://nas/media/movie.mkv".to_owned());
+        assert!(emby_source_needs_strm_resolver(&source));
+    }
+
+    #[test]
+    fn filtered_emby_item_details_skip_unrequested_enrichment() {
+        assert_eq!(
+            emby_item_detail_work_plan(Some("Path,MediaSources")),
+            EmbyItemDetailWorkPlan {
+                populate_image_tags: false,
+                read_nfo: false,
+                read_primary_image_aspect_ratio: false,
+                read_people: false,
+            }
+        );
+        assert_eq!(
+            emby_item_detail_work_plan(Some("MediaSources")),
+            EmbyItemDetailWorkPlan {
+                populate_image_tags: false,
+                read_nfo: false,
+                read_primary_image_aspect_ratio: false,
+                read_people: false,
+            }
+        );
+        assert_eq!(
+            emby_item_detail_work_plan(None),
+            EmbyItemDetailWorkPlan {
+                populate_image_tags: true,
+                read_nfo: true,
+                read_primary_image_aspect_ratio: true,
+                read_people: true,
+            }
+        );
+        assert_eq!(
+            emby_item_detail_work_plan(Some("ShareLevel")),
+            EmbyItemDetailWorkPlan {
+                populate_image_tags: true,
+                read_nfo: true,
+                read_primary_image_aspect_ratio: true,
+                read_people: true,
+            }
+        );
     }
 
     #[test]
