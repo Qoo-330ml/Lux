@@ -457,7 +457,7 @@ fn available_free_bytes(path: &Path) -> Result<u64, std::io::Error> {
     // SAFETY: statvfs returned success, so libc initialized `statistics`.
     let statistics = unsafe { statistics.assume_init() };
     (statistics.f_bavail as u64)
-        .checked_mul(statistics.f_frsize as u64)
+        .checked_mul(statistics.f_frsize)
         .ok_or_else(|| std::io::Error::other("free-space value overflowed"))
 }
 

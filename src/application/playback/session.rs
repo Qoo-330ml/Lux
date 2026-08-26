@@ -198,8 +198,8 @@ impl WebPlaybackSessionService {
                 "playback session identifiers must not be empty".to_owned(),
             ));
         }
-        let mut capabilities = input.capabilities;
-        capabilities.hardware_transcode &= self.hls.hardware_transcode_available();
+        let capabilities =
+            apply_server_capabilities(input.capabilities, self.hls.hardware_transcode_available());
         let plan = WebPlaybackPlan::from(choose_plan(PlaybackDecisionInput {
             source_kind: input.source_kind,
             capabilities,
@@ -396,6 +396,17 @@ impl WebPlaybackSessionService {
     }
 }
 
+fn apply_server_capabilities(
+    mut capabilities: PlaybackCapabilities,
+    hardware_transcode_available: bool,
+) -> PlaybackCapabilities {
+    // A browser cannot assert that the NAS has a usable encoder. The server's
+    // runtime probe/configuration is the authority for tier 3; the remaining
+    // fields describe what the browser can consume.
+    capabilities.hardware_transcode = hardware_transcode_available;
+    capabilities
+}
+
 #[derive(Clone)]
 pub struct ResourceSigner {
     key: [u8; 32],
@@ -446,7 +457,8 @@ fn signed_message(session_id: &str, resource: &str, expires_at: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ResourceSigner, unix_timestamp};
+    use super::{ResourceSigner, apply_server_capabilities, unix_timestamp};
+    use crate::application::playback::decision::PlaybackCapabilities;
 
     #[test]
     fn signatures_are_bound_to_the_session_resource_and_expiry() {
@@ -491,5 +503,22 @@ mod tests {
             &signature,
             unix_timestamp()
         ));
+    }
+
+    #[test]
+    fn server_hardware_capability_does_not_depend_on_the_browser_hint() {
+        let normalized = apply_server_capabilities(
+            PlaybackCapabilities {
+                direct_play: false,
+                hls: true,
+                video_copy_to_fmp4: false,
+                audio_copy_to_fmp4: false,
+                hardware_transcode: false,
+                software_transcode: true,
+            },
+            true,
+        );
+
+        assert!(normalized.hardware_transcode);
     }
 }
