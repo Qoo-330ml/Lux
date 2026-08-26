@@ -4615,10 +4615,10 @@ Redia）根据 `MediaSources[].Path` 执行自己的路径映射并返回云盘�
 
 验收：
 
-- [ ] PlaybackInfo 和 Emby 条目详情给出可由代理关联的 ItemId、MediaSourceId 和原始 `MediaSources[].Path`。
-- [ ] 标准查询参数播放 URL 与历史媒体源路径 URL 都能播放本地文件或对 URL 型 `.strm` 返回有限重定向。
-- [ ] `GET /Items/{MediaSourceId}` 仅返回所属且可见条目；未知 ID、无权限条目不会泄露其他条目。
-- [ ] 路径型 `.strm` 不启动外部请求、不改变 `Protocol`/`IsRemote` 语义、不产生 Lux 侧代理媒体流量。
+- [x] PlaybackInfo 和 Emby 条目详情给出可由代理关联的 ItemId、MediaSourceId 和原始 `MediaSources[].Path`。
+- [x] 标准查询参数播放 URL 与历史媒体源路径 URL 都能播放本地文件或对 URL 型 `.strm` 返回有限重定向。
+- [x] `GET /Items/{MediaSourceId}` 仅返回所属且可见条目；未知 ID、无权限条目不会泄露其他条目。
+- [x] 路径型 `.strm` 不启动外部请求、不改变 `Protocol`/`IsRemote` 语义、不产生 Lux 侧代理媒体流量。
 - [ ] 通过专项 Rust 测试、格式化、Clippy，并记录本机 ARM 架构；真实 Redia/VidHub 复测结果写入兼容性记录。
 
 明确不做：

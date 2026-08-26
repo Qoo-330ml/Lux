@@ -141,6 +141,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - 2026-08-24 STRM 播放请求归属修复：HTTP(S) `.strm` 的 `DirectStreamUrl` 返回 Lux 的受保护播放入口；入口由 Lux 直连请求上游并转发 VidHub/SenPlayer 等实际播放器的 User-Agent，有限解析 302 后向播放器返回最终地址的 307。Lux 不代理媒体字节，也不经过全局出站代理。真实客户端播放需重新部署后复测。
 - Emby `GET /Items` 对标准 ItemId 仍按逗号分隔的 `Ids` 严格过滤；不存在的 ItemId 或 UUID 返回空 `Items` 和 `TotalRecordCount: 0`。针对 Redia 的兼容兜底见下一条。
 - Redia 兼容兜底：`GET /Items?Ids=<MediaSourceId>` 在没有同名 ItemId 时会解析到该媒体源所属条目；未知 ID 仍返回空结果，不会回退到媒体库第一条。`/Videos/{ItemId}/original.strm`（含 `/emby` 和大小写路径变体）复用 Emby 播放逻辑并对 STRM 返回 307 直连；其他未注册 `/Videos/...` 路径返回 404，不再落入 Web 前端 fallback 返回 HTML。标准客户端仍应使用 ItemId 和 `/Items/{ItemId}/PlaybackInfo`。
+- 2026-08-26 LUX-199 Redia 兼容：`MediaSource.DirectStreamUrl` 现在使用标准 Emby 的 `/Videos/{ItemId}/stream[.Container]?MediaSourceId={MediaSourceId}`，旧的媒体源路径入口继续保留；`GET /Items/{MediaSourceId}` 及 `/emby` 前缀可返回所属可见条目的 `MediaSources[].Path`。路径型 `.strm` 仍保持 `Protocol=File`、`IsRemote=false`，Lux 不访问或代理云盘媒体。自动化测试已覆盖标准查询播放、历史 URL、编码查询参数和媒体源 ID 详情；真实 Redia 联调需远端重新部署后复测。
 - `cargo` 验证是在本机 `arm64` 上完成，不代表目标 x86_64 飞牛 NAS 性能或客户端兼容性。
 - Web 的“已实现”仅表示代码路径和服务端静态集成已完成；当前 Chrome smoke 覆盖登录、筛选、播放、收藏、账户会话和管理流程，不等同于所有浏览器/编码格式兼容。
 - LUX-193 的演员收藏属于 Lux Web 自有 API 和人物详情能力，不扩展 Emby `Persons` DTO 或 Emby `FavoriteItems` 语义；演员收藏的目标客户端兼容性尚未单独实测。

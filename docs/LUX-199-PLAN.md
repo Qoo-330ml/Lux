@@ -23,7 +23,7 @@
 
 ## 验证记录
 
-实现完成后补充专项测试、`cargo build --locked`、`cargo test --locked --all-targets`、
+专项 Rust 测试、`cargo build --locked`、`cargo test --locked --all-targets -- --test-threads=1`、
 `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`
-以及 `uname -m` 结果。真实第三方 Redia/VidHub 播放验证需要用户远端实例和脱敏请求日志，
-本地代码测试不宣称已经完成该外部联调。
+均已通过；本机 `uname -m=arm64`。真实第三方 Redia/VidHub 播放验证需要用户远端实例和脱敏
+请求日志，本地代码测试不宣称已经完成该外部联调。
