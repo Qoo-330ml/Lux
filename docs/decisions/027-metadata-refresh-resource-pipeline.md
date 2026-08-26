@@ -32,6 +32,8 @@
    已成功的字段和关系。
 7. 进程全局元数据条目 worker 暂保持 8。是否提高到规格中曾出现的 16 路，必须由同一数据集、同一
    provider stub 和目标 NAS 的实测吞吐、p95、错误率和资源使用共同决定。
+8. SQLite 的元数据选择短事务使用 `BEGIN IMMEDIATE`，在事务开始时取得写事务，避免 WAL 下延迟的
+   读到写升级触发 `SQLITE_BUSY_SNAPSHOT`；PostgreSQL 继续使用普通 `BEGIN`。
 
 ## 未采用的方案
 
@@ -57,10 +59,13 @@
   解释结果。
 - 新增一个小型数据库表和两份 migration；查询必须带条目/图片类型索引，避免全表扫描。
 - 图片并发受独立配额限制，短期峰值吞吐取决于上游、磁盘和 NAS，而不是单纯取决于元数据 worker 数量。
+- SQLite 元数据选择会在短事务入口等待唯一写者，换取并发补全不因写快照冲突而产生条目级失败；其他
+  元数据请求和图片下载仍保持有界并发。
 
 ## 验证
 
 - 固定 scraper stub 验证请求计划和请求计数。
 - 图片 stub 覆盖成功、404、429、5xx、超时、损坏内容和并发下载。
 - SQLite 空库 migration、PostgreSQL migration 文件校验和现有元数据/NFO/人物测试通过。
+- PostgreSQL `postgres:16-alpine` 临时实例上的元数据回归通过；SQLite 并发元数据基准连续复测通过。
 - release 模式记录阶段 p50/p95、请求数量、重试数、图片吞吐、前台请求 p95 和 `uname -m`。
