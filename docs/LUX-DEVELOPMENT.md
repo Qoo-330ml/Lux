@@ -115,7 +115,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
-- Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径必须落在配置的媒体库根目录内；扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
+- Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径按 Lux 进程实际可读性处理，不要求落在当前媒体库根目录内。扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
 - HTTP(S) 目标沿用直接播放语义，但 `DirectStreamUrl` 指向 Lux 播放入口，由 Lux 用播放器 User-Agent 解析有限重定向后返回 307；媒体字节仍由播放器直连最终地址。本地路径在 Lux 进程可安全读取时按本地文件提供；SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
@@ -124,7 +124,7 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体的 Web 播放使用 0～4 档服务端计划：档位 0 为 Direct Play，档位 1 为视频/音频 copy 的 Remux，档位 2 为视频 copy、音频转码，档位 3 为硬件转码，档位 4 为软件转码。决策始终优先选择较低档位。
 - 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
-- 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
+- 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可以位于媒体库根目录之外；目标必须是 Lux 进程实际可读取、canonicalize 后存在的普通文件，且不会把目录或另一个 `.strm` 当作视频返回。
 - URL 型 `.strm` 在 `Path` 保留原始播放地址，`DirectStreamUrl` 指向受保护的 Lux 视频端点；端点使用入站播放器 User-Agent 和单区间请求解析 HTTP(S) 目标的有限重定向，再返回最终地址的 307，不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
 - 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
@@ -1921,6 +1921,7 @@ services:
 | LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
 | LUX-160 | src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、tests/、docs/ |
+| LUX-161 | src/application/strm_target.rs、src/api/mod.rs、tests/、docs/ |
 | LUX-162 | src/application/plugin_store.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-164 | src/application/metadata_paths.rs、src/application/people.rs、migrations/（后续对象关系）、tests/、docs/ |
 | LUX-165 | src/application/images.rs、src/application/library_covers.rs、src/api/mod.rs、tests/、docs/ |
@@ -3703,6 +3704,34 @@ HTTP(S) URL，或 `UNSUPPORTED`。宿主按插件 ID 稳定顺序尝试已安装
 
 - 不绑定任何具体云盘、网盘、代理或第三方工具。
 - 不把 SMB/FTP 直接拼接为 URL，不实现媒体字节代理或转码。
+
+#### LUX-161：`.strm` 本地路径直接播放
+
+范围：修复本地绝对路径型 `.strm` 在媒体库根目录之外无法播放的问题。`.strm` 中的本地目标按 Lux
+进程实际可读性直接处理，例如 `/CloudNAS/115-122/...` 无需配置额外允许根目录，也无需修改 `.strm`
+内容。Web、Emby 和第三方播放器共用的 Lux 视频入口都使用该规则。
+
+播放时 `.strm` 目标相对于 `.strm` 所在目录解析；绝对目标不再与媒体库根目录比较，但仍必须在文件系统中
+canonicalize 成存在的普通文件。目录、失效路径和另一个 `.strm` 不作为视频返回；Lux 不主动访问远程
+HTTP/SMB/FTP 目标。
+
+验收：
+
+- [x] 任意存在且可读的本地绝对 `.strm` 目标，即使位于媒体库根目录之外，Lux Web 和 Emby 视频入口均按
+      本地文件返回 Range 响应；`.strm` 原始文本无需改写。
+- [x] 相对目标仍相对于 `.strm` 所在目录解析；目录、失效路径和另一个 `.strm` 不作为视频返回。
+- [x] 通过路径 canonicalize、普通文件检查和共享视频入口回归；不主动读取远程目标。
+- [x] 通过专项 Rust/Web 测试、格式化、Clippy、Web 构建，并记录本机 ARM 架构（`uname -m`: `arm64`）。
+
+验证：`cargo test --locked --test strm_target --test strm_allowed_roots`、相关 API 测试、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`pnpm --dir web test`、`pnpm --dir web build` 和 `uname -m`。
+
+依赖：LUX-159、LUX-160。
+
+明确不做：
+
+- 不读取或代理 HTTP/HTTPS、SMB、FTP 等远程目标；不实现路径映射、媒体字节代理、转码或改变第三方客户端的 Emby 路由合同。
 
 #### LUX-162：可配置插件商店与远程插件包
 

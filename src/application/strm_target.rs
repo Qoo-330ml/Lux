@@ -1,3 +1,5 @@
+use std::fmt;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StrmTargetKind {
     Empty,
@@ -18,6 +20,17 @@ pub enum StrmLocalPathError {
     Missing,
     Forbidden,
 }
+
+impl fmt::Display for StrmLocalPathError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Missing => "STRM local target is missing",
+            Self::Forbidden => "STRM source file is outside the library root",
+        })
+    }
+}
+
+impl std::error::Error for StrmLocalPathError {}
 
 pub async fn canonical_local_strm_target(
     root_path: &str,
@@ -45,8 +58,11 @@ pub async fn canonical_local_strm_target(
     let path = tokio::fs::canonicalize(requested)
         .await
         .map_err(|_| StrmLocalPathError::Missing)?;
-    if !path.starts_with(&root) || path == root {
-        return Err(StrmLocalPathError::Forbidden);
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .map_err(|_| StrmLocalPathError::Missing)?;
+    if !metadata.is_file() {
+        return Err(StrmLocalPathError::Missing);
     }
     Ok(path)
 }
@@ -130,9 +146,7 @@ fn has_uri_scheme(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
-    };
+    use super::{StrmTargetKind, canonical_local_strm_target, classify_strm_target};
 
     #[test]
     fn classifies_http_paths_and_other_schemes() {
@@ -196,7 +210,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolves_relative_targets_from_the_strm_directory_and_stays_in_root() {
+    async fn resolves_relative_targets_and_allows_external_absolute_targets() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let root = temp_dir.path().join("library");
         let nested = root.join("nested");
@@ -233,6 +247,25 @@ mod tests {
             outside.to_str().expect("outside path should be utf8"),
         )
         .await;
-        assert_eq!(outside_target, Err(StrmLocalPathError::Forbidden));
+        assert_eq!(
+            outside_target.expect("external absolute target should resolve"),
+            outside.canonicalize().expect("path should canonicalize")
+        );
+
+        tokio::fs::write(
+            temp_dir.path().join("outside.strm"),
+            outside.to_string_lossy().as_bytes(),
+        )
+        .await
+        .expect("external strm file should be created");
+        assert_eq!(
+            canonical_local_strm_target(
+                root.to_str().expect("root should be utf8"),
+                "../outside.strm",
+                outside.to_str().expect("outside path should be utf8"),
+            )
+            .await,
+            Err(super::StrmLocalPathError::Forbidden)
+        );
     }
 }
