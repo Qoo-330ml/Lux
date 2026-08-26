@@ -1339,6 +1339,102 @@ async fn automatic_matching_expands_only_the_best_pending_candidate_once()
 }
 
 #[tokio::test]
+async fn expired_pending_candidates_are_not_reused_by_automatic_matching()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Expired Movie",
+            "productionYear": 2020,
+            "providerIds": {"Tmdb": "603"},
+            "metadataFetched": true
+        }),
+    )
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_candidates SET expires_at = unixepoch() - 1
+         WHERE item_id = ?",
+    )
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+
+    let searches = Arc::new(AtomicUsize::new(0));
+    let handler_searches = Arc::clone(&searches);
+    let tmdb_app = Router::new().fallback(any(move |request: Request<Body>| {
+        let searches = Arc::clone(&handler_searches);
+        async move {
+            let path = request.uri().path();
+            if path == "/3/search/movie" {
+                searches.fetch_add(1, Ordering::SeqCst);
+                return Json(json!({
+                    "page": 1,
+                    "total_pages": 1,
+                    "total_results": 1,
+                    "results": [{
+                        "id": 604,
+                        "title": "Fresh Movie",
+                        "release_date": "2020-01-01",
+                        "original_language": "en"
+                    }]
+                }))
+                .into_response();
+            }
+            if path.ends_with("/images") {
+                return Json(json!({"posters": [], "backdrops": []})).into_response();
+            }
+            if path.ends_with("/credits") {
+                return Json(json!({"cast": [], "crew": []})).into_response();
+            }
+            if path.ends_with("/external_ids") {
+                return Json(json!({})).into_response();
+            }
+            if path.ends_with("/videos") || path.ends_with("/release_dates") {
+                return Json(json!({"results": []})).into_response();
+            }
+            Json(json!({
+                "id": 604,
+                "title": "Fresh Movie",
+                "release_date": "2020-01-01",
+                "original_language": "en"
+            }))
+            .into_response()
+        }
+    }));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
+    let scraper = ScraperProvider::from(TmdbClient::new(TmdbClientConfig {
+        base_url: format!("http://{address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?);
+
+    let page = MetadataCandidateService::new(fixture.database.clone())
+        .search_and_store_for_automatic_match(
+            &fixture.item_id,
+            "Example Movie",
+            Some(2020),
+            &scraper,
+        )
+        .await?;
+
+    assert!(searches.load(Ordering::SeqCst) >= 1);
+    assert!(page.items.iter().any(|item| item.provider_id == "604"));
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn fill_missing_requests_the_missing_credits_capability_without_images()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;
