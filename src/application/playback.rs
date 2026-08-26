@@ -1,6 +1,7 @@
 use std::fmt;
 
 pub mod decision;
+pub mod session;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ByteRange {
