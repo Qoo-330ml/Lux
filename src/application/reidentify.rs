@@ -14,6 +14,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
+        actor_enrichment::ActorEnrichmentQueue,
         admin_events::{AdminEventHub, AdminEventScope},
         candidates::{
             MetadataCandidateError, MetadataCandidatePage, MetadataCandidateService,
@@ -65,6 +66,7 @@ pub struct MetadataReidentifyService {
     worker_permits: Arc<Semaphore>,
     running_jobs: MetadataJobOwners,
     library_job_creation: Arc<AsyncMutex<()>>,
+    actor_enrichment: ActorEnrichmentQueue,
 }
 
 #[derive(Clone, Default)]
@@ -151,6 +153,7 @@ impl MetadataReidentifyService {
             worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
+            actor_enrichment: ActorEnrichmentQueue::new(),
         }
     }
 
@@ -182,6 +185,7 @@ impl MetadataReidentifyService {
             worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
+            actor_enrichment: ActorEnrichmentQueue::new(),
         }
     }
 
@@ -207,6 +211,7 @@ impl MetadataReidentifyService {
             worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
+            actor_enrichment: ActorEnrichmentQueue::new(),
         }
     }
 
@@ -257,6 +262,50 @@ impl MetadataReidentifyService {
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         self.create_job_with_mode(item_ids, MetadataRefreshMode::FillMissing)
             .await
+    }
+
+    pub async fn enqueue_selected_actor_enrichment(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+    ) -> Result<(), MetadataReidentifyError> {
+        let Some(selection) = self.selection.as_ref() else {
+            return Ok(());
+        };
+        let candidate = self
+            .database
+            .find_metadata_candidate(item_id, candidate_id)
+            .await?
+            .ok_or(MetadataReidentifyError::Selection(
+                MetadataSelectionError::CandidateNotFound,
+            ))?;
+        let scrapers = self
+            .providers_for_item(item_id, false)
+            .await
+            .map_err(MetadataReidentifyError::Scraper)?
+            .unwrap_or_default();
+        let scraper = scrapers
+            .into_iter()
+            .find(|scraper| {
+                scraper
+                    .provider
+                    .provider_key()
+                    .eq_ignore_ascii_case(&candidate.provider)
+            })
+            .map(|scraper| scraper.provider)
+            .unwrap_or_else(|| self.scraper.clone());
+        if !self
+            .actor_enrichment
+            .enqueue(item_id, candidate_id, selection.clone(), scraper)
+            .await
+        {
+            tracing::warn!(
+                item_id,
+                candidate_id,
+                "actor metadata enrichment queue is full"
+            );
+        }
+        Ok(())
     }
 
     async fn create_job_with_mode(
@@ -884,28 +933,16 @@ impl MetadataReidentifyService {
                 .await
         }
         .map_err(MetadataReidentifyError::Selection)?;
-        // Actor assets remain part of this persisted item worker: cancellation
-        // stops new claims and drains claimed items, job completion waits for
-        // this attempt, and a process exit cannot orphan a detached task.
-        match selection
-            .enrich_selected_actors(item_id, &candidate.id, provider)
+        if !self
+            .actor_enrichment
+            .enqueue(item_id, &candidate.id, selection.clone(), provider.clone())
             .await
         {
-            Ok(actor_count) if actor_count > 0 => {
-                tracing::debug!(
-                    item_id,
-                    candidate_id = %candidate.id,
-                    actor_count,
-                    "actor metadata enrichment completed"
-                );
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
+            tracing::warn!(
                 item_id,
                 candidate_id = %candidate.id,
-                %error,
-                "actor metadata enrichment failed"
-            ),
+                "actor metadata enrichment queue is full"
+            );
         }
         let candidate_count = i64::try_from(page.items.len()).unwrap_or(i64::MAX);
         Ok(if needs_review {

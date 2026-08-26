@@ -3,7 +3,7 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -1104,7 +1104,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         .route(
             "/3/person/10",
             get(|| async {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
                 Json(json!({
                     "id": 10,
                     "name": "后台演员",
@@ -1122,7 +1122,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         proxy_url: None,
         api_key: None,
         read_access_token: Some("stub-token".to_owned()),
-        timeout: Duration::from_secs(1),
+        timeout: Duration::from_secs(3),
         max_retries: 0,
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
@@ -1143,6 +1143,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     let scan_job = scan_jobs
         .create_movie_scan_job_with_metadata(library_id.parse()?, true)
         .await?;
+    let metadata_started = Instant::now();
     scan_jobs
         .run_to_completion_with_metadata(&scan_job.id, 100, None, Some(metadata))
         .await?;
@@ -1158,6 +1159,10 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
+    assert!(
+        metadata_started.elapsed() < Duration::from_secs(1),
+        "metadata job waited for optional actor enrichment"
+    );
     let status: String =
         sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
             .bind(&fixture.item_id)
@@ -1194,11 +1199,19 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
         person_key,
     )?
     .join("person.nfo");
-    assert!(
-        tokio::fs::read_to_string(person_nfo)
-            .await?
-            .contains("后台补全的人物简介")
-    );
+    let enrichment_started = Instant::now();
+    let mut enriched = false;
+    while enrichment_started.elapsed() < Duration::from_secs(3) {
+        if tokio::fs::read_to_string(&person_nfo)
+            .await
+            .is_ok_and(|contents| contents.contains("后台补全的人物简介"))
+        {
+            enriched = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(enriched, "background actor metadata was not persisted");
 
     tmdb_server.abort();
     Ok(())

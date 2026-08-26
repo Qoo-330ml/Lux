@@ -6,6 +6,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tokio::task::JoinSet;
 
 use crate::{
     application::{
@@ -29,6 +30,7 @@ use crate::{
 use crate::application::tmdb::TmdbCastMember;
 
 const MAX_MOVIE_NFO_ACTORS: usize = 30;
+const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct MetadataCandidateService {
@@ -398,10 +400,7 @@ impl MetadataCandidateService {
                     }
                 )
             };
-            let mut actors = generic_candidate_actors(&credits.cast);
-            if matches!(mode, CandidateSearchMode::Manual) {
-                enrich_actor_metadata(scraper, &mut actors).await;
-            }
+            let actors = generic_candidate_actors(&credits.cast);
             let mut provider_ids = details
                 .as_ref()
                 .map(|value| value.provider_ids.clone())
@@ -1096,13 +1095,32 @@ fn generic_candidate_actors(
 }
 
 async fn enrich_actor_metadata(scraper: &ScraperProvider, actors: &mut [ActorCredit]) {
-    for actor in actors.iter_mut() {
-        let provider_id = actor.id.trim();
-        if provider_id.is_empty() {
-            continue;
+    let requests = actors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, actor)| {
+            let provider_id = actor.id.trim();
+            (!provider_id.is_empty()).then(|| (index, provider_id.to_owned()))
+        })
+        .collect::<Vec<_>>();
+    let mut next_request = 0;
+    let mut pending = JoinSet::new();
+    while next_request < requests.len() || !pending.is_empty() {
+        while next_request < requests.len() && pending.len() < ACTOR_METADATA_FETCH_CONCURRENCY {
+            let (index, provider_id) = &requests[next_request];
+            let index = *index;
+            let scraper = scraper.clone();
+            let provider_id = provider_id.clone();
+            pending.spawn(async move {
+                let request = ScraperGetRequest::new(ScraperItemType::Person, provider_id, "zh-CN");
+                (index, scraper.get_generic(request).await.ok())
+            });
+            next_request += 1;
         }
-        let request = ScraperGetRequest::new(ScraperItemType::Person, provider_id, "zh-CN");
-        let Ok(metadata) = scraper.get_generic(request).await else {
+        let Some(result) = pending.join_next().await else {
+            break;
+        };
+        let Ok((index, Some(metadata))) = result else {
             continue;
         };
         let person = crate::application::people::PersonMetadata {
@@ -1125,7 +1143,7 @@ async fn enrich_actor_metadata(scraper: &ScraperProvider, actors: &mut [ActorCre
             || person.known_for_department.is_some()
             || person.place_of_birth.is_some()
         {
-            actor.person = Some(person);
+            actors[index].person = Some(person);
         }
     }
 }
@@ -1324,7 +1342,7 @@ impl MetadataSelectionService {
             }
         }
         self.people
-            .persist_item_actors(item_id, &candidate.provider, &actors)
+            .update_item_actor_metadata(item_id, &candidate.provider, &actors)
             .await
             .map_err(MetadataSelectionError::People)
     }
@@ -2387,11 +2405,128 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        TmdbCastMember, candidate_actors, default_image_selection_policy, generic_candidate_images,
+        ACTOR_METADATA_FETCH_CONCURRENCY, TmdbCastMember, candidate_actors,
+        default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
         metadata_match_score, tmdb_candidate_actors,
     };
-    use crate::application::scraper::{ScraperImage, ScraperItemType};
+    use crate::application::scraper::{
+        ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
+        ScraperFuture, ScraperGetRequest, ScraperImage, ScraperImageRequest, ScraperImagesResponse,
+        ScraperItemType, ScraperMetadata, ScraperMetadataBundle, ScraperProvider,
+        ScraperSearchRequest, ScraperSearchResponse, ScraperTrailersResponse,
+    };
     use serde_json::json;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::time::{Duration, sleep};
+
+    #[derive(Clone)]
+    struct DelayedActorAdapter {
+        active: Arc<AtomicUsize>,
+        maximum: Arc<AtomicUsize>,
+    }
+
+    impl ScraperAdapter for DelayedActorAdapter {
+        fn provider_key(&self) -> &str {
+            "tmdb"
+        }
+
+        fn search(
+            &self,
+            _request: ScraperSearchRequest,
+        ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperSearchResponse::default())))
+        }
+
+        fn get(
+            &self,
+            request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+            let active = Arc::clone(&self.active);
+            let maximum = Arc::clone(&self.maximum);
+            Box::pin(async move {
+                let active_count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                maximum.fetch_max(active_count, Ordering::SeqCst);
+                sleep(Duration::from_millis(20)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(ScraperMetadata {
+                    item_type: Some("Person".to_owned()),
+                    title: Some(request.provider_id),
+                    overview: Some("Biography".to_owned()),
+                    ..ScraperMetadata::default()
+                })
+            })
+        }
+
+        fn bundle(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+            Box::pin(std::future::ready(Err(
+                ScraperError::UnsupportedCapability("metadata.bundle".to_owned()),
+            )))
+        }
+
+        fn images(
+            &self,
+            _request: ScraperImageRequest,
+        ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperImagesResponse::default())))
+        }
+
+        fn credits(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperCreditsResponse::default())))
+        }
+
+        fn external_ids(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+            Box::pin(std::future::ready(
+                Ok(ScraperExternalIdsResponse::default()),
+            ))
+        }
+
+        fn trailers(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperTrailersResponse::default())))
+        }
+    }
+
+    #[tokio::test]
+    async fn actor_metadata_fetches_are_bounded_and_parallel() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let scraper = ScraperProvider::from_adapter(DelayedActorAdapter {
+            active: Arc::clone(&active),
+            maximum: Arc::clone(&maximum),
+        });
+        let mut actors = (0..8)
+            .map(|index| super::ActorCredit {
+                id: index.to_string(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: format!("Actor {index}"),
+                character: None,
+                order: Some(index),
+                profile_url: None,
+                person: None,
+            })
+            .collect::<Vec<_>>();
+
+        enrich_actor_metadata(&scraper, &mut actors).await;
+
+        assert!(actors.iter().all(|actor| actor.person.is_some()));
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+        assert!(maximum.load(Ordering::SeqCst) <= ACTOR_METADATA_FETCH_CONCURRENCY);
+    }
 
     #[test]
     fn metadata_refresh_keeps_backdrop_images_as_fanart() {

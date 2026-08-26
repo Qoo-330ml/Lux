@@ -18009,6 +18009,18 @@ async fn admin_select_candidate(
         .await
     {
         Ok(report) => {
+            if let Some(reidentify) = state.metadata_reidentify.as_ref()
+                && let Err(error) = reidentify
+                    .enqueue_selected_actor_enrichment(&report.item_id, &report.candidate_id)
+                    .await
+            {
+                tracing::warn!(
+                    item_id = %report.item_id,
+                    candidate_id = %report.candidate_id,
+                    %error,
+                    "selected actor metadata could not be queued"
+                );
+            }
             record_audit_event(
                 &state,
                 &headers,
