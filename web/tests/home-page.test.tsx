@@ -190,6 +190,73 @@ describe("HomePage shelves", () => {
     expect(actionRow?.querySelector(".lux-hero-carousel-controls")?.parentElement).toBe(actionRow);
   });
 
+  it("starts an unfinished episode when the carousel highlights its series", async () => {
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [],
+      recommended: [{ id: "series-1", title: "精选剧集", itemType: "SERIES" }],
+      continueWatching: [{
+        id: "episode-7",
+        title: "未看完的一集",
+        itemType: "EPISODE",
+        seriesId: "series-1",
+        userData: { positionTicks: 120_000_000 },
+      }],
+      recentlyAdded: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/episode-7");
+    expect(container.querySelector(".lux-hero-actions a.lux-button-primary")?.textContent).toContain("继续播放");
+  });
+
+  it("starts the highlighted movie from the carousel instead of opening its detail page", async () => {
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [],
+      recommended: [{ id: "movie-1", title: "精选电影", itemType: "MOVIE" }],
+      continueWatching: [],
+      recentlyAdded: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector<HTMLAnchorElement>(".lux-hero-actions a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/movie-1");
+  });
+
   it("applies the smallest title size while keeping the complete title text available", async () => {
     const title = "FC2-4916281 脸）强忍着因为嘘息而即将失禁，但在猛烈的冲击下不停地溢出";
     vi.spyOn(api, "home").mockResolvedValue({
