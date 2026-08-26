@@ -4127,26 +4127,25 @@ async fn emby_item_response(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let resolved_item_id = match catalog.find_item(principal, item_id).await {
-        Ok(Some(_)) => item_id.to_owned(),
+    let catalog_item = match catalog.find_item(principal, item_id).await {
+        Ok(Some(item)) => Some(item),
         Ok(None) => match catalog
             .find_item_by_media_source_id(principal, item_id)
             .await
         {
-            Ok(Some(item)) => item.id,
-            Ok(None) => item_id.to_owned(),
+            Ok(item) => item,
             Err(CatalogError::Storage(_)) => {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => item_id.to_owned(),
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => None,
         },
         Err(CatalogError::Storage(_)) => {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => item_id.to_owned(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => None,
     };
-    match catalog.find_item(principal, &resolved_item_id).await {
-        Ok(Some(mut item)) => {
+    match catalog_item {
+        Some(mut item) => {
             let Some(database) = state.database.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
@@ -4202,7 +4201,7 @@ async fn emby_item_response(
             }
             Json(item_json).into_response()
         }
-        Ok(None) => {
+        None => {
             let Some(access) = state.access.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
@@ -4226,10 +4225,6 @@ async fn emby_item_response(
                 Err(PeopleError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
-        }
-        Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-            unreachable!("inaccessible item is returned as not found")
         }
     }
 }
