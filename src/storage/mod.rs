@@ -11171,14 +11171,18 @@ impl Database {
         update: SelectedMetadataUpdate<'_>,
     ) -> Result<bool, StorageError> {
         let sort_title = update.title.to_lowercase();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        // SQLite WAL can reject a deferred read-to-write upgrade with
+        // SQLITE_BUSY_SNAPSHOT; reserve the single writer before this short
+        // metadata transaction performs its updates.
+        let mut transaction = (if self.backend == DatabaseBackend::Sqlite {
+            self.pool.begin_with("BEGIN IMMEDIATE").await
+        } else {
+            self.pool.begin().await
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         self.query(
             "UPDATE media_items
              SET title = ?, sort_title = ?, original_title = ?, overview = ?, production_year = ?,
