@@ -1518,6 +1518,7 @@ impl MetadataSelectionService {
     }
 
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.images = self.images.clone().with_resource_metrics(resources.clone());
         self.resources = resources;
         self
     }
