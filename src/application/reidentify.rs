@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,16 +24,27 @@ use crate::{
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
         webhooks::{WebhookEventType, WebhookService},
     },
+    config::DatabaseBackend,
     observability::resources::ResourceMetrics,
     storage::{Database, StorageError, StoredMetadataReidentifyItem},
 };
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
-const METADATA_GLOBAL_WORKER_LIMIT: usize = 8;
+const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
+const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
+const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 const AUTO_MATCH_MIN_MARGIN: f64 = 5.0;
+
+static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn metadata_global_permits() -> Arc<Semaphore> {
+    METADATA_GLOBAL_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)))
+        .clone()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum MetadataRefreshMode {
@@ -157,7 +168,7 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
-            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            worker_permits: metadata_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -189,7 +200,7 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
-            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            worker_permits: metadata_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -215,7 +226,7 @@ impl MetadataReidentifyService {
             resources: ResourceMetrics::new(),
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
-            worker_permits: Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)),
+            worker_permits: metadata_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -490,9 +501,11 @@ impl MetadataReidentifyService {
         let mut workers = JoinSet::new();
         let mut last_concurrency = None;
         loop {
+            let configured_concurrency =
+                metadata_worker_default_concurrency(self.database.backend());
             let concurrency = metadata_worker_concurrency(
                 self.resources
-                    .background_concurrency(METADATA_MATCH_CONCURRENCY)
+                    .metadata_concurrency(configured_concurrency)
                     .await,
             );
             if last_concurrency != Some(concurrency) {
@@ -1302,6 +1315,13 @@ fn metadata_worker_concurrency(recommended: usize) -> usize {
     recommended.clamp(1, METADATA_GLOBAL_WORKER_LIMIT)
 }
 
+fn metadata_worker_default_concurrency(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_METADATA_DEFAULT_CONCURRENCY,
+        DatabaseBackend::Postgres => POSTGRES_METADATA_DEFAULT_CONCURRENCY,
+    }
+}
+
 fn metadata_request_plan_is_complete(plan: MetadataRequestPlan) -> bool {
     !plan.needs_metadata
         && !plan.needs_images
@@ -1312,13 +1332,17 @@ fn metadata_request_plan_is_complete(plan: MetadataRequestPlan) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::Value;
 
     use super::{
-        AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, MetadataCandidatePage, MetadataCandidateView,
-        MetadataRequestPlan, best_automatic_candidate, metadata_request_plan_is_complete,
-        metadata_worker_concurrency,
+        AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT,
+        MetadataCandidatePage, MetadataCandidateView, MetadataRequestPlan,
+        best_automatic_candidate, metadata_global_permits, metadata_request_plan_is_complete,
+        metadata_worker_concurrency, metadata_worker_default_concurrency,
     };
+    use crate::config::DatabaseBackend;
 
     fn candidate(id: &str, score: f64) -> MetadataCandidateView {
         MetadataCandidateView {
@@ -1410,9 +1434,29 @@ mod tests {
 
     #[test]
     fn metadata_worker_concurrency_is_bounded_without_overthrottling() {
-        assert_eq!(metadata_worker_concurrency(16), 8);
+        assert_eq!(metadata_worker_concurrency(16), 16);
         assert_eq!(metadata_worker_concurrency(2), 2);
         assert_eq!(metadata_worker_concurrency(0), 1);
+    }
+
+    #[test]
+    fn metadata_worker_defaults_match_database_write_capacity() {
+        assert_eq!(
+            metadata_worker_default_concurrency(DatabaseBackend::Sqlite),
+            4
+        );
+        assert_eq!(
+            metadata_worker_default_concurrency(DatabaseBackend::Postgres),
+            8
+        );
+    }
+
+    #[test]
+    fn metadata_worker_permits_are_process_global_and_hard_capped() {
+        let first = metadata_global_permits();
+        let second = metadata_global_permits();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.available_permits(), METADATA_GLOBAL_WORKER_LIMIT);
     }
 
     #[test]

@@ -15,6 +15,8 @@ const HOME_P95_DEGRADED_MS: u64 = 300;
 const HOME_P95_TARGET_MS: u64 = 400;
 const PROBE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
 const METADATA_METRIC_SAMPLE_CAPACITY: usize = 128;
+const METADATA_GLOBAL_HARD_CAP: usize = 16;
+const METADATA_P95_SEVERE_MS: u64 = 1_000;
 
 #[derive(Clone)]
 pub struct ResourceMetrics {
@@ -169,6 +171,20 @@ impl ResourceMetrics {
             self.home_latency_p95_ms(),
             cpu_limit,
             memory.usage_percent,
+        )
+    }
+
+    pub async fn metadata_concurrency(&self, configured: usize) -> usize {
+        let (cpu, memory) = tokio::join!(
+            cpu_snapshot(Arc::clone(&self.cpu_sample)),
+            memory_snapshot(),
+        );
+        recommended_metadata_concurrency(
+            configured,
+            self.home_latency_p95_ms(),
+            memory.usage_percent,
+            cpu.usage_percent,
+            METADATA_GLOBAL_HARD_CAP,
         )
     }
 
@@ -664,6 +680,29 @@ pub fn recommended_background_concurrency(
     }
 }
 
+pub fn recommended_metadata_concurrency(
+    configured: usize,
+    home_p95_ms: Option<u64>,
+    container_memory_usage_percent: Option<f64>,
+    cpu_usage_percent: Option<f64>,
+    hard_cap: usize,
+) -> usize {
+    let base = configured.clamp(1, hard_cap.max(1));
+    let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
+        || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
+        || home_p95_ms.is_some_and(|value| value >= METADATA_P95_SEVERE_MS);
+    if severe_pressure {
+        return base.div_ceil(4).max(1);
+    }
+    let degraded = cpu_usage_percent.is_some_and(|value| value >= 75.0)
+        || container_memory_usage_percent.is_some_and(|value| value >= 85.0)
+        || home_p95_ms.is_some_and(|value| value >= HOME_P95_TARGET_MS);
+    if degraded {
+        return base.div_ceil(2).max(1);
+    }
+    base
+}
+
 #[derive(Default)]
 struct ProbeConcurrencyState {
     effective: Option<usize>,
@@ -746,7 +785,8 @@ mod tests {
     use super::{
         ResourceMetrics, calculate_cpu_usage_cores, calculate_cpu_usage_percent,
         memory_usage_percent, parse_cgroup_limit, parse_media_storage_values, process_is_member,
-        recommended_background_concurrency, recommended_probe_concurrency, select_cpu_capacity,
+        recommended_background_concurrency, recommended_metadata_concurrency,
+        recommended_probe_concurrency, select_cpu_capacity,
     };
     use std::time::Duration;
 
@@ -859,6 +899,28 @@ mod tests {
         assert_eq!(
             recommended_background_concurrency(8, 8, None, None, Some(85.0)),
             1
+        );
+    }
+
+    #[test]
+    fn metadata_concurrency_uses_io_defaults_and_backs_off_under_pressure() {
+        assert_eq!(recommended_metadata_concurrency(4, None, None, None, 16), 4);
+        assert_eq!(recommended_metadata_concurrency(8, None, None, None, 16), 8);
+        assert_eq!(
+            recommended_metadata_concurrency(4, Some(400), None, None, 16),
+            2
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(8, None, Some(90.0), None, 16),
+            4
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(8, None, None, Some(95.0), 16),
+            2
+        );
+        assert_eq!(
+            recommended_metadata_concurrency(16, None, None, None, 16),
+            16
         );
     }
 

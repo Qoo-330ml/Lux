@@ -114,8 +114,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/admin/metadata/reidentify/{jobId}/cancel`：管理员请求取消 `QUEUED` 或 `RUNNING` 的元数据任务，需要 `X-CSRF-Token`，返回 202；worker 在当前批次完成后停止领取新条目并将任务标记为 `CANCELLED`。
 - `POST /api/v1/admin/metadata/reidentify/{jobId}`：管理员对 `FAILED` 或 `CANCELLED` 任务重新排队未完成条目，保留已经成功的条目，需要 `X-CSRF-Token`；其他状态返回冲突。
 - `POST /api/v1/admin/items/{itemId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" | "FULL_REFRESH" }` 刷新一个条目的元数据；创建一个持久化后台任务并立即返回。Web 端“刷新元数据”使用 `FILL_MISSING`：电影或单集刷新自身，季刷新该季及其单集，剧集刷新该剧、所有季和所有单集，因此会补写缺失的季海报和单集横向剧照，同时保留已有本地字段和图片。
-- `POST /api/v1/admin/libraries/{libraryId}/reidentify`：管理员从媒体库入口发起整库元数据匹配；服务端创建一个持久化后台任务并立即返回 `{ "totalCount": 125, "job": { ... } }`。任务使用条目所属媒体库的刮削器，以 `FILL_MISSING` 自动选择高置信度最佳候选，内部最多 16 路并行处理条目，按媒体库图像策略下载图片并写回 NFO/图片；低置信度条目保留 pending 候选供后台处理。
-- `POST /api/v1/admin/libraries/{libraryId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" }` 或 `{ "mode": "FULL_REFRESH" }`，每次媒体库操作创建一个持久化后台任务并立即返回。前者只补缺失的未锁定 NFO 字段和图片，后者刷新未锁定 NFO 字段并替换已有图片；锁定的 NFO 字段始终保留。任务内部最多 16 路并行处理条目，未配置刮削器时不发起在线请求并保留本地元数据。
+- `POST /api/v1/admin/libraries/{libraryId}/reidentify`：管理员从媒体库入口发起整库元数据匹配；服务端创建一个持久化后台任务并立即返回 `{ "totalCount": 125, "job": { ... } }`。任务使用条目所属媒体库的刮削器，以 `FILL_MISSING` 自动选择高置信度最佳候选；SQLite 默认最多 4 路、PostgreSQL 默认最多 8 路，进程硬上限为 16 路并按前台/CPU/内存压力降档；按媒体库图像策略下载图片并写回 NFO/图片，低置信度条目保留 pending 候选供后台处理。
+- `POST /api/v1/admin/libraries/{libraryId}/metadata/refresh`：管理员发送 `{ "mode": "FILL_MISSING" }` 或 `{ "mode": "FULL_REFRESH" }`，每次媒体库操作创建一个持久化后台任务并立即返回。前者只补缺失的未锁定 NFO 字段和图片，后者刷新未锁定 NFO 字段并替换已有图片；锁定的 NFO 字段始终保留。任务使用 SQLite 默认 4 路、PostgreSQL 默认 8 路、进程硬上限 16 路的有界并发策略，并按压力降档；未配置刮削器时不发起在线请求并保留本地元数据。
 
 根路径会先 canonicalize，再检查目录存在且可读；`isWritable` 独立返回。只读目录可以保存，但返回 `LIBRARY_PATH_NOT_WRITABLE` 警告。同一库的重复/重叠路径分别返回冲突/不可处理实体错误，跨库重叠返回结构化警告。
 
