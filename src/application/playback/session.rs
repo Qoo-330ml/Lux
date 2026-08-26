@@ -20,6 +20,7 @@ use super::decision::{
     PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier,
     UnsupportedReason, choose_plan,
 };
+use super::hls::{HlsError, HlsManager};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -96,11 +97,12 @@ pub struct SignedResource {
 }
 
 #[derive(Debug)]
-pub enum WebPlaybackSessionError {
+pub(crate) enum WebPlaybackSessionError {
     Invalid(String),
     NotFound,
     Expired,
     NotActive,
+    Hls(HlsError),
     Storage(StorageError),
 }
 
@@ -111,6 +113,7 @@ impl fmt::Display for WebPlaybackSessionError {
             Self::NotFound => formatter.write_str("web playback session not found"),
             Self::Expired => formatter.write_str("web playback session expired"),
             Self::NotActive => formatter.write_str("web playback session is not active"),
+            Self::Hls(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -121,6 +124,7 @@ impl std::error::Error for WebPlaybackSessionError {
         match self {
             Self::Storage(error) => Some(error),
             Self::Invalid(_) | Self::NotFound | Self::Expired | Self::NotActive => None,
+            Self::Hls(error) => Some(error),
         }
     }
 }
@@ -131,21 +135,36 @@ impl From<StorageError> for WebPlaybackSessionError {
     }
 }
 
+impl From<HlsError> for WebPlaybackSessionError {
+    fn from(error: HlsError) -> Self {
+        Self::Hls(error)
+    }
+}
+
 #[derive(Clone)]
 pub struct WebPlaybackSessionService {
     database: Database,
     signer: Arc<ResourceSigner>,
+    hls: HlsManager,
 }
 
 impl WebPlaybackSessionService {
-    pub fn new(database: Database) -> Self {
+    pub(crate) fn new(database: Database, config_dir: std::path::PathBuf) -> Self {
+        let hls = HlsManager::new(config_dir);
+        let cleanup = hls.clone();
+        tokio::spawn(async move {
+            if let Err(error) = cleanup.cleanup_orphans().await {
+                tracing::warn!(%error, "failed to clean orphaned Web HLS directories");
+            }
+        });
         Self {
             database,
             signer: Arc::new(ResourceSigner::random()),
+            hls,
         }
     }
 
-    pub async fn create(
+    pub(crate) async fn create(
         &self,
         input: CreateWebPlaybackSession<'_>,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
@@ -155,9 +174,11 @@ impl WebPlaybackSessionService {
                 "playback session identifiers must not be empty".to_owned(),
             ));
         }
+        let mut capabilities = input.capabilities;
+        capabilities.hardware_transcode &= self.hls.hardware_transcode_available();
         let plan = WebPlaybackPlan::from(choose_plan(PlaybackDecisionInput {
             source_kind: input.source_kind,
-            capabilities: input.capabilities,
+            capabilities,
         }));
         let WebPlaybackPlan::Unsupported { .. } = plan else {
             let id = Uuid::now_v7().to_string();
@@ -200,7 +221,7 @@ impl WebPlaybackSessionService {
         })
     }
 
-    pub fn sign_resource(
+    pub(crate) fn sign_resource(
         &self,
         session_id: &str,
         resource: &str,
@@ -233,12 +254,55 @@ impl WebPlaybackSessionService {
             return Err(WebPlaybackSessionError::NotActive);
         }
         if session.expires_at < now {
+            let _ = self.hls.stop(session_id).await;
             return Err(WebPlaybackSessionError::Expired);
         }
         Ok(session)
     }
 
-    pub async fn heartbeat(
+    pub(crate) async fn start_hls(
+        &self,
+        session_id: &str,
+        tier: ServerTier,
+        input: &std::path::Path,
+    ) -> Result<(), WebPlaybackSessionError> {
+        self.hls.start(session_id, tier, input).await?;
+        let directory = self.hls.session_directory(session_id).await?;
+        let now = unix_timestamp();
+        if !self
+            .database
+            .set_web_playback_temp_dir(session_id, &directory.to_string_lossy(), now)
+            .await?
+        {
+            let _ = self.hls.stop(session_id).await;
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn wait_for_hls_manifest(
+        &self,
+        session_id: &str,
+    ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
+        Ok(self.hls.wait_for_manifest(session_id).await?)
+    }
+
+    pub(crate) async fn hls_asset_path(
+        &self,
+        session_id: &str,
+        asset: &str,
+    ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
+        Ok(self.hls.asset_path(session_id, asset).await?)
+    }
+
+    pub(crate) async fn hls_within_quota(
+        &self,
+        session_id: &str,
+    ) -> Result<bool, WebPlaybackSessionError> {
+        Ok(self.hls.within_quota(session_id).await?)
+    }
+
+    pub(crate) async fn heartbeat(
         &self,
         session_id: &str,
         user_id: &str,
@@ -255,11 +319,12 @@ impl WebPlaybackSessionService {
         Ok(expires_at)
     }
 
-    pub async fn stop(
+    pub(crate) async fn stop(
         &self,
         session_id: &str,
         user_id: &str,
     ) -> Result<(), WebPlaybackSessionError> {
+        let _ = self.hls.stop(session_id).await;
         let now = unix_timestamp();
         self.database
             .stop_web_playback_session(session_id, user_id, "STOPPED", now)

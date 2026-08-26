@@ -5743,6 +5743,29 @@ impl Database {
         })
     }
 
+    pub(crate) async fn set_web_playback_temp_dir(
+        &self,
+        session_id: &str,
+        temp_dir: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE web_playback_sessions
+             SET temp_dir = ?, updated_at = ?
+             WHERE id = ? AND state = 'ACTIVE'",
+        )
+        .bind(temp_dir)
+        .bind(now)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn touch_web_playback_session(
         &self,
         session_id: &str,
