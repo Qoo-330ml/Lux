@@ -115,7 +115,7 @@ Lux 的核心价值不是功能数量，而是：
 
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
-- Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径必须落在配置的媒体库根目录内；扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
+- Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径必须落在配置的媒体库根目录或管理员配置的 STRM 额外允许根目录内；额外允许根目录必须是容器内的绝对目录，不能配置为 `/`。扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
 - HTTP(S) 目标沿用直接播放语义，但 `DirectStreamUrl` 指向 Lux 播放入口，由 Lux 用播放器 User-Agent 解析有限重定向后返回 307；媒体字节仍由播放器直连最终地址。本地路径在 Lux 进程可安全读取时按本地文件提供；SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
@@ -124,7 +124,7 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体的 Web 播放使用 0～4 档服务端计划：档位 0 为 Direct Play，档位 1 为视频/音频 copy 的 Remux，档位 2 为视频 copy、音频转码，档位 3 为硬件转码，档位 4 为软件转码。决策始终优先选择较低档位。
 - 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
-- 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
+- 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可位于当前媒体库根目录或管理员配置的 STRM 额外允许根目录；目标必须是 canonicalize 后存在的普通文件，不能借助 `..` 或符号链接越界。
 - URL 型 `.strm` 在 `Path` 保留原始播放地址，`DirectStreamUrl` 指向受保护的 Lux 视频端点；端点使用入站播放器 User-Agent 和单区间请求解析 HTTP(S) 目标的有限重定向，再返回最终地址的 307，不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
 - 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
@@ -1531,6 +1531,8 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 
 `GET/PATCH /api/v1/admin/settings` 的 `danmaku` 配置只返回脱敏的地址和配置状态；地址中的 token、query secret 和完整外部 URL 不进入日志、审计事件或普通用户 API。
 
+管理员设置中的 `strmAllowedRoots` 是服务器级 STRM 本地播放额外允许根目录列表，默认为空；媒体库根目录始终自动允许。列表中的值必须是非根的绝对目录，播放时仍会 canonicalize 配置目录和目标文件，并要求目标是普通文件。该配置不改变 `.strm` 原始内容，也不实现路径映射。
+
 所有管理端点均在服务端检查 can_manage_server。敏感操作写审计事件。删除媒体源时，即使媒体文件已被外部删除，也会清理 Lux 中的媒体源记录；没有其他媒体源时同时标记逻辑条目移除。
 
 ---
@@ -1921,6 +1923,7 @@ services:
 | LUX-156 | src/observability/、src/main.rs、src/api/mod.rs、Cargo.toml、Cargo.lock、tests/observability.rs、tests/log_export.rs、web/src/features/admin/、web/src/lib/api/、web/tests/、docs/ |
 | LUX-158 | src/application/strm_target.rs、src/application/、tests/strm_target.rs、docs/ |
 | LUX-160 | src/application/plugin_protocol.rs、src/application/plugins.rs、src/api/mod.rs、tests/、docs/ |
+| LUX-161 | src/application/strm_target.rs、src/storage/mod.rs、src/api/mod.rs、web/src/features/admin/AdminSettingsPage.tsx、web/src/lib/api/types.ts、tests/、web/tests/、docs/ |
 | LUX-162 | src/application/plugin_store.rs、src/application/plugin_runtime.rs、src/application/plugins.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、docs/ |
 | LUX-164 | src/application/metadata_paths.rs、src/application/people.rs、migrations/（后续对象关系）、tests/、docs/ |
 | LUX-165 | src/application/images.rs、src/application/library_covers.rs、src/api/mod.rs、tests/、docs/ |
@@ -3703,6 +3706,38 @@ HTTP(S) URL，或 `UNSUPPORTED`。宿主按插件 ID 稳定顺序尝试已安装
 
 - 不绑定任何具体云盘、网盘、代理或第三方工具。
 - 不把 SMB/FTP 直接拼接为 URL，不实现媒体字节代理或转码。
+
+#### LUX-161：可配置的 STRM 本地播放额外允许根目录
+
+范围：修复本地绝对路径型 `.strm` 在媒体库根目录之外无法播放的问题。管理员通过
+`GET/PATCH /api/v1/admin/settings` 配置 `strmAllowedRoots`，每行/每项一个容器内绝对目录，
+例如 `/CloudNAS/115-122`。配置为空时保持原有行为，媒体库根目录仍自动允许；配置后，Web、Emby
+和第三方播放器共用的 Lux 视频入口可以读取额外根目录下的本地目标，无需修改 `.strm` 内容。
+
+播放时 `.strm` 目标相对于 `.strm` 所在目录解析，随后对媒体库根目录、额外允许根目录和目标文件执行
+canonicalize。只有位于任一允许根目录下且存在的普通文件可播放；`/`、空值、非绝对路径、`..` 越界、
+符号链接越界、目录和另一个 `.strm` 仍拒绝。该任务不实现任意容器路径无条件开放、路径映射、远程 URL
+代理、Remux、转码或 HLS。
+
+验收：
+
+- [ ] 管理员可以读取、保存和清除 `strmAllowedRoots`；旧数据库无该键时返回空列表，不需要 migration。
+- [ ] 本地绝对 `.strm` 目标位于额外允许根目录时，Lux Web 和 Emby 视频入口均按本地文件返回 Range 响应；
+      `.strm` 原始文本无需改写。
+- [ ] 未配置的外部路径、`..` 越界、符号链接越界、根目录、目录和 `.strm` 目标继续被拒绝。
+- [ ] 输入在管理 API 边界校验，播放时重新 canonicalize；不记录完整本地路径或 `.strm` 原始目标。
+- [ ] 通过专项 Rust/Web 测试、格式化、Clippy、Web 构建，并记录本机 ARM 架构。
+
+验证：`cargo test --locked --test strm_target --test strm_allowed_roots`、相关 API 测试、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`pnpm --dir web test`、`pnpm --dir web build` 和 `uname -m`。
+
+依赖：LUX-159、LUX-160。
+
+明确不做：
+
+- 不无条件开放容器内任意可读路径；不把 `/` 作为允许根目录。
+- 不实现路径映射、媒体字节代理、转码或改变第三方客户端的 Emby 路由合同。
 
 #### LUX-162：可配置插件商店与远程插件包
 
