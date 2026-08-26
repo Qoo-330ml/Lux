@@ -4657,16 +4657,21 @@ Redia）根据 `MediaSources[].Path` 执行自己的路径映射并返回云盘�
 
 验收：
 
-- [ ] 完整 `FILL_MISSING` 条目上游请求数为 0；只缺一类字段时不会请求无关 capability。
-- [ ] 搜索摘要、详情、图片、credits、external IDs、trailers 和图片下载均有请求计数测试；缓存和
+- [x] 完整 `FILL_MISSING` 条目上游请求数为 0；只缺一类字段时不会请求无关 capability。
+- [x] 搜索摘要、详情、图片、credits、external IDs、trailers 和图片下载均有请求计数测试；缓存和
       singleflight 不产生重复请求。
-- [ ] 404/明确无图片在后续补全中不重复请求；临时失败只在 `next_retry_at` 到期后重试，成功后清零退避。
-- [ ] 每条媒体图片并发不超过配置值，进程全局图片并发不超过 semaphore；并发测试证明 SQLite、文件写入
+- [x] 404/明确无图片在后续补全中不重复请求；临时失败只在 `next_retry_at` 到期后重试，成功后清零退避；
+      永久 HTTP 状态不会被安排为临时重试。
+- [x] 每条媒体图片并发不超过配置值，进程全局图片并发不超过 semaphore；并发测试证明 SQLite、文件写入
       和前台请求没有无界任务堆积。
 - [ ] SQLite 和 PostgreSQL 空库 migration 均可运行，已有图片、NFO 优先级、锁定字段和人物关系回归通过。
-- [ ] TMDb `0.1.8` bundle 目录、内置默认目录、包校验和相关插件测试一致。
+- [x] TMDb `0.1.8` bundle 目录、内置默认目录、包校验和相关插件测试一致。
 - [ ] 性能记录包含请求数、阶段耗时、吞吐、重试/不可用比例和本机 `uname -m`；不得将 ARM64 结果外推为
       NAS/x86_64 结论。
+
+当前本机已完成 SQLite migration 和 PostgreSQL SQL 兼容性静态修正，但没有可用的 PostgreSQL daemon，
+因此 PostgreSQL 空库实测仍待阶段门确认；性能记录目前覆盖请求数、并发边界、重试状态和 ARM64 限制，
+完整吞吐/阶段耗时基准仍待目标数据集复测。
 
 验证：参见 `docs/decisions/027-metadata-refresh-resource-pipeline.md` 和 `docs/PERFORMANCE.md`。
 
