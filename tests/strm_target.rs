@@ -1,8 +1,5 @@
-use std::path::PathBuf;
-
 use luxd::application::strm_target::{
-    StrmAllowedRootsError, StrmTargetKind, canonical_local_strm_target_with_allowed_roots,
-    classify_strm_target, normalize_strm_allowed_roots,
+    StrmTargetKind, canonical_local_strm_target, classify_strm_target,
 };
 
 #[test]
@@ -70,36 +67,8 @@ fn selects_only_the_first_non_empty_line_and_handles_empty_content() {
     assert_eq!(empty.value, None);
 }
 
-#[test]
-fn normalizes_strm_allowed_roots_and_rejects_unsafe_values() {
-    let normalized = normalize_strm_allowed_roots(&[
-        " /CloudNAS/115-122 ".to_owned(),
-        "/CloudNAS/115-122".to_owned(),
-        "/CloudNAS/other".to_owned(),
-    ])
-    .expect("allowed roots should normalize");
-    assert_eq!(
-        normalized,
-        vec!["/CloudNAS/115-122".to_owned(), "/CloudNAS/other".to_owned()]
-    );
-
-    for (value, error) in [
-        ("relative/path", StrmAllowedRootsError::NotAbsolute),
-        ("/", StrmAllowedRootsError::Root),
-        (
-            "/CloudNAS/../config",
-            StrmAllowedRootsError::ParentTraversal,
-        ),
-    ] {
-        assert_eq!(
-            normalize_strm_allowed_roots(&[value.to_owned()]),
-            Err(error)
-        );
-    }
-}
-
 #[tokio::test]
-async fn resolves_targets_inside_additional_roots_but_not_outside_them()
+async fn resolves_absolute_targets_regardless_of_the_library_root()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let library_root = temp_dir.path().join("library");
@@ -115,37 +84,34 @@ async fn resolves_targets_inside_additional_roots_but_not_outside_them()
     tokio::fs::write(&allowed_media, b"allowed").await?;
     tokio::fs::write(&outside_media, b"outside").await?;
 
-    let resolved = canonical_local_strm_target_with_allowed_roots(
+    let resolved = canonical_local_strm_target(
         library_root.to_str().ok_or("library root is not UTF-8")?,
         "movie.strm",
         allowed_media.to_str().ok_or("allowed media is not UTF-8")?,
-        &[PathBuf::from(&allowed_root)],
     )
     .await?;
     assert_eq!(resolved, tokio::fs::canonicalize(&allowed_media).await?);
 
-    let forbidden = canonical_local_strm_target_with_allowed_roots(
+    let outside_target = canonical_local_strm_target(
         library_root.to_str().ok_or("library root is not UTF-8")?,
         "movie.strm",
         outside_media.to_str().ok_or("outside media is not UTF-8")?,
-        &[PathBuf::from(&allowed_root)],
     )
-    .await;
+    .await?;
     assert_eq!(
-        forbidden,
-        Err(luxd::application::strm_target::StrmLocalPathError::Forbidden)
+        outside_target,
+        tokio::fs::canonicalize(&outside_media).await?
     );
 
-    let directory = canonical_local_strm_target_with_allowed_roots(
+    let directory = canonical_local_strm_target(
         library_root.to_str().ok_or("library root is not UTF-8")?,
         "movie.strm",
         allowed_root.to_str().ok_or("allowed root is not UTF-8")?,
-        &[PathBuf::from(&allowed_root)],
     )
     .await;
     assert_eq!(
         directory,
-        Err(luxd::application::strm_target::StrmLocalPathError::Forbidden)
+        Err(luxd::application::strm_target::StrmLocalPathError::Missing)
     );
 
     #[cfg(unix)]
@@ -154,17 +120,13 @@ async fn resolves_targets_inside_additional_roots_but_not_outside_them()
 
         let symlink_path = allowed_root.join("outside.mkv");
         symlink(&outside_media, &symlink_path)?;
-        let escaped = canonical_local_strm_target_with_allowed_roots(
+        let escaped = canonical_local_strm_target(
             library_root.to_str().ok_or("library root is not UTF-8")?,
             "movie.strm",
             symlink_path.to_str().ok_or("symlink is not UTF-8")?,
-            &[PathBuf::from(&allowed_root)],
         )
-        .await;
-        assert_eq!(
-            escaped,
-            Err(luxd::application::strm_target::StrmLocalPathError::Forbidden)
-        );
+        .await?;
+        assert_eq!(escaped, tokio::fs::canonicalize(&outside_media).await?);
     }
 
     Ok(())

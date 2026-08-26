@@ -5095,7 +5095,6 @@ impl Database {
         percent: i64,
         min_ticks: i64,
         media_strategy: &str,
-        strm_allowed_roots: &str,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -5109,7 +5108,6 @@ impl Database {
             ("resume_played_percent", percent.to_string()),
             ("resume_min_ticks", min_ticks.to_string()),
             ("media_strategy", media_strategy.to_owned()),
-            ("strm_allowed_roots", strm_allowed_roots.to_owned()),
         ] {
             self.query(
                 "INSERT INTO server_settings (key, value)
@@ -5308,25 +5306,6 @@ impl Database {
             path: self.path.clone(),
             source,
         })
-    }
-
-    pub(crate) async fn strm_allowed_roots(&self) -> Result<Vec<String>, StorageError> {
-        let stored: Option<String> = self
-            .query_scalar(
-                "SELECT value FROM server_settings
-                 WHERE key = 'strm_allowed_roots'",
-            )
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        match stored {
-            Some(value) => serde_json::from_str(&value)
-                .map_err(|source| StorageError::Serialization(source.to_string())),
-            None => Ok(Vec::new()),
-        }
     }
 
     pub(crate) async fn set_user_item_played(

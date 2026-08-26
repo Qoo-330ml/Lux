@@ -90,8 +90,7 @@ use crate::{
         strm_playback::{StrmPlaybackError, StrmPlaybackResolver},
         strm_probe::{StrmProbeError, StrmProbeService},
         strm_target::{
-            StrmLocalPathError, StrmTargetKind, canonical_local_strm_target_with_allowed_roots,
-            classify_strm_target, normalize_strm_allowed_roots,
+            StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
         },
         thumbnails::ThumbnailService,
         tmdb::TmdbClient,
@@ -10739,19 +10738,10 @@ async fn serve_media_file(
                 return redirect_strm_playback(location.as_str());
             }
             StrmTargetKind::Path => {
-                let strm_allowed_roots = match read_strm_allowed_roots(database).await {
-                    Ok(roots) => roots,
-                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                };
-                let additional_allowed_roots = strm_allowed_roots
-                    .into_iter()
-                    .map(PathBuf::from)
-                    .collect::<Vec<_>>();
-                let path = match canonical_local_strm_target_with_allowed_roots(
+                let path = match canonical_local_strm_target(
                     &source.root_path,
                     &source.relative_path,
                     &external_url,
-                    &additional_allowed_roots,
                 )
                 .await
                 {
@@ -12240,10 +12230,6 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let strm_allowed_roots = match read_strm_allowed_roots(database).await {
-        Ok(roots) => roots,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let server_name = match database.server_name().await {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
@@ -12255,7 +12241,6 @@ async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Re
         "resumePlayedPercent": played_percent,
         "resumeMinTicks": minimum_ticks,
         "mediaStrategy": media_strategy,
-        "strmAllowedRoots": strm_allowed_roots,
         "networkProxy": network_proxy,
     }))
     .into_response()
@@ -12461,7 +12446,6 @@ struct UpdatePlaybackSettingsRequest {
     resume_played_percent: Option<i64>,
     resume_min_ticks: Option<i64>,
     media_strategy: Option<MediaStrategySettings>,
-    strm_allowed_roots: Option<Vec<String>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -12552,11 +12536,6 @@ async fn read_media_strategy_settings(database: &Database) -> Result<MediaStrate
         Some(value) => serde_json::from_str(&value).map_err(|_| ()),
         None => Ok(MediaStrategySettings::default()),
     }
-}
-
-async fn read_strm_allowed_roots(database: &Database) -> Result<Vec<String>, ()> {
-    let stored = database.strm_allowed_roots().await.map_err(|_| ())?;
-    normalize_strm_allowed_roots(&stored).map_err(|_| ())
 }
 
 fn valid_strategy_code(value: &str, max_length: usize) -> bool {
@@ -12703,10 +12682,6 @@ async fn admin_update_settings(
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let current_strm_allowed_roots = match read_strm_allowed_roots(database).await {
-        Ok(roots) => roots,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let current_server_name = match database.server_name().await {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
@@ -12715,21 +12690,6 @@ async fn admin_update_settings(
     let percent = request.resume_played_percent.unwrap_or(current_percent);
     let minimum_ticks = request.resume_min_ticks.unwrap_or(current_ticks);
     let media_strategy = request.media_strategy.unwrap_or(current_media_strategy);
-    let strm_allowed_roots = match request.strm_allowed_roots {
-        Some(roots) => match normalize_strm_allowed_roots(&roots) {
-            Ok(roots) => roots,
-            Err(_) => {
-                return api_error(
-                    &headers,
-                    StatusCode::BAD_REQUEST,
-                    lux::ApiErrorCode::InvalidRequest,
-                    "STRM 允许根目录无效",
-                )
-                .into_response();
-            }
-        },
-        None => current_strm_allowed_roots,
-    };
     let server_name = match request.server_name {
         Some(name) => match normalize_server_name(&name) {
             Some(name) => name,
@@ -12756,10 +12716,6 @@ async fn admin_update_settings(
         }
     }
     let media_strategy_json = match serde_json::to_string(&media_strategy) {
-        Ok(value) => value,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let strm_allowed_roots_json = match serde_json::to_string(&strm_allowed_roots) {
         Ok(value) => value,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -12811,12 +12767,7 @@ async fn admin_update_settings(
         }
     }
     match database
-        .set_server_settings(
-            percent,
-            minimum_ticks,
-            &media_strategy_json,
-            &strm_allowed_roots_json,
-        )
+        .set_server_settings(percent, minimum_ticks, &media_strategy_json)
         .await
     {
         Ok(()) => {
@@ -12837,7 +12788,6 @@ async fn admin_update_settings(
                 "resumePlayedPercent": percent,
                 "resumeMinTicks": minimum_ticks,
                 "mediaStrategy": media_strategy,
-                "strmAllowedRoots": strm_allowed_roots,
                 "networkProxy": network_proxy_settings(&state).await,
             }))
             .into_response()

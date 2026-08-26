@@ -23,7 +23,6 @@ export function AdminSettingsPage() {
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
   const [minimumMinutes, setMinimumMinutes] = useState("2");
   const [showMetadataPending, setShowMetadataPending] = useState(true);
-  const [strmAllowedRoots, setStrmAllowedRoots] = useState("");
   const [proxyUrl, setProxyUrl] = useState("");
   const [saved, setSaved] = useState(false);
   const [proxySaved, setProxySaved] = useState(false);
@@ -33,7 +32,6 @@ export function AdminSettingsPage() {
     if (!settings.data) return;
     setMinimumMinutes(String(Math.round(settings.data.resumeMinTicks / 600000000)));
     setShowMetadataPending(settings.data.mediaStrategy.showMetadataPending ?? true);
-    setStrmAllowedRoots((settings.data.strmAllowedRoots ?? []).join("\n"));
     setProxyUrl(settings.data.networkProxy?.url ?? "");
   }, [settings.data]);
 
@@ -44,10 +42,6 @@ export function AdminSettingsPage() {
         ...settings.data!.mediaStrategy,
         showMetadataPending,
       },
-      strmAllowedRoots: strmAllowedRoots
-        .split(/\r?\n/)
-        .map((value) => value.trim())
-        .filter(Boolean),
     }),
     onSuccess: (data) => {
       setMinimumMinutes(String(Math.round(data.resumeMinTicks / 600000000)));
@@ -118,21 +112,6 @@ export function AdminSettingsPage() {
             <span>显示媒体库待确认标记</span>
           </label>
           <small>关闭后只隐藏卡片上的标记，不会改变待确认状态或待确认筛选。</small>
-          <label>
-            <span>STRM 允许播放根目录</span>
-            <small>每行填写一个容器内绝对目录，例如 /CloudNAS/115-122。媒体库根目录始终自动允许。</small>
-            <textarea
-              aria-label="STRM 允许播放根目录"
-              rows={4}
-              spellCheck={false}
-              placeholder="/CloudNAS/115-122"
-              value={strmAllowedRoots}
-              onChange={(event) => {
-                setSaved(false);
-                setStrmAllowedRoots(event.target.value);
-              }}
-            />
-          </label>
           <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={save.isPending} onClick={() => save.mutate()}>
             <Save size={16} /> {save.isPending ? "保存中…" : "保存设置"}
           </button>

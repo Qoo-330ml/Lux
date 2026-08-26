@@ -38,7 +38,6 @@ const settings = {
     },
     showMetadataPending: true,
   },
-  strmAllowedRoots: ["/CloudNAS/115-122"],
   networkProxy: {
     configured: true,
     url: "http://192.168.1.2:7890/",
@@ -130,44 +129,6 @@ describe("AdminSettingsPage network proxy", () => {
     expect(update).toHaveBeenCalledWith({
       resumeMinTicks: 1_200_000_000,
       mediaStrategy: { ...settings.mediaStrategy, showMetadataPending: false },
-      strmAllowedRoots: ["/CloudNAS/115-122"],
-    });
-  });
-
-  it("shows and saves STRM playback roots one per line", async () => {
-    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-
-    await act(async () => {
-      root.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminSettingsPage />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
-    });
-
-    const textarea = container.querySelector<HTMLTextAreaElement>("textarea[aria-label='STRM 允许播放根目录']");
-    expect(textarea?.value).toBe("/CloudNAS/115-122");
-    await act(async () => {
-      if (!textarea) throw new Error("missing STRM roots textarea");
-      Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set?.call(
-        textarea,
-        "/CloudNAS/115-122\n /mnt/media ",
-      );
-      textarea.dispatchEvent(new Event("input", { bubbles: true }));
-      textarea.dispatchEvent(new Event("change", { bubbles: true }));
-      container.querySelector<HTMLButtonElement>("button.lux-settings-save")?.click();
-    });
-
-    expect(update).toHaveBeenCalledWith({
-      resumeMinTicks: 1_200_000_000,
-      mediaStrategy: { ...settings.mediaStrategy, showMetadataPending: true },
-      strmAllowedRoots: ["/CloudNAS/115-122", "/mnt/media"],
     });
   });
 

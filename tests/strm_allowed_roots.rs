@@ -27,7 +27,7 @@ fn cookie_value(response: &reqwest::Response, name: &str) -> String {
 }
 
 #[tokio::test]
-async fn configured_strm_root_enables_web_and_emby_local_playback()
+async fn strm_absolute_path_enables_web_and_emby_local_playback_without_extra_settings()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -101,56 +101,6 @@ async fn configured_strm_root_enables_web_and_emby_local_playback()
         .as_str()
         .ok_or("missing Emby token")?
         .to_owned();
-    let denied = client
-        .get(&stream_url)
-        .header("X-Emby-Token", &emby_token)
-        .header(RANGE, "bytes=0-")
-        .send()
-        .await?;
-    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
-
-    let web_login = client
-        .post(format!("{base_url}/api/v1/auth/login"))
-        .json(&json!({"username": "admin", "password": "correct password"}))
-        .send()
-        .await?;
-    let session_cookie = cookie_value(&web_login, "lux_session");
-    let csrf_cookie = cookie_value(&web_login, "lux_csrf");
-    let cookies = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
-    let default_settings = client
-        .get(format!("{base_url}/api/v1/admin/settings"))
-        .header(COOKIE, &cookies)
-        .send()
-        .await?;
-    assert_eq!(default_settings.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        default_settings.json::<Value>().await?["strmAllowedRoots"],
-        json!([])
-    );
-
-    let invalid_settings = client
-        .patch(format!("{base_url}/api/v1/admin/settings"))
-        .header(COOKIE, &cookies)
-        .header("X-CSRF-Token", &csrf_cookie)
-        .json(&json!({"strmAllowedRoots": ["relative/path"]}))
-        .send()
-        .await?;
-    assert_eq!(invalid_settings.status(), reqwest::StatusCode::BAD_REQUEST);
-
-    let settings = client
-        .patch(format!("{base_url}/api/v1/admin/settings"))
-        .header(COOKIE, &cookies)
-        .header("X-CSRF-Token", &csrf_cookie)
-        .json(&json!({"strmAllowedRoots": [allowed_root.to_string_lossy()]}))
-        .send()
-        .await?;
-    assert_eq!(settings.status(), reqwest::StatusCode::OK);
-    let settings_body = settings.json::<Value>().await?;
-    assert_eq!(
-        settings_body["strmAllowedRoots"],
-        json!([allowed_root.to_string_lossy()])
-    );
-
     let emby_stream = client
         .get(&stream_url)
         .header("X-Emby-Token", &emby_token)
@@ -160,6 +110,14 @@ async fn configured_strm_root_enables_web_and_emby_local_playback()
     assert_eq!(emby_stream.status(), reqwest::StatusCode::PARTIAL_CONTENT);
     assert_eq!(emby_stream.bytes().await?.as_ref(), b"external-media");
 
+    let web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({"username": "admin", "password": "correct password"}))
+        .send()
+        .await?;
+    let session_cookie = cookie_value(&web_login, "lux_session");
+    let csrf_cookie = cookie_value(&web_login, "lux_csrf");
+    let cookies = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
     let web_create = client
         .post(format!("{base_url}/api/v1/playback/sessions"))
         .header(COOKIE, &cookies)
@@ -194,22 +152,6 @@ async fn configured_strm_root_enables_web_and_emby_local_playback()
     let stored_strm =
         tokio::fs::read_to_string(library_root.join("External.Movie.2026.strm")).await?;
     assert_eq!(stored_strm, external_media.to_string_lossy());
-
-    let cleared = client
-        .patch(format!("{base_url}/api/v1/admin/settings"))
-        .header(COOKIE, &cookies)
-        .header("X-CSRF-Token", &csrf_cookie)
-        .json(&json!({"strmAllowedRoots": []}))
-        .send()
-        .await?;
-    assert_eq!(cleared.status(), reqwest::StatusCode::OK);
-    let denied_after_clear = client
-        .get(&stream_url)
-        .header("X-Emby-Token", &emby_token)
-        .header(RANGE, "bytes=0-")
-        .send()
-        .await?;
-    assert_eq!(denied_after_clear.status(), reqwest::StatusCode::FORBIDDEN);
 
     server.abort();
     Ok(())
