@@ -564,9 +564,10 @@ impl MetadataCandidateService {
                     images_response,
                 )
             };
-            if images_response
-                .as_ref()
-                .is_some_and(|response| response.images.is_empty())
+            if plan.needs_images
+                && images_response
+                    .as_ref()
+                    .is_some_and(|response| response.images.is_empty())
             {
                 self.record_explicitly_unavailable_images(item_id, scraper, &provider_id)
                     .await?;
