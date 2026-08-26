@@ -2,7 +2,10 @@ use std::{collections::BTreeMap, fmt, future::Future, pin::Pin, sync::Arc, time:
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::time::{Duration, sleep};
+use tokio::{
+    sync::OnceCell,
+    time::{Duration, sleep},
+};
 
 use crate::{
     application::provider_cache::{CacheLookup, ProviderResponseCache, cache_key, ttl_for_method},
@@ -100,6 +103,8 @@ pub trait ScraperAdapter: Send + Sync {
         Box::pin(std::future::ready(()))
     }
 
+    fn with_resource_metrics(&self, _resources: ResourceMetrics) {}
+
     fn clear_response_cache(&self) -> ScraperFuture<'_, ()> {
         Box::pin(std::future::ready(()))
     }
@@ -140,7 +145,10 @@ impl ScraperProvider {
 
     pub(crate) fn with_resource_metrics(self, resources: ResourceMetrics) -> Self {
         match self {
-            Self::Adapter(adapter) => Self::Adapter(adapter),
+            Self::Adapter(adapter) => {
+                adapter.with_resource_metrics(resources);
+                Self::Adapter(adapter)
+            }
             Self::Generic(client) => {
                 Self::Generic(Box::new((*client).with_resource_metrics(resources)))
             }
@@ -812,7 +820,7 @@ pub struct ScraperPluginClient {
     plugins: PluginService,
     plugin_id: String,
     provider_key: String,
-    capabilities: Option<Vec<String>>,
+    capability_cache: Arc<OnceCell<Option<Vec<String>>>>,
     response_cache: ProviderResponseCache,
     resources: Option<ResourceMetrics>,
 }
@@ -840,11 +848,15 @@ impl ScraperPluginClient {
         capabilities: Option<Vec<String>>,
         response_cache: ProviderResponseCache,
     ) -> Self {
+        let capability_cache = Arc::new(OnceCell::new());
+        if let Some(capabilities) = capabilities {
+            let _ = capability_cache.set(Some(capabilities));
+        }
         Self {
             plugins,
             plugin_id: plugin_id.into(),
             provider_key: provider_key.into(),
-            capabilities,
+            capability_cache,
             response_cache,
             resources: None,
         }
@@ -934,11 +946,11 @@ impl ScraperPluginClient {
         params: Value,
     ) -> Result<Value, ScraperError> {
         if let Some(capability) = metadata_capability_for_method(method) {
-            let capabilities = match self.capabilities.as_ref() {
-                Some(capabilities) => Some(capabilities.clone()),
-                None => self.plugins.scraper_capabilities(&self.plugin_id).await,
-            };
-            if capabilities.is_some_and(|capabilities| {
+            let capabilities = self
+                .capability_cache
+                .get_or_init(|| async { self.plugins.scraper_capabilities(&self.plugin_id).await })
+                .await;
+            if capabilities.as_ref().is_some_and(|capabilities| {
                 !capabilities
                     .iter()
                     .any(|declared| declared.eq_ignore_ascii_case(capability))

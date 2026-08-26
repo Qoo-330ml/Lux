@@ -1,6 +1,6 @@
 use std::{
     env, fmt,
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -67,6 +67,7 @@ pub struct TmdbClient {
     next_request: Arc<Mutex<Instant>>,
     request_concurrency: Arc<Semaphore>,
     response_cache: ProviderResponseCache,
+    resources: Arc<StdMutex<Option<crate::observability::resources::ResourceMetrics>>>,
 }
 
 impl TmdbClient {
@@ -119,6 +120,7 @@ impl TmdbClient {
             next_request: Arc::new(Mutex::new(Instant::now())),
             request_concurrency: Arc::new(Semaphore::new(TMDB_MAX_CONCURRENT_REQUESTS)),
             response_cache: ProviderResponseCache::new(None),
+            resources: Arc::new(StdMutex::new(None)),
         })
     }
 
@@ -204,6 +206,15 @@ impl TmdbClient {
 
     pub(crate) async fn clear_response_cache(&self) {
         self.response_cache.clear().await;
+    }
+
+    pub(crate) fn with_resource_metrics(
+        &self,
+        resources: crate::observability::resources::ResourceMetrics,
+    ) {
+        if let Ok(mut current) = self.resources.lock() {
+            *current = Some(resources);
+        }
     }
 
     pub async fn search_movies(
@@ -694,13 +705,20 @@ impl TmdbClient {
         endpoint: &str,
         params: &[(String, String)],
     ) -> Result<serde_json::Value, TmdbError> {
+        let started = Instant::now();
         let cache_params = serde_json::json!(params);
         let cache_key = cache_key("tmdb", endpoint, &cache_params);
         let cache_owner = if let Some(cache_key) = cache_key.as_deref() {
             loop {
                 match self.response_cache.begin(cache_key).await {
-                    CacheLookup::Negative => return Err(TmdbError::NotFound),
-                    CacheLookup::Hit(value) => return Ok(value),
+                    CacheLookup::Negative => {
+                        self.record_metadata_call(endpoint, true, started);
+                        return Err(TmdbError::NotFound);
+                    }
+                    CacheLookup::Hit(value) => {
+                        self.record_metadata_call(endpoint, true, started);
+                        return Ok(value);
+                    }
                     CacheLookup::Wait(waiter) => {
                         waiter.await;
                     }
@@ -711,6 +729,7 @@ impl TmdbClient {
             None
         };
         let result = self.request_value_uncached(endpoint, params).await;
+        self.record_metadata_call(endpoint, false, started);
         if let Some(cache_key) = cache_key.as_deref() {
             match &result {
                 Ok(value) => {
@@ -767,6 +786,7 @@ impl TmdbClient {
                 Err(error) if error.is_timeout() => {
                     if retry_count < self.max_retries {
                         drop(request_permit);
+                        self.record_metadata_retry(endpoint);
                         self.wait_before_retry(retry_count, None).await;
                         retry_count += 1;
                         continue;
@@ -793,6 +813,7 @@ impl TmdbClient {
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
                 if retry_count < self.max_retries {
                     drop(request_permit);
+                    self.record_metadata_retry(endpoint);
                     self.wait_before_retry(retry_count, retry_after).await;
                     retry_count += 1;
                     continue;
@@ -801,6 +822,7 @@ impl TmdbClient {
             }
             if status.is_server_error() && retry_count < self.max_retries {
                 drop(request_permit);
+                self.record_metadata_retry(endpoint);
                 self.wait_before_retry(retry_count, retry_after).await;
                 retry_count += 1;
                 continue;
@@ -842,6 +864,50 @@ impl TmdbClient {
         };
         let delay = backoff.max(retry_after.unwrap_or_default()) + jitter;
         sleep(delay).await;
+    }
+
+    fn record_metadata_call(&self, endpoint: &str, cache_hit: bool, started: Instant) {
+        let Some(capability) = metadata_capability_for_endpoint(endpoint) else {
+            return;
+        };
+        let Ok(resources) = self.resources.lock() else {
+            return;
+        };
+        let Some(resources) = resources.as_ref() else {
+            return;
+        };
+        resources.record_metadata_request(capability, cache_hit);
+        resources.record_metadata_stage(capability, started.elapsed());
+    }
+
+    fn record_metadata_retry(&self, endpoint: &str) {
+        let Some(capability) = metadata_capability_for_endpoint(endpoint) else {
+            return;
+        };
+        let Ok(resources) = self.resources.lock() else {
+            return;
+        };
+        if let Some(resources) = resources.as_ref() {
+            resources.record_metadata_retry(capability);
+        }
+    }
+}
+
+fn metadata_capability_for_endpoint(endpoint: &str) -> Option<&'static str> {
+    if endpoint.starts_with("3/search/") {
+        Some("metadata.search")
+    } else if endpoint.contains("/images") {
+        Some("metadata.images")
+    } else if endpoint.contains("/credits") {
+        Some("metadata.credits")
+    } else if endpoint.contains("/external_ids") {
+        Some("metadata.externalIds")
+    } else if endpoint.contains("/videos") {
+        Some("metadata.trailers")
+    } else if endpoint.starts_with("3/") {
+        Some("metadata.get")
+    } else {
+        None
     }
 }
 
