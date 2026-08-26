@@ -125,7 +125,7 @@ Lux 的核心价值不是功能数量，而是：
 - 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可以位于媒体库根目录之外；目标必须是 Lux 进程实际可读取、canonicalize 后存在的普通文件，且不会把目录或另一个 `.strm` 当作视频返回。
-- URL 型 `.strm` 在 `Path` 保留原始播放地址，`DirectStreamUrl` 指向受保护的 Lux 视频端点；端点使用入站播放器 User-Agent 和单区间请求解析 HTTP(S) 目标的有限重定向，再返回最终地址的 307，不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
+- URL 型 `.strm` 在 `Path` 保留原始播放地址，`DirectStreamUrl` 指向受保护的 Lux 视频端点；端点使用入站播放器 User-Agent 和单区间请求解析 HTTP(S) 目标的有限重定向，再返回最终地址的 307，不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 的第三方 Emby DTO 仍生成标准 `/Videos/{ItemId}/stream[.Container]?MediaSourceId=...` 入口，Lux Web 的 Direct Play 计划同时提供该代理入口和签名 Lux 入口，播放器优先让 Redia 等外部 Emby 代理按 `Path` 接管并在失败时回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
 - 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -1274,7 +1274,7 @@ locked local value
 
 - 读取文件的首个非空行并 trim BOM 与首尾空白，保存为原始播放目标。
 - 目标只做词法分类：HTTP(S) URL、路径、未知/其他目标；不在扫描或 PlaybackInfo 请求中访问目标。
-- URL 型目标由 `PlaybackInfo` 返回 Lux 的受保护播放入口；播放入口使用入站播放器 User-Agent 请求原始目标并有限跟随重定向后返回 307，路径型和其他目标不得被标记为已解析的 HTTP URL，需由路径转发或解析器策略决定播放方式。
+- URL 型目标由 `PlaybackInfo` 返回 Lux 的受保护播放入口；播放入口使用入站播放器 User-Agent 请求原始目标并有限跟随重定向后返回 307。路径型目标保留原始 `Path`，由标准 Emby `/Videos/...` 入口交给外部代理执行路径映射；路径型和其他目标不得被标记为已解析的 HTTP URL，需由路径转发或解析器策略决定播放方式。
 - 下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，不能把路径型目标直接当作远程 URL 请求。
 
 ### 14.3 PlaybackInfo
@@ -1308,10 +1308,10 @@ locked local value
 ### 14.6 Web 播放
 
 - Web 播放通过独立的 `/api/v1/playback/sessions` 会话接口创建一次播放计划；Web API 与 Emby 播放接口、DTO 和领域类型分离。
-- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；播放地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie。
+- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；普通 Direct Play 和 HLS 地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie；路径型 `.strm` 的 `DIRECT` 计划额外返回标准 `/Videos/...` `proxyUrl`，Web 播放器优先使用它并在代理鉴权/映射失败时回退到签名 `url`，该代理地址依赖 Emby token 或代理注入的 API Key。
 - 档位 0 使用原生 Range 直放或现有客户端 fallback；档位 1～4 使用服务端 fMP4/CMAF HLS。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用 Web HLS 播放器。
 - 创建会话时固定媒体源、音频/字幕选择、起播位置和服务端计划；seek 必要时切换会话生成代次，不把客户端任意路径或外部 URL 交给服务端执行。
-- `.strm` 只能返回档位 0；直连失败或浏览器不支持时直接展示错误，不创建 ffmpeg 进程。
+- `.strm` 只能返回档位 0；URL 型直连、路径型外部代理接管或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
 - 不实现 DRM、字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。
@@ -4610,6 +4610,8 @@ Redia）根据 `MediaSources[].Path` 执行自己的路径映射并返回云盘�
   媒体源仍返回 404。
 - 路径型 `.strm` 的 `MediaSources[].Path` 保留原始路径；其 `Protocol=File`、`IsRemote=false` 仍表示 Lux 自身按本地文件
   语义处理，外部代理是否接管由外部代理决定，不通过伪造远程标志触发。
+- Lux Web 对路径型 `.strm` 的 Direct Play 计划额外提供标准 `/Videos/{ItemId}/stream[.Container]?MediaSourceId=...` `proxyUrl`，允许外部
+  Emby 代理接管；播放器优先使用该地址并保留签名 Lux `url` 作为回退，Lux Web 会话和播放进度仍由 Lux 的 Web 会话接口记录。
 - Emby 查询参数和请求头中的 API token 继续兼容；播放 URL 可由客户端编码为路径中的 `%3F` 形式时，视频入口仍解析其中的
   `MediaSourceId` 和 token。
 

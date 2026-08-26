@@ -262,7 +262,7 @@ export type WebPlaybackCapabilities = {
 };
 
 export type WebPlaybackPlan =
-  | { type: "DIRECT"; url: string }
+  | { type: "DIRECT"; url: string; proxyUrl?: string | null }
   | { type: "SERVER_HLS"; manifestUrl: string; tier: number }
   | { type: "UNSUPPORTED"; reason: string };
 

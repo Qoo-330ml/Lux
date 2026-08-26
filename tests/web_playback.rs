@@ -208,6 +208,46 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
             .await?;
     assert_eq!(strm_session_count, 0);
 
+    tokio::fs::write(
+        root.join("Proxy Path Movie 2027.strm"),
+        "/CloudNAS/115-122/media-AV/日本/episode.mp4\n",
+    )
+    .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let (proxy_item_id, proxy_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         WHERE mi.title = 'Proxy Path Movie' AND ms.source_kind = 'STRM_URL'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let proxy_create = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": proxy_item_id,
+            "sourceId": proxy_source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(proxy_create.status(), reqwest::StatusCode::OK);
+    let proxy_body = proxy_create.json::<Value>().await?;
+    assert_eq!(
+        proxy_body["plan"]["proxyUrl"],
+        format!("/Videos/{proxy_item_id}/stream?MediaSourceId={proxy_source_id}")
+    );
+
     let stopped = client
         .delete(format!("{base_url}/api/v1/playback/sessions/{session_id}"))
         .header(COOKIE, &cookies)

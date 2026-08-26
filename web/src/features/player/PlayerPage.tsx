@@ -154,6 +154,7 @@ export function PlayerPage() {
 
   const [playing, setPlaying] = useState(false);
   const [playbackAttempt, setPlaybackAttempt] = useState(0);
+  const [directProxyFallbackRequested, setDirectProxyFallbackRequested] = useState(false);
   const [failedStreamUrl, setFailedStreamUrl] = useState<string | null>(null);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [fallbackLoading, setFallbackLoading] = useState(false);
@@ -200,8 +201,9 @@ export function PlayerPage() {
     staleTime: Number.POSITIVE_INFINITY,
   });
   const playbackPlan = webPlaybackSession.data?.plan;
+  const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
   const streamUrl = playbackPlan?.type === "DIRECT"
-    ? playbackPlan.url
+    ? (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
@@ -290,6 +292,16 @@ export function PlayerPage() {
 
   const requestServerFallback = useCallback((reason?: string) => {
     if (
+      playbackPlan?.type === "DIRECT"
+      && directProxyUrl
+      && !directProxyFallbackRequested
+    ) {
+      setDirectProxyFallbackRequested(true);
+      setFailedStreamUrl(null);
+      setPlaybackError("外部代理播放失败，正在尝试 Lux 直放…");
+      return;
+    }
+    if (
       playbackAttempt !== 0 ||
       playbackPlan?.type !== "DIRECT" ||
       fallbackRequestedRef.current
@@ -304,7 +316,7 @@ export function PlayerPage() {
     setPlaybackError("浏览器无法播放这个媒体源，正在准备兼容的服务端播放…");
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [playbackAttempt, playbackPlan?.type, streamUrl]);
+  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, streamUrl]);
 
   useEffect(() => {
     lastProgressReportRef.current = 0;
@@ -314,6 +326,7 @@ export function PlayerPage() {
     playbackSessionIdRef.current = null;
     playbackSequenceRef.current = 0;
     setPlaybackAttempt(0);
+    setDirectProxyFallbackRequested(false);
     setFailedStreamUrl(null);
     setPlaybackError(null);
     setFallbackLoading(false);
@@ -371,8 +384,10 @@ export function PlayerPage() {
   }, [restorePlaybackPosition]);
 
   useEffect(() => {
-    const initialEngine = engineRef.current;
+    const initialEngine = engineRef.current
+      ?? (videoRef.current ? new NativeVideoEngine(videoRef.current) : null);
     if (!initialEngine || !streamUrl) return;
+    engineRef.current = initialEngine;
     let activeEngine: PlaybackEngine = initialEngine;
     let performanceElement: HTMLVideoElement | null = null;
     let cancelled = false;

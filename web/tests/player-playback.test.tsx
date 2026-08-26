@@ -204,6 +204,64 @@ describe("PlayerPage playback synchronization", () => {
     );
   });
 
+  it("uses the Emby proxy URL for path STRM and falls back to signed Lux direct play", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-proxy",
+      title: "路径代理测试",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "source-proxy",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "/CloudNAS/115-122/media-AV/episode.mp4",
+      }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+    vi.mocked(api.createWebPlaybackSession).mockResolvedValueOnce({
+      sessionId: "web-source-proxy",
+      playSessionId: "lux-web:web-source-proxy",
+      sourceId: "source-proxy",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-source-proxy/direct?expires=1900000000&signature=test",
+        proxyUrl: "/Videos/movie-proxy/stream?MediaSourceId=source-proxy",
+      },
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-proxy"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    expect(video?.getAttribute("src")).toBe("/Videos/movie-proxy/stream?MediaSourceId=source-proxy");
+    await act(async () => video?.dispatchEvent(new Event("error")));
+    expect(video?.getAttribute("src"))
+      .toBe("/api/v1/playback/sessions/web-source-proxy/direct?expires=1900000000&signature=test");
+  });
+
   it("releases the web playback session when media reaches the end", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-3",

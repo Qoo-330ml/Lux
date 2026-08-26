@@ -391,6 +391,10 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         source_id_detail_body["MediaSources"][0]["Path"],
         remote_target
     );
+    assert!(
+        source_id_detail_body.get("People").is_none(),
+        "media-source ID compatibility lookups should not build the heavy cast payload"
+    );
     let unknown_source_detail = no_redirect_client
         .get(format!("http://{address}/emby/Items/unknown-source"))
         .query(&[("api_key", token.as_str())])

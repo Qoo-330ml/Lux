@@ -4127,24 +4127,40 @@ async fn emby_item_response(
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let catalog_item = match catalog.find_item(principal, item_id).await {
-        Ok(Some(item)) => Some(item),
-        Ok(None) => match catalog
-            .find_item_by_media_source_id(principal, item_id)
-            .await
-        {
-            Ok(item) => item,
+    let (catalog_item, resolved_from_media_source_id) =
+        match catalog.find_item(principal, item_id).await {
+            Ok(Some(item)) => (Some(item), false),
+            Ok(None) => match catalog
+                .find_item_by_media_source_id(principal, item_id)
+                .await
+            {
+                Ok(item) => (item, true),
+                Err(CatalogError::Storage(_)) => {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+                Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, true),
+            },
             Err(CatalogError::Storage(_)) => {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => None,
-        },
-        Err(CatalogError::Storage(_)) => {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => None,
-    };
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => (None, false),
+        };
     match catalog_item {
+        Some(item) if resolved_from_media_source_id => {
+            let item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
+                &item,
+                &state.server_id,
+                None,
+                EmbyItemJsonOptions {
+                    nfo: None,
+                    can_download,
+                    fields,
+                    primary_image_aspect_ratio: None,
+                    include_top_level_media_streams: true,
+                },
+            );
+            Json(item_json).into_response()
+        }
         Some(mut item) => {
             let Some(database) = state.database.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -5321,10 +5337,21 @@ async fn lux_create_web_playback_session(
         }
     }
     let plan = match &created.plan {
-        WebPlaybackPlan::Direct => json!({
-            "type": "DIRECT",
-            "url": web_playback_resource_url(service, &created.id, "direct", created.expires_at),
-        }),
+        WebPlaybackPlan::Direct => {
+            let proxy_url = if source.source_kind == "STRM_URL"
+                && source.external_url.as_deref().is_some_and(|target| {
+                    matches!(classify_strm_target(target).kind, StrmTargetKind::Path)
+                }) {
+                Some(emby_media_source_stream_url(&request.item_id, source))
+            } else {
+                None
+            };
+            json!({
+                "type": "DIRECT",
+                "url": web_playback_resource_url(service, &created.id, "direct", created.expires_at),
+                "proxyUrl": proxy_url,
+            })
+        }
         WebPlaybackPlan::ServerHls { tier } => json!({
             "type": "SERVER_HLS",
             "manifestUrl": web_playback_hls_url(
@@ -7056,23 +7083,12 @@ fn emby_media_source_json_with_resolver_and_chapters(
             strm_target_kind,
             Some(StrmTargetKind::Smb | StrmTargetKind::Ftp)
         );
-    let stream_suffix = source
-        .container
-        .as_deref()
-        .filter(|container| {
-            !(source.source_kind == "STRM_URL" && container.eq_ignore_ascii_case("strm"))
-        })
-        .map(|container| format!(".{container}"))
-        .unwrap_or_default();
     let direct_stream_url = if source.source_kind == "LOCAL_FILE"
         || is_local_strm_target
         || is_remote
         || is_resolver_target
     {
-        Some(format!(
-            "/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={}",
-            source.id
-        ))
+        Some(emby_media_source_stream_url(item_id, source))
     } else {
         None
     };
@@ -7140,6 +7156,24 @@ fn emby_media_source_json_with_resolver_and_chapters(
         );
     }
     value
+}
+
+fn emby_media_source_stream_url(
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+) -> String {
+    let stream_suffix = source
+        .container
+        .as_deref()
+        .filter(|container| {
+            !(source.source_kind == "STRM_URL" && container.eq_ignore_ascii_case("strm"))
+        })
+        .map(|container| format!(".{container}"))
+        .unwrap_or_default();
+    format!(
+        "/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={}",
+        source.id
+    )
 }
 
 fn emby_chapter_json(chapter: &crate::application::catalog::CatalogChapter) -> Value {

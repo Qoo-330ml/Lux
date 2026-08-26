@@ -932,6 +932,9 @@ impl CatalogService {
         principal: AccessPrincipal,
         media_source_id: &str,
     ) -> Result<Option<CatalogItem>, CatalogError> {
+        // Emby proxy lookups only need the source-bearing catalog rows. Avoid
+        // loading detail metadata here; the normal item lookup retains the
+        // richer response for clients addressing the item ID directly.
         let Some(item_id) = self
             .database
             .find_item_id_by_media_source_id(media_source_id)
@@ -939,7 +942,11 @@ impl CatalogService {
         else {
             return Ok(None);
         };
-        self.find_item(principal, &item_id).await
+        if !self.access.can_view_item(principal, &item_id).await? {
+            return Ok(None);
+        }
+        let rows = self.database.find_catalog_rows(&item_id).await?;
+        Ok(assemble_items(rows).into_iter().next())
     }
 
     pub async fn populate_chapters(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {
