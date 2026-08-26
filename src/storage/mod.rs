@@ -8187,7 +8187,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
-                    finished_at,
+                    created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
              FROM scan_jobs
@@ -8212,7 +8212,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
-                    finished_at,
+                    created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
              FROM scan_jobs
