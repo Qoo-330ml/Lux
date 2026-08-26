@@ -64,7 +64,7 @@ Lux 的核心价值不是功能数量，而是：
 - 文件变动时只增量处理受影响的目录和条目。
 - 扫描、刮削、媒体探测不得阻塞浏览、搜索、登录或播放。
 - 优先使用本地 NFO 和图片，保护用户已经整理的元数据。
-- 以直接播放为主，不承担首版转码系统的复杂度。
+- 以直接播放为主；本地媒体允许受控的服务端 Remux/HLS 和转码档位，`.strm` 永远不进入服务端处理。
 - 使用独立、清晰的 Emby 兼容层，不让兼容 DTO 污染 Lux 内部领域模型。
 
 ### 2.1 主要用户
@@ -121,10 +121,12 @@ Lux 的核心价值不是功能数量，而是：
 
 ### 3.3 播放
 
-- 首版仅支持直接播放，不支持音视频转码、容器转换或字幕转换。
+- 本地媒体的 Web 播放使用 0～4 档服务端计划：档位 0 为 Direct Play，档位 1 为视频/音频 copy 的 Remux，档位 2 为视频 copy、音频转码，档位 3 为硬件转码，档位 4 为软件转码。决策始终优先选择较低档位。
+- 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
+- `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。
 - URL 型 `.strm` 在 `Path` 保留原始播放地址，`DirectStreamUrl` 指向受保护的 Lux 视频端点；端点使用入站播放器 User-Agent 和单区间请求解析 HTTP(S) 目标的有限重定向，再返回最终地址的 307，不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 生成受保护的 Lux 视频端点并提供本地文件语义；SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
-- 浏览器无法原生播放的编码直接显示不支持，不提供转码兜底。
+- 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
 - 是否能够渲染某种字幕由客户端能力决定。
@@ -354,9 +356,10 @@ Lux 的核心价值不是功能数量，而是：
 
 ---
 
-## 4. 明确不在首版范围
+## 4. 明确不在当前范围
 
-- 音频转码、视频转码、HLS 转码、容器转换。
+- `.strm` 的服务端 Remux、音频转码、视频转码、HLS 或媒体字节代理。
+- 字幕格式转换、字幕烧录、DRM 和多码率自适应 HLS。
 - 在线字幕搜索、字幕下载、OCR 或字幕格式转换。
 - 直播电视、DVR、DLNA、Chromecast 控制。
 - 未经插件包格式、路径、manifest、文件哈希、权限声明和独立进程监督的任意外部代码执行。
@@ -369,7 +372,7 @@ Lux 的核心价值不是功能数量，而是：
 - 内置备份恢复。
 - 复杂推荐算法。
 - 内容分级与标签 ACL。
-- 在线转码兜底的 Web 播放。
+- 无管理员资源策略、并发上限、临时目录配额和低磁盘保护的无限制在线转码。
 
 ---
 
@@ -489,7 +492,7 @@ Lux 的核心价值不是功能数量，而是：
 ### 6.4 Docker
 
 - 生产镜像为多阶段构建。
-- 运行时包含 luxd、Web 静态资源、ffprobe 和必要 CA 证书。
+- 运行时包含 luxd、Web 静态资源、Jellyfin `jellyfin-ffmpeg7` v7.1.4-3 和必要 CA 证书；不安装普通 Debian `ffmpeg`。
 - 非 root 用户运行。
 - 支持 PUID/PGID 或文档化的 UID/GID 映射，使容器能读写媒体目录。
 - /config 为可写持久化卷。
@@ -1304,12 +1307,14 @@ locked local value
 
 ### 14.6 Web 播放
 
-- 使用原生 video 元素。
-- 先根据容器/编码做能力提示，但最终以浏览器实际播放事件为准。
-- 不支持时展示清晰错误和推荐使用第三方客户端。
-- 记录开始、定时进度、暂停和停止。
-- 页面关闭使用可靠的轻量上报机制。
-- 当前正式播放器仍不实现 DRM、服务端转码、Remux 或自定义解码器。
+- Web 播放通过独立的 `/api/v1/playback/sessions` 会话接口创建一次播放计划；Web API 与 Emby 播放接口、DTO 和领域类型分离。
+- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；播放地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie。
+- 档位 0 使用原生 Range 直放或现有客户端 fallback；档位 1～4 使用服务端 fMP4/CMAF HLS。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用 Web HLS 播放器。
+- 创建会话时固定媒体源、音频/字幕选择、起播位置和服务端计划；seek 必要时切换会话生成代次，不把客户端任意路径或外部 URL 交给服务端执行。
+- `.strm` 只能返回档位 0；直连失败或浏览器不支持时直接展示错误，不创建 ffmpeg 进程。
+- 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
+- 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
+- 不实现 DRM、字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。
 - LUX-184 允许提供独立的浏览器媒体能力探针，用于实测原生 video、MediaCapabilities 和 WebCodecs；探针不接入
   正式播放路径，不读取或保存用户媒体数据。
 - LUX-185 可为 MP4/fMP4 的 HEVC 媒体增加浏览器端 WASM 解码、H.264 客户端编码和 MSE 播放 fallback；重型工作
@@ -1830,11 +1835,14 @@ services:
 - 决定：Emby 路由/DTO 与 Lux API/领域模型分离。
 - 原因：兼容怪癖不能反向污染核心设计。
 
-### ADR-004：首版只直放
+### ADR-004：直放优先的 Web 播放
 
-- 状态：已由需求确认。
-- 决定：不实现转码或 remux。
-- 后果：部分浏览器文件无法播放，明确提示。
+- 状态：已接受；服务端播放细节由 ADR-026 补充。
+- 决定：Web 播放使用 0～4 档，始终先尝试档位 0 原始 Range 直放；本地媒体必要时按顺序使用档位 1 Remux、
+  档位 2 音频转码、档位 3 硬件转码或档位 4 软件转码。服务端 HLS 只使用会话级临时资源，不生成永久副本。
+- `.strm` 永远只允许档位 0；直连失败时返回明确错误，不进入服务端 Remux、转码、HLS 或媒体字节代理。
+- 运行时统一使用 Jellyfin 官方 `jellyfin-ffmpeg` FFmpeg 7 正式版，普通 Debian `ffmpeg` 不安装。
+- 后果：本地媒体覆盖更多浏览器格式，但服务端需要会话签名、进程组、并发、磁盘配额和生命周期回收治理。
 
 ### ADR-005：本地元数据为默认来源
 
@@ -1937,6 +1945,7 @@ services:
 | LUX-194 | src/application/catalog.rs、src/application/people.rs、src/storage/mod.rs、src/api/mod.rs、web/src/features/search/、web/src/features/detail/、web/src/lib/api/、tests/、docs/ |
 | LUX-195 | src/application/scraper.rs、src/application/tmdb_plugin.rs、src/application/plugin_protocol.rs、src/application/plugins.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/images.rs、src/application/collections.rs、tests/、docs/ |
 | LUX-196 | migrations/、migrations-postgres/、src/library.rs、src/storage/mod.rs、src/application/libraries.rs、src/application/scraper.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/metadata.rs、src/api/mod.rs、web/src/features/admin/、tests/、web/tests/、docs/ |
+| LUX-198 | runtime/Dockerfile、Dockerfile、docker-bake.hcl、src/application/playback/、src/api/lux/、src/storage/、migrations/、migrations-postgres/、web/src/features/player/、web/src/lib/api/、tests/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4512,6 +4521,49 @@ ffprobe 使用独立的有界资源配额：默认 256 路，单库有效上限 
 - `uname -m`
 
 依赖：LUX-040、LUX-043、LUX-044、LUX-045、LUX-145、LUX-154。
+
+#### LUX-198：Web 播放会话、服务端 HLS 与 Jellyfin FFmpeg 7
+
+范围：在保留 Direct Play 优先级和现有客户端 HEVC/MKV fallback 的基础上，为本地媒体增加 Web 专用播放会话、
+0～4 档服务端播放计划和会话级 fMP4/CMAF HLS。运行时固定使用 Jellyfin 官方 `jellyfin-ffmpeg` 项目
+`v7.1.4-3` 正式版的 Debian Trixie ARM64/AMD64 包；普通 Debian `ffmpeg` 不再安装。
+
+播放决策必须满足：
+
+- 档位 0 为原始 Range 直放或客户端 fallback；档位 1 为视频/音频 copy 的 Remux；档位 2 为视频 copy、音频转码；
+  档位 3 为硬件转码；档位 4 为软件转码。
+- 本地媒体总是按 0 → 1 → 2 → 3 → 4 的顺序优先选择较低成本计划；浏览器能力、选择的音频/字幕轨和管理员资源策略参与决策。
+- `.strm` 只允许档位 0；直连、有限重定向或本地安全读取失败时返回明确错误，不创建 ffmpeg 进程。
+- 服务端 HLS 的清单、初始化片段和媒体片段只存于受配额限制的播放会话目录；会话结束、超时、服务重启清理孤儿目录。
+- HLS 进程使用独立进程组，持续读取 stderr，按 Remux/硬件/软件类别分别限制并发，并在低磁盘水位拒绝新会话。
+
+Web API：
+
+- `POST /api/v1/playback/sessions` 创建播放计划并返回 `sessionId`、`tier` 和 `DIRECT`/`SERVER_HLS`/`UNSUPPORTED` 判别联合。
+- `POST /api/v1/playback/sessions/{sessionId}/events` 接收带 `eventId`、`sequence`、状态和位置的幂等播放事件。
+- `POST /api/v1/playback/sessions/{sessionId}/heartbeat` 延长会话生命周期；`DELETE` 停止会话并回收资源。
+- Direct、HLS manifest 和 HLS segment 使用短期签名 URL；签名不能授权其他媒体源、路径或用户。
+- 现有 Lux 播放进度接口继续兼容；Emby 路由/DTO 不复用 Web 播放 DTO。
+
+字幕首阶段继续使用现有外挂字幕端点；不做字幕格式转换、烧录或 DRM。多码率自适应 HLS 不属于本任务。
+
+验收：
+
+- [x] 空 SQLite 和 PostgreSQL 均能运行新增迁移；播放会话、幂等事件和临时资源状态约束有效。
+- [x] 本地 MP4/H.264/AAC 在档位 0 使用 Range 直放；MKV 等容器在需要时使用档位 1 HLS，视频和音频质量不改变。
+- [x] 不兼容音频可选择档位 2；无可用硬件且策略允许时才选择档位 4；硬件能力不可用时不会伪造档位 3。
+- [x] `.strm` 直放成功时只产生档位 0；直放失败时没有 ffmpeg 子进程、临时 HLS 目录或服务器代理流量。
+- [x] HLS 播放可以取得 manifest、init segment 和媒体 segment，首次播放不需要等待整部媒体处理完成；seek、暂停、停止和断线回收正常。
+- [x] 事件重复、乱序、页面关闭和心跳超时不会造成进度倒退或会话泄漏。
+- [x] 无权限 source、过期签名、路径穿越、错误用户 session 和跨会话 segment 请求均被拒绝。
+- [x] Web 播放器支持原生 Direct、Safari 原生 HLS、MSE/HLS.js 和现有客户端 fallback，并显示可诊断的失败原因。
+- [x] `ffmpeg`、`ffprobe` 和所有现有媒体工具实际来自 `/usr/lib/jellyfin-ffmpeg`，版本为 `7.1.4-Jellyfin`。
+
+验证：Rust 单元/集成测试、SQLite/PostgreSQL migration 测试、容器 ARM64/AMD64 smoke test、Web 单测和构建、
+真实浏览器 manifest/segment/seek/停止测试；本机 `uname -m=arm64`，不以本机 ARM 结果宣称 NAS/x86 性能。验证记录见
+`docs/LUX-198-PLAN.md` 和 `docs/COMPATIBILITY.md`。
+
+依赖：LUX-184、LUX-185、LUX-189。
 
 ## 26. 风险与缓解
 

@@ -38,6 +38,11 @@ use crate::{
     application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
     application::home::{HomeError, HomeService},
+    application::playback::decision::{PlaybackCapabilities, PlaybackSourceKind},
+    application::playback::session::{
+        CreateWebPlaybackSession, WebPlaybackEvent, WebPlaybackPlan, WebPlaybackSessionError,
+        WebPlaybackSessionService,
+    },
     application::playback::{ByteRange, RangeError, parse_single_range},
     application::probe::{FfprobeRunner, MediaProbeService},
     application::setup::{SetupError, SetupService},
@@ -112,7 +117,7 @@ use crate::{
     security::LoginRateLimiter,
     storage::{
         DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, PersonListOptions,
-        PersonSort, StorageError, StoredPlaybackSession,
+        PersonSort, StorageError, StoredPlaybackSession, WebPlaybackEventClaim,
     },
 };
 use tokio::{
@@ -166,6 +171,7 @@ pub struct AppState {
     ip_location: Option<IpLocationService>,
     admin_events: AdminEventHub,
     user_events: UserEventHub,
+    web_playback: Option<WebPlaybackSessionService>,
     resources: ResourceMetrics,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
@@ -203,6 +209,10 @@ impl AppState {
         ));
         let admin_events = AdminEventHub::new();
         let user_events = UserEventHub::new();
+        let web_playback = Some(WebPlaybackSessionService::new(
+            database.clone(),
+            config_dir.clone(),
+        ));
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
         let catalog = CatalogService::new(database.clone(), access.clone());
@@ -378,6 +388,7 @@ impl AppState {
             ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
             user_events,
+            web_playback,
             resources,
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
@@ -1102,6 +1113,30 @@ pub fn app_with_state(state: AppState) -> Router {
         )
         .route("/api/v1/items/{item_id}/playback", get(lux_get_playback))
         .route("/api/v1/items/{item_id}/progress", post(lux_post_progress))
+        .route(
+            "/api/v1/playback/sessions",
+            post(lux_create_web_playback_session),
+        )
+        .route(
+            "/api/v1/playback/sessions/{session_id}/events",
+            post(lux_web_playback_event),
+        )
+        .route(
+            "/api/v1/playback/sessions/{session_id}/heartbeat",
+            post(lux_web_playback_heartbeat),
+        )
+        .route(
+            "/api/v1/playback/sessions/{session_id}/direct",
+            get(lux_web_playback_direct).head(lux_web_playback_direct),
+        )
+        .route(
+            "/api/v1/playback/sessions/{session_id}/hls/{*asset}",
+            get(lux_web_playback_hls).head(lux_web_playback_hls),
+        )
+        .route(
+            "/api/v1/playback/sessions/{session_id}",
+            delete(lux_delete_web_playback_session),
+        )
         .route("/api/v1/items/{item_id}/favorite", put(lux_set_favorite))
         .route("/api/v1/items/{item_id}/played", put(lux_set_played))
         .route("/api/v1/playback-history", get(lux_list_playback_history))
@@ -5076,7 +5111,515 @@ async fn lux_list_playback_history(
     }
 }
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+struct WebPlaybackCapabilitiesRequest {
+    #[serde(default)]
+    direct_play: bool,
+    #[serde(default)]
+    hls: bool,
+    #[serde(default)]
+    video_copy_to_fmp4: bool,
+    #[serde(default)]
+    audio_copy_to_fmp4: bool,
+    #[serde(default)]
+    hardware_transcode: bool,
+    #[serde(default)]
+    software_transcode: bool,
+}
+
+impl From<WebPlaybackCapabilitiesRequest> for PlaybackCapabilities {
+    fn from(value: WebPlaybackCapabilitiesRequest) -> Self {
+        Self {
+            direct_play: value.direct_play,
+            hls: value.hls,
+            video_copy_to_fmp4: value.video_copy_to_fmp4,
+            audio_copy_to_fmp4: value.audio_copy_to_fmp4,
+            hardware_transcode: value.hardware_transcode,
+            software_transcode: value.software_transcode,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebPlaybackSessionRequest {
+    item_id: String,
+    source_id: String,
+    #[serde(default)]
+    capabilities: WebPlaybackCapabilitiesRequest,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebPlaybackResourceQuery {
+    expires: i64,
+    signature: String,
+}
+
+fn web_playback_error(headers: &HeaderMap, error: WebPlaybackSessionError) -> Response {
+    let (status, code, message) = match error {
+        WebPlaybackSessionError::Invalid(message) => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            message,
+        ),
+        WebPlaybackSessionError::NotFound => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "播放会话不存在".to_owned(),
+        ),
+        WebPlaybackSessionError::Expired => (
+            StatusCode::GONE,
+            lux::ApiErrorCode::NotFound,
+            "播放会话已过期".to_owned(),
+        ),
+        WebPlaybackSessionError::NotActive => (
+            StatusCode::GONE,
+            lux::ApiErrorCode::NotFound,
+            "播放会话已结束".to_owned(),
+        ),
+        WebPlaybackSessionError::Hls(_) => (
+            StatusCode::BAD_GATEWAY,
+            lux::ApiErrorCode::Internal,
+            "服务端 HLS 暂时不可用".to_owned(),
+        ),
+        WebPlaybackSessionError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "播放会话暂时不可用".to_owned(),
+        ),
+    };
+    api_error(headers, status, code, &message).into_response()
+}
+
+fn web_playback_resource_url(
+    service: &WebPlaybackSessionService,
+    session_id: &str,
+    resource: &str,
+    expires_at: i64,
+) -> Option<String> {
+    let signature = service.sign_resource(session_id, resource, expires_at)?;
+    Some(format!(
+        "/api/v1/playback/sessions/{session_id}/{resource}?expires={}&signature={}",
+        signature.expires_at, signature.signature
+    ))
+}
+
+fn web_playback_hls_url(
+    service: &WebPlaybackSessionService,
+    session_id: &str,
+    asset: &str,
+    expires_at: i64,
+) -> Option<String> {
+    let resource = format!("hls:{asset}");
+    let signature = service.sign_resource(session_id, &resource, expires_at)?;
+    Some(format!(
+        "/api/v1/playback/sessions/{session_id}/hls/{asset}?expires={}&signature={}",
+        signature.expires_at, signature.signature
+    ))
+}
+
+async fn lux_create_web_playback_session(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<WebPlaybackSessionRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let item = match catalog.find_item(principal, &request.item_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(source) = item
+        .media_sources
+        .iter()
+        .find(|source| source.id == request.source_id)
+    else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let source_kind = match source.source_kind.as_str() {
+        "LOCAL_FILE" => PlaybackSourceKind::LocalFile,
+        "STRM_URL" => PlaybackSourceKind::Strm,
+        _ => return StatusCode::NOT_IMPLEMENTED.into_response(),
+    };
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let created = match service
+        .create(CreateWebPlaybackSession {
+            user_id: &user.id.to_string(),
+            is_admin: user.is_admin,
+            item_id: &request.item_id,
+            media_source_id: &request.source_id,
+            source_kind,
+            capabilities: request.capabilities.into(),
+        })
+        .await
+    {
+        Ok(created) => created,
+        Err(error) => return web_playback_error(&headers, error),
+    };
+    if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
+        let Some(database) = state.database.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let source_record = match database
+            .find_playback_source(&request.item_id, Some(&request.source_id))
+            .await
+        {
+            Ok(Some(source_record)) => source_record,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        if source_record.source_kind != "LOCAL_FILE" {
+            let _ = service.stop(&created.id, &user.id.to_string()).await;
+            return StatusCode::NOT_IMPLEMENTED.into_response();
+        }
+        let input = match canonical_local_media_path(
+            &source_record.root_path,
+            &source_record.relative_path,
+        )
+        .await
+        {
+            Ok(path) => path,
+            Err(LocalPathError::Missing) => {
+                let _ = service.stop(&created.id, &user.id.to_string()).await;
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            Err(LocalPathError::Forbidden) => {
+                let _ = service.stop(&created.id, &user.id.to_string()).await;
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        };
+        if let Err(error) = service.start_hls(&created.id, *tier, &input).await {
+            let _ = service.stop(&created.id, &user.id.to_string()).await;
+            return web_playback_error(&headers, error);
+        }
+    }
+    let plan = match &created.plan {
+        WebPlaybackPlan::Direct => json!({
+            "type": "DIRECT",
+            "url": web_playback_resource_url(service, &created.id, "direct", created.expires_at),
+        }),
+        WebPlaybackPlan::ServerHls { tier } => json!({
+            "type": "SERVER_HLS",
+            "manifestUrl": web_playback_hls_url(
+                service,
+                &created.id,
+                "index.m3u8",
+                created.expires_at,
+            ),
+            "tier": tier.number(),
+        }),
+        WebPlaybackPlan::Unsupported { reason } => json!({
+            "type": "UNSUPPORTED",
+            "reason": reason.to_string(),
+        }),
+    };
+    Json(json!({
+        "sessionId": (!created.id.is_empty()).then_some(created.id),
+        "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),
+        "tier": created.plan.tier().number(),
+        "expiresAt": created.expires_at,
+        "plan": plan,
+        "sourceId": created.media_source_id,
+    }))
+    .into_response()
+}
+
+async fn lux_web_playback_direct(
+    headers: HeaderMap,
+    method: Method,
+    Path(session_id): Path<String>,
+    Query(query): Query<WebPlaybackResourceQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let session = match service
+        .authorize_resource(&session_id, "direct", query.expires, &query.signature)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return web_playback_error(&headers, error),
+    };
+    if session.plan != "DIRECT" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Ok(user_id) = session.user_id.parse::<crate::domain::ids::UserId>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    serve_media_file(
+        &state,
+        AccessPrincipal::new(user_id, session.is_admin),
+        &headers,
+        &method,
+        &session.item_id,
+        session.media_source_id.as_deref(),
+        None,
+    )
+    .await
+}
+
+async fn lux_web_playback_hls(
+    headers: HeaderMap,
+    method: Method,
+    Path((session_id, asset)): Path<(String, String)>,
+    Query(query): Query<WebPlaybackResourceQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let resource = format!("hls:{asset}");
+    let session = match service
+        .authorize_resource(&session_id, &resource, query.expires, &query.signature)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return web_playback_error(&headers, error),
+    };
+    if session.plan != "SERVER_HLS" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if matches!(asset.as_str(), "index.m3u8") {
+        let path = match service.wait_for_hls_manifest(&session_id).await {
+            Ok(path) => path,
+            Err(error) => return web_playback_error(&headers, error),
+        };
+        let Ok(bytes) = fs::read(path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let Ok(manifest) = String::from_utf8(bytes) else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
+            web_playback_hls_url(service, &session_id, asset, session.expires_at)
+        }) else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Cache-Control", "private, no-store")
+            .header("Content-Type", "application/vnd.apple.mpegurl")
+            .header("Content-Length", manifest.len())
+            .body(if method == Method::HEAD {
+                Body::empty()
+            } else {
+                Body::from(manifest)
+            })
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let path = match service.hls_asset_path(&session_id, &asset).await {
+        Ok(path) => path,
+        Err(error) => return web_playback_error(&headers, error),
+    };
+    match service.hls_within_quota(&session_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = service.stop(&session_id, &session.user_id).await;
+            return StatusCode::INSUFFICIENT_STORAGE.into_response();
+        }
+        Err(error) => return web_playback_error(&headers, error),
+    }
+    let metadata = match fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let content_type = if asset.ends_with(".m4s") || asset.ends_with(".mp4") {
+        "video/mp4"
+    } else {
+        "application/octet-stream"
+    };
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let Ok(file) = fs::File::open(path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        Body::from_stream(tokio_util::io::ReaderStream::new(file))
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Cache-Control", "private, no-store")
+        .header("Content-Type", content_type)
+        .header("Content-Length", metadata.len())
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn rewrite_hls_manifest(
+    manifest: &str,
+    mut url_for_asset: impl FnMut(&str) -> Option<String>,
+) -> Option<String> {
+    let mut output = String::with_capacity(manifest.len() + 256);
+    for line in manifest.lines() {
+        let mut rewritten = line.to_owned();
+        if let Some(uri_start) = line.find("URI=\"") {
+            let value_start = uri_start + 5;
+            let value_end = line[value_start..].find('\"')? + value_start;
+            let asset = &line[value_start..value_end];
+            let url = url_for_asset(asset)?;
+            rewritten.replace_range(value_start..value_end, &url);
+        } else if !line.trim_start().starts_with('#') && !line.trim().is_empty() {
+            let asset = line.trim();
+            let url = url_for_asset(asset)?;
+            rewritten = line.replace(asset, &url);
+        }
+        output.push_str(&rewritten);
+        output.push('\n');
+    }
+    Some(output)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebPlaybackEventRequest {
+    event_id: String,
+    sequence: i64,
+    state: LuxPlaybackState,
+    position_ticks: i64,
+    duration_ticks: Option<i64>,
+}
+
+async fn lux_web_playback_event(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<WebPlaybackEventRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (claim, session) = match service
+        .claim_event(WebPlaybackEvent {
+            session_id: &session_id,
+            user_id: &user.id.to_string(),
+            event_id: &request.event_id,
+            sequence: request.sequence,
+            state: request.state.as_str(),
+            position_ticks: request.position_ticks,
+            duration_ticks: request.duration_ticks,
+        })
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => return web_playback_error(&headers, error),
+    };
+    let Some(session) = session else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if claim == WebPlaybackEventClaim::Accepted {
+        let Some(database) = state.database.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let played_percent = match database.user_played_percent(&user.id.to_string()).await {
+            Ok(value) => value,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        if database
+            .record_playback_event(NewPlaybackEvent {
+                user_id: &session.user_id,
+                item_id: &session.item_id,
+                media_source_id: session.media_source_id.as_deref(),
+                play_session_id: &session.play_session_id,
+                device_id: "lux-web",
+                client: Some("Lux"),
+                device_name: Some("Web"),
+                client_version: None,
+                device_type: Some("Web"),
+                remote_ip: request_client_ip(&headers, &state.remote_access).as_deref(),
+                state: request.state.as_str(),
+                position_ticks: request.position_ticks,
+                duration_ticks: request.duration_ticks,
+                played_percent,
+                is_paused: matches!(request.state, LuxPlaybackState::Paused),
+            })
+            .await
+            .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if database
+            .sync_played_container_states(&session.user_id, &session.item_id)
+            .await
+            .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    Json(json!({
+        "accepted": claim == WebPlaybackEventClaim::Accepted,
+        "duplicate": claim == WebPlaybackEventClaim::Duplicate,
+        "stale": claim == WebPlaybackEventClaim::Stale,
+    }))
+    .into_response()
+}
+
+async fn lux_web_playback_heartbeat(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.heartbeat(&session_id, &user.id.to_string()).await {
+        Ok(expires_at) => {
+            Json(json!({ "sessionId": session_id, "expiresAt": expires_at })).into_response()
+        }
+        Err(error) => web_playback_error(&headers, error),
+    }
+}
+
+async fn lux_delete_web_playback_session(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.stop(&session_id, &user.id.to_string()).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) => web_playback_error(&headers, error),
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 enum LuxPlaybackState {
     #[default]
@@ -20533,5 +21076,21 @@ mod tests {
 
         let body = lux_catalog_source_json(&source);
         assert_eq!(body["streams"][0]["details"]["Width"], 1920);
+    }
+
+    #[test]
+    fn hls_manifest_rewrites_init_and_segment_urls() {
+        let manifest = "#EXTM3U\n#EXT-X-MAP:URI=\"init.mp4\"\n#EXTINF:4.0,\nsegment_000000.m4s\n";
+        let rewritten =
+            super::rewrite_hls_manifest(manifest, |asset| Some(format!("/signed/{asset}")))
+                .expect("manifest should rewrite");
+        assert!(rewritten.contains("URI=\"/signed/init.mp4\""));
+        assert!(rewritten.contains("/signed/segment_000000.m4s"));
+    }
+
+    #[test]
+    fn hls_manifest_rejects_unexpected_media_paths() {
+        let manifest = "#EXTM3U\n#EXTINF:4.0,\n../outside.m4s\n";
+        assert!(super::rewrite_hls_manifest(manifest, |_| None).is_none());
     }
 }

@@ -65,6 +65,19 @@ describe("PlayerPage client fallback status", () => {
       state: null,
       isPaused: false,
     });
+    vi.spyOn(api, "createWebPlaybackSession").mockResolvedValue({
+      sessionId: "web-fallback",
+      playSessionId: "lux-web:web-fallback",
+      sourceId: "source-fallback",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-fallback/direct?expires=1900000000&signature=test",
+      },
+    });
+    vi.spyOn(api, "webPlaybackEvent").mockResolvedValue({ accepted: true, duplicate: false, stale: false });
+    vi.spyOn(api, "stopWebPlaybackSession").mockResolvedValue(undefined);
     vi.spyOn(api, "progress").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);

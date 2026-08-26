@@ -5689,6 +5689,259 @@ impl Database {
         })
     }
 
+    pub(crate) async fn insert_web_playback_session(
+        &self,
+        session: NewWebPlaybackSession<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO web_playback_sessions (
+                id, user_id, item_id, media_source_id, play_session_id,
+                tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                last_sequence, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?, ?, ?, -1, ?, ?)",
+        )
+        .bind(session.id)
+        .bind(session.user_id)
+        .bind(session.item_id)
+        .bind(session.media_source_id)
+        .bind(session.play_session_id)
+        .bind(session.tier)
+        .bind(session.plan)
+        .bind(session.temp_dir)
+        .bind(database_flag(session.is_admin))
+        .bind(session.expires_at)
+        .bind(session.now)
+        .bind(session.now)
+        .bind(session.now)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_web_playback_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredWebPlaybackSession>, StorageError> {
+        self.query(
+            "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                    tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                    last_sequence, created_at, updated_at
+             FROM web_playback_sessions
+             WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_web_playback_session))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn take_expired_web_playback_sessions(
+        &self,
+        now: i64,
+    ) -> Result<Vec<StoredWebPlaybackSession>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                        last_sequence, created_at, updated_at
+                 FROM web_playback_sessions
+                 WHERE state = 'ACTIVE' AND expires_at < ?
+                 ORDER BY expires_at ASC, id ASC
+                 LIMIT 128",
+            )
+            .bind(now)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut expired = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session = stored_web_playback_session(row);
+            let updated = self
+                .query(
+                    "UPDATE web_playback_sessions
+                     SET state = 'STOPPED', updated_at = ?
+                     WHERE id = ? AND state = 'ACTIVE' AND expires_at < ?",
+                )
+                .bind(now)
+                .bind(&session.id)
+                .bind(now)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if updated.rows_affected() == 1 {
+                expired.push(session);
+            }
+        }
+        Ok(expired)
+    }
+
+    pub(crate) async fn set_web_playback_temp_dir(
+        &self,
+        session_id: &str,
+        temp_dir: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE web_playback_sessions
+             SET temp_dir = ?, updated_at = ?
+             WHERE id = ? AND state = 'ACTIVE'",
+        )
+        .bind(temp_dir)
+        .bind(now)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn touch_web_playback_session(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        expires_at: i64,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE web_playback_sessions
+             SET expires_at = ?, last_heartbeat_at = ?, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'ACTIVE' AND expires_at >= ?",
+        )
+        .bind(expires_at)
+        .bind(now)
+        .bind(now)
+        .bind(session_id)
+        .bind(user_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn stop_web_playback_session(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        state: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE web_playback_sessions
+             SET state = ?, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(state)
+        .bind(now)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn accept_web_playback_event(
+        &self,
+        event: NewWebPlaybackEvent<'_>,
+    ) -> Result<WebPlaybackEventClaim, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let inserted = self
+            .query(
+                "INSERT INTO web_playback_events (
+                    session_id, event_id, sequence, state,
+                    position_ticks, duration_ticks, created_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(event.session_id)
+            .bind(event.event_id)
+            .bind(event.sequence)
+            .bind(event.state)
+            .bind(event.position_ticks)
+            .bind(event.duration_ticks)
+            .bind(event.now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if inserted.rows_affected() == 0 {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(WebPlaybackEventClaim::Duplicate);
+        }
+        let updated = self
+            .query(
+                "UPDATE web_playback_sessions
+                 SET state = CASE WHEN ? = 'STOPPED' THEN 'STOPPED' ELSE state END,
+                     last_sequence = ?, updated_at = ?
+                 WHERE id = ? AND user_id = ? AND state = 'ACTIVE'
+                   AND expires_at >= ? AND last_sequence < ?",
+            )
+            .bind(event.state)
+            .bind(event.sequence)
+            .bind(event.now)
+            .bind(event.session_id)
+            .bind(event.user_id)
+            .bind(event.now)
+            .bind(event.sequence)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(if updated.rows_affected() == 1 {
+            WebPlaybackEventClaim::Accepted
+        } else {
+            WebPlaybackEventClaim::Stale
+        })
+    }
+
     pub(crate) async fn media_source_belongs_to_item(
         &self,
         source_id: &str,
@@ -17002,6 +17255,77 @@ pub(crate) struct NewPlaybackEvent<'a> {
     pub(crate) is_paused: bool,
 }
 
+pub(crate) struct NewWebPlaybackSession<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) user_id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) media_source_id: Option<&'a str>,
+    pub(crate) play_session_id: &'a str,
+    pub(crate) tier: i64,
+    pub(crate) plan: &'a str,
+    pub(crate) temp_dir: Option<&'a str>,
+    pub(crate) is_admin: bool,
+    pub(crate) expires_at: i64,
+    pub(crate) now: i64,
+}
+
+pub(crate) struct NewWebPlaybackEvent<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) user_id: &'a str,
+    pub(crate) event_id: &'a str,
+    pub(crate) sequence: i64,
+    pub(crate) state: &'a str,
+    pub(crate) position_ticks: i64,
+    pub(crate) duration_ticks: Option<i64>,
+    pub(crate) now: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WebPlaybackEventClaim {
+    Accepted,
+    Duplicate,
+    Stale,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredWebPlaybackSession {
+    pub(crate) id: String,
+    pub(crate) user_id: String,
+    pub(crate) item_id: String,
+    pub(crate) media_source_id: Option<String>,
+    pub(crate) play_session_id: String,
+    pub(crate) tier: i64,
+    pub(crate) plan: String,
+    pub(crate) state: String,
+    pub(crate) temp_dir: Option<String>,
+    pub(crate) is_admin: bool,
+    pub(crate) expires_at: i64,
+    pub(crate) last_heartbeat_at: i64,
+    pub(crate) last_sequence: i64,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+fn stored_web_playback_session(row: sqlx::any::AnyRow) -> StoredWebPlaybackSession {
+    StoredWebPlaybackSession {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        item_id: row.get("item_id"),
+        media_source_id: row.get("media_source_id"),
+        play_session_id: row.get("play_session_id"),
+        tier: row.get("tier"),
+        plan: row.get("plan"),
+        state: row.get("state"),
+        temp_dir: row.get("temp_dir"),
+        is_admin: row.get::<i64, _>("is_admin") != 0,
+        expires_at: row.get("expires_at"),
+        last_heartbeat_at: row.get("last_heartbeat_at"),
+        last_sequence: row.get("last_sequence"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredPlaybackSession {
     pub(crate) id: String,
@@ -18137,7 +18461,7 @@ impl std::error::Error for StorageError {
 mod tests {
     use super::*;
     use crate::{
-        application::{libraries::LibraryService, scanner::LibraryScanner},
+        application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
         config::{Config, PostgresConnection},
         library::LibraryKind,
     };
@@ -19824,5 +20148,70 @@ mod tests {
                 .await
                 .expect("confirmed candidate status");
         assert_eq!(candidate_status, "SELECTED");
+    }
+
+    #[tokio::test]
+    async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let setup = SetupService::new(database.clone()).expect("setup service");
+        setup
+            .complete("Admin", "Admin", "correct password")
+            .await
+            .expect("setup");
+        let user_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("user");
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback cleanup", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback cleanup', 'playback cleanup', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "expired-session",
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:expired-session",
+                tier: 1,
+                plan: "SERVER_HLS",
+                temp_dir: Some("/config/web-playback/expired-session"),
+                is_admin: true,
+                expires_at: 99,
+                now: 1,
+            })
+            .await
+            .expect("web playback session");
+
+        let expired = database
+            .take_expired_web_playback_sessions(100)
+            .await
+            .expect("expired sessions");
+
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, "expired-session");
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM web_playback_sessions WHERE id = 'expired-session'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("session state");
+        assert_eq!(state, "STOPPED");
     }
 }

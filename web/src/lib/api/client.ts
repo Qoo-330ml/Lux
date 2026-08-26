@@ -52,6 +52,8 @@ import type {
   PersonDetail,
   PlaybackState,
   PlaybackEventState,
+  WebPlaybackCapabilities,
+  WebPlaybackSession,
   SetupStatus,
   SetupDatabaseBackend,
   SetupDatabaseStatus,
@@ -443,6 +445,52 @@ export class LuxApiClient {
   playback(itemId: string) {
     return this.request<PlaybackState>(
       `/api/v1/items/${encodeURIComponent(itemId)}/playback`,
+    );
+  }
+
+  createWebPlaybackSession(
+    itemId: string,
+    sourceId: string,
+    capabilities: WebPlaybackCapabilities,
+  ) {
+    return this.request<WebPlaybackSession>("/api/v1/playback/sessions", {
+      method: "POST",
+      body: JSON.stringify({ itemId, sourceId, capabilities }),
+    });
+  }
+
+  webPlaybackEvent(
+    sessionId: string,
+    input: {
+      eventId: string;
+      sequence: number;
+      state: PlaybackEventState;
+      positionTicks: number;
+      durationTicks: number | null;
+    },
+    keepalive = false,
+  ) {
+    return this.request<{ accepted: boolean; duplicate: boolean; stale: boolean }>(
+      `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}/events`,
+      {
+        method: "POST",
+        keepalive,
+        body: JSON.stringify(input),
+      },
+    );
+  }
+
+  webPlaybackHeartbeat(sessionId: string) {
+    return this.request<{ sessionId: string; expiresAt: number }>(
+      `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}/heartbeat`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+  }
+
+  stopWebPlaybackSession(sessionId: string, keepalive = false) {
+    return this.request<void>(
+      `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE", keepalive },
     );
   }
 

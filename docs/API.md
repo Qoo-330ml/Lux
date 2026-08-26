@@ -223,6 +223,33 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 媒体探测对本地文件使用 ffprobe；`.strm` 源优先读取同名 `-mediainfo.json` 和 NFO 的 `<fileinfo><streamdetails>`。管理员显式创建 STRM 探测任务后，宿主才会按 URL 安全策略调用 `org.lux.strm-media-info`，成功结果写入媒体源/媒体流并可选写回兼容旁车。PlaybackInfo 请求本身不访问外部地址；HTTP `.strm` 的播放入口只请求上游响应头和有限重定向，并转发播放器 User-Agent，媒体内容仍由客户端按最终地址直连。旁车内容和插件结果只接受受限字段，不写入原始 ffprobe JSON、完整 URL 或凭据。
 
+## Web 播放会话（LUX-198）
+
+Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口要求当前 Web session；除创建接口返回的
+计划外，媒体资源使用短期 HMAC 签名 URL，因此 `<video>`、HLS.js 或 Safari 请求资源时不需要携带 Lux Cookie。
+签名只绑定当前会话、资源名称和过期时间，不能被改用于其他会话、媒体源或路径。
+
+- `POST /api/v1/playback/sessions`：创建一次播放计划。请求体为
+  `{ "itemId": "...", "sourceId": "...", "capabilities": { "directPlay": true, "hls": true, "videoCopyToFmp4": true, "audioCopyToFmp4": true, "hardwareTranscode": false, "softwareTranscode": true } }`。
+  服务端先检查条目/媒体库 ACL，再按 0→4 选择最低成本计划。响应包含 `sessionId`、`playSessionId`、`tier`、
+  `expiresAt`、`sourceId` 和 `plan`。`plan.type` 为 `DIRECT`、`SERVER_HLS` 或 `UNSUPPORTED`；后者带稳定的
+  `reason`，且不会创建播放会话或 FFmpeg 进程。
+- 档位 0 是原始文件 Range 直放（客户端 HEVC/MKV fallback 仍属于此档）；档位 1 是视频/音频 copy 的
+  fMP4/CMAF HLS；档位 2 是视频 copy、音频转码；档位 3 是管理员配置且运行时确认可用的硬件转码；档位 4 是
+  Jellyfin FFmpeg 软件转码。服务端 HLS 只为当前会话生成临时 `index.m3u8`、`init.mp4` 和 `.m4s`，不生成永久副本。
+- `GET|HEAD /api/v1/playback/sessions/{sessionId}/direct?expires=...&signature=...`：读取档位 0 的本地文件，
+  支持单段 Range；HTTP `.strm` 只由此入口有限重定向到浏览器目标，不代理媒体字节。
+- `GET|HEAD /api/v1/playback/sessions/{sessionId}/hls/{asset}?expires=...&signature=...`：读取签名的 HLS
+  清单、初始化片段或媒体片段。清单中的 URI 会被重写为同一会话的签名资源，路径穿越和未知资产返回错误。
+- `POST /api/v1/playback/sessions/{sessionId}/events`：写入 `{ "eventId": "...", "sequence": 1, "state": "PLAYING|PAUSED|STOPPED", "positionTicks": 0, "durationTicks": null }`。
+  `eventId` 和 `sequence` 在会话内幂等；重复事件返回 `duplicate`，乱序事件返回 `stale`，不会倒退播放位置。
+  `STOPPED` 会停止会话并回收服务端 HLS 进程和临时目录。
+- `POST /api/v1/playback/sessions/{sessionId}/heartbeat`：延长活动会话 TTL，返回新的 `expiresAt`。
+- `DELETE /api/v1/playback/sessions/{sessionId}`：停止当前用户的会话并回收服务端资源，成功返回 204。
+
+`.strm` 永远只允许档位 0；直连失败时返回 `UNSUPPORTED`，不进入 Remux、音频/视频转码、HLS 或媒体字节代理。
+字幕首阶段继续使用现有外挂字幕端点，不在本 API 中做字幕转换、烧录、DRM 或多码率自适应 HLS。
+
 ## 媒体库 ACL（LUX-036）
 
 普通用户默认不能查看任何媒体库；管理员通过上面的管理接口授予 `canView` 后，Lux 和 Emby 的 Views、Items、详情及图片端点统一使用同一授权结果。无权库列表返回 403，已知无权条目或图片 ID 按 404 处理以避免 ID 探测。

@@ -866,4 +866,77 @@ describe("LuxApiClient", () => {
       serverName: "客厅 Lux",
     });
   });
+
+  it("uses the Web playback session contract for plans, events, heartbeats, and stop", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (path === "/api/v1/playback/sessions") {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toEqual({
+          itemId: "item-1",
+          sourceId: "source-1",
+          capabilities: {
+            directPlay: false,
+            hls: true,
+            videoCopyToFmp4: true,
+            audioCopyToFmp4: false,
+            hardwareTranscode: false,
+            softwareTranscode: true,
+          },
+        });
+        return new Response(JSON.stringify({
+          sessionId: "session-1",
+          playSessionId: "lux-web:session-1",
+          sourceId: "source-1",
+          tier: 2,
+          expiresAt: 1_900_000_000,
+          plan: { type: "SERVER_HLS", tier: 2, manifestUrl: "/manifest.m3u8" },
+        }), { status: 200 });
+      }
+      if (path.endsWith("/events")) {
+        expect(init?.method).toBe("POST");
+        expect(JSON.parse(String(init?.body))).toMatchObject({
+          eventId: "event-1",
+          sequence: 1,
+          state: "PLAYING",
+          positionTicks: 100,
+        });
+        return new Response(JSON.stringify({ accepted: true, duplicate: false, stale: false }), { status: 200 });
+      }
+      if (path.endsWith("/heartbeat")) {
+        expect(init?.method).toBe("POST");
+        return new Response(JSON.stringify({ sessionId: "session-1", expiresAt: 1_900_000_100 }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/playback/sessions/session-1");
+      expect(init?.method).toBe("DELETE");
+      return new Response(null, { status: 204 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.createWebPlaybackSession("item-1", "source-1", {
+      directPlay: false,
+      hls: true,
+      videoCopyToFmp4: true,
+      audioCopyToFmp4: false,
+      hardwareTranscode: false,
+      softwareTranscode: true,
+    })).resolves.toMatchObject({ sessionId: "session-1", tier: 2 });
+    await expect(client.webPlaybackEvent("session-1", {
+      eventId: "event-1",
+      sequence: 1,
+      state: "PLAYING",
+      positionTicks: 100,
+      durationTicks: 1_000,
+    })).resolves.toEqual({ accepted: true, duplicate: false, stale: false });
+    await expect(client.webPlaybackHeartbeat("session-1")).resolves.toEqual({
+      sessionId: "session-1",
+      expiresAt: 1_900_000_100,
+    });
+    await expect(client.stopWebPlaybackSession("session-1")).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
 });

@@ -1,4 +1,4 @@
-ARG LUX_RUNTIME_IMAGE=lux-runtime:trixie-ffmpeg-v2
+ARG LUX_RUNTIME_IMAGE=lux-runtime:trixie-jellyfin-ffmpeg7-v1
 
 FROM node:22-bookworm-slim AS web-builder
 

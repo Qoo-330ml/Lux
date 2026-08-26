@@ -87,7 +87,7 @@ async fn database_migration_creates_danmaku_tables() -> Result<(), Box<dyn std::
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 96);
+    assert_eq!(database.schema_version().await?, 98);
     let active_job_index: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master

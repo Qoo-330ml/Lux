@@ -70,7 +70,7 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 
 ### Docker Hub 镜像
 
-`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。每个架构通过 `docker-bake.hcl` 在同一个 BuildKit 构建图中生成 runtime target，runtime 不设置 registry 输出，也不会自动发布 `pdzhou/lux-runtime:trixie-ffmpeg-v2-*`；只有应用镜像发布 `test-amd64`、`test-arm64`，随后合并为 `test`。应用镜像仍会携带 runtime 层，Docker Hub 按 layer digest 复用它，因此普通应用更新不需要重复下载约 417 MiB 的依赖层。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
+`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。每个架构通过 `docker-bake.hcl` 在同一个 BuildKit 构建图中生成 runtime target，runtime 不设置 registry 输出，也不会自动发布 `lux-runtime:trixie-jellyfin-ffmpeg7-v1-*`；只有应用镜像发布 `test-amd64`、`test-arm64`，随后合并为 `test`。应用镜像仍会携带 runtime 层，Docker Hub 按 layer digest 复用它，因此普通应用更新不需要重复下载约 417 MiB 的依赖层。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`。
 
 确认测试镜像可发布后，在 GitHub Actions 手动运行 `.github/workflows/promote-dockerhub.yml`，它会把 Docker Hub 上的 `test` 多架构 manifest 晋级为 `latest` 和版本标签。当前 Docker Hub 构建 workflow 只自动维护 `test`，不会自动发布 `latest` 或版本标签；部署时应优先使用版本标签或 digest。
 
@@ -137,7 +137,7 @@ http://127.0.0.1:8097
 
 ## 升级与回滚边界
 
-发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识。应用镜像通过 `docker-bake.hcl` 内部复用固定的 `lux-runtime:trixie-ffmpeg-v2` 构建内容；普通应用更新只会产生新的 `luxd` 和 Web 层，Docker 会按 layer digest 复用 runtime 层。推荐使用和 CI 相同的构建图：
+发布镜像使用不可变版本标签和 digest，不使用 `latest` 作为唯一发布标识。应用镜像通过 `docker-bake.hcl` 内部复用固定的 `lux-runtime:trixie-jellyfin-ffmpeg7-v1` 构建内容；普通应用更新只会产生新的 `luxd` 和 Web 层，Docker 会按 layer digest 复用 runtime 层。推荐使用和 CI 相同的构建图：
 
 ```bash
 docker buildx bake --load \
