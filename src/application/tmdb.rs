@@ -1455,3 +1455,55 @@ impl fmt::Display for TmdbError {
 }
 
 impl std::error::Error for TmdbError {}
+
+#[cfg(test)]
+mod tests {
+    use super::{TmdbClient, TmdbClientConfig, metadata_capability_for_endpoint};
+    use crate::observability::resources::ResourceMetrics;
+
+    #[test]
+    fn tmdb_endpoints_map_to_metadata_capabilities() {
+        assert_eq!(
+            metadata_capability_for_endpoint("3/search/movie"),
+            Some("metadata.search")
+        );
+        assert_eq!(
+            metadata_capability_for_endpoint("3/movie/7/images"),
+            Some("metadata.images")
+        );
+        assert_eq!(
+            metadata_capability_for_endpoint("3/movie/7/credits"),
+            Some("metadata.credits")
+        );
+        assert_eq!(
+            metadata_capability_for_endpoint("3/movie/7/external_ids"),
+            Some("metadata.externalIds")
+        );
+        assert_eq!(
+            metadata_capability_for_endpoint("3/movie/7/videos"),
+            Some("metadata.trailers")
+        );
+        assert_eq!(
+            metadata_capability_for_endpoint("3/movie/7"),
+            Some("metadata.get")
+        );
+    }
+
+    #[tokio::test]
+    async fn built_in_client_records_cache_and_retry_metrics() {
+        let client = TmdbClient::new(TmdbClientConfig {
+            read_access_token: Some("test-token".to_owned()),
+            ..TmdbClientConfig::default()
+        })
+        .expect("test TMDb client");
+        let resources = ResourceMetrics::new();
+        client.with_resource_metrics(resources.clone());
+        client.record_metadata_call("3/movie/7/images", true, std::time::Instant::now());
+        client.record_metadata_retry("3/movie/7/images");
+
+        let snapshot = resources.snapshot().await;
+        assert_eq!(snapshot.metadata.counters["request.images.count"], 1);
+        assert_eq!(snapshot.metadata.counters["cache.hit.count"], 1);
+        assert_eq!(snapshot.metadata.counters["retry.images.count"], 1);
+    }
+}
