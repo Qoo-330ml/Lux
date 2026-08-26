@@ -1408,15 +1408,20 @@ fn image_attempt_failure(
     attempt_count: u32,
 ) -> (&'static str, Option<i64>, &'static str) {
     match error {
+        ImageWriteError::UpstreamStatus { status } if retryable_image_status(*status) => (
+            "FAILED",
+            Some(now.saturating_add(image_retry_delay_seconds(attempt_count))),
+            "TRANSIENT_FAILURE",
+        ),
         ImageWriteError::UpstreamStatus { status: 404 | 410 } => {
             ("UNAVAILABLE", None, "UPSTREAM_NOT_FOUND")
         }
+        ImageWriteError::UpstreamStatus { .. } => ("UNAVAILABLE", None, "UPSTREAM_PERMANENT"),
         ImageWriteError::InvalidUrl(_)
         | ImageWriteError::UnsupportedContentType { .. }
         | ImageWriteError::InvalidContent { .. }
         | ImageWriteError::TooLarge { .. } => ("UNAVAILABLE", None, "INVALID_IMAGE"),
-        ImageWriteError::UpstreamStatus { .. }
-        | ImageWriteError::Download(_)
+        ImageWriteError::Download(_)
         | ImageWriteError::ConcurrentModification(_)
         | ImageWriteError::Io { .. } => (
             "FAILED",
@@ -1818,9 +1823,9 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY,
-        global_image_permits, image_download_retry_delay, is_allowed_scraper_image_url,
-        retryable_image_status,
+        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
+        global_image_permits, image_attempt_failure, image_download_retry_delay,
+        is_allowed_scraper_image_url, retryable_image_status,
     };
 
     #[test]
@@ -1837,6 +1842,16 @@ mod tests {
         assert_eq!(image_download_retry_delay(1), IMAGE_RETRY_BASE_DELAY);
         assert_eq!(image_download_retry_delay(2), IMAGE_RETRY_BASE_DELAY * 2);
         assert_eq!(image_download_retry_delay(99), IMAGE_RETRY_MAX_DELAY);
+    }
+
+    #[test]
+    fn permanent_upstream_status_does_not_schedule_image_retry() {
+        let (status, next_retry_at, error_code) =
+            image_attempt_failure(&ImageWriteError::UpstreamStatus { status: 403 }, 100, 1);
+
+        assert_eq!(status, "UNAVAILABLE");
+        assert_eq!(next_retry_at, None);
+        assert_eq!(error_code, "UPSTREAM_PERMANENT");
     }
 
     #[test]
