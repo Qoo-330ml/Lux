@@ -116,8 +116,8 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let config_dir = config.config_dir.clone();
-    let state = AppState::ready(config, database.clone(), setup, web_auth, emby_auth)
-        .with_tmdb_client(tmdb);
+    let state =
+        AppState::ready(config, database.clone(), setup, web_auth, emby_auth).with_scraper(tmdb);
     let app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

@@ -30,7 +30,7 @@ async fn start_server(
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let state = AppState::ready(config, database, setup, auth, emby_auth);
-    let state = tmdb.map_or(state.clone(), |tmdb| state.with_tmdb_client(tmdb));
+    let state = tmdb.map_or(state.clone(), |tmdb| state.with_scraper(tmdb));
     let app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

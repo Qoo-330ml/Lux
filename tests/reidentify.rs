@@ -212,7 +212,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(
-        AppState::ready(config, database.clone(), setup, auth, emby_auth).with_tmdb_client(tmdb),
+        AppState::ready(config, database.clone(), setup, auth, emby_auth).with_scraper(tmdb),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

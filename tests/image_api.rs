@@ -134,7 +134,7 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(
-        AppState::ready(config, database, setup, auth, emby_auth).with_tmdb_client(tmdb),
+        AppState::ready(config, database, setup, auth, emby_auth).with_scraper(tmdb),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

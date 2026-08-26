@@ -110,6 +110,74 @@ pub trait ScraperAdapter: Send + Sync {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct UnconfiguredScraper;
+
+impl UnconfiguredScraper {
+    fn unavailable<T: Send + 'static>(
+        method: &'static str,
+    ) -> ScraperFuture<'static, Result<T, ScraperError>> {
+        Box::pin(std::future::ready(Err(
+            ScraperError::UnsupportedCapability(method.to_owned()),
+        )))
+    }
+}
+
+impl ScraperAdapter for UnconfiguredScraper {
+    fn provider_key(&self) -> &str {
+        ""
+    }
+
+    fn search(
+        &self,
+        _request: ScraperSearchRequest,
+    ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+        Self::unavailable(METADATA_SEARCH_CAPABILITY)
+    }
+
+    fn get(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+        Self::unavailable(METADATA_GET_CAPABILITY)
+    }
+
+    fn bundle(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+        Self::unavailable(METADATA_BUNDLE_CAPABILITY)
+    }
+
+    fn images(
+        &self,
+        _request: ScraperImageRequest,
+    ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+        Self::unavailable(METADATA_IMAGES_CAPABILITY)
+    }
+
+    fn credits(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+        Self::unavailable(METADATA_CREDITS_CAPABILITY)
+    }
+
+    fn external_ids(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+        Self::unavailable(METADATA_EXTERNAL_IDS_CAPABILITY)
+    }
+
+    fn trailers(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+        Self::unavailable(METADATA_TRAILERS_CAPABILITY)
+    }
+}
+
 /// Provider-neutral handle shared by metadata application services.
 #[derive(Clone)]
 pub enum ScraperProvider {
@@ -118,6 +186,10 @@ pub enum ScraperProvider {
 }
 
 impl ScraperProvider {
+    pub fn unconfigured() -> Self {
+        Self::from_adapter(UnconfiguredScraper)
+    }
+
     pub fn from_adapter<A>(adapter: A) -> Self
     where
         A: ScraperAdapter + 'static,
@@ -460,6 +532,25 @@ mod tests {
             Some("douban-456")
         );
         assert_eq!(provider_id_for_key(&provider_ids, "tvdb"), None);
+    }
+
+    #[tokio::test]
+    async fn unconfigured_provider_never_attempts_an_external_call() {
+        let provider = super::ScraperProvider::unconfigured();
+        let result = provider
+            .search_generic(super::ScraperSearchRequest::new(
+                super::ScraperItemType::Movie,
+                "Example",
+                None,
+                "zh-CN",
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(super::ScraperError::UnsupportedCapability(capability))
+                if capability == super::METADATA_SEARCH_CAPABILITY
+        ));
     }
 
     #[test]
@@ -826,21 +917,6 @@ pub struct ScraperPluginClient {
 }
 
 impl ScraperPluginClient {
-    pub(crate) fn new_with_provider_key(
-        plugins: PluginService,
-        plugin_id: impl Into<String>,
-        provider_key: impl Into<String>,
-        response_cache: ProviderResponseCache,
-    ) -> Self {
-        Self::new_with_provider_key_and_capabilities(
-            plugins,
-            plugin_id,
-            provider_key,
-            None,
-            response_cache,
-        )
-    }
-
     pub(crate) fn new_with_provider_key_and_capabilities(
         plugins: PluginService,
         plugin_id: impl Into<String>,
