@@ -6207,7 +6207,8 @@ impl Database {
                     include_ready, write_sidecars, media_info_enabled,
                     thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
                     cursor, processed_count,
-                    total_count, cancel_requested, error
+                    total_count, cancel_requested, error,
+                    created_at, started_at, finished_at
              FROM strm_probe_jobs WHERE id = ?",
         )
         .bind(id)
@@ -6232,7 +6233,8 @@ impl Database {
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
                         cursor, processed_count,
-                        total_count, cancel_requested, error
+                        total_count, cancel_requested, error,
+                        created_at, started_at, finished_at
                  FROM strm_probe_jobs WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -6247,7 +6249,8 @@ impl Database {
                         include_ready, write_sidecars, media_info_enabled,
                         thumbnail_enabled, thumbnail_position_percent, target_scan_job_id,
                         cursor, processed_count,
-                        total_count, cancel_requested, error
+                        total_count, cancel_requested, error,
+                        created_at, started_at, finished_at
                  FROM strm_probe_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -8061,7 +8064,7 @@ impl Database {
         self.query(
             "SELECT id, library_id, job_type, status, generation, cursor,
                     processed_count, total_count, cancel_requested, error,
-                    finished_at,
+                    created_at, started_at, finished_at,
                     discovery_completed, auto_metadata_match,
                     current_item, scan_phase
              FROM scan_jobs WHERE id = ?",
@@ -8086,7 +8089,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
-                        finished_at,
+                        created_at, started_at, finished_at,
                         discovery_completed, auto_metadata_match,
                         current_item, scan_phase
                  FROM scan_jobs WHERE status = ?
@@ -8101,7 +8104,7 @@ impl Database {
             self.query(
                 "SELECT id, library_id, job_type, status, generation, cursor,
                         processed_count, total_count, cancel_requested, error,
-                        finished_at,
+                        created_at, started_at, finished_at,
                         discovery_completed, auto_metadata_match,
                         current_item, scan_phase
                  FROM scan_jobs
@@ -13008,7 +13011,8 @@ impl Database {
         self.query(
             "SELECT id, library_id, status, overwrite, concurrency,
                     total_count, processed_count, success_count,
-                    skipped_count, failed_count, cancel_requested, error
+                    skipped_count, failed_count, cancel_requested, error,
+                    created_at, started_at, finished_at
              FROM danmaku_match_jobs WHERE id = ?",
         )
         .bind(id)
@@ -13031,7 +13035,8 @@ impl Database {
             self.query(
                 "SELECT id, library_id, status, overwrite, concurrency,
                         total_count, processed_count, success_count,
-                        skipped_count, failed_count, cancel_requested, error
+                        skipped_count, failed_count, cancel_requested, error,
+                        created_at, started_at, finished_at
                  FROM danmaku_match_jobs
                  WHERE status = ?
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
@@ -13045,7 +13050,8 @@ impl Database {
             self.query(
                 "SELECT id, library_id, status, overwrite, concurrency,
                         total_count, processed_count, success_count,
-                        skipped_count, failed_count, cancel_requested, error
+                        skipped_count, failed_count, cancel_requested, error,
+                        created_at, started_at, finished_at
                  FROM danmaku_match_jobs
                  ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
             )
@@ -14426,7 +14432,8 @@ impl Database {
         self.query(
             "SELECT id, library_id, plugin_id, status, concurrency,
                     intro_window_seconds, credits_window_seconds, match_threshold,
-                    cursor, processed_count, total_count, cancel_requested, error
+                    cursor, processed_count, total_count, cancel_requested, error,
+                    created_at, started_at, finished_at
              FROM chapter_detection_jobs WHERE id = ?",
         )
         .bind(id)
@@ -14468,13 +14475,15 @@ impl Database {
         let query = if status.is_some() {
             "SELECT id, library_id, plugin_id, status, concurrency,
                     intro_window_seconds, credits_window_seconds, match_threshold,
-                    cursor, processed_count, total_count, cancel_requested, error
+                    cursor, processed_count, total_count, cancel_requested, error,
+                    created_at, started_at, finished_at
              FROM chapter_detection_jobs WHERE status = ?
              ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
         } else {
             "SELECT id, library_id, plugin_id, status, concurrency,
                     intro_window_seconds, credits_window_seconds, match_threshold,
-                    cursor, processed_count, total_count, cancel_requested, error
+                    cursor, processed_count, total_count, cancel_requested, error,
+                    created_at, started_at, finished_at
              FROM chapter_detection_jobs
              ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
         };
@@ -16357,6 +16366,8 @@ pub(crate) struct StoredScanJob {
     pub(crate) total_count: i64,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) started_at: Option<i64>,
     pub(crate) finished_at: Option<i64>,
     pub(crate) discovery_completed: bool,
     pub(crate) auto_metadata_match: bool,
@@ -16395,6 +16406,9 @@ pub(crate) struct StoredStrmProbeJob {
     pub(crate) total_count: i64,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
 }
 
 pub(crate) struct NewStrmProbeJob<'a> {
@@ -16443,6 +16457,8 @@ fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
         total_count: row.get("total_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+        created_at: row.get("created_at"),
+        started_at: row.get("started_at"),
         finished_at: row.get("finished_at"),
         discovery_completed: row.get::<i64, _>("discovery_completed") != 0,
         auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
@@ -16484,6 +16500,9 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
         total_count: row.get("total_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+        created_at: row.get("created_at"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
     }
 }
 
@@ -16502,6 +16521,9 @@ fn stored_chapter_detection_job(row: sqlx::any::AnyRow) -> StoredChapterDetectio
         total_count: row.get("total_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+        created_at: row.get("created_at"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
     }
 }
 
@@ -17490,6 +17512,9 @@ pub(crate) struct StoredDanmakuMatchJob {
     pub(crate) failed_count: i64,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
 }
 
 #[derive(Clone, Debug)]
@@ -17562,6 +17587,9 @@ fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> StoredDanmakuMatchJob {
         failed_count: row.get("failed_count"),
         cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
         error: row.get("error"),
+        created_at: row.get("created_at"),
+        started_at: row.get("started_at"),
+        finished_at: row.get("finished_at"),
     }
 }
 
@@ -17674,6 +17702,9 @@ pub(crate) struct StoredChapterDetectionJob {
     pub(crate) total_count: i64,
     pub(crate) cancel_requested: bool,
     pub(crate) error: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
 }
 
 pub(crate) struct NewChapterDetectionJob<'a> {

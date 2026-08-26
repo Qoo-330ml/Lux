@@ -809,6 +809,9 @@ pub struct StrmProbeJob {
     pub total_count: i64,
     pub cancel_requested: bool,
     pub error: Option<String>,
+    pub created_at: i64,
+    pub started_at: Option<i64>,
+    pub finished_at: Option<i64>,
 }
 
 fn strm_probe_job(job: StoredStrmProbeJob) -> StrmProbeJob {
@@ -828,6 +831,9 @@ fn strm_probe_job(job: StoredStrmProbeJob) -> StrmProbeJob {
         total_count: job.total_count,
         cancel_requested: job.cancel_requested,
         error: job.error,
+        created_at: job.created_at,
+        started_at: job.started_at,
+        finished_at: job.finished_at,
     }
 }
 
