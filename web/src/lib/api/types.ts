@@ -252,6 +252,29 @@ export type PlaybackState = {
 
 export type PlaybackEventState = "PLAYING" | "PAUSED" | "STOPPED";
 
+export type WebPlaybackCapabilities = {
+  directPlay: boolean;
+  hls: boolean;
+  videoCopyToFmp4: boolean;
+  audioCopyToFmp4: boolean;
+  hardwareTranscode: boolean;
+  softwareTranscode: boolean;
+};
+
+export type WebPlaybackPlan =
+  | { type: "DIRECT"; url: string }
+  | { type: "SERVER_HLS"; manifestUrl: string; tier: number }
+  | { type: "UNSUPPORTED"; reason: string };
+
+export type WebPlaybackSession = {
+  sessionId: string | null;
+  playSessionId: string | null;
+  sourceId: string;
+  tier: number;
+  expiresAt: number;
+  plan: WebPlaybackPlan;
+};
+
 export type AdminRoot = {
   id: string;
   libraryId: string;

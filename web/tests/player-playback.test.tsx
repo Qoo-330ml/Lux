@@ -17,6 +17,19 @@ describe("PlayerPage playback synchronization", () => {
 
   beforeEach(() => {
     vi.spyOn(api, "progress").mockResolvedValue(undefined);
+    vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (_itemId, sourceId) => ({
+      sessionId: `web-${sourceId}`,
+      playSessionId: `lux-web:web-${sourceId}`,
+      sourceId,
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: `/api/v1/playback/sessions/web-${sourceId}/direct?expires=1900000000&signature=test`,
+      },
+    }));
+    vi.spyOn(api, "webPlaybackEvent").mockResolvedValue({ accepted: true, duplicate: false, stale: false });
+    vi.spyOn(api, "stopWebPlaybackSession").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
   });
@@ -77,36 +90,48 @@ describe("PlayerPage playback synchronization", () => {
     await act(async () => video.dispatchEvent(new Event("ended")));
     await act(async () => window.dispatchEvent(new Event("pagehide")));
 
-    expect(api.progress).toHaveBeenNthCalledWith(
+    expect(api.webPlaybackEvent).toHaveBeenNthCalledWith(
       1,
-      "movie-1",
-      480_000_000,
-      1_200_000_000,
-      "PLAYING",
+      "web-source-1",
+      expect.objectContaining({
+        sequence: 1,
+        positionTicks: 480_000_000,
+        durationTicks: 1_200_000_000,
+        state: "PLAYING",
+      }),
       false,
     );
-    expect(api.progress).toHaveBeenNthCalledWith(
+    expect(api.webPlaybackEvent).toHaveBeenNthCalledWith(
       2,
-      "movie-1",
-      480_000_000,
-      1_200_000_000,
-      "PAUSED",
+      "web-source-1",
+      expect.objectContaining({
+        sequence: 2,
+        positionTicks: 480_000_000,
+        durationTicks: 1_200_000_000,
+        state: "PAUSED",
+      }),
       false,
     );
-    expect(api.progress).toHaveBeenNthCalledWith(
+    expect(api.webPlaybackEvent).toHaveBeenNthCalledWith(
       3,
-      "movie-1",
-      480_000_000,
-      1_200_000_000,
-      "STOPPED",
+      "web-source-1",
+      expect.objectContaining({
+        sequence: 3,
+        positionTicks: 480_000_000,
+        durationTicks: 1_200_000_000,
+        state: "STOPPED",
+      }),
       false,
     );
-    expect(api.progress).toHaveBeenNthCalledWith(
+    expect(api.webPlaybackEvent).toHaveBeenNthCalledWith(
       4,
-      "movie-1",
-      480_000_000,
-      1_200_000_000,
-      "STOPPED",
+      "web-source-1",
+      expect.objectContaining({
+        sequence: 4,
+        positionTicks: 480_000_000,
+        durationTicks: 1_200_000_000,
+        state: "STOPPED",
+      }),
       true,
     );
     expect(invalidateQueries).toHaveBeenCalledWith({ queryKey: queryKeys.home });
@@ -157,20 +182,24 @@ describe("PlayerPage playback synchronization", () => {
       root = undefined;
     });
 
-    expect(api.progress).toHaveBeenNthCalledWith(
+    expect(api.webPlaybackEvent).toHaveBeenNthCalledWith(
       1,
-      "movie-2",
-      300_000_000,
-      1_200_000_000,
-      "PLAYING",
+      "web-source-2",
+      expect.objectContaining({
+        sequence: 1,
+        positionTicks: 300_000_000,
+        state: "PLAYING",
+      }),
       false,
     );
-    expect(api.progress).toHaveBeenNthCalledWith(
+    expect(api.webPlaybackEvent).toHaveBeenNthCalledWith(
       2,
-      "movie-2",
-      300_000_000,
-      1_200_000_000,
-      "STOPPED",
+      "web-source-2",
+      expect.objectContaining({
+        sequence: 2,
+        positionTicks: 300_000_000,
+        state: "STOPPED",
+      }),
       false,
     );
   });

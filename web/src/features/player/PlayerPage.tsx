@@ -26,7 +26,12 @@ import {
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { MediaItem, MediaSource, PlaybackEventState } from "../../lib/api/types";
+import type {
+  MediaItem,
+  MediaSource,
+  PlaybackEventState,
+  WebPlaybackCapabilities,
+} from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
 import {
   NativeVideoEngine,
@@ -34,6 +39,7 @@ import {
   type PlaybackEngine,
   type PlaybackPerformance,
 } from "./playback-engine";
+import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
 import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 
 const TICKS_PER_SECOND = 10_000_000;
@@ -88,6 +94,31 @@ function getSubtitleInfo(media?: MediaItem | null) {
   return null;
 }
 
+function webPlaybackCapabilities(
+  source: MediaSource | undefined,
+  attempt: number,
+): WebPlaybackCapabilities {
+  const streams = source?.streams ?? [];
+  const videoCodec = (streams.find((stream) => stream.type === "VIDEO")?.codec ?? "").toLowerCase();
+  const audioCodecs = streams
+    .filter((stream) => stream.type === "AUDIO")
+    .map((stream) => (stream.codec ?? "").toLowerCase());
+  const videoCopyToFmp4 = ["h264", "avc", "avc1", "hevc", "h265", "hvc1", "hev1", "vp9", "vp09", "av1"].some(
+    (codec) => videoCodec === codec || videoCodec.startsWith(`${codec}.`),
+  );
+  const audioCopyToFmp4 = audioCodecs.length === 0 || audioCodecs.some((codec) =>
+    ["aac", "mp4a", "mp4a.40.2"].some((supported) => codec === supported || codec.startsWith(`${supported}.`)),
+  );
+  return {
+    directPlay: attempt === 0,
+    hls: canUseHls(typeof document === "undefined" ? null : document.createElement("video")),
+    videoCopyToFmp4,
+    audioCopyToFmp4,
+    hardwareTranscode: false,
+    softwareTranscode: true,
+  };
+}
+
 export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -95,6 +126,7 @@ export function PlayerPage() {
   const queryClient = useQueryClient();
 
   const [playing, setPlaying] = useState(false);
+  const [playbackAttempt, setPlaybackAttempt] = useState(0);
   const [failedStreamUrl, setFailedStreamUrl] = useState<string | null>(null);
   const [playbackError, setPlaybackError] = useState<string | null>(null);
   const [fallbackLoading, setFallbackLoading] = useState(false);
@@ -132,13 +164,20 @@ export function PlayerPage() {
     media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
     media?.mediaSources?.find((entry) => entry.isDefault) ??
     media?.mediaSources?.[0];
-
-  const streamUrl =
-    source?.sourceKind === "STRM_URL"
-      ? source.externalUrl ?? ""
-      : source && media
-        ? `/api/v1/items/${encodeURIComponent(media.id)}/stream?sourceId=${encodeURIComponent(source.id)}`
-        : "";
+  const capabilities = webPlaybackCapabilities(source, playbackAttempt);
+  const webPlaybackSession = useQuery({
+    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt),
+    queryFn: () => api.createWebPlaybackSession(itemId, source?.id ?? "", capabilities),
+    enabled: Boolean(itemId && source?.id),
+    retry: false,
+    staleTime: Number.POSITIVE_INFINITY,
+  });
+  const playbackPlan = webPlaybackSession.data?.plan;
+  const streamUrl = playbackPlan?.type === "DIRECT"
+    ? playbackPlan.url
+    : playbackPlan?.type === "SERVER_HLS"
+      ? playbackPlan.manifestUrl
+      : "";
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
 
   const playerContainerRef = useRef<HTMLDivElement>(null);
@@ -152,6 +191,9 @@ export function PlayerPage() {
   const splashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const isDraggingScrubberRef = useRef(false);
+  const playbackSessionIdRef = useRef<string | null>(null);
+  const playbackSequenceRef = useRef(0);
+  const fallbackRequestedRef = useRef(false);
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
     if (!video) {
@@ -173,9 +215,9 @@ export function PlayerPage() {
       videoOverride?: HTMLVideoElement | null,
     ) => {
       const video = videoOverride ?? videoRef.current;
-      if (!video || (state === "STOPPED" && !hasStartedRef.current)) return;
+      if (!video || (state === "STOPPED" && !hasStartedRef.current)) return undefined;
       const now = Date.now();
-      if (!force && now - lastProgressReportRef.current < PROGRESS_REPORT_INTERVAL_MS) return;
+      if (!force && now - lastProgressReportRef.current < PROGRESS_REPORT_INTERVAL_MS) return undefined;
       const positionTicks = Math.max(
         0,
         Math.round(
@@ -187,22 +229,64 @@ export function PlayerPage() {
           ? Math.round(video.duration * TICKS_PER_SECOND)
           : null;
       lastProgressReportRef.current = now;
-      const request = api.progress(itemId, positionTicks, durationTicks, state, keepalive);
+      const sessionId = playbackSessionIdRef.current;
+      if (!sessionId) return undefined;
+      const sequence = ++playbackSequenceRef.current;
+      const request = api.webPlaybackEvent(
+        sessionId,
+        {
+          eventId: `web-${sessionId}-${sequence}-${now}`,
+          sequence,
+          state,
+          positionTicks,
+          durationTicks,
+        },
+        keepalive,
+      );
       if (state === "STOPPED") {
-        void request
+        return request
           .then(() => queryClient.invalidateQueries({ queryKey: queryKeys.home }))
           .catch(() => undefined);
       } else {
         void request.catch(() => undefined);
+        return request;
       }
     },
-    [itemId, queryClient],
+    [queryClient],
   );
+
+  const stopActiveSession = useCallback((keepalive = false) => {
+    const sessionId = playbackSessionIdRef.current;
+    if (!sessionId) return Promise.resolve();
+    return api.stopWebPlaybackSession(sessionId, keepalive).catch(() => undefined);
+  }, []);
+
+  const requestServerFallback = useCallback((reason?: string) => {
+    if (
+      playbackAttempt !== 0 ||
+      playbackPlan?.type !== "DIRECT" ||
+      fallbackRequestedRef.current
+    ) {
+      setFailedStreamUrl(streamUrl || null);
+      if (reason) setPlaybackError(`客户端播放失败：${reason}`);
+      return;
+    }
+    fallbackRequestedRef.current = true;
+    const sessionId = playbackSessionIdRef.current;
+    if (sessionId) void api.stopWebPlaybackSession(sessionId).catch(() => undefined);
+    setPlaybackError("浏览器无法播放这个媒体源，正在准备兼容的服务端播放…");
+    setFailedStreamUrl(null);
+    setPlaybackAttempt(1);
+  }, [playbackAttempt, playbackPlan?.type, streamUrl]);
 
   useEffect(() => {
     lastProgressReportRef.current = 0;
     hasStartedRef.current = false;
     hasRestoredPositionRef.current = false;
+    fallbackRequestedRef.current = false;
+    playbackSessionIdRef.current = null;
+    playbackSequenceRef.current = 0;
+    setPlaybackAttempt(0);
     setFailedStreamUrl(null);
     setPlaybackError(null);
     setFallbackLoading(false);
@@ -213,13 +297,33 @@ export function PlayerPage() {
   }, [itemId, requestedSourceId]);
 
   useEffect(() => {
-    const handlePageHide = () => reportPlayback("STOPPED", true, true);
+    playbackSessionIdRef.current = webPlaybackSession.data?.sessionId ?? null;
+    playbackSequenceRef.current = 0;
+  }, [webPlaybackSession.data?.sessionId]);
+
+  useEffect(() => {
+    const sessionId = webPlaybackSession.data?.sessionId;
+    if (!sessionId) return;
+    const heartbeat = window.setInterval(() => {
+      void api.webPlaybackHeartbeat(sessionId).catch(() => undefined);
+    }, 60_000);
+    return () => window.clearInterval(heartbeat);
+  }, [webPlaybackSession.data?.sessionId]);
+
+  useEffect(() => {
+    const handlePageHide = () => {
+      void Promise.resolve(reportPlayback("STOPPED", true, true)).finally(() => {
+        void stopActiveSession(true);
+      });
+    };
     window.addEventListener("pagehide", handlePageHide);
     return () => {
       window.removeEventListener("pagehide", handlePageHide);
-      reportPlayback("STOPPED", true, false, lastVideoRef.current);
+      void Promise.resolve(reportPlayback("STOPPED", true, false, lastVideoRef.current)).finally(() => {
+        void stopActiveSession();
+      });
     };
-  }, [reportPlayback]);
+  }, [reportPlayback, stopActiveSession]);
 
   const restorePlaybackPosition = useCallback(() => {
     if (hasRestoredPositionRef.current) return;
@@ -251,24 +355,31 @@ export function PlayerPage() {
     };
     const load = async () => {
       try {
-        const useMkvFallback = await shouldUseClientMkv(source, initialEngine.element);
-        const useHevcFallback =
-          !useMkvFallback && (await shouldUseClientHevc(source, initialEngine.element));
-        if (useMkvFallback || useHevcFallback) {
-          setFallbackLoading(true);
-          if (cancelled) return;
+        if (playbackPlan?.type === "SERVER_HLS") {
           initialEngine.destroy();
-          if (useMkvFallback) {
-            const { ClientMkvEngine } = await import("./mkv-playback-engine");
-            activeEngine = new ClientMkvEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
-          } else {
-            const { ClientHevcEngine } = await import("./hevc-playback-engine");
-            activeEngine = new ClientHevcEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
-          }
+          activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
-          performanceElement = activeEngine.element;
-          performanceElement.addEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
+        } else {
+          const useMkvFallback = await shouldUseClientMkv(source, initialEngine.element);
+          const useHevcFallback =
+            !useMkvFallback && (await shouldUseClientHevc(source, initialEngine.element));
+          if (useMkvFallback || useHevcFallback) {
+            setFallbackLoading(true);
+            if (cancelled) return;
+            initialEngine.destroy();
+            if (useMkvFallback) {
+              const { ClientMkvEngine } = await import("./mkv-playback-engine");
+              activeEngine = new ClientMkvEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
+            } else {
+              const { ClientHevcEngine } = await import("./hevc-playback-engine");
+              activeEngine = new ClientHevcEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
+            }
+            engineRef.current = activeEngine;
+            performanceElement = activeEngine.element;
+            performanceElement.addEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
+          }
         }
+        if (cancelled) return;
         await activeEngine.setSource(streamUrl, poster);
         if (!cancelled && activeEngine.performance)
           handlePerformance(
@@ -278,11 +389,15 @@ export function PlayerPage() {
           );
       } catch (cause) {
         if (!cancelled) {
-          setFailedStreamUrl(streamUrl);
           const reason = cause instanceof Error ? cause.message : "未知错误";
-          setPlaybackError(
-            `客户端解码失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`,
-          );
+          if (playbackPlan?.type === "DIRECT") {
+            requestServerFallback(reason);
+          } else {
+            setFailedStreamUrl(streamUrl);
+            setPlaybackError(
+              `服务端播放失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`,
+            );
+          }
         }
       } finally {
         if (!cancelled) setFallbackLoading(false);
@@ -295,7 +410,7 @@ export function PlayerPage() {
       activeEngine.destroy();
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
-  }, [poster, source, streamUrl]);
+  }, [playbackPlan?.type, poster, requestServerFallback, source, streamUrl]);
 
   // Fullscreen change listener
   useEffect(() => {
@@ -610,10 +725,37 @@ export function PlayerPage() {
     );
   }
 
+  if (webPlaybackSession.isPending) {
+    return (
+      <main className="lux-player-page lux-player-page-loading" aria-busy="true">
+        <div className="lux-spinner" aria-hidden="true" />
+        <p>正在创建播放会话…</p>
+      </main>
+    );
+  }
+
+  if (webPlaybackSession.error) {
+    return (
+      <main className="lux-player-page lux-player-page-error" role="alert">
+        <div className="lux-player-error-card">
+          <AlertCircle size={36} className="lux-player-error-icon" />
+          <h1>播放会话创建失败</h1>
+          <p>{webPlaybackSession.error.message}</p>
+          <button className="lux-player-glass-btn" type="button" onClick={handleBack}>
+            <ArrowLeft size={16} /> 返回上一页
+          </button>
+        </div>
+      </main>
+    );
+  }
+
   const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPercent = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
   const mediaBadgeText = getMediaBadge(source);
   const subtitleInfo = getSubtitleInfo(media);
+  const playbackPlanError = playbackPlan?.type === "UNSUPPORTED"
+    ? `浏览器和服务端都无法播放这个媒体源（${playbackPlan.reason}）。请尝试其他版本或使用支持该格式的客户端。`
+    : null;
 
   return (
     <main
@@ -641,13 +783,18 @@ export function PlayerPage() {
               toggleFullscreen();
             }}
             onError={() => {
-              setFailedStreamUrl(streamUrl);
-              const reason = engineRef.current?.error?.message;
-              setPlaybackError(
-                reason
-                  ? `客户端播放失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`
-                  : null,
-              );
+              const engine = engineRef.current;
+              const reason = engine?.error?.message;
+              if (engine?.kind === "native") {
+                requestServerFallback(reason);
+              } else {
+                setFailedStreamUrl(streamUrl);
+                setPlaybackError(
+                  reason
+                    ? `客户端解码失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`
+                    : null,
+                );
+              }
             }}
             onLoadedMetadata={handleLoadedMetadata}
             onPlay={() => {
@@ -696,7 +843,7 @@ export function PlayerPage() {
             <div className="lux-player-error-card">
               <AlertCircle size={36} className="lux-player-error-icon" />
               <p className="lux-player-error">
-                {playbackError ??
+                {playbackError ?? playbackPlanError ??
                   "浏览器无法播放这个媒体源。请尝试其他版本或使用支持该格式的客户端。"}
               </p>
               <div className="lux-player-error-actions">

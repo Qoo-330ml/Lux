@@ -18,6 +18,21 @@ describe("MediaDetailPage series hierarchy", () => {
 
   beforeEach(() => {
     vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
+    vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (itemId, sourceId, capabilities) => ({
+      sessionId: `web-${sourceId}`,
+      playSessionId: `lux-web:web-${sourceId}`,
+      sourceId,
+      tier: capabilities.directPlay ? 0 : 4,
+      expiresAt: 1_900_000_000,
+      plan: capabilities.directPlay
+        ? {
+            type: "DIRECT",
+            url: `/api/v1/playback/sessions/web-${sourceId}/direct?expires=1900000000&signature=test`,
+          }
+        : { type: "UNSUPPORTED", reason: "BROWSER_CANNOT_CONSUME_HLS" },
+    }));
+    vi.spyOn(api, "webPlaybackEvent").mockResolvedValue({ accepted: true, duplicate: false, stale: false });
+    vi.spyOn(api, "stopWebPlaybackSession").mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -888,7 +903,7 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector<HTMLVideoElement>("video")?.getAttribute("src"))
-      .toBe("/api/v1/items/episode-1/stream?sourceId=source-hdr");
+      .toBe("/api/v1/playback/sessions/web-source-hdr/direct?expires=1900000000&signature=test");
   });
 
   it("passes a strm source directly to the browser", async () => {
@@ -925,7 +940,7 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector<HTMLVideoElement>("video")?.getAttribute("src"))
-      .toBe("https://example.invalid/video.mkv");
+      .toBe("/api/v1/playback/sessions/web-source-strm/direct?expires=1900000000&signature=test");
   });
 
   it("shows a clear message when the browser cannot play the source", async () => {
@@ -958,6 +973,9 @@ describe("MediaDetailPage series hierarchy", () => {
 
     await act(async () => {
       container.querySelector<HTMLVideoElement>("video")?.dispatchEvent(new Event("error"));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
     expect(container.querySelector(".lux-player-error")?.textContent)
