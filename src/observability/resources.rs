@@ -123,6 +123,13 @@ impl ResourceMetrics {
         );
     }
 
+    pub fn record_metadata_image_retry(&self) {
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        increment_counter(&mut metrics.counters, "retry.image_download.count", 1);
+    }
+
     pub fn record_metadata_image_bytes(&self, bytes: u64) {
         let Ok(mut metrics) = self.metadata.lock() else {
             return;
@@ -799,6 +806,7 @@ mod tests {
         metrics.record_metadata_request("metadata.images", false);
         metrics.record_metadata_request("metadata.images", true);
         metrics.record_metadata_retry("metadata.images");
+        metrics.record_metadata_image_retry();
         metrics.record_metadata_image_bytes(42);
 
         let snapshot = metrics.snapshot().await;
@@ -806,6 +814,7 @@ mod tests {
         assert_eq!(snapshot.metadata.counters["cache.hit.count"], 1);
         assert_eq!(snapshot.metadata.counters["cache.miss.count"], 1);
         assert_eq!(snapshot.metadata.counters["retry.images.count"], 1);
+        assert_eq!(snapshot.metadata.counters["retry.image_download.count"], 1);
         assert_eq!(snapshot.metadata.counters["image.bytes"], 42);
         assert_eq!(snapshot.metadata.stage_p95_ms["images"], 20);
     }

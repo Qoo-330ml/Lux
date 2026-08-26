@@ -32,7 +32,8 @@ use crate::{
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const IMAGE_DOWNLOAD_MAX_RETRIES: u32 = 2;
-const IMAGE_RETRY_DELAY: Duration = Duration::from_millis(250);
+const IMAGE_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const IMAGE_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
 const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
 const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
@@ -615,7 +616,8 @@ impl ImageWriteService {
                         && retryable_image_status(response.status().as_u16()) =>
                 {
                     retry_count += 1;
-                    sleep(IMAGE_RETRY_DELAY * retry_count).await;
+                    self.record_image_retry();
+                    sleep(image_download_retry_delay(retry_count)).await;
                 }
                 Ok(response) => return Ok(response),
                 Err(error)
@@ -623,10 +625,17 @@ impl ImageWriteService {
                         && (error.is_timeout() || error.is_connect()) =>
                 {
                     retry_count += 1;
-                    sleep(IMAGE_RETRY_DELAY * retry_count).await;
+                    self.record_image_retry();
+                    sleep(image_download_retry_delay(retry_count)).await;
                 }
                 Err(error) => return Err(ImageWriteError::Download(error.to_string())),
             }
+        }
+    }
+
+    fn record_image_retry(&self) {
+        if let Some(resources) = &self.resources {
+            resources.record_metadata_image_retry();
         }
     }
 
@@ -1752,9 +1761,21 @@ fn retryable_image_status(status: u16) -> bool {
     status == 429 || (500..=599).contains(&status)
 }
 
+fn image_download_retry_delay(retry_count: u32) -> Duration {
+    let exponent = retry_count.saturating_sub(1).min(31);
+    let factor = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
+    IMAGE_RETRY_BASE_DELAY
+        .checked_mul(factor)
+        .unwrap_or(IMAGE_RETRY_MAX_DELAY)
+        .min(IMAGE_RETRY_MAX_DELAY)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_allowed_scraper_image_url, retryable_image_status};
+    use super::{
+        IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, image_download_retry_delay,
+        is_allowed_scraper_image_url, retryable_image_status,
+    };
 
     #[test]
     fn image_retries_only_transient_upstream_statuses() {
@@ -1763,6 +1784,13 @@ mod tests {
         assert!(retryable_image_status(503));
         assert!(!retryable_image_status(200));
         assert!(!retryable_image_status(404));
+    }
+
+    #[test]
+    fn image_retries_use_bounded_exponential_backoff() {
+        assert_eq!(image_download_retry_delay(1), IMAGE_RETRY_BASE_DELAY);
+        assert_eq!(image_download_retry_delay(2), IMAGE_RETRY_BASE_DELAY * 2);
+        assert_eq!(image_download_retry_delay(99), IMAGE_RETRY_MAX_DELAY);
     }
 
     #[test]
