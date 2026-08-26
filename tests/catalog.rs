@@ -811,6 +811,25 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .is_empty()
     );
 
+    let path_media_source_detail = client
+        .get(format!(
+            "{base_url}/Items/{item_id}?Fields=Path,MediaSources"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(path_media_source_detail.status(), reqwest::StatusCode::OK);
+    let path_media_source_detail_body: Value = path_media_source_detail.json().await?;
+    assert!(path_media_source_detail_body["MediaSources"].is_array());
+    assert_eq!(
+        path_media_source_detail_body["Path"],
+        format!("/media/{}/Alpha Movie.mkv", library.id)
+    );
+    assert!(
+        path_media_source_detail_body.get("People").is_none(),
+        "path/media-source detail lookups should not build the heavy cast payload"
+    );
+
     // Filmly/网易爆米花 sends ShareLevel as a capability hint, while still
     // requiring the complete detail payload needed to start playback.
     let popcorn_detail = client
