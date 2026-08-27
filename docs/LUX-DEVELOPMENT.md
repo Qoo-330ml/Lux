@@ -5066,10 +5066,10 @@ Lux SRT/ASS/SSA/VTT 文本覆盖层。偏移只影响当前选中字幕的显示
 
 验收：
 
-- [ ] 原生 cue 和 Lux cue 都以不可累计的原始时间应用偏移，范围裁剪到媒体时长；反复调整不会漂移。
-- [ ] 关闭/切换字幕、source/engine 变更和 destroy 会恢复/释放旧 cue，不污染下一播放会话。
-- [ ] 无字幕或字幕尚未加载时设置安全可用并显示明确状态；控件具备 label、当前秒数和键盘路径。
-- [ ] ArtPlayer `subtitleOffset.js`/`subtitleOffsetMix.js` 仅作生命周期参考，Lux 保持自有解析器和 DOM。
+- [x] 原生 cue 和 Lux cue 都以不可累计的原始时间应用偏移，范围裁剪到媒体时长；反复调整不会漂移。
+- [x] 关闭/切换字幕、source/engine 变更和 destroy 会恢复/释放旧 cue，不污染下一播放会话。
+- [x] 无字幕或字幕尚未加载时设置安全可用并显示明确状态；控件具备 label、当前秒数和键盘路径。
+- [x] ArtPlayer `subtitleOffset.js`/`subtitleOffsetMix.js` 仅作生命周期参考，Lux 保持自有解析器和 DOM。
 
 验证：VTT/native track 与覆盖层单测、source 生命周期组件测试、`pnpm --dir web test`、`pnpm --dir web build`。
 
