@@ -41,6 +41,8 @@ import {
 } from "./playback-engine";
 import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
 import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
+import { LuxPlayerRuntime } from "./core/player-runtime";
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
@@ -213,6 +215,7 @@ export function PlayerPage() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const lastVideoRef = useRef<HTMLVideoElement | null>(null);
   const engineRef = useRef<PlaybackEngine | null>(null);
+  const runtimeRef = useRef<LuxPlayerRuntime | null>(null);
   const lastProgressReportRef = useRef(0);
   const hasStartedRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
@@ -226,7 +229,13 @@ export function PlayerPage() {
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
     if (!video) {
-      engineRef.current?.destroy();
+      const runtime = runtimeRef.current;
+      runtimeRef.current = null;
+      if (runtime?.element) {
+        runtime.destroy();
+      } else {
+        engineRef.current?.destroy();
+      }
       engineRef.current = null;
       videoRef.current = null;
       return;
@@ -387,6 +396,8 @@ export function PlayerPage() {
     const initialEngine = engineRef.current
       ?? (videoRef.current ? new NativeVideoEngine(videoRef.current) : null);
     if (!initialEngine || !streamUrl) return;
+    const runtime = runtimeRef.current ?? new LuxPlayerRuntime();
+    runtimeRef.current = runtime;
     engineRef.current = initialEngine;
     let activeEngine: PlaybackEngine = initialEngine;
     let performanceElement: HTMLVideoElement | null = null;
@@ -422,7 +433,17 @@ export function PlayerPage() {
           }
         }
         if (cancelled) return;
-        await activeEngine.setSource(streamUrl, poster);
+        await runtime.load(
+          new LegacyPlaybackEngineAdapter(
+            activeEngine,
+            playbackPlan?.type === "SERVER_HLS" ? "hls" : undefined,
+          ),
+          {
+            id: source?.id ?? "",
+            url: streamUrl,
+            poster,
+          },
+        );
         if (!cancelled && activeEngine.performance)
           handlePerformance(
             new CustomEvent(PLAYBACK_PERFORMANCE_EVENT, {
@@ -449,7 +470,8 @@ export function PlayerPage() {
     return () => {
       cancelled = true;
       performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
-      activeEngine.destroy();
+      runtime.destroy();
+      if (runtimeRef.current === runtime) runtimeRef.current = null;
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
   }, [playbackPlan?.type, poster, requestServerFallback, source, streamUrl]);
