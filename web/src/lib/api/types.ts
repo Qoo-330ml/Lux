@@ -86,6 +86,13 @@ export type MediaStream = {
   details?: Record<string, unknown>;
 };
 
+export type MediaChapter = {
+  startPositionTicks: number;
+  name?: string | null;
+  markerType: string;
+  chapterIndex: number;
+};
+
 export type MediaSource = {
   id: string;
   sourceKind?: string | null;
@@ -99,6 +106,8 @@ export type MediaSource = {
   probeStatus?: string | null;
   isDefault?: boolean;
   streams?: MediaStream[];
+  /** Chapters belong to this media source; absent in older cached responses. */
+  chapters?: MediaChapter[];
 };
 
 export type MediaActor = {

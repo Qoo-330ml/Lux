@@ -12393,7 +12393,23 @@ async fn lux_get_person_image_inner(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+const MAX_LUX_CHAPTERS_PER_SOURCE: usize = 1_000;
+
 fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) -> Value {
+    let mut chapters = source
+        .chapters
+        .iter()
+        .filter(|chapter| chapter.start_position_ticks >= 0 && chapter.chapter_index >= 0)
+        .collect::<Vec<_>>();
+    chapters.sort_by(|left, right| {
+        left.start_position_ticks
+            .cmp(&right.start_position_ticks)
+            .then_with(|| {
+                lux_chapter_marker_rank(&left.marker_type)
+                    .cmp(&lux_chapter_marker_rank(&right.marker_type))
+            })
+            .then(left.chapter_index.cmp(&right.chapter_index))
+    });
     json!({
         "id": source.id,
         "sourceKind": source.source_kind,
@@ -12417,6 +12433,29 @@ fn lux_catalog_source_json(source: &crate::application::catalog::CatalogSource) 
             "isForced": stream.is_forced,
             "details": &stream.details,
         })).collect::<Vec<_>>(),
+        "chapters": chapters
+            .into_iter()
+            .take(MAX_LUX_CHAPTERS_PER_SOURCE)
+            .map(lux_catalog_chapter_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn lux_chapter_marker_rank(marker_type: &str) -> u8 {
+    match marker_type {
+        "INTRO_START" => 0,
+        "INTRO_END" => 1,
+        "CREDITS_START" => 2,
+        _ => 99,
+    }
+}
+
+fn lux_catalog_chapter_json(chapter: &crate::application::catalog::CatalogChapter) -> Value {
+    json!({
+        "startPositionTicks": chapter.start_position_ticks,
+        "name": chapter.name,
+        "markerType": chapter.marker_type,
+        "chapterIndex": chapter.chapter_index,
     })
 }
 
@@ -21415,6 +21454,51 @@ mod tests {
         assert!(without_chapters.get("Chapters").is_none());
         let with_chapters = emby_media_source_json_with_resolver("item-1", &source, false, false);
         assert_eq!(with_chapters["Chapters"].as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn lux_media_source_chapters_are_sorted_bounded_and_source_local() {
+        let mut chapters = (0_i64..=1_000)
+            .rev()
+            .map(|index| CatalogChapter {
+                start_position_ticks: index,
+                name: Some(format!("chapter-{index}")),
+                marker_type: "CHAPTER".to_owned(),
+                chapter_index: index,
+            })
+            .collect::<Vec<_>>();
+        chapters.push(CatalogChapter {
+            start_position_ticks: -1,
+            name: Some("invalid".to_owned()),
+            marker_type: "CHAPTER".to_owned(),
+            chapter_index: 0,
+        });
+        let source = CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "LOCAL_FILE".to_owned(),
+            container: None,
+            size: None,
+            external_url: None,
+            edition_name: None,
+            quality_label: None,
+            bitrate: None,
+            duration_ticks: None,
+            is_default: true,
+            probe_status: "READY".to_owned(),
+            streams: Vec::new(),
+            chapters,
+        };
+
+        let body = lux_catalog_source_json(&source);
+        let chapters = body["chapters"]
+            .as_array()
+            .expect("chapters should be an array");
+        assert_eq!(chapters.len(), super::MAX_LUX_CHAPTERS_PER_SOURCE);
+        assert_eq!(chapters[0]["startPositionTicks"], 0);
+        assert_eq!(chapters[999]["startPositionTicks"], 999);
+        assert_eq!(chapters[0]["markerType"], "CHAPTER");
+        assert_eq!(chapters[0]["chapterIndex"], 0);
+        assert!(chapters[0].get("sourceId").is_none());
     }
 
     #[test]

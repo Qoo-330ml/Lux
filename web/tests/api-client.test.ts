@@ -23,6 +23,33 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
   });
 
+  it("decodes chapters scoped to each Lux media source", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        id: "item-1",
+        mediaSources: [{
+          id: "source-1",
+          chapters: [{
+            startPositionTicks: 10_000_000,
+            name: null,
+            markerType: "INTRO_START",
+            chapterIndex: 0,
+          }],
+        }],
+      }), { status: 200 }),
+    );
+
+    const item = await new LuxApiClient().item("item/1");
+
+    expect(item.mediaSources?.[0]?.chapters).toEqual([{
+      startPositionTicks: 10_000_000,
+      name: null,
+      markerType: "INTRO_START",
+      chapterIndex: 0,
+    }]);
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/items/item%2F1");
+  });
+
   it("requests paginated actor search and person works through the Lux API", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ items: [], total: 0, page: 2, pageSize: 12 }), { status: 200 }),

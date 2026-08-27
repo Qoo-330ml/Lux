@@ -10,8 +10,8 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::AUTHORIZATION;
-use serde_json::Value;
+use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
 #[tokio::test]
@@ -146,6 +146,42 @@ async fn emby_exposes_source_scoped_intro_outro_markers() -> Result<(), Box<dyn 
         .ok_or("missing admin token")?
         .to_owned();
 
+    let web_login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({"username": "admin", "password": "correct password"}))
+        .send()
+        .await?;
+    assert_eq!(web_login.status(), reqwest::StatusCode::OK);
+    let web_cookie = cookie_pair(web_login.headers());
+    let lux_item = client
+        .get(format!("http://{address}/api/v1/items/{item_id}"))
+        .header(COOKIE, &web_cookie)
+        .send()
+        .await?;
+    assert_eq!(lux_item.status(), reqwest::StatusCode::OK);
+    let lux_body = lux_item.json::<Value>().await?;
+    let lux_sources = lux_body["mediaSources"]
+        .as_array()
+        .ok_or("missing Lux media sources")?;
+    let lux_base = lux_sources
+        .iter()
+        .find(|source| source["id"] == sources[0].0)
+        .ok_or("missing Lux base source")?;
+    assert_eq!(lux_base["chapters"].as_array().map(Vec::len), Some(1));
+    assert_eq!(lux_base["chapters"][0]["startPositionTicks"], 10_000_000);
+    assert_eq!(lux_base["chapters"][0]["markerType"], "INTRO_START");
+    assert!(lux_base["chapters"][0]["name"].is_null());
+    assert!(lux_base["chapters"][0].get("providerId").is_none());
+    let lux_high = lux_sources
+        .iter()
+        .find(|source| source["id"] == sources[1].0)
+        .ok_or("missing Lux high source")?;
+    assert_eq!(lux_high["chapters"].as_array().map(Vec::len), Some(1));
+    assert_eq!(lux_high["chapters"][0]["startPositionTicks"], 900_000_000);
+    assert_eq!(lux_high["chapters"][0]["name"], "片尾");
+    assert_eq!(lux_high["chapters"][0]["chapterIndex"], 2);
+    assert!(lux_high["chapters"][0].get("confidence").is_none());
+
     let item = client
         .get(format!("http://{address}/Items/{item_id}?Fields=Chapters"))
         .header("X-Emby-Token", &token)
@@ -250,4 +286,14 @@ async fn emby_exposes_source_scoped_intro_outro_markers() -> Result<(), Box<dyn 
     database.close().await;
     let _ = admin;
     Ok(())
+}
+
+fn cookie_pair(headers: &reqwest::header::HeaderMap) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .collect::<Vec<_>>()
+        .join("; ")
 }
