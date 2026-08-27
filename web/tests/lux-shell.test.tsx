@@ -89,6 +89,22 @@ describe("LuxShell user control", () => {
     expect(document.title).toBe("客厅 Lux - Lux");
   });
 
+  it("uses the built-in server title while the server name is unavailable", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      renderWithProviders(root,
+        <MemoryRouter>
+          <LuxShell user={{ id: "user-1", usernameNormalized: "test" }} />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(document.title).toBe("Lux Server - Lux");
+  });
+
   it("puts the current user id in the account route", () => {
     container = document.createElement("div");
     document.body.append(container);

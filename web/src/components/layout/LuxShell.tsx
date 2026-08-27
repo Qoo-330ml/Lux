@@ -17,6 +17,8 @@ import { ScanActivityPopover } from "../../features/activity/ScanActivityPopover
 import { useUserEvents } from "../../features/activity/useUserEvents";
 import { LuxLogo } from "../LuxLogo";
 
+const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
+
 type LuxShellProps = { user: LuxUser; serverName?: string | null };
 type AvatarContextValue = {
   avatarUrl: string | null;
@@ -62,9 +64,10 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
     if (isDetail) return;
 
     const name = serverName?.trim();
-    document.title = name ? `${name} - Lux` : "Lux";
+    const serverTitle = name ? `${name} - Lux` : DEFAULT_BROWSER_TITLE;
+    document.title = serverTitle;
     return () => {
-      document.title = "Lux";
+      document.title = serverTitle;
     };
   }, [isDetail, serverName]);
 
