@@ -12,7 +12,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use crate::{
     application::{
         home::HomeService,
-        images::{ImageWriteError, ImageWriteService, image_no_candidate_key},
+        images::{ImageWriteError, ImageWriteService, MAX_IMAGE_VARIANTS, image_no_candidate_key},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
         nfo::{MovieNfoCredit, MovieNfoMetadata, NfoWriteError, NfoWriteService},
@@ -1379,6 +1379,20 @@ fn current_provider_ids(current: &StoredMediaMetadata) -> BTreeMap<String, Strin
         .unwrap_or_default()
 }
 
+fn insert_provider_id_if_missing(
+    provider_ids: &mut BTreeMap<String, String>,
+    provider: &str,
+    provider_id: &str,
+) {
+    if provider_ids
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case(provider))
+    {
+        return;
+    }
+    provider_ids.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+}
+
 fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, String)> {
     let provider_ids = current_provider_ids(current);
     let Some(source) = current
@@ -1802,6 +1816,7 @@ struct MetadataSelectionOptions<'a> {
     keep_pending: bool,
     scraper_id: Option<&'a str>,
     supplemental: bool,
+    preserve_identity: bool,
     image_policy: Option<ImageSelectionPolicy>,
 }
 
@@ -1847,23 +1862,40 @@ impl MetadataSelectionService {
         self
     }
 
-    pub(crate) async fn fill_missing_request_plan(
-        &self,
-        item_id: &str,
-    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        let current = self
-            .database
-            .find_media_item_metadata(item_id)
-            .await?
-            .ok_or(MetadataSelectionError::ItemNotFound)?;
-        self.fill_missing_request_plan_for_current(item_id, &current)
-            .await
-    }
-
     pub(crate) async fn fill_missing_request_plan_for_current(
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+        self.fill_missing_request_plan_for_current_with_options(item_id, current, false)
+            .await
+    }
+
+    pub(crate) async fn fallback_request_plan_for_current(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+        self.fill_missing_request_plan_for_current_with_options(item_id, current, true)
+            .await
+    }
+
+    pub(crate) async fn supplemental_request_plan(
+        &self,
+        item_id: &str,
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+        let image_policy = self.image_selection_policy(item_id).await?;
+        Ok(MetadataRequestPlan {
+            image_policy: Some(image_policy),
+            ..MetadataRequestPlan::full()
+        })
+    }
+
+    async fn fill_missing_request_plan_for_current_with_options(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+        ignore_attempt_history: bool,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
             return Ok(MetadataRequestPlan::full());
@@ -1887,7 +1919,8 @@ impl MetadataSelectionService {
             if local_image_types.contains(image_type) {
                 continue;
             }
-            let explicitly_unavailable = !image_attempt_identities.is_empty()
+            let explicitly_unavailable = !ignore_attempt_history
+                && !image_attempt_identities.is_empty()
                 && image_attempt_identities
                     .iter()
                     .all(|(source, provider_id)| {
@@ -1927,24 +1960,26 @@ impl MetadataSelectionService {
             metadata_request_plan(current, images_missing, credits_missing, details.as_ref());
         plan.image_policy = Some(image_policy);
         let capability_identity = selected_capability_identity(current);
-        plan.needs_credits = plan.needs_credits
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_CREDITS,
-            );
-        plan.needs_external_ids = plan.needs_external_ids
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_EXTERNAL_IDS,
-            );
-        plan.needs_trailers = plan.needs_trailers
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_TRAILERS,
-            );
+        if !ignore_attempt_history {
+            plan.needs_credits = plan.needs_credits
+                && capability_needs_request(
+                    &capability_states,
+                    capability_identity.as_ref(),
+                    CAPABILITY_CREDITS,
+                );
+            plan.needs_external_ids = plan.needs_external_ids
+                && capability_needs_request(
+                    &capability_states,
+                    capability_identity.as_ref(),
+                    CAPABILITY_EXTERNAL_IDS,
+                );
+            plan.needs_trailers = plan.needs_trailers
+                && capability_needs_request(
+                    &capability_states,
+                    capability_identity.as_ref(),
+                    CAPABILITY_TRAILERS,
+                );
+        }
         if !has_selected_provider_id(current) {
             plan.needs_metadata = true;
         }
@@ -1965,6 +2000,7 @@ impl MetadataSelectionService {
                 keep_pending: false,
                 scraper_id: None,
                 supplemental: false,
+                preserve_identity: false,
                 image_policy: None,
             },
         )
@@ -2007,6 +2043,7 @@ impl MetadataSelectionService {
                 keep_pending: false,
                 scraper_id,
                 supplemental,
+                preserve_identity: false,
                 image_policy,
             },
         )
@@ -2030,6 +2067,7 @@ impl MetadataSelectionService {
                 keep_pending: true,
                 scraper_id,
                 supplemental,
+                preserve_identity: false,
                 image_policy,
             },
         )
@@ -2050,6 +2088,7 @@ impl MetadataSelectionService {
                 keep_pending: true,
                 scraper_id: None,
                 supplemental: false,
+                preserve_identity: false,
                 image_policy: None,
             },
         )
@@ -2094,6 +2133,28 @@ impl MetadataSelectionService {
             .ok_or(MetadataSelectionError::CandidateNotFound)?;
         self.select(item_id, &candidate.id, MetadataSelectionMode::FillMissing)
             .await
+    }
+
+    pub(crate) async fn select_fallback_with_scraper_and_policy(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        scraper_id: &str,
+        image_policy: Option<ImageSelectionPolicy>,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(
+            item_id,
+            candidate_id,
+            MetadataSelectionMode::FillMissing,
+            MetadataSelectionOptions {
+                keep_pending: false,
+                scraper_id: Some(scraper_id),
+                supplemental: false,
+                preserve_identity: true,
+                image_policy,
+            },
+        )
+        .await
     }
 
     async fn select_internal(
@@ -2157,7 +2218,14 @@ impl MetadataSelectionService {
         let mut movie_nfo = payload.movie_nfo.clone();
         movie_nfo.base = state.metadata.clone();
         let image_types = self
-            .write_selected_images(item_id, &payload, image_policy, image_source, mode)
+            .write_selected_images(
+                item_id,
+                &payload,
+                image_policy,
+                image_source,
+                mode,
+                options.supplemental,
+            )
             .await?;
         let has_primary_artwork = image_types
             .iter()
@@ -2177,18 +2245,17 @@ impl MetadataSelectionService {
         self.resources
             .record_metadata_stage("nfo_write", nfo_started.elapsed());
         let mut provider_ids = current_provider_ids(&current);
-        provider_ids.extend(movie_nfo.provider_ids.clone());
-        if options.supplemental {
-            if !provider_ids
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case(&candidate.provider))
-            {
-                provider_ids.insert(
-                    candidate.provider.to_ascii_lowercase(),
-                    candidate.provider_id.clone(),
-                );
+        if options.supplemental || options.preserve_identity {
+            for (provider, provider_id) in &movie_nfo.provider_ids {
+                insert_provider_id_if_missing(&mut provider_ids, provider, provider_id);
             }
+            insert_provider_id_if_missing(
+                &mut provider_ids,
+                &candidate.provider,
+                &candidate.provider_id,
+            );
         } else {
+            provider_ids.extend(movie_nfo.provider_ids.clone());
             provider_ids.insert(
                 candidate.provider.to_ascii_lowercase(),
                 candidate.provider_id.clone(),
@@ -2212,7 +2279,9 @@ impl MetadataSelectionService {
                 rating: payload.rating,
                 rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
                 provider_ids_json: &provider_ids_json,
-                metadata_scraper_id: (!options.supplemental && !options.keep_pending)
+                metadata_scraper_id: (!options.supplemental
+                    && !options.preserve_identity
+                    && !options.keep_pending)
                     .then_some(options.scraper_id)
                     .flatten(),
                 metadata_fingerprint: &nfo_report.fingerprint,
@@ -2251,27 +2320,54 @@ impl MetadataSelectionService {
         image_policy: ImageSelectionPolicy,
         source: &str,
         mode: MetadataSelectionMode,
+        supplemental: bool,
     ) -> Result<Vec<&'static str>, MetadataSelectionError> {
-        let specs = if payload.typed_images_present {
-            image_policy
-                .enabled_types()
-                .filter_map(|image_type| {
-                    let urls = payload.images.get(image_type)?.clone();
-                    (!urls.is_empty()).then_some((image_type, urls))
-                })
-                .collect::<Vec<_>>()
+        let mut specs = Vec::new();
+        macro_rules! add_spec {
+            ($image_type:expr, $urls:expr) => {
+                let urls = $urls;
+                if !urls.is_empty() {
+                    specs.push(($image_type, urls, 0_i64));
+                }
+            };
+        }
+        if payload.typed_images_present {
+            for image_type in image_policy.enabled_types() {
+                if let Some(urls) = payload.images.get(image_type).cloned() {
+                    if image_type == "FANART" && supplemental {
+                        let start = self.images.next_image_index(item_id, image_type).await?;
+                        for (offset, url) in urls.into_iter().take(MAX_IMAGE_VARIANTS).enumerate() {
+                            specs.push((
+                                image_type,
+                                vec![url],
+                                start.saturating_add(i64::try_from(offset).unwrap_or(0)),
+                            ));
+                        }
+                    } else if image_type == "FANART" {
+                        for (offset, url) in urls.into_iter().take(MAX_IMAGE_VARIANTS).enumerate() {
+                            specs.push((image_type, vec![url], i64::try_from(offset).unwrap_or(0)));
+                        }
+                    } else {
+                        add_spec!(image_type, urls);
+                    }
+                }
+            }
         } else {
-            [
-                ("POSTER", payload.poster_url.clone()),
-                ("FANART", payload.fanart_url.clone()),
-            ]
-            .into_iter()
-            .filter_map(|(image_type, url)| url.map(|url| (image_type, vec![url])))
-            .collect::<Vec<_>>()
-        };
+            if let Some(url) = payload.poster_url.clone() {
+                add_spec!("POSTER", vec![url]);
+            }
+            if let Some(url) = payload.fanart_url.clone() {
+                if supplemental {
+                    let start = self.images.next_image_index(item_id, "FANART").await?;
+                    specs.push(("FANART", vec![url], start));
+                } else {
+                    specs.push(("FANART", vec![url], 0));
+                }
+            }
+        }
         let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
         let mut tasks = JoinSet::new();
-        for (index, (image_type, urls)) in specs.into_iter().enumerate() {
+        for (index, (image_type, urls, image_index)) in specs.into_iter().enumerate() {
             let permit = item_permits.clone().acquire_owned().await.map_err(|_| {
                 MetadataSelectionError::InvalidCandidate("image semaphore closed".to_owned())
             })?;
@@ -2285,17 +2381,33 @@ impl MetadataSelectionService {
                     let result = match mode {
                         MetadataSelectionMode::FillMissing => {
                             images
-                                .try_download_item_image_if_missing_from_scraper(
-                                    &item_id, image_type, &url, &source,
+                                .try_download_item_image_if_missing_from_scraper_at_index(
+                                    &item_id,
+                                    image_type,
+                                    &url,
+                                    &source,
+                                    image_index,
                                 )
                                 .await
                         }
                         MetadataSelectionMode::RefreshUnlocked => {
-                            images
-                                .download_item_image_from_scraper(
-                                    &item_id, image_type, &url, &source,
-                                )
-                                .await
+                            if image_index == 0 {
+                                images
+                                    .download_item_image_from_scraper(
+                                        &item_id, image_type, &url, &source,
+                                    )
+                                    .await
+                            } else {
+                                images
+                                    .download_item_image_from_scraper_at_index(
+                                        &item_id,
+                                        image_type,
+                                        &url,
+                                        &source,
+                                        image_index,
+                                    )
+                                    .await
+                            }
                         }
                     };
                     match result {
@@ -2330,10 +2442,13 @@ impl MetadataSelectionService {
             }
         }
         image_types.sort_unstable_by_key(|(index, _)| *index);
-        Ok(image_types
-            .into_iter()
-            .map(|(_, image_type)| image_type)
-            .collect())
+        let mut result = Vec::new();
+        for (_, image_type) in image_types {
+            if !result.contains(&image_type) {
+                result.push(image_type);
+            }
+        }
+        Ok(result)
     }
 
     async fn image_selection_policy(
@@ -2609,7 +2724,7 @@ fn fill_missing_scalar_values_complete(current: &StoredMediaMetadata) -> bool {
     }
 }
 
-fn has_selected_provider_id(current: &StoredMediaMetadata) -> bool {
+pub(crate) fn has_selected_provider_id(current: &StoredMediaMetadata) -> bool {
     let Some(scraper) = current
         .metadata_scraper_id
         .as_deref()

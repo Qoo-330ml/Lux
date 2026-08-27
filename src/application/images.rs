@@ -8,6 +8,7 @@ use std::{
 };
 
 use reqwest::{Client, Url, header::CONTENT_TYPE};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
@@ -40,9 +41,24 @@ const IMAGE_ATTEMPT_LEASE: Duration = Duration::from_secs(5 * 60);
 const IMAGE_RETRY_BASE_SECONDS: i64 = 60;
 const IMAGE_RETRY_MAX_SECONDS: i64 = 6 * 60 * 60;
 const IMAGE_GLOBAL_CONCURRENCY: usize = 16;
+pub(crate) const MAX_IMAGE_VARIANTS: usize = 4;
 
 static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMediaImageSettings {
+    #[serde(default)]
+    write_to_metadata: bool,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredMediaImageStrategy {
+    #[serde(default)]
+    images: StoredMediaImageSettings,
+}
 
 fn global_image_download_permits() -> Arc<Semaphore> {
     IMAGE_GLOBAL_DOWNLOAD_PERMITS
@@ -245,15 +261,50 @@ impl ImageWriteService {
             .await
     }
 
-    pub(crate) async fn try_download_item_image_if_missing_from_scraper(
+    pub(crate) async fn try_download_item_image_if_missing_from_scraper_at_index(
         &self,
         item_id: &str,
         image_type: &str,
         image_url: &str,
         source: &str,
+        image_index: i64,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        self.download_item_image_if_missing_impl(item_id, image_type, image_url, source)
-            .await
+        let normalized_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        if self
+            .local_image_exists_at_index(item_id, normalized_type, image_index)
+            .await?
+        {
+            if image_index == 0
+                && normalized_type == "THUMB"
+                && self
+                    .database
+                    .find_item_image_source(item_id, "THUMB")
+                    .await?
+                    .is_some_and(|value| value.eq_ignore_ascii_case("STRM_FFMPEG"))
+            {
+                return self
+                    .download_item_image_attempt_at_index(
+                        item_id,
+                        normalized_type,
+                        image_url,
+                        source,
+                        image_index,
+                        true,
+                    )
+                    .await;
+            }
+            return Ok(None);
+        }
+        self.download_item_image_attempt_at_index(
+            item_id,
+            normalized_type,
+            image_url,
+            source,
+            image_index,
+            false,
+        )
+        .await
     }
 
     async fn download_item_image_if_missing_impl(
@@ -263,23 +314,10 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        if self.local_image_exists(item_id, image_type).await? {
-            if image_type.eq_ignore_ascii_case("THUMB")
-                && self
-                    .database
-                    .find_item_image_source(item_id, "THUMB")
-                    .await?
-                    .is_some_and(|value| value.eq_ignore_ascii_case("STRM_FFMPEG"))
-            {
-                return self
-                    .download_item_image_attempt(item_id, image_type, image_url, source, true)
-                    .await;
-            }
-            return Ok(None);
-        }
-
-        self.download_item_image_attempt(item_id, image_type, image_url, source, false)
-            .await
+        self.try_download_item_image_if_missing_from_scraper_at_index(
+            item_id, image_type, image_url, source, 0,
+        )
+        .await
     }
 
     async fn download_item_image_attempt(
@@ -288,6 +326,19 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
         source: &str,
+        force: bool,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
+        self.download_item_image_attempt_at_index(item_id, image_type, image_url, source, 0, force)
+            .await
+    }
+
+    async fn download_item_image_attempt_at_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+        image_index: i64,
         force: bool,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
         let normalized_type = normalize_image_type(image_type)
@@ -311,7 +362,14 @@ impl ImageWriteService {
         }
 
         let result = self
-            .download_item_image_impl(item_id, normalized_type, image_url, source, true)
+            .download_item_image_impl(
+                item_id,
+                normalized_type,
+                image_url,
+                source,
+                image_index,
+                true,
+            )
             .await;
         match result {
             Ok(report) => {
@@ -439,19 +497,30 @@ impl ImageWriteService {
     ) -> Result<bool, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        self.local_image_exists_at_index(item_id, image_type, 0)
+            .await
+    }
+
+    async fn local_image_exists_at_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+    ) -> Result<bool, ImageWriteError> {
         if let Some(config_dir) = self.config_dir.as_ref()
             && self
-                .metadata_image_exists(config_dir, item_id, image_type)
+                .metadata_image_exists_at_index(config_dir, item_id, image_type, image_index)
                 .await?
         {
             return Ok(true);
         }
         let (_, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
-        let Some(path) = find_any_image_path(
+        let Some(path) = find_image_path_at_index(
             &directory,
             image_type,
             movie_stem.as_deref(),
             episode_stem.as_deref(),
+            image_index,
         )
         .await?
         else {
@@ -460,11 +529,12 @@ impl ImageWriteService {
         image_file_stamp(&path).await.map(|_| true)
     }
 
-    async fn metadata_image_exists(
+    async fn metadata_image_exists_at_index(
         &self,
         config_dir: &Path,
         item_id: &str,
         image_type: &str,
+        image_index: i64,
     ) -> Result<bool, ImageWriteError> {
         let directory = library_item_directory(config_dir, item_id)
             .map_err(|error| ImageWriteError::InvalidConfiguration(error.to_string()))?;
@@ -483,7 +553,9 @@ impl ImageWriteService {
                 ),
             });
         }
-        let Some(path) = find_any_image_path(&directory, image_type, None, None).await? else {
+        let Some(path) =
+            find_image_path_at_index(&directory, image_type, None, None, image_index).await?
+        else {
             return Ok(false);
         };
         image_file_stamp(&path).await.map(|stamp| stamp.is_some())
@@ -519,11 +591,14 @@ impl ImageWriteService {
             reject_metadata_symlinks(&directory).await?;
             let paths = read_image_directory_entries(&directory).await?;
             for image_type in &image_types {
-                let (_, generic_stem) = image_file_stems(image_type, None, None)?;
-                if let Some(path) = find_existing_image_path_in_paths(&paths, &[generic_stem])
-                    && image_file_stamp(&path).await?.is_some()
-                {
-                    found.insert((*image_type).to_owned());
+                for image_index in 0..MAX_IMAGE_VARIANTS {
+                    let stems = image_lookup_stems(image_type, None, None, image_index as i64)?;
+                    if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
+                        && image_file_stamp(&path).await?.is_some()
+                    {
+                        found.insert((*image_type).to_owned());
+                        break;
+                    }
                 }
             }
         }
@@ -534,16 +609,19 @@ impl ImageWriteService {
             if found.contains(*image_type) {
                 continue;
             }
-            let (prefixed_stem, generic_stem) =
-                image_file_stems(image_type, movie_stem.as_deref(), episode_stem.as_deref())?;
-            let stems = prefixed_stem
-                .into_iter()
-                .chain(std::iter::once(generic_stem))
-                .collect::<Vec<_>>();
-            if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
-                && image_file_stamp(&path).await?.is_some()
-            {
-                found.insert((*image_type).to_owned());
+            for image_index in 0..MAX_IMAGE_VARIANTS {
+                let stems = image_lookup_stems(
+                    image_type,
+                    movie_stem.as_deref(),
+                    episode_stem.as_deref(),
+                    image_index as i64,
+                )?;
+                if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
+                    && image_file_stamp(&path).await?.is_some()
+                {
+                    found.insert((*image_type).to_owned());
+                    break;
+                }
             }
         }
         Ok(found)
@@ -565,6 +643,7 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
         source: &str,
+        image_index: i64,
         reuse_existing_path: bool,
     ) -> Result<ImageWriteReport, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
@@ -639,31 +718,47 @@ impl ImageWriteService {
         validate_image_payload(format, &body)?;
         drop(_download_permit);
 
-        let (root, directory, movie_stem, episode_stem) = if let Some(config_dir) =
-            self.config_dir.as_ref()
-        {
-            let root = metadata_root(config_dir);
-            let directory = self.metadata_image_directory(config_dir, item_id).await?;
-            let canonical_root = fs::canonicalize(&root)
-                .await
-                .map_err(|source| image_io_error(&root, source))?;
-            (canonical_root, directory, None, None)
-        } else {
-            let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
-            (root, directory, movie_stem, episode_stem)
-        };
+        let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
         let target = image_target(
             &directory,
             image_type,
             format,
             movie_stem.as_deref(),
             episode_stem.as_deref(),
+            image_index,
             reuse_existing_path,
         )
         .await?;
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
         }
+        let metadata_target =
+            if self.config_dir.is_some() && self.write_to_metadata(item_id).await? {
+                let config_dir = self.config_dir.as_ref().ok_or_else(|| {
+                    ImageWriteError::InvalidConfiguration("missing config directory".to_owned())
+                })?;
+                let metadata_root_path = metadata_root(config_dir);
+                let metadata_directory = self.metadata_image_directory(config_dir, item_id).await?;
+                let canonical_metadata_root = fs::canonicalize(&metadata_root_path)
+                    .await
+                    .map_err(|source| image_io_error(&metadata_root_path, source))?;
+                let metadata_target = image_target(
+                    &metadata_directory,
+                    image_type,
+                    format,
+                    None,
+                    None,
+                    image_index,
+                    true,
+                )
+                .await?;
+                if !metadata_target.starts_with(&canonical_metadata_root) {
+                    return Err(ImageWriteError::PathOutsideRoot(metadata_target));
+                }
+                Some(metadata_target)
+            } else {
+                None
+            };
         let _write_permit = self
             .write_permits
             .clone()
@@ -674,6 +769,9 @@ impl ImageWriteService {
             })?;
         let write_started = std::time::Instant::now();
         write_image_atomically(&target, &body).await?;
+        if let Some(metadata_target) = metadata_target.as_deref() {
+            write_image_atomically(metadata_target, &body).await?;
+        }
 
         let file_size = i64::try_from(body.len()).map_err(|_| ImageWriteError::TooLarge {
             size,
@@ -683,9 +781,10 @@ impl ImageWriteService {
         let dimensions = read_image_dimensions(&target).await;
         let id = self
             .database
-            .upsert_item_image(
+            .upsert_item_image_at_index(
                 item_id,
                 image_type,
+                image_index,
                 &target,
                 ItemImageMetadata {
                     file_size,
@@ -768,6 +867,24 @@ impl ImageWriteService {
         Ok(canonical_directory)
     }
 
+    async fn write_to_metadata(&self, item_id: &str) -> Result<bool, ImageWriteError> {
+        let library_id = self
+            .database
+            .find_item_library_id(item_id)
+            .await?
+            .ok_or(ImageWriteError::ItemNotFound)?;
+        let library = self
+            .database
+            .find_library(&library_id)
+            .await?
+            .ok_or(ImageWriteError::ItemNotFound)?;
+        let global = self.database.media_strategy_settings().await?;
+        let stored = library.media_strategy_json.as_deref().or(global.as_deref());
+        Ok(stored
+            .and_then(|value| serde_json::from_str::<StoredMediaImageStrategy>(value).ok())
+            .is_some_and(|strategy| strategy.images.write_to_metadata))
+    }
+
     pub async fn download_item_image_from_scraper_candidate(
         &self,
         item_id: &str,
@@ -807,6 +924,50 @@ impl ImageWriteService {
             .await
     }
 
+    pub(crate) async fn download_item_image_from_scraper_at_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_url: &str,
+        source: &str,
+        image_index: i64,
+    ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
+        if !is_allowed_scraper_image_url(image_url) {
+            return Err(ImageWriteError::InvalidUrl(
+                "scraper image URL must be a valid HTTPS URL".to_owned(),
+            ));
+        }
+        self.download_item_image_attempt_at_index(
+            item_id,
+            image_type,
+            image_url,
+            source,
+            image_index,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn next_image_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+    ) -> Result<i64, ImageWriteError> {
+        let image_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        if image_type != "FANART" {
+            return Ok(0);
+        }
+        let images = self.database.list_item_images(item_id).await?;
+        Ok(images
+            .iter()
+            .filter(|image| image.image_type.eq_ignore_ascii_case(image_type))
+            .map(|image| image.image_index)
+            .max()
+            .unwrap_or(-1)
+            .saturating_add(1))
+    }
+
     async fn download_item_image_with_source(
         &self,
         item_id: &str,
@@ -814,7 +975,7 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        self.download_item_image_impl(item_id, image_type, image_url, source, false)
+        self.download_item_image_impl(item_id, image_type, image_url, source, 0, false)
             .await
     }
 
@@ -1172,14 +1333,10 @@ async fn image_target(
     format: ImageFormat,
     movie_stem: Option<&str>,
     episode_stem: Option<&str>,
+    image_index: i64,
     reuse_existing_path: bool,
 ) -> Result<PathBuf, ImageWriteError> {
-    let (prefixed_stem, generic_stem) = image_file_stems(image_type, movie_stem, episode_stem)?;
-    let mut stems = Vec::with_capacity(2);
-    if let Some(prefixed_stem) = prefixed_stem.as_ref() {
-        stems.push(prefixed_stem.clone());
-    }
-    stems.push(generic_stem.clone());
+    let stems = image_lookup_stems(image_type, movie_stem, episode_stem, image_index)?;
     if reuse_existing_path {
         if let Some(existing) = find_existing_image_path(directory, &stems, None).await? {
             return Ok(existing);
@@ -1188,6 +1345,8 @@ async fn image_target(
     if let Some(existing) = find_existing_image_path(directory, &stems, Some(format)).await? {
         return Ok(existing);
     }
+    let (prefixed_stem, generic_stem) =
+        canonical_image_stems(image_type, movie_stem, episode_stem, image_index)?;
     let target_stem = if let Some(prefixed_stem) = prefixed_stem {
         let prefixed_exists =
             find_existing_image_path(directory, std::slice::from_ref(&prefixed_stem), None)
@@ -1204,19 +1363,15 @@ async fn image_target(
     Ok(directory.join(format!("{target_stem}.{}", format.extension())))
 }
 
-async fn find_any_image_path(
+async fn find_image_path_at_index(
     directory: &Path,
     image_type: &str,
     movie_stem: Option<&str>,
     episode_stem: Option<&str>,
+    image_index: i64,
 ) -> Result<Option<PathBuf>, ImageWriteError> {
-    let (prefixed_stem, generic_stem) = image_file_stems(image_type, movie_stem, episode_stem)?;
-    if let Some(prefixed_stem) = prefixed_stem {
-        if let Some(path) = find_existing_image_path(directory, &[prefixed_stem], None).await? {
-            return Ok(Some(path));
-        }
-    }
-    find_existing_image_path(directory, &[generic_stem], None).await
+    let stems = image_lookup_stems(image_type, movie_stem, episode_stem, image_index)?;
+    find_existing_image_path(directory, &stems, None).await
 }
 
 fn find_existing_image_path_in_paths(paths: &[PathBuf], stems: &[String]) -> Option<PathBuf> {
@@ -1278,6 +1433,62 @@ async fn read_image_directory_entries(directory: &Path) -> Result<Vec<PathBuf>, 
         paths.push(entry.path());
     }
     Ok(paths)
+}
+
+fn image_lookup_stems(
+    image_type: &str,
+    movie_stem: Option<&str>,
+    episode_stem: Option<&str>,
+    image_index: i64,
+) -> Result<Vec<String>, ImageWriteError> {
+    let image_index = image_index.max(0);
+    let (legacy_prefixed, legacy_generic) = image_file_stems(image_type, movie_stem, episode_stem)?;
+    let (canonical_prefixed, canonical_generic) =
+        canonical_image_stems(image_type, movie_stem, episode_stem, image_index)?;
+    let mut stems = Vec::with_capacity(6);
+    if let Some(stem) = canonical_prefixed {
+        stems.push(stem);
+    }
+    if let Some(stem) = legacy_prefixed {
+        stems.push(indexed_legacy_stem(&stem, image_index));
+    }
+    stems.push(canonical_generic.clone());
+    stems.push(indexed_legacy_stem(&legacy_generic, image_index));
+    if image_index > 0 && image_type.eq_ignore_ascii_case("FANART") {
+        stems.push(format!("{canonical_generic}-{image_index}"));
+    }
+    Ok(stems)
+}
+
+fn canonical_image_stems(
+    image_type: &str,
+    movie_stem: Option<&str>,
+    episode_stem: Option<&str>,
+    image_index: i64,
+) -> Result<(Option<String>, String), ImageWriteError> {
+    let (prefixed, generic) = image_file_stems(image_type, movie_stem, episode_stem)?;
+    let canonical = |stem: String| {
+        let stem = if image_type.eq_ignore_ascii_case("FANART") && episode_stem.is_none() {
+            stem.replace("-fanart", "-backdrop")
+                .replace("fanart", "backdrop")
+        } else {
+            stem
+        };
+        if image_index == 0 {
+            stem
+        } else {
+            format!("{stem}{image_index}")
+        }
+    };
+    Ok((prefixed.map(canonical), canonical(generic)))
+}
+
+fn indexed_legacy_stem(stem: &str, image_index: i64) -> String {
+    if image_index == 0 {
+        stem.to_owned()
+    } else {
+        format!("{stem}-{image_index}")
+    }
 }
 
 fn image_file_stems(
@@ -1948,8 +2159,9 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
-        global_image_download_permits, global_image_write_permits, image_attempt_failure,
-        image_download_retry_delay, is_allowed_scraper_image_url, retryable_image_status,
+        canonical_image_stems, global_image_download_permits, global_image_write_permits,
+        image_attempt_failure, image_download_retry_delay, image_lookup_stems,
+        is_allowed_scraper_image_url, retryable_image_status,
     };
 
     #[test]
@@ -2014,5 +2226,20 @@ mod tests {
         assert!(!is_allowed_scraper_image_url(
             "http://img.douban.example/poster.jpg"
         ));
+    }
+
+    #[test]
+    fn fanart_uses_emby_backdrop_numbering_and_keeps_legacy_names_readable() {
+        assert_eq!(
+            canonical_image_stems("FANART", None, None, 0).expect("fanart type"),
+            (None, "backdrop".to_owned())
+        );
+        assert_eq!(
+            canonical_image_stems("FANART", None, None, 1).expect("fanart type"),
+            (None, "backdrop1".to_owned())
+        );
+        let lookup = image_lookup_stems("FANART", None, None, 1).expect("fanart type");
+        assert!(lookup.iter().any(|stem| stem == "backdrop1"));
+        assert!(lookup.iter().any(|stem| stem == "fanart-1"));
     }
 }

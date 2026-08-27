@@ -394,9 +394,10 @@ where
             let Some(image_type) = image_type_for_media(path, media_stem) else {
                 continue;
             };
-            if images
-                .iter()
-                .any(|image: &LocalImage| image.image_type == image_type)
+            if image_type != ImageType::Fanart
+                && images
+                    .iter()
+                    .any(|image: &LocalImage| image.image_type == image_type)
             {
                 continue;
             }
@@ -410,9 +411,10 @@ where
         let Some(image_type) = image_type_for(&path) else {
             continue;
         };
-        if images
-            .iter()
-            .any(|image: &LocalImage| image.image_type == image_type)
+        if image_type != ImageType::Fanart
+            && images
+                .iter()
+                .any(|image: &LocalImage| image.image_type == image_type)
         {
             continue;
         }
@@ -454,11 +456,12 @@ fn image_type_for_media(path: &Path, media_stem: &str) -> Option<ImageType> {
     .into_iter()
     .find_map(|(suffix, image_type)| {
         let expected = format!("{media_stem}-{suffix}");
-        stem.eq_ignore_ascii_case(&expected).then_some(image_type)
+        matches_indexed_stem(&stem, &expected).then_some(image_type)
     })
 }
 
 fn image_type_for_stem(stem: &str) -> Option<ImageType> {
+    let stem = indexed_stem_base(stem);
     match stem {
         "poster" => Some(ImageType::Poster),
         "fanart" | "backdrop" => Some(ImageType::Fanart),
@@ -470,6 +473,42 @@ fn image_type_for_stem(stem: &str) -> Option<ImageType> {
         "wallpaper" => Some(ImageType::Wallpaper),
         _ => None,
     }
+}
+
+fn indexed_stem_base(stem: &str) -> &str {
+    if let Some((base, suffix)) = stem.rsplit_once('-')
+        && !suffix.is_empty()
+        && suffix.chars().all(|character| character.is_ascii_digit())
+    {
+        return base;
+    }
+    let digit_start = stem
+        .char_indices()
+        .find(|(_, character)| character.is_ascii_digit())
+        .map(|(index, _)| index);
+    if let Some(index) = digit_start
+        && index > 0
+        && stem[index..]
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    {
+        return &stem[..index];
+    }
+    stem
+}
+
+fn matches_indexed_stem(stem: &str, base: &str) -> bool {
+    if stem.eq_ignore_ascii_case(base) {
+        return true;
+    }
+    let Some(suffix) = stem.get(base.len()..) else {
+        return false;
+    };
+    if !stem[..base.len()].eq_ignore_ascii_case(base) {
+        return false;
+    }
+    let suffix = suffix.strip_prefix('-').unwrap_or(suffix);
+    !suffix.is_empty() && suffix.chars().all(|character| character.is_ascii_digit())
 }
 
 #[derive(Debug)]
@@ -796,6 +835,7 @@ impl MetadataEnricher {
         let has_primary_artwork = images
             .iter()
             .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
+        let mut image_indexes = BTreeMap::<&'static str, i64>::new();
         let mut inserted_count = 0;
         for image in images {
             let file_size = match fs::metadata(&image.path).await {
@@ -835,11 +875,13 @@ impl MetadataEnricher {
                 }
             };
             let dimensions = read_image_dimensions(&image.path).await;
+            let image_index = next_local_image_index(&mut image_indexes, image.image_type);
             match self
                 .database
-                .insert_item_image(
+                .insert_item_image_at_index(
                     item_id,
                     image.image_type.as_str(),
+                    image_index,
                     &image.path,
                     ItemImageMetadata {
                         file_size,
@@ -1240,6 +1282,7 @@ impl MetadataEnricher {
         let has_primary_artwork = images
             .iter()
             .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
+        let mut image_indexes = BTreeMap::<&'static str, i64>::new();
         let mut inserted_count = 0;
         for image in images {
             let file_size = fs::metadata(&image.path)
@@ -1262,11 +1305,13 @@ impl MetadataEnricher {
                         source,
                     })?;
             let dimensions = read_image_dimensions(&image.path).await;
+            let image_index = next_local_image_index(&mut image_indexes, image.image_type);
             if self
                 .database
-                .insert_item_image(
+                .insert_item_image_at_index(
                     item_id,
                     image.image_type.as_str(),
+                    image_index,
                     &image.path,
                     ItemImageMetadata {
                         file_size,
@@ -1288,6 +1333,17 @@ impl MetadataEnricher {
         }
         Ok(inserted_count)
     }
+}
+
+fn next_local_image_index(indexes: &mut BTreeMap<&'static str, i64>, image_type: ImageType) -> i64 {
+    let key = image_type.as_str();
+    if image_type != ImageType::Fanart {
+        return 0;
+    }
+    let index = indexes.entry(key).or_default();
+    let current = *index;
+    *index = index.saturating_add(1);
+    current
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1510,29 +1566,24 @@ fn find_series_images(paths: &[PathBuf], season_number: Option<i64>) -> Vec<Loca
         };
         let stem = stem.to_ascii_lowercase();
         let image_type = match season_number {
-            None => match stem.as_str() {
-                "poster" => ImageType::Poster,
-                "fanart" | "backdrop" => ImageType::Fanart,
-                "logo" | "clearlogo" => ImageType::Logo,
-                "thumb" | "thumbnail" => ImageType::Thumb,
-                "banner" => ImageType::Banner,
-                "disc" | "discart" => ImageType::Disc,
-                "art" | "artwork" => ImageType::Art,
-                "wallpaper" => ImageType::Wallpaper,
-                _ => continue,
-            },
+            None => {
+                let Some(image_type) = image_type_for_stem(&stem) else {
+                    continue;
+                };
+                image_type
+            }
             Some(number) => {
                 let prefix = format!("season{number}");
                 let padded_prefix = format!("season{number:02}");
-                let is_poster = stem == "poster"
-                    || stem == format!("{prefix}-poster")
-                    || stem == format!("{padded_prefix}-poster");
-                let is_fanart = stem == "fanart"
-                    || stem == "backdrop"
-                    || stem == format!("{prefix}-fanart")
-                    || stem == format!("{padded_prefix}-fanart")
-                    || stem == format!("{prefix}-backdrop")
-                    || stem == format!("{padded_prefix}-backdrop");
+                let is_poster = matches_indexed_stem(&stem, "poster")
+                    || matches_indexed_stem(&stem, &format!("{prefix}-poster"))
+                    || matches_indexed_stem(&stem, &format!("{padded_prefix}-poster"));
+                let is_fanart = matches_indexed_stem(&stem, "fanart")
+                    || matches_indexed_stem(&stem, "backdrop")
+                    || matches_indexed_stem(&stem, &format!("{prefix}-fanart"))
+                    || matches_indexed_stem(&stem, &format!("{padded_prefix}-fanart"))
+                    || matches_indexed_stem(&stem, &format!("{prefix}-backdrop"))
+                    || matches_indexed_stem(&stem, &format!("{padded_prefix}-backdrop"));
                 if is_poster {
                     ImageType::Poster
                 } else if is_fanart {
@@ -1542,9 +1593,10 @@ fn find_series_images(paths: &[PathBuf], season_number: Option<i64>) -> Vec<Loca
                 }
             }
         };
-        if images
-            .iter()
-            .any(|image: &LocalImage| image.image_type == image_type)
+        if image_type != ImageType::Fanart
+            && images
+                .iter()
+                .any(|image: &LocalImage| image.image_type == image_type)
         {
             continue;
         }
@@ -1580,19 +1632,44 @@ fn find_episode_images(paths: &[PathBuf], media_path: &Path) -> Vec<LocalImage> 
             continue;
         };
         let image_type = match suffix {
-            "poster" => ImageType::Poster,
-            "fanart" | "backdrop" => ImageType::Fanart,
-            "thumb" | "thumbnail" => ImageType::Thumb,
-            "logo" | "clearlogo" => ImageType::Logo,
-            "banner" => ImageType::Banner,
-            "disc" | "discart" => ImageType::Disc,
-            "art" | "artwork" => ImageType::Art,
-            "wallpaper" => ImageType::Wallpaper,
+            value if matches_indexed_stem(value, "poster") => ImageType::Poster,
+            value
+                if matches_indexed_stem(value, "fanart")
+                    || matches_indexed_stem(value, "backdrop") =>
+            {
+                ImageType::Fanart
+            }
+            value
+                if matches_indexed_stem(value, "thumb")
+                    || matches_indexed_stem(value, "thumbnail") =>
+            {
+                ImageType::Thumb
+            }
+            value
+                if matches_indexed_stem(value, "logo")
+                    || matches_indexed_stem(value, "clearlogo") =>
+            {
+                ImageType::Logo
+            }
+            value if matches_indexed_stem(value, "banner") => ImageType::Banner,
+            value
+                if matches_indexed_stem(value, "disc")
+                    || matches_indexed_stem(value, "discart") =>
+            {
+                ImageType::Disc
+            }
+            value
+                if matches_indexed_stem(value, "art") || matches_indexed_stem(value, "artwork") =>
+            {
+                ImageType::Art
+            }
+            value if matches_indexed_stem(value, "wallpaper") => ImageType::Wallpaper,
             _ => continue,
         };
-        if images
-            .iter()
-            .any(|image: &LocalImage| image.image_type == image_type)
+        if image_type != ImageType::Fanart
+            && images
+                .iter()
+                .any(|image: &LocalImage| image.image_type == image_type)
         {
             continue;
         }
@@ -1620,7 +1697,7 @@ fn is_prefixed_season_image(path: &Path, season_number: i64) -> bool {
         format!("{padded_prefix}-backdrop"),
     ]
     .into_iter()
-    .any(|candidate| stem == candidate)
+    .any(|candidate| matches_indexed_stem(&stem, &candidate))
 }
 
 #[derive(Debug)]

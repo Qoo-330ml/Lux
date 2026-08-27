@@ -15989,10 +15989,11 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn insert_item_image(
+    pub(crate) async fn insert_item_image_at_index(
         &self,
         item_id: &str,
         image_type: &str,
+        image_index: i64,
         local_path: &std::path::Path,
         metadata: ItemImageMetadata<'_>,
     ) -> Result<bool, StorageError> {
@@ -16004,7 +16005,7 @@ impl Database {
                 "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, width, height,
                 file_size, content_tag, source
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                 id = excluded.id,
                 local_path = excluded.local_path,
@@ -16023,6 +16024,7 @@ impl Database {
             .bind(id)
             .bind(item_id)
             .bind(image_type)
+            .bind(image_index)
             .bind(local_path.to_string_lossy().as_ref())
             .bind(metadata.width)
             .bind(metadata.height)
@@ -16082,6 +16084,18 @@ impl Database {
         local_path: &std::path::Path,
         metadata: ItemImageMetadata<'_>,
     ) -> Result<String, StorageError> {
+        self.upsert_item_image_at_index(item_id, image_type, 0, local_path, metadata)
+            .await
+    }
+
+    pub(crate) async fn upsert_item_image_at_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        local_path: &std::path::Path,
+        metadata: ItemImageMetadata<'_>,
+    ) -> Result<String, StorageError> {
         let id = Uuid::now_v7().to_string();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
@@ -16089,7 +16103,7 @@ impl Database {
             "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, width, height,
                 file_size, content_tag, source
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                 id = excluded.id,
                 local_path = excluded.local_path,
@@ -16103,6 +16117,7 @@ impl Database {
         .bind(&id)
         .bind(item_id)
         .bind(image_type)
+        .bind(image_index)
         .bind(local_path.to_string_lossy().as_ref())
         .bind(metadata.width)
         .bind(metadata.height)

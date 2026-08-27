@@ -20,6 +20,7 @@ use crate::{
             ImageSelectionPolicy, MetadataCandidateError, MetadataCandidatePage,
             MetadataCandidateService, MetadataCandidateView, MetadataRequestPlan,
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
+            has_selected_provider_id,
         },
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
         webhooks::{WebhookEventType, WebhookService},
@@ -141,6 +142,7 @@ enum RefreshItemOutcome {
 struct RefreshItemOptions {
     scraper_id: Option<String>,
     supplemental: bool,
+    preserve_identity: bool,
     request_plan: Option<MetadataRequestPlan>,
     image_policy: Option<ImageSelectionPolicy>,
 }
@@ -676,7 +678,6 @@ impl MetadataReidentifyService {
                         Ok(None)
                     };
                     match request_plan {
-                        Ok(Some(plan)) if metadata_request_plan_is_complete(plan) => Ok(0),
                         Ok(request_plan) => {
                             match self
                                 .providers_for_item(
@@ -842,46 +843,59 @@ impl MetadataReidentifyService {
         request_plan: Option<MetadataRequestPlan>,
     ) -> Result<i64, MetadataReidentifyError> {
         let mut candidate_count = 0_i64;
-        let mut selected_scraper_id = None;
+        let already_confirmed =
+            !matches!(mode, MetadataRefreshMode::Reidentify) && has_selected_provider_id(item);
+        let mut selected_scraper_id = already_confirmed.then(|| {
+            item.metadata_scraper_id
+                .as_deref()
+                .or(item.scraper_id.as_deref())
+                .unwrap_or_default()
+                .to_owned()
+        });
         let mut last_recoverable_error = None;
         let mut saw_needs_review = false;
-        for scraper in scrapers.iter().filter(|scraper| {
-            matches!(
-                scraper.role,
-                crate::library::LibraryScraperRole::Primary
-                    | crate::library::LibraryScraperRole::Backup
-                    | crate::library::LibraryScraperRole::Both
-            )
-        }) {
-            match self
-                .refresh_item(
-                    item_id,
-                    item,
-                    mode,
-                    &scraper.provider,
-                    RefreshItemOptions {
-                        scraper_id: Some(scraper.scraper_id.clone()),
-                        supplemental: false,
-                        request_plan,
-                        image_policy: request_plan.and_then(|plan| plan.image_policy),
-                    },
+        let should_refresh_primary = !already_confirmed
+            || request_plan.is_none_or(|plan| !metadata_request_plan_is_complete(plan));
+        if should_refresh_primary {
+            for scraper in scrapers.iter().filter(|scraper| {
+                matches!(
+                    scraper.role,
+                    crate::library::LibraryScraperRole::Primary
+                        | crate::library::LibraryScraperRole::Backup
+                        | crate::library::LibraryScraperRole::Both
                 )
-                .await
-            {
-                Ok(RefreshItemOutcome::Confirmed(count)) => {
-                    candidate_count = candidate_count.saturating_add(count);
-                    selected_scraper_id = Some(scraper.scraper_id.as_str());
-                    break;
+            }) {
+                match self
+                    .refresh_item(
+                        item_id,
+                        item,
+                        mode,
+                        &scraper.provider,
+                        RefreshItemOptions {
+                            scraper_id: Some(scraper.scraper_id.clone()),
+                            supplemental: false,
+                            preserve_identity: false,
+                            request_plan,
+                            image_policy: request_plan.and_then(|plan| plan.image_policy),
+                        },
+                    )
+                    .await
+                {
+                    Ok(RefreshItemOutcome::Confirmed(count)) => {
+                        candidate_count = candidate_count.saturating_add(count);
+                        selected_scraper_id = Some(scraper.scraper_id.clone());
+                        break;
+                    }
+                    Ok(RefreshItemOutcome::NeedsReview(count)) => {
+                        candidate_count = candidate_count.saturating_add(count);
+                        last_recoverable_error = Some(MetadataReidentifyError::LowConfidence);
+                        saw_needs_review = true;
+                    }
+                    Err(error) if recoverable_scraper_attempt(&error) => {
+                        last_recoverable_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
                 }
-                Ok(RefreshItemOutcome::NeedsReview(count)) => {
-                    candidate_count = candidate_count.saturating_add(count);
-                    last_recoverable_error = Some(MetadataReidentifyError::LowConfidence);
-                    saw_needs_review = true;
-                }
-                Err(error) if recoverable_scraper_attempt(&error) => {
-                    last_recoverable_error = Some(error);
-                }
-                Err(error) => return Err(error),
             }
         }
         if selected_scraper_id.is_none() {
@@ -891,6 +905,46 @@ impl MetadataReidentifyService {
             return Err(last_recoverable_error.unwrap_or(MetadataReidentifyError::LowConfidence));
         }
         if !matches!(mode, MetadataRefreshMode::Reidentify) {
+            if let Some(selection) = self.selection.as_ref() {
+                for scraper in scrapers.iter().filter(|scraper| {
+                    matches!(
+                        scraper.role,
+                        crate::library::LibraryScraperRole::Backup
+                            | crate::library::LibraryScraperRole::Both
+                    )
+                }) {
+                    let fallback_plan = selection
+                        .fallback_request_plan_for_current(item_id, item)
+                        .await
+                        .map_err(MetadataReidentifyError::Selection)?;
+                    if metadata_request_plan_is_complete(fallback_plan) {
+                        break;
+                    }
+                    match self
+                        .refresh_item(
+                            item_id,
+                            item,
+                            mode,
+                            &scraper.provider,
+                            RefreshItemOptions {
+                                scraper_id: Some(scraper.scraper_id.clone()),
+                                supplemental: false,
+                                preserve_identity: true,
+                                request_plan: Some(fallback_plan),
+                                image_policy: fallback_plan.image_policy,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(
+                            RefreshItemOutcome::Confirmed(count)
+                            | RefreshItemOutcome::NeedsReview(count),
+                        ) => candidate_count = candidate_count.saturating_add(count),
+                        Err(error) if recoverable_scraper_attempt(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
             for scraper in scrapers.iter().filter(|scraper| {
                 matches!(
                     scraper.role,
@@ -898,23 +952,16 @@ impl MetadataReidentifyService {
                         | crate::library::LibraryScraperRole::Both
                 )
             }) {
-                let supplemental_plan = if matches!(mode, MetadataRefreshMode::FillMissing) {
-                    if let Some(selection) = self.selection.as_ref() {
-                        Some(
-                            selection
-                                .fill_missing_request_plan(item_id)
-                                .await
-                                .map_err(MetadataReidentifyError::Selection)?,
-                        )
-                    } else {
-                        None
-                    }
+                let supplemental_plan = if let Some(selection) = self.selection.as_ref() {
+                    Some(
+                        selection
+                            .supplemental_request_plan(item_id)
+                            .await
+                            .map_err(MetadataReidentifyError::Selection)?,
+                    )
                 } else {
                     None
                 };
-                if supplemental_plan.is_some_and(metadata_request_plan_is_complete) {
-                    break;
-                }
                 match self
                     .refresh_item(
                         item_id,
@@ -922,8 +969,9 @@ impl MetadataReidentifyService {
                         mode,
                         &scraper.provider,
                         RefreshItemOptions {
-                            scraper_id: None,
+                            scraper_id: Some(scraper.scraper_id.clone()),
                             supplemental: true,
+                            preserve_identity: false,
                             request_plan: supplemental_plan,
                             image_policy: supplemental_plan.and_then(|plan| plan.image_policy),
                         },
@@ -955,7 +1003,10 @@ impl MetadataReidentifyService {
         provider: &ScraperProvider,
         options: RefreshItemOptions,
     ) -> Result<RefreshItemOutcome, MetadataReidentifyError> {
-        let page = if matches!(mode, MetadataRefreshMode::FillMissing) {
+        let page = if matches!(mode, MetadataRefreshMode::FillMissing)
+            || options.supplemental
+            || options.preserve_identity
+        {
             self.candidates
                 .search_and_store_for_automatic_match_with_plan(
                     item_id,
@@ -993,15 +1044,28 @@ impl MetadataReidentifyService {
             return Err(MetadataReidentifyError::LowConfidence);
         };
         let needs_review = best_automatic_candidate(&page).is_none();
-        if options.supplemental && needs_review {
+        if (options.supplemental || options.preserve_identity) && needs_review {
             return Err(MetadataReidentifyError::LowConfidence);
         }
-        let selection_mode = match mode {
-            MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
-            MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
-            MetadataRefreshMode::Reidentify => return Ok(RefreshItemOutcome::Confirmed(0)),
+        let selection_mode = if options.supplemental || options.preserve_identity {
+            MetadataSelectionMode::FillMissing
+        } else {
+            match mode {
+                MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
+                MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
+                MetadataRefreshMode::Reidentify => return Ok(RefreshItemOutcome::Confirmed(0)),
+            }
         };
-        if needs_review {
+        if options.preserve_identity {
+            selection
+                .select_fallback_with_scraper_and_policy(
+                    item_id,
+                    &candidate.id,
+                    options.scraper_id.as_deref().unwrap_or_default(),
+                    options.image_policy,
+                )
+                .await
+        } else if needs_review {
             selection
                 .select_for_review_with_scraper_and_policy(
                     item_id,
