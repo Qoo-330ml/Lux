@@ -15,8 +15,9 @@ use uuid::Uuid;
 use crate::{
     application::emby_migration::{
         EmbyMigrationPluginClient, EmbyMigrationSource, HistoryCapability, MigrationConnectionInfo,
-        MigrationInputError, MigrationItem, MigrationItemPage, MigrationMergePolicy, MigrationUser,
-        MigrationUserData, MigrationUserStateFilter, StoredItemState, merge_item_state,
+        MigrationInputError, MigrationItem, MigrationItemPage, MigrationLibraryFolder,
+        MigrationMergePolicy, MigrationUser, MigrationUserData, MigrationUserStateFilter,
+        StoredItemState, merge_item_state,
     },
     application::plugin_runtime::PluginRuntimeError,
     application::plugins::PluginServiceError,
@@ -647,13 +648,15 @@ impl EmbyMigrationService {
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "USERS", None)
             .await?;
-        let users = match self.plugin.list_users(&source).await {
-            Ok(page) => page.items,
+        let user_page = match self.plugin.list_users(&source).await {
+            Ok(page) => page,
             Err(error) => {
                 self.fail_job(job_id, "USERS", &error.to_string()).await?;
                 return Err(error.into());
             }
         };
+        let library_folders = user_page.library_folders;
+        let users = user_page.items;
         let user_store = UserStore::new(self.database.clone()).map_err(UserStoreError::from)?;
         let mut user_links = Vec::with_capacity(users.len());
         for user in &users {
@@ -669,6 +672,7 @@ impl EmbyMigrationService {
             .update_emby_migration_job_status(job_id, "RUNNING", "ITEMS", None)
             .await?;
         let identity_index = MigrationMediaIdentityIndex::new(self.load_media_identities().await?);
+        let lux_library_identities = self.load_library_identities().await?;
         let mut processed = job.processed_count;
         let mut matched = job.matched_count;
         let mut skipped = job.skipped_count;
@@ -716,14 +720,11 @@ impl EmbyMigrationService {
                         }
                     }
                     for item in page.items {
-                        let Some(user_data) = item.user_data.clone() else {
+                        let Some(user_data) =
+                            recorded_state_for_migration(&item, &mut seen_emby_item_ids)
+                        else {
                             continue;
                         };
-                        if !user_data.has_recorded_state()
-                            || !seen_emby_item_ids.insert(item.id.clone())
-                        {
-                            continue;
-                        }
                         processed += 1;
                         let outcome = match_item(&item, &identity_index);
                         let detail = serde_json::to_string(&migration_item_detail(
@@ -830,15 +831,32 @@ impl EmbyMigrationService {
                 }
             }
             if !job.dry_run {
-                let library_ids = if user.enable_all_folders {
+                let (library_ids, exact_library_access) = if user.enable_all_folders {
+                    (self.database.list_enabled_library_ids().await?, true)
+                } else if let Some(source_folders) = library_folders.as_deref() {
+                    let allowed_library_ids = map_enabled_library_ids(
+                        &user,
+                        Some(source_folders),
+                        &lux_library_identities,
+                    );
+                    (allowed_library_ids.into_iter().collect(), true)
+                } else {
+                    (accessible_library_ids.into_iter().collect(), false)
+                };
+                let allowed_library_ids = library_ids.iter().cloned().collect::<HashSet<_>>();
+                let enabled_library_ids = if exact_library_access {
                     self.database.list_enabled_library_ids().await?
                 } else {
-                    accessible_library_ids.into_iter().collect()
+                    library_ids
                 };
-                for library_id in library_ids {
+                for library_id in enabled_library_ids {
                     if let Some(lux_user_id) = lux_user_id.as_deref() {
                         self.database
-                            .set_user_library_access(lux_user_id, &library_id, true)
+                            .set_user_library_access(
+                                lux_user_id,
+                                &library_id,
+                                !exact_library_access || allowed_library_ids.contains(&library_id),
+                            )
                             .await?;
                     }
                 }
@@ -1039,38 +1057,19 @@ impl EmbyMigrationService {
         }
         let existing = user_store.find_by_username(source_user_name).await?;
         let (lux_user, status) = match existing {
-            Some(user) => {
-                if user.is_disabled != source_user.is_disabled {
-                    user_store
-                        .update_user(
-                            &user.id.to_string(),
-                            UserUpdate {
-                                is_disabled: Some(source_user.is_disabled),
-                                ..UserUpdate::default()
-                            },
-                        )
-                        .await?;
-                }
-                (user, "LINKED")
-            }
+            Some(user) => (user, "LINKED"),
             None => {
                 let placeholder = Uuid::now_v7().to_string();
                 let user = user_store
                     .create_user(source_user_name, source_user_name, &placeholder, false)
                     .await?;
-                let user = user_store
-                    .update_user(
-                        &user.id.to_string(),
-                        UserUpdate {
-                            is_disabled: Some(source_user.is_disabled),
-                            ..UserUpdate::default()
-                        },
-                    )
-                    .await?
-                    .ok_or(EmbyMigrationServiceError::NotFound)?;
                 (user, "AUTO_CREATED")
             }
         };
+        let lux_user = user_store
+            .update_user(&lux_user.id.to_string(), migration_user_update(source_user))
+            .await?
+            .ok_or(EmbyMigrationServiceError::NotFound)?;
         self.database
             .upsert_emby_migration_user_binding(&StoredEmbyMigrationUserBinding {
                 lux_user_id: lux_user.id.to_string(),
@@ -1112,6 +1111,34 @@ impl EmbyMigrationService {
             }
         }
         Ok(identities)
+    }
+
+    async fn load_library_identities(
+        &self,
+    ) -> Result<Vec<MigrationLuxLibraryIdentity>, EmbyMigrationServiceError> {
+        let libraries = self.database.list_libraries().await?;
+        let library_ids = libraries
+            .iter()
+            .map(|library| library.id.clone())
+            .collect::<Vec<_>>();
+        let mut roots_by_library = self
+            .database
+            .list_library_roots_by_library_ids(&library_ids)
+            .await?;
+        Ok(libraries
+            .into_iter()
+            .filter(|library| library.is_enabled)
+            .map(|library| MigrationLuxLibraryIdentity {
+                id: library.id.clone(),
+                name: library.name,
+                root_paths: roots_by_library
+                    .remove(&library.id)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|root| root.canonical_path)
+                    .collect(),
+            })
+            .collect())
     }
 
     async fn recover_migration_page(
@@ -1405,6 +1432,88 @@ fn split_migration_page_range(start_index: u32, limit: u32) -> Option<((u32, u32
         (start_index, left_limit),
         (start_index.saturating_add(left_limit), right_limit),
     ))
+}
+
+fn recorded_state_for_migration(
+    item: &MigrationItem,
+    seen_emby_item_ids: &mut HashSet<String>,
+) -> Option<MigrationUserData> {
+    let user_data = item.user_data.clone()?;
+    if !user_data.has_recorded_state() || !seen_emby_item_ids.insert(item.id.clone()) {
+        return None;
+    }
+    Some(user_data)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MigrationLuxLibraryIdentity {
+    id: String,
+    name: String,
+    root_paths: Vec<String>,
+}
+
+fn map_enabled_library_ids(
+    user: &MigrationUser,
+    source_folders: Option<&[MigrationLibraryFolder]>,
+    lux_libraries: &[MigrationLuxLibraryIdentity],
+) -> HashSet<String> {
+    let Some(source_folders) = source_folders else {
+        return HashSet::new();
+    };
+    source_folders
+        .iter()
+        .filter(|folder| user.enabled_folders.iter().any(|id| id == &folder.id))
+        .filter_map(|folder| match_lux_library(folder, lux_libraries))
+        .collect()
+}
+
+fn match_lux_library(
+    source_folder: &MigrationLibraryFolder,
+    lux_libraries: &[MigrationLuxLibraryIdentity],
+) -> Option<String> {
+    let normalized_name = normalize_title(&source_folder.name);
+    let name_matches = lux_libraries
+        .iter()
+        .filter(|library| normalize_title(&library.name) == normalized_name)
+        .collect::<Vec<_>>();
+    if name_matches.len() == 1 {
+        return name_matches.first().map(|library| library.id.clone());
+    }
+
+    let source_paths = source_folder
+        .locations
+        .iter()
+        .map(|path| normalize_library_path(path))
+        .filter(|path| !path.is_empty())
+        .collect::<HashSet<_>>();
+    let path_matches = lux_libraries
+        .iter()
+        .filter(|library| {
+            library
+                .root_paths
+                .iter()
+                .map(|path| normalize_library_path(path))
+                .any(|path| source_paths.contains(&path))
+        })
+        .collect::<Vec<_>>();
+    (path_matches.len() == 1).then(|| path_matches[0].id.clone())
+}
+
+fn normalize_library_path(value: &str) -> String {
+    let value = value.trim().replace('\\', "/");
+    if value == "/" {
+        return value;
+    }
+    value.trim_end_matches('/').to_owned()
+}
+
+fn migration_user_update(source_user: &MigrationUser) -> UserUpdate<'_> {
+    UserUpdate {
+        is_disabled: Some(source_user.is_disabled),
+        can_remote_access: Some(source_user.enable_remote_access),
+        can_download: Some(source_user.enable_content_downloading),
+        ..UserUpdate::default()
+    }
 }
 
 struct MatchOutcome {
@@ -1725,6 +1834,105 @@ mod tests {
         assert_eq!(detail["reason"], "PLUGIN_INVALID_RESPONSE");
         assert_eq!(detail["sourceStartIndex"], 27365);
         assert_eq!(detail["pageKind"], "USER_STATE_PLAYED");
+    }
+
+    #[test]
+    fn duplicate_state_filter_results_are_claimed_once() {
+        let item = MigrationItem {
+            id: "emby-1".to_owned(),
+            name: "The Film".to_owned(),
+            item_type: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids: BTreeMap::new(),
+            parent_id: None,
+            series_id: None,
+            season_id: None,
+            index_number: None,
+            parent_index_number: None,
+            user_data: Some(MigrationUserData {
+                playback_position_ticks: 0,
+                played: true,
+                is_favorite: true,
+                play_count: 1,
+                last_played_date: None,
+            }),
+        };
+        let mut seen = HashSet::new();
+
+        assert!(recorded_state_for_migration(&item, &mut seen).is_some());
+        assert!(recorded_state_for_migration(&item, &mut seen).is_none());
+    }
+
+    #[test]
+    fn enabled_source_folders_map_to_unique_lux_libraries() {
+        let user = MigrationUser {
+            id: "emby-user".to_owned(),
+            name: "Alice".to_owned(),
+            has_password: false,
+            is_disabled: false,
+            is_administrator: false,
+            enable_all_folders: false,
+            enabled_folders: vec!["emby-movies".to_owned()],
+            enable_remote_access: false,
+            enable_content_downloading: false,
+            primary_image_tag: None,
+        };
+        let source_folders = vec![MigrationLibraryFolder {
+            id: "emby-movies".to_owned(),
+            name: "Movies".to_owned(),
+            locations: vec!["/media/movies".to_owned()],
+        }];
+        let lux_libraries = vec![MigrationLuxLibraryIdentity {
+            id: "lux-movies".to_owned(),
+            name: "Movies".to_owned(),
+            root_paths: vec!["/media/movies".to_owned()],
+        }];
+
+        assert_eq!(
+            map_enabled_library_ids(&user, Some(&source_folders), &lux_libraries),
+            HashSet::from(["lux-movies".to_owned()])
+        );
+
+        let lux_libraries = vec![
+            MigrationLuxLibraryIdentity {
+                id: "lux-other".to_owned(),
+                name: "Movies".to_owned(),
+                root_paths: vec!["/media/other".to_owned()],
+            },
+            MigrationLuxLibraryIdentity {
+                id: "lux-movies".to_owned(),
+                name: "Movies".to_owned(),
+                root_paths: vec!["/media/movies".to_owned()],
+            },
+        ];
+        assert_eq!(
+            map_enabled_library_ids(&user, Some(&source_folders), &lux_libraries),
+            HashSet::from(["lux-movies".to_owned()])
+        );
+    }
+
+    #[test]
+    fn migration_user_permissions_do_not_promote_emby_admins() {
+        let user = MigrationUser {
+            id: "emby-user".to_owned(),
+            name: "Alice".to_owned(),
+            has_password: false,
+            is_disabled: true,
+            is_administrator: true,
+            enable_all_folders: false,
+            enabled_folders: Vec::new(),
+            enable_remote_access: true,
+            enable_content_downloading: true,
+            primary_image_tag: None,
+        };
+
+        let update = migration_user_update(&user);
+
+        assert_eq!(update.is_disabled, Some(true));
+        assert_eq!(update.can_remote_access, Some(true));
+        assert_eq!(update.can_download, Some(true));
+        assert_eq!(update.is_admin, None);
+        assert_eq!(update.can_manage_server, None);
     }
 
     fn identity(id: &str, provider_ids: &str) -> StoredMigrationMediaIdentity {

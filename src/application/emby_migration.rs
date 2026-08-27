@@ -129,7 +129,20 @@ pub struct MigrationUser {
     pub is_administrator: bool,
     pub enable_all_folders: bool,
     pub enabled_folders: Vec<String>,
+    #[serde(default)]
+    pub enable_remote_access: bool,
+    #[serde(default)]
+    pub enable_content_downloading: bool,
     pub primary_image_tag: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MigrationLibraryFolder {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub locations: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -137,6 +150,8 @@ pub struct MigrationUser {
 pub struct MigrationUserPage {
     pub items: Vec<MigrationUser>,
     pub history_capability: HistoryCapability,
+    #[serde(default)]
+    pub library_folders: Option<Vec<MigrationLibraryFolder>>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
