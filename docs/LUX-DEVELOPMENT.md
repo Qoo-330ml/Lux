@@ -51,7 +51,8 @@
 - 默认 SQLite 数据库位于 /config 的本机持久化卷，不位于 SMB/NFS；首次引导也可以选择管理员已准备好的外部 PostgreSQL。
 - 兼容性只承诺实施时真实测试并记录版本的 VidHub、SenPlayer 和 Infuse；“对标 Emby”不等于实现 Emby 全部端点。
 - 首版运行单个 Lux 实例，不做多节点或高可用；外部 PostgreSQL 只作为可选的共享存储后端，不代表 Lux 首版承诺多节点部署。
-- 弹幕首版只面向支持弹幕接口的第三方客户端；不把 Emby 标准字幕端点当作弹幕协议，也不为其他客户端增加 ASS 或转码兜底。
+- LUX-150 的弹幕首版只面向支持弹幕接口的第三方客户端；LUX-214 才会为 Lux Web 添加已登记 XML 的本地渲染。
+  两者都不把 Emby 标准字幕端点当作弹幕协议，也不为其他客户端增加 ASS 或服务端转码兜底。
 
 ---
 
@@ -212,7 +213,8 @@ Lux 的核心价值不是功能数量，而是：
 - 后台匹配任务优先使用上游 `/api/v2/match`，不支持时回退到 Dandanplay 兼容的搜索、详情和弹幕接口。
 - 匹配成功的 XML 弹幕写回视频同目录、同 basename 的 `.xml` 旁车；使用临时文件、刷盘和原子重命名。
 - 只承诺支持弹幕接口的第三方客户端可以通过 Lux 的 Emby 接口读取；其他客户端是否识别 `.xml` 不属于 Lux 兼容承诺。
-- 首版不实现 Web 播放器弹幕、ASS 写回、Lux 侧弹幕文字转换、实时发送、代理播放或非弹幕客户端适配。
+- LUX-150 本身不实现 Web 播放器弹幕、ASS 写回、Lux 侧弹幕文字转换、实时发送、代理播放或非弹幕客户端适配；
+  后续 LUX-213/LUX-214 只能读取已登记的本地 XML 并在 Lux Web 内部渲染。
 
 ### 3.8 图片
 
@@ -370,8 +372,9 @@ Lux 的核心价值不是功能数量，而是：
 ## 4. 明确不在当前范围
 
 - `.strm` 的服务端 Remux、音频转码、视频转码、HLS 或媒体字节代理。
-- 字幕格式转换、字幕烧录、DRM 和多码率自适应 HLS。
-- 在线字幕搜索、字幕下载、OCR 或字幕格式转换。
+- 服务端字幕格式转换、字幕烧录、DRM 和多码率自适应 HLS。LUX-212 可以在浏览器中对已授权的本地文本字幕
+  进行临时、无写回的 cue 归一化；它不是服务端转换能力。
+- 在线字幕搜索、字幕下载、OCR 或服务器字幕格式转换。
 - 直播电视、DVR、DLNA、Chromecast 控制。
 - 未经插件包格式、路径、manifest、文件哈希、权限声明和独立进程监督的任意外部代码执行。
 - Emby Connect、Quick Connect 或官方云账户。
@@ -1326,7 +1329,8 @@ locked local value
 - `.strm` 只能返回档位 0；URL 型直连、路径型外部代理接管或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
-- 不实现 DRM、字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。
+- 不实现 DRM、服务器字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。LUX-212 的浏览器文本 cue
+  归一化不生成或写回媒体文件，不能扩展为服务端转码能力。
 - LUX-203 至 LUX-208 建立 LuxPlayer 的独立产品层；Web 弹幕、完整 ASS/SSA 渲染和更复杂的字幕/轨道能力只能在对应任务中实现。
 - LUX-184 允许提供独立的浏览器媒体能力探针，用于实测原生 video、MediaCapabilities 和 WebCodecs；探针不接入
   正式播放路径，不读取或保存用户媒体数据。
@@ -1982,6 +1986,12 @@ services:
 | LUX-207 | web/src/features/player/、web/tests/；实现来源可追溯的手势、自动隐藏和时间轴交互 |
 | LUX-208 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；Media Session、移动端安全区和兼容性收尾 |
 | LUX-209 | web/src/features/player/、web/tests/、docs/；ArtPlayer 风格控制层与无数据管道的弹幕可见性 UI |
+| LUX-210 | docs/LUX-DEVELOPMENT.md；关闭 LuxPlayer 核心阶段并定义字幕、弹幕后续边界 |
+| LUX-211 | web/src/features/player/、web/src/lib/api/types.ts、web/tests/；选择可用字幕轨与原生 WebVTT 生命周期 |
+| LUX-212 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有的安全文本字幕解析与渲染 |
+| LUX-213 | src/api/mod.rs、web/src/lib/api/、tests/、docs/；独立的 Lux Web 弹幕读取合同 |
+| LUX-214 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有弹幕解析、调度、渲染与控制层整合 |
+| LUX-215 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；字幕/弹幕跨引擎、性能与真实浏览器阶段门 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4875,11 +4885,131 @@ Rust/WASM 播放增强任务。
 
 阶段门：
 
-- [ ] LuxPlayer 已拥有独立的 Controller、Engine contract 和 UI 组件，业务代码不依赖 ArtPlayer 包。
-- [ ] Direct、服务器 HLS、客户端 fallback、版本选择、续播、播放进度和页面离开通过真实浏览器回归。
-- [ ] 桌面和移动 viewport 的播放控制、手势、Media Session 和错误提示通过验证。
-- [ ] ArtPlayer 衍生代码来源和 MIT notice 完整；无未记录的复制代码。
-- [ ] 运行本阶段 Web 检查，并记录 `uname -m`；不将本机 ARM 结果外推为 NAS/x86 性能。
+- [x] LuxPlayer 已拥有独立的 Controller、Engine contract 和 UI 组件，业务代码不依赖 ArtPlayer 包。
+- [x] Direct、服务器 HLS、客户端 fallback、版本选择、续播、播放进度和页面离开通过真实浏览器回归。
+- [x] 桌面和移动 viewport 的播放控制、手势、Media Session 和错误提示通过验证。
+- [x] ArtPlayer 衍生代码来源和 MIT notice 完整；无未记录的复制代码。
+- [x] 运行本阶段 Web 检查，并记录 `uname -m`；不将本机 ARM 结果外推为 NAS/x86 性能。
+
+#### LUX-210：LuxPlayer 后续范围与字幕/弹幕合同
+
+范围：在 LUX-203 至 LUX-209 已验证的自有播放器基础上，关闭核心控制层阶段门，并定义下一个阶段的字幕与 Web
+弹幕工作顺序、数据边界和验收。此任务只改文档；它不改变 Rust/TypeScript 行为、不新增路由或依赖，也不复制
+ArtPlayer 源码。
+
+后续阶段必须先完成字幕轨生命周期，再为 Web 创建独立于 Emby 的弹幕读取合同，最后实现 Lux 自有调度与渲染。ArtPlayer
+的 `src/subtitle.js`、`packages/artplayer-plugin-danmuku/src/` 仅作为 MIT 许可下的行为、性能边界和交互参考；复制或
+改造任何实现前必须先写入 `docs/THIRD-PARTY-NOTICES.md`。Lux 不得引入 `artplayer` 或其插件作为运行时依赖。
+
+本阶段以已存在的 Lux 播放会话、媒体源流信息、受鉴权字幕端点和已登记弹幕旁车为唯一数据基础。不得将 Emby
+`/api/danmu/*` 路由直接给 Lux Web 调用，不得在播放请求中做弹幕匹配、外部请求、整库扫描或旁车写入。
+
+验收：
+
+- [x] LUX-203 至 LUX-209 阶段门按 `docs/COMPATIBILITY.md`、自动化测试和本机 `arm64` 记录关闭；项目所有者已确认进入后续阶段。
+- [x] LUX-211 至 LUX-215 各有单一目标、依赖、明确不做项和可执行验证；字幕格式处理、Web 弹幕协议和渲染没有混入同一任务。
+- [x] 明确保持“不发送弹幕、无热力图、无远程弹幕上游访问、无服务器字幕转码/烧录、无 ArtPlayer 运行时依赖”的产品边界。
+
+验证：`git diff --check`，人工审阅任务边界与第三方台账；文档任务不需要新增代码测试。
+
+依赖：LUX-209。
+
+### 阶段 17：LuxPlayer 字幕与本地弹幕体验
+
+本阶段只把 Lux 已授权、已索引的本地文本字幕和已登记 Bilibili XML 弹幕带入 Lux Web 播放器。字幕与弹幕在切换媒体源、
+停止会话、页面离开、Direct/HLS/fallback 切换时必须一起释放；它们不能影响播放计划、媒体 URL、ACL、进度、心跳或
+Media Session。所有 UI 使用 Lux 自有类型、状态、DOM、CSS 和图标。
+
+#### LUX-211：LuxPlayer 字幕轨选择与 WebVTT 生命周期
+
+范围：从现有 `MediaSource.streams` 中识别可用字幕，为 LuxPlayer 提供关闭/选择状态和可访问的控制入口；已声明为
+外挂 WebVTT 的轨道使用既有受鉴权 Lux 字幕端点和原生 `TextTrack`。切换来源、退出页面或更换选择时销毁旧 track，
+不重新创建播放会话。
+
+验收：
+
+- [ ] 仅显示当前媒体源的 `SUBTITLE` 流；语言、标题、default/forced 信息可读，且“关闭字幕”始终可选。
+- [ ] 选择外置 VTT 只请求 `/api/v1/items/{itemId}/subtitles/{streamIndex}`，不拼接文件路径、外部 URL 或 Emby 路由；无 VTT 或浏览器不支持时安全降级并说明原因。
+- [ ] 轨道选择在 source/engine/页面生命周期中不残留旧 cue、不改变播放会话或进度事件；键盘和触摸均可操作。
+- [ ] 不在本任务读取/转换 SRT、ASS/SSA、PGS/SUP 或内嵌字幕，不做样式编辑或服务端改动。
+
+验证：字幕选择单测、现有播放器会话回归、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器验证 track 网络请求与切换。
+
+依赖：LUX-210、LUX-208。
+
+#### LUX-212：LuxPlayer 安全文本字幕解析与渲染
+
+范围：为已选的本地 SRT、ASS/SSA 与 VTT 外挂文本轨建立 Lux 自有的有界浏览器解析与覆盖层。解析器只接受由
+LUX-211 从已授权字幕流导出的同源字节；它使用文本节点渲染，限制输入大小、cue 数、单条长度和时间范围，并在
+Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改变或写回源字幕，不创建服务器字幕转换、烧录或缓存。
+
+验收：
+
+- [ ] SRT、ASS/SSA、VTT 的安全测试夹具可产生有序、受限的 Lux cue；格式错误、超限、负/倒置时间、控制字符和标记文本安全失败，不执行 HTML。
+- [ ] 覆盖层按播放时间显示/隐藏 cue，seek、暂停、倍速、source 变更和 destroy 不显示陈旧内容；渲染不依赖浏览器原生字幕样式。
+- [ ] ArtPlayer 仅作为 `subtitle.js` 生命周期和转换边界参考；Lux 代码、Worker 协议、DOM、CSS、错误文案和测试均为自有实现，并在台账记录来源状态。
+- [ ] 不支持 PGS/SUP 图形字幕、在线字幕搜索/下载、服务端转换/烧录或可编辑字幕样式。
+
+验证：解析器/Worker/组件单测、恶意文本回归、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器检查 source 切换和 console。
+
+依赖：LUX-211。
+
+#### LUX-213：Lux Web 弹幕读取合同
+
+范围：在 Rust Lux API 中增加与 Emby 弹幕路由分离的、ACL 保护的 Web 弹幕元数据和原始 XML 读取端点；只读取已登记的
+本地同名 XML 旁车。合同使用可扩展 DTO 和统一 Lux API 错误，不泄露文件路径、上游地址、token 或插件配置。
+
+验收：
+
+- [ ] 已授权用户只能看到所拥有条目的 `available`、固定 `BILIBILI_XML` 格式与同源 raw 读取地址；不存在、无权、未登记或故障情形遵循 Lux API 错误边界。
+- [ ] raw 端点执行现有 ACL、返回受限 XML 和 private no-cache，且不会触发匹配、插件 RPC、上游网络、扫描或旁车写入。
+- [ ] TypeScript API 类型/客户端是 Rust 合同的显式消费者；不复用或暴露 Emby `/api/danmu/*` DTO。
+- [ ] Rust API/ACL 测试覆盖授权、拒绝、缺失、无服务与 raw 内容；不实现发送、持久化、实时推送或热力图。
+
+验证：相关 Rust API/ACL 测试、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、Web API 单测与构建。
+
+依赖：LUX-210、LUX-150、LUX-090。
+
+#### LUX-214：LuxPlayer 弹幕解析、调度与渲染
+
+范围：消费 LUX-213 合同，实现 Lux 自有 Bilibili XML 弹幕解析、时间调度、轨道分配、防重叠和 DOM 覆盖层。默认开关
+继续是本实例内的 UI 状态；加载只在可见时发生，切换为不可见、来源/会话切换或 destroy 时取消/丢弃旧结果。
+
+验收：
+
+- [ ] 解析器验证并限制 XML、条目数、文本长度、时间、模式和样式值；弹幕文字始终以文本节点渲染，不能执行标记或脚本。
+- [ ] 滚动、顶部和底部模式在 seek、暂停、倍速、窗口缩放和 source 切换中正确同步；轨道调度防止可见重叠并在高密度数据下有界。
+- [ ] `aria-pressed` 开关保持可访问，关闭时不请求或渲染；没有输入框、发送按钮、热力图、实时推送、上游匹配或 XML 持久化。
+- [ ] ArtPlayer 弹幕插件仅作为 lane、生命周期和性能问题的参考；Lux 不复制其 DOM、CSS、图标、网络调用或发送界面，实际来源状态写入台账。
+
+验证：解析/调度单测、组件/会话隔离回归、Playwright 鼠标/触摸/seek 流程、`pnpm --dir web test`、`pnpm --dir web build`。
+
+依赖：LUX-213、LUX-212。
+
+#### LUX-215：LuxPlayer 字幕/弹幕兼容性与性能阶段门
+
+范围：以真实浏览器和固定、无个人数据的媒体/字幕/弹幕夹具验证阶段 17。验证 Direct、服务器 HLS 和客户端 fallback，
+并记录性能上限、可访问性、网络边界及真实设备差异；不新增新的解码引擎。现有 LUX-185 Worker/WASM fallback 仍是
+浏览器解码增强的唯一承诺，新增 WebCodecs 或 WASM 引擎必须另立 ADR 和任务。
+
+验收：
+
+- [ ] 390×844、768×1024、1440×900 下字幕、弹幕、控制栏、安全区、键盘焦点和触摸 seek 不重叠、不产生横向溢出。
+- [ ] Direct/HLS/fallback 的 source 切换、会话停止、页面离开和错误路径不会保留字幕/弹幕；console 为 0 error/0 warning，网络只包含声明的 Lux 端点。
+- [ ] 记录浏览器/平台/夹具哈希、解析/调度上限、已验证能力和未验证真机项；本机 `arm64` 结论不外推为 NAS/x86 或所有移动浏览器性能。
+- [ ] 全部 Rust/Web 质量门通过，第三方台账和 `docs/COMPATIBILITY.md` 更新；项目所有者确认阶段门后才可以再扩展播放器能力。
+
+验证：相关 Rust 测试、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、`pnpm --dir web build`、Playwright/真实浏览器检查、`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+依赖：LUX-212、LUX-214。
+
+阶段门：
+
+- [ ] 所有 Web 字幕与弹幕请求经过独立 Lux API、会话生命周期与媒体库 ACL；没有外部 URL、文件路径或 Emby DTO 泄露到 Lux Web。
+- [ ] 文本字幕与弹幕解析/渲染在 Direct、HLS 和客户端 fallback 下通过安全、功能与性能回归。
+- [ ] 桌面和移动 viewport 下的控制、字幕、弹幕和手势通过真实浏览器验证；真机差异明确记录。
+- [ ] ArtPlayer 任何复制/改造均有 MIT 追溯；未复制的逻辑标为仅参考，Lux 不依赖 ArtPlayer 包。
+- [ ] LUX-215 的 Rust/Web 全量检查、兼容性记录和 `uname -m` 完成，并由项目所有者确认。
 
 ## 26. 风险与缓解
 
