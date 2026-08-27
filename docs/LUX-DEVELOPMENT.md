@@ -132,6 +132,11 @@ Lux 的核心价值不是功能数量，而是：
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
 - 是否能够渲染某种字幕由客户端能力决定。
+- Lux Web 播放使用自有 `LuxPlayer`，不直接引入 ArtPlayer 作为运行时播放器。ArtPlayer MIT 源码可以按模块选择性复制和改造，
+  但 Lux 必须拥有自己的状态、事件、UI、字幕、弹幕、手势和引擎接口；所有复制或改造来源记录在
+  `docs/THIRD-PARTY-NOTICES.md`。
+- LuxPlayer 的字幕、弹幕、移动端手势和浏览器解码能力必须与 Lux 的播放会话、媒体源、版本、ACL、进度、章节和错误降级结合，
+  不能绕过 `/api/v1/playback/sessions` 或 `.strm` 播放边界。
 
 ### 3.4 多版本
 
@@ -1322,6 +1327,7 @@ locked local value
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
 - 不实现 DRM、字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。
+- LUX-203 至 LUX-208 建立 LuxPlayer 的独立产品层；Web 弹幕、完整 ASS/SSA 渲染和更复杂的字幕/轨道能力只能在对应任务中实现。
 - LUX-184 允许提供独立的浏览器媒体能力探针，用于实测原生 video、MediaCapabilities 和 WebCodecs；探针不接入
   正式播放路径，不读取或保存用户媒体数据。
 - LUX-185 可为 MP4/fMP4 的 HEVC 媒体增加浏览器端 WASM 解码、H.264 客户端编码和 MSE 播放 fallback；重型工作
@@ -1969,6 +1975,12 @@ services:
 | LUX-198 | runtime/Dockerfile、Dockerfile、docker-bake.hcl、src/application/playback/、src/api/lux/、src/storage/、migrations/、migrations-postgres/、web/src/features/player/、web/src/lib/api/、tests/、web/tests/、docs/ |
 | LUX-199 | src/application/catalog.rs、src/storage/mod.rs、src/api/mod.rs、tests/、docs/ |
 | LUX-202 | src/application/images.rs、src/application/nfo.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、web/tests/、docs/ |
+| LUX-203 | docs/LUX-DEVELOPMENT.md、docs/decisions/029-luxplayer.md、docs/THIRD-PARTY-NOTICES.md |
+| LUX-204 | web/src/features/player/core/、web/tests/；定义 LuxPlayer 状态、命令和引擎契约 |
+| LUX-205 | web/src/features/player/core/、web/src/features/player/PlayerPage.tsx、web/tests/；接入现有 Web 播放会话 |
+| LUX-206 | web/src/features/player/、web/tests/；拆分 LuxPlayer UI 与播放页面 |
+| LUX-207 | web/src/features/player/、web/tests/；实现来源可追溯的手势、自动隐藏和时间轴交互 |
+| LUX-208 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；Media Session、移动端安全区和兼容性收尾 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4733,6 +4745,117 @@ Lux 主程序编译的 TMDb client/adapter、TMDb endpoint/凭据/图片 URL 逻
 依赖：LUX-142、LUX-169、LUX-200。
 
 验证：`docs/LUX-201-PLAN.md`。
+
+### 阶段 16：LuxPlayer 原生 Web 播放系统
+
+本阶段把现有 Web 播放能力收拢为 Lux 自有播放器系统。每次只执行一个 `LUX-*` 任务；ArtPlayer 只作为 MIT 许可下的
+选择性衍生来源或实现参考，不作为 Lux 的运行时依赖。LUX-203 至 LUX-208 完成后必须经过阶段门，才能进入字幕、弹幕和
+Rust/WASM 播放增强任务。
+
+#### LUX-203：LuxPlayer 产品边界、衍生代码与许可证治理
+
+范围：建立 LuxPlayer 的产品规格、架构边界、ArtPlayer MIT 衍生代码规则、第三方来源台账和后续第一阶段任务。此任务
+只改文档，不复制 ArtPlayer 代码，不改变播放行为。
+
+验收：
+
+- [x] ADR 明确 LuxPlayer 与 ArtPlayer 的产品和运行时边界，并兼容 ADR-006、ADR-026。
+- [x] `docs/THIRD-PARTY-NOTICES.md` 固定 ArtPlayer 上游仓库、MIT 许可、版权、参考 commit 和来源台账格式。
+- [x] LUX-204 至 LUX-208 各自只有一个清晰目标、验收和验证方式，没有把字幕/弹幕/Rust codec 提前混入。
+
+验证：`git diff --check`，人工审阅三份文档；文档-only 任务不需要新增代码测试。
+
+依赖：LUX-201。
+
+#### LUX-204：LuxPlayer 核心状态、命令和引擎契约
+
+范围：在 `web/src/features/player/core/` 建立 Lux 自己的播放状态、命令、事件、快照、错误和 `PlaybackEngine` 契约，
+将 Native/HLS/fallback 的生命周期约束写成 TypeScript 单测。此任务不改变页面视觉，不增加服务端 API。
+
+契约最低要求：
+
+- 状态至少区分 `IDLE`、`PREPARING`、`READY`、`PLAYING`、`PAUSED`、`BUFFERING`、`SEEKING`、`ENDED` 和 `FAILED`。
+- 引擎必须声明 `setSource`、`play`、`pause`、`seek`、`snapshot` 和 `destroy`；`destroy` 幂等且不可向旧媒体继续派发事件。
+- 状态转换拒绝不合法的旧事件；错误保留用户可诊断的原因和是否允许服务端回退。
+- Controller 不知道 ArtPlayer 类型、DOM 结构或上游事件命名。
+
+验收：单测覆盖初始加载、播放/暂停、缓冲、seek、结束、错误、重复销毁和旧引擎事件隔离；现有 Web 构建通过。
+
+验证：`pnpm --dir web test`、`pnpm --dir web build`。
+
+依赖：LUX-203。
+
+#### LUX-205：LuxPlayer Controller 接入 Lux 播放会话
+
+范围：把 LUX-204 的 Controller 接入现有 `/api/v1/playback/sessions`、事件、心跳和停止接口，保持当前 Direct、HLS、
+客户端 fallback、版本选择、续播和错误回退语义。此任务不拆 UI。
+
+验收：
+
+- Controller 从服务端计划选择正确引擎，并在媒体源/会话变化时停止旧引擎和旧会话。
+- 播放、暂停、定时进度、停止、页面离开、heartbeat 和单调 sequence 行为与现有测试一致。
+- `.strm` 仍只走档位 0；Controller 不拼接任意 URL、不创建服务端未声明的计划。
+
+验证：扩展 `web/tests/player-playback.test.tsx` 的会话生命周期断言，运行 `pnpm --dir web test`、
+`pnpm --dir web build`，并运行相关 Rust Web 播放测试。
+
+依赖：LUX-204、LUX-198。
+
+#### LUX-206：LuxPlayer UI 与播放页面拆分
+
+范围：将现有 `PlayerPage` 拆分为 LuxPlayer 容器、视频 surface、顶部信息、底部控制栏、设置面板和错误/加载状态；
+保持已有外观、快捷键、倍速、音量、全屏、画中画、版本选择和可访问性行为，再为后续手势/字幕/弹幕预留明确插槽。
+
+验收：
+
+- 页面数据获取和播放器呈现职责分离；UI 不直接创建播放会话或操作 Rust API。
+- 当前 Native、HLS、HEVC/MKV fallback 和错误提示回归不变。
+- 所有交互控件有可访问名称、键盘路径和移动端可操作尺寸；不引入 ArtPlayer DOM/CSS。
+
+验证：组件/页面单测、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器检查桌面和 320/768/1440 宽度。
+
+依赖：LUX-205、LUX-113。
+
+#### LUX-207：LuxPlayer 手势、自动隐藏和时间轴交互
+
+范围：吸收并改造 ArtPlayer 中经过验证的手势、自动隐藏、时间轴和触摸交互思路，形成 Lux 自有实现。桌面保留
+键盘快捷键；移动端增加双击快进/快退、水平滑动 seek、垂直滑动音量，并处理 pointer capture、滚动冲突和可访问性。
+
+验收：
+
+- 手势只作用于当前 LuxPlayer 实例，不泄漏到页面或旧播放会话。
+- 单击、双击、拖动、悬停预览、缓冲显示和自动隐藏在鼠标、触摸和键盘输入下互不误触。
+- seek 期间状态、时间显示、进度上报和 HLS/fallback 引擎保持一致。
+- 来源台账记录实际复制/改造的 ArtPlayer 模块；没有复制的部分标为“仅参考”。
+
+验证：纯逻辑与组件单测、Playwright 触摸/鼠标流程、`pnpm --dir web test`、`pnpm --dir web build`。
+
+依赖：LUX-206。
+
+#### LUX-208：Media Session、移动端安全区与播放器兼容性收尾
+
+范围：将浏览器 Media Session、页面可见性、移动端 safe-area、方向/全屏策略和可诊断兼容性状态接入 LuxPlayer；不在
+此任务中加入字幕、弹幕或 Rust/WASM codec。
+
+验收：
+
+- 支持的浏览器通过 Media Session 控制播放、暂停、前进、后退和 seek；不支持时安全降级。
+- iOS/Android viewport、刘海安全区、横竖屏和全屏状态不遮挡核心控制；桌面键盘行为不回归。
+- 播放失败能区分浏览器不支持、资源过期、引擎失败和服务端计划失败，并给出 Lux 建议。
+- 兼容性记录包含浏览器、平台、媒体样本和已验证能力；不以单次探测宣称 4K 实时播放。
+
+验证：Playwright 多 viewport、`pnpm --dir web test`、`pnpm --dir web build`、真实浏览器 console/network 检查，并更新
+`docs/COMPATIBILITY.md`。
+
+依赖：LUX-207、LUX-184、LUX-185。
+
+阶段门：
+
+- [ ] LuxPlayer 已拥有独立的 Controller、Engine contract 和 UI 组件，业务代码不依赖 ArtPlayer 包。
+- [ ] Direct、服务器 HLS、客户端 fallback、版本选择、续播、播放进度和页面离开通过真实浏览器回归。
+- [ ] 桌面和移动 viewport 的播放控制、手势、Media Session 和错误提示通过验证。
+- [ ] ArtPlayer 衍生代码来源和 MIT notice 完整；无未记录的复制代码。
+- [ ] 运行本阶段 Web 检查，并记录 `uname -m`；不将本机 ARM 结果外推为 NAS/x86 性能。
 
 ## 26. 风险与缓解
 
