@@ -849,6 +849,7 @@ export type MediaImageStrategySettings = {
   thumbnail: boolean;
   disc: boolean;
   wallpaper: boolean;
+  writeToMetadata: boolean;
   maxBackdropCount: number;
   minDownloadWidth: number;
 };
