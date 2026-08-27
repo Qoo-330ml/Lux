@@ -13496,42 +13496,133 @@ impl Database {
     pub(crate) async fn find_local_danmaku_source_for_item(
         &self,
         item_id: &str,
+        source_id: Option<&str>,
     ) -> Result<Option<StoredDanmakuSource>, StorageError> {
-        self.query(
-            "SELECT ms.id AS source_id, ms.item_id,
-                    mi.item_type, mi.title, mi.original_title,
-                    series.title AS series_title,
-                    series.original_title AS series_original_title,
-                    lr.canonical_path AS root_path, fe.relative_path
-             FROM media_sources ms
-             JOIN media_items mi ON mi.id = ms.item_id
-             LEFT JOIN media_items series ON series.id = mi.series_id
-             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-             JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
-               AND fe.is_missing = 0
-             ORDER BY ms.is_default DESC, fe.relative_path
-             LIMIT 1",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| {
-            row.map(|row| StoredDanmakuSource {
-                source_id: row.get("source_id"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-                item_type: row.get("item_type"),
-                title: row.get("title"),
-                original_title: row.get("original_title"),
-                series_title: row.get("series_title"),
-                series_original_title: row.get("series_original_title"),
-            })
-        })
+        let row = match source_id {
+            Some(source_id) => {
+                self.query(
+                    "SELECT ms.id AS source_id, ms.item_id,
+                            mi.item_type, mi.title, mi.original_title,
+                            series.title AS series_title,
+                            series.original_title AS series_original_title,
+                            lr.canonical_path AS root_path, fe.relative_path
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     LEFT JOIN media_items series ON series.id = mi.series_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     WHERE mi.id = ? AND ms.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                       AND fe.is_missing = 0
+                     LIMIT 1",
+                )
+                .bind(item_id)
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await
+            }
+            None => {
+                self.query(
+                    "SELECT ms.id AS source_id, ms.item_id,
+                            mi.item_type, mi.title, mi.original_title,
+                            series.title AS series_title,
+                            series.original_title AS series_original_title,
+                            lr.canonical_path AS root_path, fe.relative_path
+                     FROM media_sources ms
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     LEFT JOIN media_items series ON series.id = mi.series_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                       AND fe.is_missing = 0
+                     ORDER BY ms.is_default DESC, fe.relative_path
+                     LIMIT 1",
+                )
+                .bind(item_id)
+                .fetch_optional(&self.pool)
+                .await
+            }
+        }
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        Ok(row.map(|row| StoredDanmakuSource {
+            source_id: row.get("source_id"),
+            root_path: row.get("root_path"),
+            relative_path: row.get("relative_path"),
+            item_type: row.get("item_type"),
+            title: row.get("title"),
+            original_title: row.get("original_title"),
+            series_title: row.get("series_title"),
+            series_original_title: row.get("series_original_title"),
+        }))
+    }
+
+    pub(crate) async fn find_registered_local_danmaku_source_for_item(
+        &self,
+        item_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Option<StoredDanmakuSource>, StorageError> {
+        let row = match source_id {
+            Some(source_id) => {
+                self.query(
+                    "SELECT ms.id AS source_id, ms.item_id,
+                            mi.item_type, mi.title, mi.original_title,
+                            series.title AS series_title,
+                            series.original_title AS series_original_title,
+                            lr.canonical_path AS root_path, fe.relative_path
+                     FROM media_sources ms
+                     JOIN danmaku_tracks dt ON dt.media_source_id = ms.id
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     LEFT JOIN media_items series ON series.id = mi.series_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     WHERE mi.id = ? AND ms.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                       AND fe.is_missing = 0 AND dt.status = 'READY'
+                     LIMIT 1",
+                )
+                .bind(item_id)
+                .bind(source_id)
+                .fetch_optional(&self.pool)
+                .await
+            }
+            None => {
+                self.query(
+                    "SELECT ms.id AS source_id, ms.item_id,
+                            mi.item_type, mi.title, mi.original_title,
+                            series.title AS series_title,
+                            series.original_title AS series_original_title,
+                            lr.canonical_path AS root_path, fe.relative_path
+                     FROM media_sources ms
+                     JOIN danmaku_tracks dt ON dt.media_source_id = ms.id
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     LEFT JOIN media_items series ON series.id = mi.series_id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                       AND fe.is_missing = 0 AND dt.status = 'READY'
+                     ORDER BY ms.is_default DESC, fe.relative_path
+                     LIMIT 1",
+                )
+                .bind(item_id)
+                .fetch_optional(&self.pool)
+                .await
+            }
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(row.map(|row| StoredDanmakuSource {
+            source_id: row.get("source_id"),
+            root_path: row.get("root_path"),
+            relative_path: row.get("relative_path"),
+            item_type: row.get("item_type"),
+            title: row.get("title"),
+            original_title: row.get("original_title"),
+            series_title: row.get("series_title"),
+            series_original_title: row.get("series_original_title"),
+        }))
     }
 
     pub(crate) async fn upsert_danmaku_track(

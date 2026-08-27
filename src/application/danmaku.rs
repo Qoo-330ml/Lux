@@ -445,9 +445,47 @@ impl DanmakuService {
         &self,
         item_id: &str,
     ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
+        self.read_sidecar_for_source(item_id, None).await
+    }
+
+    pub async fn read_sidecar_for_source(
+        &self,
+        item_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
         let Some(source) = self
             .database
-            .find_local_danmaku_source_for_item(item_id)
+            .find_local_danmaku_source_for_item(item_id, source_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let Ok((_, target)) = safe_danmaku_source_paths(&source).await else {
+            return Ok(None);
+        };
+        let Ok(metadata) = fs::symlink_metadata(&target).await else {
+            return Ok(None);
+        };
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return Ok(None);
+        }
+        let Ok(bytes) = read_danmaku_file(&target).await else {
+            return Ok(None);
+        };
+        if validate_danmaku_xml(&bytes).is_err() {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    pub async fn read_registered_sidecar_for_source(
+        &self,
+        item_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
+        let Some(source) = self
+            .database
+            .find_registered_local_danmaku_source_for_item(item_id, source_id)
             .await?
         else {
             return Ok(None);

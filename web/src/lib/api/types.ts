@@ -275,6 +275,14 @@ export type WebPlaybackSession = {
   plan: WebPlaybackPlan;
 };
 
+/** Metadata for a registered, same-origin Lux Web danmaku sidecar. */
+export type WebDanmakuInfo = {
+  available: true;
+  format: "BILIBILI_XML";
+  sourceId: string | null;
+  rawUrl: string;
+};
+
 export type AdminRoot = {
   id: string;
   libraryId: string;

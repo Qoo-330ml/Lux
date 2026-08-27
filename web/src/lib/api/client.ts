@@ -54,6 +54,7 @@ import type {
   PlaybackEventState,
   WebPlaybackCapabilities,
   WebPlaybackSession,
+  WebDanmakuInfo,
   SetupStatus,
   SetupDatabaseBackend,
   SetupDatabaseStatus,
@@ -445,6 +446,13 @@ export class LuxApiClient {
   playback(itemId: string) {
     return this.request<PlaybackState>(
       `/api/v1/items/${encodeURIComponent(itemId)}/playback`,
+    );
+  }
+
+  webDanmaku(itemId: string, sourceId?: string) {
+    const query = sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : "";
+    return this.request<WebDanmakuInfo>(
+      `/api/v1/items/${encodeURIComponent(itemId)}/danmaku${query}`,
     );
   }
 

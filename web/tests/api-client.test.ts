@@ -939,4 +939,26 @@ describe("LuxApiClient", () => {
     await expect(client.stopWebPlaybackSession("session-1")).resolves.toBeUndefined();
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
+
+  it("reads Lux Web danmaku metadata without using the Emby compatibility route", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        available: true,
+        format: "BILIBILI_XML",
+        sourceId: "source / 4k",
+        rawUrl: "/api/v1/items/item-1/danmaku/raw?sourceId=source%20%2F%204k",
+      }), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().webDanmaku("item-1", "source / 4k")).resolves.toEqual({
+      available: true,
+      format: "BILIBILI_XML",
+      sourceId: "source / 4k",
+      rawUrl: "/api/v1/items/item-1/danmaku/raw?sourceId=source%20%2F%204k",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/items/item-1/danmaku?sourceId=source%20%2F%204k",
+    );
+  });
 });

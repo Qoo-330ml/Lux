@@ -1092,6 +1092,8 @@ pub fn app_with_state(state: AppState) -> Router {
             "/api/v1/items/{item_id}/subtitles/{stream_index}",
             get(lux_subtitle).head(lux_subtitle),
         )
+        .route("/api/v1/items/{item_id}/danmaku", get(lux_danmaku_info))
+        .route("/api/v1/items/{item_id}/danmaku/raw", get(lux_danmaku_raw))
         .route(
             "/api/v1/items/{item_id}/stream",
             get(lux_stream).head(lux_stream),
@@ -10299,6 +10301,138 @@ async fn lux_subtitle(
         stream_index,
     )
     .await
+}
+
+async fn lux_danmaku_info(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = ensure_lux_item_visible(&state, &headers, &user, &item_id).await {
+        return response;
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return lux_danmaku_unavailable(&headers);
+    };
+    match service
+        .read_registered_sidecar_for_source(&item_id, query.source_id.as_deref())
+        .await
+    {
+        Ok(Some(_)) => Json(json!({
+            "available": true,
+            "format": "BILIBILI_XML",
+            "sourceId": query.source_id,
+            "rawUrl": lux_danmaku_raw_url(&item_id, query.source_id.as_deref()),
+        }))
+        .into_response(),
+        Ok(None) => lux_danmaku_not_found(&headers),
+        Err(_) => lux_danmaku_unavailable(&headers),
+    }
+}
+
+async fn lux_danmaku_raw(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<LuxStreamQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = ensure_lux_item_visible(&state, &headers, &user, &item_id).await {
+        return response;
+    }
+    let Some(service) = state.danmaku.as_ref() else {
+        return lux_danmaku_unavailable(&headers);
+    };
+    match service
+        .read_registered_sidecar_for_source(&item_id, query.source_id.as_deref())
+        .await
+    {
+        Ok(Some(bytes)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "application/xml; charset=utf-8")
+            .header("Cache-Control", "private, no-cache")
+            .body(Body::from(bytes))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        Ok(None) => lux_danmaku_not_found(&headers),
+        Err(_) => lux_danmaku_unavailable(&headers),
+    }
+}
+
+fn lux_danmaku_not_found(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::NOT_FOUND,
+        lux::ApiErrorCode::NotFound,
+        "当前媒体源没有可用弹幕",
+    )
+    .into_response()
+}
+
+fn lux_danmaku_unavailable(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::SERVICE_UNAVAILABLE,
+        lux::ApiErrorCode::DatabaseUnavailable,
+        "弹幕读取服务暂时不可用",
+    )
+    .into_response()
+}
+
+async fn ensure_lux_item_visible(
+    state: &AppState,
+    headers: &HeaderMap,
+    user: &UserRecord,
+    item_id: &str,
+) -> Result<(), Response> {
+    let Some(access) = state.access.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "媒体访问服务暂时不可用",
+        )
+        .into_response());
+    };
+    match access
+        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), item_id)
+        .await
+    {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(api_error(
+            headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response()),
+        Err(_) => Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "媒体访问服务暂时不可用",
+        )
+        .into_response()),
+    }
+}
+
+fn lux_danmaku_raw_url(item_id: &str, source_id: Option<&str>) -> String {
+    let mut url = format!(
+        "/api/v1/items/{}/danmaku/raw",
+        percent_encode_filename(item_id)
+    );
+    if let Some(source_id) = source_id {
+        url.push_str("?sourceId=");
+        url.push_str(&percent_encode_filename(source_id));
+    }
+    url
 }
 
 #[derive(Deserialize, Default)]
