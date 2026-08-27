@@ -770,6 +770,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
             "thumbnail": false,
             "disc": true,
             "wallpaper": false,
+            "writeToMetadata": true,
             "maxBackdropCount": 3,
             "minDownloadWidth": 1920
         },
@@ -799,6 +800,10 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     );
     assert_eq!(
         strategy_body["library"]["mediaStrategy"]["images"]["disc"],
+        true
+    );
+    assert_eq!(
+        strategy_body["library"]["mediaStrategy"]["images"]["writeToMetadata"],
         true
     );
 

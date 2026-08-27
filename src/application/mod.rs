@@ -22,6 +22,7 @@ pub mod media_matching;
 pub mod metadata;
 pub mod metadata_objects;
 pub mod metadata_paths;
+pub(crate) mod metadata_writeback;
 pub mod network_diagnostics;
 pub mod nfo;
 pub mod people;

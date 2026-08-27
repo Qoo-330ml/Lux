@@ -76,7 +76,7 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
     assert_eq!(poster.content_type, "image/png");
     let canonical_movie_dir = tokio::fs::canonicalize(&movie_dir).await?;
     assert_eq!(poster.path, canonical_movie_dir.join("poster.png"));
-    assert_eq!(fanart.path, canonical_movie_dir.join("fanart.webp"));
+    assert_eq!(fanart.path, canonical_movie_dir.join("backdrop.webp"));
     assert_eq!(tokio::fs::read(&poster.path).await?, PNG_1X1);
     assert_eq!(
         tokio::fs::read(&fanart.path).await?,
@@ -483,9 +483,9 @@ async fn permanent_image_failure_is_not_retried_automatically()
 }
 
 #[tokio::test]
-async fn config_managed_images_use_the_metadata_library_directory()
+async fn config_managed_images_use_the_media_directory_by_default()
 -> Result<(), Box<dyn std::error::Error>> {
-    let (database, item_id, root, _movie_dir) = prepared_movie().await?;
+    let (database, item_id, root, movie_dir) = prepared_movie().await?;
     let config_dir = root.join("config");
     let app = Router::new().route(
         "/poster",
@@ -504,13 +504,14 @@ async fn config_managed_images_use_the_metadata_library_directory()
     let report = service
         .download_item_image(&item_id, "poster", &format!("http://{address}/poster"))
         .await?;
-    let expected = tokio::fs::canonicalize(library_item_directory(&config_dir, &item_id)?)
-        .await?
-        .join("poster.png");
-    assert_eq!(report.path, expected);
-    let canonical_metadata_root = tokio::fs::canonicalize(config_dir.join("metadata")).await?;
-    assert!(report.path.starts_with(canonical_metadata_root));
+    let canonical_movie_dir = tokio::fs::canonicalize(&movie_dir).await?;
+    assert_eq!(report.path, canonical_movie_dir.join("poster.png"));
     assert_eq!(tokio::fs::read(&report.path).await?, PNG_1X1);
+    assert!(
+        !library_item_directory(&config_dir, &item_id)?
+            .join("poster.png")
+            .exists()
+    );
 
     let indexed: String =
         sqlx::query_scalar("SELECT local_path FROM item_images WHERE item_id = ?")
@@ -528,6 +529,60 @@ async fn config_managed_images_use_the_metadata_library_directory()
     Ok(())
 }
 
+#[tokio::test]
+async fn config_managed_images_can_write_an_additional_metadata_copy()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, root, movie_dir) = prepared_movie().await?;
+    let config_dir = root.join("config");
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({
+                "images": { "writeToMetadata": true }
+            })
+            .to_string(),
+        )
+        .bind(library_id)
+        .execute(database.pool())
+        .await?;
+    let app = Router::new().route(
+        "/poster",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_1X1.to_vec()))
+                .expect("test image response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+
+    let service = ImageWriteService::new_with_config_dir(database.clone(), config_dir.clone())?;
+    let report = service
+        .download_item_image(&item_id, "poster", &format!("http://{address}/poster"))
+        .await?;
+    let canonical_movie_dir = tokio::fs::canonicalize(&movie_dir).await?;
+    assert_eq!(report.path, canonical_movie_dir.join("poster.png"));
+    let metadata_poster = tokio::fs::canonicalize(library_item_directory(&config_dir, &item_id)?)
+        .await?
+        .join("poster.png");
+    assert_eq!(tokio::fs::read(metadata_poster).await?, PNG_1X1);
+
+    let indexed: String =
+        sqlx::query_scalar("SELECT local_path FROM item_images WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(indexed, report.path.to_string_lossy());
+
+    server.abort();
+    Ok(())
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn config_managed_image_writes_reject_metadata_parent_symlinks()
@@ -536,6 +591,20 @@ async fn config_managed_image_writes_reject_metadata_parent_symlinks()
 
     let (database, item_id, root, _movie_dir) = prepared_movie().await?;
     let config_dir = root.join("config");
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(
+            serde_json::json!({
+                "images": { "writeToMetadata": true }
+            })
+            .to_string(),
+        )
+        .bind(library_id)
+        .execute(database.pool())
+        .await?;
     tokio::fs::create_dir_all(&config_dir).await?;
     let external_metadata = root.join("external-metadata");
     tokio::fs::create_dir_all(&external_metadata).await?;

@@ -8,7 +8,6 @@ use std::{
 };
 
 use reqwest::{Client, Url, header::CONTENT_TYPE};
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
@@ -23,6 +22,7 @@ use crate::{
     application::{
         metadata::series_directory,
         metadata_paths::{library_item_directory, metadata_root},
+        metadata_writeback::item_metadata_writeback_enabled,
         scraper::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperProvider,
             ScraperResolver,
@@ -30,7 +30,9 @@ use crate::{
     },
     network::client_builder_from_env_or,
     observability::resources::ResourceMetrics,
-    storage::{Database, ItemImageMetadata, MetadataImageAttemptUpdate, StorageError},
+    storage::{
+        Database, ItemImageMetadata, MetadataImageAttemptUpdate, StorageError, StoredItemImage,
+    },
 };
 
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
@@ -45,20 +47,6 @@ pub(crate) const MAX_IMAGE_VARIANTS: usize = 4;
 
 static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredMediaImageSettings {
-    #[serde(default)]
-    write_to_metadata: bool,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredMediaImageStrategy {
-    #[serde(default)]
-    images: StoredMediaImageSettings,
-}
 
 fn global_image_download_permits() -> Arc<Semaphore> {
     IMAGE_GLOBAL_DOWNLOAD_PERMITS
@@ -455,6 +443,7 @@ impl ImageWriteService {
             .await?
             .ok_or(ImageWriteError::ItemNotFound)?;
         let path = PathBuf::from(&image.local_path);
+        self.delete_metadata_image_copy(&image).await?;
         if let Ok(metadata) = fs::symlink_metadata(&path).await {
             if metadata.file_type().is_symlink() {
                 return Err(ImageWriteError::SymlinkTarget(path));
@@ -501,6 +490,63 @@ impl ImageWriteService {
         if !self.database.delete_item_image(item_id, image_id).await? {
             return Err(ImageWriteError::ItemNotFound);
         }
+        Ok(())
+    }
+
+    async fn delete_metadata_image_copy(
+        &self,
+        image: &StoredItemImage,
+    ) -> Result<(), ImageWriteError> {
+        let Some(config_dir) = self.config_dir.as_deref() else {
+            return Ok(());
+        };
+        let metadata_root_path = metadata_root(config_dir);
+        let metadata_directory = library_item_directory(config_dir, &image.item_id)
+            .map_err(|error| ImageWriteError::InvalidConfiguration(error.to_string()))?;
+        reject_metadata_symlinks(&metadata_root_path).await?;
+        let directory_metadata = match fs::symlink_metadata(&metadata_directory).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(image_io_error(&metadata_directory, source)),
+        };
+        if !directory_metadata.is_dir() {
+            return Err(ImageWriteError::Io {
+                path: metadata_directory,
+                source: std::io::Error::new(
+                    std::io::ErrorKind::NotADirectory,
+                    "metadata item path is not a directory",
+                ),
+            });
+        }
+        reject_metadata_symlinks(&metadata_directory).await?;
+        let canonical_root = fs::canonicalize(&metadata_root_path)
+            .await
+            .map_err(|source| image_io_error(&metadata_root_path, source))?;
+        let canonical_directory = fs::canonicalize(&metadata_directory)
+            .await
+            .map_err(|source| image_io_error(&metadata_directory, source))?;
+        if !canonical_directory.starts_with(&canonical_root) {
+            return Err(ImageWriteError::PathOutsideRoot(canonical_directory));
+        }
+        let stems = image_lookup_stems(&image.image_type, None, None, image.image_index)?;
+        let Some(path) = find_existing_image_path(&canonical_directory, &stems, None).await? else {
+            return Ok(());
+        };
+        let metadata = fs::symlink_metadata(&path)
+            .await
+            .map_err(|source| image_io_error(&path, source))?;
+        if metadata.file_type().is_symlink() {
+            return Err(ImageWriteError::SymlinkTarget(path));
+        }
+        let canonical_path = fs::canonicalize(&path)
+            .await
+            .map_err(|source| image_io_error(&path, source))?;
+        if !canonical_path.starts_with(&canonical_root) {
+            return Err(ImageWriteError::PathOutsideRoot(canonical_path));
+        }
+        fs::remove_file(&canonical_path)
+            .await
+            .map_err(|source| image_io_error(&canonical_path, source))?;
         Ok(())
     }
 
@@ -746,33 +792,34 @@ impl ImageWriteService {
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
         }
-        let metadata_target =
-            if self.config_dir.is_some() && self.write_to_metadata(item_id).await? {
-                let config_dir = self.config_dir.as_ref().ok_or_else(|| {
-                    ImageWriteError::InvalidConfiguration("missing config directory".to_owned())
-                })?;
-                let metadata_root_path = metadata_root(config_dir);
-                let metadata_directory = self.metadata_image_directory(config_dir, item_id).await?;
-                let canonical_metadata_root = fs::canonicalize(&metadata_root_path)
-                    .await
-                    .map_err(|source| image_io_error(&metadata_root_path, source))?;
-                let metadata_target = image_target(
-                    &metadata_directory,
-                    image_type,
-                    format,
-                    None,
-                    None,
-                    image_index,
-                    true,
-                )
-                .await?;
-                if !metadata_target.starts_with(&canonical_metadata_root) {
-                    return Err(ImageWriteError::PathOutsideRoot(metadata_target));
-                }
-                Some(metadata_target)
-            } else {
-                None
-            };
+        let metadata_target = if self.config_dir.is_some()
+            && item_metadata_writeback_enabled(&self.database, item_id).await?
+        {
+            let config_dir = self.config_dir.as_ref().ok_or_else(|| {
+                ImageWriteError::InvalidConfiguration("missing config directory".to_owned())
+            })?;
+            let metadata_root_path = metadata_root(config_dir);
+            let metadata_directory = self.metadata_image_directory(config_dir, item_id).await?;
+            let canonical_metadata_root = fs::canonicalize(&metadata_root_path)
+                .await
+                .map_err(|source| image_io_error(&metadata_root_path, source))?;
+            let metadata_target = image_target(
+                &metadata_directory,
+                image_type,
+                format,
+                None,
+                None,
+                image_index,
+                true,
+            )
+            .await?;
+            if !metadata_target.starts_with(&canonical_metadata_root) {
+                return Err(ImageWriteError::PathOutsideRoot(metadata_target));
+            }
+            Some(metadata_target)
+        } else {
+            None
+        };
         let _write_permit = self
             .write_permits
             .clone()
@@ -880,24 +927,6 @@ impl ImageWriteService {
             return Err(ImageWriteError::PathOutsideRoot(canonical_directory));
         }
         Ok(canonical_directory)
-    }
-
-    async fn write_to_metadata(&self, item_id: &str) -> Result<bool, ImageWriteError> {
-        let library_id = self
-            .database
-            .find_item_library_id(item_id)
-            .await?
-            .ok_or(ImageWriteError::ItemNotFound)?;
-        let library = self
-            .database
-            .find_library(&library_id)
-            .await?
-            .ok_or(ImageWriteError::ItemNotFound)?;
-        let global = self.database.media_strategy_settings().await?;
-        let stored = library.media_strategy_json.as_deref().or(global.as_deref());
-        Ok(stored
-            .and_then(|value| serde_json::from_str::<StoredMediaImageStrategy>(value).ok())
-            .is_some_and(|strategy| strategy.images.write_to_metadata))
     }
 
     pub async fn download_item_image_from_scraper_candidate(

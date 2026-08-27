@@ -1841,7 +1841,7 @@ impl MetadataSelectionService {
         config_dir: std::path::PathBuf,
     ) -> Self {
         Self {
-            nfo: NfoWriteService::new(database.clone()),
+            nfo: NfoWriteService::new_with_config_dir(database.clone(), config_dir.clone()),
             database: database.clone(),
             images,
             people: crate::application::people::PeopleService::new(config_dir)
