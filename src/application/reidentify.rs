@@ -1552,10 +1552,11 @@ mod tests {
             _request: ScraperSearchRequest,
         ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
             self.record("search");
-            let response = self
-                .match_found
-                .then(|| self.search_response())
-                .unwrap_or_default();
+            let response = if self.match_found {
+                self.search_response()
+            } else {
+                ScraperSearchResponse::default()
+            };
             Box::pin(std::future::ready(Ok(response)))
         }
 
