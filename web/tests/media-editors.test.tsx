@@ -69,12 +69,12 @@ describe("media editors", () => {
 
     expect(container.querySelectorAll(".lux-image-type-tabs [role=tab]")).toHaveLength(7);
     await act(async () => container.querySelector<HTMLButtonElement>(".lux-image-editor-toolbar .lux-button")?.click());
-    expect(search).toHaveBeenCalledWith("item-1", { imageType: "POSTER", language: "zh-CN", source: "TMDB" });
+    expect(search).toHaveBeenCalledWith("item-1", { imageType: "POSTER", language: "zh-CN", source: "" });
     expect(container.querySelector<HTMLElement>(".lux-image-result")?.dataset.imageType).toBe("POSTER");
 
     await act(async () => container.querySelectorAll<HTMLButtonElement>(".lux-select-trigger")[0]?.click());
     await act(async () => document.querySelector<HTMLButtonElement>("[role=option][data-value='en-US']")?.click());
-    expect(search).toHaveBeenLastCalledWith("item-1", { imageType: "POSTER", language: "en-US", source: "TMDB" });
+    expect(search).toHaveBeenLastCalledWith("item-1", { imageType: "POSTER", language: "en-US", source: "" });
   });
 
   it("marks the current image container with the selected image type", async () => {

@@ -290,7 +290,8 @@ describe("AdminPluginsPage plugin cards", () => {
         languageFallbackEnabled: false,
         titleAliasReplacementEnabled: false,
         fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
-        alternateApiEnabled: false,
+        alternateApiEnabled: true,
+        apiBaseUrlPreset: "official",
         apiBaseUrl: "https://api.themoviedb.org",
       },
       configFields: [
@@ -345,16 +346,25 @@ describe("AdminPluginsPage plugin cards", () => {
           description: "开启后使用下方地址访问 TMDb。",
         },
         {
-          key: "apiBaseUrl",
+          key: "apiBaseUrlPreset",
           label: "TMDb API 地址",
           type: "select",
-          required: true,
+          required: false,
           sensitive: false,
           options: [
             { value: "official", label: "https://api.themoviedb.org" },
             { value: "alternate", label: "https://api.tmdb.org" },
             { value: "custom", label: "自定义" },
           ],
+        },
+        {
+          key: "apiBaseUrl",
+          label: "自定义 TMDb API 地址",
+          type: "text",
+          required: false,
+          sensitive: false,
+          defaultValue: "https://api.themoviedb.org",
+          description: "选择自定义时填写基础地址；不要附带查询参数或片段。",
         },
       ],
     };
@@ -378,6 +388,15 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(dialog?.textContent).toContain("当tmdb语言检索不到中文名称时，尝试使用中文别名替换");
     expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
 
+    await act(async () => selects[2]?.click());
+    await act(async () => document.querySelector<HTMLButtonElement>("[role=option][data-value='custom']")?.click());
+    const customApiBaseUrl = dialog?.querySelector<HTMLInputElement>("#plugin-config-org\\.lux\\.tmdb-custom-api-base-url");
+    expect(customApiBaseUrl).toBeTruthy();
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(customApiBaseUrl, "https://tmdb.internal.example");
+      customApiBaseUrl?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
     await act(async () => {
       dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
     });
@@ -386,8 +405,9 @@ describe("AdminPluginsPage plugin cards", () => {
       languageFallbackEnabled: false,
       titleAliasReplacementEnabled: false,
       fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
-      alternateApiEnabled: false,
-      apiBaseUrl: "https://api.themoviedb.org",
+      alternateApiEnabled: true,
+      apiBaseUrlPreset: "custom",
+      apiBaseUrl: "https://tmdb.internal.example",
     }));
   });
 

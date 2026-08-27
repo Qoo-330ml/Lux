@@ -27,7 +27,6 @@ const languageOptions = [
 ];
 
 const sourceOptions = [
-  { value: "TMDB", label: "TMDb" },
   { value: "", label: "不限来源" },
 ];
 
@@ -35,7 +34,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const [imageType, setImageType] = useState("POSTER");
   const [language, setLanguage] = useState("zh-CN");
-  const [source, setSource] = useState("TMDB");
+  const [source, setSource] = useState("");
   const [images, setImages] = useState<ItemImage[]>([]);
   const [results, setResults] = useState<ImageSearchResult[]>([]);
   const [loading, setLoading] = useState(true);

@@ -168,6 +168,10 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const fallbackLanguagesField = plugin.configFields.find((field) => field.key === "fallbackLanguages");
   const alternateApiField = plugin.configFields.find((field) => field.key === "alternateApiEnabled");
   const apiBaseUrlField = plugin.configFields.find((field) => field.key === "apiBaseUrl");
+  const apiBaseUrlPresetField = plugin.configFields.find((field) => field.key === "apiBaseUrlPreset")
+    ?? (apiBaseUrlField?.type === "select" ? apiBaseUrlField : undefined);
+  const customApiBaseUrlField = plugin.configFields.find((field) => field.key === "customApiBaseUrl")
+    ?? (apiBaseUrlField?.type === "text" ? apiBaseUrlField : undefined);
   const libraryIdsField = plugin.configFields.find((field) => field.key === "libraryIds");
   const concurrencyField = plugin.configFields.find((field) => field.key === "concurrency");
   const introWindowField = plugin.configFields.find((field) => field.key === "introWindowSeconds");
@@ -179,7 +183,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const thumbnailPositionPercentField = plugin.configFields.find((field) => field.key === "thumbnailPositionPercent");
   const writeSidecarsField = plugin.configFields.find((field) => field.key === "writeSidecars");
   const scheduleField = plugin.configFields.find((field) => field.key === "schedule");
-  const customApiBaseUrlOption = apiBaseUrlField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
+  const customApiBaseUrlOption = apiBaseUrlPresetField?.options?.find((option) => option.label === "自定义")?.value ?? "custom";
   const canConfigure = plugin.installed && plugin.configurable && plugin.configFields.length > 0;
   const toggleBlockedByProvider = plugin.unavailableReason === "OTHER_IP_LOCATION_PLUGIN_INSTALLED";
   const closeDialog = useCallback(() => setOpen(false), []);
@@ -218,9 +222,23 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           titleAliasReplacementEnabled,
           fallbackLanguages,
           alternateApiEnabled,
-          apiBaseUrl: apiBaseUrlChoice === customApiBaseUrlOption
-            ? customApiBaseUrl.trim()
-            : apiBaseUrlField?.options?.find((option) => option.value === apiBaseUrlChoice)?.label ?? customApiBaseUrl.trim(),
+          ...(apiBaseUrlPresetField?.key === "apiBaseUrlPreset"
+            ? {
+              apiBaseUrlPreset: apiBaseUrlChoice,
+              apiBaseUrl: apiBaseUrlChoice === customApiBaseUrlOption
+                ? customApiBaseUrl.trim()
+                : apiBaseUrlPresetField.options?.find((option) => option.value === apiBaseUrlChoice)?.label ?? "",
+            }
+            : apiBaseUrlField
+              ? {
+                apiBaseUrl: apiBaseUrlField.type === "select"
+                  ? apiBaseUrlChoice
+                  : customApiBaseUrl.trim(),
+                ...(customApiBaseUrlField?.key === "customApiBaseUrl"
+                  ? { customApiBaseUrl: customApiBaseUrl.trim() }
+                  : {}),
+              }
+              : {}),
         }),
     onSuccess: () => {
       setApiKey("");
@@ -269,9 +287,17 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
       : ["zh-SG", "zh-HK", "zh-TW"];
     const configuredApiBaseUrl = typeof values.apiBaseUrl === "string"
       ? values.apiBaseUrl
-      : apiBaseUrlField?.options?.[0]?.label ?? "https://api.themoviedb.org";
-    const selectedApiOption = apiBaseUrlField?.options?.find(
-      (option) => option.value !== customApiBaseUrlOption && option.label === configuredApiBaseUrl,
+      : typeof apiBaseUrlField?.defaultValue === "string"
+        ? apiBaseUrlField.defaultValue
+        : apiBaseUrlPresetField?.options?.[0]?.label ?? "https://api.themoviedb.org";
+    const configuredApiBaseUrlPreset = typeof values.apiBaseUrlPreset === "string"
+      ? values.apiBaseUrlPreset
+      : undefined;
+    const selectedApiOption = apiBaseUrlPresetField?.options?.find(
+      (option) => option.value !== customApiBaseUrlOption
+        && (option.value === configuredApiBaseUrlPreset
+          || option.value === configuredApiBaseUrl
+          || option.label === configuredApiBaseUrl),
     );
     setPreferredLanguage(preferred);
     setLanguageFallbackEnabled(values.languageFallbackEnabled === true);
@@ -279,7 +305,9 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setFallbackLanguages(fallback);
     setAlternateApiEnabled(values.alternateApiEnabled === true);
     setApiBaseUrlChoice(selectedApiOption?.value ?? customApiBaseUrlOption);
-    setCustomApiBaseUrl(selectedApiOption ? "" : configuredApiBaseUrl);
+    setCustomApiBaseUrl(typeof values.customApiBaseUrl === "string"
+      ? values.customApiBaseUrl
+      : selectedApiOption ? "" : configuredApiBaseUrl);
     const configuredLibraryIds = Array.isArray(values.libraryIds)
       ? values.libraryIds.filter((value): value is string => typeof value === "string")
       : [];
@@ -307,7 +335,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setApiKeyDirty(false);
     setDanmakuProviderBaseUrl("");
     setDanmakuProviderBaseUrlDirty(false);
-  }, [apiBaseUrlField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
+  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -378,8 +406,8 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
                 {fallbackEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={languageFallbackEnabled} onChange={(event) => setLanguageFallbackEnabled(event.target.checked)} /> <span><strong>{fallbackEnabledField.label}</strong><small>{fallbackEnabledField.description}</small></span></label> : null}
                 {fallbackLanguagesField ? <label htmlFor={"plugin-config-" + plugin.id + "-fallback-languages"}>{fallbackLanguagesField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-fallback-languages"} multiple value={fallbackLanguages} options={fallbackLanguagesField.options ?? []} onChange={setFallbackLanguages} aria-label={fallbackLanguagesField.label} /><small>{fallbackLanguagesField.description}</small></label> : null}
                 {alternateApiField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={alternateApiEnabled} onChange={(event) => setAlternateApiEnabled(event.target.checked)} /> <span><strong>{alternateApiField.label}</strong><small>{alternateApiField.description}</small></span></label> : null}
-                {apiBaseUrlField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} options={apiBaseUrlField.options ?? []} disabled={!alternateApiEnabled} onChange={setApiBaseUrlChoice} aria-label={apiBaseUrlField.label} /><small>{apiBaseUrlField.description}</small></label> : null}
-                {apiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>自定义 API 地址<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>只填写 TMDb API 的基础地址，不要附带查询参数。</small></label> : null}
+                {apiBaseUrlPresetField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-base-url"}>{apiBaseUrlPresetField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-api-base-url"} value={apiBaseUrlChoice} options={apiBaseUrlPresetField.options ?? []} disabled={!alternateApiEnabled} onChange={setApiBaseUrlChoice} aria-label={apiBaseUrlPresetField.label} /><small>{apiBaseUrlPresetField.description}</small></label> : null}
+                {customApiBaseUrlField && apiBaseUrlChoice === customApiBaseUrlOption ? <label htmlFor={"plugin-config-" + plugin.id + "-custom-api-base-url"}>{customApiBaseUrlField.label}<input id={"plugin-config-" + plugin.id + "-custom-api-base-url"} type="url" value={customApiBaseUrl} disabled={!alternateApiEnabled} onChange={(event) => setCustomApiBaseUrl(event.target.value)} placeholder="https://example.com" autoComplete="url" /><small>{customApiBaseUrlField.description}</small></label> : null}
               </>}
               <p>{danmakuProviderField?.description ?? configField?.description ?? "插件配置"} 当前：{availabilityLabel(plugin.configSource)}。</p>
               <div className="lux-admin-plugin-dialog-actions">

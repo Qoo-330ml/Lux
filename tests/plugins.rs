@@ -24,7 +24,7 @@ fn signed_dynamic_manifest() -> Value {
         "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
         "type": "metadata",
         "providerKey": "tmdb",
-        "supportedItemTypes": ["Movie"],
+        "supportedItemTypes": ["Movie", "Series", "Season", "Episode", "Person", "BoxSet"],
         "capabilities": ["metadata.search"],
         "configFields": [{
             "key": "apiKey",
@@ -97,10 +97,16 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
             }, {
                 "key": "preferredLanguage",
                 "label": "首选语言",
-                "type": "text",
+                "type": "select",
                 "required": false,
                 "sensitive": false,
-                "defaultValue": "zh-CN"
+                "defaultValue": "zh-CN",
+                "options": [
+                    {"value": "zh-CN", "label": "简体中文"},
+                    {"value": "zh-SG", "label": "zh-SG"},
+                    {"value": "zh-HK", "label": "zh-HK"},
+                    {"value": "zh-TW", "label": "zh-TW"}
+                ]
             }, {
                 "key": "languageFallbackEnabled",
                 "label": "语言回退",
@@ -116,6 +122,7 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
                 "required": false,
                 "sensitive": false,
                 "options": [
+                    {"value": "zh-CN", "label": "简体中文"},
                     {"value": "zh-SG", "label": "zh-SG"},
                     {"value": "zh-HK", "label": "zh-HK"},
                     {"value": "zh-TW", "label": "zh-TW"}
@@ -128,8 +135,19 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
                 "sensitive": false,
                 "defaultValue": false
             }, {
-                "key": "apiBaseUrl",
+                "key": "apiBaseUrlPreset",
                 "label": "TMDb API 地址",
+                "type": "select",
+                "required": false,
+                "sensitive": false,
+                "options": [
+                    {"value": "official", "label": "https://api.themoviedb.org"},
+                    {"value": "alternate", "label": "https://api.tmdb.org"},
+                    {"value": "custom", "label": "自定义"}
+                ]
+            }, {
+                "key": "apiBaseUrl",
+                "label": "自定义 TMDb API 地址",
                 "type": "text",
                 "required": false,
                 "sensitive": false,
@@ -263,7 +281,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     assert_eq!(tmdb["configurable"], true);
     assert_eq!(tmdb["configSource"], "PLUGIN_CONFIG");
     assert_eq!(config_field(tmdb, "apiKey")["type"], "password");
-    assert_eq!(config_field(tmdb, "preferredLanguage")["type"], "text");
+    assert_eq!(config_field(tmdb, "preferredLanguage")["type"], "select");
     assert_eq!(
         config_field(tmdb, "preferredLanguage")["defaultValue"],
         "zh-CN"
@@ -281,6 +299,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
         "https://api.themoviedb.org"
     );
     assert_eq!(config_field(tmdb, "alternateApiEnabled")["type"], "toggle");
+    assert_eq!(config_field(tmdb, "apiBaseUrlPreset")["type"], "select");
     assert_eq!(config_field(tmdb, "apiBaseUrl")["type"], "text");
     assert_eq!(
         config_field(tmdb, "titleAliasReplacementEnabled")["type"],
@@ -631,6 +650,7 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
             "titleAliasReplacementEnabled": true,
             "fallbackLanguages": ["zh-HK", "zh-TW"],
             "alternateApiEnabled": true,
+            "apiBaseUrlPreset": "alternate",
             "apiBaseUrl": "https://api.tmdb.org"
         }))
         .send()
@@ -661,6 +681,10 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
     assert_eq!(
         configured_body["plugin"]["configValues"]["apiBaseUrl"],
         "https://api.tmdb.org"
+    );
+    assert_eq!(
+        configured_body["plugin"]["configValues"]["apiBaseUrlPreset"],
+        "alternate"
     );
     assert!(!configured_body.to_string().contains(custom_key));
     let stored_config: Value = serde_json::from_slice(
