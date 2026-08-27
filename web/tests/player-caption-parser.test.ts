@@ -3,6 +3,7 @@ import {
   CaptionParseError,
   parseCaptionText,
 } from "../src/features/player/caption-parser";
+import { parseCaptionWorkerRequest } from "../src/features/player/caption-parser-worker";
 
 describe("LuxPlayer safe caption parser", () => {
   it("normalizes ordered SRT, ASS, SSA, and VTT cues", () => {
@@ -40,5 +41,28 @@ describe("LuxPlayer safe caption parser", () => {
     ).join("\n\n");
     expect(() => parseCaptionText(tooManyCues, "srt"))
       .toThrowError(new CaptionParseError("TOO_MANY_CUES", "字幕条目过多"));
+  });
+
+  it("keeps worker parsing results and failures inside a request generation", () => {
+    expect(parseCaptionWorkerRequest({
+      type: "PARSE",
+      requestId: 7,
+      format: "vtt",
+      text: "WEBVTT\n\n00:00.000 --> 00:01.000\nworker cue",
+    })).toEqual({
+      type: "PARSED",
+      requestId: 7,
+      cues: [{ id: "cue-0", start: 0, end: 1, text: "worker cue" }],
+    });
+    expect(parseCaptionWorkerRequest({
+      type: "PARSE",
+      requestId: 8,
+      format: "srt",
+      text: "invalid",
+    })).toEqual({
+      type: "FAILED",
+      requestId: 8,
+      message: "字幕条目格式无效",
+    });
   });
 });
