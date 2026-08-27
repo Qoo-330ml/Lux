@@ -127,6 +127,13 @@ function codecCandidates(kind: "audio" | "video", codec: string): string[] {
   return [codec];
 }
 
+function timelinePosition(bar: HTMLDivElement, clientX: number, duration: number) {
+  const rect = bar.getBoundingClientRect();
+  if (rect.width <= 0 || duration <= 0) return 0;
+  const progress = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+  return progress * duration;
+}
+
 export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -152,6 +159,8 @@ export function PlayerPage() {
   const [showSettings, setShowSettings] = useState(false);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
+  const [isPointerInteracting, setIsPointerInteracting] = useState(false);
+  const [controlActivity, setControlActivity] = useState(0);
   const [centerSplash, setCenterSplash] = useState<"play" | "pause" | null>(null);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [hoverPercent, setHoverPercent] = useState<number | null>(null);
@@ -206,10 +215,10 @@ export function PlayerPage() {
   const lastProgressReportRef = useRef(0);
   const hasStartedRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
-  const hideControlsTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const splashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const isDraggingScrubberRef = useRef(false);
+  const scrubberPointerIdRef = useRef<number | null>(null);
   const playbackSequenceRef = useRef(0);
   const fallbackRequestedRef = useRef(false);
   const sessionTransitionRef = useRef(Promise.resolve());
@@ -436,6 +445,8 @@ export function PlayerPage() {
         case "PLAYING":
           hasStartedRef.current = true;
           setPlaying(true);
+          setControlsVisible(true);
+          setControlActivity((activity) => activity + 1);
           void reportPlayback("PLAYING", true, false, initialEngine.element);
           break;
         case "PAUSED":
@@ -570,20 +581,22 @@ export function PlayerPage() {
     };
   }, []);
 
-  // Show/Hide controls with idle timer
+  // Show or reset the controls. The effect below owns the actual timer so
+  // concurrent mouse, touch, and keyboard events cannot leave stale timers.
   const resetControlsTimeout = useCallback(() => {
     setControlsVisible(true);
-    if (hideControlsTimeoutRef.current) {
-      clearTimeout(hideControlsTimeoutRef.current);
-    }
-    if (playing) {
-      hideControlsTimeoutRef.current = setTimeout(() => {
-        if (!showSettings && !isDraggingScrubberRef.current) {
-          setControlsVisible(false);
-        }
-      }, AUTO_HIDE_DELAY_MS);
-    }
-  }, [playing, showSettings]);
+    setControlActivity((activity) => activity + 1);
+  }, []);
+
+  useEffect(() => {
+    if (!playing || !controlsVisible || showSettings || isPointerInteracting) return;
+    const timeout = window.setTimeout(() => setControlsVisible(false), AUTO_HIDE_DELAY_MS);
+    return () => window.clearTimeout(timeout);
+  }, [controlActivity, controlsVisible, isPointerInteracting, playing, showSettings]);
+
+  useEffect(() => () => {
+    if (splashTimeoutRef.current) clearTimeout(splashTimeoutRef.current);
+  }, []);
 
   const showCenterSplash = (type: "play" | "pause") => {
     setCenterSplash(type);
@@ -606,13 +619,23 @@ export function PlayerPage() {
     }
   }, []);
 
+  const seekTo = useCallback((seconds: number) => {
+    const video = videoRef.current;
+    if (!video) return;
+    const maximum = Number.isFinite(video.duration) && video.duration > 0
+      ? video.duration
+      : Math.max(0, duration);
+    const target = Math.max(0, Math.min(maximum, seconds));
+    if (runtimeRef.current) runtimeRef.current.seek(target);
+    else video.currentTime = target;
+    setCurrentTime(target);
+  }, [duration]);
+
   const seekRelative = useCallback((seconds: number) => {
     const video = videoRef.current;
     if (!video) return;
-    const target = Math.max(0, Math.min(video.duration || 0, video.currentTime + seconds));
-    video.currentTime = target;
-    setCurrentTime(target);
-  }, []);
+    seekTo(video.currentTime + seconds);
+  }, [seekTo]);
 
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
@@ -747,37 +770,50 @@ export function PlayerPage() {
   // Scrubber scrubbing handlers
   const handleScrubberPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     const bar = progressBarRef.current;
-    const video = videoRef.current;
-    if (!bar || !video || !duration) return;
+    if (
+      !bar
+      || !duration
+      || scrubberPointerIdRef.current !== null
+      || (e.pointerType === "mouse" && e.button !== 0)
+    ) return;
 
     isDraggingScrubberRef.current = true;
-    const updatePosition = (clientX: number) => {
-      const rect = bar.getBoundingClientRect();
-      const pos = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-      const targetTime = pos * duration;
-      setCurrentTime(targetTime);
-      return targetTime;
-    };
+    scrubberPointerIdRef.current = e.pointerId;
+    setIsPointerInteracting(true);
+    resetControlsTimeout();
+    try {
+      bar.setPointerCapture?.(e.pointerId);
+    } catch {
+      // A cancelled pointer can no longer be captured; the timeline still
+      // receives its element-scoped fallback events.
+    }
+    seekTo(timelinePosition(bar, e.clientX, duration));
+  };
 
-    const targetTime = updatePosition(e.clientX);
-    video.currentTime = targetTime;
+  const handleScrubberPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const bar = progressBarRef.current;
+    if (!bar || scrubberPointerIdRef.current !== event.pointerId) return;
+    seekTo(timelinePosition(bar, event.clientX, duration));
+  };
 
-    const handlePointerMove = (moveEvent: MouseEvent) => {
-      const time = updatePosition(moveEvent.clientX);
-      video.currentTime = time;
-    };
-
-    const handlePointerUp = (upEvent: MouseEvent) => {
-      const time = updatePosition(upEvent.clientX);
-      video.currentTime = time;
-      isDraggingScrubberRef.current = false;
-      window.removeEventListener("mousemove", handlePointerMove);
-      window.removeEventListener("mouseup", handlePointerUp);
-      resetControlsTimeout();
-    };
-
-    window.addEventListener("mousemove", handlePointerMove);
-    window.addEventListener("mouseup", handlePointerUp);
+  const finishScrubberPointer = (
+    event: ReactPointerEvent<HTMLDivElement>,
+    commitPosition: boolean,
+  ) => {
+    const bar = progressBarRef.current;
+    if (!bar || scrubberPointerIdRef.current !== event.pointerId) return;
+    try {
+      if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
+        event.currentTarget.releasePointerCapture?.(event.pointerId);
+      }
+    } catch {
+      // Browsers may release capture before a pointercancel reaches React.
+    }
+    isDraggingScrubberRef.current = false;
+    scrubberPointerIdRef.current = null;
+    setIsPointerInteracting(false);
+    if (commitPosition) seekTo(timelinePosition(bar, event.clientX, duration));
+    resetControlsTimeout();
   };
 
   const handleScrubberMouseMove = (e: ReactMouseEvent<HTMLDivElement>) => {
@@ -803,13 +839,10 @@ export function PlayerPage() {
       seekRelative(5);
     } else if (event.key === "Home") {
       event.preventDefault();
-      runtimeRef.current?.seek(0);
-      setCurrentTime(0);
+      seekTo(0);
     } else if (event.key === "End") {
       event.preventDefault();
-      const target = Math.max(0, duration);
-      runtimeRef.current?.seek(target);
-      setCurrentTime(target);
+      seekTo(duration);
     }
   };
 
@@ -885,6 +918,17 @@ export function PlayerPage() {
           event.stopPropagation();
           toggleFullscreen();
         }}
+        gestureOptions={{
+          currentTime,
+          duration,
+          volume,
+          onSeekTo: seekTo,
+          onVolumeChange: changeVolume,
+          onSeekRelative: seekRelative,
+          onSingleTap: togglePlayPause,
+          onActivity: resetControlsTimeout,
+          onInteractionChange: setIsPointerInteracting,
+        }}
         centerSplash={centerSplash}
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
@@ -936,6 +980,9 @@ export function PlayerPage() {
         hoverPercent={hoverPercent}
         progressBarRef={progressBarRef}
         onTimelinePointerDown={handleScrubberPointerDown}
+        onTimelinePointerMove={handleScrubberPointerMove}
+        onTimelinePointerUp={(event) => finishScrubberPointer(event, true)}
+        onTimelinePointerCancel={(event) => finishScrubberPointer(event, false)}
         onTimelineMouseMove={handleScrubberMouseMove}
         onTimelineMouseLeave={handleScrubberMouseLeave}
         onTimelineKeyDown={handleTimelineKeyDown}

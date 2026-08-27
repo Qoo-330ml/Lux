@@ -131,6 +131,9 @@ describe("LuxPlayer state components", () => {
         hoverPercent={null}
         progressBarRef={{ current: null }}
         onTimelinePointerDown={() => undefined}
+        onTimelinePointerMove={() => undefined}
+        onTimelinePointerUp={() => undefined}
+        onTimelinePointerCancel={() => undefined}
         onTimelineMouseMove={() => undefined}
         onTimelineMouseLeave={() => undefined}
         onTimelineKeyDown={() => undefined}

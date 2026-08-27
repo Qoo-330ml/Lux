@@ -33,6 +33,9 @@ export type PlayerControlsProps = {
   hoverPercent: number | null;
   progressBarRef: RefObject<HTMLDivElement | null>;
   onTimelinePointerDown: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onTimelinePointerMove: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onTimelinePointerUp: (event: ReactPointerEvent<HTMLDivElement>) => void;
+  onTimelinePointerCancel: (event: ReactPointerEvent<HTMLDivElement>) => void;
   onTimelineMouseMove: (event: ReactMouseEvent<HTMLDivElement>) => void;
   onTimelineMouseLeave: () => void;
   onTimelineKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
@@ -73,6 +76,9 @@ export function PlayerControls({
   hoverPercent,
   progressBarRef,
   onTimelinePointerDown,
+  onTimelinePointerMove,
+  onTimelinePointerUp,
+  onTimelinePointerCancel,
   onTimelineMouseMove,
   onTimelineMouseLeave,
   onTimelineKeyDown,
@@ -101,6 +107,9 @@ export function PlayerControls({
         aria-valuenow={Math.max(0, Math.round(currentTime))}
         aria-valuetext={`${formatTime(currentTime)} / ${formatTime(duration)}`}
         onPointerDown={onTimelinePointerDown}
+        onPointerMove={onTimelinePointerMove}
+        onPointerUp={onTimelinePointerUp}
+        onPointerCancel={onTimelinePointerCancel}
         onMouseMove={onTimelineMouseMove}
         onMouseLeave={onTimelineMouseLeave}
         onKeyDown={onTimelineKeyDown}

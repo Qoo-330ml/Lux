@@ -11,6 +11,21 @@ import { queryKeys } from "../src/lib/api/query-keys";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
+function dispatchPointer(
+  target: Element,
+  type: "pointerdown" | "pointermove" | "pointerup" | "pointercancel",
+  options: { pointerId: number; pointerType: string; clientX: number; clientY: number },
+) {
+  const event = new Event(type, { bubbles: true, cancelable: true });
+  Object.defineProperties(event, {
+    pointerId: { value: options.pointerId },
+    pointerType: { value: options.pointerType },
+    clientX: { value: options.clientX },
+    clientY: { value: options.clientY },
+  });
+  target.dispatchEvent(event);
+}
+
 describe("PlayerPage playback synchronization", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
@@ -35,6 +50,7 @@ describe("PlayerPage playback synchronization", () => {
   });
 
   afterEach(() => {
+    vi.useRealTimers();
     if (root) act(() => root?.unmount());
     container?.remove();
     vi.restoreAllMocks();
@@ -442,5 +458,98 @@ describe("PlayerPage playback synchronization", () => {
     await act(async () => video.dispatchEvent(new Event("ended")));
 
     expect(api.stopWebPlaybackSession).toHaveBeenCalledWith("web-source-3", false);
+  });
+
+  it("keeps pointer controls active while seeking and uses pointer capture for the timeline", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-pointer",
+      title: "手势交互测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-pointer", isDefault: true, durationTicks: 1_000_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-pointer"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    const player = container.querySelector<HTMLElement>(".lux-player-page");
+    const timeline = container.querySelector<HTMLDivElement>('[aria-label="播放进度"]');
+    if (!video || !player || !timeline) throw new Error("player controls were not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 100 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 0 });
+    vi.spyOn(video, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 400,
+      height: 200,
+      right: 400,
+      bottom: 200,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    vi.spyOn(timeline, "getBoundingClientRect").mockReturnValue({
+      left: 0,
+      top: 0,
+      width: 100,
+      height: 22,
+      right: 100,
+      bottom: 22,
+      x: 0,
+      y: 0,
+      toJSON: () => ({}),
+    });
+    const capture = vi.fn();
+    const release = vi.fn();
+    Object.defineProperty(timeline, "setPointerCapture", { configurable: true, value: capture });
+    Object.defineProperty(timeline, "hasPointerCapture", { configurable: true, value: () => true });
+    Object.defineProperty(timeline, "releasePointerCapture", { configurable: true, value: release });
+
+    await act(async () => video.dispatchEvent(new Event("loadedmetadata")));
+    vi.useFakeTimers();
+    await act(async () => video.dispatchEvent(new Event("play")));
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(player.classList.contains("controls-hidden")).toBe(true);
+
+    act(() => dispatchPointer(video, "pointerdown", { pointerId: 1, pointerType: "touch", clientX: 100, clientY: 100 }));
+    act(() => dispatchPointer(video, "pointermove", { pointerId: 1, pointerType: "touch", clientX: 200, clientY: 100 }));
+    expect(player.classList.contains("controls-visible")).toBe(true);
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(player.classList.contains("controls-hidden")).toBe(false);
+    act(() => dispatchPointer(video, "pointercancel", { pointerId: 1, pointerType: "touch", clientX: 200, clientY: 100 }));
+
+    act(() => dispatchPointer(timeline, "pointerdown", { pointerId: 2, pointerType: "touch", clientX: 50, clientY: 10 }));
+    act(() => dispatchPointer(timeline, "pointermove", { pointerId: 3, pointerType: "touch", clientX: 80, clientY: 10 }));
+    act(() => dispatchPointer(timeline, "pointerup", { pointerId: 3, pointerType: "touch", clientX: 90, clientY: 10 }));
+    act(() => dispatchPointer(timeline, "pointermove", { pointerId: 2, pointerType: "touch", clientX: 60, clientY: 10 }));
+    act(() => dispatchPointer(timeline, "pointerup", { pointerId: 2, pointerType: "touch", clientX: 60, clientY: 10 }));
+
+    expect(capture).toHaveBeenCalledWith(2);
+    expect(release).toHaveBeenCalledWith(2);
+    expect(video.currentTime).toBe(60);
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(player.classList.contains("controls-hidden")).toBe(true);
   });
 });

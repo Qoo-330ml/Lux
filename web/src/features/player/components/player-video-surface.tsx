@@ -1,9 +1,11 @@
 import { AlertCircle, ArrowLeft, Pause, Play } from "lucide-react";
 import type {
   MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
   RefCallback,
   SyntheticEvent,
 } from "react";
+import { usePlayerSurfaceGestures } from "./player-gestures";
 
 type PlayerVideoSurfaceProps = {
   streamUrl: string;
@@ -25,6 +27,17 @@ type PlayerVideoSurfaceProps = {
   showError: boolean;
   onRetry: () => void;
   onBack: () => void;
+  gestureOptions?: {
+    currentTime: number;
+    duration: number;
+    volume: number;
+    onSeekTo: (position: number) => void;
+    onVolumeChange: (volume: number) => void;
+    onSeekRelative: (seconds: number) => void;
+    onSingleTap: () => void;
+    onActivity: () => void;
+    onInteractionChange: (interacting: boolean) => void;
+  };
 };
 
 export function PlayerVideoSurface({
@@ -47,7 +60,35 @@ export function PlayerVideoSurface({
   showError,
   onRetry,
   onBack,
+  gestureOptions,
 }: PlayerVideoSurfaceProps) {
+  const gestures = usePlayerSurfaceGestures({
+    enabled: Boolean(gestureOptions),
+    currentTime: gestureOptions?.currentTime ?? 0,
+    duration: gestureOptions?.duration ?? 0,
+    volume: gestureOptions?.volume ?? 0,
+    onSeekTo: gestureOptions?.onSeekTo ?? (() => undefined),
+    onVolumeChange: gestureOptions?.onVolumeChange ?? (() => undefined),
+    onSeekRelative: gestureOptions?.onSeekRelative ?? (() => undefined),
+    onSingleTap: gestureOptions?.onSingleTap ?? (() => undefined),
+    onActivity: gestureOptions?.onActivity ?? (() => undefined),
+    onInteractionChange: gestureOptions?.onInteractionChange ?? (() => undefined),
+  });
+
+  const handleClick = (event: ReactMouseEvent<HTMLVideoElement>) => {
+    if (gestures.consumeSuppressedClick(event)) return;
+    onClick(event);
+  };
+
+  const handlePointerDown = (event: ReactPointerEvent<HTMLVideoElement>) => {
+    gestures.onPointerDown(event);
+  };
+
+  const handleDoubleClick = (event: ReactMouseEvent<HTMLVideoElement>) => {
+    if (gestures.consumeSuppressedClick(event)) return;
+    onDoubleClick(event);
+  };
+
   return (
     <div className="lux-player-frame">
       {streamUrl ? (
@@ -57,8 +98,12 @@ export function PlayerVideoSurface({
           src={streamUrl}
           poster={poster ?? undefined}
           preload="metadata"
-          onClick={onClick}
-          onDoubleClick={onDoubleClick}
+          onClick={handleClick}
+          onDoubleClick={handleDoubleClick}
+          onPointerDown={handlePointerDown}
+          onPointerMove={gestures.onPointerMove}
+          onPointerUp={gestures.onPointerUp}
+          onPointerCancel={gestures.onPointerCancel}
           onError={onError}
           onLoadedMetadata={onLoadedMetadata}
           onPlay={onPlay}

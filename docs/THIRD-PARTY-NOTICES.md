@@ -22,6 +22,7 @@ MIT License 要求在软件的所有副本或实质性部分中保留版权和�
 | 上游快照 | 上游路径 | Lux 路径 | 处理方式 | 变更摘要 | 许可证/notice |
 |---|---|---|---|---|---|
 | 待填 | 待填 | 待填 | 复制 / 改造 / 仅参考 | 待填 | MIT / 本文件 |
+| `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/events/gestureInit.js`、`packages/artplayer/src/events/clickInit.js`、`packages/artplayer/src/control/progress.js` | `web/src/features/player/components/player-gestures.ts`、`web/src/features/player/PlayerPage.tsx`、`web/src/features/player/components/player-video-surface.tsx` | 仅参考 | 参考手势方向、时间轴局部坐标与单/双击冲突处理的问题边界；Lux 使用自己的 Pointer Events、pointer capture、状态回调、阈值和测试，未复制上游代码、DOM、CSS、图标或 API。 | MIT / 本文件 |
 
 “仅参考”表示没有复制可受版权保护的代码，可以不放入 `vendor-derived` 目录；但仍应在设计文档中说明参考目的。复制或改造的代码必须经过 Lux 自己的类型、状态和安全边界，不得把上游插件的网络请求、远程资源、品牌资产或默认配置带入 Lux。
 
