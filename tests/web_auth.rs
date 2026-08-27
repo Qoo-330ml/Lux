@@ -227,6 +227,20 @@ async fn avatar_upload_requires_csrf_and_survives_a_second_login()
     let csrf_cookie = cookie_value(login.headers(), "lux_csrf");
     let cookie_header = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
 
+    let no_avatar = client
+        .get(format!("{base_url}/api/v1/auth/avatar"))
+        .header(COOKIE, &cookie_header)
+        .send()
+        .await?;
+    assert_eq!(no_avatar.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(
+        no_avatar
+            .headers()
+            .get(reqwest::header::CACHE_CONTROL)
+            .and_then(|value| value.to_str().ok()),
+        Some("private, no-cache")
+    );
+
     let missing_csrf = client
         .put(format!("{base_url}/api/v1/auth/avatar"))
         .header(COOKIE, &cookie_header)

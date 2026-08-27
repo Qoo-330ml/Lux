@@ -8713,7 +8713,14 @@ async fn auth_avatar(headers: HeaderMap, State(state): State<AppState>) -> Respo
             Ok(response) => response,
             Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         },
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => match Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .header(CACHE_CONTROL, "private, no-cache")
+            .body(Body::empty())
+        {
+            Ok(response) => response,
+            Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+        },
         Err(error) => user_avatar_error(&headers, error),
     }
 }

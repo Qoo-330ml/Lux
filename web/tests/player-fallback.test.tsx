@@ -9,6 +9,11 @@ import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { shouldUseClientHevc } from "../src/features/player/playback-selection";
 
+const fallbackState = vi.hoisted(() => ({
+  assets: [] as Array<{ workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string }>,
+  snapshotDuration: 8 as number | null,
+}));
+
 vi.mock("../src/features/player/playback-selection", () => ({
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
@@ -25,7 +30,12 @@ vi.mock("../src/features/player/hevc-playback-engine", () => ({
       realtime: false,
     };
 
-    constructor(readonly element: HTMLVideoElement) {}
+    constructor(
+      readonly element: HTMLVideoElement,
+      readonly assets: { workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string },
+    ) {
+      fallbackState.assets.push(assets);
+    }
 
     setSource() {
       return Promise.resolve();
@@ -35,7 +45,7 @@ vi.mock("../src/features/player/hevc-playback-engine", () => ({
     play() { return this.element.play(); }
     pause() { this.element.pause(); }
     seek(seconds: number) { this.element.currentTime = seconds; }
-    snapshot() { return { currentTime: 0, duration: 8, ended: false }; }
+    snapshot() { return { currentTime: 0, duration: fallbackState.snapshotDuration, ended: false }; }
   },
 }));
 
@@ -46,6 +56,8 @@ describe("PlayerPage client fallback status", () => {
   let root: Root | undefined;
 
   beforeEach(() => {
+    fallbackState.assets.length = 0;
+    fallbackState.snapshotDuration = 8;
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-fallback",
@@ -111,6 +123,9 @@ describe("PlayerPage client fallback status", () => {
     });
     expect(container?.textContent).toContain("客户端解码速度低于实时");
     expect(container?.textContent).toContain("使用原生客户端或降低清晰度");
+    expect(fallbackState.assets[0]).toMatchObject({
+      wasmUrl: "/hevc/hevc-decode.js",
+    });
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {
@@ -171,5 +186,41 @@ describe("PlayerPage client fallback status", () => {
 
     expect(container?.textContent).toContain("客户端解码速度低于实时");
     expect(container?.textContent).toContain("0.25×");
+  });
+
+  it("updates the seekable duration when fallback metadata finishes after canplay", async () => {
+    fallbackState.snapshotDuration = null;
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-fallback"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    const timeline = container.querySelector<HTMLElement>("[role='slider'][aria-label='播放进度']");
+    expect(video).not.toBeNull();
+    expect(timeline?.getAttribute("aria-valuemax")).toBe("0");
+
+    await act(async () => video?.dispatchEvent(new Event("canplay")));
+    expect(timeline?.getAttribute("aria-valuemax")).toBe("0");
+
+    fallbackState.snapshotDuration = 8;
+    await act(async () => video?.dispatchEvent(new Event("durationchange")));
+
+    expect(timeline?.getAttribute("aria-valuemax")).toBe("8");
   });
 });

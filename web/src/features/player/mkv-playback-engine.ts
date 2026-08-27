@@ -87,7 +87,7 @@ export class ClientMkvEngine implements PlaybackEngine {
     };
     worker.postMessage({
       type: "init",
-      wasmUrl: this.assets.wasmUrl,
+      wasmUrl: this.assets.wasmModuleUrl,
       wasmBinaryUrl: this.assets.wasmBinaryUrl,
       mode: hasClientMkvHevcRuntime() ? "hevc-remux" : "sdr",
     });

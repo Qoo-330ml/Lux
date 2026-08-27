@@ -56,7 +56,8 @@ const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 const HEVC_RUNTIME_ASSETS = {
   workerUrl: "/hevc/transcode-worker.js",
-  wasmUrl: "/hevc/hevc-decode-module.js",
+  wasmUrl: "/hevc/hevc-decode.js",
+  wasmModuleUrl: "/hevc/hevc-decode-module.js",
   wasmBinaryUrl: "/hevc/hevc-decode.wasm",
 };
 
@@ -317,7 +318,9 @@ export function PlayerPage() {
       );
       if (state === "STOPPED") {
         return request
-          .then(() => queryClient.invalidateQueries({ queryKey: queryKeys.home }))
+          .then(() => {
+            void queryClient.invalidateQueries({ queryKey: queryKeys.home });
+          })
           .catch(() => undefined);
       } else {
         void request.catch(() => undefined);
@@ -474,11 +477,13 @@ export function PlayerPage() {
     const syncSnapshot = (snapshot: {
       currentTime: number;
       duration: number | null;
-      bufferedEnd: number;
+      bufferedEnd?: number;
     }) => {
       if (!isDraggingScrubberRef.current) setCurrentTime(snapshot.currentTime);
       setDuration(snapshot.duration ?? 0);
-      setBufferedEnd(snapshot.bufferedEnd);
+      const ranges = activeEngine.element.buffered;
+      setBufferedEnd(snapshot.bufferedEnd
+        ?? (ranges.length > 0 ? ranges.end(ranges.length - 1) : snapshot.currentTime));
     };
     const removeRuntimeSubscription = runtime.subscribeEvents((event) => {
       if (cancelled) return;
@@ -533,6 +538,7 @@ export function PlayerPage() {
           }
           break;
         case "CAN_PLAY":
+          syncSnapshot(activeEngine.snapshot());
           break;
       }
     });
@@ -541,6 +547,10 @@ export function PlayerPage() {
       const performance = (event as CustomEvent<PlaybackPerformance | null>).detail;
       setFallbackSpeedX(performance && !performance.realtime ? performance.speedX : null);
     };
+    const handleDurationChange = () => {
+      if (!cancelled) syncSnapshot(activeEngine.snapshot());
+    };
+    initialEngine.element.addEventListener("durationchange", handleDurationChange);
     const load = async () => {
       try {
         if (playbackPlan?.type === "SERVER_HLS") {
@@ -604,6 +614,7 @@ export function PlayerPage() {
     void load();
     return () => {
       cancelled = true;
+      initialEngine.element.removeEventListener("durationchange", handleDurationChange);
       performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
       removeRuntimeSubscription();
       runtime.destroy();

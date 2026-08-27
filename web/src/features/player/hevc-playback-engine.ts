@@ -6,6 +6,7 @@ import { isHevcCodec } from "./media-codec";
 export type HevcRuntimeAssets = {
   workerUrl: string;
   wasmUrl: string;
+  wasmModuleUrl: string;
   wasmBinaryUrl: string;
 };
 

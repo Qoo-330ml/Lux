@@ -176,6 +176,7 @@ describe("PlayerPage playback synchronization", () => {
     document.body.append(container);
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    vi.spyOn(queryClient, "invalidateQueries").mockImplementation(() => new Promise(() => undefined));
 
     await act(async () => {
       root?.render(
@@ -223,6 +224,7 @@ describe("PlayerPage playback synchronization", () => {
       }),
       false,
     );
+    expect(api.stopWebPlaybackSession).toHaveBeenCalledWith("web-source-2", false);
   });
 
   it("uses the Emby proxy URL for path STRM and falls back to signed Lux direct play", async () => {
