@@ -129,7 +129,7 @@ async fn auto_cover_waits_for_nine_posters_then_runs_only_once()
             .join(&generated_path),
     )?;
     let generated_image = image::load_from_memory(&generated)?;
-    assert_eq!(generated_image.dimensions(), (1920, 1080));
+    assert_eq!(generated_image.dimensions(), (1280, 720));
 
     assert_eq!(
         covers.run_manually(library.id).await?,
