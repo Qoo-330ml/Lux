@@ -1992,6 +1992,13 @@ services:
 | LUX-213 | src/api/mod.rs、web/src/lib/api/、tests/、docs/；独立的 Lux Web 弹幕读取合同 |
 | LUX-214 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有弹幕解析、调度、渲染与控制层整合 |
 | LUX-215 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；字幕/弹幕跨引擎、性能与真实浏览器阶段门 |
+| LUX-216 | docs/LUX-216-PLAN.md、docs/LUX-DEVELOPMENT.md；核验剩余 ArtPlayer 默认交互并定义阶段 18 |
+| LUX-217 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；循环、画面比例和镜像设置 |
+| LUX-218 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；原生 VTT 与 Lux 文本字幕偏移 |
+| LUX-219 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；AirPlay 能力门和 mini progress bar |
+| LUX-220 | src/api/mod.rs、web/src/lib/api/types.ts、tests/chapters.rs、docs/；Lux source-scoped 章节合同 |
+| LUX-221 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；章节时间轴与片头跳过体验 |
+| LUX-222 | scripts/player-danmaku-smoke.mjs、web/tests/、docs/COMPATIBILITY.md；阶段 18 真实浏览器和全量质量门 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5011,6 +5018,136 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 - [x] 桌面和移动 viewport 下的控制、字幕、弹幕和手势通过真实浏览器验证；真机差异明确记录。
 - [x] ArtPlayer 任何复制/改造均有 MIT 追溯；未复制的逻辑标为仅参考，Lux 不依赖 ArtPlayer 包。
 - [x] LUX-215 的 Rust/Web 全量检查、兼容性记录和 `uname -m` 完成，并由项目所有者确认。
+
+### 阶段 18：LuxPlayer 默认交互与 Lux 章节整合
+
+本阶段补齐 ArtPlayer 官方首页默认播放器中适合 Lux 的循环、画面比例、镜像、字幕偏移、AirPlay 和控制隐藏态细进度条，
+并把 Lux 已有的 source-scoped 章节/片头片尾数据接入播放器。自动续播继续使用 Lux 服务端用户进度，清晰度继续使用
+媒体源选择，独立播放路由已经是视觉 viewport 全屏，因此不复制 ArtPlayer localStorage 续播或重复网页全屏按钮。
+
+阶段 18 不加入弹幕发送、热力图、演示页自定义按钮、Chromecast、外置音轨、完整样式 ASS/SSA、新解码器或新播放器依赖。
+这些能力若要进入产品，必须另立 ADR 和任务，不得借本阶段修改播放计划或公共模型。
+
+#### LUX-216：LuxPlayer 剩余能力核验与阶段 18 计划
+
+范围：以 ArtPlayer 官方首页、固定源码快照、ADR-029 和当前 LuxPlayer 代码/真实截图为证据，区分“已由 Lux 等价实现”、
+“本阶段缺失”和“不是 Lux 产品能力”，并把剩余工作拆成 LUX-217 至 LUX-222。此任务只改文档，不改变运行时行为。
+
+验收：
+
+- [x] 记录 ArtPlayer 首页默认选项、设置菜单、AirPlay 能力门、mini progress 和章节插件的固定源码路径。
+- [x] 明确已有播放/音量/时间/倍速/版本/截图/画中画/全屏/续播能力不重复实现，并保留不发送弹幕、无热力图边界。
+- [x] LUX-217 至 LUX-222 各有单一目标、依赖、预计文件和可执行验证；没有把新依赖、音轨合同或完整 ASS 渲染混入。
+
+验证：`git diff --check`，人工核对 `docs/LUX-216-PLAN.md`、ADR-029、ArtPlayer 固定 commit 和当前 Web 组件。
+
+依赖：LUX-215。
+
+#### LUX-217：LuxPlayer 循环、画面比例与镜像设置
+
+范围：在现有 Lux 设置面板中增加播放器实例内的循环、`default/4:3/16:9` 画面比例和
+`normal/horizontal/vertical` 镜像。只改变当前 video 呈现和结束行为，不创建或替换播放会话，不写服务器设置。
+
+验收：
+
+- [ ] 设置项显示当前值并可通过键盘、鼠标和触摸操作；循环使用可访问开关，比例和镜像选项有明确中文名称。
+- [ ] Direct、HLS 和客户端 fallback 的当前 video 都应用相同设置；source/engine 替换后重新应用，旧 DOM 不保留 transform/尺寸。
+- [ ] 切换设置不请求网络、不上报虚假进度；关闭循环仍执行原有 `ENDED/STOPPED` 生命周期。
+- [ ] ArtPlayer `aspectRatioMix.js`、`flipMix.js` 和设置模块只作为边界参考，实际来源状态写入第三方台账。
+
+验证：设置纯逻辑/组件/页面测试、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器检查三种播放引擎。
+
+依赖：LUX-216。
+
+#### LUX-218：LuxPlayer 字幕偏移
+
+范围：在设置面板增加 -10.0s 至 +10.0s、0.1s 步进的字幕偏移；同时支持原生 WebVTT track 和
+Lux SRT/ASS/SSA/VTT 文本覆盖层。偏移只影响当前选中字幕的显示时间，不修改、缓存或写回字幕文件。
+
+验收：
+
+- [ ] 原生 cue 和 Lux cue 都以不可累计的原始时间应用偏移，范围裁剪到媒体时长；反复调整不会漂移。
+- [ ] 关闭/切换字幕、source/engine 变更和 destroy 会恢复/释放旧 cue，不污染下一播放会话。
+- [ ] 无字幕或字幕尚未加载时设置安全可用并显示明确状态；控件具备 label、当前秒数和键盘路径。
+- [ ] ArtPlayer `subtitleOffset.js`/`subtitleOffsetMix.js` 仅作生命周期参考，Lux 保持自有解析器和 DOM。
+
+验证：VTT/native track 与覆盖层单测、source 生命周期组件测试、`pnpm --dir web test`、`pnpm --dir web build`。
+
+依赖：LUX-217、LUX-212。
+
+#### LUX-219：LuxPlayer AirPlay 与隐藏态细进度条
+
+范围：按平台能力显示 AirPlay 控件，并在常规控制层自动隐藏时保留无交互 mini progress bar。AirPlay 只调用当前
+video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或新的媒体 URL。
+
+验收：
+
+- [ ] 仅当 `webkitShowPlaybackTargetPicker` 和播放目标可用时显示有可访问名称的 AirPlay 控件；不可用时不显示且无错误。
+- [ ] AirPlay 调用当前引擎 video，不创建会话、不改写 URL；source/engine 变化后能力监听和引用一起更新/释放。
+- [ ] 控制层隐藏时显示当前播放/缓冲比例的细进度条，显示控制层、媒体未就绪或直播时按定义隐藏；不抢占 pointer/focus。
+- [ ] 参考 ArtPlayer `airplayMix.js`、`control/airplay.js`、`miniProgressBar.js` 的边界并更新第三方台账。
+
+验证：平台能力/组件测试、响应式布局检查、`pnpm --dir web test`、`pnpm --dir web build`，Safari 真机差异记入兼容性记录。
+
+依赖：LUX-217、LUX-208。
+
+#### LUX-220：Lux Web source-scoped 章节合同
+
+范围：将现有 `CatalogSource.chapters` 映射到 Lux item DTO 的每个媒体源，TypeScript 增加显式章节类型。
+不新增数据库、检测、扫描、插件调用或独立章节端点；请求继续走现有 item ACL。
+
+验收：
+
+- [ ] 每个媒体源只返回自己的有序、受限章节：`startPositionTicks`、可选 `name`、`markerType` 和 `chapterIndex`。
+- [ ] Lux DTO 使用 camelCase 且与 Emby ChapterInfo 分离；无章节返回空数组，不能泄露路径、插件配置或其他 source 数据。
+- [ ] Lux item ACL、默认/选中 source 和现有 Emby 章节输出回归通过；请求路径不运行检测或文件读取。
+
+验证：`cargo test --locked --test chapters`、相关 API 单测、Web 类型/客户端测试、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`、`pnpm --dir web build`。
+
+依赖：LUX-216、现有章节持久化与 Emby 输出。
+
+#### LUX-221：LuxPlayer 章节时间轴与片头跳过
+
+范围：消费 LUX-220 合同，将当前 source 的普通章节、片头开始/结束和片尾开始标记带入时间轴；完整的片头区间显示
+“跳过片头”操作。只执行当前引擎 seek，不修改章节或播放会话。
+
+验收：
+
+- [ ] 章节按时间排序、去重和限制，时间轴分段/标记可 hover、focus 并显示标题；窄屏不产生横向溢出。
+- [ ] `INTRO_START/INTRO_END` 完整且当前时间位于区间时显示可访问的“跳过片头”，点击只 seek 到片头结束；
+      缺失/倒置标记不猜测。`CREDITS_START` 可见但不伪造片尾结束。
+- [ ] source/engine/页面切换立即清理旧章节和跳过操作；Direct/HLS/fallback、进度、字幕和弹幕不回归。
+- [ ] ArtPlayer 章节插件只作为时间轴分段和标题定位参考，Lux 使用自己的章节 DTO、DOM、CSS 和 seek 命令。
+
+验证：章节归一化单测、组件/页面 source 隔离测试、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器鼠标/键盘/触摸检查。
+
+依赖：LUX-220、LUX-217。
+
+#### LUX-222：LuxPlayer 默认交互与章节阶段门
+
+范围：使用固定、无个人数据夹具验证 LUX-217 至 LUX-221；覆盖 Direct、服务器 HLS、客户端 fallback、source 切换、
+三种 viewport、设置、章节、会话清理和网络边界，不新增行为。
+
+验收：
+
+- [ ] 390×844、768×1024、1440×900 下设置、mini progress、章节、字幕、弹幕和控制栏不重叠且可访问。
+- [ ] Direct/HLS/fallback 下循环、比例、镜像、字幕偏移、章节 seek 和 source 切换生命周期通过；console/network 清洁。
+- [ ] AirPlay 的能力可用/不可用路径有自动化证据，真实 Safari/AirPlay 目标是否验证明确记录，不以 Chrome 结果冒充真机。
+- [ ] Rust/Web 全量质量门、第三方台账、兼容性记录和 `uname -m` 完成；项目所有者确认后关闭阶段 18。
+
+验证：相关 Rust/Web 测试、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、
+`pnpm --dir web build`、真实浏览器检查、`cargo build --locked`、`cargo test --locked --all-targets`、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+依赖：LUX-217、LUX-218、LUX-219、LUX-220、LUX-221。
+
+阶段门：
+
+- [ ] ArtPlayer 首页适合 Lux 的默认控制和设置已有实现或明确的 Lux 等价能力，没有重复产品功能。
+- [ ] 当前媒体源章节/片头片尾与 Lux 会话、source、字幕、弹幕和引擎生命周期一致。
+- [ ] 无 ArtPlayer 运行时、发送弹幕、热力图、外部播放器 SDK、新解码器或未登记衍生代码。
+- [ ] 真实浏览器、Rust/Web 全量门和兼容性限制记录完成。
 
 ## 26. 风险与缓解
 
