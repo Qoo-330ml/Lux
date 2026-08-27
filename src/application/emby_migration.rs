@@ -165,6 +165,46 @@ pub struct MigrationUserData {
     pub last_played_date: Option<String>,
 }
 
+impl MigrationUserData {
+    pub fn has_recorded_state(&self) -> bool {
+        self.playback_position_ticks > 0
+            || self.played
+            || self.is_favorite
+            || self.play_count > 0
+            || self.last_played_date.is_some()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MigrationUserStateFilter {
+    Played,
+    Favorite,
+    Resumable,
+}
+
+impl MigrationUserStateFilter {
+    pub const ALL: [Self; 3] = [Self::Played, Self::Favorite, Self::Resumable];
+}
+
+#[cfg(test)]
+mod user_data_tests {
+    use super::MigrationUserData;
+
+    #[test]
+    fn empty_user_data_is_not_a_recorded_state() {
+        let data = MigrationUserData {
+            playback_position_ticks: 0,
+            played: false,
+            is_favorite: false,
+            play_count: 0,
+            last_played_date: None,
+        };
+
+        assert!(!data.has_recorded_state());
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MigrationItemPage {
@@ -286,6 +326,7 @@ impl EmbyMigrationPluginClient {
         user_id: &str,
         start_index: u32,
         limit: u32,
+        state_filter: MigrationUserStateFilter,
     ) -> Result<MigrationItemPage, PluginServiceError> {
         let page = self
             .call_with(
@@ -295,6 +336,7 @@ impl EmbyMigrationPluginClient {
                     "userId": validate_id(user_id)?,
                     "startIndex": start_index,
                     "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
+                    "stateFilter": state_filter,
                 }),
             )
             .await?;

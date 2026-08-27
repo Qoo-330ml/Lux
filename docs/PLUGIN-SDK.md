@@ -234,8 +234,9 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   媒体库文件夹策略和头像标签；不返回 Emby token、密码或完整原始响应。
 - `migration.list_items`：接收一个 Emby 用户 ID 和有界分页参数，返回 Movie、Series、Season、Episode 的稳定 ID、
   ProviderIds、层级字段和可选的用户状态；未知条目类型不得被伪造成支持类型。
-- `migration.user_state`：接收一个 Emby 用户 ID 和有界分页参数，返回已看、播放位置、播放次数、最近播放时间和收藏。
-  当前 `historyCapability: "ITEM_STATE"` 只表示条目聚合状态，不得生成假的历史事件。
+- `migration.user_state`：接收一个 Emby 用户 ID、有界分页参数和必填的 `stateFilter`；筛选值为
+  `PLAYED`、`FAVORITE` 或 `RESUMABLE`，分别只返回已看、收藏或存在可继续播放位置的媒体，并返回播放位置、播放次数、最近播放时间和收藏。
+  宿主应分别请求三种筛选并按 Emby 条目 ID 去重。当前 `historyCapability: "ITEM_STATE"` 只表示条目聚合状态，不得生成假的历史事件。
 - `migration.authenticate_user`：仅在 Lux 用户首次登录迁移账户时接收一次用户名和密码，向 Emby 验证后只返回成功及
   脱敏用户身份；插件不得返回或持久化 Emby access token、密码或完整认证响应。
 - 迁移插件必须声明 `type: "data_migration"`、`category: "MIGRATION"` 和 `capabilities: ["migration.emby"]`。
