@@ -1,5 +1,5 @@
 import { AlertCircle, ArrowLeft, Pause, Play } from "lucide-react";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -11,6 +11,7 @@ import { usePlayerSurfaceGestures } from "./player-gestures";
 import type { PlayerNativeCaptionTrack } from "./player-captions";
 import {
   DEFAULT_VIDEO_PRESENTATION,
+  playerVideoPresentationSize,
   playerVideoPresentationStyle,
   type PlayerVideoPresentation,
 } from "./player-presentation";
@@ -86,7 +87,9 @@ export function PlayerVideoSurface({
   onBack,
   gestureOptions,
 }: PlayerVideoSurfaceProps) {
+  const frameRef = useRef<HTMLDivElement>(null);
   const captionTrackRef = useRef<HTMLTrackElement>(null);
+  const [presentationSize, setPresentationSize] = useState<ReturnType<typeof playerVideoPresentationSize>>(null);
   const gestures = usePlayerSurfaceGestures({
     enabled: Boolean(gestureOptions),
     currentTime: gestureOptions?.currentTime ?? 0,
@@ -99,6 +102,35 @@ export function PlayerVideoSurface({
     onActivity: gestureOptions?.onActivity ?? (() => undefined),
     onInteractionChange: gestureOptions?.onInteractionChange ?? (() => undefined),
   });
+
+  useEffect(() => {
+    if (presentation.aspectRatio === "default") {
+      setPresentationSize(null);
+      return;
+    }
+    const frame = frameRef.current;
+    if (!frame) return;
+    const updateSize = () => {
+      const nextSize = playerVideoPresentationSize(
+        presentation.aspectRatio,
+        frame.clientWidth,
+        frame.clientHeight,
+      );
+      setPresentationSize((previous) => (
+        previous?.width === nextSize?.width && previous?.height === nextSize?.height
+          ? previous
+          : nextSize
+      ));
+    };
+    updateSize();
+    if (typeof ResizeObserver !== "undefined") {
+      const observer = new ResizeObserver(updateSize);
+      observer.observe(frame);
+      return () => observer.disconnect();
+    }
+    window.addEventListener("resize", updateSize);
+    return () => window.removeEventListener("resize", updateSize);
+  }, [presentation.aspectRatio]);
 
   const handleClick = (event: ReactMouseEvent<HTMLVideoElement>) => {
     if (gestures.consumeSuppressedClick(event)) return;
@@ -125,7 +157,7 @@ export function PlayerVideoSurface({
   }, [captionLifecycleKey, captionTrack?.id, captionTrack?.src]);
 
   return (
-    <div className="lux-player-frame">
+    <div ref={frameRef} className="lux-player-frame">
       {streamUrl ? (
         <video
           ref={videoRef}
@@ -134,7 +166,7 @@ export function PlayerVideoSurface({
           poster={poster ?? undefined}
           preload="metadata"
           loop={presentation.loop}
-          style={playerVideoPresentationStyle(presentation.aspectRatio, presentation.flip)}
+          style={playerVideoPresentationStyle(presentation.aspectRatio, presentation.flip, presentationSize)}
           onClick={handleClick}
           onDoubleClick={handleDoubleClick}
           onPointerDown={handlePointerDown}

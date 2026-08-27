@@ -2,7 +2,10 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { PlayerErrorState, PlayerLoadingState } from "../src/features/player/components/player-state";
 import { PlayerVideoSurface } from "../src/features/player/components/player-video-surface";
-import { playerVideoPresentationStyle } from "../src/features/player/components/player-presentation";
+import {
+  playerVideoPresentationSize,
+  playerVideoPresentationStyle,
+} from "../src/features/player/components/player-presentation";
 import { PlayerControls } from "../src/features/player/components/player-controls";
 import { PlayerSettingsPanel } from "../src/features/player/components/player-settings-panel";
 import { PlayerTopBar } from "../src/features/player/components/player-top-bar";
@@ -80,6 +83,8 @@ describe("LuxPlayer state components", () => {
       objectFit: "fill",
       transform: "translate(-50%, -50%) scaleX(-1)",
     });
+    expect(playerVideoPresentationSize("4:3", 1440, 900)).toEqual({ width: 1200, height: 900 });
+    expect(playerVideoPresentationSize("16:9", 390, 844)).toEqual({ width: 390, height: 219.375 });
 
     const markup = renderToStaticMarkup(
       <PlayerVideoSurface

@@ -400,6 +400,160 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.textContent).not.toContain("热力图");
   });
 
+  it("keeps presentation settings local and reapplies them across source changes", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-presentation",
+      title: "画面设置测试",
+      itemType: "MOVIE",
+      mediaSources: [
+        { id: "source-presentation-1", isDefault: true, qualityLabel: "1080P" },
+        { id: "source-presentation-2", qualityLabel: "4K" },
+      ],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-presentation"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+
+    const loop = container.querySelector<HTMLButtonElement>('[role="switch"][aria-labelledby="lux-player-loop-label"]');
+    const aspect = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.trim() === "4:3");
+    const flip = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.trim() === "水平镜像");
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!loop || !aspect || !flip || !video) throw new Error("presentation controls were not rendered");
+    const sessionCallsBeforeSettings = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
+    const eventCallsBeforeSettings = vi.mocked(api.webPlaybackEvent).mock.calls.length;
+
+    await act(async () => loop.click());
+    await act(async () => aspect.click());
+    await act(async () => flip.click());
+
+    expect(loop.getAttribute("aria-checked")).toBe("true");
+    expect(video.loop).toBe(true);
+    expect(video.style.aspectRatio).toBe("4 / 3");
+    expect(video.style.transform).toBe("translate(-50%, -50%) scaleX(-1)");
+    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSettings);
+    expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeSettings);
+
+    const sourceSelector = container.querySelector<HTMLSelectElement>('[aria-label="选择播放版本"]');
+    if (!sourceSelector) throw new Error("source selector was not rendered");
+    await act(async () => {
+      sourceSelector.value = "source-presentation-2";
+      sourceSelector.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const replacementVideo = container.querySelector<HTMLVideoElement>("video");
+    if (!replacementVideo) {
+      throw new Error("replacement video was not rendered after the source change");
+    }
+    expect(replacementVideo?.loop).toBe(true);
+    expect(replacementVideo?.style.aspectRatio).toBe("4 / 3");
+    expect(replacementVideo?.style.transform).toBe("translate(-50%, -50%) scaleX(-1)");
+
+    const defaultAspect = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.trim() === "默认");
+    const normalFlip = Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+      .find((button) => button.textContent?.trim() === "正常");
+    if (!defaultAspect || !normalFlip) throw new Error("default presentation controls were not rendered");
+    await act(async () => defaultAspect.click());
+    await act(async () => normalFlip.click());
+
+    expect(replacementVideo?.style.aspectRatio).toBe("");
+    expect(replacementVideo?.style.transform).toBe("");
+  });
+
+  it("restarts locally at the end only while loop is enabled", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-loop",
+      title: "循环播放测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-loop", isDefault: true, durationTicks: 120_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+    const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-loop"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!settings || !video) throw new Error("loop test player was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 12 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 12 });
+    await act(async () => settings.click());
+    const loop = container.querySelector<HTMLButtonElement>('[role="switch"][aria-labelledby="lux-player-loop-label"]');
+    if (!loop) throw new Error("loop control was not rendered");
+
+    await act(async () => loop.click());
+    await act(async () => video.dispatchEvent(new Event("play")));
+    await act(async () => video.dispatchEvent(new Event("ended")));
+
+    expect(video.currentTime).toBe(0);
+    expect(play).toHaveBeenCalledTimes(1);
+    expect(api.stopWebPlaybackSession).not.toHaveBeenCalled();
+    expect(vi.mocked(api.webPlaybackEvent).mock.calls.some(([, event]) => event.state === "STOPPED"))
+      .toBe(false);
+
+    video.currentTime = 12;
+    await act(async () => loop.click());
+    await act(async () => video.dispatchEvent(new Event("ended")));
+
+    expect(api.stopWebPlaybackSession).toHaveBeenCalledWith("web-source-loop", false);
+    expect(vi.mocked(api.webPlaybackEvent).mock.calls.some(([, event]) => event.state === "STOPPED"))
+      .toBe(true);
+  });
+
   it("selects and clears a current-source WebVTT track without replacing the playback session", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-captions",

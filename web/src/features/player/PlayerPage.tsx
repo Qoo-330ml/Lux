@@ -34,6 +34,10 @@ import { LuxPlayer } from "./components/lux-player";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerTopBar } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
+import type {
+  PlayerAspectRatio,
+  PlayerFlip,
+} from "./components/player-presentation";
 import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
 import {
@@ -179,6 +183,9 @@ export function PlayerPage() {
   const [volume, setVolume] = useState(1);
   const [isMuted, setIsMuted] = useState(false);
   const [playbackRate, setPlaybackRate] = useState(1.0);
+  const [loopPlayback, setLoopPlayback] = useState(false);
+  const [aspectRatio, setAspectRatio] = useState<PlayerAspectRatio>("default");
+  const [flip, setFlip] = useState<PlayerFlip>("normal");
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
@@ -522,6 +529,17 @@ export function PlayerPage() {
           break;
         case "ENDED": {
           syncSnapshot(event.snapshot);
+          if (initialEngine.element.loop) {
+            runtime.seek(0);
+            setCurrentTime(0);
+            void runtime.play().catch((cause) => {
+              if (!cancelled) {
+                setFailedStreamUrl(streamUrl);
+                setPlaybackFailure(classifyPlayerEngineFailure(cause));
+              }
+            });
+            break;
+          }
           setPlaying(false);
           const sessionId = playbackSessionIdRef.current;
           void Promise.resolve(reportPlayback("STOPPED", true, false, initialEngine.element, sessionId)).finally(() => {
@@ -1060,6 +1078,7 @@ export function PlayerPage() {
         poster={poster}
         title={mediaTitle(media)}
         videoRef={setVideoRef}
+        presentation={{ loop: loopPlayback, aspectRatio, flip }}
         onClick={(event) => {
           event.stopPropagation();
           togglePlayPause();
@@ -1125,6 +1144,14 @@ export function PlayerPage() {
           playbackRates={PLAYBACK_SPEEDS}
           playbackRate={playbackRate}
           onChangeRate={changePlaybackRate}
+          presentation={{
+            loop: loopPlayback,
+            aspectRatio,
+            flip,
+            onToggleLoop: () => setLoopPlayback((enabled) => !enabled),
+            onChangeAspectRatio: setAspectRatio,
+            onChangeFlip: setFlip,
+          }}
           captions={captionOptions}
           selectedCaptionStreamIndex={captionSourceId === source?.id ? selectedCaptionStreamIndex : null}
           captionStatus={captionStatus}
