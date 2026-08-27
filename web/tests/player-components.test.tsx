@@ -5,6 +5,7 @@ import { PlayerVideoSurface } from "../src/features/player/components/player-vid
 import { PlayerControls } from "../src/features/player/components/player-controls";
 import { PlayerSettingsPanel } from "../src/features/player/components/player-settings-panel";
 import { PlayerTopBar } from "../src/features/player/components/player-top-bar";
+import { LuxPlayer } from "../src/features/player/components/lux-player";
 
 describe("LuxPlayer state components", () => {
   it("renders a busy loading state with its product message", () => {
@@ -151,5 +152,26 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-valuemax="100"');
     expect(markup).toContain('aria-label="播放"');
     expect(markup).toContain('aria-label="音量调节"');
+  });
+
+  it("provides named future caption and danmu slots at the LuxPlayer boundary", () => {
+    const markup = renderToStaticMarkup(
+      <LuxPlayer
+        controlsVisible={false}
+        containerRef={{ current: null }}
+        onActivity={() => undefined}
+        surface={<div data-slot="surface" />}
+        topBar={<div data-slot="top-bar" />}
+        settings={<div data-slot="settings" />}
+        controls={<div data-slot="controls" />}
+        captionSlot={<div data-slot="captions" />}
+        danmuSlot={<div data-slot="danmu" />}
+      />,
+    );
+
+    expect(markup).toContain('class="lux-player-page controls-hidden"');
+    expect(markup).toContain('data-slot="surface"');
+    expect(markup).toContain('data-slot="captions"');
+    expect(markup).toContain('data-slot="danmu"');
   });
 });

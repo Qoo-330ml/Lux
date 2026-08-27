@@ -31,6 +31,7 @@ import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
+import { LuxPlayer } from "./components/lux-player";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerTopBar, type PlayerSourceOption } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
@@ -794,12 +795,10 @@ export function PlayerPage() {
   }));
 
   return (
-    <main
-      ref={playerContainerRef}
-      className={`lux-player-page ${controlsVisible ? "controls-visible" : "controls-hidden"}`}
-      onMouseMove={resetControlsTimeout}
-      onTouchStart={resetControlsTimeout}
-      onClick={resetControlsTimeout}
+    <LuxPlayer
+      containerRef={playerContainerRef}
+      controlsVisible={controlsVisible}
+      onActivity={resetControlsTimeout}
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
@@ -908,6 +907,6 @@ export function PlayerPage() {
         onTogglePictureInPicture={togglePictureInPicture}
         onToggleFullscreen={toggleFullscreen}
       />
-    </main>
+    </LuxPlayer>
   );
 }
