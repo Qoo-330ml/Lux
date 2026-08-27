@@ -3,7 +3,7 @@ use std::{
     fmt,
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -98,6 +98,7 @@ struct HomeServiceInner {
     shared: Mutex<Option<CachedSharedSnapshot>>,
     shared_compute_lock: Mutex<()>,
     refresh_tx: mpsc::Sender<()>,
+    refresh_pending: AtomicBool,
     invalidation_notify: Notify,
 }
 
@@ -122,6 +123,7 @@ impl HomeService {
             entries: Mutex::new(HashMap::new()),
             shared_compute_lock: Mutex::new(()),
             refresh_tx,
+            refresh_pending: AtomicBool::new(false),
             invalidation_notify: Notify::new(),
         });
         let worker_inner = Arc::downgrade(&inner);
@@ -134,6 +136,7 @@ impl HomeService {
                 let Some(inner) = worker_inner.upgrade() else {
                     break;
                 };
+                inner.refresh_pending.store(false, Ordering::Release);
                 (Self { inner }).refresh_cached_entries().await;
             }
         });
@@ -199,7 +202,12 @@ impl HomeService {
     }
 
     fn schedule_refresh(&self) {
-        let _ = self.inner.refresh_tx.try_send(());
+        if self.inner.refresh_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.inner.refresh_tx.try_send(()).is_err() {
+            self.inner.refresh_pending.store(false, Ordering::Release);
+        }
     }
 
     async fn entry(&self, key: HomeCacheKey, principal: AccessPrincipal) -> Arc<HomeCacheEntry> {

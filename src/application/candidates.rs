@@ -2224,7 +2224,6 @@ impl MetadataSelectionService {
             ));
         }
         if let Some(home) = &self.home {
-            eprintln!("metadata selection invalidating home");
             home.invalidate();
         }
         Ok(MetadataSelectionReport {

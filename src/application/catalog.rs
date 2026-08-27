@@ -186,6 +186,7 @@ struct LibraryPageCache {
     generation: AtomicU64,
     entries: Mutex<HashMap<LibraryPageCacheKey, Arc<LibraryPageCacheEntry>>>,
     refresh_tx: mpsc::Sender<()>,
+    refresh_pending: AtomicBool,
 }
 
 impl LibraryPageCache {
@@ -199,6 +200,7 @@ impl LibraryPageCache {
             generation: AtomicU64::new(0),
             entries: Mutex::new(HashMap::new()),
             refresh_tx,
+            refresh_pending: AtomicBool::new(false),
         });
         let worker_cache = Arc::downgrade(&cache);
         tokio::spawn(async move {
@@ -210,6 +212,7 @@ impl LibraryPageCache {
                 let Some(cache) = worker_cache.upgrade() else {
                     break;
                 };
+                cache.refresh_pending.store(false, Ordering::Release);
                 let service = CatalogService {
                     database: database.clone(),
                     access: access.clone(),
@@ -244,7 +247,12 @@ impl LibraryPageCache {
     }
 
     fn schedule_refresh(&self) {
-        let _ = self.refresh_tx.try_send(());
+        if self.refresh_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if self.refresh_tx.try_send(()).is_err() {
+            self.refresh_pending.store(false, Ordering::Release);
+        }
     }
 
     fn invalidate(&self) {
