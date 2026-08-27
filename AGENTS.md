@@ -16,8 +16,12 @@
    expected to change.
 3. Use test-driven development for behavior changes: write a failing test, implement the smallest
    passing change, then refactor only when the tests remain green.
-4. Keep increments small, compilable, and independently revertible. Run the relevant checks after
-   every increment and commit each completed increment atomically.
+4. Keep increments small, compilable, and independently revertible. Run the narrowest relevant
+   checks after every increment and commit each completed increment atomically. For Rust behavior
+   changes, run the related `cargo test --locked --test <target>` target(s), or
+   `cargo test --locked --lib <module-or-test-filter>` for library tests. Do not run
+   `cargo test --locked --all-targets` during routine increments; reserve it for task completion,
+   a documented phase gate, cross-cutting changes, or an explicit project-owner request.
 5. Report changed files, acceptance results, test results, and remaining risks at the end of a task.
 
 ## Engineering boundaries
@@ -47,6 +51,15 @@
   Emby endpoints outside the assigned task.
 
 ## Required checks
+
+### AI test selection
+
+- Before testing, identify the narrowest Rust target named by the assigned task's acceptance
+  criteria or the changed behavior. Prefer one or more explicit `--test <target>` flags; do not
+  use a broad test-name filter as a substitute for selecting the target.
+- For a library-only change, prefer `cargo test --locked --lib <module-or-test-filter>`.
+- Run `cargo test --locked --all-targets` only at the completion or phase-gate conditions stated
+  above. It remains part of the full Rust completion gate and is not waived by targeted tests.
 
 Run checks relevant to the changed surface. The baseline Rust checks are:
 

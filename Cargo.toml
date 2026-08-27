@@ -59,3 +59,10 @@ path = "src/main.rs"
 [[bin]]
 name = "lux-plugin-danmaku"
 path = "src/bin/lux-plugin-danmaku.rs"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+incremental = false
