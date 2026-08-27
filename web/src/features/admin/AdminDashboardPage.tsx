@@ -76,7 +76,6 @@ export function AdminDashboardPage() {
     { label: "数据库", ok: health.database.writable, detail: health.database.writable ? "可读写" : "不可写" },
     { label: "配置目录", ok: health.config.available && health.config.writable, detail: health.config.writable ? "可读写" : "不可写或不可用" },
     { label: "ffprobe", ok: health.ffprobe.available, detail: health.ffprobe.available ? "已就绪" : "未找到" },
-    { label: "TMDb", ok: health.tmdb.configured, detail: health.tmdb.configured ? "已配置" : "未配置（可选）" },
   ];
 
   return (

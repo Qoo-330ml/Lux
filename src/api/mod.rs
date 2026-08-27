@@ -229,6 +229,7 @@ impl AppState {
         );
         let metadata_selection = image_writes.clone().map(|images| {
             MetadataSelectionService::with_config_dir(database.clone(), images, config_dir.clone())
+                .with_home(home.clone())
         });
         let plugins = PluginService::new_with_proxy(
             database.clone(),
@@ -16823,7 +16824,6 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
         },
         "config": { "available": config_available, "writable": config_writable },
         "ffprobe": { "available": ffprobe_available },
-        "tmdb": { "configured": state.scraper.is_some() },
         "jobs": {
             "scanRunning": jobs["scanRunning"],
             "scanFailed": jobs["scanFailed"],

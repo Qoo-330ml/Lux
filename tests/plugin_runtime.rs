@@ -20,6 +20,7 @@ fn signed_manifest_value_with_version(entrypoint: &str, version: &str) -> Value 
         "apiVersion": 1,
         "runtime": {"kind": "process", "entrypoint": entrypoint},
         "type": "metadata",
+        "providerKey": "example-provider",
         "aliases": ["legacy-example"],
         "supportedItemTypes": ["Movie"],
         "capabilities": ["metadata.search"],
@@ -115,6 +116,24 @@ fn resolves_a_manifest_alias_to_the_installed_plugin() {
     assert_eq!(
         catalog
             .get_by_alias("legacy-example")
+            .map(|plugin| plugin.manifest.id.as_str()),
+        Some("org.lux.example")
+    );
+}
+
+#[test]
+fn resolves_a_manifest_provider_key_to_the_installed_plugin() {
+    let root = tempdir().expect("temp dir should be created");
+    let plugin = root.path().join("example");
+    fs::create_dir_all(plugin.join("binaries")).expect("plugin directory should be created");
+    fs::write(plugin.join("binaries/plugin"), b"plugin").expect("entrypoint should be written");
+    write_manifest(&plugin, "binaries/plugin");
+
+    let catalog = PluginCatalog::discover(root.path());
+
+    assert_eq!(
+        catalog
+            .get_by_provider_key("example-provider")
             .map(|plugin| plugin.manifest.id.as_str()),
         Some("org.lux.example")
     );

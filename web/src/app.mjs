@@ -541,7 +541,6 @@ function renderAdminDashboard({ ready = {}, health: reportedHealth, libraries = 
     <div class="section-heading"><h2>系统状态诊断</h2><span>服务器健康度与路径检测</span></div>
     <div class="admin-list">
       <div><strong>ffprobe 工具</strong><span>${health.ffprobe?.available ? "🟢 可用" : "🔴 未就绪"}</span></div>
-      <div><strong>TMDb API</strong><span>${health.tmdb?.configured ? "🟢 可用" : "🔴 不可用"}</span></div>
       <div><strong>配置卷路径</strong><span>${health.config?.writable ? "🟢 可读写" : "🔴 权限异常"}</span></div>
       <div><strong>媒体挂载根目录</strong><span>${availableRootCount}/${rootCount} 可用 · ${writableRootCount} 可写</span></div>
       <div><strong>后台扫描队列</strong><span>${Number(health.jobs?.scanRunning || 0)} 个运行中 · 失败 ${Number(health.jobs?.scanFailed || 0)}</span></div>
