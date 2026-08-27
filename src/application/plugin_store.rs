@@ -551,8 +551,8 @@ const DEFAULT_PLUGIN_INDEX_JSON: &str = r#"
 {
   "formatVersion": 1,
   "plugins": [
-    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.9","runtime":"process","providerKey":"tmdb","aliases":["tmdb"],"capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.9-linux-aarch64.zip","sha256":"01dabb997ea184f11b879a634e12b0b331ee6ea44ed747ddc70bce1c1d7c8a17"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.9-linux-x86_64.zip","sha256":"274be17fa4a7b1b6adc1b8075c328e342102d66ad0d09a910aaf44c8071fd402"}]},
-    {"id":"org.lux.douban","name":"豆瓣元数据插件","description":"从豆瓣提供电影、剧集、图片、人物和预告片元数据。公开搜索无需配置；详情接口可配置豆瓣客户端凭据。","category":"SCRAPER","version":"0.1.4","runtime":"process","providerKey":"douban","aliases":["douban"],"capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.douban/org.lux.douban-0.1.4-linux-aarch64.zip","sha256":"7b0e248b55f2e4eba730baf6a3ddd1d9359bd2c835132390fad218929df79f55"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.douban/org.lux.douban-0.1.4-linux-x86_64.zip","sha256":"2fa89811334d399c34fd498e665b79c4b1036e01b4510c69ad8af0fa0dde9461"}]},
+    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.9","runtime":"process","providerKey":"tmdb","aliases":["tmdb"],"capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.9-linux-aarch64.zip","sha256":"32a98a8ba96f5c899ef81af986289c0980007bb795782b90be1793e99b980852"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.9-linux-x86_64.zip","sha256":"a77fb201146ed4e4b97ab49e3b3cfed49981463a80bde0f75a1491096253977b"}]},
+    {"id":"org.lux.douban","name":"豆瓣元数据插件","description":"从豆瓣提供电影、剧集、图片、人物和预告片元数据。公开搜索无需配置；详情接口可配置豆瓣客户端凭据。","category":"SCRAPER","version":"0.1.4","runtime":"process","providerKey":"douban","aliases":["douban"],"capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.douban/org.lux.douban-0.1.4-linux-aarch64.zip","sha256":"315338dda5aff1976a89df028a1885f90240950987c3f923dc30273e7bcbcedf"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.douban/org.lux.douban-0.1.4-linux-x86_64.zip","sha256":"7ee8143b12d6c5f78c1307906cb187f63c27e7dd5b332271cd0ab31a177fe467"}]},
     {"id":"org.lux.strm-media-info","name":"strm媒体信息提取","description":"使用 ffprobe 提取媒体信息，并使用 ffmpeg 生成同时作为海报和缩略图的 STRM 截图。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["media.probe"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-aarch64.zip","sha256":"22977b5f23ab94c22c4e5be83888099f03079570e6b4953e5aea238735fabf82"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-x86_64.zip","sha256":"65411be32c8566a511d21a02ebd54e326f79f1225750d496fcae85c1302bc50c"}]},
     {"id":"org.lux.ip-hiofd","name":"IP归属地查询增强","description":"通过 Hiofd 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-aarch64.zip","sha256":"f2e93e49e9b3507cd400720fe0a6480e16e146a1fd15abf945ba861a53255db9"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-x86_64.zip","sha256":"d734697e3fafa490a1ade0698f2d1ca74d93d894d3ac23d3098564046bfdaab6"}]},
     {"id":"org.lux.qoo-ip138","name":"ip138 IP归属地查询","description":"通过 ipshudi.com 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-aarch64.zip","sha256":"8b7879c4d6e82b823f476f8672b878b3aa127ab76c164492317a23a243632bd7"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-x86_64.zip","sha256":"9423cfd53247ba55b6ec64fdbc0d9066ae73599c0fd35df8bf609446ca4a971f"}]},
@@ -633,6 +633,14 @@ mod tests {
                 .any(|capability| capability == "metadata.bundle")
         );
         assert_eq!(index.plugins[0].packages.len(), 2);
+        assert_eq!(
+            index.plugins[0].packages[0].sha256,
+            "32a98a8ba96f5c899ef81af986289c0980007bb795782b90be1793e99b980852"
+        );
+        assert_eq!(
+            index.plugins[0].packages[1].sha256,
+            "a77fb201146ed4e4b97ab49e3b3cfed49981463a80bde0f75a1491096253977b"
+        );
         let douban = index
             .plugins
             .iter()
@@ -641,6 +649,14 @@ mod tests {
         assert_eq!(douban.version, "0.1.4");
         assert_eq!(douban.provider_key.as_deref(), Some("douban"));
         assert_eq!(douban.aliases, vec!["douban"]);
+        assert_eq!(
+            douban.packages[0].sha256,
+            "315338dda5aff1976a89df028a1885f90240950987c3f923dc30273e7bcbcedf"
+        );
+        assert_eq!(
+            douban.packages[1].sha256,
+            "7ee8143b12d6c5f78c1307906cb187f63c27e7dd5b332271cd0ab31a177fe467"
+        );
         assert!(
             douban
                 .capabilities

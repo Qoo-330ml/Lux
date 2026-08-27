@@ -99,10 +99,6 @@ pub trait ScraperAdapter: Send + Sync {
         request: ScraperGetRequest,
     ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>>;
 
-    fn configure_api_key(&self, _api_key: Option<String>) -> ScraperFuture<'_, ()> {
-        Box::pin(std::future::ready(()))
-    }
-
     fn with_resource_metrics(&self, _resources: ResourceMetrics) {}
 
     fn clear_response_cache(&self) -> ScraperFuture<'_, ()> {
@@ -313,12 +309,6 @@ impl ScraperProvider {
         match self {
             Self::Adapter(adapter) => adapter.trailers(request).await,
             Self::Generic(client) => client.trailers(request).await,
-        }
-    }
-
-    pub async fn configure_api_key(&self, api_key: Option<&str>) {
-        if let Self::Adapter(adapter) = self {
-            adapter.configure_api_key(api_key.map(str::to_owned)).await;
         }
     }
 

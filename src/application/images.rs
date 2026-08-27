@@ -241,7 +241,7 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
     ) -> Result<Option<ImageWriteReport>, ImageWriteError> {
-        self.download_item_image_if_missing_impl(item_id, image_type, image_url, "TMDB")
+        self.download_item_image_if_missing_impl(item_id, image_type, image_url, "SCRAPER")
             .await
     }
 
@@ -555,7 +555,7 @@ impl ImageWriteService {
         image_type: &str,
         image_url: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        self.download_item_image_with_source(item_id, image_type, image_url, "TMDB")
+        self.download_item_image_with_source(item_id, image_type, image_url, "SCRAPER")
             .await
     }
 

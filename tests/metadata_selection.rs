@@ -293,23 +293,39 @@ async fn metadata_selection_refreshes_cached_catalog_and_home_images()
         .await?;
     assert_eq!(detail["imageTags"]["poster"], poster_id);
 
-    tokio::time::sleep(Duration::from_millis(2500)).await;
-    let list = client
-        .get(&list_url)
-        .header(COOKIE, &cookies)
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
-    assert_eq!(list["items"][0]["imageTags"]["poster"], poster_id);
-    let home = client
-        .get(format!("{base_url}/api/v1/home"))
-        .header(COOKIE, &cookies)
-        .send()
-        .await?
-        .json::<Value>()
-        .await?;
-    assert_eq!(home["recentlyAdded"][0]["imageTags"]["poster"], poster_id);
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut list_poster = None;
+    let mut home_poster = None;
+    while Instant::now() < deadline {
+        let list = client
+            .get(&list_url)
+            .header(COOKIE, &cookies)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        list_poster = list["items"][0]["imageTags"]["poster"]
+            .as_str()
+            .map(str::to_owned);
+        let home = client
+            .get(format!("{base_url}/api/v1/home"))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        home_poster = home["recentlyAdded"][0]["imageTags"]["poster"]
+            .as_str()
+            .map(str::to_owned);
+        if list_poster.as_deref() == Some(poster_id.as_str())
+            && home_poster.as_deref() == Some(poster_id.as_str())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(list_poster.as_deref(), Some(poster_id.as_str()));
+    assert_eq!(home_poster.as_deref(), Some(poster_id.as_str()));
 
     lux_server.abort();
     image_server.abort();

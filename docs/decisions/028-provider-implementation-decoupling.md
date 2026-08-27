@@ -24,8 +24,9 @@ Lux 已有 provider-neutral 的 metadata RPC，但主程序仍编译 TMDb HTTP c
    通过通用兼容表处理，不触发 provider-specific client 或数字转换。
 4. 宿主为 metadata 插件传递 `LUX_PLUGIN_CONFIG_PATH`，值是该插件的受限配置文件；metadata 插件不继承
    `LUX_CONFIG_DIR`。配置文件由宿主按 manifest 字段写入，敏感字段仍只在插件进程使用。
-5. 旧 TMDb 共享文件做幂等迁移到 `plugin-config/org.lux.tmdb.json`。迁移只在插件目录发现时执行，
-   成功后保留旧文件用于回滚/一个发布周期，主程序不再读取其上游含义。
+5. 旧 TMDb 共享文件只在首次发现时做一次幂等复制到
+   `plugin-config/org.lux.tmdb.json`，并写入迁移完成标记。成功后保留旧文件用于回滚/一个发布周期；这条
+   迁移路径不创建 provider client、不发起上游请求，标记写入后主程序不再读取这些字段的上游含义。
 
 ## 未采用方案
 
@@ -48,6 +49,7 @@ provider-neutral fake adapter 或独立插件进程。
 
 ## 验证
 
-- `rg` 检查 Lux 非测试源码不含 `TmdbClient`、`tmdb_plugin`、TMDb endpoint、凭据读取和图片 CDN 转换。
+- `rg` 检查 Lux 非测试源码不含 `TmdbClient`、`tmdb_plugin`、TMDb endpoint、运行时凭据解析和图片 CDN
+  转换；唯一保留的旧凭据读取位于一次性兼容迁移函数，且只复制到插件专属配置文件。
 - runtime 测试证明 metadata 子进程只收到 `LUX_PLUGIN_CONFIG_PATH`。
 - 旧配置和 alias 迁移测试、TMDb/豆瓣 RPC v1 测试、Rust/Web 全量检查与性能基准通过。
