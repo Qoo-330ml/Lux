@@ -102,25 +102,13 @@ describe("LuxPlayer state components", () => {
         title="示例电影"
         badge="1080P • H264"
         subtitle="2026"
-        sources={[
-          { id: "source-1", label: "1080P", detail: "MP4" },
-          { id: "source-2", label: "4K", detail: "MKV" },
-        ]}
-        selectedSourceId="source-1"
-        settingsOpen
-        fullscreen={false}
         onBack={() => undefined}
-        onSourceChange={() => undefined}
-        onToggleSettings={() => undefined}
-        onToggleFullscreen={() => undefined}
       />,
     );
 
     expect(markup).toContain("示例电影");
     expect(markup).toContain("1080P • H264");
-    expect(markup).toContain('aria-label="选择播放源"');
-    expect(markup).toContain('aria-label="播放器设置"');
-    expect(markup).toContain('aria-label="全屏"');
+    expect(markup).toContain('aria-label="返回"');
   });
 
   it("keeps settings actions in a focused, keyboard-addressable panel", () => {
@@ -148,9 +136,12 @@ describe("LuxPlayer state components", () => {
         bufferedEnd={25}
         volume={1}
         muted={false}
-        playbackRate={1}
         fullscreen={false}
-        pictureInPictureEnabled={false}
+        pictureInPictureEnabled
+        sources={[{ id: "source-1", label: "1080P", detail: "MP4" }]}
+        selectedSourceId="source-1"
+        danmuVisible
+        settingsOpen={false}
         remainingTime={false}
         hoverTime={null}
         hoverPercent={null}
@@ -167,7 +158,10 @@ describe("LuxPlayer state components", () => {
         onToggleMute={() => undefined}
         onVolumeChange={() => undefined}
         onToggleRemainingTime={() => undefined}
-        onCycleRate={() => undefined}
+        onSourceChange={() => undefined}
+        onToggleDanmu={() => undefined}
+        onTakeScreenshot={() => undefined}
+        onToggleSettings={() => undefined}
         onTogglePictureInPicture={() => undefined}
         onToggleFullscreen={() => undefined}
       />,
@@ -180,6 +174,13 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-valuemax="100"');
     expect(markup).toContain('aria-label="播放"');
     expect(markup).toContain('aria-label="音量调节"');
+    expect(markup).toContain('aria-label="隐藏弹幕"');
+    expect(markup).toContain('aria-pressed="true"');
+    expect(markup).toContain('aria-label="选择播放版本"');
+    expect(markup).toContain('aria-label="截图"');
+    expect(markup).toContain('aria-label="播放器设置"');
+    expect(markup).not.toContain("发送弹幕");
+    expect(markup).not.toContain("热力图");
   });
 
   it("provides named future caption and danmu slots at the LuxPlayer boundary", () => {

@@ -21,6 +21,8 @@ type PlayerVideoSurfaceProps = {
   onPause?: (event: SyntheticEvent<HTMLVideoElement>) => void;
   onTimeUpdate?: () => void;
   onEnded?: () => void;
+  playing?: boolean;
+  onTogglePlayback?: () => void;
   centerSplash: "play" | "pause" | null;
   fallbackLoading: boolean;
   fallbackSpeedX: number | null;
@@ -55,6 +57,8 @@ export function PlayerVideoSurface({
   onPause,
   onTimeUpdate,
   onEnded,
+  playing = false,
+  onTogglePlayback = () => undefined,
   centerSplash,
   fallbackLoading,
   fallbackSpeedX,
@@ -115,6 +119,18 @@ export function PlayerVideoSurface({
           onEnded={onEnded}
           aria-label={`播放 ${title}`}
         />
+      ) : null}
+
+      {!playing && streamUrl && !fallbackLoading && !showError ? (
+        <button
+          type="button"
+          className="lux-player-center-play"
+          aria-label="播放"
+          title="播放 (空格)"
+          onClick={onTogglePlayback}
+        >
+          <Play size={42} fill="currentColor" aria-hidden="true" />
+        </button>
       ) : null}
 
       {centerSplash ? (

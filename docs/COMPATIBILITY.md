@@ -101,6 +101,19 @@ x86_64 性能或真实 iOS/Android 设备兼容性。
 LUX-184、LUX-185 与 LUX-198 的样本和记录为准。页面可见性恢复、方向变化和 Media Session 不可用降级已有
 Web 组件测试；仍需在至少一台真实 iOS 和一台真实 Android 设备上验证系统媒体控件、safe-area 与横竖屏行为。
 
+## LuxPlayer LUX-209 控制层视觉回归（2026-08-27）
+
+LUX-209 以 ArtPlayer 首页默认控制层和弹幕演示页的可见布局为参考，重新实现 Lux 自有 React 控制层；没有加入
+`artplayer` 依赖，也没有复制其代码、DOM、CSS、图标或演示资源。验证使用无个人数据的本地 API fixture、公开短 MP4
+媒体夹具和 Codex 内置 Chromium（宿主 `uname -m=arm64`）；结论不外推为 NAS/x86_64 性能或真实 iOS/Android 设备兼容性。
+
+| viewport / 平台 | 已验证能力 | 结果与边界 |
+|---|---|---|
+| 1440×900，macOS arm64 | 46px 透明底部控制层、4px 基础时间轴/6px hover 时间轴、底部渐变、中心播放、版本选择、设置、画中画与原生全屏入口 | 通过；暂停和设置状态均可见，所有控件拥有可访问名称。独立 Lux 播放路由默认已占满视觉 viewport，因此没有无效的重复“网页全屏”按钮。 |
+| 768×1024、390×844，macOS arm64 | safe-area、动态 viewport、中心播放、窄屏控制栏 | 通过；播放器自身没有横向溢出。窄屏将右侧非核心控制保留在可横向滚动的控制组中，键盘焦点可将目标带入视图；真实刘海设备仍待复测。 |
+| 1440×900，Chromium DevTools 网络观察 | 弹幕显示开关 | 通过；`aria-pressed` 从 `true` 切换为 `false`，观察窗口内 `Network.requestWillBeSent` 为 0，console 为 0 error / 0 warning。没有输入框、发送动作、弹幕加载/渲染或热力图。 |
+| Web 组件回归 | 本地 PNG 截图 | 通过；模拟已就绪视频帧后创建 canvas PNG 下载并清理 object URL，文件名剔除路径分隔符。跨域媒体不能导出帧时仅显示通用失败状态，不回显播放 URL。 |
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。

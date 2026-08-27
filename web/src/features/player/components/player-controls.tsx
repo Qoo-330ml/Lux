@@ -1,11 +1,12 @@
 import {
+  Camera,
   Maximize,
+  MessageCircleMore,
   Minimize,
   Pause,
   PictureInPicture2,
   Play,
-  RotateCcw,
-  RotateCw,
+  Settings2,
   Volume1,
   Volume2,
   VolumeX,
@@ -25,9 +26,12 @@ export type PlayerControlsProps = {
   bufferedEnd: number;
   volume: number;
   muted: boolean;
-  playbackRate: number;
   fullscreen: boolean;
   pictureInPictureEnabled: boolean;
+  sources: readonly PlayerControlSourceOption[];
+  selectedSourceId: string;
+  danmuVisible: boolean;
+  settingsOpen: boolean;
   remainingTime: boolean;
   hoverTime: number | null;
   hoverPercent: number | null;
@@ -40,13 +44,21 @@ export type PlayerControlsProps = {
   onTimelineMouseLeave: () => void;
   onTimelineKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
   onTogglePlayPause: () => void;
-  onSeekRelative: (seconds: number) => void;
   onToggleMute: () => void;
   onVolumeChange: (volume: number) => void;
   onToggleRemainingTime: () => void;
-  onCycleRate: () => void;
+  onSourceChange: (sourceId: string) => void;
+  onToggleDanmu: () => void;
+  onTakeScreenshot: () => void;
+  onToggleSettings: () => void;
   onTogglePictureInPicture: () => void;
   onToggleFullscreen: () => void;
+};
+
+export type PlayerControlSourceOption = {
+  id: string;
+  label: string;
+  detail: string;
 };
 
 export function formatTime(seconds: number): string {
@@ -68,9 +80,12 @@ export function PlayerControls({
   bufferedEnd,
   volume,
   muted,
-  playbackRate,
   fullscreen,
   pictureInPictureEnabled,
+  sources,
+  selectedSourceId,
+  danmuVisible,
+  settingsOpen,
   remainingTime,
   hoverTime,
   hoverPercent,
@@ -83,11 +98,13 @@ export function PlayerControls({
   onTimelineMouseLeave,
   onTimelineKeyDown,
   onTogglePlayPause,
-  onSeekRelative,
   onToggleMute,
   onVolumeChange,
   onToggleRemainingTime,
-  onCycleRate,
+  onSourceChange,
+  onToggleDanmu,
+  onTakeScreenshot,
+  onToggleSettings,
   onTogglePictureInPicture,
   onToggleFullscreen,
 }: PlayerControlsProps) {
@@ -140,15 +157,6 @@ export function PlayerControls({
             {playing ? <Pause size={22} fill="currentColor" aria-hidden="true" /> : <Play size={22} fill="currentColor" aria-hidden="true" />}
           </button>
 
-          <button type="button" className="lux-player-action-btn" aria-label="快退10秒" title="快退 10 秒 (←)" onClick={() => onSeekRelative(-10)}>
-            <RotateCcw size={19} aria-hidden="true" />
-            <span className="lux-player-step-label">10</span>
-          </button>
-          <button type="button" className="lux-player-action-btn" aria-label="快进10秒" title="快进 10 秒 (→)" onClick={() => onSeekRelative(10)}>
-            <RotateCw size={19} aria-hidden="true" />
-            <span className="lux-player-step-label">10</span>
-          </button>
-
           <div className="lux-player-volume-group">
             <button
               type="button"
@@ -188,9 +196,48 @@ export function PlayerControls({
           </button>
         </div>
 
+        <div className="lux-player-controls-middle">
+          <button
+            type="button"
+            className={`lux-player-action-btn lux-player-danmu-btn ${danmuVisible ? "is-active" : ""}`}
+            aria-label={danmuVisible ? "隐藏弹幕" : "显示弹幕"}
+            aria-pressed={danmuVisible}
+            title={danmuVisible ? "隐藏弹幕" : "显示弹幕"}
+            onClick={onToggleDanmu}
+          >
+            <MessageCircleMore size={20} aria-hidden="true" />
+          </button>
+        </div>
+
         <div className="lux-player-controls-right">
-          <button type="button" className="lux-player-rate-btn" aria-label="倍速切换" title="切换倍速" onClick={onCycleRate}>
-            {playbackRate === 1 ? "倍速" : `${playbackRate}x`}
+          {sources.length > 0 ? (
+            <select
+              className="lux-player-source-control"
+              aria-label="选择播放版本"
+              title="选择播放版本"
+              value={selectedSourceId}
+              onChange={(event) => onSourceChange(event.target.value)}
+            >
+              {sources.map((source) => (
+                <option key={source.id} value={source.id}>
+                  {source.label} ({source.detail})
+                </option>
+              ))}
+            </select>
+          ) : null}
+          <button type="button" className="lux-player-action-btn" aria-label="截图" title="截图" onClick={onTakeScreenshot}>
+            <Camera size={20} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
+            className={`lux-player-action-btn ${settingsOpen ? "is-active" : ""}`}
+            aria-label="播放器设置"
+            aria-expanded={settingsOpen}
+            aria-pressed={settingsOpen}
+            title="设置"
+            onClick={onToggleSettings}
+          >
+            <Settings2 size={20} aria-hidden="true" />
           </button>
           {pictureInPictureEnabled ? (
             <button type="button" className="lux-player-action-btn" aria-label="画中画" title="画中画" onClick={onTogglePictureInPicture}>

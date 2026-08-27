@@ -28,11 +28,11 @@ import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
 import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
-import { PlayerControls } from "./components/player-controls";
+import { type PlayerControlSourceOption, PlayerControls } from "./components/player-controls";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
 import { LuxPlayer } from "./components/lux-player";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
-import { PlayerTopBar, type PlayerSourceOption } from "./components/player-top-bar";
+import { PlayerTopBar } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
 import {
   classifyPlayerEngineFailure,
@@ -79,6 +79,15 @@ function getSubtitleInfo(media?: MediaItem | null) {
     return String(media.productionYear);
   }
   return null;
+}
+
+function screenshotFileName(title: string) {
+  const normalized = title
+    .replace(/[\\/:*?"<>|]/g, "-")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return `${normalized || "lux-screenshot"}-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
 }
 
 export function webPlaybackCapabilities(
@@ -170,6 +179,8 @@ export function PlayerPage() {
   const [centerSplash, setCenterSplash] = useState<"play" | "pause" | null>(null);
   const [hoverTime, setHoverTime] = useState<number | null>(null);
   const [hoverPercent, setHoverPercent] = useState<number | null>(null);
+  const [danmuVisible, setDanmuVisible] = useState(true);
+  const [screenshotStatus, setScreenshotStatus] = useState<string | null>(null);
 
   const requestedSourceId = searchParams.get("sourceId");
   const item = useQuery({
@@ -222,6 +233,7 @@ export function PlayerPage() {
   const hasStartedRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
   const splashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const screenshotStatusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const isDraggingScrubberRef = useRef(false);
   const scrubberPointerIdRef = useRef<number | null>(null);
@@ -599,6 +611,7 @@ export function PlayerPage() {
 
   useEffect(() => () => {
     if (splashTimeoutRef.current) clearTimeout(splashTimeoutRef.current);
+    if (screenshotStatusTimeoutRef.current) clearTimeout(screenshotStatusTimeoutRef.current);
   }, []);
 
   const showCenterSplash = (type: "play" | "pause") => {
@@ -711,6 +724,52 @@ export function PlayerPage() {
     video.playbackRate = rate;
     setPlaybackRate(rate);
   }, []);
+
+  const showScreenshotStatus = useCallback((message: string) => {
+    setScreenshotStatus(message);
+    if (screenshotStatusTimeoutRef.current) clearTimeout(screenshotStatusTimeoutRef.current);
+    screenshotStatusTimeoutRef.current = setTimeout(() => setScreenshotStatus(null), 2_500);
+  }, []);
+
+  const takeScreenshot = useCallback(() => {
+    const video = videoRef.current;
+    if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) {
+      showScreenshotStatus("当前视频帧尚未就绪");
+      return;
+    }
+
+    const canvas = document.createElement("canvas");
+    canvas.width = video.videoWidth;
+    canvas.height = video.videoHeight;
+    const context = canvas.getContext("2d");
+    if (!context) {
+      showScreenshotStatus("当前浏览器无法生成截图");
+      return;
+    }
+
+    try {
+      context.drawImage(video, 0, 0, canvas.width, canvas.height);
+      canvas.toBlob((blob) => {
+        if (!blob) {
+          showScreenshotStatus("当前媒体不允许截图");
+          return;
+        }
+        try {
+          const objectUrl = URL.createObjectURL(blob);
+          const anchor = document.createElement("a");
+          anchor.href = objectUrl;
+          anchor.download = screenshotFileName(media ? mediaTitle(media) : "lux-screenshot");
+          anchor.click();
+          window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
+          showScreenshotStatus("截图已保存");
+        } catch {
+          showScreenshotStatus("当前浏览器无法保存截图");
+        }
+      }, "image/png");
+    } catch {
+      showScreenshotStatus("当前媒体不允许截图");
+    }
+  }, [media, showScreenshotStatus]);
 
   // Keyboard shortcut listener
   useEffect(() => {
@@ -930,7 +989,7 @@ export function PlayerPage() {
   const surfaceFailure = playbackFailure
     ?? planFailure
     ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
-  const sourceOptions: PlayerSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
+  const sourceOptions: PlayerControlSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
     detail: entry.sourceKind === "STRM_URL" ? "STRM" : entry.container || "直链",
@@ -955,6 +1014,8 @@ export function PlayerPage() {
           event.stopPropagation();
           toggleFullscreen();
         }}
+        playing={playing}
+        onTogglePlayback={togglePlayPause}
         gestureOptions={{
           currentTime,
           duration,
@@ -984,14 +1045,7 @@ export function PlayerPage() {
         title={mediaTitle(media)}
         badge={mediaBadgeText}
         subtitle={subtitleInfo}
-        sources={sourceOptions}
-        selectedSourceId={source?.id ?? ""}
-        settingsOpen={showSettings}
-        fullscreen={isFullscreen}
         onBack={handleBack}
-        onSourceChange={(sourceId) => setSearchParams({ sourceId })}
-        onToggleSettings={() => setShowSettings((visible) => !visible)}
-        onToggleFullscreen={toggleFullscreen}
       />
 
       {showSettings ? (
@@ -1003,6 +1057,12 @@ export function PlayerPage() {
         />
       ) : null}
 
+      {screenshotStatus ? (
+        <div className="lux-player-screenshot-status" role="status">
+          {screenshotStatus}
+        </div>
+      ) : null}
+
       <PlayerControls
         playing={playing}
         currentTime={currentTime}
@@ -1010,9 +1070,12 @@ export function PlayerPage() {
         bufferedEnd={bufferedEnd}
         volume={volume}
         muted={isMuted}
-        playbackRate={playbackRate}
         fullscreen={isFullscreen}
         pictureInPictureEnabled={Boolean(document.pictureInPictureEnabled)}
+        sources={sourceOptions}
+        selectedSourceId={source?.id ?? ""}
+        danmuVisible={danmuVisible}
+        settingsOpen={showSettings}
         remainingTime={isRemainingTime}
         hoverTime={hoverTime}
         hoverPercent={hoverPercent}
@@ -1025,14 +1088,16 @@ export function PlayerPage() {
         onTimelineMouseLeave={handleScrubberMouseLeave}
         onTimelineKeyDown={handleTimelineKeyDown}
         onTogglePlayPause={togglePlayPause}
-        onSeekRelative={seekRelative}
         onToggleMute={toggleMute}
         onVolumeChange={changeVolume}
         onToggleRemainingTime={() => setIsRemainingTime((remaining) => !remaining)}
-        onCycleRate={() => {
-          const nextIndex = (PLAYBACK_SPEEDS.indexOf(playbackRate) + 1) % PLAYBACK_SPEEDS.length;
-          changePlaybackRate(PLAYBACK_SPEEDS[nextIndex]);
+        onSourceChange={(sourceId) => setSearchParams({ sourceId })}
+        onToggleDanmu={() => {
+          setDanmuVisible((visible) => !visible);
+          resetControlsTimeout();
         }}
+        onTakeScreenshot={takeScreenshot}
+        onToggleSettings={() => setShowSettings((visible) => !visible)}
         onTogglePictureInPicture={togglePictureInPicture}
         onToggleFullscreen={toggleFullscreen}
       />

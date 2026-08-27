@@ -57,6 +57,7 @@ describe("PlayerPage playback synchronization", () => {
     if (mediaSessionDescriptor) Object.defineProperty(navigator, "mediaSession", mediaSessionDescriptor);
     else delete (navigator as Navigator & { mediaSession?: unknown }).mediaSession;
     mediaSessionDescriptor = undefined;
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -337,7 +338,7 @@ describe("PlayerPage playback synchronization", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const sourceSelector = container.querySelector<HTMLSelectElement>('select[aria-label="选择播放源"]');
+    const sourceSelector = container.querySelector<HTMLSelectElement>('select[aria-label="选择播放版本"]');
     expect(sourceSelector).not.toBeNull();
     if (!sourceSelector) throw new Error("source selector was not rendered");
     await act(async () => {
@@ -347,6 +348,124 @@ describe("PlayerPage playback synchronization", () => {
     });
 
     expect(lifecycle).toEqual(["create:source-1", "stop:web-source-1", "create:source-2"]);
+  });
+
+  it("toggles only the local danmu visibility control without playback requests", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-danmu-toggle",
+      title: "弹幕开关测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-danmu-toggle", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-danmu-toggle"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const toggle = container.querySelector<HTMLButtonElement>('[aria-label="隐藏弹幕"]');
+    if (!toggle) throw new Error("danmu visibility control was not rendered");
+    const sessionCallsBeforeToggle = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
+    const eventCallsBeforeToggle = vi.mocked(api.webPlaybackEvent).mock.calls.length;
+
+    await act(async () => toggle.click());
+
+    expect(toggle.getAttribute("aria-pressed")).toBe("false");
+    expect(toggle.getAttribute("aria-label")).toBe("显示弹幕");
+    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeToggle);
+    expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeToggle);
+    expect(container.querySelector("input[placeholder*='弹幕']")).toBeNull();
+    expect(container.textContent).not.toContain("热力图");
+  });
+
+  it("creates a local PNG from the current video frame without playback requests", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-screenshot",
+      title: "截图: 测试/媒体",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-screenshot", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-screenshot"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    const screenshot = container.querySelector<HTMLButtonElement>('[aria-label="截图"]');
+    if (!video || !screenshot) throw new Error("screenshot controls were not rendered");
+    Object.defineProperties(video, {
+      videoWidth: { configurable: true, value: 1920 },
+      videoHeight: { configurable: true, value: 1080 },
+    });
+    const drawImage = vi.fn();
+    vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockReturnValue({
+      drawImage,
+    } as unknown as CanvasRenderingContext2D);
+    vi.spyOn(HTMLCanvasElement.prototype, "toBlob").mockImplementation((callback) => {
+      callback(new Blob(["fixture"], { type: "image/png" }));
+    });
+    const createObjectURL = vi.fn(() => "blob:lux-screenshot");
+    const revokeObjectURL = vi.fn();
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL });
+    let downloadedFileName = "";
+    vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function click() {
+      downloadedFileName = this.download;
+    });
+    const sessionCallsBeforeScreenshot = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
+    const eventCallsBeforeScreenshot = vi.mocked(api.webPlaybackEvent).mock.calls.length;
+
+    await act(async () => screenshot.click());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(drawImage).toHaveBeenCalledWith(video, 0, 0, 1920, 1080);
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:lux-screenshot");
+    expect(downloadedFileName).toMatch(/^截图- 测试-媒体-.*\.png$/);
+    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeScreenshot);
+    expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeScreenshot);
   });
 
   it("waits for the direct session to stop before creating a server fallback", async () => {
