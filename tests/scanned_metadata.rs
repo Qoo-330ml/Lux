@@ -111,6 +111,53 @@ async fn incremental_movie_scan_indexes_local_images() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn movie_scan_indexes_multiple_emby_backdrops_in_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Multiple Backdrops (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Multiple.Backdrops.2024.mkv"), b"movie").await?;
+    tokio::fs::write(movie_dir.join("backdrop.jpg"), b"backdrop-0").await?;
+    tokio::fs::write(movie_dir.join("backdrop1.jpg"), b"backdrop-1").await?;
+    tokio::fs::write(movie_dir.join("fanart-2.jpg"), b"backdrop-2").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let images: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT image_index, local_path
+         FROM item_images
+         WHERE image_type = 'FANART'
+         ORDER BY image_index",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(images.len(), 3);
+    assert_eq!(images[0].0, 0);
+    assert!(images[0].1.ends_with("backdrop.jpg"));
+    assert_eq!(images[1].0, 1);
+    assert!(images[1].1.ends_with("backdrop1.jpg"));
+    assert_eq!(images[2].0, 2);
+    assert!(images[2].1.ends_with("fanart-2.jpg"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_flat_movie_scan_indexes_media_prefixed_images_per_item()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
