@@ -93,11 +93,11 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
     assert_eq!(indexed[0].0, "FANART");
     assert_eq!(indexed[0].1, fanart.path.to_string_lossy());
     assert_eq!(indexed[0].2, 12);
-    assert_eq!(indexed[0].3, "TMDB");
+    assert_eq!(indexed[0].3, "SCRAPER");
     assert_eq!(indexed[1].0, "POSTER");
     assert_eq!(indexed[1].1, poster.path.to_string_lossy());
     assert_eq!(indexed[1].2, PNG_1X1.len() as i64);
-    assert_eq!(indexed[1].3, "TMDB");
+    assert_eq!(indexed[1].3, "SCRAPER");
 
     server.abort();
     let _ = root;
@@ -403,7 +403,7 @@ async fn successful_image_retry_clears_the_backoff_state() -> Result<(), Box<dyn
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let image_url = format!("http://{address}/poster");
-    let candidate_key = Sha256::digest(format!("TMDB\0POSTER\0{image_url}").as_bytes())
+    let candidate_key = Sha256::digest(format!("SCRAPER\0POSTER\0{image_url}").as_bytes())
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
