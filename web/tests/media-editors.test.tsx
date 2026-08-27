@@ -70,10 +70,35 @@ describe("media editors", () => {
     expect(container.querySelectorAll(".lux-image-type-tabs [role=tab]")).toHaveLength(7);
     await act(async () => container.querySelector<HTMLButtonElement>(".lux-image-editor-toolbar .lux-button")?.click());
     expect(search).toHaveBeenCalledWith("item-1", { imageType: "POSTER", language: "zh-CN", source: "TMDB" });
+    expect(container.querySelector<HTMLElement>(".lux-image-result")?.dataset.imageType).toBe("POSTER");
 
     await act(async () => container.querySelectorAll<HTMLButtonElement>(".lux-select-trigger")[0]?.click());
     await act(async () => document.querySelector<HTMLButtonElement>("[role=option][data-value='en-US']")?.click());
     expect(search).toHaveBeenLastCalledWith("item-1", { imageType: "POSTER", language: "en-US", source: "TMDB" });
+  });
+
+  it("marks the current image container with the selected image type", async () => {
+    vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => {
+      root.render(<MediaImageEditor item={{ id: "item-1", title: "示例电影" }} onClose={() => undefined} />);
+    });
+    await act(async () => await Promise.resolve());
+
+    const currentCard = () => container.querySelector<HTMLElement>(".lux-image-current-card");
+    expect(currentCard()?.dataset.imageType).toBe("POSTER");
+
+    for (const [label, imageType] of [["徽标", "LOGO"], ["缩略图", "THUMB"], ["横幅图", "BANNER"], ["光盘封面", "DISC"], ["艺术图", "ART"], ["壁纸", "WALLPAPER"]]) {
+      await act(async () => {
+        const tab = [...container.querySelectorAll<HTMLButtonElement>(".lux-image-type-tabs [role=tab]")]
+          .find((button) => button.textContent?.includes(label));
+        tab?.click();
+      });
+      expect(currentCard()?.dataset.imageType).toBe(imageType);
+    }
   });
 
   it("edits an indexed external subtitle without exposing embedded tracks", async () => {
