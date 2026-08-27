@@ -45,8 +45,8 @@
 - “使用 Rust”指 Lux 的核心服务端、索引、兼容 API、调度和文件传输使用 Rust；Web 前端暂按 React + TypeScript 设计，仍需在阶段 0 门确认。
 - 三个第三方客户端通过服务器 URL 手动添加 Lux；局域网自动发现不是首版阻塞项。
 - 飞牛 NAS 向 Docker 暴露普通 Linux 目录，媒体路径可 bind mount。
-- 因为管理员要求回写 NFO，相关媒体目录将以读写方式挂载；媒体目录中的本地图片仍需可读，Lux
-  管理的新下载图片默认写回媒体目录；管理员可以在全局或媒体库图片策略中选择是否额外保存到
+- 因为管理员要求回写 NFO 和图片，相关媒体目录将以读写方式挂载；媒体目录中的本地资源仍需可读，
+  Lux 管理的新元数据资源默认写回媒体目录；管理员可以在全局或媒体库策略中选择是否额外保存到
   /config/metadata/library。
 - 默认 SQLite 数据库位于 /config 的本机持久化卷，不位于 SMB/NFS；首次引导也可以选择管理员已准备好的外部 PostgreSQL。
 - 兼容性只承诺实施时真实测试并记录版本的 VidHub、SenPlayer 和 Infuse；“对标 Emby”不等于实现 Emby 全部端点。
@@ -82,7 +82,7 @@ Lux 的核心价值不是功能数量，而是：
 - 10,000 部电影和 50,000 集剧集的测试库中，常用查询达到第 5 节定义的性能目标。
 - 实时文件事件只触发局部增量扫描；定时全量校验在后台可暂停、可恢复，不锁住前台。
 - 本地 NFO 和图片优先，所选刮削器仅补缺；低置信度匹配进入“待处理”。
-- 管理员能重新匹配元数据条目并将结果原子地回写到 NFO 和媒体目录图片；可选的
+- 管理员能重新匹配元数据条目并将结果原子地回写到媒体目录旁车 NFO 和图片；可选的
   /config/metadata/library 镜像也必须原子写入。
 - Docker 容器重启后，任务、进度、用户、索引和扫描游标均保持一致。
 
@@ -179,9 +179,10 @@ Lux 的核心价值不是功能数量，而是：
 - 媒体详情页在完成待确认匹配后提供“下一个待确认”入口，支持连续处理同一媒体库中的异常条目。
 - 元数据匹配错误时支持“重新匹配”。
 - 重新匹配可选择仅补缺字段或刷新在线字段；无论哪种模式都不覆盖已锁定字段。
-- 成功编辑或匹配后，将 NFO 和 Lux 管理的主图片回写到媒体目录；当图片策略启用
-  `writeToMetadata` 时，再将同一图片额外写入 /config/metadata/library/<shard>/<item-id>/。
-  媒体目录已有图片仍保留且优先，历史 metadata 图片不自动搬迁。
+- 成功编辑或匹配后，将 NFO 和 Lux 管理的图片回写到媒体目录旁车；当策略启用
+  `writeToMetadata` 时，再将同一份 NFO 和图片额外写入
+  /config/metadata/library/<shard>/<item-id>/。媒体目录已有 NFO 和图片仍保留且优先，历史
+  metadata 资源不自动搬迁。
 - 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按主/备用角色和高置信度选择最佳候选，再按补充角色补齐缺失元数据，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
 - 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。
 - 媒体详情页或媒体卡片上的“扫描所在文件夹”只扫描该媒体现有媒体源所在的文件夹；媒体库管理页上的“扫描媒体库文件”才扫描整个媒体库。两者都只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削。
@@ -216,7 +217,7 @@ Lux 的核心价值不是功能数量，而是：
 - 背景图 backdrop/fanart。
 - 背景图写回采用 Emby 兼容命名：首张为 `backdrop.jpg`，后续为 `backdrop1.jpg`、`backdrop2.jpg`；读取继续兼容 `fanart.jpg`、`fanart-1.jpg` 等历史命名。
 - 本地图片发现、尺寸读取、缓存标签、HTTP 缓存和缩放接口兼容。
-- 缺失时从实际成功、备用或补充刮削器下载并写入媒体目录的标准旁车文件；当图片策略启用
+- 缺失时从实际成功来源下载并写入媒体目录的标准旁车文件；当策略启用
   `writeToMetadata` 时，同时写入 /config/metadata/library/<shard>/<item-id>/。匹配选择时按所属
   媒体库启用的图片类型逐项处理：海报、徽标、缩略图等单图类型只在没有更高优先级本地图片时写入；背景图允许多张，主来源和补充来源的图片按 URL 去重并按优先级追加。扫描发现的媒体目录图片仍按本地优先
   规则登记和提供。
@@ -502,8 +503,8 @@ Lux 的核心价值不是功能数量，而是：
 - 非 root 用户运行。
 - 支持 PUID/PGID 或文档化的 UID/GID 映射，使容器能读写媒体目录。
 - /config 为可写持久化卷。
-- 媒体目录必须按需求以读写方式挂载，因为 Lux 要回写 NFO 和默认图片；媒体目录中的本地图片仍需可读。
-  图片策略可选择额外将 Lux 管理的新图片写入 /config/metadata/library。
+- 媒体目录必须按需求以读写方式挂载，因为 Lux 要回写 NFO 和默认图片；媒体目录中的本地资源仍需可读。
+  元数据策略可选择额外将 Lux 管理的 NFO 和图片写入 /config/metadata/library。
 - 默认容器端口建议 8097，避免与现有 Emby 的 8096 冲突；可通过环境变量修改。
 
 ---
@@ -1967,7 +1968,7 @@ services:
 | LUX-196 | migrations/、migrations-postgres/、src/library.rs、src/storage/mod.rs、src/application/libraries.rs、src/application/scraper.rs、src/application/candidates.rs、src/application/reidentify.rs、src/application/metadata.rs、src/api/mod.rs、web/src/features/admin/、tests/、web/tests/、docs/ |
 | LUX-198 | runtime/Dockerfile、Dockerfile、docker-bake.hcl、src/application/playback/、src/api/lux/、src/storage/、migrations/、migrations-postgres/、web/src/features/player/、web/src/lib/api/、tests/、web/tests/、docs/ |
 | LUX-199 | src/application/catalog.rs、src/storage/mod.rs、src/api/mod.rs、tests/、docs/ |
-| LUX-202 | src/application/images.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、web/tests/、docs/ |
+| LUX-202 | src/application/images.rs、src/application/nfo.rs、src/api/mod.rs、web/src/features/admin/、web/src/lib/api/、tests/、web/tests/、docs/ |
 
 ### 阶段 0：仓库和工程纪律
 
