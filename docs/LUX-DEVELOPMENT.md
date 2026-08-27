@@ -5098,9 +5098,9 @@ video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或�
 
 验收：
 
-- [ ] 每个媒体源只返回自己的有序、受限章节：`startPositionTicks`、可选 `name`、`markerType` 和 `chapterIndex`。
-- [ ] Lux DTO 使用 camelCase 且与 Emby ChapterInfo 分离；无章节返回空数组，不能泄露路径、插件配置或其他 source 数据。
-- [ ] Lux item ACL、默认/选中 source 和现有 Emby 章节输出回归通过；请求路径不运行检测或文件读取。
+- [x] 每个媒体源只返回自己的有序、受限章节：`startPositionTicks`、可选 `name`、`markerType` 和 `chapterIndex`。
+- [x] Lux DTO 使用 camelCase 且与 Emby ChapterInfo 分离；无章节返回空数组，不能泄露路径、插件配置或其他 source 数据。
+- [x] Lux item ACL、默认/选中 source 和现有 Emby 章节输出回归通过；请求路径不运行检测或文件读取。
 
 验证：`cargo test --locked --test chapters`、相关 API 单测、Web 类型/客户端测试、`cargo fmt --all -- --check`、
 `cargo clippy --locked --all-targets --all-features -- -D warnings`、`pnpm --dir web build`。
