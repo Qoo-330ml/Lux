@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -2340,6 +2340,9 @@ impl MetadataSelectionService {
             for image_type in image_policy.enabled_types() {
                 if let Some(urls) = payload.images.get(image_type).cloned() {
                     if image_type == "FANART" && supplemental {
+                        let urls = self
+                            .filter_new_supplemental_image_urls(item_id, image_type, urls)
+                            .await?;
                         let start = self.images.next_image_index(item_id, image_type).await?;
                         for (offset, url) in urls.into_iter().take(MAX_IMAGE_VARIANTS).enumerate() {
                             specs.push((
@@ -2363,8 +2366,13 @@ impl MetadataSelectionService {
             }
             if let Some(url) = payload.fanart_url.clone() {
                 if supplemental {
-                    let start = self.images.next_image_index(item_id, "FANART").await?;
-                    specs.push(("FANART", vec![url], start));
+                    let mut urls = self
+                        .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
+                        .await?;
+                    if let Some(url) = urls.pop() {
+                        let start = self.images.next_image_index(item_id, "FANART").await?;
+                        specs.push(("FANART", vec![url], start));
+                    }
                 } else {
                     specs.push(("FANART", vec![url], 0));
                 }
@@ -2454,6 +2462,31 @@ impl MetadataSelectionService {
             }
         }
         Ok(result)
+    }
+
+    async fn filter_new_supplemental_image_urls(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        urls: Vec<String>,
+    ) -> Result<Vec<String>, MetadataSelectionError> {
+        let mut seen = HashSet::new();
+        let mut filtered = Vec::with_capacity(urls.len());
+        for url in urls {
+            let url = url.trim().to_owned();
+            if url.is_empty() || !seen.insert(url.clone()) {
+                continue;
+            }
+            if self
+                .images
+                .image_source_url_exists(item_id, image_type, &url)
+                .await?
+            {
+                continue;
+            }
+            filtered.push(url);
+        }
+        Ok(filtered)
     }
 
     async fn image_selection_policy(

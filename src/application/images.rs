@@ -423,6 +423,20 @@ impl ImageWriteService {
         Ok(())
     }
 
+    pub(crate) async fn image_source_url_exists(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        source_url: &str,
+    ) -> Result<bool, ImageWriteError> {
+        let image_type = normalize_image_type(image_type)
+            .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
+        self.database
+            .item_image_source_url_exists(item_id, image_type, source_url)
+            .await
+            .map_err(ImageWriteError::Storage)
+    }
+
     pub(crate) async fn list_item_images(
         &self,
         item_id: &str,
@@ -792,6 +806,7 @@ impl ImageWriteService {
                     height: dimensions.map(|(_, height)| height),
                     content_tag: &content_tag,
                     source,
+                    source_url: Some(image_url),
                 },
             )
             .await?;

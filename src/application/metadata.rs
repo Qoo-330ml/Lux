@@ -889,6 +889,7 @@ impl MetadataEnricher {
                         height: dimensions.map(|(_, height)| height),
                         content_tag: &content_tag,
                         source: "LOCAL",
+                        source_url: None,
                     },
                 )
                 .await
@@ -1319,6 +1320,7 @@ impl MetadataEnricher {
                         height: dimensions.map(|(_, height)| height),
                         content_tag: &content_tag,
                         source: "LOCAL",
+                        source_url: None,
                     },
                 )
                 .await?

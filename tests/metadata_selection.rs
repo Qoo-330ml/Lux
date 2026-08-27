@@ -720,6 +720,7 @@ async fn supplemental_selection_appends_multiple_backdrops_after_main_image()
             "title": "补充来源标题",
             "images": {
                 "FANART": [
+                    format!("{image_url}/fanart"),
                     format!("{image_url}/fanart-supplement-1"),
                     format!("{image_url}/fanart-supplement-2")
                 ]

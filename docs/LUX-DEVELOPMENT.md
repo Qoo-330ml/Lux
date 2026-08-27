@@ -1025,6 +1025,7 @@ pub async fn get_item(
 - file_size
 - content_tag
 - source
+- source_url，可空；在线图片写入时用于跨主/备用/补充来源按 URL 去重
 - language
 
 #### collections / collection_items

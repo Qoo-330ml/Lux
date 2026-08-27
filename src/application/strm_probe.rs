@@ -697,6 +697,7 @@ impl StrmProbeService {
                             height: dimensions.map(|(_, height)| height),
                             content_tag: &content_tag,
                             source: "STRM_FFMPEG",
+                            source_url: None,
                         },
                     )
                     .await
