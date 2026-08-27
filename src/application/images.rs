@@ -443,7 +443,6 @@ impl ImageWriteService {
             .await?
             .ok_or(ImageWriteError::ItemNotFound)?;
         let path = PathBuf::from(&image.local_path);
-        self.delete_metadata_image_copy(&image).await?;
         if let Ok(metadata) = fs::symlink_metadata(&path).await {
             if metadata.file_type().is_symlink() {
                 return Err(ImageWriteError::SymlinkTarget(path));
@@ -487,6 +486,7 @@ impl ImageWriteService {
                     })?;
             }
         }
+        self.delete_metadata_image_copy(&image).await?;
         if !self.database.delete_item_image(item_id, image_id).await? {
             return Err(ImageWriteError::ItemNotFound);
         }
