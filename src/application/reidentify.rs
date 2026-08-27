@@ -1438,13 +1438,23 @@ mod tests {
     #[derive(Clone)]
     struct RoleRecordingAdapter {
         provider_key: String,
+        match_found: bool,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
     impl RoleRecordingAdapter {
         fn new(provider_key: &str, calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self::with_match(provider_key, calls, true)
+        }
+
+        fn with_match(
+            provider_key: &str,
+            calls: Arc<Mutex<Vec<String>>>,
+            match_found: bool,
+        ) -> Self {
             Self {
                 provider_key: provider_key.to_owned(),
+                match_found,
                 calls,
             }
         }
@@ -1542,7 +1552,11 @@ mod tests {
             _request: ScraperSearchRequest,
         ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
             self.record("search");
-            Box::pin(std::future::ready(Ok(self.search_response())))
+            let response = self
+                .match_found
+                .then(|| self.search_response())
+                .unwrap_or_default();
+            Box::pin(std::future::ready(Ok(response)))
         }
 
         fn get(
@@ -1550,7 +1564,9 @@ mod tests {
             _request: ScraperGetRequest,
         ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
             self.record("get");
-            Box::pin(std::future::ready(Ok(self.bundle_response().metadata)))
+            let mut metadata = self.bundle_response().metadata;
+            metadata.genres = vec![format!("{} supplemental genre", self.provider_key)];
+            Box::pin(std::future::ready(Ok(metadata)))
         }
 
         fn bundle(
@@ -1693,6 +1709,206 @@ mod tests {
             .clone();
         assert!(calls.iter().any(|call| call == "primary:bundle"));
         assert!(calls.iter().all(|call| !call.starts_with("backup:")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_takes_over_in_order_when_primary_cannot_identify() -> Result<(), Box<dyn Error>>
+    {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_match("primary", Arc::clone(&calls), false);
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+
+        let candidate_count = service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::Reidentify,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        assert!(candidate_count > 0);
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        let first_backup_call = calls
+            .iter()
+            .position(|call| call.starts_with("backup:"))
+            .ok_or("backup scraper was not called")?;
+        assert!(
+            calls[..first_backup_call]
+                .iter()
+                .all(|call| call.starts_with("primary:"))
+        );
+        assert!(
+            calls[first_backup_call..]
+                .iter()
+                .all(|call| call.starts_with("backup:"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_requests_only_missing_image_capability() -> Result<(), Box<dyn Error>> {
+        let (temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::new("primary", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(MetadataSelectionService::with_config_dir(
+                database.clone(),
+                ImageWriteService::new(database.clone())?,
+                config.config_dir.clone(),
+            )),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let primary_only = vec![super::ResolvedScraper {
+            scraper_id: "primary".to_owned(),
+            role: LibraryScraperRole::Primary,
+            provider: super::ScraperProvider::from_adapter(primary.clone()),
+        }];
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &primary_only,
+                None,
+            )
+            .await?;
+        calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clear();
+        tokio::fs::remove_file(
+            temp_dir
+                .path()
+                .join("Movies/Example Movie (2020)/backdrop.jpg"),
+        )
+        .await?;
+
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("refreshed fixture movie is missing")?;
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &current,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        let backup_calls = calls
+            .into_iter()
+            .filter(|call| call.starts_with("backup:"))
+            .collect::<Vec<_>>();
+        assert_eq!(backup_calls, ["backup:search", "backup:images"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_scraper_supplements_after_using_backup_role() -> Result<(), Box<dyn Error>> {
+        let (temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_match("primary", Arc::clone(&calls), false);
+        let both = RoleRecordingAdapter::new("both", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(MetadataSelectionService::with_config_dir(
+                database.clone(),
+                ImageWriteService::new(database.clone())?,
+                config.config_dir.clone(),
+            )),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "both".to_owned(),
+                role: LibraryScraperRole::Both,
+                provider: super::ScraperProvider::from_adapter(both),
+            },
+        ];
+
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let nfo = tokio::fs::read_to_string(
+            temp_dir
+                .path()
+                .join("Movies/Example Movie (2020)/movie.nfo"),
+        )
+        .await?;
+        assert!(nfo.contains("<genre>both supplemental genre</genre>"));
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        assert!(calls.iter().any(|call| call == "both:bundle"));
+        assert!(calls.iter().any(|call| call == "both:get"));
         Ok(())
     }
 
