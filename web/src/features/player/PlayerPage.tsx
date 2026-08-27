@@ -1,6 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  AlertCircle,
   ArrowLeft,
   Check,
   Maximize,
@@ -43,6 +42,8 @@ import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
 import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
+import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
+import { PlayerVideoSurface } from "./components/player-video-surface";
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
@@ -751,65 +752,36 @@ export function PlayerPage() {
   };
 
   if (item.isPending) {
-    return (
-      <main className="lux-player-page lux-player-page-loading">
-        <div className="lux-spinner" aria-hidden="true" />
-        <p>正在准备播放器…</p>
-      </main>
-    );
+    return <PlayerLoadingState message="正在准备播放器…" />;
   }
 
   if (item.error) {
     return (
-      <main className="lux-player-page lux-player-page-error" role="alert">
-        <div className="lux-player-error-card">
-          <AlertCircle size={36} className="lux-player-error-icon" />
-          <h1>播放器加载失败</h1>
-          <p>{item.error.message}</p>
-          <button className="lux-player-glass-btn" type="button" onClick={handleBack}>
-            <ArrowLeft size={16} /> 返回上一页
-          </button>
-        </div>
-      </main>
+      <PlayerErrorState
+        title="播放器加载失败"
+        message={item.error.message}
+        onBack={handleBack}
+      />
     );
   }
 
   if (!media) {
     return (
-      <main className="lux-player-page lux-player-page-error" role="alert">
-        <div className="lux-player-error-card">
-          <AlertCircle size={36} className="lux-player-error-icon" />
-          <h1>播放器加载失败</h1>
-          <p>媒体条目为空。</p>
-          <button className="lux-player-glass-btn" type="button" onClick={handleBack}>
-            <ArrowLeft size={16} /> 返回
-          </button>
-        </div>
-      </main>
+      <PlayerErrorState title="播放器加载失败" message="媒体条目为空。" onBack={handleBack} />
     );
   }
 
   if (webPlaybackSession.isPending) {
-    return (
-      <main className="lux-player-page lux-player-page-loading" aria-busy="true">
-        <div className="lux-spinner" aria-hidden="true" />
-        <p>正在创建播放会话…</p>
-      </main>
-    );
+    return <PlayerLoadingState message="正在创建播放会话…" />;
   }
 
   if (webPlaybackSession.error) {
     return (
-      <main className="lux-player-page lux-player-page-error" role="alert">
-        <div className="lux-player-error-card">
-          <AlertCircle size={36} className="lux-player-error-icon" />
-          <h1>播放会话创建失败</h1>
-          <p>{webPlaybackSession.error.message}</p>
-          <button className="lux-player-glass-btn" type="button" onClick={handleBack}>
-            <ArrowLeft size={16} /> 返回上一页
-          </button>
-        </div>
-      </main>
+      <PlayerErrorState
+        title="播放会话创建失败"
+        message={webPlaybackSession.error.message}
+        onBack={handleBack}
+      />
     );
   }
 
@@ -829,109 +801,55 @@ export function PlayerPage() {
       onTouchStart={resetControlsTimeout}
       onClick={resetControlsTimeout}
     >
-      {/* Background Video Frame */}
-      <div className="lux-player-frame">
-        {streamUrl ? (
-          <video
-            ref={setVideoRef}
-            className="lux-video"
-            src={streamUrl}
-            poster={poster ?? undefined}
-            preload="metadata"
-            onClick={(e) => {
-              e.stopPropagation();
-              togglePlayPause();
-            }}
-            onDoubleClick={(e) => {
-              e.stopPropagation();
-              toggleFullscreen();
-            }}
-            onError={() => {
-              const engine = engineRef.current;
-              const reason = engine?.error?.message;
-              if (engine?.kind === "native") {
-                requestServerFallback(reason);
-              } else {
-                setFailedStreamUrl(streamUrl);
-                setPlaybackError(
-                  reason
-                    ? `客户端解码失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`
-                    : null,
-                );
-              }
-            }}
-            onLoadedMetadata={handleLoadedMetadata}
-            onPlay={() => {
-              hasStartedRef.current = true;
-              setPlaying(true);
-              reportPlayback("PLAYING", true);
-            }}
-            onPause={handlePause}
-            onTimeUpdate={handleTimeUpdate}
-            onEnded={() => {
-              setPlaying(false);
-              void Promise.resolve(reportPlayback("STOPPED", true)).finally(() => {
-                void stopActiveSession();
-              });
-            }}
-            aria-label={`播放 ${mediaTitle(media)}`}
-          />
-        ) : null}
-
-        {/* Center Splash Animation */}
-        {centerSplash && (
-          <div className="lux-player-center-splash" aria-hidden="true">
-            {centerSplash === "play" ? (
-              <Play size={48} fill="currentColor" />
-            ) : (
-              <Pause size={48} fill="currentColor" />
-            )}
-          </div>
-        )}
-
-        {/* Fallback and Error Notifications */}
-        {fallbackLoading ? (
-          <div className="lux-player-status-badge" role="status">
-            <span className="lux-player-status">正在准备客户端解码…</span>
-          </div>
-        ) : null}
-
-        {fallbackSpeedX !== null ? (
-          <div className="lux-player-speed-alert" role="status">
-            <p className="lux-player-status">
-              客户端解码速度低于实时（约 {fallbackSpeedX.toFixed(2)}×），当前已缓存后播放；建议使用原生客户端或降低清晰度。
-            </p>
-          </div>
-        ) : null}
-
-        {failedStreamUrl === streamUrl || !streamUrl ? (
-          <div className="lux-player-error-modal" role="alert">
-            <div className="lux-player-error-card">
-              <AlertCircle size={36} className="lux-player-error-icon" />
-              <p className="lux-player-error">
-                {playbackError ?? playbackPlanError ??
-                  "浏览器无法播放这个媒体源。请尝试其他版本或使用支持该格式的客户端。"}
-              </p>
-              <div className="lux-player-error-actions">
-                <button
-                  className="lux-player-glass-btn"
-                  type="button"
-                  onClick={() => window.location.reload()}
-                >
-                  重试
-                </button>
-                <button
-                  className="lux-player-glass-btn lux-player-glass-btn-primary"
-                  type="button"
-                  onClick={handleBack}
-                >
-                  返回
-                </button>
-              </div>
-            </div>
-          </div>
-        ) : null}
-      </div>
+      <PlayerVideoSurface
+        streamUrl={streamUrl}
+        poster={poster}
+        title={mediaTitle(media)}
+        videoRef={setVideoRef}
+        onClick={(event) => {
+          event.stopPropagation();
+          togglePlayPause();
+        }}
+        onDoubleClick={(event) => {
+          event.stopPropagation();
+          toggleFullscreen();
+        }}
+        onError={() => {
+          const engine = engineRef.current;
+          const reason = engine?.error?.message;
+          if (engine?.kind === "native") {
+            requestServerFallback(reason);
+          } else {
+            setFailedStreamUrl(streamUrl);
+            setPlaybackError(
+              reason
+                ? `客户端解码失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`
+                : null,
+            );
+          }
+        }}
+        onLoadedMetadata={handleLoadedMetadata}
+        onPlay={() => {
+          hasStartedRef.current = true;
+          setPlaying(true);
+          reportPlayback("PLAYING", true);
+        }}
+        onPause={handlePause}
+        onTimeUpdate={handleTimeUpdate}
+        onEnded={() => {
+          setPlaying(false);
+          void Promise.resolve(reportPlayback("STOPPED", true)).finally(() => {
+            void stopActiveSession();
+          });
+        }}
+        centerSplash={centerSplash}
+        fallbackLoading={fallbackLoading}
+        fallbackSpeedX={fallbackSpeedX}
+        errorMessage={playbackError ?? playbackPlanError}
+        showError={failedStreamUrl === streamUrl || !streamUrl}
+        onRetry={() => window.location.reload()}
+        onBack={handleBack}
+      />
 
       {/* Floating Vignette Shadows */}
       <div className="lux-player-vignette-top" aria-hidden="true" />
