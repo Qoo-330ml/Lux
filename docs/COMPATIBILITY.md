@@ -169,6 +169,26 @@ PostgreSQL 的集成测试按测试声明保持 ignored，不属于本阶段浏�
 横竖屏、系统锁屏/耳机按键，也不代表飞牛 NAS/x86_64、4K/HDR 或其他浏览器的性能。真机差异仍需单独记录；
 本机结果不得外推。
 
+## LuxPlayer LUX-217 循环、比例与镜像（2026-08-28）
+
+本次在 Lux `8247db44` 的当前 Web 产物上使用隔离 Docker fixture、一次性测试账号和 Playwright Chrome
+`151.0.7922.174`。宿主为 macOS `arm64`（`uname -m=arm64`）；测试密码、Cookie、签名 URL、完整播放地址和
+用户数据未写入输出。Chrome DevTools MCP 未配置，因此使用仓库既有 Playwright smoke 所采用的隔离浏览器方式，
+并在播放器媒体就绪后检查 DOM、实际盒子尺寸、网络计数、console 和 page error。
+
+| 播放路径 | 结果 | 证据 |
+|---|---|---|
+| Direct | 通过 | 最终计划为 `DIRECT`；开启循环、`4:3`、水平镜像后 video 的实际盒子比例为 `1.3333333333`，`loop` 属性和 `scaleX(-1)` 生效。 |
+| 服务器 HLS | 通过 | 计划由 `DIRECT` 降级为 `SERVER_HLS`；同一设置操作和几何断言通过，未产生外部请求或播放器错误。 |
+| 客户端 HEVC fallback | 通过 | 强制原生 HEVC 不可用后出现 Lux 客户端解码准备态；同一循环、比例和镜像合同通过，默认/正常切换清除动态样式。 |
+| 设置副作用 | 通过 | 三条路径在设置操作前后播放会话/事件请求计数不变；切换比例与镜像只更新当前 video 呈现，不创建会话、不上报进度。 |
+| 可访问性与布局 | 通过 | `循环播放` 使用 `role=switch`/`aria-checked`，比例和镜像使用原生按钮/`aria-pressed`；390×844 截图中设置面板无横向溢出，三个路径均有截图留档。 |
+
+页面媒体就绪前的未认证 `/api/v1/auth/me` 和无头像 fixture 的 `/api/v1/auth/avatar` 404 属于夹具启动噪声，未计入
+播放器交互窗口；媒体就绪后的 console、page error 和外部请求均为 0。Web 质量门为 `pnpm --dir web test`
+（83 个 Node 检查、347 个 Vitest 测试）和 `pnpm --dir web build`，均通过。该记录证明 LUX-217 行为，不代表
+Safari AirPlay、真实 iOS/Android 或其他浏览器的性能兼容性。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。

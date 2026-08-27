@@ -5050,10 +5050,10 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 
 验收：
 
-- [ ] 设置项显示当前值并可通过键盘、鼠标和触摸操作；循环使用可访问开关，比例和镜像选项有明确中文名称。
-- [ ] Direct、HLS 和客户端 fallback 的当前 video 都应用相同设置；source/engine 替换后重新应用，旧 DOM 不保留 transform/尺寸。
-- [ ] 切换设置不请求网络、不上报虚假进度；关闭循环仍执行原有 `ENDED/STOPPED` 生命周期。
-- [ ] ArtPlayer `aspectRatioMix.js`、`flipMix.js` 和设置模块只作为边界参考，实际来源状态写入第三方台账。
+- [x] 设置项显示当前值并可通过键盘、鼠标和触摸操作；循环使用可访问开关，比例和镜像选项有明确中文名称。
+- [x] Direct、HLS 和客户端 fallback 的当前 video 都应用相同设置；source/engine 替换后重新应用，旧 DOM 不保留 transform/尺寸。
+- [x] 切换设置不请求网络、不上报虚假进度；关闭循环仍执行原有 `ENDED/STOPPED` 生命周期。
+- [x] ArtPlayer `aspectRatioMix.js`、`flipMix.js` 和设置模块只作为边界参考，实际来源状态写入第三方台账。
 
 验证：设置纯逻辑/组件/页面测试、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器检查三种播放引擎。
 
