@@ -40,6 +40,11 @@ import {
   type PlayerFailure,
 } from "./components/player-diagnostics";
 import { usePlayerPlatform } from "./components/player-platform";
+import {
+  defaultCaptionSelection,
+  nativeCaptionTrack,
+  playerCaptionOptions,
+} from "./components/player-captions";
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
@@ -181,6 +186,9 @@ export function PlayerPage() {
   const [hoverPercent, setHoverPercent] = useState<number | null>(null);
   const [danmuVisible, setDanmuVisible] = useState(true);
   const [screenshotStatus, setScreenshotStatus] = useState<string | null>(null);
+  const [selectedCaptionStreamIndex, setSelectedCaptionStreamIndex] = useState<number | null>(null);
+  const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
+  const [captionStatus, setCaptionStatus] = useState<string | null>(null);
 
   const requestedSourceId = searchParams.get("sourceId");
   const item = useQuery({
@@ -201,6 +209,12 @@ export function PlayerPage() {
     media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
     media?.mediaSources?.find((entry) => entry.isDefault) ??
     media?.mediaSources?.[0];
+  const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
+  const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported);
+  const selectedCaptionOption = captionSourceId === source?.id
+    ? captionOptions.find((caption) => caption.streamIndex === selectedCaptionStreamIndex && caption.available) ?? null
+    : null;
+  const captionTrack = nativeCaptionTrack(itemId, source?.id ?? "", selectedCaptionOption);
   const playbackKey = `${itemId}:${source?.id ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(playbackKey);
   const sessionStartedRef = useRef(false);
@@ -364,6 +378,15 @@ export function PlayerPage() {
     setDuration(0);
     setBufferedEnd(0);
   }, [itemId, requestedSourceId]);
+
+  useEffect(() => {
+    const initialCaption = defaultCaptionSelection(
+      playerCaptionOptions(source, nativeCaptionTracksSupported),
+    );
+    setCaptionSourceId(source?.id ?? null);
+    setSelectedCaptionStreamIndex(initialCaption?.streamIndex ?? null);
+    setCaptionStatus(null);
+  }, [nativeCaptionTracksSupported, source?.id]);
 
   useEffect(() => {
     if (sessionGateKey === playbackKey) return;
@@ -725,6 +748,22 @@ export function PlayerPage() {
     setPlaybackRate(rate);
   }, []);
 
+  const selectCaption = useCallback((streamIndex: number | null) => {
+    if (streamIndex === null) {
+      setCaptionSourceId(source?.id ?? null);
+      setSelectedCaptionStreamIndex(null);
+      setCaptionStatus(null);
+      resetControlsTimeout();
+      return;
+    }
+    const option = captionOptions.find((caption) => caption.streamIndex === streamIndex);
+    if (!option?.available) return;
+    setCaptionSourceId(source?.id ?? null);
+    setSelectedCaptionStreamIndex(option.streamIndex);
+    setCaptionStatus(null);
+    resetControlsTimeout();
+  }, [captionOptions, resetControlsTimeout, source?.id]);
+
   const showScreenshotStatus = useCallback((message: string) => {
     setScreenshotStatus(message);
     if (screenshotStatusTimeoutRef.current) clearTimeout(screenshotStatusTimeoutRef.current);
@@ -1030,6 +1069,9 @@ export function PlayerPage() {
         centerSplash={centerSplash}
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
+        captionTrack={captionTrack}
+        onCaptionTrackLoad={() => setCaptionStatus(null)}
+        onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
         failure={surfaceFailure}
         showError={failedStreamUrl === streamUrl || !streamUrl}
@@ -1053,6 +1095,10 @@ export function PlayerPage() {
           playbackRates={PLAYBACK_SPEEDS}
           playbackRate={playbackRate}
           onChangeRate={changePlaybackRate}
+          captions={captionOptions}
+          selectedCaptionStreamIndex={captionSourceId === source?.id ? selectedCaptionStreamIndex : null}
+          captionStatus={captionStatus}
+          onSelectCaption={selectCaption}
           onClose={() => setShowSettings(false)}
         />
       ) : null}

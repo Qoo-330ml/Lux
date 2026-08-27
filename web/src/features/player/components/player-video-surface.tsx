@@ -1,4 +1,5 @@
 import { AlertCircle, ArrowLeft, Pause, Play } from "lucide-react";
+import { useEffect, useRef } from "react";
 import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -7,6 +8,7 @@ import type {
 } from "react";
 import type { PlayerFailure } from "./player-diagnostics";
 import { usePlayerSurfaceGestures } from "./player-gestures";
+import type { PlayerNativeCaptionTrack } from "./player-captions";
 
 type PlayerVideoSurfaceProps = {
   streamUrl: string;
@@ -21,6 +23,9 @@ type PlayerVideoSurfaceProps = {
   onPause?: (event: SyntheticEvent<HTMLVideoElement>) => void;
   onTimeUpdate?: () => void;
   onEnded?: () => void;
+  captionTrack?: PlayerNativeCaptionTrack | null;
+  onCaptionTrackLoad?: () => void;
+  onCaptionTrackError?: () => void;
   playing?: boolean;
   onTogglePlayback?: () => void;
   centerSplash: "play" | "pause" | null;
@@ -57,6 +62,9 @@ export function PlayerVideoSurface({
   onPause,
   onTimeUpdate,
   onEnded,
+  captionTrack = null,
+  onCaptionTrackLoad,
+  onCaptionTrackError,
   playing = false,
   onTogglePlayback = () => undefined,
   centerSplash,
@@ -69,6 +77,7 @@ export function PlayerVideoSurface({
   onBack,
   gestureOptions,
 }: PlayerVideoSurfaceProps) {
+  const captionTrackRef = useRef<HTMLTrackElement>(null);
   const gestures = usePlayerSurfaceGestures({
     enabled: Boolean(gestureOptions),
     currentTime: gestureOptions?.currentTime ?? 0,
@@ -96,6 +105,16 @@ export function PlayerVideoSurface({
     onDoubleClick(event);
   };
 
+  useEffect(() => {
+    const track = captionTrackRef.current;
+    const nativeTrack = track?.track;
+    if (!nativeTrack || !captionTrack) return;
+    nativeTrack.mode = "showing";
+    return () => {
+      nativeTrack.mode = "disabled";
+    };
+  }, [captionTrack?.id, captionTrack?.src]);
+
   return (
     <div className="lux-player-frame">
       {streamUrl ? (
@@ -118,7 +137,20 @@ export function PlayerVideoSurface({
           onTimeUpdate={onTimeUpdate}
           onEnded={onEnded}
           aria-label={`播放 ${title}`}
-        />
+        >
+          {captionTrack ? (
+            <track
+              key={captionTrack.src}
+              ref={captionTrackRef}
+              kind="subtitles"
+              label={captionTrack.label}
+              srcLang={captionTrack.language}
+              src={captionTrack.src}
+              onLoad={onCaptionTrackLoad}
+              onError={onCaptionTrackError}
+            />
+          ) : null}
+        </video>
       ) : null}
 
       {!playing && streamUrl && !fallbackLoading && !showError ? (

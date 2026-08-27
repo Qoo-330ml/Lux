@@ -398,6 +398,77 @@ describe("PlayerPage playback synchronization", () => {
     expect(container.textContent).not.toContain("热力图");
   });
 
+  it("selects and clears a current-source WebVTT track without replacing the playback session", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-captions",
+      title: "字幕轨道测试",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "source / 4k",
+        isDefault: true,
+        streams: [
+          { index: 0, type: "VIDEO", codec: "h264" },
+          { index: 2, type: "SUBTITLE", codec: "vtt", language: "zho", title: "简体中文", isExternal: true, isDefault: true },
+          { index: 3, type: "SUBTITLE", codec: "srt", language: "eng", title: "English", isExternal: true },
+        ],
+      }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-captions"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+
+    const captionSelector = container.querySelector<HTMLSelectElement>('[aria-label="选择字幕"]');
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!captionSelector || !video) throw new Error("caption controls were not rendered");
+    const sessionCallsBeforeSelection = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
+    const eventCallsBeforeSelection = vi.mocked(api.webPlaybackEvent).mock.calls.length;
+
+    expect(captionSelector.value).toBe("2");
+    expect(video.querySelector("track")?.getAttribute("src"))
+      .toBe("/api/v1/items/movie-captions/subtitles/2?sourceId=source%20%2F%204k");
+
+    await act(async () => {
+      captionSelector.value = "";
+      captionSelector.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(video.querySelector("track")).toBeNull();
+
+    await act(async () => {
+      captionSelector.value = "2";
+      captionSelector.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    expect(video.querySelector("track")?.getAttribute("src"))
+      .toBe("/api/v1/items/movie-captions/subtitles/2?sourceId=source%20%2F%204k");
+    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSelection);
+    expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeSelection);
+  });
+
   it("creates a local PNG from the current video frame without playback requests", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-screenshot",

@@ -1,9 +1,14 @@
 import { Check, X } from "lucide-react";
+import type { PlayerCaptionOption } from "./player-captions";
 
 type PlayerSettingsPanelProps = {
   playbackRates: readonly number[];
   playbackRate: number;
   onChangeRate: (rate: number) => void;
+  captions?: readonly PlayerCaptionOption[];
+  selectedCaptionStreamIndex?: number | null;
+  captionStatus?: string | null;
+  onSelectCaption?: (streamIndex: number | null) => void;
   onClose: () => void;
 };
 
@@ -11,8 +16,19 @@ export function PlayerSettingsPanel({
   playbackRates,
   playbackRate,
   onChangeRate,
+  captions = [],
+  selectedCaptionStreamIndex = null,
+  captionStatus = null,
+  onSelectCaption = () => undefined,
   onClose,
 }: PlayerSettingsPanelProps) {
+  const captionHelp = captionStatus
+    ?? (captions.length === 0
+      ? "当前版本没有字幕轨。"
+      : captions.every((caption) => !caption.available)
+        ? "当前版本没有可用的 WebVTT 字幕。"
+        : null);
+
   return (
     <div className="lux-player-settings-popover" role="dialog" aria-label="播放设置">
       <div className="lux-player-settings-header">
@@ -43,6 +59,33 @@ export function PlayerSettingsPanel({
             </button>
           ))}
         </div>
+      </div>
+      <div className="lux-player-settings-section">
+        <label className="lux-player-settings-label" htmlFor="lux-player-caption-select">字幕</label>
+        <select
+          id="lux-player-caption-select"
+          className="lux-player-caption-select"
+          aria-label="选择字幕"
+          value={selectedCaptionStreamIndex ?? ""}
+          onChange={(event) => {
+            const value = event.target.value;
+            onSelectCaption(value === "" ? null : Number(value));
+          }}
+        >
+          <option value="">关闭字幕</option>
+          {captions.map((caption) => (
+            <option
+              key={caption.streamIndex}
+              value={caption.streamIndex}
+              disabled={!caption.available}
+            >
+              {caption.unavailableReason
+                ? `${caption.label}（${caption.unavailableReason}）`
+                : caption.label}
+            </option>
+          ))}
+        </select>
+        {captionHelp ? <p className="lux-player-caption-status" role="status">{captionHelp}</p> : null}
       </div>
       <div className="lux-player-settings-section">
         <span className="lux-player-settings-label" id="lux-player-shortcuts-label">快捷键提示</span>

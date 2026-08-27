@@ -661,6 +661,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-settings-close:hover { color: #fff; }
 .lux-player-settings-section { margin-top: 12px; }
 .lux-player-settings-label { display: block; font-size: .75rem; color: var(--lux-muted); margin-bottom: 8px; }
+.lux-player-caption-select { width: 100%; min-height: 36px; padding: 0 10px; border: 1px solid var(--lux-line-soft); border-radius: 8px; outline: 0; color: var(--lux-text); background: rgba(255,255,255,.05); font-size: .8rem; }
+.lux-player-caption-select:focus { border-color: color-mix(in srgb, var(--lux-accent) 60%, var(--lux-line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-accent) 16%, transparent); }
+.lux-player-caption-select option { color: #fff; background: #24242a; }
+.lux-player-caption-status { margin: 7px 0 0; color: var(--lux-subtle); font-size: .7rem; line-height: 1.45; }
 .lux-player-speed-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
 .lux-player-speed-pill { display: flex; align-items: center; justify-content: center; gap: 4px; padding: 6px 8px; border: 1px solid var(--lux-line-soft); border-radius: 8px; font-size: .78rem; color: var(--lux-text); background: rgba(255,255,255,.04); cursor: pointer; transition: all .15s ease; }
 .lux-player-speed-pill:hover { background: rgba(255,255,255,.1); border-color: rgba(255,255,255,.2); }
