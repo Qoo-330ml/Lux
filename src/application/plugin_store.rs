@@ -41,8 +41,10 @@ pub struct PluginStoreEntry {
     pub version: String,
     #[serde(default)]
     pub runtime: String,
-    #[serde(default)]
+    #[serde(default, rename = "providerKey", alias = "provider_key")]
     pub provider_key: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -473,6 +475,17 @@ fn validate_catalog(
         {
             return Err(PluginStoreError::InvalidCatalog);
         }
+        if entry.aliases.len() > 16
+            || entry.aliases.iter().any(|alias| {
+                alias.is_empty()
+                    || alias.len() > 64
+                    || alias.chars().any(|character| {
+                        !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '_'))
+                    })
+            })
+        {
+            return Err(PluginStoreError::InvalidCatalog);
+        }
         if entry.packages.is_empty() {
             if entry.package_url.is_empty()
                 || entry.sha256.len() != 64
@@ -538,7 +551,8 @@ const DEFAULT_PLUGIN_INDEX_JSON: &str = r#"
 {
   "formatVersion": 1,
   "plugins": [
-    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.8","runtime":"process","providerKey":"tmdb","capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.8-linux-aarch64.zip","sha256":"3984d879572d17f6ae6aeb360baeb7b4d52488f00aafad3cbfedde6d31fd0514"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.8-linux-x86_64.zip","sha256":"85d82e4811406e37f8600a64c3a2370f210a3eef96a3be2ca6c1ab1f8b3914c3"}]},
+    {"id":"org.lux.tmdb","name":"TMDb 元数据插件","description":"从 TMDb 提供 Emby 风格电影、剧集和图片元数据。","category":"SCRAPER","version":"0.1.9","runtime":"process","providerKey":"tmdb","aliases":["tmdb"],"capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.9-linux-aarch64.zip","sha256":"32a98a8ba96f5c899ef81af986289c0980007bb795782b90be1793e99b980852"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.tmdb/org.lux.tmdb-0.1.9-linux-x86_64.zip","sha256":"a77fb201146ed4e4b97ab49e3b3cfed49981463a80bde0f75a1491096253977b"}]},
+    {"id":"org.lux.douban","name":"豆瓣元数据插件","description":"从豆瓣提供电影、剧集、图片、人物和预告片元数据。公开搜索无需配置；详情接口可配置豆瓣客户端凭据。","category":"SCRAPER","version":"0.1.4","runtime":"process","providerKey":"douban","aliases":["douban"],"capabilities":["metadata.search","metadata.get","metadata.bundle","metadata.images","metadata.credits","metadata.externalIds","metadata.trailers"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.douban/org.lux.douban-0.1.4-linux-aarch64.zip","sha256":"315338dda5aff1976a89df028a1885f90240950987c3f923dc30273e7bcbcedf"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/org.lux.douban/org.lux.douban-0.1.4-linux-x86_64.zip","sha256":"7ee8143b12d6c5f78c1307906cb187f63c27e7dd5b332271cd0ab31a177fe467"}]},
     {"id":"org.lux.strm-media-info","name":"strm媒体信息提取","description":"使用 ffprobe 提取媒体信息，并使用 ffmpeg 生成同时作为海报和缩略图的 STRM 截图。","category":"MEDIA","version":"0.2.0","runtime":"process","capabilities":["media.probe"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-aarch64.zip","sha256":"22977b5f23ab94c22c4e5be83888099f03079570e6b4953e5aea238735fabf82"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.strm-media-info-0.2.0-linux-x86_64.zip","sha256":"65411be32c8566a511d21a02ebd54e326f79f1225750d496fcae85c1302bc50c"}]},
     {"id":"org.lux.ip-hiofd","name":"IP归属地查询增强","description":"通过 Hiofd 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-aarch64.zip","sha256":"f2e93e49e9b3507cd400720fe0a6480e16e146a1fd15abf945ba861a53255db9"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.ip-hiofd-0.1.0-linux-x86_64.zip","sha256":"d734697e3fafa490a1ade0698f2d1ca74d93d894d3ac23d3098564046bfdaab6"}]},
     {"id":"org.lux.qoo-ip138","name":"ip138 IP归属地查询","description":"通过 ipshudi.com 查询公网 IP 的归属地信息。","category":"NETWORK","version":"0.1.0","runtime":"process","capabilities":["ip.location"],"packages":[{"platform":"linux","arch":"aarch64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-aarch64.zip","sha256":"8b7879c4d6e82b823f476f8672b878b3aa127ab76c164492317a23a243632bd7"},{"platform":"linux","arch":"x86_64","url":"https://github.com/Qoo-330ml/Lux-plugins/releases/download/build-3/org.lux.qoo-ip138-0.1.0-linux-x86_64.zip","sha256":"9423cfd53247ba55b6ec64fdbc0d9066ae73599c0fd35df8bf609446ca4a971f"}]},
@@ -586,6 +600,7 @@ mod tests {
                 version: "1.0.0".to_owned(),
                 runtime: "process".to_owned(),
                 provider_key: None,
+                aliases: Vec::new(),
                 capabilities: Vec::new(),
                 packages: Vec::new(),
                 package_url: "packages/example.zip".to_owned(),
@@ -608,9 +623,9 @@ mod tests {
     fn embedded_default_catalog_matches_the_published_store_shape() {
         let index = PluginStore::default_index().expect("embedded catalog should be valid");
         assert_eq!(index.format_version, 1);
-        assert_eq!(index.plugins.len(), 6);
+        assert_eq!(index.plugins.len(), 7);
         assert_eq!(index.plugins[0].id, "org.lux.tmdb");
-        assert_eq!(index.plugins[0].version, "0.1.8");
+        assert_eq!(index.plugins[0].version, "0.1.9");
         assert!(
             index.plugins[0]
                 .capabilities
@@ -618,6 +633,36 @@ mod tests {
                 .any(|capability| capability == "metadata.bundle")
         );
         assert_eq!(index.plugins[0].packages.len(), 2);
+        assert_eq!(
+            index.plugins[0].packages[0].sha256,
+            "32a98a8ba96f5c899ef81af986289c0980007bb795782b90be1793e99b980852"
+        );
+        assert_eq!(
+            index.plugins[0].packages[1].sha256,
+            "a77fb201146ed4e4b97ab49e3b3cfed49981463a80bde0f75a1491096253977b"
+        );
+        let douban = index
+            .plugins
+            .iter()
+            .find(|plugin| plugin.id == "org.lux.douban")
+            .expect("embedded catalog should include Douban");
+        assert_eq!(douban.version, "0.1.4");
+        assert_eq!(douban.provider_key.as_deref(), Some("douban"));
+        assert_eq!(douban.aliases, vec!["douban"]);
+        assert_eq!(
+            douban.packages[0].sha256,
+            "315338dda5aff1976a89df028a1885f90240950987c3f923dc30273e7bcbcedf"
+        );
+        assert_eq!(
+            douban.packages[1].sha256,
+            "7ee8143b12d6c5f78c1307906cb187f63c27e7dd5b332271cd0ab31a177fe467"
+        );
+        assert!(
+            douban
+                .capabilities
+                .iter()
+                .any(|capability| capability == "metadata.bundle")
+        );
     }
 
     #[test]
@@ -641,6 +686,7 @@ mod tests {
             version: "1.0.0".to_owned(),
             runtime: "process".to_owned(),
             provider_key: None,
+            aliases: Vec::new(),
             capabilities: Vec::new(),
             packages: vec![
                 PluginStorePackage {

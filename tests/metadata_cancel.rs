@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc,
@@ -7,15 +9,12 @@ use std::{
 };
 
 use axum::{Json, Router, extract::State, http::Uri, routing::any};
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        libraries::LibraryService,
-        reidentify::MetadataReidentifyService,
-        scanner::LibraryScanner,
-        scraper::ScraperProvider,
-        setup::SetupService,
-        tmdb::{TmdbClient, TmdbClientConfig},
+        libraries::LibraryService, reidentify::MetadataReidentifyService, scanner::LibraryScanner,
+        scraper::ScraperProvider, setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -106,7 +105,7 @@ async fn metadata_job_can_be_cancelled_while_running() -> Result<(), Box<dyn std
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -118,7 +117,8 @@ async fn metadata_job_can_be_cancelled_while_running() -> Result<(), Box<dyn std
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
     let job = metadata.create_library_job(&library.id.to_string()).await?;
     let job_id = job.id.clone();
     let runner = metadata.clone();
@@ -197,7 +197,7 @@ async fn metadata_job_reduces_workers_when_home_latency_is_degraded()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -211,8 +211,9 @@ async fn metadata_job_reduces_workers_when_home_latency_is_degraded()
     })?;
     let resources = luxd::observability::resources::ResourceMetrics::new();
     resources.record_home_latency(Duration::from_millis(400));
-    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb))
-        .with_resource_metrics(resources);
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb))
+            .with_resource_metrics(resources);
     let job = metadata.create_library_job(&library.id.to_string()).await?;
     metadata.run(&job.id).await;
 
@@ -249,7 +250,7 @@ async fn admin_can_request_metadata_job_cancellation() -> Result<(), Box<dyn std
     let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
         .fetch_one(database.pool())
         .await?;
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: "http://127.0.0.1:1".to_owned(),
         proxy_url: None,
         api_key: None,
@@ -261,7 +262,8 @@ async fn admin_can_request_metadata_job_cancellation() -> Result<(), Box<dyn std
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
     let job = metadata.create_job(vec![item_id]).await?;
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;

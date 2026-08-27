@@ -16,6 +16,7 @@ use tracing::{error, info};
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
     let _logging_guard = observability::init(&config.config_dir).await;
+    luxd::application::plugin_compat::migrate_legacy_tmdb_config(&config.config_dir).await?;
     let explicit_database_configuration = config.load_explicit_database_configuration().await?;
     let legacy_sqlite_database = config.has_legacy_sqlite_database().await;
     if explicit_database_configuration.is_none() && !legacy_sqlite_database {

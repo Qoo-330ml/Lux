@@ -99,14 +99,78 @@ pub trait ScraperAdapter: Send + Sync {
         request: ScraperGetRequest,
     ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>>;
 
-    fn configure_api_key(&self, _api_key: Option<String>) -> ScraperFuture<'_, ()> {
-        Box::pin(std::future::ready(()))
-    }
-
     fn with_resource_metrics(&self, _resources: ResourceMetrics) {}
 
     fn clear_response_cache(&self) -> ScraperFuture<'_, ()> {
         Box::pin(std::future::ready(()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct UnconfiguredScraper;
+
+impl UnconfiguredScraper {
+    fn unavailable<T: Send + 'static>(
+        method: &'static str,
+    ) -> ScraperFuture<'static, Result<T, ScraperError>> {
+        Box::pin(std::future::ready(Err(
+            ScraperError::UnsupportedCapability(method.to_owned()),
+        )))
+    }
+}
+
+impl ScraperAdapter for UnconfiguredScraper {
+    fn provider_key(&self) -> &str {
+        ""
+    }
+
+    fn search(
+        &self,
+        _request: ScraperSearchRequest,
+    ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+        Self::unavailable(METADATA_SEARCH_CAPABILITY)
+    }
+
+    fn get(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+        Self::unavailable(METADATA_GET_CAPABILITY)
+    }
+
+    fn bundle(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+        Self::unavailable(METADATA_BUNDLE_CAPABILITY)
+    }
+
+    fn images(
+        &self,
+        _request: ScraperImageRequest,
+    ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+        Self::unavailable(METADATA_IMAGES_CAPABILITY)
+    }
+
+    fn credits(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+        Self::unavailable(METADATA_CREDITS_CAPABILITY)
+    }
+
+    fn external_ids(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+        Self::unavailable(METADATA_EXTERNAL_IDS_CAPABILITY)
+    }
+
+    fn trailers(
+        &self,
+        _request: ScraperGetRequest,
+    ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+        Self::unavailable(METADATA_TRAILERS_CAPABILITY)
     }
 }
 
@@ -118,6 +182,10 @@ pub enum ScraperProvider {
 }
 
 impl ScraperProvider {
+    pub fn unconfigured() -> Self {
+        Self::from_adapter(UnconfiguredScraper)
+    }
+
     pub fn from_adapter<A>(adapter: A) -> Self
     where
         A: ScraperAdapter + 'static,
@@ -140,6 +208,18 @@ impl ScraperProvider {
         match self {
             Self::Adapter(adapter) => adapter.provider_key(),
             Self::Generic(client) => client.provider_key(),
+        }
+    }
+
+    pub fn matches_scraper_id(&self, selected_scraper: &str) -> bool {
+        match self {
+            Self::Adapter(adapter) => scraper_id_matches_provider(
+                selected_scraper,
+                adapter.plugin_id(),
+                adapter.provider_key(),
+                &[],
+            ),
+            Self::Generic(client) => client.matches_scraper_id(selected_scraper),
         }
     }
 
@@ -229,12 +309,6 @@ impl ScraperProvider {
         match self {
             Self::Adapter(adapter) => adapter.trailers(request).await,
             Self::Generic(client) => client.trailers(request).await,
-        }
-    }
-
-    pub async fn configure_api_key(&self, api_key: Option<&str>) {
-        if let Self::Adapter(adapter) = self {
-            adapter.configure_api_key(api_key.map(str::to_owned)).await;
         }
     }
 
@@ -404,7 +478,7 @@ mod tests {
     use super::{
         PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
         metadata_capability_for_method, provider_id_for_key, provider_key_from_plugin_id,
-        retryable_scraper_error,
+        retryable_scraper_error, scraper_id_matches_provider,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
     use serde_json::json;
@@ -462,6 +536,25 @@ mod tests {
         assert_eq!(provider_id_for_key(&provider_ids, "tvdb"), None);
     }
 
+    #[tokio::test]
+    async fn unconfigured_provider_never_attempts_an_external_call() {
+        let provider = super::ScraperProvider::unconfigured();
+        let result = provider
+            .search_generic(super::ScraperSearchRequest::new(
+                super::ScraperItemType::Movie,
+                "Example",
+                None,
+                "zh-CN",
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(super::ScraperError::UnsupportedCapability(capability))
+                if capability == super::METADATA_SEARCH_CAPABILITY
+        ));
+    }
+
     #[test]
     fn decodes_metadata_bundle_with_attached_provider_data() {
         let bundle = decode_bundle_response(json!({
@@ -515,6 +608,34 @@ mod tests {
             error.to_string(),
             "scraper capability unavailable: metadata.images"
         );
+    }
+
+    #[test]
+    fn scraper_id_matching_accepts_provider_aliases_and_plugin_id() {
+        assert!(scraper_id_matches_provider(
+            "tmdb",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &["tmdb".to_owned()]
+        ));
+        assert!(scraper_id_matches_provider(
+            "legacy-tmdb",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &["legacy-tmdb".to_owned()]
+        ));
+        assert!(scraper_id_matches_provider(
+            "org.lux.tmdb",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &[]
+        ));
+        assert!(!scraper_id_matches_provider(
+            "douban",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &["tmdb".to_owned()]
+        ));
     }
 }
 
@@ -584,6 +705,21 @@ pub fn provider_id_for_key<'a>(
                     || provider.eq_ignore_ascii_case(&short_provider))
         })
         .map(|(_, value)| value.as_str())
+}
+
+fn scraper_id_matches_provider(
+    selected_scraper: &str,
+    plugin_id: Option<&str>,
+    provider_key: &str,
+    aliases: &[String],
+) -> bool {
+    let selected_scraper = selected_scraper.trim();
+    !selected_scraper.is_empty()
+        && (plugin_id.is_some_and(|plugin_id| selected_scraper.eq_ignore_ascii_case(plugin_id))
+            || selected_scraper.eq_ignore_ascii_case(provider_key)
+            || aliases
+                .iter()
+                .any(|alias| selected_scraper.eq_ignore_ascii_case(alias)))
 }
 
 pub(crate) fn metadata_capability_for_method(method: &str) -> Option<&'static str> {
@@ -820,31 +956,18 @@ pub struct ScraperPluginClient {
     plugins: PluginService,
     plugin_id: String,
     provider_key: String,
+    aliases: Vec<String>,
     capability_cache: Arc<OnceCell<Option<Vec<String>>>>,
     response_cache: ProviderResponseCache,
     resources: Option<ResourceMetrics>,
 }
 
 impl ScraperPluginClient {
-    pub(crate) fn new_with_provider_key(
-        plugins: PluginService,
-        plugin_id: impl Into<String>,
-        provider_key: impl Into<String>,
-        response_cache: ProviderResponseCache,
-    ) -> Self {
-        Self::new_with_provider_key_and_capabilities(
-            plugins,
-            plugin_id,
-            provider_key,
-            None,
-            response_cache,
-        )
-    }
-
     pub(crate) fn new_with_provider_key_and_capabilities(
         plugins: PluginService,
         plugin_id: impl Into<String>,
         provider_key: impl Into<String>,
+        aliases: Vec<String>,
         capabilities: Option<Vec<String>>,
         response_cache: ProviderResponseCache,
     ) -> Self {
@@ -856,6 +979,7 @@ impl ScraperPluginClient {
             plugins,
             plugin_id: plugin_id.into(),
             provider_key: provider_key.into(),
+            aliases,
             capability_cache,
             response_cache,
             resources: None,
@@ -868,6 +992,15 @@ impl ScraperPluginClient {
 
     pub fn provider_key(&self) -> &str {
         &self.provider_key
+    }
+
+    fn matches_scraper_id(&self, selected_scraper: &str) -> bool {
+        scraper_id_matches_provider(
+            selected_scraper,
+            Some(&self.plugin_id),
+            &self.provider_key,
+            &self.aliases,
+        )
     }
 
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {

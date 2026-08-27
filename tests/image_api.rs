@@ -1,14 +1,12 @@
+mod common;
+
 use std::time::Duration;
 
 use axum::{Json, Router, routing::any};
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
-    application::{
-        libraries::LibraryService,
-        scanner::LibraryScanner,
-        setup::SetupService,
-        tmdb::{TmdbClient, TmdbClientConfig},
-    },
+    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
@@ -124,17 +122,17 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
         .execute(database.pool())
         .await?;
 
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         read_access_token: Some("stub-token".to_owned()),
         requests_per_second: 0,
         max_retries: 0,
-        ..TmdbClientConfig::default()
+        ..TestScraperConfig::default()
     })?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(
-        AppState::ready(config, database, setup, auth, emby_auth).with_tmdb_client(tmdb),
+        AppState::ready(config, database, setup, auth, emby_auth).with_scraper(tmdb.provider()),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

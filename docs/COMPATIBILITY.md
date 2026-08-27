@@ -6,10 +6,11 @@
 `metadata.search/get/bundle/images/credits/externalIds/trailers`，provider ID 按不透明字符串处理；因此
 `tmdb:123`、`imdb:tt1234567`、`imdb:nm123` 和 `douban:douban-456` 不需要共享数字 ID 解析路径。
 
-当前内置 TMDb adapter 的 typed endpoint、语言回退、合集、图片 URL 转换和 TMDb 配置接口保留在 TMDb
-边界内；外置插件统一走通用 `ScraperPluginClient`，不再按 TMDb 插件 ID 特判。manifest 未声明所需
-capability 时，宿主在发起 RPC 前返回稳定的 `scraper capability unavailable: <capability>` 错误，既不回退
-到 TMDb，也不把缺失能力报告为 TMDb 故障。此变更不新增数据库 migration。
+TMDb 和豆瓣的 typed endpoint、语言回退、合集、图片 URL 转换、凭据和配置解释全部由各自外置插件负责；
+Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 或按 TMDb 插件 ID 特判。metadata
+插件只收到自己的 `LUX_PLUGIN_CONFIG_PATH`，不能继承整个 `LUX_CONFIG_DIR`。manifest 未声明所需 capability
+时，宿主在发起 RPC 前返回稳定的 `scraper capability unavailable: <capability>` 错误，既不回退到 TMDb，
+也不把缺失能力报告为 TMDb 故障。`tmdb`、`douban` 仍是兼容 namespace/alias；此变更不新增数据库 migration。
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 

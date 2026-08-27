@@ -1,6 +1,9 @@
+mod common;
+
 use std::time::Duration;
 
 use axum::{Json, Router, routing::get};
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -8,7 +11,6 @@ use luxd::{
         metadata_paths::{MetadataObjectKind, metadata_object_directory},
         scanner::LibraryScanner,
         setup::SetupService,
-        tmdb::{TmdbClient, TmdbClientConfig},
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
@@ -101,7 +103,7 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -117,7 +119,7 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let config_dir = config.config_dir.clone();
     let state = AppState::ready(config, database.clone(), setup, web_auth, emby_auth)
-        .with_tmdb_client(tmdb);
+        .with_scraper(tmdb.provider());
     let app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;

@@ -517,7 +517,6 @@ export type AdminHealth = {
   database: { status: string; backend: "SQLITE" | "POSTGRESQL" | string; journalMode: string; writable: boolean };
   config: { available: boolean; writable: boolean };
   ffprobe: { available: boolean };
-  tmdb: { configured: boolean };
   jobs: {
     scanRunning: number;
     scanFailed: number;

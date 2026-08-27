@@ -6,6 +6,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
@@ -73,6 +76,8 @@ pub struct Database {
     backend: DatabaseBackend,
     person_credits_write_lock: Arc<AsyncMutex<()>>,
     metadata_write_lock: Arc<AsyncMutex<()>>,
+    #[cfg(test)]
+    query_count: Arc<AtomicUsize>,
 }
 
 impl Database {
@@ -173,6 +178,8 @@ impl Database {
             backend,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
+            #[cfg(test)]
+            query_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -3772,6 +3779,51 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_library_scrapers_by_library_ids(
+        &self,
+        library_ids: &[String],
+    ) -> Result<HashMap<String, Vec<StoredLibraryScraper>>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut scrapers = HashMap::<String, Vec<StoredLibraryScraper>>::new();
+        for library_ids in library_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", library_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT library_id, scraper_id, position, role
+                 FROM library_scrapers
+                 WHERE library_id IN ({placeholders})
+                 ORDER BY library_id, position"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for library_id in library_ids {
+                statement = statement.bind(library_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let library_id: String = row.get("library_id");
+                scrapers
+                    .entry(library_id)
+                    .or_default()
+                    .push(StoredLibraryScraper {
+                        scraper_id: row.get("scraper_id"),
+                        position: row.get("position"),
+                        role: row.get("role"),
+                    });
+            }
+        }
+        Ok(scrapers)
+    }
+
     pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
         let rows = self
             .query(
@@ -3789,6 +3841,13 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
+        let library_ids = rows
+            .iter()
+            .map(|row| row.get::<String, _>("id"))
+            .collect::<Vec<_>>();
+        let mut scrapers = self
+            .list_library_scrapers_by_library_ids(&library_ids)
+            .await?;
         let mut libraries = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.get("id");
@@ -3808,7 +3867,7 @@ impl Database {
                 probe_concurrency: row.get("probe_concurrency"),
                 last_scan_at: row.get("last_scan_at"),
                 scraper_id: row.get("scraper_id"),
-                scrapers: self.list_library_scrapers(&id).await?,
+                scrapers: scrapers.remove(&id).unwrap_or_default(),
                 chapter_source_id: row.get("chapter_source_id"),
                 cover_image_path: row.get("cover_image_path"),
                 cover_image_content_type: row.get("cover_image_content_type"),
@@ -6042,6 +6101,49 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_library_roots_by_library_ids(
+        &self,
+        library_ids: &[String],
+    ) -> Result<HashMap<String, Vec<StoredLibraryRoot>>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut roots = HashMap::<String, Vec<StoredLibraryRoot>>::new();
+        for library_ids in library_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", library_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT id, library_id, canonical_path, display_path,
+                        is_available, is_writable, last_checked_at,
+                        unavailable_since, scan_cursor
+                 FROM library_roots
+                 WHERE library_id IN ({placeholders})
+                 ORDER BY library_id, canonical_path, id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for library_id in library_ids {
+                statement = statement.bind(library_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let library_id: String = row.get("library_id");
+                roots
+                    .entry(library_id)
+                    .or_default()
+                    .push(stored_library_root(row));
+            }
+        }
+        Ok(roots)
     }
 
     pub(crate) async fn delete_library_root(
@@ -11994,9 +12096,56 @@ impl Database {
             return Ok(Vec::new());
         }
         let mut rows = Vec::new();
-        for library_id in library_ids {
-            let query =
-                "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+        for library_ids in library_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", library_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+            "WITH visible_catalog AS (
+                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.library_id IN ({placeholders})
+                   AND mi.item_type IN ('MOVIE', 'SERIES')
+                   AND mi.removed_at IS NULL
+                   AND mi.has_available_source = 1
+                 UNION ALL
+                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.library_id IN ({placeholders})
+                   AND mi.item_type = 'SERIES'
+                   AND mi.removed_at IS NULL
+                   AND mi.has_available_source = 0
+                   AND (
+                       EXISTS (
+                           SELECT 1
+                           FROM media_items visible_child
+                           WHERE visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                             AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
+                       )
+                       OR EXISTS (
+                           SELECT 1
+                           FROM collection_items visible_collection_item
+                           JOIN collections visible_collection
+                             ON visible_collection.id = visible_collection_item.collection_id
+                           JOIN media_items visible_child
+                             ON visible_child.id = visible_collection_item.item_id
+                           WHERE visible_collection.item_id = mi.id
+                             AND visible_child.removed_at IS NULL
+                             AND visible_child.has_available_source = 1
+                       )
+                   )
+             ), ranked AS (
+                 SELECT id, library_id,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY library_id
+                            ORDER BY added_at DESC, sort_title ASC, id ASC
+                        ) AS library_rank
+                 FROM visible_catalog
+             )
+             SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
@@ -12017,49 +12166,7 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM (
-                 WITH visible_catalog AS (
-                     SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
-                     FROM media_items mi
-                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                     WHERE mi.library_id = ?
-                       AND mi.item_type IN ('MOVIE', 'SERIES')
-                       AND mi.removed_at IS NULL
-                       AND mi.has_available_source = 1
-                     UNION ALL
-                     SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
-                     FROM media_items mi
-                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                     WHERE mi.library_id = ?
-                       AND mi.item_type = 'SERIES'
-                       AND mi.removed_at IS NULL
-                       AND mi.has_available_source = 0
-                       AND (
-                           EXISTS (
-                               SELECT 1
-                               FROM media_items visible_child
-                               WHERE visible_child.removed_at IS NULL
-                                 AND visible_child.has_available_source = 1
-                                 AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
-                           )
-                           OR EXISTS (
-                               SELECT 1
-                               FROM collection_items visible_collection_item
-                               JOIN collections visible_collection
-                                 ON visible_collection.id = visible_collection_item.collection_id
-                               JOIN media_items visible_child
-                                 ON visible_child.id = visible_collection_item.item_id
-                               WHERE visible_collection.item_id = mi.id
-                                 AND visible_child.removed_at IS NULL
-                                 AND visible_child.has_available_source = 1
-                           )
-                       )
-                 )
-                 SELECT id, library_id
-                 FROM visible_catalog
-                 ORDER BY added_at DESC, sort_title ASC, id ASC
-                 LIMIT ?
-             ) ranked
+             FROM ranked
              JOIN media_items mi ON mi.id = ranked.id
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
@@ -12068,19 +12175,15 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY mi.added_at DESC, mi.sort_title ASC, mi.id ASC,
-                      ms.id, mt.stream_index";
-            let library_rows = self
-                .fetch_catalog_rows(
-                    query,
-                    &[
-                        CatalogBind::Text(library_id),
-                        CatalogBind::Text(library_id),
-                        CatalogBind::Integer(limit),
-                    ],
-                )
-                .await?;
-            rows.extend(library_rows);
+             WHERE ranked.library_rank <= ?
+             ORDER BY ranked.library_id, mi.added_at DESC, mi.sort_title ASC,
+                      mi.id ASC, ms.id, mt.stream_index"
+            );
+            let mut binds = Vec::with_capacity(library_ids.len() * 2 + 1);
+            binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
+            binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
+            binds.push(CatalogBind::Integer(limit));
+            rows.extend(self.fetch_catalog_rows(&query, &binds).await?);
         }
         Ok(rows)
     }
@@ -16594,10 +16697,22 @@ impl Database {
         self.pool.close().await;
     }
 
+    #[cfg(test)]
+    fn reset_query_count(&self) {
+        self.query_count.store(0, AtomicOrdering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn query_count(&self) -> usize {
+        self.query_count.load(AtomicOrdering::Relaxed)
+    }
+
     fn query(
         &self,
         sql: impl sqlx::SqlSafeStr,
     ) -> sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments> {
+        #[cfg(test)]
+        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query(sqlx::AssertSqlSafe(adapt_sql_for_backend(
             self.backend,
             sql,
@@ -16611,6 +16726,8 @@ impl Database {
     where
         O: for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
     {
+        #[cfg(test)]
+        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_as(sqlx::AssertSqlSafe(adapt_sql_for_backend(
             self.backend,
             sql,
@@ -16624,6 +16741,8 @@ impl Database {
     where
         (O,): for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
     {
+        #[cfg(test)]
+        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(sqlx::AssertSqlSafe(adapt_sql_for_backend(
             self.backend,
             sql,
@@ -19070,6 +19189,102 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn library_listing_uses_constant_number_of_child_queries() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let service = LibraryService::new(database.clone());
+
+        for index in 0..3 {
+            let library = service
+                .create_library_with_scraper(
+                    &format!("Library {index}"),
+                    LibraryKind::Movie,
+                    false,
+                    Some("tmdb"),
+                    false,
+                )
+                .await
+                .expect("library");
+            let root = temp_dir.path().join(format!("root-{index}"));
+            tokio::fs::create_dir(&root).await.expect("library root");
+            service
+                .add_root(library.id, root.to_str().expect("utf-8 root"))
+                .await
+                .expect("library root record");
+        }
+
+        database.reset_query_count();
+        let views = service.list_libraries().await.expect("library views");
+
+        assert_eq!(views.len(), 3);
+        assert!(views.iter().all(|view| view.library.scrapers.len() == 1));
+        assert!(views.iter().all(|view| view.roots.len() == 1));
+        assert_eq!(database.query_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn recent_catalog_rows_use_one_query_for_multiple_libraries() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let service = LibraryService::new(database.clone());
+        let first = service
+            .create_library("First", LibraryKind::Movie, false)
+            .await
+            .expect("first library");
+        let second = service
+            .create_library("Second", LibraryKind::Movie, false)
+            .await
+            .expect("second library");
+        let first_id = first.id.to_string();
+        let second_id = second.id.to_string();
+
+        for (item_id, library_id, title, added_at) in [
+            ("recent-first-old", &first_id, "First old movie", 10_i64),
+            ("recent-first-new", &first_id, "First new movie", 20_i64),
+            ("recent-second-old", &second_id, "Second old movie", 5_i64),
+            ("recent-second-new", &second_id, "Second new movie", 15_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, 1)",
+            )
+            .bind(item_id)
+            .bind(library_id)
+            .bind(title)
+            .bind(title.to_ascii_lowercase())
+            .bind(added_at)
+            .execute(database.pool())
+            .await
+            .expect("media item");
+        }
+
+        database.reset_query_count();
+        let rows = database
+            .list_recent_catalog_rows_by_library(&[first_id, second_id], 1)
+            .await
+            .expect("recent catalog rows");
+
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.item_id.as_str())
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from(["recent-first-new", "recent-second-new"])
+        );
+        assert_eq!(database.query_count(), 1);
+    }
+
+    #[tokio::test]
     async fn concurrent_metadata_capability_writes_are_serialized() {
         let temp_dir = tempfile::tempdir().expect("temporary directory");
         let config = Config {
@@ -19230,6 +19445,7 @@ mod tests {
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
+            query_count: Arc::new(AtomicUsize::new(0)),
         };
         let jobs = database
             .list_metadata_reidentify_jobs(None, 0, 1)
@@ -20228,6 +20444,7 @@ mod tests {
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
+            query_count: Arc::new(AtomicUsize::new(0)),
         };
         assert!(database.probe_write().await.is_err());
         database.close().await;
@@ -20285,6 +20502,7 @@ mod tests {
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
+            query_count: Arc::new(AtomicUsize::new(0)),
         };
 
         assert_eq!(
@@ -20371,6 +20589,7 @@ mod tests {
             backend: DatabaseBackend::Sqlite,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
+            query_count: Arc::new(AtomicUsize::new(0)),
         };
 
         let reconciled = database

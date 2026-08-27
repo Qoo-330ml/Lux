@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc,
@@ -7,6 +9,7 @@ use std::{
 };
 
 use axum::{Json, Router, extract::State as AxumState, routing::any};
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -21,7 +24,6 @@ use luxd::{
         scanner::LibraryScanner,
         scraper::ScraperProvider,
         setup::SetupService,
-        tmdb::{TmdbClient, TmdbClientConfig},
         webhooks::WebhookService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
@@ -128,7 +130,7 @@ async fn setup_movie_library_with_parent_folder()
 }
 
 fn unreachable_tmdb_provider() -> Result<ScraperProvider, Box<dyn std::error::Error>> {
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: "http://127.0.0.1:1".to_owned(),
         read_access_token: Some("stub-token".to_owned()),
         timeout: Duration::from_millis(100),
@@ -136,9 +138,9 @@ fn unreachable_tmdb_provider() -> Result<ScraperProvider, Box<dyn std::error::Er
         initial_backoff: Duration::ZERO,
         max_backoff: Duration::ZERO,
         retry_jitter: Duration::ZERO,
-        ..TmdbClientConfig::default()
+        ..TestScraperConfig::default()
     })?;
-    Ok(ScraperProvider::from(tmdb))
+    Ok(ScraperProvider::from_adapter(tmdb))
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -189,7 +191,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -203,7 +205,7 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     })?;
     let low_confidence_metadata = MetadataReidentifyService::with_selection(
         database.clone(),
-        tmdb.clone(),
+        tmdb.clone().provider(),
         Some(MetadataSelectionService::new(
             database.clone(),
             ImageWriteService::new(database.clone())?,
@@ -212,7 +214,8 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(
-        AppState::ready(config, database.clone(), setup, auth, emby_auth).with_tmdb_client(tmdb),
+        AppState::ready(config, database.clone(), setup, auth, emby_auth)
+            .with_scraper(tmdb.provider()),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -596,7 +599,7 @@ async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn 
     .fetch_one(database.pool())
     .await?;
 
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: "http://127.0.0.1:1".to_owned(),
         proxy_url: None,
         api_key: None,
@@ -608,7 +611,8 @@ async fn item_metadata_refresh_includes_series_children() -> Result<(), Box<dyn 
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
     let job = metadata
         .create_item_refresh_job(&series_id, MetadataRefreshMode::FillMissing)
         .await?;
@@ -697,7 +701,7 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -722,7 +726,7 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
         .await?;
     let metadata = MetadataReidentifyService::with_selection(
         database.clone(),
-        ScraperProvider::from(tmdb),
+        ScraperProvider::from_adapter(tmdb),
         Some(selection),
     )
     .with_webhooks(webhooks);
@@ -802,7 +806,7 @@ async fn library_metadata_job_processes_items_concurrently()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -816,8 +820,9 @@ async fn library_metadata_job_processes_items_concurrently()
     })?;
     let admin_events = AdminEventHub::new();
     let mut event_receiver = admin_events.subscribe();
-    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb))
-        .with_admin_events(admin_events);
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb))
+            .with_admin_events(admin_events);
     let job = metadata.create_library_job(&library.id.to_string()).await?;
     assert_eq!(event_receiver.recv().await, Ok(AdminEventScope::Jobs));
     metadata.run(&job.id).await;

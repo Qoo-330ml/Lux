@@ -162,14 +162,21 @@ impl LibraryService {
 
     pub async fn list_libraries(&self) -> Result<Vec<LibraryView>, LibraryServiceError> {
         let libraries = self.database.list_libraries().await?;
+        let library_ids = libraries
+            .iter()
+            .map(|library| library.id.clone())
+            .collect::<Vec<_>>();
+        let mut roots_by_library = self
+            .database
+            .list_library_roots_by_library_ids(&library_ids)
+            .await?;
         let mut views = Vec::with_capacity(libraries.len());
         for library in libraries {
             let id = library.id.clone();
             let library = stored_library(library)?;
-            let roots = self
-                .database
-                .list_library_roots(&id)
-                .await?
+            let roots = roots_by_library
+                .remove(&id)
+                .unwrap_or_default()
                 .into_iter()
                 .map(stored_library_root)
                 .collect::<Result<Vec<_>, _>>()?;

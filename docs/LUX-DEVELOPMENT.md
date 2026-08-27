@@ -156,7 +156,7 @@ Lux 的核心价值不是功能数量，而是：
 - 锁定的 NFO 字段在任何刮削模式下都不覆盖；在线没有返回的图片不删除本地图片。
 - TMDb 插件提供可配置的首选语言，默认使用简体中文 `zh-CN`；可选语言按 `zh-CN`、`zh-SG`、`zh-HK`、`zh-TW`、其他 TMDb 主翻译语言的顺序展示。
 - TMDb 语言回退开关默认关闭；开启后，电影、剧集、季度和单集元数据按管理员选择的语言顺序逐字段补全，默认预选 `zh-SG`、`zh-HK`、`zh-TW`。
-- TMDb 插件提供默认关闭的替代 API 地址开关；开启后可选择默认官方地址 `https://api.themoviedb.org`、`https://api.tmdb.org` 或自定义 HTTP(S) 基础地址。自定义地址不得包含凭据、查询参数或片段，并持久化到 `/config/tmdb_settings.json`。
+- TMDb 插件提供默认关闭的替代 API 地址开关；开启后可选择默认官方地址 `https://api.themoviedb.org`、`https://api.tmdb.org` 或自定义 HTTP(S) 基础地址。自定义地址不得包含凭据、查询参数或片段，并由插件配置持久化到 `/config/plugin-config/org.lux.tmdb.json`。
 - 图片优先本地；在线图片按 zh-CN、无语言、英文的顺序选择。
 - 电影、剧集、季度和单集 NFO 均应兼容常见 Emby/Kodi 旁挂形式。
 - 至少识别 movie.nfo、tvshow.nfo、与视频同名的 .nfo、poster、fanart/backdrop、seasonXX-poster 等常见命名。
@@ -323,9 +323,9 @@ Lux 的核心价值不是功能数量，而是：
 - Lux 提供安全的插件注册表；插件以标准 `.zip` 插件包放入 `/config/plugins`，服务重启时扫描并加载。插件代码运行在受监督的独立进程中，不直接注入 Lux Rust 主进程。Lux 发布包和 Docker 镜像不包含任何现有插件实现、打包器或插件 ZIP。
 - 插件商店使用可配置的 HTTPS 目录地址；目录返回插件元数据和包地址。默认目录源为 `https://github.com/Qoo-330ml/Lux-plugins`，Lux 将其解析为仓库 `main` 分支的 `index.json`；管理员可以在插件商店页面填写其他目录地址。
 - 管理员从插件商店安装插件时，Lux 只下载目录声明的 `.zip` 包，限制大小、文件数量、路径、manifest、协议版本、平台入口和声明文件 SHA-256，并在校验成功后原子写入 `/config/plugins`；未经目录声明的地址不得作为下载目标。
-- 首个独立插件为 `org.lux.tmdb`，由外部插件仓库发布。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义。
+- 首个独立插件为 `org.lux.tmdb`，由外部插件仓库发布。它提取 Emby `MovieDb.dll` 的 TMDb 行为，按 Lux 插件协议重写，并保留 Emby 风格的媒体类型、ProviderIds、ImageType、搜索结果和图片结果定义；上游 client、凭据和图片地址处理均只存在于插件进程。
 - SDK v1 同时支持 `media_probe` 插件类型。`org.lux.strm-media-info` 只接收 Lux 宿主按单个任务提交的已校验 STRM 探测目标，按原始字符串调用 `ffprobe` 并返回受限的 format/stream 结果；插件不能访问 Lux 数据库、媒体根目录或任务对象，宿主负责并发、取消、恢复、结果落库和可选旁车写回。
-- 只有已安装、已启用且可用的插件才能被媒体库选择或调度。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 优先使用管理员填写的 API Key，其次使用运行时或历史 Read Access Token，最后使用外置 TMDb 插件自己的默认凭据；任何凭据都不返回 API 或写入日志。
+- 只有已安装、已启用且可用的插件才能被媒体库选择或调度。插件可以声明自己的配置字段；没有配置项的插件不需要展开配置。TMDb 的 API Key、历史 Read Access Token、默认凭据和优先级由外置插件自己解释；Lux 只保存并传递该插件的专属配置文件，任何凭据都不返回 API 或写入日志。
 - 媒体库的有序刮削器列表为空表示不进行在线刮削、只使用本地元数据；插件安装状态与媒体库选择、顺序和角色均持久化，服务重启后保持不变。对旧客户端继续返回首位 `scraperId`，新 Lux API 使用带有 `scraperId`、`position` 和 `role` 的有序列表。
 - 片头片尾插件的 `libraryIds` 不再是媒体库归属配置；旧配置只用于一次性迁移到对应媒体库的
   `chapterSourceId`，迁移后调度只读取媒体库字段。
@@ -451,7 +451,7 @@ Lux 的核心价值不是功能数量，而是：
 - SQLx + SQLite：异步数据库访问、迁移和编译期查询检查。
 - quick-xml：宽容读取和写入 NFO。
 - notify：Linux inotify 实时监听；无法可靠监听时回退 PollWatcher 或定时校验。
-- reqwest + rustls：TMDb HTTPS 客户端。
+- reqwest + rustls：Lux 自身需要的 HTTPS 请求；TMDb/豆瓣 HTTPS client 属于各自外置插件，不属于 Lux 核心依赖。
 - tracing / tracing-subscriber：结构化日志。
 - argon2：密码哈希，使用 Argon2id。
 - uuid：内部 ID，优先 UUIDv7；Emby DTO 只暴露字符串。
@@ -756,7 +756,7 @@ pub async fn get_item(
 
 ### 10.5 永远禁止
 
-- 提交密码、用户 TMDb token、真实 .strm URL 或用户数据；项目所有者明确批准的内置第三方 TMDb fallback Key 除外，但该 Key 仍不得由 API 返回或写入日志。
+- 提交密码、用户 TMDb/豆瓣 token、真实 .strm URL 或用户数据；第三方 provider 凭据只能通过受保护的插件配置或 secrets 注入，绝不写入 API、日志或版本库。
 - 在日志中输出访问令牌、Cookie、完整查询令牌或 .strm 地址。
 - 为了通过测试删除失败测试或降低断言。
 - 在媒体扫描时加载整个库到内存。
@@ -1200,10 +1200,9 @@ locked local value
 
 ### 13.3 刮削器客户端
 
-- TMDb 客户端同时兼容 v3 API Key 和历史 v4 Read Access Token。管理员通过 TMDb 插件详情配置自己的 API Key。
-- 服务端内置一个与 Emby 插件兼容的默认 TMDb API Key，因此首次引导不要求配置 TMDb；管理员填写的 API Key 优先于内置值。
-- 自定义 API Key 和历史 token 只保存在 /config 中的受限配置或 secrets 文件，不返回普通用户、插件 API 或日志。
-- TMDb 插件配置还包括首选语言、语言回退开关和有序回退语言列表；这些非敏感值保存在 `/config/tmdb_settings.json`，可通过管理员插件配置 API 返回，凭据仍不可返回。
+- TMDb 外置插件的客户端同时兼容 v3 API Key 和历史 v4 Read Access Token。管理员通过 TMDb 插件详情配置自己的 API Key。
+- TMDb 插件自行决定默认凭据、管理员 API Key 和历史 token 的优先级；Lux 不内置、不解析这些凭据，也不在自身 API 或日志中返回它们。
+- TMDb 插件配置包括首选语言、语言回退开关和有序回退语言列表，由宿主保存于 `/config/plugin-config/org.lux.tmdb.json` 并通过 `LUX_PLUGIN_CONFIG_PATH` 传给插件；敏感字段仍不可返回。
 - 主进程的元数据匹配、候选搜索、图片候选和合集请求统一通过媒体库有序刮削器协议；主进程不得直接访问第三方元数据 API。主刮削器和备用刮削器负责身份匹配，补充刮削器只对已确认条目请求缺失字段或图片能力。
 - 插件内部使用统一 HTTP client、超时、16 并发配额、每秒 32 次请求限流、重试和 User-Agent。
 - 插件 stdin/stdout RPC 支持有界多路复用；响应按 request ID 分发并允许乱序返回，插件进程故障或超时会结束其全部 pending 请求。
@@ -1639,7 +1638,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 
 - /health/live：进程事件循环可响应。
 - /health/ready：数据库迁移完成、配置可读、必要目录可访问。
-- 管理健康页额外检查 SQLite WAL、任务延迟、根路径状态、ffprobe 可用性和 TMDb 配置。
+- 管理健康页额外检查 SQLite WAL、任务延迟、根路径状态和 ffprobe 可用性；具体 metadata provider 的状态通过插件管理接口查看。
 
 ---
 
@@ -1865,6 +1864,18 @@ services:
 - 决定：Lux 管理的图片、人物资料和后续对象资源统一放入 `/config/metadata`；数据库继续负责
   关系和查询，媒体目录中的 NFO/本地图片仍按 ADR-005 作为字段级来源。
 - 后果：新布局必须支持旧 `/config/people` 只读兼容、原子写入、路径校验和可重建迁移。
+
+### ADR-028：元数据 provider 与宿主实现彻底解耦
+
+- 状态：已接受；由 LUX-201 实施。
+- 决定：Lux 主程序只依赖 provider-neutral 的 metadata RPC 和插件目录契约；TMDb、豆瓣以及其他上游
+  服务的 HTTP client、endpoint DTO、凭据读取、语言策略和图片 URL 转换全部属于各自的外置插件。
+- 兼容：`tmdb`、`douban` 等 provider namespace 可以继续出现在 NFO、Emby DTO、历史 provider ID 和
+  旧 `scraperId` 中，但只能由通用兼容层按字符串处理；它们不是主程序的 client、配置或网络探针依赖。
+- 配置：宿主为每个插件生成并传递专属 `LUX_PLUGIN_CONFIG_PATH`，metadata 插件不得获得整个 Lux 配置根目录。
+  旧共享配置在首次发现/启动时迁移到对应插件配置文件，迁移成功后不再由宿主读取上游专属字段。
+- 版本：协议 v1 的 metadata 方法保持不变；TMDb 与豆瓣插件分别在解耦发布中增加一个 patch 版本。
+- 原因：避免新增 provider 时修改核心依赖、数据库模型和应用服务，也避免插件读取无关凭据。
 
 ---
 
@@ -4677,6 +4688,42 @@ SQLite 空库 migration、NFO/图片优先级、锁定字段和人物关系回�
 验证：参见 `docs/decisions/027-metadata-refresh-resource-pipeline.md` 和 `docs/PERFORMANCE.md`。
 
 依赖：LUX-169、LUX-189、LUX-196。
+
+#### LUX-201：TMDb/豆瓣与 Lux 主程序彻底解耦
+
+范围：在不改变 metadata RPC v1、NFO/Emby provider namespace 和现有元数据性能优化结果的前提下，移除
+Lux 主程序编译的 TMDb client/adapter、TMDb endpoint/凭据/图片 URL 逻辑和 TMDb 专用配置分支；TMDb 与
+豆瓣的实现、配置读取和上游访问全部由 `Lux-plugins` 独立插件负责。
+
+契约：
+
+- metadata 插件必须通过 manifest 声明 `providerKey`；`pluginId` 只表示安装和运行时身份，aliases 只用于
+  旧 `scraperId` 的通用解析。provider ID 在 Lux 业务层始终是不透明字符串。
+- metadata RPC 继续使用 `metadata.search`、`metadata.get`、`metadata.bundle`、`metadata.images`、
+  `metadata.credits`、`metadata.externalIds` 和 `metadata.trailers`，不增加 TMDb 专用方法。
+- 宿主对 metadata 插件只传递其专属配置文件路径 `LUX_PLUGIN_CONFIG_PATH`，不传递 `LUX_CONFIG_DIR`；
+  其他插件的配置隔离策略不因本任务改变。
+- 旧 `/config/tmdb_*` 和其他历史 TMDb 设置只允许做一次性迁移，迁移结果写入 `plugin-config/org.lux.tmdb.json`；
+  迁移过程不记录凭据，迁移后主程序不再解释这些字段。
+- `tmdb` 和 `douban` 仅作为兼容 namespace/alias 保留，不能触发主程序的 provider 特判或外部网络请求。
+
+验收：
+
+- [x] Lux 主程序源码和二进制不包含 `TmdbClient`、`tmdb_plugin`、TMDb API endpoint、TMDb 运行时凭据解析或
+      TMDb 图片 CDN 转换实现；旧配置读取仅存在于一次性兼容迁移路径。
+- [x] TMDb `0.1.9` 和豆瓣 `0.1.4` 插件独立完成 metadata RPC v1，并只读取各自专属配置路径。
+- [x] 旧 TMDb 配置、旧 `scraperId: "tmdb"`、NFO/Emby provider ID 和 TheIntroDB 所需外部 ID 均可兼容，
+      且 provider ID 不丢失、不被强制转换为数字。
+- [x] metadata 插件进程无法读取整个 Lux 配置目录；配置 API 不返回敏感值，日志不包含凭据和完整外部 URL。
+- [x] 现有 LUX-200 元数据请求数、吞吐和 Rust/Web 质量门不退化；补充插件仓库构建、manifest、RPC、
+      Linux x86_64/aarch64 包验证。
+
+验证记录：详见 `docs/LUX-201-PLAN.md`；Lux 全量质量门和插件发布验证于 2026-08-27 完成，本机架构为
+`uname -m=arm64`，性能结论不外推到 NAS/x86_64。
+
+依赖：LUX-142、LUX-169、LUX-200。
+
+验证：`docs/LUX-201-PLAN.md`。
 
 ## 26. 风险与缓解
 

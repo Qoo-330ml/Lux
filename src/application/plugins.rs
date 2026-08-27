@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet,
-    env, fmt, io,
+    fmt, io,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::Arc,
@@ -41,19 +41,12 @@ use crate::{
             DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE,
             DEFAULT_STRM_MEDIA_INFO_SCHEDULE, validate_cron,
         },
-        settings::{
-            TMDB_API_KEY_FILE, TMDB_SETTINGS_FILE, TMDB_TOKEN_FILE, TmdbSettings,
-            read_tmdb_settings, tmdb_api_base_url_options, tmdb_language_options,
-            write_tmdb_api_key, write_tmdb_settings,
-        },
         strm_target::{StrmTargetKind, classify_strm_target},
     },
     domain::ids::LibraryId,
     storage::{Database, StorageError},
 };
 
-pub const TMDB_PLUGIN_ID: &str = "tmdb";
-pub const TMDB_DYNAMIC_PLUGIN_ID: &str = "org.lux.tmdb";
 pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.strm-media-info";
 pub const CHAPTER_DETECTOR_PLUGIN_ID: &str = "org.lux.intro-outro-detector";
 const THEINTRODB_CHAPTER_SOURCE_ID: &str = "org.lux.theintrodb-chapter-source";
@@ -62,10 +55,6 @@ pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
 pub const IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
 pub const DANMAKU_PLUGIN_ID: &str = "org.lux.danmaku";
 pub const EMBY_MIGRATION_PLUGIN_ID: &str = "org.lux.emby-migration";
-const CONFIG_SOURCE_CUSTOM: &str = "CUSTOM";
-const CONFIG_SOURCE_ENVIRONMENT: &str = "ENVIRONMENT";
-const CONFIG_SOURCE_READ_ACCESS_TOKEN: &str = "READ_ACCESS_TOKEN";
-const CONFIG_SOURCE_PLUGIN_DEFAULT: &str = "PLUGIN_DEFAULT";
 const CONFIG_SOURCE_NONE: &str = "NONE";
 const CONFIG_SOURCE_PLUGIN: &str = "PLUGIN_CONFIG";
 const PLUGIN_CONFIG_DIR: &str = "plugin-config";
@@ -76,16 +65,6 @@ const MAX_MEDIA_PROBE_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 30;
 pub const MIN_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 1;
 pub const MAX_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 99;
-
-pub struct TmdbConfigUpdate<'a> {
-    pub api_key: Option<&'a str>,
-    pub preferred_language: Option<&'a str>,
-    pub language_fallback_enabled: Option<bool>,
-    pub title_alias_replacement_enabled: Option<bool>,
-    pub fallback_languages: Option<Vec<String>>,
-    pub alternate_api_enabled: Option<bool>,
-    pub api_base_url: Option<&'a str>,
-}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaInfoSettings {
@@ -121,122 +100,6 @@ pub struct MediaProbeOutput {
     pub media: MediaProbeResult,
     pub thumbnail_jpeg: Option<Vec<u8>>,
 }
-fn tmdb_config_fields() -> Vec<PluginConfigField> {
-    let options = tmdb_language_options()
-        .into_iter()
-        .map(|option| PluginConfigOption {
-            value: option.value,
-            label: option.label,
-        })
-        .collect::<Vec<_>>();
-    vec![
-        PluginConfigField {
-            key: "apiKey".to_owned(),
-            label: "TMDb API Key".to_owned(),
-            input_type: "password".to_owned(),
-            required: false,
-            sensitive: true,
-            description: Some("可选。留空时使用 TMDb 插件自己的默认凭据。".to_owned()),
-            multiple: false,
-            options: Vec::new(),
-            options_source: None,
-            default_value: None,
-            minimum: None,
-            maximum: None,
-        },
-        PluginConfigField {
-            key: "preferredLanguage".to_owned(),
-            label: "首选语言".to_owned(),
-            input_type: "select".to_owned(),
-            required: true,
-            sensitive: false,
-            description: Some("TMDb 电影、剧集、季和集元数据的首选语言。".to_owned()),
-            multiple: false,
-            options: options.clone(),
-            options_source: None,
-            default_value: None,
-            minimum: None,
-            maximum: None,
-        },
-        PluginConfigField {
-            key: "languageFallbackEnabled".to_owned(),
-            label: "TMDb 语言回退".to_owned(),
-            input_type: "toggle".to_owned(),
-            required: false,
-            sensitive: false,
-            description: Some("按备选语言顺序逐字段补全缺失元数据。".to_owned()),
-            multiple: false,
-            options: Vec::new(),
-            options_source: None,
-            default_value: None,
-            minimum: None,
-            maximum: None,
-        },
-        PluginConfigField {
-            key: "fallbackLanguages".to_owned(),
-            label: "备选语言顺序".to_owned(),
-            input_type: "select".to_owned(),
-            required: false,
-            sensitive: false,
-            description: Some("开启语言回退后按此顺序请求 TMDb。".to_owned()),
-            multiple: true,
-            options,
-            options_source: None,
-            default_value: None,
-            minimum: None,
-            maximum: None,
-        },
-        PluginConfigField {
-            key: "alternateApiEnabled".to_owned(),
-            label: "替代 API 地址".to_owned(),
-            input_type: "toggle".to_owned(),
-            required: false,
-            sensitive: false,
-            description: Some("开启后使用下方地址访问 TMDb，默认使用官方地址。".to_owned()),
-            multiple: false,
-            options: Vec::new(),
-            options_source: None,
-            default_value: None,
-            minimum: None,
-            maximum: None,
-        },
-        PluginConfigField {
-            key: "apiBaseUrl".to_owned(),
-            label: "TMDb API 地址".to_owned(),
-            input_type: "select".to_owned(),
-            required: true,
-            sensitive: false,
-            description: Some("可选择官方地址、替代地址，或填写自定义地址。".to_owned()),
-            multiple: false,
-            options: tmdb_api_base_url_options()
-                .into_iter()
-                .map(|option| PluginConfigOption {
-                    value: option.value,
-                    label: option.label,
-                })
-                .collect(),
-            options_source: None,
-            default_value: None,
-            minimum: None,
-            maximum: None,
-        },
-        PluginConfigField {
-            key: "titleAliasReplacementEnabled".to_owned(),
-            label: "标题别名替换".to_owned(),
-            input_type: "toggle".to_owned(),
-            required: false,
-            sensitive: false,
-            description: Some("当tmdb语言检索不到中文名称时，尝试使用中文别名替换".to_owned()),
-            multiple: false,
-            options: Vec::new(),
-            options_source: None,
-            default_value: None,
-            minimum: None,
-            maximum: None,
-        },
-    ]
-}
-
 #[derive(Clone)]
 pub struct PluginService {
     database: Database,
@@ -330,12 +193,7 @@ impl PluginService {
         let mut listed_ids = HashSet::new();
         for entry in &store_index.plugins {
             let local_plugin = catalog.get(&entry.id);
-            let status_id = if is_tmdb_plugin_id(&entry.id) {
-                TMDB_DYNAMIC_PLUGIN_ID
-            } else {
-                entry.id.as_str()
-            };
-            let status = self.database.plugin_installation_status(status_id).await?;
+            let status = self.database.plugin_installation_status(&entry.id).await?;
             let installed = local_plugin.is_some() && status.is_some();
             let enabled = installed && status == Some(true);
             if installed_only && !installed {
@@ -353,7 +211,7 @@ impl PluginService {
             listed_ids.insert(entry.id.clone());
         }
         for plugin in &catalog.plugins {
-            if listed_ids.contains(&plugin.manifest.id) || is_tmdb_plugin_id(&plugin.manifest.id) {
+            if listed_ids.contains(&plugin.manifest.id) {
                 continue;
             }
             let status = self
@@ -380,21 +238,26 @@ impl PluginService {
     pub async fn install(&self, plugin_id: &str) -> Result<PluginInstall, PluginServiceError> {
         let requested_id = plugin_id.trim().to_owned();
         let catalog = self.catalog_snapshot().await;
-        let plugin_id = if requested_id == TMDB_PLUGIN_ID
-            && catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_none()
-            && self
-                .store_index()
+        let plugin_id = self.canonical_plugin_id(&requested_id, &catalog);
+        let plugin_id = if catalog.get(&plugin_id).is_none() {
+            self.store_index()
                 .await
                 .plugins
                 .iter()
-                .any(|entry| entry.id == TMDB_DYNAMIC_PLUGIN_ID)
-        {
-            TMDB_DYNAMIC_PLUGIN_ID.to_owned()
+                .find(|entry| {
+                    entry.id == plugin_id
+                        || entry
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(&plugin_id))
+                })
+                .map(|entry| entry.id.clone())
+                .unwrap_or(plugin_id)
         } else {
-            self.canonical_plugin_id(&requested_id, &catalog)
+            plugin_id
         };
         let was_installed = self.database.has_plugin_installation(&plugin_id).await?;
-        if plugin_id != TMDB_PLUGIN_ID && catalog.get(&plugin_id).is_none() {
+        if catalog.get(&plugin_id).is_none() {
             let entry = self
                 .store_index()
                 .await
@@ -564,68 +427,6 @@ impl PluginService {
         {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
-        let (installed, enabled) = self.plugin_state(&plugin_id).await?;
-        self.view_for_id(&plugin_id, installed, enabled).await
-    }
-
-    pub async fn update_config(
-        &self,
-        plugin_id: &str,
-        update: TmdbConfigUpdate<'_>,
-    ) -> Result<PluginView, PluginServiceError> {
-        let catalog = self.catalog_snapshot().await;
-        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
-        self.ensure_known_plugin(&plugin_id, &catalog)?;
-        if !is_tmdb_plugin_id(&plugin_id) {
-            return Err(PluginServiceError::InvalidConfig);
-        }
-        if update
-            .api_key
-            .is_some_and(|value| value.trim().chars().count() > 4096)
-        {
-            return Err(PluginServiceError::InvalidConfig);
-        }
-        let current_settings = read_tmdb_settings(&self.config_dir).await;
-        let settings = TmdbSettings::new_with_api_and_title_alias_config(
-            update
-                .preferred_language
-                .map(str::to_owned)
-                .unwrap_or(current_settings.preferred_language),
-            update
-                .language_fallback_enabled
-                .unwrap_or(current_settings.language_fallback_enabled),
-            update
-                .title_alias_replacement_enabled
-                .unwrap_or(current_settings.title_alias_replacement_enabled),
-            update
-                .fallback_languages
-                .unwrap_or(current_settings.fallback_languages),
-            update
-                .alternate_api_enabled
-                .unwrap_or(current_settings.alternate_api_enabled),
-            update
-                .api_base_url
-                .map(str::to_owned)
-                .unwrap_or(current_settings.api_base_url),
-        )
-        .map_err(|_| PluginServiceError::InvalidConfig)?;
-        if let Some(api_key) = update.api_key {
-            let api_key = api_key.trim();
-            write_tmdb_api_key(&self.config_dir, (!api_key.is_empty()).then_some(api_key))
-                .await
-                .map_err(PluginServiceError::ConfigIo)?;
-        }
-        write_tmdb_settings(&self.config_dir, &settings)
-            .await
-            .map_err(|error| match error {
-                crate::application::settings::TmdbSettingsError::Io(error) => {
-                    PluginServiceError::ConfigIo(error)
-                }
-                crate::application::settings::TmdbSettingsError::Invalid(_)
-                | crate::application::settings::TmdbSettingsError::Serialization(_) => {
-                    PluginServiceError::InvalidConfig
-                }
-            })?;
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
     }
@@ -1093,9 +894,6 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
         self.ensure_known_plugin(&plugin_id, &catalog)?;
-        if is_tmdb_plugin_id(&plugin_id) {
-            return Err(PluginServiceError::InvalidConfig);
-        }
         let plugin = catalog
             .get(&plugin_id)
             .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
@@ -1731,9 +1529,6 @@ impl PluginService {
         let catalog = self.catalog_snapshot().await;
         let plugin_id = self.canonical_plugin_id(scraper_id, &catalog);
         self.ensure_known_plugin(&plugin_id, &catalog)?;
-        if plugin_id == TMDB_PLUGIN_ID {
-            return Err(PluginServiceError::Unavailable(plugin_id));
-        }
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         let view = self.view_for_id(&plugin_id, installed, enabled).await?;
         if view.category != PLUGIN_CATEGORY_SCRAPER || !view.available {
@@ -1748,11 +1543,16 @@ impl PluginService {
         let capabilities = catalog
             .get(&plugin_id)
             .map(|plugin| plugin.manifest.capabilities.clone());
+        let aliases = catalog
+            .get(&plugin_id)
+            .map(|plugin| plugin.manifest.aliases.clone())
+            .unwrap_or_default();
         Ok(
             crate::application::scraper::ScraperPluginClient::new_with_provider_key_and_capabilities(
                 self.clone(),
                 plugin_id,
                 provider_key,
+                aliases,
                 capabilities,
                 self.provider_cache(),
             ),
@@ -1965,9 +1765,7 @@ impl PluginService {
         let runtime = self.supervisor.status(&plugin.manifest.id).await;
         let disabled_by_other_ip_provider = plugin.manifest.id == IP138_PLUGIN_ID
             && !self.installed_other_ip_location_plugins().await?.is_empty();
-        let config_source = if is_tmdb_plugin_id(&plugin.manifest.id) {
-            self.tmdb_config_source().await.to_owned()
-        } else if plugin.manifest.config_fields.is_empty() {
+        let config_source = if plugin.manifest.config_fields.is_empty() {
             CONFIG_SOURCE_NONE.to_owned()
         } else {
             CONFIG_SOURCE_PLUGIN.to_owned()
@@ -1983,13 +1781,9 @@ impl PluginService {
             merge_default_config_values(&config_fields, stored_values),
         );
         let public_config_values = public_config_values(&config_fields, &config_values);
-        let configured = if is_tmdb_plugin_id(&plugin.manifest.id) {
-            config_source != CONFIG_SOURCE_NONE
-        } else {
-            config_fields.is_empty()
-                || (validate_config_values(&config_fields, &config_values).is_ok()
-                    && validate_dynamic_plugin_config(&plugin.manifest.id, &config_values).is_ok())
-        };
+        let configured = config_fields.is_empty()
+            || (validate_config_values(&config_fields, &config_values).is_ok()
+                && validate_dynamic_plugin_config(&plugin.manifest.id, &config_values).is_ok());
         let enabled = installed && enabled && !disabled_by_other_ip_provider;
         let available = enabled && configured;
         Ok(PluginView {
@@ -2032,17 +1826,9 @@ impl PluginService {
                 None
             },
             configurable: !config_fields.is_empty(),
-            config_fields: if is_tmdb_plugin_id(&plugin.manifest.id) {
-                tmdb_config_fields()
-            } else {
-                config_fields
-            },
+            config_fields,
             config_source,
-            config_values: if is_tmdb_plugin_id(&plugin.manifest.id) {
-                tmdb_config_values(&self.config_dir).await
-            } else {
-                public_config_values
-            },
+            config_values: public_config_values,
             latest_version: None,
             update_available: false,
         })
@@ -2053,7 +1839,7 @@ impl PluginService {
         plugin_id: &str,
         catalog: &PluginCatalog,
     ) -> Result<(), PluginServiceError> {
-        if plugin_id == TMDB_PLUGIN_ID || catalog.get(plugin_id).is_some() {
+        if catalog.get(plugin_id).is_some() {
             Ok(())
         } else {
             Err(PluginServiceError::UnknownPlugin(plugin_id.to_owned()))
@@ -2064,24 +1850,14 @@ impl PluginService {
         let plugin_id = plugin_id.trim();
         if plugin_id == MEDIA_INFO_LEGACY_PLUGIN_ID {
             MEDIA_INFO_PLUGIN_ID.to_owned()
-        } else if plugin_id == TMDB_PLUGIN_ID && catalog.get(TMDB_DYNAMIC_PLUGIN_ID).is_some() {
-            TMDB_DYNAMIC_PLUGIN_ID.to_owned()
+        } else if catalog.get(plugin_id).is_some() {
+            plugin_id.to_owned()
+        } else if let Some(plugin) = catalog.get_by_alias(plugin_id) {
+            plugin.manifest.id.clone()
+        } else if let Some(plugin) = catalog.get_by_provider_key(plugin_id) {
+            plugin.manifest.id.clone()
         } else {
             plugin_id.to_owned()
-        }
-    }
-
-    async fn tmdb_config_source(&self) -> &'static str {
-        if secret_file_configured(&self.config_dir, TMDB_API_KEY_FILE).await {
-            CONFIG_SOURCE_CUSTOM
-        } else if has_environment_value("LUX_TMDB_API_KEY") {
-            CONFIG_SOURCE_ENVIRONMENT
-        } else if has_environment_value("LUX_TMDB_READ_ACCESS_TOKEN")
-            || secret_file_configured(&self.config_dir, TMDB_TOKEN_FILE).await
-        {
-            CONFIG_SOURCE_READ_ACCESS_TOKEN
-        } else {
-            CONFIG_SOURCE_PLUGIN_DEFAULT
         }
     }
 }
@@ -2236,23 +2012,6 @@ fn optional_i64_config(
         .ok_or(PluginServiceError::InvalidConfig)
 }
 
-async fn secret_file_configured(config_dir: &std::path::Path, file_name: &str) -> bool {
-    tokio::fs::read_to_string(config_dir.join(file_name))
-        .await
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn has_environment_value(name: &str) -> bool {
-    env::var(name)
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn is_tmdb_plugin_id(plugin_id: &str) -> bool {
-    plugin_id == TMDB_PLUGIN_ID || plugin_id == TMDB_DYNAMIC_PLUGIN_ID
-}
-
 fn remote_plugin_view(entry: &PluginStoreEntry, installed: bool, enabled: bool) -> PluginView {
     let enabled = installed && enabled;
     PluginView {
@@ -2308,11 +2067,6 @@ async fn remove_plugin_config(config_dir: &Path, plugin_id: &str) -> io::Result<
     if plugin_id == MEDIA_INFO_PLUGIN_ID {
         remove_file_if_present(&plugin_config_path(config_dir, MEDIA_INFO_LEGACY_PLUGIN_ID))
             .await?;
-    }
-    if is_tmdb_plugin_id(plugin_id) {
-        for file_name in [TMDB_API_KEY_FILE, TMDB_TOKEN_FILE, TMDB_SETTINGS_FILE] {
-            remove_file_if_present(&config_dir.join(file_name)).await?;
-        }
     }
     Ok(())
 }
@@ -2925,42 +2679,6 @@ impl From<StorageError> for PluginServiceError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
-}
-
-async fn tmdb_config_values(config_dir: &std::path::Path) -> serde_json::Map<String, Value> {
-    let settings = read_tmdb_settings(config_dir).await;
-    serde_json::Map::from_iter([
-        (
-            "preferredLanguage".to_owned(),
-            Value::String(settings.preferred_language),
-        ),
-        (
-            "languageFallbackEnabled".to_owned(),
-            Value::Bool(settings.language_fallback_enabled),
-        ),
-        (
-            "titleAliasReplacementEnabled".to_owned(),
-            Value::Bool(settings.title_alias_replacement_enabled),
-        ),
-        (
-            "fallbackLanguages".to_owned(),
-            Value::Array(
-                settings
-                    .fallback_languages
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        ),
-        (
-            "alternateApiEnabled".to_owned(),
-            Value::Bool(settings.alternate_api_enabled),
-        ),
-        (
-            "apiBaseUrl".to_owned(),
-            Value::String(settings.api_base_url),
-        ),
-    ])
 }
 
 #[cfg(test)]

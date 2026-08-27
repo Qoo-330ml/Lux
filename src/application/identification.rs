@@ -1,16 +1,13 @@
-use crate::application::{
-    scraper::{
-        ScraperError, ScraperGetRequest, ScraperItemType, ScraperProvider, ScraperSearchRequest,
-        ScraperSearchResult,
-    },
-    tmdb::TmdbMovieSummary,
+use crate::application::scraper::{
+    ScraperError, ScraperGetRequest, ScraperItemType, ScraperProvider, ScraperSearchRequest,
+    ScraperSearchResult,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MovieIdentity {
     pub title: String,
     pub year: Option<i32>,
-    pub provider_id: Option<i64>,
+    pub provider_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,7 +34,7 @@ pub enum IdentificationReason {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct IdentificationDecision<C = TmdbMovieSummary> {
+pub struct IdentificationDecision<C> {
     pub status: IdentificationStatus,
     pub candidate: Option<C>,
     pub score: u8,
@@ -52,31 +49,9 @@ pub trait IdentificationCandidate: Clone {
     fn premiere_date(&self) -> Option<&str>;
 }
 
-impl IdentificationCandidate for TmdbMovieSummary {
-    fn provider_id(&self) -> Option<String> {
-        Some(self.id.to_string())
-    }
-
-    fn title(&self) -> Option<&str> {
-        self.title.as_deref()
-    }
-
-    fn original_title(&self) -> Option<&str> {
-        self.original_title.as_deref()
-    }
-
-    fn production_year(&self) -> Option<i32> {
-        release_year(self.release_date.as_deref())
-    }
-
-    fn premiere_date(&self) -> Option<&str> {
-        self.release_date.as_deref()
-    }
-}
-
 impl IdentificationCandidate for ScraperSearchResult {
     fn provider_id(&self) -> Option<String> {
-        None
+        self.first_provider_id().map(str::to_owned)
     }
 
     fn title(&self) -> Option<&str> {
@@ -118,7 +93,7 @@ impl MovieIdentifier {
         self.identify_scraper(&ScraperMovieIdentity {
             title: identity.title.clone(),
             year: identity.year,
-            provider_id: identity.provider_id.map(|value| value.to_string()),
+            provider_id: identity.provider_id.clone(),
         })
         .await
     }
@@ -173,10 +148,7 @@ where
     identify_with_provider(
         &identity.title,
         identity.year,
-        identity
-            .provider_id
-            .map(|value| value.to_string())
-            .as_deref(),
+        identity.provider_id.as_deref(),
         candidates,
         |candidate| candidate.provider_id(),
     )

@@ -80,12 +80,12 @@ use crate::{
             NfoWriteError,
         },
         people::{PeopleError, PeopleService, PersonMetadataUpdate},
-        plugins::{PluginPage, PluginService, PluginServiceError, TMDB_DYNAMIC_PLUGIN_ID},
+        plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
-        scraper::{ScraperPluginClient, ScraperProvider, ScraperResolver},
+        scraper::{ScraperProvider, ScraperResolver},
         settings::{read_network_proxy_url_async, write_network_proxy_url},
         strm_playback::{StrmPlaybackError, StrmPlaybackResolver},
         strm_probe::{StrmProbeError, StrmProbeService},
@@ -93,7 +93,6 @@ use crate::{
             StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
         },
         thumbnails::ThumbnailService,
-        tmdb::TmdbClient,
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
         watch::LibraryWatchService,
         webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
@@ -230,6 +229,7 @@ impl AppState {
         );
         let metadata_selection = image_writes.clone().map(|images| {
             MetadataSelectionService::with_config_dir(database.clone(), images, config_dir.clone())
+                .with_home(home.clone())
         });
         let plugins = PluginService::new_with_proxy(
             database.clone(),
@@ -241,12 +241,7 @@ impl AppState {
             plugins.clone(),
             config_dir.clone(),
         )));
-        let scraper = ScraperProvider::from_scraper(ScraperPluginClient::new_with_provider_key(
-            plugins.clone(),
-            TMDB_DYNAMIC_PLUGIN_ID,
-            "tmdb",
-            plugins.provider_cache(),
-        ));
+        let scraper = ScraperProvider::unconfigured();
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
         let collections = Some(
             CollectionService::with_resolver(
@@ -394,20 +389,6 @@ impl AppState {
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
         }
-    }
-
-    pub fn with_tmdb_client(self, tmdb: TmdbClient) -> Self {
-        let tmdb = ScraperProvider::from(
-            tmdb.with_cache_dir(
-                self.config_dir
-                    .clone()
-                    .map(|path| path.join("metadata/provider-responses.json"))
-                    .unwrap_or_else(|| {
-                        std::path::PathBuf::from("./config/metadata/provider-responses.json")
-                    }),
-            ),
-        );
-        self.with_scraper(tmdb)
     }
 
     #[doc(hidden)]
@@ -16843,7 +16824,6 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
         },
         "config": { "available": config_available, "writable": config_writable },
         "ffprobe": { "available": ffprobe_available },
-        "tmdb": { "configured": state.scraper.is_some() },
         "jobs": {
             "scanRunning": jobs["scanRunning"],
             "scanFailed": jobs["scanFailed"],
@@ -19378,20 +19358,6 @@ async fn admin_update_plugin_enabled(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginConfigRequest {
-    #[serde(default)]
-    api_key: Option<String>,
-    #[serde(default)]
-    preferred_language: Option<String>,
-    #[serde(default)]
-    language_fallback_enabled: Option<bool>,
-    #[serde(default)]
-    title_alias_replacement_enabled: Option<bool>,
-    #[serde(default)]
-    fallback_languages: Option<Vec<String>>,
-    #[serde(default)]
-    alternate_api_enabled: Option<bool>,
-    #[serde(default)]
-    api_base_url: Option<String>,
     #[serde(flatten)]
     values: serde_json::Map<String, Value>,
 }
@@ -19414,51 +19380,12 @@ async fn admin_update_plugin_config(
         )
         .into_response();
     };
-    let api_key_value = request.api_key.clone();
-    let api_key = api_key_value.as_deref().map(str::trim);
-    let result = if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
-        || plugin_id == crate::application::plugins::TMDB_DYNAMIC_PLUGIN_ID
-    {
-        plugins
-            .update_config(
-                &plugin_id,
-                crate::application::plugins::TmdbConfigUpdate {
-                    api_key,
-                    preferred_language: request.preferred_language.as_deref(),
-                    language_fallback_enabled: request.language_fallback_enabled,
-                    title_alias_replacement_enabled: request.title_alias_replacement_enabled,
-                    fallback_languages: request.fallback_languages,
-                    alternate_api_enabled: request.alternate_api_enabled,
-                    api_base_url: request.api_base_url.as_deref(),
-                },
-            )
-            .await
-    } else {
-        let mut values = request.values;
-        if plugin_id == crate::application::plugins::EMBY_MIGRATION_PLUGIN_ID {
-            if let Some(api_key) = api_key_value.as_ref() {
-                values.insert(
-                    "apiKey".to_owned(),
-                    Value::String(api_key.trim().to_owned()),
-                );
-            }
-        }
-        plugins.update_dynamic_config(&plugin_id, values).await
-    };
+    let result = plugins
+        .update_dynamic_config(&plugin_id, request.values)
+        .await;
     match result {
         Ok(plugin) => {
-            if plugin_id == crate::application::plugins::TMDB_PLUGIN_ID
-                || plugin_id == crate::application::plugins::TMDB_DYNAMIC_PLUGIN_ID
-            {
-                if let Some(scraper) = state.scraper.as_ref() {
-                    if let Some(api_key) = api_key {
-                        scraper
-                            .configure_api_key((!api_key.is_empty()).then_some(api_key))
-                            .await;
-                    }
-                }
-                plugins.restart(&plugin_id).await;
-            }
+            plugins.restart(&plugin_id).await;
             record_audit_event(
                 &state,
                 &headers,

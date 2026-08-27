@@ -26,7 +26,6 @@ const dashboard: AdminDashboard = {
     database: { status: "ok", backend: "SQLITE", journalMode: "wal", writable: true },
     config: { available: true, writable: true },
     ffprobe: { available: true },
-    tmdb: { configured: true },
     jobs: { scanRunning: 1, scanFailed: 0, metadataReidentifyRunning: 0 },
     libraries: [{ id: "library-1", name: "电影库", isEnabled: true, rootCount: 1, availableRootCount: 1, writableRootCount: 1 }],
   },

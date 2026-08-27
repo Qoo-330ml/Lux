@@ -30,8 +30,10 @@ pub const MAX_LIBRARY_COVER_BYTES: u64 = 5 * 1024 * 1024;
 pub const AUTO_LIBRARY_COVER_TASK_TYPE: &str = "AUTO_LIBRARY_COVER";
 pub const AUTO_LIBRARY_COVER_POSTER_COUNT: usize = 9;
 const AUTO_LIBRARY_COVER_CANDIDATE_LIMIT: i64 = 64;
-const AUTO_LIBRARY_COVER_WIDTH: u32 = 1920;
-const AUTO_LIBRARY_COVER_HEIGHT: u32 = 1080;
+const AUTO_LIBRARY_COVER_WIDTH: u32 = 1280;
+const AUTO_LIBRARY_COVER_HEIGHT: u32 = 720;
+const AUTO_LIBRARY_COVER_TITLE_FONT_SIZE: f32 = 240.0;
+const AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE: f32 = 100.0;
 const SMILEY_SANS_FONT: &[u8] = include_bytes!("../../assets/fonts/SmileySans-Oblique.ttf");
 
 #[derive(Clone)]
@@ -958,21 +960,23 @@ fn overlay(base: &mut RgbaImage, layer: &RgbaImage, left: i32, top: i32) {
 }
 
 fn draw_library_text(canvas: &mut RgbaImage, name: &str, subtitle: &str, font: &FontArc) {
-    let scale = PxScale::from(160.0);
+    let scale = PxScale::from(AUTO_LIBRARY_COVER_TITLE_FONT_SIZE);
     let lines = wrap_text(font, scale, name, 960.0);
     let line_height = font.as_scaled(scale).height().ceil() as i32;
-    draw_accent_bar(canvas, 113, 626, 20, 100);
+    let subtitle_scale = PxScale::from(AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE);
+    let subtitle_y = canvas.height() as i32 - 120;
+    let title_y = subtitle_y - lines.len() as i32 * line_height - 24;
+    draw_accent_bar(canvas, 113, subtitle_y, 20, 100);
     for (index, line) in lines.iter().enumerate() {
-        let y = 432 + index as i32 * line_height;
+        let y = title_y + index as i32 * line_height;
         draw_text_mut(canvas, Rgba([0, 0, 0, 100]), 101, y + 5, scale, font, line);
         draw_text_mut(canvas, Rgba([255, 255, 255, 255]), 96, y, scale, font, line);
     }
-    let subtitle_scale = PxScale::from(50.0);
     draw_text_mut(
         canvas,
         Rgba([0, 0, 0, 100]),
         156,
-        629,
+        subtitle_y + 3,
         subtitle_scale,
         font,
         subtitle,
@@ -981,7 +985,7 @@ fn draw_library_text(canvas: &mut RgbaImage, name: &str, subtitle: &str, font: &
         canvas,
         Rgba([255, 255, 255, 255]),
         153,
-        626,
+        subtitle_y,
         subtitle_scale,
         font,
         subtitle,
@@ -1103,7 +1107,8 @@ mod tests {
     use image::Rgba;
 
     use super::{
-        RgbaImage, add_shadow, bundled_cover_font, library_kind_subtitle, rotate_cover_column,
+        AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE, AUTO_LIBRARY_COVER_TITLE_FONT_SIZE, RgbaImage,
+        add_shadow, bundled_cover_font, library_kind_subtitle, rotate_cover_column,
     };
 
     #[test]
@@ -1118,6 +1123,12 @@ mod tests {
         assert_eq!(library_kind_subtitle("MOVIE"), "Movies");
         assert_eq!(library_kind_subtitle("SERIES"), "Series");
         assert_eq!(library_kind_subtitle("MIXED"), "Mixed");
+    }
+
+    #[test]
+    fn cover_text_uses_the_requested_emphasis() {
+        assert_eq!(AUTO_LIBRARY_COVER_TITLE_FONT_SIZE, 240.0);
+        assert_eq!(AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE, 100.0);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     sync::{
         Arc, Mutex,
@@ -14,6 +16,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get},
 };
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
@@ -27,7 +30,6 @@ use luxd::{
         scanner::LibraryScanner,
         scraper::ScraperProvider,
         setup::SetupService,
-        tmdb::{TmdbClient, TmdbClientConfig},
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -217,6 +219,113 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(fallback_required, 0);
+
+    lux_server.abort();
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_selection_refreshes_cached_catalog_and_home_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online Title",
+            "overview": "Online Overview",
+            "productionYear": 2020,
+            "images": { "POSTER": [format!("{image_url}/poster")] }
+        }),
+    )
+    .await?;
+    let (base_url, lux_server) = start_lux(&fixture).await?;
+    let client = reqwest::Client::new();
+    let (cookies, csrf) = login(&client, &base_url).await?;
+    let list_url = format!("{base_url}/api/v1/libraries/{library_id}/items?pageSize=10");
+
+    let before_list = client
+        .get(&list_url)
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(before_list["items"][0]["imageTags"]["poster"].is_null());
+    let before_home = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(before_home["recentlyAdded"][0]["imageTags"]["poster"].is_null());
+
+    let response = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{}/identify/candidates/{candidate_id}/select",
+            fixture.item_id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "fillMissing" }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let poster_id: String = sqlx::query_scalar(
+        "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'POSTER' LIMIT 1",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    let detail = client
+        .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(detail["imageTags"]["poster"], poster_id);
+
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut list_poster = None;
+    let mut home_poster = None;
+    while Instant::now() < deadline {
+        let list = client
+            .get(&list_url)
+            .header(COOKIE, &cookies)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        list_poster = list["items"][0]["imageTags"]["poster"]
+            .as_str()
+            .map(str::to_owned);
+        let home = client
+            .get(format!("{base_url}/api/v1/home"))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?
+            .json::<Value>()
+            .await?;
+        home_poster = home["recentlyAdded"][0]["imageTags"]["poster"]
+            .as_str()
+            .map(str::to_owned);
+        if list_poster.as_deref() == Some(poster_id.as_str())
+            && home_poster.as_deref() == Some(poster_id.as_str())
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(list_poster.as_deref(), Some(poster_id.as_str()));
+    assert_eq!(home_poster.as_deref(), Some(poster_id.as_str()));
 
     lux_server.abort();
     image_server.abort();
@@ -1133,7 +1242,7 @@ async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std:
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -1152,7 +1261,7 @@ async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std:
             &fixture.series_id,
             "Example Show",
             Some(2020),
-            &ScraperProvider::from(tmdb),
+            &ScraperProvider::from_adapter(tmdb),
         )
         .await?;
 
@@ -1224,7 +1333,7 @@ async fn automatic_candidate_search_expands_only_the_best_result()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -1237,7 +1346,7 @@ async fn automatic_candidate_search_expands_only_the_best_result()
         requests_per_second: 0,
     })?;
     let candidates = MetadataCandidateService::new(fixture.database.clone());
-    let scraper = ScraperProvider::from(tmdb);
+    let scraper = ScraperProvider::from_adapter(tmdb);
 
     let page = candidates
         .search_and_store_for_automatic_match(
@@ -1301,7 +1410,7 @@ async fn automatic_matching_reuses_an_unexpired_pending_candidate_without_search
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
-    let scraper = ScraperProvider::from(TmdbClient::new(TmdbClientConfig {
+    let scraper = ScraperProvider::from_adapter(TestScraper::new(TestScraperConfig {
         base_url: format!("http://{address}"),
         proxy_url: None,
         api_key: None,
@@ -1366,7 +1475,7 @@ async fn automatic_matching_expands_only_the_best_pending_candidate_once()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
-    let config = TmdbClientConfig {
+    let config = TestScraperConfig {
         base_url: format!("http://{address}"),
         proxy_url: None,
         api_key: None,
@@ -1378,7 +1487,7 @@ async fn automatic_matching_expands_only_the_best_pending_candidate_once()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     };
-    let first_scraper = ScraperProvider::from(TmdbClient::new(config.clone())?);
+    let first_scraper = ScraperProvider::from_adapter(TestScraper::new(config.clone())?);
     let candidates = MetadataCandidateService::new(fixture.database.clone());
     let first_page = candidates
         .search_and_store_for_automatic_match(
@@ -1393,7 +1502,7 @@ async fn automatic_matching_expands_only_the_best_pending_candidate_once()
         "Hydrated overview"
     );
 
-    let second_scraper = ScraperProvider::from(TmdbClient::new(config)?);
+    let second_scraper = ScraperProvider::from_adapter(TestScraper::new(config)?);
     let second_page = candidates
         .search_and_store_for_automatic_match(
             &fixture.item_id,
@@ -1479,7 +1588,7 @@ async fn expired_pending_candidates_are_not_reused_by_automatic_matching()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
-    let scraper = ScraperProvider::from(TmdbClient::new(TmdbClientConfig {
+    let scraper = ScraperProvider::from_adapter(TestScraper::new(TestScraperConfig {
         base_url: format!("http://{address}"),
         proxy_url: None,
         api_key: None,
@@ -1589,7 +1698,7 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -1612,7 +1721,7 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
     );
     let service = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
-        ScraperProvider::from(tmdb),
+        ScraperProvider::from_adapter(tmdb),
         Some(selection.clone()),
     );
     let job = service
@@ -1649,7 +1758,7 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
     .await?;
     assert_eq!(capability_status, "UNAVAILABLE");
 
-    let fresh_tmdb = TmdbClient::new(TmdbClientConfig {
+    let fresh_tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -1663,7 +1772,7 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
     })?;
     let fresh_service = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
-        ScraperProvider::from(fresh_tmdb),
+        ScraperProvider::from_adapter(fresh_tmdb),
         Some(selection),
     );
     let third_job = fresh_service
@@ -1731,7 +1840,7 @@ async fn metadata_candidate_refresh_counts_all_capabilities_and_reuses_cache()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{address}"),
         proxy_url: None,
         api_key: None,
@@ -1744,7 +1853,7 @@ async fn metadata_candidate_refresh_counts_all_capabilities_and_reuses_cache()
         requests_per_second: 0,
     })?;
     let candidates = MetadataCandidateService::new(fixture.database.clone());
-    let scraper = ScraperProvider::from(tmdb);
+    let scraper = ScraperProvider::from_adapter(tmdb);
 
     candidates
         .search_and_store(&fixture.item_id, "Example Movie", Some(2020), &scraper)
@@ -1761,7 +1870,6 @@ async fn metadata_candidate_refresh_counts_all_capabilities_and_reuses_cache()
             "/3/movie/7/credits".to_owned(),
             "/3/movie/7/external_ids".to_owned(),
             "/3/movie/7/images".to_owned(),
-            "/3/movie/7/release_dates".to_owned(),
             "/3/movie/7/videos".to_owned(),
             "/3/search/movie".to_owned(),
         ]
@@ -1847,7 +1955,7 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb_config = TmdbClientConfig {
+    let tmdb_config = TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -1870,7 +1978,7 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
     let selection_for_second_run = selection.clone();
     let service = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
-        ScraperProvider::from(TmdbClient::new(tmdb_config.clone())?),
+        ScraperProvider::from_adapter(TestScraper::new(tmdb_config.clone())?),
         Some(selection),
     );
     let first_job = service
@@ -1896,7 +2004,7 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
 
     let second_service = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
-        ScraperProvider::from(TmdbClient::new(tmdb_config)?),
+        ScraperProvider::from_adapter(TestScraper::new(tmdb_config)?),
         Some(selection_for_second_run),
     );
     let second_job = second_service
@@ -1984,7 +2092,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
     let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: format!("http://{tmdb_address}"),
         proxy_url: None,
         api_key: None,
@@ -2003,7 +2111,7 @@ async fn completed_scan_automatically_matches_and_writes_metadata()
     );
     let metadata = MetadataReidentifyService::with_selection(
         fixture.database.clone(),
-        ScraperProvider::from(tmdb),
+        ScraperProvider::from_adapter(tmdb),
         Some(selection),
     );
     let scan_jobs = luxd::application::scanner::ScanJobService::new(fixture.database.clone());

@@ -67,6 +67,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub provider_key: Option<String>,
     #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
     pub supported_item_types: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
@@ -230,10 +232,16 @@ impl PluginManifest {
             }
         }
         self.runtime.validate()?;
-        if self.supported_item_types.len() > 32 || self.capabilities.len() > 64 {
+        if self.supported_item_types.len() > 32
+            || self.capabilities.len() > 64
+            || self.aliases.len() > 16
+        {
             return Err(PluginManifestError::Invalid(
-                "manifest declares too many item types or capabilities".to_owned(),
+                "manifest declares too many item types, capabilities or aliases".to_owned(),
             ));
+        }
+        for alias in &self.aliases {
+            validate_identifier("plugin alias", alias, 64)?;
         }
         for field in &self.config_fields {
             validate_identifier("config field key", &field.key, 64)?;
