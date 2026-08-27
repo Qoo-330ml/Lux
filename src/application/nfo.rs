@@ -24,6 +24,8 @@ use crate::application::metadata::{
     MetadataField, MetadataSource, MetadataState, NfoError, NfoMetadata, find_nfo_path,
     nfo_fingerprint, parse_nfo, series_directory,
 };
+use crate::application::metadata_paths::{library_item_directory, metadata_root};
+use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
 use crate::storage::{Database, MediaMetadataUpdate, StorageError};
 
@@ -1430,11 +1432,22 @@ pub async fn write_movie_nfo_atomically(
 #[derive(Clone)]
 pub struct NfoWriteService {
     database: Database,
+    config_dir: Option<PathBuf>,
 }
 
 impl NfoWriteService {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            config_dir: None,
+        }
+    }
+
+    pub fn new_with_config_dir(database: Database, config_dir: PathBuf) -> Self {
+        Self {
+            database,
+            config_dir: Some(config_dir),
+        }
     }
 
     pub async fn read_item_projection(
@@ -1483,6 +1496,7 @@ impl NfoWriteService {
         target: PathBuf,
         write: NfoFileWrite,
     ) -> Result<NfoWriteReport, NfoWriteError> {
+        self.mirror_item_nfo_if_enabled(item_id, &target).await?;
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
@@ -1501,6 +1515,45 @@ impl NfoWriteService {
             content_fingerprint: write.content_fingerprint,
             changed: write.changed,
         })
+    }
+
+    async fn mirror_item_nfo_if_enabled(
+        &self,
+        item_id: &str,
+        source: &Path,
+    ) -> Result<(), NfoWriteError> {
+        let Some(config_dir) = self.config_dir.as_deref() else {
+            return Ok(());
+        };
+        if !item_metadata_writeback_enabled(&self.database, item_id).await? {
+            return Ok(());
+        }
+        let metadata_root_path = metadata_root(config_dir);
+        reject_metadata_symlinks(&metadata_root_path).await?;
+        let metadata_directory = library_item_directory(config_dir, item_id)
+            .map_err(|error| NfoWriteError::InvalidMetadata(error.to_string()))?;
+        fs::create_dir_all(&metadata_directory)
+            .await
+            .map_err(|error| io_error(&metadata_directory, error))?;
+        reject_metadata_symlinks(&metadata_directory).await?;
+        let canonical_root = fs::canonicalize(&metadata_root_path)
+            .await
+            .map_err(|error| io_error(&metadata_root_path, error))?;
+        let canonical_directory = fs::canonicalize(&metadata_directory)
+            .await
+            .map_err(|error| io_error(&metadata_directory, error))?;
+        if !canonical_directory.starts_with(&canonical_root) {
+            return Err(NfoWriteError::PathOutsideRoot(canonical_directory));
+        }
+        let file_name = source
+            .file_name()
+            .ok_or_else(|| NfoWriteError::PathOutsideRoot(source.to_owned()))?;
+        let target = canonical_directory.join(file_name);
+        let bytes = fs::read(source)
+            .await
+            .map_err(|error| io_error(source, error))?;
+        write_nfo_atomically_with_rewriter(&target, |_| Ok(bytes.clone()), None).await?;
+        Ok(())
     }
 
     async fn item_nfo_target(&self, item_id: &str) -> Result<PathBuf, NfoWriteError> {
@@ -1600,6 +1653,13 @@ impl MetadataWriteService {
     pub fn new(database: Database) -> Self {
         Self {
             nfo: NfoWriteService::new(database.clone()),
+            database,
+        }
+    }
+
+    pub fn new_with_config_dir(database: Database, config_dir: PathBuf) -> Self {
+        Self {
+            nfo: NfoWriteService::new_with_config_dir(database.clone(), config_dir),
             database,
         }
     }
@@ -1978,6 +2038,32 @@ fn io_error(path: &Path, source: std::io::Error) -> NfoWriteError {
         path: path.to_owned(),
         source,
     }
+}
+
+async fn reject_metadata_symlinks(path: &Path) -> Result<(), NfoWriteError> {
+    let mut current = Some(path.to_owned());
+    while let Some(candidate) = current {
+        match fs::symlink_metadata(&candidate).await {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(NfoWriteError::SymlinkTarget(candidate));
+            }
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(NfoWriteError::Io {
+                    path: candidate,
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotADirectory,
+                        "metadata path component is not a directory",
+                    ),
+                });
+            }
+            Ok(_) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                current = candidate.parent().map(Path::to_owned);
+            }
+            Err(source) => return Err(io_error(&candidate, source)),
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

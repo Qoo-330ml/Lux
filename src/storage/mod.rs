@@ -10617,7 +10617,7 @@ impl Database {
         self.query(
             "SELECT mi.item_type, mi.title, mi.original_title, mi.overview, mi.production_year,
                     mi.premiere_date, mi.last_air_date, mi.status, mi.original_language, mi.rating,
-                    mi.provider_ids_json, mi.metadata_scraper_id,
+                    mi.provider_ids_json, mi.metadata_scraper_id, mi.identification_status,
                     mi.metadata_provenance_json, mi.locked_fields_json,
                     mi.nfo_metadata_json,
                     mi.series_id, mi.season_number, mi.episode_number,
@@ -10658,6 +10658,7 @@ impl Database {
                     rating: row.get("rating"),
                     provider_ids_json: row.get("provider_ids_json"),
                     metadata_scraper_id: row.get("metadata_scraper_id"),
+                    identification_status: row.get("identification_status"),
                     scraper_id,
                     provenance_json: row.get("metadata_provenance_json"),
                     locked_fields_json: row.get("locked_fields_json"),
@@ -15989,10 +15990,11 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn insert_item_image(
+    pub(crate) async fn insert_item_image_at_index(
         &self,
         item_id: &str,
         image_type: &str,
+        image_index: i64,
         local_path: &std::path::Path,
         metadata: ItemImageMetadata<'_>,
     ) -> Result<bool, StorageError> {
@@ -16003,8 +16005,8 @@ impl Database {
             .query(
                 "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, width, height,
-                file_size, content_tag, source
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                file_size, content_tag, source, source_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                 id = excluded.id,
                 local_path = excluded.local_path,
@@ -16013,22 +16015,26 @@ impl Database {
                 file_size = excluded.file_size,
                 content_tag = excluded.content_tag,
                 source = excluded.source,
+                source_url = excluded.source_url,
                 updated_at = unixepoch()
             WHERE item_images.local_path <> excluded.local_path
                OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
                OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
                OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
-               OR item_images.source <> excluded.source",
+               OR item_images.source <> excluded.source
+               OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')",
             )
             .bind(id)
             .bind(item_id)
             .bind(image_type)
+            .bind(image_index)
             .bind(local_path.to_string_lossy().as_ref())
             .bind(metadata.width)
             .bind(metadata.height)
             .bind(metadata.file_size)
             .bind(metadata.content_tag)
             .bind(metadata.source)
+            .bind(metadata.source_url)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -16082,14 +16088,26 @@ impl Database {
         local_path: &std::path::Path,
         metadata: ItemImageMetadata<'_>,
     ) -> Result<String, StorageError> {
+        self.upsert_item_image_at_index(item_id, image_type, 0, local_path, metadata)
+            .await
+    }
+
+    pub(crate) async fn upsert_item_image_at_index(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        local_path: &std::path::Path,
+        metadata: ItemImageMetadata<'_>,
+    ) -> Result<String, StorageError> {
         let id = Uuid::now_v7().to_string();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, width, height,
-                file_size, content_tag, source
-            ) VALUES (?, ?, ?, 0, ?, ?, ?, ?, ?, ?)
+                file_size, content_tag, source, source_url
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
                 id = excluded.id,
                 local_path = excluded.local_path,
@@ -16098,17 +16116,20 @@ impl Database {
                 file_size = excluded.file_size,
                 content_tag = excluded.content_tag,
                 source = excluded.source,
+                source_url = excluded.source_url,
                 updated_at = unixepoch()",
         )
         .bind(&id)
         .bind(item_id)
         .bind(image_type)
+        .bind(image_index)
         .bind(local_path.to_string_lossy().as_ref())
         .bind(metadata.width)
         .bind(metadata.height)
         .bind(metadata.file_size)
         .bind(metadata.content_tag)
         .bind(metadata.source)
+        .bind(metadata.source_url)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -16154,6 +16175,29 @@ impl Database {
                 })
                 .collect()
         })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn item_image_source_url_exists(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        source_url: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar::<i64>(
+            "SELECT 1 FROM item_images
+             WHERE item_id = ? AND image_type = ? AND source_url = ?
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .bind(image_type)
+        .bind(source_url)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value| value.is_some())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -17741,6 +17785,7 @@ pub(crate) struct StoredMediaMetadata {
     pub(crate) rating: Option<f64>,
     pub(crate) provider_ids_json: Option<String>,
     pub(crate) metadata_scraper_id: Option<String>,
+    pub(crate) identification_status: String,
     pub(crate) scraper_id: Option<String>,
     pub(crate) provenance_json: Option<String>,
     pub(crate) locked_fields_json: Option<String>,
@@ -18104,6 +18149,7 @@ pub(crate) struct ItemImageMetadata<'a> {
     pub(crate) height: Option<i32>,
     pub(crate) content_tag: &'a str,
     pub(crate) source: &'a str,
+    pub(crate) source_url: Option<&'a str>,
 }
 
 pub(crate) struct MetadataImageAttemptUpdate<'a> {

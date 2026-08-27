@@ -27,6 +27,7 @@ const settings = {
       thumbnail: true,
       disc: false,
       wallpaper: false,
+      writeToMetadata: false,
       maxBackdropCount: 1,
       minDownloadWidth: 1280,
     },

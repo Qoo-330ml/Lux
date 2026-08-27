@@ -104,6 +104,7 @@ describe("AdminLibrariesPage library cards", () => {
           thumbnail: true,
           disc: false,
           wallpaper: false,
+          writeToMetadata: false,
           maxBackdropCount: 1,
           minDownloadWidth: 1280,
         },
@@ -672,6 +673,7 @@ describe("AdminLibrariesPage library cards", () => {
     });
 
     expect(container.textContent).toContain("全局策略");
+    expect(container.textContent).toContain("额外保存元数据到 metadata");
     expect(container.textContent).toContain("图像抓取");
     expect(container.textContent).toContain("光盘封面");
     expect(container.textContent).toContain("壁纸");
@@ -735,7 +737,7 @@ describe("AdminLibrariesPage library cards", () => {
         region: "CN",
         scraperId: null,
         applyScope: "NEW_CONTENT",
-        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, disc: false, wallpaper: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
+        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
       },
     });
@@ -746,8 +748,14 @@ describe("AdminLibrariesPage library cards", () => {
         .find((button) => button.textContent?.includes("高级"))
         ?.click();
     });
-    const artworkToggle = container.querySelectorAll<HTMLInputElement>(".lux-library-strategy-toggle input")[1];
+    const artworkToggle = [...container.querySelectorAll<HTMLLabelElement>(".lux-library-strategy-toggle")]
+      .find((label) => label.textContent?.includes("艺术图"))
+      ?.querySelector<HTMLInputElement>("input");
+    const metadataToggle = [...container.querySelectorAll<HTMLLabelElement>(".lux-library-strategy-toggle")]
+      .find((label) => label.textContent?.includes("额外保存元数据到 metadata"))
+      ?.querySelector<HTMLInputElement>("input");
     await act(async () => artworkToggle?.click());
+    await act(async () => metadataToggle?.click());
     await act(async () => {
       [...container.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.includes("保存全局策略"))
@@ -756,7 +764,7 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({
       mediaStrategy: expect.objectContaining({
-        images: expect.objectContaining({ artwork: true }),
+        images: expect.objectContaining({ artwork: true, writeToMetadata: true }),
       }),
     }));
   });

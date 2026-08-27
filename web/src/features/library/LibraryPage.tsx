@@ -8,6 +8,7 @@ import type { Library } from "../../lib/api/types";
 import { MediaCard } from "../home/media";
 
 const LIBRARY_SORT_STORAGE_KEY = "lux.library.sort";
+const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
 
 type LibrarySortPreference = {
   sortBy: LibrarySortBy;
@@ -134,10 +135,11 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     if (typeof document === "undefined") return;
 
     const libraryName = library?.name.trim();
-    document.title = libraryName ? `${libraryName} - Lux` : "Lux";
+    const serverNameValue = serverName?.trim();
+    const serverTitle = serverNameValue ? `${serverNameValue} - Lux` : DEFAULT_BROWSER_TITLE;
+    document.title = libraryName ? `${libraryName} - Lux` : serverTitle;
     return () => {
-      const serverTitle = serverName?.trim();
-      document.title = serverTitle ? `${serverTitle} - Lux` : "Lux";
+      document.title = serverTitle;
     };
   }, [library?.name, serverName]);
 

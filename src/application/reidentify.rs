@@ -20,6 +20,7 @@ use crate::{
             ImageSelectionPolicy, MetadataCandidateError, MetadataCandidatePage,
             MetadataCandidateService, MetadataCandidateView, MetadataRequestPlan,
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
+            has_selected_provider_id,
         },
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
         webhooks::{WebhookEventType, WebhookService},
@@ -141,6 +142,7 @@ enum RefreshItemOutcome {
 struct RefreshItemOptions {
     scraper_id: Option<String>,
     supplemental: bool,
+    preserve_identity: bool,
     request_plan: Option<MetadataRequestPlan>,
     image_policy: Option<ImageSelectionPolicy>,
 }
@@ -676,7 +678,6 @@ impl MetadataReidentifyService {
                         Ok(None)
                     };
                     match request_plan {
-                        Ok(Some(plan)) if metadata_request_plan_is_complete(plan) => Ok(0),
                         Ok(request_plan) => {
                             match self
                                 .providers_for_item(
@@ -842,46 +843,62 @@ impl MetadataReidentifyService {
         request_plan: Option<MetadataRequestPlan>,
     ) -> Result<i64, MetadataReidentifyError> {
         let mut candidate_count = 0_i64;
-        let mut selected_scraper_id = None;
+        let already_confirmed = item_identity_is_confirmed(item, mode);
+        let mut selected_scraper_id = already_confirmed.then(|| {
+            item.metadata_scraper_id
+                .as_deref()
+                .or(item.scraper_id.as_deref())
+                .unwrap_or_default()
+                .to_owned()
+        });
         let mut last_recoverable_error = None;
         let mut saw_needs_review = false;
-        for scraper in scrapers.iter().filter(|scraper| {
-            matches!(
-                scraper.role,
-                crate::library::LibraryScraperRole::Primary
-                    | crate::library::LibraryScraperRole::Backup
-                    | crate::library::LibraryScraperRole::Both
-            )
-        }) {
-            match self
-                .refresh_item(
-                    item_id,
-                    item,
-                    mode,
-                    &scraper.provider,
-                    RefreshItemOptions {
-                        scraper_id: Some(scraper.scraper_id.clone()),
-                        supplemental: false,
-                        request_plan,
-                        image_policy: request_plan.and_then(|plan| plan.image_policy),
-                    },
-                )
-                .await
-            {
-                Ok(RefreshItemOutcome::Confirmed(count)) => {
-                    candidate_count = candidate_count.saturating_add(count);
-                    selected_scraper_id = Some(scraper.scraper_id.as_str());
-                    break;
+        let should_refresh_primary = !already_confirmed
+            || request_plan.is_none_or(|plan| !metadata_request_plan_is_complete(plan));
+        if should_refresh_primary {
+            for scraper in scrapers.iter().filter(|scraper| {
+                if already_confirmed {
+                    scraper.role == crate::library::LibraryScraperRole::Primary
+                } else {
+                    matches!(
+                        scraper.role,
+                        crate::library::LibraryScraperRole::Primary
+                            | crate::library::LibraryScraperRole::Backup
+                            | crate::library::LibraryScraperRole::Both
+                    )
                 }
-                Ok(RefreshItemOutcome::NeedsReview(count)) => {
-                    candidate_count = candidate_count.saturating_add(count);
-                    last_recoverable_error = Some(MetadataReidentifyError::LowConfidence);
-                    saw_needs_review = true;
+            }) {
+                match self
+                    .refresh_item(
+                        item_id,
+                        item,
+                        mode,
+                        &scraper.provider,
+                        RefreshItemOptions {
+                            scraper_id: Some(scraper.scraper_id.clone()),
+                            supplemental: false,
+                            preserve_identity: false,
+                            request_plan,
+                            image_policy: request_plan.and_then(|plan| plan.image_policy),
+                        },
+                    )
+                    .await
+                {
+                    Ok(RefreshItemOutcome::Confirmed(count)) => {
+                        candidate_count = candidate_count.saturating_add(count);
+                        selected_scraper_id = Some(scraper.scraper_id.clone());
+                        break;
+                    }
+                    Ok(RefreshItemOutcome::NeedsReview(count)) => {
+                        candidate_count = candidate_count.saturating_add(count);
+                        last_recoverable_error = Some(MetadataReidentifyError::LowConfidence);
+                        saw_needs_review = true;
+                    }
+                    Err(error) if recoverable_scraper_attempt(&error) => {
+                        last_recoverable_error = Some(error);
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) if recoverable_scraper_attempt(&error) => {
-                    last_recoverable_error = Some(error);
-                }
-                Err(error) => return Err(error),
             }
         }
         if selected_scraper_id.is_none() {
@@ -891,6 +908,51 @@ impl MetadataReidentifyService {
             return Err(last_recoverable_error.unwrap_or(MetadataReidentifyError::LowConfidence));
         }
         if !matches!(mode, MetadataRefreshMode::Reidentify) {
+            if let Some(selection) = self.selection.as_ref() {
+                for scraper in scrapers.iter().filter(|scraper| {
+                    matches!(
+                        scraper.role,
+                        crate::library::LibraryScraperRole::Backup
+                            | crate::library::LibraryScraperRole::Both
+                    )
+                }) {
+                    let current = self
+                        .database
+                        .find_media_item_metadata(item_id)
+                        .await?
+                        .ok_or_else(|| MetadataReidentifyError::ItemNotFound(item_id.to_owned()))?;
+                    let fallback_plan = selection
+                        .fallback_request_plan_for_current(item_id, &current)
+                        .await
+                        .map_err(MetadataReidentifyError::Selection)?;
+                    if metadata_request_plan_is_complete(fallback_plan) {
+                        break;
+                    }
+                    match self
+                        .refresh_item(
+                            item_id,
+                            &current,
+                            mode,
+                            &scraper.provider,
+                            RefreshItemOptions {
+                                scraper_id: Some(scraper.scraper_id.clone()),
+                                supplemental: false,
+                                preserve_identity: true,
+                                request_plan: Some(fallback_plan),
+                                image_policy: fallback_plan.image_policy,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(
+                            RefreshItemOutcome::Confirmed(count)
+                            | RefreshItemOutcome::NeedsReview(count),
+                        ) => candidate_count = candidate_count.saturating_add(count),
+                        Err(error) if recoverable_scraper_attempt(&error) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
             for scraper in scrapers.iter().filter(|scraper| {
                 matches!(
                     scraper.role,
@@ -898,23 +960,16 @@ impl MetadataReidentifyService {
                         | crate::library::LibraryScraperRole::Both
                 )
             }) {
-                let supplemental_plan = if matches!(mode, MetadataRefreshMode::FillMissing) {
-                    if let Some(selection) = self.selection.as_ref() {
-                        Some(
-                            selection
-                                .fill_missing_request_plan(item_id)
-                                .await
-                                .map_err(MetadataReidentifyError::Selection)?,
-                        )
-                    } else {
-                        None
-                    }
+                let supplemental_plan = if let Some(selection) = self.selection.as_ref() {
+                    Some(
+                        selection
+                            .supplemental_request_plan(item_id)
+                            .await
+                            .map_err(MetadataReidentifyError::Selection)?,
+                    )
                 } else {
                     None
                 };
-                if supplemental_plan.is_some_and(metadata_request_plan_is_complete) {
-                    break;
-                }
                 match self
                     .refresh_item(
                         item_id,
@@ -922,8 +977,9 @@ impl MetadataReidentifyService {
                         mode,
                         &scraper.provider,
                         RefreshItemOptions {
-                            scraper_id: None,
+                            scraper_id: Some(scraper.scraper_id.clone()),
                             supplemental: true,
+                            preserve_identity: false,
                             request_plan: supplemental_plan,
                             image_policy: supplemental_plan.and_then(|plan| plan.image_policy),
                         },
@@ -955,7 +1011,10 @@ impl MetadataReidentifyService {
         provider: &ScraperProvider,
         options: RefreshItemOptions,
     ) -> Result<RefreshItemOutcome, MetadataReidentifyError> {
-        let page = if matches!(mode, MetadataRefreshMode::FillMissing) {
+        let page = if matches!(mode, MetadataRefreshMode::FillMissing)
+            || options.supplemental
+            || options.preserve_identity
+        {
             self.candidates
                 .search_and_store_for_automatic_match_with_plan(
                     item_id,
@@ -993,15 +1052,28 @@ impl MetadataReidentifyService {
             return Err(MetadataReidentifyError::LowConfidence);
         };
         let needs_review = best_automatic_candidate(&page).is_none();
-        if options.supplemental && needs_review {
+        if (options.supplemental || options.preserve_identity) && needs_review {
             return Err(MetadataReidentifyError::LowConfidence);
         }
-        let selection_mode = match mode {
-            MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
-            MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
-            MetadataRefreshMode::Reidentify => return Ok(RefreshItemOutcome::Confirmed(0)),
+        let selection_mode = if options.supplemental || options.preserve_identity {
+            MetadataSelectionMode::FillMissing
+        } else {
+            match mode {
+                MetadataRefreshMode::FillMissing => MetadataSelectionMode::FillMissing,
+                MetadataRefreshMode::FullRefresh => MetadataSelectionMode::RefreshUnlocked,
+                MetadataRefreshMode::Reidentify => return Ok(RefreshItemOutcome::Confirmed(0)),
+            }
         };
-        if needs_review {
+        if options.preserve_identity {
+            selection
+                .select_fallback_with_scraper_and_policy(
+                    item_id,
+                    &candidate.id,
+                    options.scraper_id.as_deref().unwrap_or_default(),
+                    options.image_policy,
+                )
+                .await
+        } else if needs_review {
             selection
                 .select_for_review_with_scraper_and_policy(
                     item_id,
@@ -1330,11 +1402,47 @@ fn metadata_request_plan_is_complete(plan: MetadataRequestPlan) -> bool {
         && !plan.needs_trailers
 }
 
+fn item_identity_is_confirmed(
+    item: &crate::storage::StoredMediaMetadata,
+    mode: MetadataRefreshMode,
+) -> bool {
+    if matches!(mode, MetadataRefreshMode::Reidentify) {
+        return false;
+    }
+    let selected_scraper = item
+        .metadata_scraper_id
+        .as_deref()
+        .or(item.scraper_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if selected_scraper.is_some() {
+        return has_selected_provider_id(item);
+    }
+    item.identification_status == "ONLINE_CONFIRMED" && has_any_provider_id(item)
+}
+
+fn has_any_provider_id(item: &crate::storage::StoredMediaMetadata) -> bool {
+    let Some(raw) = item.provider_ids_json.as_deref() else {
+        return false;
+    };
+    let Ok(Value::Object(provider_ids)) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    provider_ids
+        .values()
+        .any(|value| value.as_str().is_some_and(|id| !id.trim().is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{
+        collections::BTreeMap,
+        error::Error,
+        sync::{Arc, Mutex},
+    };
 
     use serde_json::Value;
+    use tempfile::TempDir;
 
     use super::{
         AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT,
@@ -1342,7 +1450,591 @@ mod tests {
         best_automatic_candidate, metadata_global_permits, metadata_request_plan_is_complete,
         metadata_worker_concurrency, metadata_worker_default_concurrency,
     };
-    use crate::config::DatabaseBackend;
+    use crate::{
+        application::{
+            candidates::MetadataSelectionService,
+            images::ImageWriteService,
+            libraries::LibraryService,
+            scanner::LibraryScanner,
+            scraper::{
+                ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
+                ScraperFuture, ScraperGetRequest, ScraperImageRequest, ScraperImagesResponse,
+                ScraperMetadata, ScraperMetadataBundle, ScraperSearchRequest,
+                ScraperSearchResponse, ScraperSearchResult, ScraperTrailer,
+                ScraperTrailersResponse,
+            },
+        },
+        config::{Config, DatabaseBackend},
+        library::{LibraryKind, LibraryScraperRole},
+        storage::Database,
+    };
+
+    #[derive(Clone)]
+    struct RoleRecordingAdapter {
+        provider_key: String,
+        match_found: bool,
+        fail_get: bool,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl RoleRecordingAdapter {
+        fn new(provider_key: &str, calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self::with_match(provider_key, calls, true)
+        }
+
+        fn with_match(
+            provider_key: &str,
+            calls: Arc<Mutex<Vec<String>>>,
+            match_found: bool,
+        ) -> Self {
+            Self {
+                provider_key: provider_key.to_owned(),
+                match_found,
+                fail_get: false,
+                calls,
+            }
+        }
+
+        fn with_get_failure(provider_key: &str, calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                provider_key: provider_key.to_owned(),
+                match_found: true,
+                fail_get: true,
+                calls,
+            }
+        }
+
+        fn record(&self, method: &str) {
+            self.calls
+                .lock()
+                .expect("role scraper call list should not be poisoned")
+                .push(format!("{}:{method}", self.provider_key));
+        }
+
+        fn search_response(&self) -> ScraperSearchResponse {
+            ScraperSearchResponse {
+                items: vec![ScraperSearchResult {
+                    item_type: Some("Movie".to_owned()),
+                    title: Some("Example Movie".to_owned()),
+                    original_title: Some("Example Movie".to_owned()),
+                    overview: Some("A complete scraper result.".to_owned()),
+                    production_year: Some(2020),
+                    provider_ids: BTreeMap::from([(
+                        self.provider_key.clone(),
+                        format!("{}-1", self.provider_key),
+                    )]),
+                    ..ScraperSearchResult::default()
+                }],
+            }
+        }
+
+        fn bundle_response(&self) -> ScraperMetadataBundle {
+            let provider_id = format!("{}-1", self.provider_key);
+            ScraperMetadataBundle {
+                metadata: ScraperMetadata {
+                    item_type: Some("Movie".to_owned()),
+                    title: Some("Example Movie".to_owned()),
+                    original_title: Some("Example Movie Original".to_owned()),
+                    overview: Some("A complete scraper result.".to_owned()),
+                    production_year: Some(2020),
+                    premiere_date: Some("2020-01-01".to_owned()),
+                    original_language: Some("en".to_owned()),
+                    status: Some("Released".to_owned()),
+                    rating: Some(8.0),
+                    provider_ids: BTreeMap::from([
+                        (self.provider_key.clone(), provider_id.clone()),
+                        ("imdb".to_owned(), "tt-example".to_owned()),
+                    ]),
+                    ..ScraperMetadata::default()
+                },
+                credits: ScraperCreditsResponse {
+                    cast: vec![crate::application::scraper::ScraperActorCredit {
+                        provider_id: "actor-1".to_owned(),
+                        name: Some("演员甲".to_owned()),
+                        character: Some("角色甲".to_owned()),
+                        order: Some(0),
+                        ..Default::default()
+                    }],
+                    crew: vec![
+                        crate::application::scraper::ScraperCrewCredit {
+                            provider_id: "director-1".to_owned(),
+                            name: Some("导演甲".to_owned()),
+                            job: Some("Director".to_owned()),
+                            department: Some("Directing".to_owned()),
+                        },
+                        crate::application::scraper::ScraperCrewCredit {
+                            provider_id: "writer-1".to_owned(),
+                            name: Some("编剧甲".to_owned()),
+                            job: Some("Writer".to_owned()),
+                            department: Some("Writing".to_owned()),
+                        },
+                    ],
+                },
+                external_ids: ScraperExternalIdsResponse {
+                    provider_ids: BTreeMap::from([
+                        (self.provider_key.clone(), provider_id),
+                        ("imdb".to_owned(), "tt-example".to_owned()),
+                    ]),
+                },
+                trailers: ScraperTrailersResponse {
+                    trailers: vec![ScraperTrailer {
+                        url: Some("https://video.example/trailer".to_owned()),
+                        ..Default::default()
+                    }],
+                },
+                ..Default::default()
+            }
+        }
+    }
+
+    impl ScraperAdapter for RoleRecordingAdapter {
+        fn provider_key(&self) -> &str {
+            &self.provider_key
+        }
+
+        fn search(
+            &self,
+            _request: ScraperSearchRequest,
+        ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+            self.record("search");
+            let response = if self.match_found {
+                self.search_response()
+            } else {
+                ScraperSearchResponse::default()
+            };
+            Box::pin(std::future::ready(Ok(response)))
+        }
+
+        fn get(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+            self.record("get");
+            if self.fail_get {
+                return Box::pin(std::future::ready(Err(ScraperError::Provider(
+                    "test metadata request failed".to_owned(),
+                ))));
+            }
+            let mut metadata = self.bundle_response().metadata;
+            metadata.genres = vec![format!("{} supplemental genre", self.provider_key)];
+            Box::pin(std::future::ready(Ok(metadata)))
+        }
+
+        fn bundle(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+            self.record("bundle");
+            Box::pin(std::future::ready(Ok(self.bundle_response())))
+        }
+
+        fn images(
+            &self,
+            _request: ScraperImageRequest,
+        ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+            self.record("images");
+            Box::pin(std::future::ready(Ok(ScraperImagesResponse::default())))
+        }
+
+        fn credits(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+            self.record("credits");
+            Box::pin(std::future::ready(Ok(self.bundle_response().credits)))
+        }
+
+        fn external_ids(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+            self.record("externalIds");
+            Box::pin(std::future::ready(Ok(self.bundle_response().external_ids)))
+        }
+
+        fn trailers(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+            self.record("trailers");
+            Box::pin(std::future::ready(Ok(self.bundle_response().trailers)))
+        }
+    }
+
+    async fn role_test_fixture() -> Result<(TempDir, Config, Database, String), Box<dyn Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let root = temp_dir.path().join("Movies");
+        let movie_dir = root.join("Example Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
+        tokio::fs::write(movie_dir.join("backdrop.jpg"), b"local backdrop").await?;
+
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+            .bind(
+                serde_json::json!({
+                    "images": {
+                        "poster": false,
+                        "artwork": false,
+                        "banner": false,
+                        "logo": false,
+                        "thumbnail": false,
+                        "disc": false,
+                        "wallpaper": false
+                    }
+                })
+                .to_string(),
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let item_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        Ok((temp_dir, config, database, item_id))
+    }
+
+    #[tokio::test]
+    async fn scraper_roles_recompute_missing_capabilities_after_primary_selection()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::new("primary", Arc::clone(&calls));
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(selection),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        assert!(calls.iter().any(|call| call == "primary:bundle"));
+        assert!(calls.iter().all(|call| !call.starts_with("backup:")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_takes_over_in_order_when_primary_cannot_identify() -> Result<(), Box<dyn Error>>
+    {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_match("primary", Arc::clone(&calls), false);
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::new(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+
+        let candidate_count = service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::Reidentify,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        assert!(candidate_count > 0);
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        let first_backup_call = calls
+            .iter()
+            .position(|call| call.starts_with("backup:"))
+            .ok_or("backup scraper was not called")?;
+        assert!(
+            calls[..first_backup_call]
+                .iter()
+                .all(|call| call.starts_with("primary:"))
+        );
+        assert!(
+            calls[first_backup_call..]
+                .iter()
+                .all(|call| call.starts_with("backup:"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_requests_only_missing_image_capability() -> Result<(), Box<dyn Error>> {
+        let (temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::new("primary", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(MetadataSelectionService::with_config_dir(
+                database.clone(),
+                ImageWriteService::new(database.clone())?,
+                config.config_dir.clone(),
+            )),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let primary_only = vec![super::ResolvedScraper {
+            scraper_id: "primary".to_owned(),
+            role: LibraryScraperRole::Primary,
+            provider: super::ScraperProvider::from_adapter(primary.clone()),
+        }];
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &primary_only,
+                None,
+            )
+            .await?;
+        calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clear();
+        tokio::fs::remove_file(
+            temp_dir
+                .path()
+                .join("Movies/Example Movie (2020)/backdrop.jpg"),
+        )
+        .await?;
+
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("refreshed fixture movie is missing")?;
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &current,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        let backup_calls = calls
+            .into_iter()
+            .filter(|call| call.starts_with("backup:"))
+            .collect::<Vec<_>>();
+        assert_eq!(backup_calls, ["backup:search", "backup:images"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn confirmed_identity_is_preserved_when_primary_fails_before_backup_fill()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                original_title = 'Example Movie', overview = 'Existing overview',
+                production_year = 2020, premiere_date = '2020-01-01',
+                original_language = 'en', rating = 8.0,
+                provider_ids_json = ?, metadata_scraper_id = 'primary'
+             WHERE id = ?",
+        )
+        .bind(serde_json::json!({ "primary": "primary-1", "imdb": "tt-example" }).to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE libraries SET scraper_id = 'primary'
+             WHERE id = (SELECT library_id FROM media_items WHERE id = ?)",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_get_failure("primary", Arc::clone(&calls));
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(selection),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let selected_scraper: Option<String> =
+            sqlx::query_scalar("SELECT metadata_scraper_id FROM media_items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(selected_scraper.as_deref(), Some("primary"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn both_scraper_supplements_after_using_backup_role() -> Result<(), Box<dyn Error>> {
+        let (temp_dir, config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_match("primary", Arc::clone(&calls), false);
+        let both = RoleRecordingAdapter::new("both", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(MetadataSelectionService::with_config_dir(
+                database.clone(),
+                ImageWriteService::new(database.clone())?,
+                config.config_dir.clone(),
+            )),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "both".to_owned(),
+                role: LibraryScraperRole::Both,
+                provider: super::ScraperProvider::from_adapter(both),
+            },
+        ];
+
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let nfo = tokio::fs::read_to_string(
+            temp_dir
+                .path()
+                .join("Movies/Example Movie (2020)/movie.nfo"),
+        )
+        .await?;
+        assert!(nfo.contains("<genre>both supplemental genre</genre>"));
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        assert!(calls.iter().any(|call| call == "both:bundle"));
+        assert!(calls.iter().any(|call| call == "both:get"));
+        Ok(())
+    }
 
     fn candidate(id: &str, score: f64) -> MetadataCandidateView {
         MetadataCandidateView {

@@ -123,7 +123,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
           {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
           <div className="lux-image-editor-current">
             <span className="lux-editor-section-label">当前{selectedLabel}</span>
-            <div className="lux-image-current-card">
+            <div className="lux-image-current-card" data-image-type={imageType}>
               {currentImage ? <img src={currentImage.url} alt={`${selectedLabel} 当前图片`} /> : <div><ImageIcon size={26} /><span>尚未设置</span></div>}
             </div>
           </div>
@@ -133,7 +133,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
             {!searching && !results.length ? <div className="lux-image-result-state">选择语言和来源后搜索{selectedLabel}。</div> : null}
             <div className="lux-image-result-grid">
               {results.map((result) => (
-                <button className="lux-image-result" type="button" key={result.id} disabled={Boolean(selecting)} onClick={() => void select(result)}>
+                <button className="lux-image-result" type="button" key={result.id} data-image-type={imageType} disabled={Boolean(selecting)} onClick={() => void select(result)}>
                   <img src={result.url} alt={`${selectedLabel} 搜索结果`} />
                   <span>{selecting === result.id ? "保存中…" : `${result.source}${result.language ? ` · ${result.language}` : ""}`}</span>
                 </button>

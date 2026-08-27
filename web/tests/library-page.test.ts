@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { LibraryPage, libraryItemTypeFilter } from "../src/features/library/LibraryPage";
 import { api } from "../src/lib/api/client";
+import type { LibrariesResponse } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -80,6 +81,47 @@ describe("LibraryPage infinite scroll", () => {
       root = undefined;
     });
     expect(document.title).toBe("客厅 Lux - Lux");
+  });
+
+  it("keeps the server title while the library name is loading", async () => {
+    let resolveLibraries: (response: LibrariesResponse) => void = () => {};
+    vi.spyOn(api, "libraries").mockImplementation(() => new Promise((resolve) => {
+      resolveLibraries = resolve;
+    }));
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [],
+      page: 1,
+      pageSize: 24,
+      total: 0,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage, { serverName: "客厅 Lux" }) }),
+          ),
+        ),
+      ));
+    });
+
+    expect(document.title).toBe("客厅 Lux - Lux");
+
+    await act(async () => {
+      resolveLibraries({ libraries: [{ id: "library-1", name: "电影收藏", kind: "MOVIE" }] });
+      await vi.waitFor(() => expect(document.title).toBe("电影收藏 - Lux"));
+    });
   });
 
   it("loads the next library page when the scroll sentinel becomes visible", async () => {

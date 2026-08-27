@@ -291,6 +291,7 @@ impl ThumbnailService {
                     height: dimensions.map(|(_, height)| height),
                     content_tag: &content_tag,
                     source: "FFMPEG",
+                    source_url: None,
                 },
             )
             .await

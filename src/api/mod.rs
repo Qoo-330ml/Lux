@@ -350,7 +350,10 @@ impl AppState {
             access: Some(access),
             metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
             metadata_selection,
-            metadata_writes: Some(MetadataWriteService::new(database.clone())),
+            metadata_writes: Some(MetadataWriteService::new_with_config_dir(
+                database.clone(),
+                config_dir.clone(),
+            )),
             downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
                 .ok(),
             // STRM targets can be internal NAS services. This resolver is
@@ -12740,6 +12743,8 @@ struct MediaImageStrategySettings {
     disc: bool,
     #[serde(default)]
     wallpaper: bool,
+    #[serde(default)]
+    write_to_metadata: bool,
     max_backdrop_count: i64,
     min_download_width: i64,
 }
@@ -12771,6 +12776,7 @@ impl Default for MediaStrategySettings {
                 thumbnail: true,
                 disc: false,
                 wallpaper: false,
+                write_to_metadata: false,
                 max_backdrop_count: 1,
                 min_download_width: 1280,
             },

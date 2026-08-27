@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
@@ -12,7 +12,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 use crate::{
     application::{
         home::HomeService,
-        images::{ImageWriteError, ImageWriteService, image_no_candidate_key},
+        images::{ImageWriteError, ImageWriteService, MAX_IMAGE_VARIANTS, image_no_candidate_key},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
         nfo::{MovieNfoCredit, MovieNfoMetadata, NfoWriteError, NfoWriteService},
@@ -1379,6 +1379,20 @@ fn current_provider_ids(current: &StoredMediaMetadata) -> BTreeMap<String, Strin
         .unwrap_or_default()
 }
 
+fn insert_provider_id_if_missing(
+    provider_ids: &mut BTreeMap<String, String>,
+    provider: &str,
+    provider_id: &str,
+) {
+    if provider_ids
+        .keys()
+        .any(|key| key.eq_ignore_ascii_case(provider))
+    {
+        return;
+    }
+    provider_ids.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+}
+
 fn image_attempt_identities(current: &StoredMediaMetadata) -> Vec<(String, String)> {
     let provider_ids = current_provider_ids(current);
     let Some(source) = current
@@ -1802,6 +1816,7 @@ struct MetadataSelectionOptions<'a> {
     keep_pending: bool,
     scraper_id: Option<&'a str>,
     supplemental: bool,
+    preserve_identity: bool,
     image_policy: Option<ImageSelectionPolicy>,
 }
 
@@ -1826,7 +1841,7 @@ impl MetadataSelectionService {
         config_dir: std::path::PathBuf,
     ) -> Self {
         Self {
-            nfo: NfoWriteService::new(database.clone()),
+            nfo: NfoWriteService::new_with_config_dir(database.clone(), config_dir.clone()),
             database: database.clone(),
             images,
             people: crate::application::people::PeopleService::new(config_dir)
@@ -1847,23 +1862,40 @@ impl MetadataSelectionService {
         self
     }
 
-    pub(crate) async fn fill_missing_request_plan(
-        &self,
-        item_id: &str,
-    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
-        let current = self
-            .database
-            .find_media_item_metadata(item_id)
-            .await?
-            .ok_or(MetadataSelectionError::ItemNotFound)?;
-        self.fill_missing_request_plan_for_current(item_id, &current)
-            .await
-    }
-
     pub(crate) async fn fill_missing_request_plan_for_current(
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+        self.fill_missing_request_plan_for_current_with_options(item_id, current, false)
+            .await
+    }
+
+    pub(crate) async fn fallback_request_plan_for_current(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+        self.fill_missing_request_plan_for_current_with_options(item_id, current, true)
+            .await
+    }
+
+    pub(crate) async fn supplemental_request_plan(
+        &self,
+        item_id: &str,
+    ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
+        let image_policy = self.image_selection_policy(item_id).await?;
+        Ok(MetadataRequestPlan {
+            image_policy: Some(image_policy),
+            ..MetadataRequestPlan::full()
+        })
+    }
+
+    async fn fill_missing_request_plan_for_current_with_options(
+        &self,
+        item_id: &str,
+        current: &StoredMediaMetadata,
+        ignore_attempt_history: bool,
     ) -> Result<MetadataRequestPlan, MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
             return Ok(MetadataRequestPlan::full());
@@ -1887,7 +1919,8 @@ impl MetadataSelectionService {
             if local_image_types.contains(image_type) {
                 continue;
             }
-            let explicitly_unavailable = !image_attempt_identities.is_empty()
+            let explicitly_unavailable = !ignore_attempt_history
+                && !image_attempt_identities.is_empty()
                 && image_attempt_identities
                     .iter()
                     .all(|(source, provider_id)| {
@@ -1927,24 +1960,26 @@ impl MetadataSelectionService {
             metadata_request_plan(current, images_missing, credits_missing, details.as_ref());
         plan.image_policy = Some(image_policy);
         let capability_identity = selected_capability_identity(current);
-        plan.needs_credits = plan.needs_credits
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_CREDITS,
-            );
-        plan.needs_external_ids = plan.needs_external_ids
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_EXTERNAL_IDS,
-            );
-        plan.needs_trailers = plan.needs_trailers
-            && capability_needs_request(
-                &capability_states,
-                capability_identity.as_ref(),
-                CAPABILITY_TRAILERS,
-            );
+        if !ignore_attempt_history {
+            plan.needs_credits = plan.needs_credits
+                && capability_needs_request(
+                    &capability_states,
+                    capability_identity.as_ref(),
+                    CAPABILITY_CREDITS,
+                );
+            plan.needs_external_ids = plan.needs_external_ids
+                && capability_needs_request(
+                    &capability_states,
+                    capability_identity.as_ref(),
+                    CAPABILITY_EXTERNAL_IDS,
+                );
+            plan.needs_trailers = plan.needs_trailers
+                && capability_needs_request(
+                    &capability_states,
+                    capability_identity.as_ref(),
+                    CAPABILITY_TRAILERS,
+                );
+        }
         if !has_selected_provider_id(current) {
             plan.needs_metadata = true;
         }
@@ -1965,6 +2000,7 @@ impl MetadataSelectionService {
                 keep_pending: false,
                 scraper_id: None,
                 supplemental: false,
+                preserve_identity: false,
                 image_policy: None,
             },
         )
@@ -2007,6 +2043,7 @@ impl MetadataSelectionService {
                 keep_pending: false,
                 scraper_id,
                 supplemental,
+                preserve_identity: false,
                 image_policy,
             },
         )
@@ -2030,6 +2067,7 @@ impl MetadataSelectionService {
                 keep_pending: true,
                 scraper_id,
                 supplemental,
+                preserve_identity: false,
                 image_policy,
             },
         )
@@ -2050,6 +2088,7 @@ impl MetadataSelectionService {
                 keep_pending: true,
                 scraper_id: None,
                 supplemental: false,
+                preserve_identity: false,
                 image_policy: None,
             },
         )
@@ -2096,6 +2135,28 @@ impl MetadataSelectionService {
             .await
     }
 
+    pub(crate) async fn select_fallback_with_scraper_and_policy(
+        &self,
+        item_id: &str,
+        candidate_id: &str,
+        scraper_id: &str,
+        image_policy: Option<ImageSelectionPolicy>,
+    ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
+        self.select_internal(
+            item_id,
+            candidate_id,
+            MetadataSelectionMode::FillMissing,
+            MetadataSelectionOptions {
+                keep_pending: false,
+                scraper_id: Some(scraper_id),
+                supplemental: false,
+                preserve_identity: true,
+                image_policy,
+            },
+        )
+        .await
+    }
+
     async fn select_internal(
         &self,
         item_id: &str,
@@ -2128,7 +2189,11 @@ impl MetadataSelectionService {
         payload.movie_nfo.actors = payload.actors.clone();
         if matches!(mode, MetadataSelectionMode::FillMissing) || options.supplemental {
             let projection = self.nfo.read_item_projection(item_id).await?;
-            merge_supplemental_movie_nfo(&mut payload.movie_nfo, projection.as_ref());
+            merge_supplemental_movie_nfo(
+                &mut payload.movie_nfo,
+                projection.as_ref(),
+                options.supplemental,
+            );
             payload.actors = payload.movie_nfo.actors.clone();
             if options.supplemental {
                 preserve_supplemental_scalar_values(&mut payload, &current);
@@ -2144,7 +2209,12 @@ impl MetadataSelectionService {
             source: MetadataSource::ScraperLocalized,
             metadata: payload.metadata.clone(),
         };
-        match mode {
+        let application_mode = if options.supplemental || options.preserve_identity {
+            MetadataSelectionMode::FillMissing
+        } else {
+            mode
+        };
+        match application_mode {
             MetadataSelectionMode::FillMissing => state.apply_fill_missing(&metadata_candidate),
             MetadataSelectionMode::RefreshUnlocked => {
                 state.apply_refresh_unlocked(&metadata_candidate)
@@ -2153,7 +2223,14 @@ impl MetadataSelectionService {
         let mut movie_nfo = payload.movie_nfo.clone();
         movie_nfo.base = state.metadata.clone();
         let image_types = self
-            .write_selected_images(item_id, &payload, image_policy, image_source, mode)
+            .write_selected_images(
+                item_id,
+                &payload,
+                image_policy,
+                image_source,
+                application_mode,
+                options.supplemental,
+            )
             .await?;
         let has_primary_artwork = image_types
             .iter()
@@ -2173,18 +2250,17 @@ impl MetadataSelectionService {
         self.resources
             .record_metadata_stage("nfo_write", nfo_started.elapsed());
         let mut provider_ids = current_provider_ids(&current);
-        provider_ids.extend(movie_nfo.provider_ids.clone());
-        if options.supplemental {
-            if !provider_ids
-                .keys()
-                .any(|key| key.eq_ignore_ascii_case(&candidate.provider))
-            {
-                provider_ids.insert(
-                    candidate.provider.to_ascii_lowercase(),
-                    candidate.provider_id.clone(),
-                );
+        if options.supplemental || options.preserve_identity {
+            for (provider, provider_id) in &movie_nfo.provider_ids {
+                insert_provider_id_if_missing(&mut provider_ids, provider, provider_id);
             }
+            insert_provider_id_if_missing(
+                &mut provider_ids,
+                &candidate.provider,
+                &candidate.provider_id,
+            );
         } else {
+            provider_ids.extend(movie_nfo.provider_ids.clone());
             provider_ids.insert(
                 candidate.provider.to_ascii_lowercase(),
                 candidate.provider_id.clone(),
@@ -2208,7 +2284,9 @@ impl MetadataSelectionService {
                 rating: payload.rating,
                 rating_source: payload.rating.as_ref().map(|_| candidate.provider.as_str()),
                 provider_ids_json: &provider_ids_json,
-                metadata_scraper_id: (!options.supplemental && !options.keep_pending)
+                metadata_scraper_id: (!options.supplemental
+                    && !options.preserve_identity
+                    && !options.keep_pending)
                     .then_some(options.scraper_id)
                     .flatten(),
                 metadata_fingerprint: &nfo_report.fingerprint,
@@ -2247,27 +2325,62 @@ impl MetadataSelectionService {
         image_policy: ImageSelectionPolicy,
         source: &str,
         mode: MetadataSelectionMode,
+        supplemental: bool,
     ) -> Result<Vec<&'static str>, MetadataSelectionError> {
-        let specs = if payload.typed_images_present {
-            image_policy
-                .enabled_types()
-                .filter_map(|image_type| {
-                    let urls = payload.images.get(image_type)?.clone();
-                    (!urls.is_empty()).then_some((image_type, urls))
-                })
-                .collect::<Vec<_>>()
+        let mut specs = Vec::new();
+        macro_rules! add_spec {
+            ($image_type:expr, $urls:expr) => {
+                let urls = $urls;
+                if !urls.is_empty() {
+                    specs.push(($image_type, urls, 0_i64));
+                }
+            };
+        }
+        if payload.typed_images_present {
+            for image_type in image_policy.enabled_types() {
+                if let Some(urls) = payload.images.get(image_type).cloned() {
+                    if image_type == "FANART" && supplemental {
+                        let urls = self
+                            .filter_new_supplemental_image_urls(item_id, image_type, urls)
+                            .await?;
+                        let start = self.images.next_image_index(item_id, image_type).await?;
+                        for (offset, url) in urls.into_iter().take(MAX_IMAGE_VARIANTS).enumerate() {
+                            specs.push((
+                                image_type,
+                                vec![url],
+                                start.saturating_add(i64::try_from(offset).unwrap_or(0)),
+                            ));
+                        }
+                    } else if image_type == "FANART" {
+                        for (offset, url) in urls.into_iter().take(MAX_IMAGE_VARIANTS).enumerate() {
+                            specs.push((image_type, vec![url], i64::try_from(offset).unwrap_or(0)));
+                        }
+                    } else {
+                        add_spec!(image_type, urls);
+                    }
+                }
+            }
         } else {
-            [
-                ("POSTER", payload.poster_url.clone()),
-                ("FANART", payload.fanart_url.clone()),
-            ]
-            .into_iter()
-            .filter_map(|(image_type, url)| url.map(|url| (image_type, vec![url])))
-            .collect::<Vec<_>>()
-        };
+            if let Some(url) = payload.poster_url.clone() {
+                add_spec!("POSTER", vec![url]);
+            }
+            if let Some(url) = payload.fanart_url.clone() {
+                if supplemental {
+                    let mut urls = self
+                        .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
+                        .await?;
+                    if let Some(url) = urls.pop() {
+                        let start = self.images.next_image_index(item_id, "FANART").await?;
+                        specs.push(("FANART", vec![url], start));
+                    }
+                } else {
+                    specs.push(("FANART", vec![url], 0));
+                }
+            }
+        }
         let item_permits = Arc::new(Semaphore::new(IMAGE_ITEM_CONCURRENCY));
         let mut tasks = JoinSet::new();
-        for (index, (image_type, urls)) in specs.into_iter().enumerate() {
+        for (index, (image_type, urls, image_index)) in specs.into_iter().enumerate() {
             let permit = item_permits.clone().acquire_owned().await.map_err(|_| {
                 MetadataSelectionError::InvalidCandidate("image semaphore closed".to_owned())
             })?;
@@ -2281,17 +2394,33 @@ impl MetadataSelectionService {
                     let result = match mode {
                         MetadataSelectionMode::FillMissing => {
                             images
-                                .try_download_item_image_if_missing_from_scraper(
-                                    &item_id, image_type, &url, &source,
+                                .try_download_item_image_if_missing_from_scraper_at_index(
+                                    &item_id,
+                                    image_type,
+                                    &url,
+                                    &source,
+                                    image_index,
                                 )
                                 .await
                         }
                         MetadataSelectionMode::RefreshUnlocked => {
-                            images
-                                .download_item_image_from_scraper(
-                                    &item_id, image_type, &url, &source,
-                                )
-                                .await
+                            if image_index == 0 {
+                                images
+                                    .download_item_image_from_scraper(
+                                        &item_id, image_type, &url, &source,
+                                    )
+                                    .await
+                            } else {
+                                images
+                                    .download_item_image_from_scraper_at_index(
+                                        &item_id,
+                                        image_type,
+                                        &url,
+                                        &source,
+                                        image_index,
+                                    )
+                                    .await
+                            }
                         }
                     };
                     match result {
@@ -2326,10 +2455,38 @@ impl MetadataSelectionService {
             }
         }
         image_types.sort_unstable_by_key(|(index, _)| *index);
-        Ok(image_types
-            .into_iter()
-            .map(|(_, image_type)| image_type)
-            .collect())
+        let mut result = Vec::new();
+        for (_, image_type) in image_types {
+            if !result.contains(&image_type) {
+                result.push(image_type);
+            }
+        }
+        Ok(result)
+    }
+
+    async fn filter_new_supplemental_image_urls(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        urls: Vec<String>,
+    ) -> Result<Vec<String>, MetadataSelectionError> {
+        let mut seen = HashSet::new();
+        let mut filtered = Vec::with_capacity(urls.len());
+        for url in urls {
+            let url = url.trim().to_owned();
+            if url.is_empty() || !seen.insert(url.clone()) {
+                continue;
+            }
+            if self
+                .images
+                .image_source_url_exists(item_id, image_type, &url)
+                .await?
+            {
+                continue;
+            }
+            filtered.push(url);
+        }
+        Ok(filtered)
     }
 
     async fn image_selection_policy(
@@ -2357,6 +2514,7 @@ impl MetadataSelectionService {
 fn merge_supplemental_movie_nfo(
     candidate: &mut MovieNfoMetadata,
     existing: Option<&crate::application::nfo::LocalNfoProjection>,
+    append_lists: bool,
 ) {
     let Some(existing) = existing else {
         return;
@@ -2369,58 +2527,237 @@ fn merge_supplemental_movie_nfo(
             }
         };
     }
-    preserve!(rating);
-    preserve!(votes);
-    preserve!(tagline);
-    preserve!(premiered);
+    if append_lists {
+        replace_if_present(&mut candidate.rating, details.rating);
+        replace_if_present(&mut candidate.votes, details.votes);
+        replace_if_present(&mut candidate.tagline, details.tagline.clone());
+        replace_if_present(&mut candidate.premiered, details.premiered.clone());
+    } else {
+        preserve!(rating);
+        preserve!(votes);
+        preserve!(tagline);
+        preserve!(premiered);
+    }
     if candidate.releasedate.is_none() {
         candidate.releasedate = details.release_date.clone();
     }
-    preserve!(runtime);
-    preserve!(status);
-    preserve!(original_language);
-    preserve!(website);
-    preserve!(set_name);
-    preserve!(set_id);
-    preserve!(certification);
-    if !details.countries.is_empty() {
-        candidate.countries = details.countries.clone();
-    }
-    if !details.genres.is_empty() {
-        candidate.genres = details.genres.clone();
-    }
-    if !details.studios.is_empty() {
-        candidate.studios = details.studios.clone();
-    }
-    if !details.directors.is_empty() {
-        candidate.directors = details
-            .directors
-            .iter()
-            .map(|credit| MovieNfoCredit {
-                provider_id: credit.provider_id.clone(),
-                name: credit.name.clone(),
-            })
-            .collect();
-    }
-    if !details.writers.is_empty() {
-        candidate.writers = details
-            .writers
-            .iter()
-            .map(|credit| MovieNfoCredit {
-                provider_id: credit.provider_id.clone(),
-                name: credit.name.clone(),
-            })
-            .collect();
-    }
-    if !details.trailers.is_empty() {
-        candidate.trailers = details.trailers.clone();
-    }
-    if !existing.actors.is_empty() {
-        candidate.actors = existing.actors.clone();
+    if append_lists {
+        replace_if_present(&mut candidate.releasedate, details.release_date.clone());
+        replace_if_present(&mut candidate.runtime, details.runtime);
+        replace_if_present(&mut candidate.status, details.status.clone());
+        replace_if_present(
+            &mut candidate.original_language,
+            details.original_language.clone(),
+        );
+        replace_if_present(&mut candidate.website, details.website.clone());
+        replace_if_present(&mut candidate.set_name, details.set_name.clone());
+        replace_if_present(&mut candidate.set_id, details.set_id.clone());
+        replace_if_present(&mut candidate.certification, details.certification.clone());
+        candidate.countries = merge_string_values(&details.countries, &candidate.countries);
+        candidate.genres = merge_string_values(&details.genres, &candidate.genres);
+        candidate.studios = merge_string_values(&details.studios, &candidate.studios);
+        candidate.directors = merge_credit_values(&details.directors, &candidate.directors);
+        candidate.writers = merge_credit_values(&details.writers, &candidate.writers);
+        candidate.trailers = merge_string_values(&details.trailers, &candidate.trailers);
+        candidate.actors = merge_actor_values(&existing.actors, &candidate.actors);
+    } else {
+        preserve!(runtime);
+        preserve!(status);
+        preserve!(original_language);
+        preserve!(website);
+        preserve!(set_name);
+        preserve!(set_id);
+        preserve!(certification);
+        if !details.countries.is_empty() {
+            candidate.countries = details.countries.clone();
+        }
+        if !details.genres.is_empty() {
+            candidate.genres = details.genres.clone();
+        }
+        if !details.studios.is_empty() {
+            candidate.studios = details.studios.clone();
+        }
+        if !details.directors.is_empty() {
+            candidate.directors = details
+                .directors
+                .iter()
+                .map(|credit| MovieNfoCredit {
+                    provider_id: credit.provider_id.clone(),
+                    name: credit.name.clone(),
+                })
+                .collect();
+        }
+        if !details.writers.is_empty() {
+            candidate.writers = details
+                .writers
+                .iter()
+                .map(|credit| MovieNfoCredit {
+                    provider_id: credit.provider_id.clone(),
+                    name: credit.name.clone(),
+                })
+                .collect();
+        }
+        if !details.trailers.is_empty() {
+            candidate.trailers = details.trailers.clone();
+        }
+        if !existing.actors.is_empty() {
+            candidate.actors = existing.actors.clone();
+        }
     }
     for (provider, id) in &details.provider_ids {
-        candidate.provider_ids.insert(provider.clone(), id.clone());
+        candidate
+            .provider_ids
+            .entry(provider.clone())
+            .or_insert_with(|| id.clone());
     }
+}
+
+fn replace_if_present<T>(target: &mut Option<T>, value: Option<T>) {
+    if value.is_some() {
+        *target = value;
+    }
+}
+
+fn merge_string_values(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    for value in existing.iter().chain(incoming) {
+        let trimmed = value.trim();
+        if trimmed.is_empty()
+            || merged
+                .iter()
+                .any(|stored: &String| stored.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        merged.push(trimmed.to_owned());
+    }
+    merged
+}
+
+fn merge_credit_values(
+    existing: &[MovieNfoCredit],
+    incoming: &[MovieNfoCredit],
+) -> Vec<MovieNfoCredit> {
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    for credit in existing.iter().chain(incoming) {
+        if credit.name.trim().is_empty() {
+            continue;
+        }
+        let duplicate = merged.iter().any(|stored: &MovieNfoCredit| {
+            if !credit.provider_id.trim().is_empty() && !stored.provider_id.trim().is_empty() {
+                credit.provider_id.eq_ignore_ascii_case(&stored.provider_id)
+            } else {
+                credit.name.trim().eq_ignore_ascii_case(stored.name.trim())
+            }
+        });
+        if !duplicate {
+            merged.push(credit.clone());
+        }
+    }
+    merged
+}
+
+fn merge_actor_values(existing: &[ActorCredit], incoming: &[ActorCredit]) -> Vec<ActorCredit> {
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    for actor in existing {
+        if actor.name.trim().is_empty() {
+            continue;
+        }
+        merged.push(actor.clone());
+    }
+    for actor in incoming {
+        if actor.name.trim().is_empty() {
+            continue;
+        }
+        if let Some(stored) = merged.iter_mut().find(|stored| same_actor(stored, actor)) {
+            merge_missing_actor_fields(stored, actor);
+        } else {
+            merged.push(actor.clone());
+        }
+    }
+    merged
+}
+
+fn same_actor(left: &ActorCredit, right: &ActorCredit) -> bool {
+    if !left.id.trim().is_empty() && !right.id.trim().is_empty() {
+        left.provider
+            .as_deref()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(right.provider.as_deref().unwrap_or_default())
+            && left.id.eq_ignore_ascii_case(&right.id)
+    } else {
+        left.name.trim().eq_ignore_ascii_case(right.name.trim())
+            && left
+                .character
+                .as_deref()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(right.character.as_deref().unwrap_or_default())
+    }
+}
+
+fn merge_missing_actor_fields(target: &mut ActorCredit, incoming: &ActorCredit) {
+    if target.provider.is_none() {
+        target.provider = incoming.provider.clone();
+    }
+    fill_missing_string(&mut target.character, &incoming.character);
+    if target.order.is_none() {
+        target.order = incoming.order;
+    }
+    fill_missing_string(&mut target.profile_url, &incoming.profile_url);
+    for identity in &incoming.identities {
+        if !target.identities.iter().any(|stored| {
+            stored.provider.eq_ignore_ascii_case(&identity.provider)
+                && stored.id.eq_ignore_ascii_case(&identity.id)
+        }) {
+            target.identities.push(identity.clone());
+        }
+    }
+    match (&mut target.person, &incoming.person) {
+        (Some(target), Some(incoming)) => merge_missing_person_fields(target, incoming),
+        (None, Some(incoming)) => target.person = Some(incoming.clone()),
+        _ => {}
+    }
+}
+
+fn fill_missing_string(target: &mut Option<String>, incoming: &Option<String>) {
+    if target
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && incoming
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        *target = incoming.clone();
+    }
+}
+
+fn merge_missing_person_fields(
+    target: &mut crate::application::people::PersonMetadata,
+    incoming: &crate::application::people::PersonMetadata,
+) {
+    fill_missing_string(&mut target.biography, &incoming.biography);
+    fill_missing_string(&mut target.birthday, &incoming.birthday);
+    fill_missing_string(&mut target.deathday, &incoming.deathday);
+    fill_missing_string(
+        &mut target.known_for_department,
+        &incoming.known_for_department,
+    );
+    fill_missing_string(&mut target.place_of_birth, &incoming.place_of_birth);
+    if target.production_year.is_none() {
+        target.production_year = incoming.production_year;
+    }
+    fill_missing_string(&mut target.premiere_date, &incoming.premiere_date);
+    for (provider, id) in &incoming.provider_ids {
+        target
+            .provider_ids
+            .entry(provider.clone())
+            .or_insert_with(|| id.clone());
+    }
+    target.genres = merge_string_values(&target.genres, &incoming.genres);
+    target.tags = merge_string_values(&target.tags, &incoming.tags);
+    target.production_locations =
+        merge_string_values(&target.production_locations, &incoming.production_locations);
+    target.taglines = merge_string_values(&target.taglines, &incoming.taglines);
 }
 
 fn preserve_supplemental_scalar_values(
@@ -2498,7 +2835,7 @@ fn fill_missing_scalar_values_complete(current: &StoredMediaMetadata) -> bool {
     }
 }
 
-fn has_selected_provider_id(current: &StoredMediaMetadata) -> bool {
+pub(crate) fn has_selected_provider_id(current: &StoredMediaMetadata) -> bool {
     let Some(scraper) = current
         .metadata_scraper_id
         .as_deref()
@@ -3161,7 +3498,8 @@ mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, candidate_actors, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
-        metadata_match_score, metadata_request_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_match_score,
+        metadata_request_plan,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3326,6 +3664,7 @@ mod tests {
             rating: Some(8.0),
             provider_ids_json: Some(json!({"tmdb": "1", "imdb": "tt1"}).to_string()),
             metadata_scraper_id: Some("tmdb".to_owned()),
+            identification_status: "ONLINE_CONFIRMED".to_owned(),
             scraper_id: Some("tmdb".to_owned()),
             provenance_json: Some(
                 json!({
@@ -3382,6 +3721,7 @@ mod tests {
             rating: Some(8.0),
             provider_ids_json: Some(json!({"tmdb": "1", "imdb": "tt1"}).to_string()),
             metadata_scraper_id: Some("tmdb".to_owned()),
+            identification_status: "ONLINE_CONFIRMED".to_owned(),
             scraper_id: Some("tmdb".to_owned()),
             provenance_json: Some(
                 json!({
@@ -3532,6 +3872,123 @@ mod tests {
                 Some(2015),
             ),
             45.0
+        );
+    }
+
+    #[test]
+    fn supplemental_merge_appends_unique_lists_and_keeps_existing_first() {
+        let mut candidate = crate::application::nfo::MovieNfoMetadata {
+            genres: vec!["动作".to_owned(), "科幻".to_owned()],
+            studios: vec!["主制作公司".to_owned()],
+            directors: vec![crate::application::nfo::MovieNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "主导演".to_owned(),
+            }],
+            actors: vec![super::ActorCredit {
+                id: "actor-2".to_owned(),
+                provider: Some("supplement".to_owned()),
+                identities: Vec::new(),
+                name: "补充演员".to_owned(),
+                character: None,
+                order: Some(1),
+                profile_url: None,
+                person: None,
+            }],
+            provider_ids: [
+                ("tmdb".to_owned(), "main-1".to_owned()),
+                ("imdb".to_owned(), "tt-supplement".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            trailers: vec!["https://video.example/supplement".to_owned()],
+            ..Default::default()
+        };
+        let existing = crate::application::nfo::LocalNfoProjection {
+            details: crate::application::nfo::LocalNfoDetails {
+                genres: vec!["动作".to_owned(), "本地类型".to_owned()],
+                studios: vec!["主制作公司".to_owned(), "本地制作公司".to_owned()],
+                directors: vec![crate::application::nfo::LocalNfoCredit {
+                    provider_id: "director-1".to_owned(),
+                    name: "主导演".to_owned(),
+                }],
+                provider_ids: [("tmdb".to_owned(), "local-1".to_owned())]
+                    .into_iter()
+                    .collect(),
+                trailers: vec!["https://video.example/main".to_owned()],
+                ..Default::default()
+            },
+            actors: vec![super::ActorCredit {
+                id: "actor-1".to_owned(),
+                provider: Some("main".to_owned()),
+                identities: Vec::new(),
+                name: "主演员".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+            ..Default::default()
+        };
+
+        merge_supplemental_movie_nfo(&mut candidate, Some(&existing), true);
+
+        assert_eq!(candidate.genres, ["动作", "本地类型", "科幻"]);
+        assert_eq!(candidate.studios, ["主制作公司", "本地制作公司"]);
+        assert_eq!(candidate.directors.len(), 1);
+        assert_eq!(
+            candidate.trailers,
+            [
+                "https://video.example/main",
+                "https://video.example/supplement"
+            ]
+        );
+        assert_eq!(candidate.actors.len(), 2);
+        assert_eq!(candidate.provider_ids["tmdb"], "main-1");
+        assert_eq!(candidate.provider_ids["imdb"], "tt-supplement");
+    }
+
+    #[test]
+    fn supplemental_actor_merge_fills_missing_fields_without_duplicate() {
+        let existing = [super::ActorCredit {
+            id: "actor-1".to_owned(),
+            provider: Some("main".to_owned()),
+            identities: Vec::new(),
+            name: "主演员".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let incoming = [super::ActorCredit {
+            id: "actor-1".to_owned(),
+            provider: Some("main".to_owned()),
+            identities: Vec::new(),
+            name: "补充来源演员名".to_owned(),
+            character: Some("补充角色".to_owned()),
+            order: Some(4),
+            profile_url: Some("https://images.example/actor-1.jpg".to_owned()),
+            person: Some(crate::application::people::PersonMetadata {
+                biography: Some("补充人物简介".to_owned()),
+                ..Default::default()
+            }),
+        }];
+
+        let merged = merge_actor_values(&existing, &incoming);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "主演员");
+        assert_eq!(merged[0].character.as_deref(), Some("补充角色"));
+        assert_eq!(merged[0].order, Some(0));
+        assert_eq!(
+            merged[0].profile_url.as_deref(),
+            Some("https://images.example/actor-1.jpg")
+        );
+        assert_eq!(
+            merged[0]
+                .person
+                .as_ref()
+                .and_then(|person| person.biography.as_deref()),
+            Some("补充人物简介")
         );
     }
 }

@@ -277,6 +277,7 @@ function GlobalStrategyPanel({
             <ScraperSelect id="global-strategy-scraper" value={strategy.scraperId ?? ""} plugins={plugins} onChange={(value) => onChange({ ...strategy, scraperId: value || null })} />
           </div>
           <p className="lux-library-strategy-help">仅补全只写入缺失内容；完整刮削会替换已有图片，但锁定的 NFO 字段不会被替换。</p>
+          <StrategyToggle label="额外保存元数据到 metadata" description="同时保存一份 NFO 和图片配置卷镜像" checked={strategy.images.writeToMetadata} onChange={(checked) => updateImages("writeToMetadata", checked)} />
         </section>
 
         <section className="lux-library-strategy-card lux-library-strategy-card-wide">
@@ -480,6 +481,7 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
         <StrategyToggle label="缩略图" checked={draft.images.thumbnail} onChange={(checked) => updateImages("thumbnail", checked)} />
         <StrategyToggle label="光盘封面" checked={draft.images.disc} onChange={(checked) => updateImages("disc", checked)} />
         <StrategyToggle label="壁纸" checked={draft.images.wallpaper} onChange={(checked) => updateImages("wallpaper", checked)} />
+        <StrategyToggle label="额外保存元数据到 metadata" checked={draft.images.writeToMetadata} onChange={(checked) => updateImages("writeToMetadata", checked)} />
       </div>
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />

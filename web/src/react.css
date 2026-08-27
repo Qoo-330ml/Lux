@@ -329,7 +329,14 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-editor-section-label { display: block; margin-bottom: 10px; color: var(--lux-muted); font-size: .74rem; }
 .lux-image-editor-current { margin-top: 20px; }
 .lux-image-current-card { display: grid; place-items: center; width: 145px; aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-subtle); background: rgba(255,255,255,.035); }
+.lux-image-current-card[data-image-type="LOGO"], .lux-image-result[data-image-type="LOGO"] img,
+.lux-image-current-card[data-image-type="BANNER"], .lux-image-result[data-image-type="BANNER"] img { aspect-ratio: 3 / 1; }
+.lux-image-current-card[data-image-type="THUMB"], .lux-image-result[data-image-type="THUMB"] img,
+.lux-image-current-card[data-image-type="ART"], .lux-image-result[data-image-type="ART"] img,
+.lux-image-current-card[data-image-type="WALLPAPER"], .lux-image-result[data-image-type="WALLPAPER"] img { aspect-ratio: 16 / 9; }
+.lux-image-current-card[data-image-type="DISC"], .lux-image-result[data-image-type="DISC"] img { aspect-ratio: 1 / 1; }
 .lux-image-current-card img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-image-current-card[data-image-type="LOGO"] img, .lux-image-result[data-image-type="LOGO"] img { object-fit: contain; }
 .lux-image-current-card > div { display: grid; justify-items: center; gap: 8px; padding: 12px; text-align: center; }
 .lux-image-current-card span, .lux-image-result span { font-size: .7rem; }
 .lux-image-results { margin-top: 22px; }

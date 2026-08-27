@@ -90,7 +90,7 @@ const settings: AdminSettings = {
     region: "CN",
     scraperId: null,
     applyScope: "NEW_CONTENT",
-    images: { poster: true, artwork: false, banner: false, logo: true, thumbnail: true, disc: false, wallpaper: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
+    images: { poster: true, artwork: false, banner: false, logo: true, thumbnail: true, disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
     subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
   },
 };
