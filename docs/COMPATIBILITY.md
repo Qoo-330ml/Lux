@@ -178,6 +178,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - LUX-161 允许本地绝对路径型 `.strm` 直接指向媒体库根目录之外的可读普通文件，无需额外配置；专项回归覆盖 Web/Emby 视频入口的 Range 响应和原始 `.strm` 内容保持不变。本机 ARM 架构验证为 `arm64`；部署后仍需用实际 Web、Emby 和第三方播放器复测，不能仅凭服务端测试宣称客户端兼容。
 - LUX-151 IP 归属地只扩展 Lux 管理员 Web 仪表盘的 `nowPlaying` 数据，不改变 VidHub、SenPlayer 或 Infuse 的 Emby 兼容接口；Hiofd 出站可用性和归属地准确性尚未做目标 NAS 现场验证。
 - LUX-165 图片资源布局回归：Rust 集成测试已验证新下载图片写入 `/config/metadata/library/<shard>/<item-id>/`，Lux/Emby 图片端点可读取该路径，媒体目录本地图片仍可读取，且删除仅允许两类受保护根目录；这属于服务端协议回归，不替代 VidHub、SenPlayer 或 Infuse 的真实客户端复测。
+- LUX-202 元数据资源布局回归：新生成或回写的电影、剧集、季、集 NFO 和 Lux 管理图片默认写入媒体目录旁车；策略开启时同一份 NFO/图片额外原子镜像到 `/config/metadata/library/<shard>/<item-id>/`，图片数据库路径仍指向媒体目录，删除图片会清理镜像。全局和媒体库覆盖的策略 API 与 Web 管理开关已有回归测试；这属于服务端存储行为，不改变主刮削器、备用刮削器或补充刮削器的选择逻辑。
 - 本地 NFO 派生缓存回归：详情接口只读取数据库快照；快照损坏或过大时会清理该派生行并继续返回基础条目，演员关系或人物头像损坏时保留演员文字信息并由 Web 使用人物占位图标。该行为已由 `tests/catalog.rs`、`tests/metadata.rs` 和人物单元测试覆盖，尚未替代第三方客户端现场复测。
 - LUX-166 元数据对象路径回归：Rust 路径契约测试已验证 `collections`、`genres`、`studios`、`tags` 的展示名桶、provider/object ID 身份和越界拒绝；本任务不改变客户端 API 行为。
 - LUX-167 元数据对象快照回归：合集刷新协议测试已验证数据库关系更新后生成 `collection.json`，快照写入失败映射为可重试的服务错误；genres、studios、tags 尚无在线对象数据源，因此仅验证共用存储能力。
