@@ -15,6 +15,27 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.0",
+    date: "2026-08-27",
+    sections: [
+      { kind: "added", items: [
+        "增加供应商无关的 metadata 插件兼容层，支持稳定的 providerKey、aliases、通用 RPC 和透明的 provider ID。",
+        "增加 metadata 插件专属配置路径与旧版 TMDb 配置的一次性兼容迁移，降低插件对服务器其他配置和凭据的可见范围。",
+        "增加首页和媒体库查询的批量读取路径，减少大媒体库场景下的重复数据库查询。",
+      ] },
+      { kind: "fixed", items: [
+        "修复旧版 metadata 配置迁移重复执行或覆盖已有插件配置的问题，并保留旧配置文件以便回滚。",
+        "修复目录和首页缓存刷新事件持续重置防抖窗口、导致缓存刷新可能长期饥饿的问题。",
+        "修复内嵌插件目录中的 TMDb、豆瓣包校验值与实际发布包不一致的问题。",
+      ] },
+      { kind: "changed", items: [
+        "TMDb、豆瓣的上游 HTTP 客户端、DTO、认证和图片处理从 Lux 主程序移至独立插件；主程序不再编译或创建内置 TMDb provider。",
+        "metadata 插件配置改由 manifest 字段和插件专属文件管理，具体 provider 的健康状态与配置由插件负责；主程序健康检查和网络诊断不再硬编码 TMDb。",
+        "自动生成的媒体库封面默认调整为 1280×720，并同步优化标题与副标题的排版比例。",
+      ] },
+    ],
+  },
+  {
     version: "0.2.9",
     date: "2026-08-27",
     sections: [
