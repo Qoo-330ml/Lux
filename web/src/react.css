@@ -656,7 +656,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-player-caption-overlay { position: absolute; right: calc(8% + env(safe-area-inset-right)); bottom: calc(13% + env(safe-area-inset-bottom)); left: calc(8% + env(safe-area-inset-left)); display: flex; justify-content: center; z-index: 8; pointer-events: none; text-align: center; }
 .lux-player-caption-text { max-width: min(100%, 72rem); padding: 4px 9px; border-radius: 4px; color: #fff; background: rgba(0,0,0,.68); box-shadow: 0 1px 2px rgba(0,0,0,.75); font-size: clamp(1rem, 2.2vw, 1.65rem); font-weight: 600; line-height: 1.45; text-wrap: balance; white-space: pre-line; }
-.lux-player-danmaku-overlay { position: absolute; inset: 0; z-index: 7; overflow: hidden; pointer-events: none; }
+.lux-player-danmaku-overlay { position: absolute; inset: clamp(88px, 12vh, 120px) 0 clamp(92px, 18vh, 156px) 0; z-index: 7; overflow: hidden; pointer-events: none; }
 .lux-player-danmaku-text { position: absolute; display: block; max-width: 90%; overflow: hidden; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; line-height: 1.2; text-shadow: 0 1px 2px rgba(0,0,0,.95), 1px 0 2px rgba(0,0,0,.7), -1px 0 2px rgba(0,0,0,.7); white-space: pre-line; }
 .lux-player-danmaku-top, .lux-player-danmaku-bottom { left: 50% !important; max-width: min(90%, 72rem); transform: translateX(-50%); text-align: center; }
 

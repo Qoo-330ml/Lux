@@ -32,6 +32,17 @@ export const DANMAKU_LIMITS = {
   maxVisible: 80,
 } as const;
 
+const SCROLL_LINE_HEIGHT = 32;
+const FIXED_LINE_HEIGHT = 34;
+
+function laneGeometry(height: number) {
+  const fixedLaneCount = Math.max(2, Math.min(4, Math.floor((height * 0.16) / FIXED_LINE_HEIGHT)));
+  const fixedBandHeight = fixedLaneCount * FIXED_LINE_HEIGHT + 8;
+  const availableScrollHeight = Math.max(SCROLL_LINE_HEIGHT * 4, height - fixedBandHeight * 2);
+  const scrollLaneCount = Math.max(4, Math.min(18, Math.floor((availableScrollHeight * 0.64) / SCROLL_LINE_HEIGHT)));
+  return { fixedLaneCount, fixedBandHeight, scrollLaneCount };
+}
+
 export type DanmakuParseErrorCode =
   | "INVALID_XML"
   | "INPUT_TOO_LARGE"
@@ -158,10 +169,7 @@ export function assignDanmakuLanes(
 ): ScheduledDanmaku[] {
   const width = Math.max(1, viewport.width);
   const height = Math.max(1, viewport.height);
-  const scrollLineHeight = 32;
-  const fixedLineHeight = 34;
-  const scrollLaneCount = Math.max(4, Math.min(18, Math.floor((height * 0.64) / scrollLineHeight)));
-  const fixedLaneCount = Math.max(2, Math.min(4, Math.floor((height * 0.16) / fixedLineHeight)));
+  const { fixedLaneCount, scrollLaneCount } = laneGeometry(height);
   const lastByMode: Record<DanmakuMode, Array<ScheduledDanmaku | undefined>> = {
     scroll: Array.from({ length: scrollLaneCount }),
     top: Array.from({ length: fixedLaneCount }),
@@ -170,7 +178,7 @@ export function assignDanmakuLanes(
   const result: ScheduledDanmaku[] = [];
 
   for (const entry of [...entries].sort((left, right) => left.start - right.start)) {
-    const lineHeight = entry.mode === "scroll" ? scrollLineHeight : fixedLineHeight;
+    const lineHeight = entry.mode === "scroll" ? SCROLL_LINE_HEIGHT : FIXED_LINE_HEIGHT;
     const duration = entry.mode === "scroll" ? 8 : 4;
     const estimatedWidth = Math.min(width * 0.9, Math.max(48, entry.text.length * entry.fontSize * 0.95 + 16));
     const lanes = lastByMode[entry.mode];
@@ -202,6 +210,7 @@ export function activeDanmaku(
   if (!Number.isFinite(time) || time < 0) return [];
   const width = Math.max(1, viewport.width);
   const height = Math.max(1, viewport.height);
+  const { fixedBandHeight } = laneGeometry(height);
   const candidates = entries
     .filter((entry) => time >= entry.start && time < entry.start + entry.duration)
     .sort((left, right) => right.start - left.start);
@@ -220,10 +229,10 @@ export function activeDanmaku(
       ? width - progress * (width + entry.estimatedWidth)
       : width / 2;
     const y = entry.mode === "bottom"
-      ? height - (entry.lane + 1) * entry.lineHeight - 8
+      ? height - (entry.lane + 1) * FIXED_LINE_HEIGHT - 8
       : entry.mode === "top"
-        ? entry.lane * entry.lineHeight + 8
-        : entry.lane * entry.lineHeight + 8;
+        ? entry.lane * FIXED_LINE_HEIGHT + 8
+        : fixedBandHeight + entry.lane * SCROLL_LINE_HEIGHT + 8;
     selected.push({ ...entry, x, y, progress });
   }
   return selected.sort((left, right) => left.start - right.start);

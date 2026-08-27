@@ -11,3 +11,10 @@ test("LuxPlayer reserves dynamic viewport and safe-area space for mobile control
   assert.match(styles, /\.lux-player-controls-wrap \{[^}]*bottom: calc\(10px \+ env\(safe-area-inset-bottom\)\)/);
   assert.match(styles, /\.lux-player-settings-popover \{[^}]*right: calc\(2% \+ env\(safe-area-inset-right\)\)/);
 });
+
+test("LuxPlayer keeps danmaku out of the title and control safe zones", () => {
+  assert.match(
+    styles,
+    /\.lux-player-danmaku-overlay \{[^}]*inset: clamp\(88px, 12vh, 120px\) 0 clamp\(92px, 18vh, 156px\) 0/,
+  );
+});

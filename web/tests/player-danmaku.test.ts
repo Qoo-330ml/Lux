@@ -69,6 +69,13 @@ describe("LuxPlayer danmaku lane scheduler", () => {
       expect.objectContaining({ id: "danmaku-2", lane: 0, duration: 4 }),
       expect.objectContaining({ id: "danmaku-3", lane: 0, duration: 4 }),
     ]);
+    const safeZoneEntries = [entries[0]!, entries[2]!, entries[3]!];
+    const placements = activeDanmaku(
+      assignDanmakuLanes(safeZoneEntries, { width: 390, height: 590 }),
+      2.5,
+      { width: 390, height: 590 },
+    );
+    expect(new Set(placements.map((placement) => placement.y)).size).toBe(3);
   });
 
   it("keeps scheduling bounded and activates only entries at the playback time", () => {
