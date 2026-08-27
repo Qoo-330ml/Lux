@@ -1,4 +1,7 @@
 import type { MediaSource, MediaStream } from "../../../lib/api/types";
+import type { CaptionFormat } from "../caption-parser";
+
+export type PlayerCaptionRenderMode = "native" | "overlay";
 
 export type PlayerCaptionOption = {
   streamIndex: number;
@@ -9,6 +12,8 @@ export type PlayerCaptionOption = {
   language?: string;
   isDefault: boolean;
   isForced: boolean;
+  format?: CaptionFormat;
+  renderMode?: PlayerCaptionRenderMode;
 };
 
 export type PlayerNativeCaptionTrack = {
@@ -16,6 +21,10 @@ export type PlayerNativeCaptionTrack = {
   label: string;
   language?: string;
   src: string;
+};
+
+export type PlayerOverlayCaptionSource = PlayerNativeCaptionTrack & {
+  format: CaptionFormat;
 };
 
 export function playerCaptionOptions(
@@ -26,7 +35,9 @@ export function playerCaptionOptions(
     .filter(isSubtitleStream)
     .filter((stream): stream is MediaStream & { index: number } => Number.isInteger(stream.index) && stream.index >= 0)
     .map((stream) => {
-      const unavailableReason = captionUnavailableReason(stream, nativeTracksSupported);
+      const format = captionFormat(stream);
+      const renderMode = format === "vtt" && nativeTracksSupported ? "native" : "overlay";
+      const unavailableReason = captionUnavailableReason(stream, format);
       const name = captionName(stream);
       return {
         streamIndex: stream.index,
@@ -37,6 +48,8 @@ export function playerCaptionOptions(
         language: normalizedText(stream.language),
         isDefault: stream.isDefault === true,
         isForced: stream.isForced === true,
+        format,
+        renderMode,
       };
     });
 }
@@ -52,7 +65,7 @@ export function nativeCaptionTrack(
   sourceId: string,
   option: PlayerCaptionOption | null | undefined,
 ): PlayerNativeCaptionTrack | null {
-  if (!option?.available || !itemId || !sourceId) return null;
+  if (!option?.available || option.renderMode !== "native" || !itemId || !sourceId) return null;
   return {
     id: `caption-${option.streamIndex}`,
     label: option.name,
@@ -61,15 +74,38 @@ export function nativeCaptionTrack(
   };
 }
 
+export function overlayCaptionSource(
+  itemId: string,
+  sourceId: string,
+  option: PlayerCaptionOption | null | undefined,
+): PlayerOverlayCaptionSource | null {
+  if (!option?.available || option.renderMode !== "overlay" || !option.format || !itemId || !sourceId) {
+    return null;
+  }
+  return {
+    id: `caption-${option.streamIndex}`,
+    label: option.name,
+    language: option.language,
+    format: option.format,
+    src: `/api/v1/items/${encodeURIComponent(itemId)}/subtitles/${option.streamIndex}?sourceId=${encodeURIComponent(sourceId)}`,
+  };
+}
+
 function isSubtitleStream(stream: MediaStream) {
   return stream.type?.toUpperCase() === "SUBTITLE";
 }
 
-function captionUnavailableReason(stream: MediaStream, nativeTracksSupported: boolean) {
-  if (!nativeTracksSupported) return "浏览器不支持原生字幕";
+function captionUnavailableReason(stream: MediaStream, format: CaptionFormat | undefined) {
   if (stream.isExternal !== true) return "内嵌字幕将在后续支持";
-  if (stream.codec?.toLowerCase() !== "vtt") return "当前仅支持外挂 WebVTT";
+  if (!format) return "当前不支持此字幕格式";
   return undefined;
+}
+
+function captionFormat(stream: MediaStream): CaptionFormat | undefined {
+  const codec = stream.codec?.trim().toLowerCase();
+  return codec === "srt" || codec === "ass" || codec === "ssa" || codec === "vtt"
+    ? codec
+    : undefined;
 }
 
 function captionLabel(name: string, stream: MediaStream, unavailable: boolean) {

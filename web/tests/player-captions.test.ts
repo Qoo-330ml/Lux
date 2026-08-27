@@ -22,7 +22,7 @@ describe("LuxPlayer caption selection", () => {
 
     expect(options).toEqual([
       expect.objectContaining({ streamIndex: 2, label: "简体中文 · 默认", available: true }),
-      expect.objectContaining({ streamIndex: 3, label: "English · 暂不支持", available: false }),
+      expect.objectContaining({ streamIndex: 3, label: "English", available: true, format: "srt", renderMode: "overlay" }),
       expect.objectContaining({ streamIndex: 4, label: "内嵌日文 · 强制 · 暂不支持", available: false }),
     ]);
     expect(defaultCaptionSelection(options)?.streamIndex).toBe(2);
@@ -38,5 +38,20 @@ describe("LuxPlayer caption selection", () => {
       src: "/api/v1/items/item%20%2F%20%E7%94%B5%E5%BD%B1/subtitles/2?sourceId=source%20%2F%204k",
     });
     expect(nativeCaptionTrack("item", source.id, playerCaptionOptions(source, true)[1])).toBeNull();
+  });
+
+  it("uses the Lux overlay for SRT and ASS while keeping VTT native when available", () => {
+    const options = playerCaptionOptions({
+      id: "source-text",
+      streams: [
+        { index: 1, type: "SUBTITLE", codec: "ass", title: "样式字幕", isExternal: true },
+        { index: 2, type: "SUBTITLE", codec: "vtt", title: "浏览器字幕", isExternal: true },
+      ],
+    }, true);
+
+    expect(options).toEqual([
+      expect.objectContaining({ format: "ass", renderMode: "overlay", available: true }),
+      expect.objectContaining({ format: "vtt", renderMode: "native", available: true }),
+    ]);
   });
 });
