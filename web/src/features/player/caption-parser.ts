@@ -49,6 +49,23 @@ export function parseCaptionText(input: string, format: CaptionFormat): LuxCapti
     .map((cue, index) => ({ ...cue, id: `cue-${index}` }));
 }
 
+export function activeCaptionCue(cues: readonly LuxCaptionCue[], time: number) {
+  if (!Number.isFinite(time) || time < 0 || cues.length === 0) return null;
+  let low = 0;
+  let high = cues.length - 1;
+  let candidate = -1;
+  while (low <= high) {
+    const middle = Math.floor((low + high) / 2);
+    if (cues[middle].start <= time) {
+      candidate = middle;
+      low = middle + 1;
+    } else {
+      high = middle - 1;
+    }
+  }
+  return candidate >= 0 && time < cues[candidate].end ? cues[candidate] : null;
+}
+
 function parseSrt(input: string): LuxCaptionCue[] {
   const cues: LuxCaptionCue[] = [];
   for (const block of nonEmptyBlocks(input)) {

@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  activeCaptionCue,
   CaptionParseError,
+  type LuxCaptionCue,
   parseCaptionText,
 } from "../src/features/player/caption-parser";
 import { parseCaptionWorkerRequest } from "../src/features/player/caption-parser-worker";
@@ -64,5 +66,16 @@ describe("LuxPlayer safe caption parser", () => {
       requestId: 8,
       message: "字幕条目格式无效",
     });
+  });
+
+  it("finds only the cue active at the current playback time", () => {
+    const cues: LuxCaptionCue[] = [
+      { id: "cue-0", start: 1, end: 3, text: "one" },
+      { id: "cue-1", start: 5, end: 8, text: "two" },
+    ];
+    expect(activeCaptionCue(cues, 2)?.text).toBe("one");
+    expect(activeCaptionCue(cues, 3)).toBeNull();
+    expect(activeCaptionCue(cues, 6)?.text).toBe("two");
+    expect(activeCaptionCue(cues, 9)).toBeNull();
   });
 });

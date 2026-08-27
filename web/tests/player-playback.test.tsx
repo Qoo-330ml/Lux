@@ -469,6 +469,61 @@ describe("PlayerPage playback synchronization", () => {
     expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeSelection);
   });
 
+  it("renders selected SRT through the Lux text overlay without executing markup", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-srt-caption",
+      title: "SRT 字幕测试",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "source-srt",
+        isDefault: true,
+        streams: [{ index: 4, type: "SUBTITLE", codec: "srt", language: "zho", title: "中文", isExternal: true, isDefault: true }],
+      }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      headers: new Headers({ "content-length": "52" }),
+      body: null,
+      text: async () => "1\n00:00:00,000 --> 00:00:04,000\n<b>纯文本</b>",
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-srt-caption"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const text = container.querySelector<HTMLElement>(".lux-player-caption-text");
+    expect(text?.textContent).toBe("<b>纯文本</b>");
+    expect(text?.firstChild?.nodeType).toBe(Node.TEXT_NODE);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/items/movie-srt-caption/subtitles/4?sourceId=source-srt",
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(container.querySelector("script")).toBeNull();
+  });
+
   it("creates a local PNG from the current video frame without playback requests", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-screenshot",

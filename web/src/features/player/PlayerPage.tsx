@@ -34,6 +34,7 @@ import { LuxPlayer } from "./components/lux-player";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerTopBar } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
+import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -43,6 +44,7 @@ import { usePlayerPlatform } from "./components/player-platform";
 import {
   defaultCaptionSelection,
   nativeCaptionTrack,
+  overlayCaptionSource,
   playerCaptionOptions,
 } from "./components/player-captions";
 
@@ -215,6 +217,7 @@ export function PlayerPage() {
     ? captionOptions.find((caption) => caption.streamIndex === selectedCaptionStreamIndex && caption.available) ?? null
     : null;
   const captionTrack = nativeCaptionTrack(itemId, source?.id ?? "", selectedCaptionOption);
+  const captionOverlaySource = overlayCaptionSource(itemId, source?.id ?? "", selectedCaptionOption);
   const playbackKey = `${itemId}:${source?.id ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(playbackKey);
   const sessionStartedRef = useRef(false);
@@ -1070,6 +1073,7 @@ export function PlayerPage() {
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
         captionTrack={captionTrack}
+        captionLifecycleKey={playbackKey}
         onCaptionTrackLoad={() => setCaptionStatus(null)}
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
@@ -1077,6 +1081,12 @@ export function PlayerPage() {
         showError={failedStreamUrl === streamUrl || !streamUrl}
         onRetry={() => window.location.reload()}
         onBack={handleBack}
+      />
+      <PlayerCaptionOverlay
+        source={captionOverlaySource}
+        currentTime={currentTime}
+        lifecycleKey={playbackKey}
+        onStatusChange={setCaptionStatus}
       />
 
       {/* Floating Vignette Shadows */}

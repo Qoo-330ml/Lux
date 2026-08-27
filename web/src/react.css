@@ -654,6 +654,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-player-screenshot-status { position: absolute; bottom: calc(77px + env(safe-area-inset-bottom)); left: 50%; max-width: min(90vw, 420px); padding: 8px 13px; border: 1px solid rgba(255,255,255,.18); border-radius: 5px; transform: translateX(-50%); color: #fff; background: rgba(16,16,18,.8); box-shadow: 0 8px 22px rgba(0,0,0,.3); font-size: .78rem; z-index: 15; }
 
+.lux-player-caption-overlay { position: absolute; right: calc(8% + env(safe-area-inset-right)); bottom: calc(13% + env(safe-area-inset-bottom)); left: calc(8% + env(safe-area-inset-left)); display: flex; justify-content: center; z-index: 8; pointer-events: none; text-align: center; }
+.lux-player-caption-text { max-width: min(100%, 72rem); padding: 4px 9px; border-radius: 4px; color: #fff; background: rgba(0,0,0,.68); box-shadow: 0 1px 2px rgba(0,0,0,.75); font-size: clamp(1rem, 2.2vw, 1.65rem); font-weight: 600; line-height: 1.45; text-wrap: balance; white-space: pre-line; }
+
 .lux-player-settings-popover { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(70px + env(safe-area-inset-bottom)); width: 270px; padding: 16px; border: 1px solid rgba(255,255,255,.15); border-radius: 16px; background: rgba(18,18,26,.88); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); box-shadow: 0 20px 50px rgba(0,0,0,.6); z-index: 20; color: #fff; animation: lux-popover-in .2s var(--lux-ease); }
 @keyframes lux-popover-in { from { opacity: 0; transform: translateY(8px) scale(.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
 .lux-player-settings-header { display: flex; align-items: center; justify-content: space-between; font-size: .88rem; font-weight: 600; padding-bottom: 10px; border-bottom: 1px solid var(--lux-line-soft); }

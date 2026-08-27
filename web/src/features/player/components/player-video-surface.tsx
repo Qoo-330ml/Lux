@@ -24,6 +24,7 @@ type PlayerVideoSurfaceProps = {
   onTimeUpdate?: () => void;
   onEnded?: () => void;
   captionTrack?: PlayerNativeCaptionTrack | null;
+  captionLifecycleKey?: string;
   onCaptionTrackLoad?: () => void;
   onCaptionTrackError?: () => void;
   playing?: boolean;
@@ -63,6 +64,7 @@ export function PlayerVideoSurface({
   onTimeUpdate,
   onEnded,
   captionTrack = null,
+  captionLifecycleKey = "",
   onCaptionTrackLoad,
   onCaptionTrackError,
   playing = false,
@@ -113,7 +115,7 @@ export function PlayerVideoSurface({
     return () => {
       nativeTrack.mode = "disabled";
     };
-  }, [captionTrack?.id, captionTrack?.src]);
+  }, [captionLifecycleKey, captionTrack?.id, captionTrack?.src]);
 
   return (
     <div className="lux-player-frame">
@@ -140,7 +142,7 @@ export function PlayerVideoSurface({
         >
           {captionTrack ? (
             <track
-              key={captionTrack.src}
+              key={`${captionTrack.src}:${captionLifecycleKey}`}
               ref={captionTrackRef}
               kind="subtitles"
               label={captionTrack.label}
