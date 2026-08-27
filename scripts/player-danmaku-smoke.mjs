@@ -23,6 +23,8 @@ let captureBrowserDiagnostics = false;
 const externalRequests = [];
 const compatibilityDanmakuRequests = [];
 const danmakuResponses = [];
+const playbackPlans = [];
+const playbackPlanReads = [];
 
 page.on("console", (message) => {
   if (!captureBrowserDiagnostics) return;
@@ -42,6 +44,11 @@ page.on("request", (request) => {
 });
 page.on("response", (response) => {
   const url = new URL(response.url());
+  if (url.pathname === "/api/v1/playback/sessions" && response.request().method() === "POST") {
+    playbackPlanReads.push(response.json().then((body) => {
+      playbackPlans.push({ type: body?.plan?.type || null });
+    }).catch(() => undefined));
+  }
   if (url.pathname.includes("/danmaku")) {
     const match = [...danmakuResponses].reverse().find((entry) => entry.path === url.pathname && entry.status === null);
     if (match) match.status = response.status();
@@ -58,7 +65,9 @@ await Promise.all([
 captureBrowserDiagnostics = true;
 
 const playerUrl = `${baseUrl}/watch/${encodeURIComponent(itemId)}${sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : ""}`;
-await page.goto(playerUrl, { waitUntil: "networkidle" });
+// HLS keeps requesting playlists/segments while playing, so networkidle is
+// not a stable readiness signal for the player route.
+await page.goto(playerUrl, { waitUntil: "domcontentloaded" });
 await page.locator(".lux-player-page").waitFor({ state: "visible" });
 await page.locator("video.lux-video").waitFor({ state: "attached" });
 await page.locator("[data-lux-danmaku-overlay]").waitFor({ state: "attached" });
@@ -117,6 +126,7 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 768, height: 1024 
 const result = {
   viewportChecks,
   danmakuResponses: danmakuResponses.map(({ method, path, status }) => ({ method, path, status })),
+  playbackPlans,
   hasRawRead: danmakuResponses.some(({ path, status }) => path.endsWith("/danmaku/raw") && status === 200),
   safeZone,
   compatibilityDanmakuRequests,
@@ -125,6 +135,7 @@ const result = {
   consoleWarnings,
   pageErrors,
 };
+await Promise.all(playbackPlanReads);
 console.log(JSON.stringify(result, null, 2));
 await browser.close();
 
