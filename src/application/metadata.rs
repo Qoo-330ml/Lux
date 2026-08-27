@@ -456,7 +456,7 @@ fn image_type_for_media(path: &Path, media_stem: &str) -> Option<ImageType> {
     .into_iter()
     .find_map(|(suffix, image_type)| {
         let expected = format!("{media_stem}-{suffix}");
-        matches_indexed_stem(&stem, &expected).then_some(image_type)
+        matches_indexed_stem(stem, &expected).then_some(image_type)
     })
 }
 
