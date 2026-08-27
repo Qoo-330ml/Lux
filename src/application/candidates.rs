@@ -3664,6 +3664,7 @@ mod tests {
             rating: Some(8.0),
             provider_ids_json: Some(json!({"tmdb": "1", "imdb": "tt1"}).to_string()),
             metadata_scraper_id: Some("tmdb".to_owned()),
+            identification_status: "ONLINE_CONFIRMED".to_owned(),
             scraper_id: Some("tmdb".to_owned()),
             provenance_json: Some(
                 json!({
@@ -3720,6 +3721,7 @@ mod tests {
             rating: Some(8.0),
             provider_ids_json: Some(json!({"tmdb": "1", "imdb": "tt1"}).to_string()),
             metadata_scraper_id: Some("tmdb".to_owned()),
+            identification_status: "ONLINE_CONFIRMED".to_owned(),
             scraper_id: Some("tmdb".to_owned()),
             provenance_json: Some(
                 json!({

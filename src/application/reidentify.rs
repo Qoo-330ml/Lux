@@ -843,8 +843,7 @@ impl MetadataReidentifyService {
         request_plan: Option<MetadataRequestPlan>,
     ) -> Result<i64, MetadataReidentifyError> {
         let mut candidate_count = 0_i64;
-        let already_confirmed =
-            !matches!(mode, MetadataRefreshMode::Reidentify) && has_selected_provider_id(item);
+        let already_confirmed = item_identity_is_confirmed(item, mode);
         let mut selected_scraper_id = already_confirmed.then(|| {
             item.metadata_scraper_id
                 .as_deref()
@@ -858,12 +857,16 @@ impl MetadataReidentifyService {
             || request_plan.is_none_or(|plan| !metadata_request_plan_is_complete(plan));
         if should_refresh_primary {
             for scraper in scrapers.iter().filter(|scraper| {
-                matches!(
-                    scraper.role,
-                    crate::library::LibraryScraperRole::Primary
-                        | crate::library::LibraryScraperRole::Backup
-                        | crate::library::LibraryScraperRole::Both
-                )
+                if already_confirmed {
+                    scraper.role == crate::library::LibraryScraperRole::Primary
+                } else {
+                    matches!(
+                        scraper.role,
+                        crate::library::LibraryScraperRole::Primary
+                            | crate::library::LibraryScraperRole::Backup
+                            | crate::library::LibraryScraperRole::Both
+                    )
+                }
             }) {
                 match self
                     .refresh_item(
@@ -1399,6 +1402,37 @@ fn metadata_request_plan_is_complete(plan: MetadataRequestPlan) -> bool {
         && !plan.needs_trailers
 }
 
+fn item_identity_is_confirmed(
+    item: &crate::storage::StoredMediaMetadata,
+    mode: MetadataRefreshMode,
+) -> bool {
+    if matches!(mode, MetadataRefreshMode::Reidentify) {
+        return false;
+    }
+    let selected_scraper = item
+        .metadata_scraper_id
+        .as_deref()
+        .or(item.scraper_id.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if selected_scraper.is_some() {
+        return has_selected_provider_id(item);
+    }
+    item.identification_status == "ONLINE_CONFIRMED" && has_any_provider_id(item)
+}
+
+fn has_any_provider_id(item: &crate::storage::StoredMediaMetadata) -> bool {
+    let Some(raw) = item.provider_ids_json.as_deref() else {
+        return false;
+    };
+    let Ok(Value::Object(provider_ids)) = serde_json::from_str::<Value>(raw) else {
+        return false;
+    };
+    provider_ids
+        .values()
+        .any(|value| value.as_str().is_some_and(|id| !id.trim().is_empty()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1439,6 +1473,7 @@ mod tests {
     struct RoleRecordingAdapter {
         provider_key: String,
         match_found: bool,
+        fail_get: bool,
         calls: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1455,6 +1490,16 @@ mod tests {
             Self {
                 provider_key: provider_key.to_owned(),
                 match_found,
+                fail_get: false,
+                calls,
+            }
+        }
+
+        fn with_get_failure(provider_key: &str, calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                provider_key: provider_key.to_owned(),
+                match_found: true,
+                fail_get: true,
                 calls,
             }
         }
@@ -1565,6 +1610,11 @@ mod tests {
             _request: ScraperGetRequest,
         ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
             self.record("get");
+            if self.fail_get {
+                return Box::pin(std::future::ready(Err(ScraperError::Provider(
+                    "test metadata request failed".to_owned(),
+                ))));
+            }
             let mut metadata = self.bundle_response().metadata;
             metadata.genres = vec![format!("{} supplemental genre", self.provider_key)];
             Box::pin(std::future::ready(Ok(metadata)))
@@ -1852,6 +1902,79 @@ mod tests {
             .filter(|call| call.starts_with("backup:"))
             .collect::<Vec<_>>();
         assert_eq!(backup_calls, ["backup:search", "backup:images"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn confirmed_identity_is_preserved_when_primary_fails_before_backup_fill()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                original_title = 'Example Movie', overview = 'Existing overview',
+                production_year = 2020, premiere_date = '2020-01-01',
+                original_language = 'en', rating = 8.0,
+                provider_ids_json = ?, metadata_scraper_id = 'primary'
+             WHERE id = ?",
+        )
+        .bind(serde_json::json!({ "primary": "primary-1", "imdb": "tt-example" }).to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE libraries SET scraper_id = 'primary'
+             WHERE id = (SELECT library_id FROM media_items WHERE id = ?)",
+        )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_get_failure("primary", Arc::clone(&calls));
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir.clone(),
+        );
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(selection),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+
+        let selected_scraper: Option<String> =
+            sqlx::query_scalar("SELECT metadata_scraper_id FROM media_items WHERE id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(selected_scraper.as_deref(), Some("primary"));
         Ok(())
     }
 
