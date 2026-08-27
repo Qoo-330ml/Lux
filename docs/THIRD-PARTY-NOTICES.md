@@ -13,7 +13,9 @@
 - 许可证原文：https://raw.githubusercontent.com/zhw2590582/ArtPlayer/master/LICENSE
 - 当前 Lux 使用状态：LUX-207 已按台账中列出的三个模块借鉴交互与边界处理思路；Lux 未复制 ArtPlayer
   源码，也未将 `artplayer` 加入依赖。LUX-208 未新增 ArtPlayer 衍生代码；LUX-209 只核验官网演示页的可见
-  布局与控件状态，不复制 ArtPlayer DOM、CSS、图标、品牌或演示资产。
+  布局与控件状态，不复制 ArtPlayer DOM、CSS、图标、品牌或演示资产。LUX-212 至 LUX-214 继续使用
+  Lux 自有字幕/弹幕解析、Worker 协议、轨道调度、DOM 和生命周期；ArtPlayer 的字幕生命周期、弹幕 lane
+  调度和控制层只作为公开行为参考，没有新增复制或改造代码。
 
 MIT License 要求在软件的所有副本或实质性部分中保留版权和许可声明。Lux 对 ArtPlayer 的复制或改造必须保留上述信息，并在衍生文件中注明 Lux 修改边界。
 

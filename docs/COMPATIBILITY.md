@@ -22,7 +22,7 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 | VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 通过 | 未测试 | 2026-08-05 本机 ARM64 真实 UI 播放本地 MKV，Playing/Progress/Stopped 回传和 Resume 读回通过；收藏/已观看状态另有 2026-08-03 证据 |
 | SenPlayer | 6.0.6 | macOS arm64 | 通过 | 通过 | 首页、电影列表通过 | 通过 | 未测试 | 未测试 | 2026-08-07 本机 ARM64 真实 UI 播放 `.strm` 电影通过；服务端兼容客户端生成的小写 `/emby/videos` 和路径内编码查询参数，并对远程源返回 307 直连重定向 |
 | Harbor | 1.4.6 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目列表通过 | 未测试 | 未测试 | 未测试 | 2026-08-09 本机 Harbor 连接本机 Lux 后，媒体库详情请求 `/Users/:userId/Items/:libraryId` 从 404 修复为 200，并进入电影库显示条目 |
-| Lux Web | Chrome 150 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本代码已实现、字幕路径已有服务端测试 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、控制台无错误；`scripts/browser-smoke.mjs` 和 `scripts/admin-smoke.mjs` 已固化 |
+| Lux Web | Chrome 151 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | MP4 直放通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本/字幕路径已有服务端测试；已登记 Bilibili XML 弹幕与可见性开关通过 | Chrome headless：普通用户无管理入口、stream 206、readyState=4、390/768/1440 viewport 无横向溢出、登录后控制台无错误；`scripts/browser-smoke.mjs`、`scripts/admin-smoke.mjs` 和 `scripts/player-danmaku-smoke.mjs` 已固化 |
 
 ## Lux Web 4K 媒体能力探针
 
@@ -113,6 +113,29 @@ LUX-209 以 ArtPlayer 首页默认控制层和弹幕演示页的可见布局为�
 | 768×1024、390×844，macOS arm64 | safe-area、动态 viewport、中心播放、窄屏控制栏 | 通过；播放器自身没有横向溢出。窄屏将右侧非核心控制保留在可横向滚动的控制组中，键盘焦点可将目标带入视图；真实刘海设备仍待复测。 |
 | 1440×900，Chromium DevTools 网络观察 | 弹幕显示开关 | 通过；`aria-pressed` 从 `true` 切换为 `false`，观察窗口内 `Network.requestWillBeSent` 为 0，console 为 0 error / 0 warning。没有输入框、发送动作、弹幕加载/渲染或热力图。 |
 | Web 组件回归 | 本地 PNG 截图 | 通过；模拟已就绪视频帧后创建 canvas PNG 下载并清理 object URL，文件名剔除路径分隔符。跨域媒体不能导出帧时仅显示通用失败状态，不回显播放 URL。 |
+
+## LuxPlayer LUX-212 至 LUX-214 弹幕阶段验证（2026-08-27）
+
+本次使用单独的临时 SQLite 配置、无个人数据的短 H.264/AAC MP4 和已登记的 Bilibili XML 旁车；没有把
+密码、Cookie、签名 URL 或完整播放地址写入记录。宿主机 `uname -m=arm64`，浏览器为
+Chrome/Chromium `151.0.7922.174`；结论不外推为飞牛 NAS/x86_64 性能、真实 iOS/Android 设备或所有浏览器。
+
+样本 SHA-256：MP4 `0cd83d944a6ca7822b4a8306cecc60a36e859b041f6702c6a1ad9ead78924451`（1,128,375 bytes，
+时长 5.055 秒），XML `34a00dfa18be71bceec4c723290ba5403dda0a99a0b9558ab1992eb69de9306e`（104 bytes）。解析/调度
+上限为 4 MiB、5,000 条、单条 200 字、时间 24 小时、字号 12-64px、同时渲染最多 80 条；支持滚动、顶部、
+底部三种模式，文本使用 React 文本节点渲染。
+
+| 浏览器/viewport | 已验证能力 | 结果与边界 |
+|---|---|---|
+| Chrome 151，macOS arm64，390×844 | Direct 播放、弹幕元数据/raw 读取、Worker 解析、seek、顶部/滚动弹幕安全区、控制栏 | 通过；元数据和 raw 均为 200，媒体 Range 为 206；seek 从 0 秒到约 60% 位置成功。弹幕层位于标题栏下方和控制栏上方，390 viewport 无横向溢出。 |
+| Chrome 151，macOS arm64，768×1024 与 1440×900 | 控制栏、版本选择、截图、设置、画中画、全屏和弹幕开关的可访问名称 | 通过；三个 viewport 均无横向溢出，默认按钮均存在。 |
+| Chrome 151，macOS arm64，390×844 | 关闭/开启弹幕及会话内生命周期 | 通过；`aria-pressed` 在 `true/false` 间切换，关闭时 overlay 被销毁且不创建新请求；开启后只读取 `/api/v1/items/{itemId}/danmaku`、`/danmaku/raw` 和同源 Worker。未请求 Emby `/api/danmu/*`，无外部请求、输入框、发送按钮、热力图或实时推送。 |
+| Web 单测与 Rust 全量测试 | 恶意 XML/有界解析、lane 调度、source 生命周期、ACL/raw 合同 | 通过；Web 343 tests、Rust 273 passed/1 ignored，fmt、clippy、build 均通过。 |
+
+LUX-215 的联合阶段门仍保留两项边界：本次真实浏览器夹具实际走的是 Direct，服务器 HLS 与客户端 fallback
+分别沿用 LUX-198/LUX-185 的引擎记录，尚未在同一弹幕夹具上做联合现场复测；也没有真实刘海 iOS/Android 设备
+和系统锁屏/耳机媒体按键证据。已有 LuxPlayer 组件/引擎生命周期测试覆盖 source/engine 切换时清理覆盖层，
+但不能替代上述现场验证。
 
 ## 记录格式
 

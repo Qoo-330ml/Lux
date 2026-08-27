@@ -4946,10 +4946,10 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 
 验收：
 
-- [ ] SRT、ASS/SSA、VTT 的安全测试夹具可产生有序、受限的 Lux cue；格式错误、超限、负/倒置时间、控制字符和标记文本安全失败，不执行 HTML。
-- [ ] 覆盖层按播放时间显示/隐藏 cue，seek、暂停、倍速、source 变更和 destroy 不显示陈旧内容；渲染不依赖浏览器原生字幕样式。
-- [ ] ArtPlayer 仅作为 `subtitle.js` 生命周期和转换边界参考；Lux 代码、Worker 协议、DOM、CSS、错误文案和测试均为自有实现，并在台账记录来源状态。
-- [ ] 不支持 PGS/SUP 图形字幕、在线字幕搜索/下载、服务端转换/烧录或可编辑字幕样式。
+- [x] SRT、ASS/SSA、VTT 的安全测试夹具可产生有序、受限的 Lux cue；格式错误、超限、负/倒置时间、控制字符和标记文本安全失败，不执行 HTML。
+- [x] 覆盖层按播放时间显示/隐藏 cue，seek、暂停、倍速、source 变更和 destroy 不显示陈旧内容；渲染不依赖浏览器原生字幕样式。
+- [x] ArtPlayer 仅作为 `subtitle.js` 生命周期和转换边界参考；Lux 代码、Worker 协议、DOM、CSS、错误文案和测试均为自有实现，并在台账记录来源状态。
+- [x] 不支持 PGS/SUP 图形字幕、在线字幕搜索/下载、服务端转换/烧录或可编辑字幕样式。
 
 验证：解析器/Worker/组件单测、恶意文本回归、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器检查 source 切换和 console。
 
@@ -4962,10 +4962,10 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 
 验收：
 
-- [ ] 已授权用户只能看到所拥有条目的 `available`、固定 `BILIBILI_XML` 格式与同源 raw 读取地址；不存在、无权、未登记或故障情形遵循 Lux API 错误边界。
-- [ ] raw 端点执行现有 ACL、返回受限 XML 和 private no-cache，且不会触发匹配、插件 RPC、上游网络、扫描或旁车写入。
-- [ ] TypeScript API 类型/客户端是 Rust 合同的显式消费者；不复用或暴露 Emby `/api/danmu/*` DTO。
-- [ ] Rust API/ACL 测试覆盖授权、拒绝、缺失、无服务与 raw 内容；不实现发送、持久化、实时推送或热力图。
+- [x] 已授权用户只能看到所拥有条目的 `available`、固定 `BILIBILI_XML` 格式与同源 raw 读取地址；不存在、无权、未登记或故障情形遵循 Lux API 错误边界。
+- [x] raw 端点执行现有 ACL、返回受限 XML 和 private no-cache，且不会触发匹配、插件 RPC、上游网络、扫描或旁车写入。
+- [x] TypeScript API 类型/客户端是 Rust 合同的显式消费者；不复用或暴露 Emby `/api/danmu/*` DTO。
+- [x] Rust API/ACL 测试覆盖授权、拒绝、缺失、无服务与 raw 内容；不实现发送、持久化、实时推送或热力图。
 
 验证：相关 Rust API/ACL 测试、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、Web API 单测与构建。
 
@@ -4978,10 +4978,10 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 
 验收：
 
-- [ ] 解析器验证并限制 XML、条目数、文本长度、时间、模式和样式值；弹幕文字始终以文本节点渲染，不能执行标记或脚本。
-- [ ] 滚动、顶部和底部模式在 seek、暂停、倍速、窗口缩放和 source 切换中正确同步；轨道调度防止可见重叠并在高密度数据下有界。
-- [ ] `aria-pressed` 开关保持可访问，关闭时不请求或渲染；没有输入框、发送按钮、热力图、实时推送、上游匹配或 XML 持久化。
-- [ ] ArtPlayer 弹幕插件仅作为 lane、生命周期和性能问题的参考；Lux 不复制其 DOM、CSS、图标、网络调用或发送界面，实际来源状态写入台账。
+- [x] 解析器验证并限制 XML、条目数、文本长度、时间、模式和样式值；弹幕文字始终以文本节点渲染，不能执行标记或脚本。
+- [x] 滚动、顶部和底部模式在 seek、暂停、倍速、窗口缩放和 source 切换中正确同步；轨道调度防止可见重叠并在高密度数据下有界。
+- [x] `aria-pressed` 开关保持可访问，关闭时不请求或渲染；没有输入框、发送按钮、热力图、实时推送、上游匹配或 XML 持久化。
+- [x] ArtPlayer 弹幕插件仅作为 lane、生命周期和性能问题的参考；Lux 不复制其 DOM、CSS、图标、网络调用或发送界面，实际来源状态写入台账。
 
 验证：解析/调度单测、组件/会话隔离回归、Playwright 鼠标/触摸/seek 流程、`pnpm --dir web test`、`pnpm --dir web build`。
 
@@ -4997,7 +4997,7 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 
 - [ ] 390×844、768×1024、1440×900 下字幕、弹幕、控制栏、安全区、键盘焦点和触摸 seek 不重叠、不产生横向溢出。
 - [ ] Direct/HLS/fallback 的 source 切换、会话停止、页面离开和错误路径不会保留字幕/弹幕；console 为 0 error/0 warning，网络只包含声明的 Lux 端点。
-- [ ] 记录浏览器/平台/夹具哈希、解析/调度上限、已验证能力和未验证真机项；本机 `arm64` 结论不外推为 NAS/x86 或所有移动浏览器性能。
+- [x] 记录浏览器/平台/夹具哈希、解析/调度上限、已验证能力和未验证真机项；本机 `arm64` 结论不外推为 NAS/x86 或所有移动浏览器性能。
 - [ ] 全部 Rust/Web 质量门通过，第三方台账和 `docs/COMPATIBILITY.md` 更新；项目所有者确认阶段门后才可以再扩展播放器能力。
 
 验证：相关 Rust 测试、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、`pnpm --dir web build`、Playwright/真实浏览器检查、`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
@@ -5006,10 +5006,10 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 
 阶段门：
 
-- [ ] 所有 Web 字幕与弹幕请求经过独立 Lux API、会话生命周期与媒体库 ACL；没有外部 URL、文件路径或 Emby DTO 泄露到 Lux Web。
+- [x] 所有 Web 字幕与弹幕请求经过独立 Lux API、会话生命周期与媒体库 ACL；没有外部 URL、文件路径或 Emby DTO 泄露到 Lux Web。
 - [ ] 文本字幕与弹幕解析/渲染在 Direct、HLS 和客户端 fallback 下通过安全、功能与性能回归。
 - [ ] 桌面和移动 viewport 下的控制、字幕、弹幕和手势通过真实浏览器验证；真机差异明确记录。
-- [ ] ArtPlayer 任何复制/改造均有 MIT 追溯；未复制的逻辑标为仅参考，Lux 不依赖 ArtPlayer 包。
+- [x] ArtPlayer 任何复制/改造均有 MIT 追溯；未复制的逻辑标为仅参考，Lux 不依赖 ArtPlayer 包。
 - [ ] LUX-215 的 Rust/Web 全量检查、兼容性记录和 `uname -m` 完成，并由项目所有者确认。
 
 ## 26. 风险与缓解
