@@ -11,6 +11,7 @@ import { PlayerSettingsPanel } from "../src/features/player/components/player-se
 import { PlayerTopBar } from "../src/features/player/components/player-top-bar";
 import { LuxPlayer } from "../src/features/player/components/lux-player";
 import { playerFailure } from "../src/features/player/components/player-diagnostics";
+import type { PlayerChapterSegment } from "../src/features/player/player-chapters";
 
 describe("LuxPlayer state components", () => {
   it("renders a busy loading state with its product message", () => {
@@ -189,6 +190,10 @@ describe("LuxPlayer state components", () => {
   });
 
   it("exposes a labeled keyboard timeline alongside the playback controls", () => {
+    const chapters: PlayerChapterSegment[] = [
+      { id: "chapter-1", start: 0, end: 50, title: "开场", markerType: "CHAPTER", chapterIndex: 0 },
+      { id: "chapter-2", start: 50, end: 100, title: "片尾开始", markerType: "CREDITS_START", chapterIndex: 1 },
+    ];
     const markup = renderToStaticMarkup(
       <PlayerControls
         playing={false}
@@ -202,6 +207,8 @@ describe("LuxPlayer state components", () => {
         sources={[{ id: "source-1", label: "1080P", detail: "MP4" }]}
         selectedSourceId="source-1"
         danmuVisible
+        chapters={chapters}
+        introSkip={{ start: 0, end: 20 }}
         airPlayAvailable
         settingsOpen={false}
         remainingTime={false}
@@ -222,6 +229,8 @@ describe("LuxPlayer state components", () => {
         onToggleRemainingTime={() => undefined}
         onSourceChange={() => undefined}
         onToggleDanmu={() => undefined}
+        onChapterSeek={() => undefined}
+        onSkipIntro={() => undefined}
         onAirPlay={() => undefined}
         onTakeScreenshot={() => undefined}
         onToggleSettings={() => undefined}
@@ -240,6 +249,10 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-label="隐藏弹幕"');
     expect(markup).toContain('aria-pressed="true"');
     expect(markup).toContain('aria-label="AirPlay"');
+    expect(markup).toContain('aria-label="章节：开场"');
+    expect(markup).toContain('aria-label="章节：片尾开始"');
+    expect(markup).toContain('data-marker-type="CREDITS_START"');
+    expect(markup).toContain('aria-label="跳过片头"');
     expect(markup).toContain('aria-label="选择播放版本"');
     expect(markup).toContain('aria-label="截图"');
     expect(markup).toContain('aria-label="播放器设置"');

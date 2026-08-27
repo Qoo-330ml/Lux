@@ -19,6 +19,8 @@ import type {
   PointerEvent as ReactPointerEvent,
   RefObject,
 } from "react";
+import { PlayerChapterTimeline, PlayerIntroSkip } from "./player-chapter-timeline";
+import type { PlayerChapterSegment, PlayerIntroRange } from "../player-chapters";
 
 export type PlayerControlsProps = {
   playing: boolean;
@@ -33,6 +35,8 @@ export type PlayerControlsProps = {
   selectedSourceId: string;
   danmuVisible: boolean;
   airPlayAvailable?: boolean;
+  chapters?: readonly PlayerChapterSegment[];
+  introSkip?: PlayerIntroRange | null;
   settingsOpen: boolean;
   remainingTime: boolean;
   hoverTime: number | null;
@@ -52,6 +56,8 @@ export type PlayerControlsProps = {
   onSourceChange: (sourceId: string) => void;
   onToggleDanmu: () => void;
   onAirPlay?: () => void;
+  onChapterSeek?: (seconds: number) => void;
+  onSkipIntro?: (seconds: number) => void;
   onTakeScreenshot: () => void;
   onToggleSettings: () => void;
   onTogglePictureInPicture: () => void;
@@ -89,6 +95,8 @@ export function PlayerControls({
   selectedSourceId,
   danmuVisible,
   airPlayAvailable = false,
+  chapters = [],
+  introSkip = null,
   settingsOpen,
   remainingTime,
   hoverTime,
@@ -108,6 +116,8 @@ export function PlayerControls({
   onSourceChange,
   onToggleDanmu,
   onAirPlay = () => undefined,
+  onChapterSeek = () => undefined,
+  onSkipIntro = () => undefined,
   onTakeScreenshot,
   onToggleSettings,
   onTogglePictureInPicture,
@@ -118,6 +128,8 @@ export function PlayerControls({
 
   return (
     <div className="lux-player-controls-wrap">
+      <PlayerIntroSkip currentTime={currentTime} introSkip={introSkip} onSkip={onSkipIntro} />
+      <PlayerChapterTimeline segments={chapters} duration={duration} onSeek={onChapterSeek} />
       <div
         ref={progressBarRef}
         className="lux-player-timeline"

@@ -5114,11 +5114,11 @@ video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或�
 
 验收：
 
-- [ ] 章节按时间排序、去重和限制，时间轴分段/标记可 hover、focus 并显示标题；窄屏不产生横向溢出。
-- [ ] `INTRO_START/INTRO_END` 完整且当前时间位于区间时显示可访问的“跳过片头”，点击只 seek 到片头结束；
+- [x] 章节按时间排序、去重和限制，时间轴分段/标记可 hover、focus 并显示标题；窄屏不产生横向溢出。
+- [x] `INTRO_START/INTRO_END` 完整且当前时间位于区间时显示可访问的“跳过片头”，点击只 seek 到片头结束；
       缺失/倒置标记不猜测。`CREDITS_START` 可见但不伪造片尾结束。
-- [ ] source/engine/页面切换立即清理旧章节和跳过操作；Direct/HLS/fallback、进度、字幕和弹幕不回归。
-- [ ] ArtPlayer 章节插件只作为时间轴分段和标题定位参考，Lux 使用自己的章节 DTO、DOM、CSS 和 seek 命令。
+- [x] source/engine/页面切换立即清理旧章节和跳过操作；Direct/HLS/fallback、进度、字幕和弹幕不回归。
+- [x] ArtPlayer 章节插件只作为时间轴分段和标题定位参考，Lux 使用自己的章节 DTO、DOM、CSS 和 seek 命令。
 
 验证：章节归一化单测、组件/页面 source 隔离测试、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器鼠标/键盘/触摸检查。
 

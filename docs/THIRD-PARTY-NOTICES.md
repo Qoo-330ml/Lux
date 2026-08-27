@@ -22,6 +22,8 @@
   ArtPlayer 只作为不可累计偏移、时长裁剪和销毁恢复边界参考。
   LUX-219 的 AirPlay 能力门和隐藏态细进度条继续使用 Lux 自有 hook、React 控制层和 CSS；ArtPlayer 只作为
   WebKit 能力事件监听、当前 video 调用和控制层隐藏时保留细进度的边界参考。
+  LUX-221 的章节分段、标题定位和片头跳过继续使用 Lux 自有章节归一化、React DOM 和 seek 命令；ArtPlayer
+  章节插件只作为时间轴分段和标题定位的行为参考。
 
 MIT License 要求在软件的所有副本或实质性部分中保留版权和许可声明。Lux 对 ArtPlayer 的复制或改造必须保留上述信息，并在衍生文件中注明 Lux 修改边界。
 
@@ -39,6 +41,7 @@ MIT License 要求在软件的所有副本或实质性部分中保留版权和�
 | `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/subtitle.js`、`packages/artplayer-plugin-danmuku/src/danmuku.js`、`packages/artplayer-plugin-danmuku/src/worker.js`、`packages/artplayer-plugin-danmuku/src/bilibili.js` | `web/src/features/player/caption-parser.ts`、`web/src/features/player/caption-parser-worker.ts`、`web/src/features/player/components/player-caption-overlay.tsx`、`web/src/features/player/danmaku.ts`、`web/src/features/player/danmaku-worker.ts`、`web/src/features/player/components/player-danmaku-overlay.tsx` | 仅参考 | 参考字幕切换/销毁、弹幕状态池、lane 防重叠、Worker 计算和 Bilibili XML 模式映射的问题边界；Lux 使用有界安全解析、request generation、同源 Lux API、React 文本节点和自有调度算法，未复制上游实现、DOM、CSS、图标、网络调用、发送器或热力图。 | MIT / 本文件 |
 | `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/setting/subtitleOffset.js`、`packages/artplayer/src/player/subtitleOffsetMix.js` | `web/src/features/player/caption-offset.ts`、`web/src/features/player/components/player-settings-panel.tsx`、`web/src/features/player/components/player-caption-overlay.tsx`、`web/src/features/player/components/player-video-surface.tsx` | 仅参考 | 参考 `-10s～+10s`、0.1s 步进、从原始 cue 时间重新计算、按媒体时长裁剪和 track 生命周期恢复；Lux 使用自己的 TypeScript 时间范围函数、原生 TextTrack 控制器、React range 控件和覆盖层，未复制上游代码、DOM、样式或事件 API。 | MIT / 本文件 |
 | `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/player/airplayMix.js`、`packages/artplayer/src/control/airplay.js`、`packages/artplayer/src/plugins/miniProgressBar.js`、`packages/artplayer/src/style/plugins.less` | `web/src/features/player/components/player-airplay.ts`、`web/src/features/player/components/player-mini-progress.tsx`、`web/src/features/player/components/player-controls.tsx`、`web/src/features/player/PlayerPage.tsx`、`web/src/react.css` | 仅参考 | 参考 WebKit 播放目标可用性事件、当前 video picker 调用和控制隐藏态保留细进度的边界；Lux 使用自己的能力 hook、可访问 React 控件、只读 mini progress DOM 和 CSS，未复制上游代码、DOM、图标、样式或远程 API。 | MIT / 本文件 |
+| `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer-plugin-chapter/src/index.js`、`packages/artplayer-plugin-chapter/src/style.less` | `web/src/features/player/player-chapters.ts`、`web/src/features/player/components/player-chapter-timeline.tsx`、`web/src/features/player/components/player-controls.tsx`、`web/src/features/player/PlayerPage.tsx`、`web/src/react.css` | 仅参考 | 参考章节按时间分段、标题定位和时间轴视觉层；Lux 使用自己的 source-scoped DTO、归一化/去重/限量、显式片头区间判断、React DOM、CSS 和当前引擎 seek，未复制上游代码、DOM、样式或插件 API。 | MIT / 本文件 |
 
 “仅参考”表示没有复制可受版权保护的代码，可以不放入 `vendor-derived` 目录；但仍应在设计文档中说明参考目的。复制或改造的代码必须经过 Lux 自己的类型、状态和安全边界，不得把上游插件的网络请求、远程资源、品牌资产或默认配置带入 Lux。
 

@@ -616,6 +616,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-mini-progress-buffered, .lux-player-mini-progress-played { position: absolute; top: 0; bottom: 0; left: 0; border-radius: inherit; pointer-events: none; }
 .lux-player-mini-progress-buffered { background: rgba(255,255,255,.32); }
 .lux-player-mini-progress-played { background: var(--lux-accent); }
+.lux-player-chapter-rail { position: relative; width: 100%; height: 8px; overflow: hidden; border-radius: 9999px; background: rgba(255,255,255,.16); }
+.lux-player-chapter-segment { position: absolute; top: 2px; bottom: 2px; min-width: 3px; padding: 0; border: 0; border-right: 2px solid rgba(0,0,0,.5); border-radius: 2px; background: rgba(255,255,255,.44); cursor: pointer; transition: top .15s ease, bottom .15s ease, background .15s ease; }
+.lux-player-chapter-segment:hover, .lux-player-chapter-segment:focus-visible { top: 0; bottom: 0; background: #fff; }
+.lux-player-chapter-segment:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: -2px; }
+.lux-player-skip-intro { position: absolute; right: 0; bottom: calc(73px + env(safe-area-inset-bottom)); z-index: 3; padding: 7px 12px; border: 1px solid rgba(255,255,255,.24); border-radius: 7px; color: #fff; background: rgba(18,18,24,.8); backdrop-filter: blur(12px); font-size: .76rem; font-weight: 600; cursor: pointer; }
+.lux-player-skip-intro:hover, .lux-player-skip-intro:focus-visible { border-color: var(--lux-accent); background: rgba(30,30,40,.94); }
+.lux-player-skip-intro:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
 
 .lux-player-timeline { position: relative; width: 100%; height: 21px; padding: 10px 0 5px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
 .lux-player-timeline-rail { position: relative; width: 100%; height: 4px; background: rgba(255,255,255,.28); border-radius: 9999px; transition: height .15s ease; }

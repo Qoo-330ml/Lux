@@ -2,6 +2,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useCallback,
   useEffect,
+  useMemo,
   useRef,
   useState,
   type KeyboardEvent as ReactKeyboardEvent,
@@ -43,6 +44,7 @@ import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
 import { usePlayerAirPlay } from "./components/player-airplay";
 import { PlayerMiniProgressBar } from "./components/player-mini-progress";
+import { normalizePlayerChapters } from "./player-chapters";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -254,6 +256,13 @@ export function PlayerPage() {
       ? playbackPlan.manifestUrl
       : "";
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
+  const chapterTimeline = useMemo(
+    () => normalizePlayerChapters(source?.chapters, duration),
+    [duration, source?.chapters],
+  );
+  const activeIntroRange = chapterTimeline.introRanges.find(
+    (range) => currentTime >= range.start && currentTime < range.end,
+  ) ?? null;
 
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -1204,6 +1213,8 @@ export function PlayerPage() {
         selectedSourceId={source?.id ?? ""}
         danmuVisible={danmuVisible}
         airPlayAvailable={airPlay.available}
+        chapters={chapterTimeline.segments}
+        introSkip={activeIntroRange}
         settingsOpen={showSettings}
         remainingTime={isRemainingTime}
         hoverTime={hoverTime}
@@ -1226,6 +1237,8 @@ export function PlayerPage() {
           resetControlsTimeout();
         }}
         onAirPlay={airPlay.showPicker}
+        onChapterSeek={seekTo}
+        onSkipIntro={seekTo}
         onTakeScreenshot={takeScreenshot}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
         onTogglePictureInPicture={togglePictureInPicture}

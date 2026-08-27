@@ -554,6 +554,89 @@ describe("PlayerPage playback synchronization", () => {
       .toBe(true);
   });
 
+  it("renders only the current source chapters and skips an explicit intro range", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-chapters",
+      title: "章节测试",
+      itemType: "EPISODE",
+      mediaSources: [
+        {
+          id: "source-chapters-1",
+          isDefault: true,
+          chapters: [
+            { startPositionTicks: 0, name: "开场", markerType: "CHAPTER", chapterIndex: 0 },
+            { startPositionTicks: 20_000_000, name: null, markerType: "INTRO_START", chapterIndex: 1 },
+            { startPositionTicks: 60_000_000, name: null, markerType: "INTRO_END", chapterIndex: 2 },
+            { startPositionTicks: 80_000_000, name: "片尾", markerType: "CREDITS_START", chapterIndex: 3 },
+          ],
+        },
+        {
+          id: "source-chapters-2",
+          chapters: [{ startPositionTicks: 0, name: "另一版本", markerType: "CHAPTER", chapterIndex: 0 }],
+        },
+      ],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-chapters"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    const sourceSelector = container.querySelector<HTMLSelectElement>("[aria-label='选择播放版本']");
+    if (!video || !sourceSelector) throw new Error("chapter player was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 10 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 3 });
+    await act(async () => video.dispatchEvent(new Event("durationchange")));
+    await act(async () => video.dispatchEvent(new Event("timeupdate")));
+
+    expect(container.querySelector("[aria-label='章节：片头开始']")).not.toBeNull();
+    expect(container.querySelector("[data-marker-type='CREDITS_START']")).not.toBeNull();
+    const skip = container.querySelector<HTMLButtonElement>("[aria-label='跳过片头']");
+    if (!skip) throw new Error("intro skip control was not rendered");
+    const sessionCallsBeforeSeek = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
+    await act(async () => skip.click());
+    expect(video.currentTime).toBe(6);
+    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSeek);
+
+    await act(async () => {
+      sourceSelector.value = "source-chapters-2";
+      sourceSelector.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const replacementVideo = container.querySelector<HTMLVideoElement>("video");
+    if (!replacementVideo) throw new Error("replacement chapter video was not rendered");
+    Object.defineProperty(replacementVideo, "duration", { configurable: true, value: 10 });
+    await act(async () => replacementVideo.dispatchEvent(new Event("durationchange")));
+    expect(container.querySelector("[aria-label='章节：片头开始']")).toBeNull();
+    expect(container.querySelector("[aria-label='章节：另一版本']")).not.toBeNull();
+    expect(container.querySelector("[aria-label='跳过片头']")).toBeNull();
+  });
+
   it("selects and clears a current-source WebVTT track without replacing the playback session", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-captions",
