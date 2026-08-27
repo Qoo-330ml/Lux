@@ -2626,32 +2626,105 @@ fn merge_credit_values(
 
 fn merge_actor_values(existing: &[ActorCredit], incoming: &[ActorCredit]) -> Vec<ActorCredit> {
     let mut merged = Vec::with_capacity(existing.len() + incoming.len());
-    for actor in existing.iter().chain(incoming) {
+    for actor in existing {
         if actor.name.trim().is_empty() {
             continue;
         }
-        let duplicate = merged.iter().any(|stored: &ActorCredit| {
-            if !actor.id.trim().is_empty() && !stored.id.trim().is_empty() {
-                actor
-                    .provider
-                    .as_deref()
-                    .unwrap_or_default()
-                    .eq_ignore_ascii_case(stored.provider.as_deref().unwrap_or_default())
-                    && actor.id.eq_ignore_ascii_case(&stored.id)
-            } else {
-                actor.name.trim().eq_ignore_ascii_case(stored.name.trim())
-                    && actor
-                        .character
-                        .as_deref()
-                        .unwrap_or_default()
-                        .eq_ignore_ascii_case(stored.character.as_deref().unwrap_or_default())
-            }
-        });
-        if !duplicate {
+        merged.push(actor.clone());
+    }
+    for actor in incoming {
+        if actor.name.trim().is_empty() {
+            continue;
+        }
+        if let Some(stored) = merged.iter_mut().find(|stored| same_actor(stored, actor)) {
+            merge_missing_actor_fields(stored, actor);
+        } else {
             merged.push(actor.clone());
         }
     }
     merged
+}
+
+fn same_actor(left: &ActorCredit, right: &ActorCredit) -> bool {
+    if !left.id.trim().is_empty() && !right.id.trim().is_empty() {
+        left.provider
+            .as_deref()
+            .unwrap_or_default()
+            .eq_ignore_ascii_case(right.provider.as_deref().unwrap_or_default())
+            && left.id.eq_ignore_ascii_case(&right.id)
+    } else {
+        left.name.trim().eq_ignore_ascii_case(right.name.trim())
+            && left
+                .character
+                .as_deref()
+                .unwrap_or_default()
+                .eq_ignore_ascii_case(right.character.as_deref().unwrap_or_default())
+    }
+}
+
+fn merge_missing_actor_fields(target: &mut ActorCredit, incoming: &ActorCredit) {
+    if target.provider.is_none() {
+        target.provider = incoming.provider.clone();
+    }
+    fill_missing_string(&mut target.character, &incoming.character);
+    if target.order.is_none() {
+        target.order = incoming.order;
+    }
+    fill_missing_string(&mut target.profile_url, &incoming.profile_url);
+    for identity in &incoming.identities {
+        if !target.identities.iter().any(|stored| {
+            stored.provider.eq_ignore_ascii_case(&identity.provider)
+                && stored.id.eq_ignore_ascii_case(&identity.id)
+        }) {
+            target.identities.push(identity.clone());
+        }
+    }
+    match (&mut target.person, &incoming.person) {
+        (Some(target), Some(incoming)) => merge_missing_person_fields(target, incoming),
+        (None, Some(incoming)) => target.person = Some(incoming.clone()),
+        _ => {}
+    }
+}
+
+fn fill_missing_string(target: &mut Option<String>, incoming: &Option<String>) {
+    if target
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+        && incoming
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        *target = incoming.clone();
+    }
+}
+
+fn merge_missing_person_fields(
+    target: &mut crate::application::people::PersonMetadata,
+    incoming: &crate::application::people::PersonMetadata,
+) {
+    fill_missing_string(&mut target.biography, &incoming.biography);
+    fill_missing_string(&mut target.birthday, &incoming.birthday);
+    fill_missing_string(&mut target.deathday, &incoming.deathday);
+    fill_missing_string(
+        &mut target.known_for_department,
+        &incoming.known_for_department,
+    );
+    fill_missing_string(&mut target.place_of_birth, &incoming.place_of_birth);
+    if target.production_year.is_none() {
+        target.production_year = incoming.production_year;
+    }
+    fill_missing_string(&mut target.premiere_date, &incoming.premiere_date);
+    for (provider, id) in &incoming.provider_ids {
+        target
+            .provider_ids
+            .entry(provider.clone())
+            .or_insert_with(|| id.clone());
+    }
+    target.genres = merge_string_values(&target.genres, &incoming.genres);
+    target.tags = merge_string_values(&target.tags, &incoming.tags);
+    target.production_locations =
+        merge_string_values(&target.production_locations, &incoming.production_locations);
+    target.taglines = merge_string_values(&target.taglines, &incoming.taglines);
 }
 
 fn preserve_supplemental_scalar_values(
@@ -3392,7 +3465,8 @@ mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, candidate_actors, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
-        merge_supplemental_movie_nfo, metadata_match_score, metadata_request_plan,
+        merge_actor_values, merge_supplemental_movie_nfo, metadata_match_score,
+        metadata_request_plan,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3836,5 +3910,50 @@ mod tests {
         assert_eq!(candidate.actors.len(), 2);
         assert_eq!(candidate.provider_ids["tmdb"], "main-1");
         assert_eq!(candidate.provider_ids["imdb"], "tt-supplement");
+    }
+
+    #[test]
+    fn supplemental_actor_merge_fills_missing_fields_without_duplicate() {
+        let existing = [super::ActorCredit {
+            id: "actor-1".to_owned(),
+            provider: Some("main".to_owned()),
+            identities: Vec::new(),
+            name: "主演员".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let incoming = [super::ActorCredit {
+            id: "actor-1".to_owned(),
+            provider: Some("main".to_owned()),
+            identities: Vec::new(),
+            name: "补充来源演员名".to_owned(),
+            character: Some("补充角色".to_owned()),
+            order: Some(4),
+            profile_url: Some("https://images.example/actor-1.jpg".to_owned()),
+            person: Some(crate::application::people::PersonMetadata {
+                biography: Some("补充人物简介".to_owned()),
+                ..Default::default()
+            }),
+        }];
+
+        let merged = merge_actor_values(&existing, &incoming);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].name, "主演员");
+        assert_eq!(merged[0].character.as_deref(), Some("补充角色"));
+        assert_eq!(merged[0].order, Some(0));
+        assert_eq!(
+            merged[0].profile_url.as_deref(),
+            Some("https://images.example/actor-1.jpg")
+        );
+        assert_eq!(
+            merged[0]
+                .person
+                .as_ref()
+                .and_then(|person| person.biography.as_deref()),
+            Some("补充人物简介")
+        );
     }
 }
