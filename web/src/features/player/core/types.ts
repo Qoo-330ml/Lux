@@ -29,6 +29,13 @@ export type LuxPlaybackSnapshot = {
   ended: boolean;
 };
 
+export type LuxPlaybackPerformance = {
+  mediaDurationMs: number;
+  processingDurationMs: number;
+  speedX: number;
+  realtime: boolean;
+};
+
 export type LuxPlayerErrorCode =
   | "UNSUPPORTED"
   | "RESOURCE_EXPIRED"
@@ -61,6 +68,15 @@ export type LuxPlayerEvent =
   | { type: "TIME_UPDATE"; generation: number; snapshot: LuxPlaybackSnapshot }
   | { type: "ENDED"; generation: number; snapshot: LuxPlaybackSnapshot }
   | { type: "ERROR"; generation: number; error: LuxPlayerError }
+  | { type: "RESET" };
+
+export type LuxPlayerCommand =
+  | { type: "LOAD"; source: LuxPlaybackSource }
+  | { type: "PLAY" }
+  | { type: "PAUSE"; snapshot?: LuxPlaybackSnapshot }
+  | { type: "WAITING" }
+  | { type: "CAN_PLAY"; playing: boolean }
+  | { type: "SEEK"; position: number }
   | { type: "RESET" };
 
 export type LuxPlaybackEngineEvent =

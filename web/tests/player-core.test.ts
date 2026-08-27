@@ -3,6 +3,7 @@ import {
   initialLuxPlayerState,
   reduceLuxPlayerState,
 } from "../src/features/player/core/player-state";
+import { LuxPlayerController } from "../src/features/player/core/player-controller";
 import {
   LuxPlaybackEngineHandle,
   type LuxPlaybackEngine,
@@ -115,6 +116,52 @@ describe("LuxPlayer core state", () => {
         generation: failed.generation,
       }),
     ).toBe(failed);
+  });
+});
+
+describe("LuxPlayer controller", () => {
+  it("turns player commands and engine events into observable state", () => {
+    const controller = new LuxPlayerController();
+    const updates: string[] = [];
+    controller.subscribe((state) => updates.push(state.status));
+
+    controller.dispatch({ type: "LOAD", source });
+    controller.dispatchEngineEvent({
+      type: "SOURCE_READY",
+      snapshot,
+    });
+    controller.dispatchEngineEvent({ type: "PLAYING" });
+    controller.dispatchEngineEvent({ type: "WAITING" });
+    controller.dispatchEngineEvent({ type: "CAN_PLAY", playing: true });
+    controller.dispatch({ type: "SEEK", position: 90 });
+
+    expect(controller.state.status).toBe("SEEKING");
+    expect(controller.state.snapshot.currentTime).toBe(90);
+    expect(updates).toEqual([
+      "PREPARING",
+      "READY",
+      "PLAYING",
+      "BUFFERING",
+      "PLAYING",
+      "SEEKING",
+    ]);
+  });
+
+  it("ignores an engine event after a new source command", () => {
+    const controller = new LuxPlayerController();
+    controller.dispatch({ type: "LOAD", source });
+    controller.dispatchEngineEvent({
+      type: "SOURCE_READY",
+      snapshot,
+    });
+    controller.dispatch({
+      type: "LOAD",
+      source: { ...source, id: "source-2", url: "/signed/source-2" },
+    });
+    controller.dispatchEngineEvent({ type: "PLAYING" });
+
+    expect(controller.state.status).toBe("PREPARING");
+    expect(controller.state.source?.id).toBe("source-2");
   });
 });
 

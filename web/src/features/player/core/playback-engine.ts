@@ -2,6 +2,7 @@ import {
   EMPTY_LUX_PLAYBACK_SNAPSHOT,
   type LuxPlaybackEngineEvent,
   type LuxPlaybackEngineKind,
+  type LuxPlaybackPerformance,
   type LuxPlaybackSnapshot,
   type LuxPlaybackSource,
 } from "./types";
@@ -11,7 +12,7 @@ export type { LuxPlaybackEngineEvent } from "./types";
 export interface LuxPlaybackEngine {
   readonly kind: LuxPlaybackEngineKind;
   readonly element: HTMLVideoElement;
-  readonly performance: unknown;
+  readonly performance: LuxPlaybackPerformance | null;
   readonly error: Error | null;
   setSource(source: LuxPlaybackSource): Promise<void>;
   play(): Promise<void>;
