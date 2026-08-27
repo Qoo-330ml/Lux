@@ -1987,7 +1987,7 @@ services:
 | LUX-208 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；Media Session、移动端安全区和兼容性收尾 |
 | LUX-209 | web/src/features/player/、web/tests/、docs/；ArtPlayer 风格控制层与无数据管道的弹幕可见性 UI |
 | LUX-210 | docs/LUX-DEVELOPMENT.md；关闭 LuxPlayer 核心阶段并定义字幕、弹幕后续边界 |
-| LUX-211 | web/src/features/player/、web/src/lib/api/types.ts、web/tests/；选择可用字幕轨与原生 WebVTT 生命周期 |
+| LUX-211 | src/api/mod.rs、tests/、web/src/features/player/、web/tests/、docs/；将字幕轨绑定到当前媒体源并实现原生 WebVTT 生命周期 |
 | LUX-212 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有的安全文本字幕解析与渲染 |
 | LUX-213 | src/api/mod.rs、web/src/lib/api/、tests/、docs/；独立的 Lux Web 弹幕读取合同 |
 | LUX-214 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；Lux 自有弹幕解析、调度、渲染与控制层整合 |
@@ -4923,17 +4923,18 @@ Media Session。所有 UI 使用 Lux 自有类型、状态、DOM、CSS 和图标
 #### LUX-211：LuxPlayer 字幕轨选择与 WebVTT 生命周期
 
 范围：从现有 `MediaSource.streams` 中识别可用字幕，为 LuxPlayer 提供关闭/选择状态和可访问的控制入口；已声明为
-外挂 WebVTT 的轨道使用既有受鉴权 Lux 字幕端点和原生 `TextTrack`。切换来源、退出页面或更换选择时销毁旧 track，
-不重新创建播放会话。
+外挂 WebVTT 的轨道使用既有受鉴权 Lux 字幕端点和原生 `TextTrack`。为使字幕严格属于当前版本，现有 Lux 字幕端点
+增加可选 `sourceId` 查询参数：省略时保持默认版本优先的既有行为，提供时只接受同时属于 `{itemId}` 的媒体源。
+切换来源、退出页面或更换选择时销毁旧 track，不重新创建播放会话。
 
 验收：
 
 - [ ] 仅显示当前媒体源的 `SUBTITLE` 流；语言、标题、default/forced 信息可读，且“关闭字幕”始终可选。
-- [ ] 选择外置 VTT 只请求 `/api/v1/items/{itemId}/subtitles/{streamIndex}`，不拼接文件路径、外部 URL 或 Emby 路由；无 VTT 或浏览器不支持时安全降级并说明原因。
+- [ ] 选择外置 VTT 只请求 `/api/v1/items/{itemId}/subtitles/{streamIndex}?sourceId={mediaSourceId}`；`sourceId` 省略时保持既有默认版本回退，错误/跨条目 ID 返回既有安全失败。播放器不拼接文件路径、外部 URL 或 Emby 路由；无 VTT 或浏览器不支持时安全降级并说明原因。
 - [ ] 轨道选择在 source/engine/页面生命周期中不残留旧 cue、不改变播放会话或进度事件；键盘和触摸均可操作。
-- [ ] 不在本任务读取/转换 SRT、ASS/SSA、PGS/SUP 或内嵌字幕，不做样式编辑或服务端改动。
+- [ ] 不在本任务读取/转换 SRT、ASS/SSA、PGS/SUP 或内嵌字幕，不做样式编辑、数据库迁移或其他服务端行为改变。
 
-验证：字幕选择单测、现有播放器会话回归、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器验证 track 网络请求与切换。
+验证：字幕 sourceId Rust API/ACL 测试、字幕选择单测、现有播放器会话回归、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器验证 track 网络请求与切换。
 
 依赖：LUX-210、LUX-208。
 
