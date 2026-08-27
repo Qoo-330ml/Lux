@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { PlayerErrorState, PlayerLoadingState } from "../src/features/player/components/player-state";
 import { PlayerVideoSurface } from "../src/features/player/components/player-video-surface";
+import { playerVideoPresentationStyle } from "../src/features/player/components/player-presentation";
 import { PlayerControls } from "../src/features/player/components/player-controls";
 import { PlayerSettingsPanel } from "../src/features/player/components/player-settings-panel";
 import { PlayerTopBar } from "../src/features/player/components/player-top-bar";
@@ -72,6 +73,37 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain("客户端解码失败");
   });
 
+  it("applies loop, aspect ratio, and flip to the current video presentation", () => {
+    expect(playerVideoPresentationStyle("default", "normal")).toBeUndefined();
+    expect(playerVideoPresentationStyle("4:3", "horizontal")).toMatchObject({
+      aspectRatio: "4 / 3",
+      objectFit: "fill",
+      transform: "translate(-50%, -50%) scaleX(-1)",
+    });
+
+    const markup = renderToStaticMarkup(
+      <PlayerVideoSurface
+        streamUrl="/signed/movie-presentation"
+        title="画面设置测试"
+        videoRef={() => undefined}
+        onClick={() => undefined}
+        onDoubleClick={() => undefined}
+        presentation={{ loop: true, aspectRatio: "16:9", flip: "vertical" }}
+        centerSplash={null}
+        fallbackLoading={false}
+        fallbackSpeedX={null}
+        errorMessage={null}
+        showError={false}
+        onRetry={() => undefined}
+        onBack={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain(" loop=\"\"");
+    expect(markup).toContain("aspect-ratio:16 / 9");
+    expect(markup).toContain("scaleY(-1)");
+  });
+
   it("renders a classified Lux recovery path instead of an underlying engine error", () => {
     const markup = renderToStaticMarkup(
       <PlayerVideoSurface
@@ -117,6 +149,14 @@ describe("LuxPlayer state components", () => {
         playbackRates={[0.5, 1, 1.5]}
         playbackRate={1}
         onChangeRate={() => undefined}
+        presentation={{
+          loop: true,
+          aspectRatio: "4:3",
+          flip: "horizontal",
+          onToggleLoop: () => undefined,
+          onChangeAspectRatio: () => undefined,
+          onChangeFlip: () => undefined,
+        }}
         onClose={() => undefined}
       />,
     );
@@ -124,6 +164,13 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('role="dialog"');
     expect(markup).toContain('aria-label="播放设置"');
     expect(markup).toContain("标准");
+    expect(markup).toContain("循环播放");
+    expect(markup).toContain('role="switch"');
+    expect(markup).toContain('aria-checked="true"');
+    expect(markup).toContain("画面比例");
+    expect(markup).toContain("4:3");
+    expect(markup).toContain("画面翻转");
+    expect(markup).toContain("水平镜像");
     expect(markup).toContain('aria-label="关闭播放设置"');
   });
 

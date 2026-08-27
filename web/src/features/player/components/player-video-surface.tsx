@@ -9,6 +9,11 @@ import type {
 import type { PlayerFailure } from "./player-diagnostics";
 import { usePlayerSurfaceGestures } from "./player-gestures";
 import type { PlayerNativeCaptionTrack } from "./player-captions";
+import {
+  DEFAULT_VIDEO_PRESENTATION,
+  playerVideoPresentationStyle,
+  type PlayerVideoPresentation,
+} from "./player-presentation";
 
 type PlayerVideoSurfaceProps = {
   streamUrl: string;
@@ -27,6 +32,7 @@ type PlayerVideoSurfaceProps = {
   captionLifecycleKey?: string;
   onCaptionTrackLoad?: () => void;
   onCaptionTrackError?: () => void;
+  presentation?: PlayerVideoPresentation;
   playing?: boolean;
   onTogglePlayback?: () => void;
   centerSplash: "play" | "pause" | null;
@@ -67,6 +73,7 @@ export function PlayerVideoSurface({
   captionLifecycleKey = "",
   onCaptionTrackLoad,
   onCaptionTrackError,
+  presentation = DEFAULT_VIDEO_PRESENTATION,
   playing = false,
   onTogglePlayback = () => undefined,
   centerSplash,
@@ -126,6 +133,8 @@ export function PlayerVideoSurface({
           src={streamUrl}
           poster={poster ?? undefined}
           preload="metadata"
+          loop={presentation.loop}
+          style={playerVideoPresentationStyle(presentation.aspectRatio, presentation.flip)}
           onClick={handleClick}
           onDoubleClick={handleDoubleClick}
           onPointerDown={handlePointerDown}

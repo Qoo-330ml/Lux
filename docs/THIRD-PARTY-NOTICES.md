@@ -16,7 +16,8 @@
   布局与控件状态，不复制 ArtPlayer DOM、CSS、图标、品牌或演示资产。LUX-212 至 LUX-214 继续使用
   Lux 自有字幕/弹幕解析、Worker 协议、轨道调度、DOM 和生命周期；ArtPlayer 的字幕生命周期、弹幕 lane
   调度和控制层只作为公开行为参考，没有新增复制或改造代码。LUX-215 重新核验上述固定快照，只验证
-  生命周期、lane、安全边界和性能问题，没有新增复制、改造或运行时依赖。
+  生命周期、lane、安全边界和性能问题，没有新增复制、改造或运行时依赖。LUX-217 的画面比例、镜像
+  与设置组件继续使用 Lux 自有类型、React DOM 和呈现映射，ArtPlayer 只作为选项集合与生命周期边界参考。
 
 MIT License 要求在软件的所有副本或实质性部分中保留版权和许可声明。Lux 对 ArtPlayer 的复制或改造必须保留上述信息，并在衍生文件中注明 Lux 修改边界。
 
@@ -28,6 +29,7 @@ MIT License 要求在软件的所有副本或实质性部分中保留版权和�
 |---|---|---|---|---|---|
 | 待填 | 待填 | 待填 | 复制 / 改造 / 仅参考 | 待填 | MIT / 本文件 |
 | `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/events/gestureInit.js`、`packages/artplayer/src/events/clickInit.js`、`packages/artplayer/src/control/progress.js` | `web/src/features/player/components/player-gestures.ts`、`web/src/features/player/PlayerPage.tsx`、`web/src/features/player/components/player-video-surface.tsx` | 仅参考 | 参考手势方向、时间轴局部坐标与单/双击冲突处理的问题边界；Lux 使用自己的 Pointer Events、pointer capture、状态回调、阈值和测试，未复制上游代码、DOM、CSS、图标或 API。 | MIT / 本文件 |
+| `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/player/aspectRatioMix.js`、`packages/artplayer/src/player/flipMix.js`、`packages/artplayer/src/setting/aspectRatio.js`、`packages/artplayer/src/setting/flip.js` | `web/src/features/player/components/player-presentation.ts`、`web/src/features/player/components/player-settings-panel.tsx`、`web/src/features/player/components/player-video-surface.tsx` | 仅参考 | 参考 `default/4:3/16:9`、`normal/horizontal/vertical` 的稳定选项集合、容器内比例适配意图和镜像语义；Lux 使用自己的 TypeScript 联合类型、React 可访问控件和 CSSProperties 映射，未复制上游控制流、DOM、样式或事件 API。 | MIT / 本文件 |
 | `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | ArtPlayer 官方演示页默认控制层与弹幕插件演示页（2026-08-27 可见布局核验） | `web/src/features/player/components/player-controls.tsx`、`web/src/react.css` | 仅参考 | 核验播放、音量、时间、版本、截图、设置、画中画与全屏控件的可见顺序、46px 节奏、底部渐变层和时间轴密度；Lux 使用自身 React DOM、Lucide 图标、媒体会话和会话接口，未复制上游代码、DOM、CSS、图标或资源。 | MIT / 本文件 |
 | `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/subtitle.js`、`packages/artplayer-plugin-danmuku/src/danmuku.js`、`packages/artplayer-plugin-danmuku/src/worker.js`、`packages/artplayer-plugin-danmuku/src/bilibili.js` | `web/src/features/player/caption-parser.ts`、`web/src/features/player/caption-parser-worker.ts`、`web/src/features/player/components/player-caption-overlay.tsx`、`web/src/features/player/danmaku.ts`、`web/src/features/player/danmaku-worker.ts`、`web/src/features/player/components/player-danmaku-overlay.tsx` | 仅参考 | 参考字幕切换/销毁、弹幕状态池、lane 防重叠、Worker 计算和 Bilibili XML 模式映射的问题边界；Lux 使用有界安全解析、request generation、同源 Lux API、React 文本节点和自有调度算法，未复制上游实现、DOM、CSS、图标、网络调用、发送器或热力图。 | MIT / 本文件 |
 

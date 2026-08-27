@@ -1,5 +1,16 @@
 import { Check, X } from "lucide-react";
 import type { PlayerCaptionOption } from "./player-captions";
+import type {
+  PlayerAspectRatio,
+  PlayerFlip,
+  PlayerVideoPresentation,
+} from "./player-presentation";
+
+type PlayerPresentationSettings = PlayerVideoPresentation & {
+  onToggleLoop: () => void;
+  onChangeAspectRatio: (aspectRatio: PlayerAspectRatio) => void;
+  onChangeFlip: (flip: PlayerFlip) => void;
+};
 
 type PlayerSettingsPanelProps = {
   playbackRates: readonly number[];
@@ -9,8 +20,21 @@ type PlayerSettingsPanelProps = {
   selectedCaptionStreamIndex?: number | null;
   captionStatus?: string | null;
   onSelectCaption?: (streamIndex: number | null) => void;
+  presentation?: PlayerPresentationSettings;
   onClose: () => void;
 };
+
+const ASPECT_RATIO_OPTIONS: readonly { value: PlayerAspectRatio; label: string }[] = [
+  { value: "default", label: "默认" },
+  { value: "4:3", label: "4:3" },
+  { value: "16:9", label: "16:9" },
+];
+
+const FLIP_OPTIONS: readonly { value: PlayerFlip; label: string }[] = [
+  { value: "normal", label: "正常" },
+  { value: "horizontal", label: "水平镜像" },
+  { value: "vertical", label: "垂直镜像" },
+];
 
 export function PlayerSettingsPanel({
   playbackRates,
@@ -20,6 +44,7 @@ export function PlayerSettingsPanel({
   selectedCaptionStreamIndex = null,
   captionStatus = null,
   onSelectCaption = () => undefined,
+  presentation,
   onClose,
 }: PlayerSettingsPanelProps) {
   const captionHelp = captionStatus
@@ -60,6 +85,56 @@ export function PlayerSettingsPanel({
           ))}
         </div>
       </div>
+      {presentation ? (
+        <>
+          <div className="lux-player-settings-section">
+            <span className="lux-player-settings-label" id="lux-player-loop-label">循环播放</span>
+            <button
+              type="button"
+              className={`lux-player-speed-pill ${presentation.loop ? "is-active" : ""}`}
+              role="switch"
+              aria-labelledby="lux-player-loop-label"
+              aria-checked={presentation.loop}
+              onClick={presentation.onToggleLoop}
+            >
+              {presentation.loop ? "已开启" : "已关闭"}
+              {presentation.loop ? <Check size={14} aria-hidden="true" /> : null}
+            </button>
+          </div>
+          <div className="lux-player-settings-section">
+            <span className="lux-player-settings-label" id="lux-player-aspect-ratio-label">画面比例</span>
+            <div className="lux-player-speed-grid" role="group" aria-labelledby="lux-player-aspect-ratio-label">
+              {ASPECT_RATIO_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`lux-player-speed-pill ${presentation.aspectRatio === option.value ? "is-active" : ""}`}
+                  aria-pressed={presentation.aspectRatio === option.value}
+                  onClick={() => presentation.onChangeAspectRatio(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="lux-player-settings-section">
+            <span className="lux-player-settings-label" id="lux-player-flip-label">画面翻转</span>
+            <div className="lux-player-speed-grid" role="group" aria-labelledby="lux-player-flip-label">
+              {FLIP_OPTIONS.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`lux-player-speed-pill ${presentation.flip === option.value ? "is-active" : ""}`}
+                  aria-pressed={presentation.flip === option.value}
+                  onClick={() => presentation.onChangeFlip(option.value)}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+          </div>
+        </>
+      ) : null}
       <div className="lux-player-settings-section">
         <label className="lux-player-settings-label" htmlFor="lux-player-caption-select">字幕</label>
         <select
