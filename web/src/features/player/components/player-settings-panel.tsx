@@ -1,5 +1,12 @@
 import { Check, X } from "lucide-react";
 import type { PlayerCaptionOption } from "./player-captions";
+import {
+  CAPTION_OFFSET_MAX,
+  CAPTION_OFFSET_MIN,
+  CAPTION_OFFSET_STEP,
+  formatCaptionOffset,
+  normalizeCaptionOffset,
+} from "../caption-offset";
 import type {
   PlayerAspectRatio,
   PlayerFlip,
@@ -20,6 +27,8 @@ type PlayerSettingsPanelProps = {
   selectedCaptionStreamIndex?: number | null;
   captionStatus?: string | null;
   onSelectCaption?: (streamIndex: number | null) => void;
+  captionOffset?: number;
+  onChangeCaptionOffset?: (offset: number) => void;
   presentation?: PlayerPresentationSettings;
   onClose: () => void;
 };
@@ -44,6 +53,8 @@ export function PlayerSettingsPanel({
   selectedCaptionStreamIndex = null,
   captionStatus = null,
   onSelectCaption = () => undefined,
+  captionOffset = 0,
+  onChangeCaptionOffset = () => undefined,
   presentation,
   onClose,
 }: PlayerSettingsPanelProps) {
@@ -161,6 +172,27 @@ export function PlayerSettingsPanel({
           ))}
         </select>
         {captionHelp ? <p className="lux-player-caption-status" role="status">{captionHelp}</p> : null}
+      </div>
+      <div className="lux-player-settings-section">
+        <div className="lux-player-caption-offset-heading">
+          <label className="lux-player-settings-label" htmlFor="lux-player-caption-offset">字幕偏移</label>
+          <output htmlFor="lux-player-caption-offset" className="lux-player-caption-offset-value">
+            {formatCaptionOffset(captionOffset)}
+          </output>
+        </div>
+        <input
+          id="lux-player-caption-offset"
+          className="lux-player-caption-offset"
+          type="range"
+          min={CAPTION_OFFSET_MIN}
+          max={CAPTION_OFFSET_MAX}
+          step={CAPTION_OFFSET_STEP}
+          value={normalizeCaptionOffset(captionOffset)}
+          aria-label="字幕偏移"
+          aria-valuetext={formatCaptionOffset(captionOffset)}
+          onChange={(event) => onChangeCaptionOffset(Number(event.target.value))}
+        />
+        <p className="lux-player-caption-status">正值延后，负值提前；仅影响当前选中的字幕。</p>
       </div>
       <div className="lux-player-settings-section">
         <span className="lux-player-settings-label" id="lux-player-shortcuts-label">快捷键提示</span>

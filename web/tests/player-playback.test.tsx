@@ -678,6 +678,24 @@ describe("PlayerPage playback synchronization", () => {
       expect.objectContaining({ credentials: "same-origin" }),
     );
     expect(container.querySelector("script")).toBeNull();
+
+    const captionOffset = container.querySelector<HTMLInputElement>("#lux-player-caption-offset");
+    const captionOffsetValue = container.querySelector<HTMLOutputElement>(".lux-player-caption-offset-value");
+    if (!captionOffset || !captionOffsetValue) throw new Error("caption offset control was not rendered");
+    const sessionCallsBeforeOffset = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
+    const eventCallsBeforeOffset = vi.mocked(api.webPlaybackEvent).mock.calls.length;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(captionOffset, "1");
+      captionOffset.dispatchEvent(new Event("input", { bubbles: true }));
+      captionOffset.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(captionOffset.value).toBe("1");
+    expect(captionOffsetValue.textContent).toBe("+1.0s");
+    expect(container.querySelector(".lux-player-caption-text")).toBeNull();
+    expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeOffset);
+    expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeOffset);
   });
 
   it("creates a local PNG from the current video frame without playback requests", async () => {

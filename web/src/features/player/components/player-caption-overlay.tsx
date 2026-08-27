@@ -9,20 +9,34 @@ import {
   parseCaptionWorkerRequest,
   type CaptionWorkerResponse,
 } from "../caption-parser-worker";
+import { offsetCaptionCues } from "../caption-offset";
 import type { PlayerOverlayCaptionSource } from "./player-captions";
 
 type PlayerCaptionOverlayProps = {
   source: PlayerOverlayCaptionSource | null;
   currentTime: number;
+  captionOffset?: number;
+  captionDuration?: number | null;
   lifecycleKey?: string;
   onStatusChange?: (status: string | null) => void;
 };
 
-export function PlayerCaptionOverlay({ source, currentTime, lifecycleKey = "", onStatusChange }: PlayerCaptionOverlayProps) {
+export function PlayerCaptionOverlay({
+  source,
+  currentTime,
+  captionOffset = 0,
+  captionDuration = null,
+  lifecycleKey = "",
+  onStatusChange,
+}: PlayerCaptionOverlayProps) {
   const [cues, setCues] = useState<LuxCaptionCue[]>([]);
   const [loading, setLoading] = useState(false);
   const generationRef = useRef(0);
-  const activeCue = useMemo(() => activeCaptionCue(cues, currentTime), [cues, currentTime]);
+  const shiftedCues = useMemo(
+    () => offsetCaptionCues(cues, captionOffset, captionDuration),
+    [captionDuration, captionOffset, cues],
+  );
+  const activeCue = useMemo(() => activeCaptionCue(shiftedCues, currentTime), [currentTime, shiftedCues]);
 
   useEffect(() => {
     const generation = ++generationRef.current;
@@ -30,8 +44,10 @@ export function PlayerCaptionOverlay({ source, currentTime, lifecycleKey = "", o
     let worker: Worker | null = null;
     setCues([]);
     setLoading(false);
-    onStatusChange?.(null);
-    if (!source) return () => controller.abort();
+    if (!source) {
+      return () => controller.abort();
+    }
+    onStatusChange?.("字幕加载中…");
 
     const fail = (message: string) => {
       if (generation !== generationRef.current) return;

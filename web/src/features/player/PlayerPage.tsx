@@ -24,6 +24,7 @@ import {
   type PlaybackEngine,
   type PlaybackPerformance,
 } from "./playback-engine";
+import { normalizeCaptionOffset } from "./caption-offset";
 import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
 import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
@@ -200,6 +201,7 @@ export function PlayerPage() {
   const [selectedCaptionStreamIndex, setSelectedCaptionStreamIndex] = useState<number | null>(null);
   const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
   const [captionStatus, setCaptionStatus] = useState<string | null>(null);
+  const [captionOffset, setCaptionOffset] = useState(0);
 
   const requestedSourceId = searchParams.get("sourceId");
   const item = useQuery({
@@ -793,9 +795,14 @@ export function PlayerPage() {
     if (!option?.available) return;
     setCaptionSourceId(source?.id ?? null);
     setSelectedCaptionStreamIndex(option.streamIndex);
-    setCaptionStatus(null);
+    setCaptionStatus("字幕加载中…");
     resetControlsTimeout();
   }, [captionOptions, resetControlsTimeout, source?.id]);
+
+  const changeCaptionOffset = useCallback((offset: number) => {
+    setCaptionOffset(normalizeCaptionOffset(offset));
+    resetControlsTimeout();
+  }, [resetControlsTimeout]);
 
   const showScreenshotStatus = useCallback((message: string) => {
     setScreenshotStatus(message);
@@ -1104,6 +1111,8 @@ export function PlayerPage() {
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
         captionTrack={captionTrack}
+        captionOffset={captionOffset}
+        captionDuration={duration}
         captionLifecycleKey={playbackKey}
         onCaptionTrackLoad={() => setCaptionStatus(null)}
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
@@ -1116,6 +1125,8 @@ export function PlayerPage() {
       <PlayerCaptionOverlay
         source={captionOverlaySource}
         currentTime={currentTime}
+        captionOffset={captionOffset}
+        captionDuration={duration}
         lifecycleKey={playbackKey}
         onStatusChange={setCaptionStatus}
       />
@@ -1156,6 +1167,8 @@ export function PlayerPage() {
           selectedCaptionStreamIndex={captionSourceId === source?.id ? selectedCaptionStreamIndex : null}
           captionStatus={captionStatus}
           onSelectCaption={selectCaption}
+          captionOffset={captionOffset}
+          onChangeCaptionOffset={changeCaptionOffset}
           onClose={() => setShowSettings(false)}
         />
       ) : null}

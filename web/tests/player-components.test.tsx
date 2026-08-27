@@ -154,6 +154,8 @@ describe("LuxPlayer state components", () => {
         playbackRates={[0.5, 1, 1.5]}
         playbackRate={1}
         onChangeRate={() => undefined}
+        captionOffset={-1.2}
+        onChangeCaptionOffset={() => undefined}
         presentation={{
           loop: true,
           aspectRatio: "4:3",
@@ -176,6 +178,13 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain("4:3");
     expect(markup).toContain("画面翻转");
     expect(markup).toContain("水平镜像");
+    expect(markup).toContain('id="lux-player-caption-offset"');
+    expect(markup).toContain('min="-10"');
+    expect(markup).toContain('max="10"');
+    expect(markup).toContain('step="0.1"');
+    expect(markup).toContain('value="-1.2"');
+    expect(markup).toContain('aria-valuetext="-1.2s"');
+    expect(markup).toContain("正值延后，负值提前");
     expect(markup).toContain('aria-label="关闭播放设置"');
   });
 

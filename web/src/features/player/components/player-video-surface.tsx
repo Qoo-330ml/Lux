@@ -9,6 +9,7 @@ import type {
 import type { PlayerFailure } from "./player-diagnostics";
 import { usePlayerSurfaceGestures } from "./player-gestures";
 import type { PlayerNativeCaptionTrack } from "./player-captions";
+import { createNativeCaptionOffsetController } from "../caption-offset";
 import {
   DEFAULT_VIDEO_PRESENTATION,
   playerVideoPresentationSize,
@@ -30,6 +31,8 @@ type PlayerVideoSurfaceProps = {
   onTimeUpdate?: () => void;
   onEnded?: () => void;
   captionTrack?: PlayerNativeCaptionTrack | null;
+  captionOffset?: number;
+  captionDuration?: number | null;
   captionLifecycleKey?: string;
   onCaptionTrackLoad?: () => void;
   onCaptionTrackError?: () => void;
@@ -71,6 +74,8 @@ export function PlayerVideoSurface({
   onTimeUpdate,
   onEnded,
   captionTrack = null,
+  captionOffset = 0,
+  captionDuration = null,
   captionLifecycleKey = "",
   onCaptionTrackLoad,
   onCaptionTrackError,
@@ -89,6 +94,7 @@ export function PlayerVideoSurface({
 }: PlayerVideoSurfaceProps) {
   const frameRef = useRef<HTMLDivElement>(null);
   const captionTrackRef = useRef<HTMLTrackElement>(null);
+  const captionOffsetControllerRef = useRef<ReturnType<typeof createNativeCaptionOffsetController> | null>(null);
   const [presentationSize, setPresentationSize] = useState<ReturnType<typeof playerVideoPresentationSize>>(null);
   const gestures = usePlayerSurfaceGestures({
     enabled: Boolean(gestureOptions),
@@ -150,11 +156,27 @@ export function PlayerVideoSurface({
     const track = captionTrackRef.current;
     const nativeTrack = track?.track;
     if (!nativeTrack || !captionTrack) return;
+    const controller = createNativeCaptionOffsetController(nativeTrack);
+    captionOffsetControllerRef.current = controller;
     nativeTrack.mode = "showing";
+    controller.apply(captionOffset, captionDuration);
     return () => {
+      controller.restore();
       nativeTrack.mode = "disabled";
+      if (captionOffsetControllerRef.current === controller) {
+        captionOffsetControllerRef.current = null;
+      }
     };
   }, [captionLifecycleKey, captionTrack?.id, captionTrack?.src]);
+
+  useEffect(() => {
+    captionOffsetControllerRef.current?.apply(captionOffset, captionDuration);
+  }, [captionDuration, captionOffset]);
+
+  const handleCaptionTrackLoad = () => {
+    captionOffsetControllerRef.current?.apply(captionOffset, captionDuration);
+    onCaptionTrackLoad?.();
+  };
 
   return (
     <div ref={frameRef} className="lux-player-frame">
@@ -189,7 +211,7 @@ export function PlayerVideoSurface({
               label={captionTrack.label}
               srcLang={captionTrack.language}
               src={captionTrack.src}
-              onLoad={onCaptionTrackLoad}
+              onLoad={handleCaptionTrackLoad}
               onError={onCaptionTrackError}
             />
           ) : null}
