@@ -10280,6 +10280,7 @@ async fn lux_subtitle(
     headers: HeaderMap,
     method: Method,
     Path((item_id, stream_index)): Path<(String, String)>,
+    Query(query): Query<LuxStreamQuery>,
     State(state): State<AppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -10294,7 +10295,7 @@ async fn lux_subtitle(
         AccessPrincipal::new(user.id, user.is_admin),
         &method,
         &item_id,
-        None,
+        query.source_id.as_deref(),
         stream_index,
     )
     .await

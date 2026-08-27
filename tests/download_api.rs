@@ -119,13 +119,18 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
     let selected = "二毛 (2019) - 2160p - H.265 - AAC - test.mkv";
     tokio::fs::write(movie_dir.join(selected), b"selected video").await?;
     tokio::fs::write(
-        movie_dir.join("二毛 (2019) - 2160p - H.265 - AAC - test.zh.ass"),
-        b"subtitle",
+        movie_dir.join("二毛 (2019) - 2160p - H.265 - AAC - test.zh.vtt"),
+        b"WEBVTT\n\n00:00.000 --> 00:01.000\nselected subtitle\n",
     )
     .await?;
     tokio::fs::write(
         movie_dir.join("二毛 (2019) - 1080p - H.264 - AAC.mkv"),
         b"other video",
+    )
+    .await?;
+    tokio::fs::write(
+        movie_dir.join("二毛 (2019) - 1080p - H.264 - AAC.zh.vtt"),
+        b"WEBVTT\n\n00:00.000 --> 00:01.000\nalternate subtitle\n",
     )
     .await?;
     tokio::fs::write(
@@ -173,6 +178,51 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
     .bind(format!("二毛 (2019)/{selected}"))
     .fetch_one(database.pool())
     .await?;
+    let alternate_source_id: String = sqlx::query_scalar(
+        "SELECT ms.id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE ms.item_id = ? AND fe.relative_path = ?",
+    )
+    .bind(&item_id)
+    .bind("二毛 (2019)/二毛 (2019) - 1080p - H.264 - AAC.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams
+         (id, media_source_id, stream_index, stream_type, codec, language, title,
+          external_path, is_external, is_default, is_forced)
+         VALUES (?, ?, 2, 'SUBTITLE', 'vtt', 'zho', 'Selected', ?, 1, 1, 0),
+                (?, ?, 2, 'SUBTITLE', 'vtt', 'zho', 'Alternate', ?, 1, 1, 0)",
+    )
+    .bind("download-api-selected-vtt")
+    .bind(&source_id)
+    .bind("二毛 (2019)/二毛 (2019) - 2160p - H.265 - AAC - test.zh.vtt")
+    .bind("download-api-alternate-vtt")
+    .bind(&alternate_source_id)
+    .bind("二毛 (2019)/二毛 (2019) - 1080p - H.264 - AAC.zh.vtt")
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_sources SET is_default = CASE WHEN id = ? THEN 1 ELSE 0 END WHERE item_id = ?")
+        .bind(&source_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let selected_subtitle_index: i64 = sqlx::query_scalar(
+        "SELECT stream_index FROM media_streams
+         WHERE media_source_id = ? AND stream_type = 'SUBTITLE' AND is_external = 1",
+    )
+    .bind(&source_id)
+    .fetch_one(database.pool())
+    .await?;
+    let alternate_subtitle_index: i64 = sqlx::query_scalar(
+        "SELECT stream_index FROM media_streams
+         WHERE media_source_id = ? AND stream_type = 'SUBTITLE' AND is_external = 1",
+    )
+    .bind(&alternate_source_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(selected_subtitle_index, alternate_subtitle_index);
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -255,6 +305,32 @@ async fn download_returns_selected_local_and_strm_sources_without_archiving()
     assert_eq!(response.headers()["content-type"], "video/x-matroska");
     assert_eq!(response.headers()["content-length"], "17");
     assert!(response.bytes().await?.is_empty());
+
+    let response = client
+        .get(format!(
+            "{base_url}/api/v1/items/{item_id}/subtitles/{alternate_subtitle_index}?sourceId={alternate_source_id}"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/vtt; charset=utf-8"
+    );
+    assert_eq!(
+        response.bytes().await?.as_ref(),
+        b"WEBVTT\n\n00:00.000 --> 00:01.000\nalternate subtitle\n"
+    );
+
+    let response = client
+        .get(format!(
+            "{base_url}/api/v1/items/{item_id}/subtitles/{alternate_subtitle_index}?sourceId={remote_source_id}"
+        ))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::NOT_FOUND);
 
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
