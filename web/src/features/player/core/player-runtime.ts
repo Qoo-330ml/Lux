@@ -1,13 +1,20 @@
 import { LuxPlayerController } from "./player-controller";
 import { LuxPlaybackEngineHandle, type LuxPlaybackEngine } from "./playback-engine";
-import type { LuxPlaybackSource, LuxPlayerState } from "./types";
+import type {
+  LuxPlaybackEngineEvent,
+  LuxPlaybackSource,
+  LuxPlayerState,
+} from "./types";
 
 type LuxPlayerRuntimeListener = (state: LuxPlayerState) => void;
+type LuxPlayerRuntimeEventListener = (event: LuxPlaybackEngineEvent) => void;
 
 export class LuxPlayerRuntime {
   private readonly controller = new LuxPlayerController();
+  private readonly eventListeners = new Set<LuxPlayerRuntimeEventListener>();
   private activeEngine: LuxPlaybackEngineHandle | null = null;
   private removeEngineSubscription: (() => void) | null = null;
+  private operationGeneration = 0;
 
   get state() {
     return this.controller.state;
@@ -21,19 +28,38 @@ export class LuxPlayerRuntime {
     return this.controller.subscribe(listener);
   }
 
+  subscribeEvents(listener: LuxPlayerRuntimeEventListener) {
+    this.eventListeners.add(listener);
+    return () => this.eventListeners.delete(listener);
+  }
+
   async load(engine: LuxPlaybackEngine, source: LuxPlaybackSource) {
+    const operationGeneration = ++this.operationGeneration;
     this.disposeActiveEngine();
     this.controller.dispatch({ type: "LOAD", source });
     const handle = new LuxPlaybackEngineHandle(engine);
     this.activeEngine = handle;
-    this.removeEngineSubscription = handle.subscribe((event) => {
-      this.controller.dispatchEngineEvent(event);
-    });
+    this.removeEngineSubscription = handle.subscribe((event) => this.dispatchEngineEvent(event));
     try {
       await handle.setSource(source);
+      if (
+        operationGeneration !== this.operationGeneration
+        || this.activeEngine !== handle
+        || handle.isDestroyed
+      ) {
+        handle.destroy();
+        return this.state;
+      }
     } catch (cause) {
+      if (
+        operationGeneration !== this.operationGeneration
+        || this.activeEngine !== handle
+        || handle.isDestroyed
+      ) {
+        return this.state;
+      }
       if (this.activeEngine === handle) {
-        this.controller.dispatchEngineEvent({
+        this.dispatchEngineEvent({
           type: "ERROR",
           error: runtimeError(cause),
         });
@@ -56,6 +82,14 @@ export class LuxPlayerRuntime {
   }
 
   destroy() {
+    if (
+      this.activeEngine === null
+      && this.removeEngineSubscription === null
+      && this.state.status === "IDLE"
+    ) {
+      return;
+    }
+    this.operationGeneration += 1;
     this.disposeActiveEngine();
     this.controller.dispatch({ type: "RESET" });
   }
@@ -65,6 +99,11 @@ export class LuxPlayerRuntime {
     this.removeEngineSubscription = null;
     this.activeEngine?.destroy();
     this.activeEngine = null;
+  }
+
+  private dispatchEngineEvent(event: LuxPlaybackEngineEvent) {
+    this.controller.dispatchEngineEvent(event);
+    this.eventListeners.forEach((listener) => listener(event));
   }
 }
 

@@ -14,6 +14,8 @@ type MediaEventName = keyof HTMLMediaElementEventMap;
 
 export class LegacyPlaybackEngineAdapter implements LuxPlaybackEngine {
   readonly kind: LuxPlaybackEngineKind;
+  private destroyed = false;
+  private readonly subscriptions = new Set<() => void>();
 
   constructor(
     private readonly engine: PlaybackEngine,
@@ -61,12 +63,15 @@ export class LegacyPlaybackEngineAdapter implements LuxPlaybackEngine {
   }
 
   subscribe(listener: (event: LuxPlaybackEngineEvent) => void) {
+    if (this.destroyed) return () => undefined;
     const subscriptions: Array<() => void> = [];
     const on = (
       eventName: MediaEventName,
       createEvent: () => LuxPlaybackEngineEvent,
     ) => {
-      const handler = () => listener(createEvent());
+      const handler = () => {
+        if (!this.destroyed) listener(createEvent());
+      };
       this.element.addEventListener(eventName, handler);
       subscriptions.push(() => this.element.removeEventListener(eventName, handler));
     };
@@ -82,10 +87,22 @@ export class LegacyPlaybackEngineAdapter implements LuxPlaybackEngine {
     on("ended", () => ({ type: "ENDED", snapshot: this.snapshot() }));
     on("error", () => ({ type: "ERROR", error: playbackError(this.engine.error, this.element.error) }));
 
-    return () => subscriptions.splice(0).forEach((unsubscribe) => unsubscribe());
+    let active = true;
+    const unsubscribe = () => {
+      if (!active) return;
+      active = false;
+      subscriptions.splice(0).forEach((remove) => remove());
+      this.subscriptions.delete(unsubscribe);
+    };
+    this.subscriptions.add(unsubscribe);
+    return unsubscribe;
   }
 
   destroy() {
+    if (this.destroyed) return;
+    this.destroyed = true;
+    for (const unsubscribe of [...this.subscriptions]) unsubscribe();
+    this.subscriptions.clear();
     this.engine.destroy();
   }
 }

@@ -82,6 +82,30 @@ describe("LuxPlayer runtime", () => {
     expect(runtime.state.source?.id).toBe("source-2");
   });
 
+  it("does not apply a late old-engine error to a ready replacement", async () => {
+    const runtime = new LuxPlayerRuntime();
+    const first = fakeEngine();
+    const second = fakeEngine();
+
+    await runtime.load(first.engine, source);
+    first.emit({ type: "SOURCE_READY", snapshot });
+    await runtime.load(second.engine, { ...source, id: "source-2" });
+    second.emit({ type: "SOURCE_READY", snapshot });
+    first.emit({
+      type: "ERROR",
+      error: {
+        code: "ENGINE_FAILED",
+        message: "old engine failed",
+        recoverable: true,
+        canFallback: true,
+      },
+    });
+
+    expect(runtime.state.status).toBe("READY");
+    expect(runtime.state.source?.id).toBe("source-2");
+    expect(runtime.state.error).toBeNull();
+  });
+
   it("destroys the active engine and resets the controller once", async () => {
     const runtime = new LuxPlayerRuntime();
     const fake = fakeEngine();
@@ -93,6 +117,58 @@ describe("LuxPlayer runtime", () => {
     expect(fake.engine.destroy).toHaveBeenCalledTimes(1);
     expect(runtime.state.status).toBe("IDLE");
     expect(runtime.state.source).toBeNull();
+  });
+
+  it("does not publish a second reset when teardown is repeated", async () => {
+    const runtime = new LuxPlayerRuntime();
+    const fake = fakeEngine();
+    const states: string[] = [];
+    runtime.subscribe((state) => states.push(`${state.status}:${state.generation}`));
+
+    await runtime.load(fake.engine, source);
+    runtime.destroy();
+    runtime.destroy();
+
+    expect(states).toEqual(["PREPARING:1", "IDLE:2"]);
+  });
+
+  it("destroys a load that finishes after the runtime has been torn down", async () => {
+    let resolveSource: (() => void) | undefined;
+    const runtime = new LuxPlayerRuntime();
+    const fake = fakeEngine();
+    fake.engine.setSource = vi.fn(() => new Promise<void>((resolve) => {
+      resolveSource = resolve;
+    }));
+
+    const load = runtime.load(fake.engine, source);
+    runtime.destroy();
+    resolveSource?.();
+    await load;
+
+    expect(fake.engine.destroy).toHaveBeenCalledTimes(1);
+    expect(runtime.state.status).toBe("IDLE");
+  });
+
+  it("publishes a loading failure to runtime event listeners", async () => {
+    const runtime = new LuxPlayerRuntime();
+    const fake = fakeEngine();
+    const events: LuxPlaybackEngineEvent[] = [];
+    fake.engine.setSource = vi.fn(async () => {
+      throw new Error("source rejected");
+    });
+    runtime.subscribeEvents((event) => events.push(event));
+
+    await expect(runtime.load(fake.engine, source)).rejects.toThrow("source rejected");
+
+    expect(events).toEqual([{
+      type: "ERROR",
+      error: {
+        code: "ENGINE_FAILED",
+        message: "source rejected",
+        recoverable: true,
+        canFallback: true,
+      },
+    }]);
   });
 });
 
@@ -127,5 +203,30 @@ describe("LegacyPlaybackEngineAdapter", () => {
     unsubscribe();
 
     expect(events).toEqual(["SEEK_START:42", "CAN_PLAY:true"]);
+  });
+
+  it("removes DOM listeners when the adapter is destroyed directly", () => {
+    const video = document.createElement("video");
+    const engine: PlaybackEngine = {
+      kind: "native",
+      element: video,
+      performance: null,
+      error: null,
+      setSource: vi.fn(async () => undefined),
+      play: vi.fn(async () => undefined),
+      pause: vi.fn(),
+      seek: vi.fn(),
+      snapshot: vi.fn(() => ({ currentTime: 0, duration: 100, ended: false })),
+      destroy: vi.fn(),
+    };
+    const adapter = new LegacyPlaybackEngineAdapter(engine);
+    const events: LuxPlaybackEngineEvent[] = [];
+    adapter.subscribe((event) => events.push(event));
+
+    adapter.destroy();
+    video.dispatchEvent(new Event("play"));
+
+    expect(events).toEqual([]);
+    expect(engine.destroy).toHaveBeenCalledTimes(1);
   });
 });

@@ -262,6 +262,143 @@ describe("PlayerPage playback synchronization", () => {
       .toBe("/api/v1/playback/sessions/web-source-proxy/direct?expires=1900000000&signature=test");
   });
 
+  it("stops the old session before creating a selected replacement source", async () => {
+    const lifecycle: string[] = [];
+    vi.mocked(api.createWebPlaybackSession).mockImplementation(async (_itemId, sourceId) => {
+      lifecycle.push(`create:${sourceId}`);
+      return {
+        sessionId: `web-${sourceId}`,
+        playSessionId: `lux-web:web-${sourceId}`,
+        sourceId,
+        tier: 0,
+        expiresAt: 1_900_000_000,
+        plan: {
+          type: "DIRECT",
+          url: `/api/v1/playback/sessions/web-${sourceId}/direct?expires=1900000000&signature=test`,
+        },
+      };
+    });
+    vi.mocked(api.stopWebPlaybackSession).mockImplementation(async (sessionId) => {
+      lifecycle.push(`stop:${sessionId}`);
+    });
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-switch",
+      title: "版本切换测试",
+      itemType: "MOVIE",
+      mediaSources: [
+        { id: "source-1", isDefault: true, qualityLabel: "1080P" },
+        { id: "source-2", qualityLabel: "4K" },
+      ],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-switch"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const sourceSelector = container.querySelector<HTMLSelectElement>('select[aria-label="选择播放源"]');
+    expect(sourceSelector).not.toBeNull();
+    if (!sourceSelector) throw new Error("source selector was not rendered");
+    await act(async () => {
+      sourceSelector.value = "source-2";
+      sourceSelector.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+
+    expect(lifecycle).toEqual(["create:source-1", "stop:web-source-1", "create:source-2"]);
+  });
+
+  it("waits for the direct session to stop before creating a server fallback", async () => {
+    const lifecycle: string[] = [];
+    let finishStop: (() => void) | undefined;
+    vi.mocked(api.createWebPlaybackSession).mockImplementation(async (_itemId, sourceId) => {
+      lifecycle.push(`create:${sourceId}`);
+      return {
+        sessionId: `web-${sourceId}`,
+        playSessionId: `lux-web:web-${sourceId}`,
+        sourceId,
+        tier: 0,
+        expiresAt: 1_900_000_000,
+        plan: {
+          type: "DIRECT",
+          url: `/api/v1/playback/sessions/web-${sourceId}/direct?expires=1900000000&signature=test`,
+        },
+      };
+    });
+    vi.mocked(api.stopWebPlaybackSession).mockImplementation(async (sessionId) => {
+      lifecycle.push(`stop:${sessionId}`);
+      await new Promise<void>((resolve) => {
+        finishStop = resolve;
+      });
+    });
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-fallback-order",
+      title: "回退会话顺序测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-fallback-order"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    await act(async () => {
+      video.dispatchEvent(new Event("error"));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(lifecycle).toEqual(["create:source-1", "stop:web-source-1"]);
+
+    await act(async () => {
+      finishStop?.();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    });
+    expect(lifecycle).toEqual(["create:source-1", "stop:web-source-1", "create:source-1"]);
+  });
+
   it("releases the web playback session when media reaches the end", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-3",

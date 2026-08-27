@@ -12,12 +12,12 @@ type PlayerVideoSurfaceProps = {
   videoRef: RefCallback<HTMLVideoElement>;
   onClick: (event: ReactMouseEvent<HTMLVideoElement>) => void;
   onDoubleClick: (event: ReactMouseEvent<HTMLVideoElement>) => void;
-  onError: () => void;
-  onLoadedMetadata: () => void;
-  onPlay: () => void;
-  onPause: (event: SyntheticEvent<HTMLVideoElement>) => void;
-  onTimeUpdate: () => void;
-  onEnded: () => void;
+  onError?: (event: SyntheticEvent<HTMLVideoElement>) => void;
+  onLoadedMetadata?: () => void;
+  onPlay?: () => void;
+  onPause?: (event: SyntheticEvent<HTMLVideoElement>) => void;
+  onTimeUpdate?: () => void;
+  onEnded?: () => void;
   centerSplash: "play" | "pause" | null;
   fallbackLoading: boolean;
   fallbackSpeedX: number | null;

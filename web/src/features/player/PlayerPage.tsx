@@ -7,7 +7,6 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
   type PointerEvent as ReactPointerEvent,
-  type SyntheticEvent,
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
@@ -168,17 +167,25 @@ export function PlayerPage() {
     queryFn: () => api.playback(itemId),
     enabled: Boolean(itemId),
   });
+  const playbackDataRef = useRef(playback.data);
+  playbackDataRef.current = playback.data;
 
   const media = item.data;
   const source =
     media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
     media?.mediaSources?.find((entry) => entry.isDefault) ??
     media?.mediaSources?.[0];
+  const playbackKey = `${itemId}:${source?.id ?? ""}:${playbackAttempt}`;
+  const [sessionGateKey, setSessionGateKey] = useState(playbackKey);
+  const sessionStartedRef = useRef(false);
+  const playbackSessionIdRef = useRef<string | null>(null);
   const capabilities = webPlaybackCapabilities(source, playbackAttempt);
   const webPlaybackSession = useQuery({
     queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt),
     queryFn: () => api.createWebPlaybackSession(itemId, source?.id ?? "", capabilities),
-    enabled: Boolean(itemId && source?.id),
+    enabled: Boolean(itemId && source?.id)
+      && (sessionGateKey === playbackKey
+        || (!sessionStartedRef.current && playbackSessionIdRef.current === null)),
     retry: false,
     staleTime: Number.POSITIVE_INFINITY,
   });
@@ -203,9 +210,10 @@ export function PlayerPage() {
   const splashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const isDraggingScrubberRef = useRef(false);
-  const playbackSessionIdRef = useRef<string | null>(null);
   const playbackSequenceRef = useRef(0);
   const fallbackRequestedRef = useRef(false);
+  const sessionTransitionRef = useRef(Promise.resolve());
+  const fallbackGenerationRef = useRef(0);
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
     if (!video) {
@@ -231,6 +239,7 @@ export function PlayerPage() {
       force = false,
       keepalive = false,
       videoOverride?: HTMLVideoElement | null,
+      sessionIdOverride?: string | null,
     ) => {
       const video = videoOverride ?? videoRef.current;
       if (!video || (state === "STOPPED" && !hasStartedRef.current)) return undefined;
@@ -247,7 +256,7 @@ export function PlayerPage() {
           ? Math.round(video.duration * TICKS_PER_SECOND)
           : null;
       lastProgressReportRef.current = now;
-      const sessionId = playbackSessionIdRef.current;
+      const sessionId = sessionIdOverride ?? playbackSessionIdRef.current;
       if (!sessionId) return undefined;
       const sequence = ++playbackSequenceRef.current;
       const request = api.webPlaybackEvent(
@@ -273,13 +282,12 @@ export function PlayerPage() {
     [queryClient],
   );
 
-  const stopActiveSession = useCallback((keepalive = false) => {
-    const sessionId = playbackSessionIdRef.current;
+  const stopActiveSession = useCallback((sessionId: string | null, keepalive = false) => {
     if (!sessionId) return Promise.resolve();
     return api.stopWebPlaybackSession(sessionId, keepalive).catch(() => undefined);
   }, []);
 
-  const requestServerFallback = useCallback((reason?: string) => {
+  const requestServerFallback = useCallback(async (reason?: string) => {
     if (
       playbackPlan?.type === "DIRECT"
       && directProxyUrl
@@ -301,19 +309,24 @@ export function PlayerPage() {
     }
     fallbackRequestedRef.current = true;
     const sessionId = playbackSessionIdRef.current;
-    if (sessionId) void api.stopWebPlaybackSession(sessionId).catch(() => undefined);
+    const fallbackGeneration = fallbackGenerationRef.current;
+    if (sessionId) await stopActiveSession(sessionId);
+    if (fallbackGeneration !== fallbackGenerationRef.current) return;
+    if (playbackSessionIdRef.current === sessionId) {
+      playbackSessionIdRef.current = null;
+      playbackSequenceRef.current = 0;
+    }
     setPlaybackError("浏览器无法播放这个媒体源，正在准备兼容的服务端播放…");
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, streamUrl]);
+  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, stopActiveSession, streamUrl]);
 
   useEffect(() => {
+    fallbackGenerationRef.current += 1;
     lastProgressReportRef.current = 0;
     hasStartedRef.current = false;
     hasRestoredPositionRef.current = false;
     fallbackRequestedRef.current = false;
-    playbackSessionIdRef.current = null;
-    playbackSequenceRef.current = 0;
     setPlaybackAttempt(0);
     setDirectProxyFallbackRequested(false);
     setFailedStreamUrl(null);
@@ -326,9 +339,28 @@ export function PlayerPage() {
   }, [itemId, requestedSourceId]);
 
   useEffect(() => {
+    if (sessionGateKey === playbackKey) return;
+    const previousSessionId = playbackSessionIdRef.current;
+    playbackSessionIdRef.current = null;
+    playbackSequenceRef.current = 0;
+    let active = true;
+    sessionTransitionRef.current = sessionTransitionRef.current
+      .catch(() => undefined)
+      .then(() => previousSessionId ? stopActiveSession(previousSessionId) : undefined)
+      .finally(() => {
+        if (active) setSessionGateKey(playbackKey);
+      });
+    return () => {
+      active = false;
+    };
+  }, [playbackKey, sessionGateKey, stopActiveSession]);
+
+  useEffect(() => {
+    if (sessionGateKey !== playbackKey) return;
+    if (webPlaybackSession.data?.sessionId) sessionStartedRef.current = true;
     playbackSessionIdRef.current = webPlaybackSession.data?.sessionId ?? null;
     playbackSequenceRef.current = 0;
-  }, [webPlaybackSession.data?.sessionId]);
+  }, [playbackKey, sessionGateKey, webPlaybackSession.data?.sessionId]);
 
   useEffect(() => {
     const sessionId = webPlaybackSession.data?.sessionId;
@@ -341,15 +373,17 @@ export function PlayerPage() {
 
   useEffect(() => {
     const handlePageHide = () => {
-      void Promise.resolve(reportPlayback("STOPPED", true, true)).finally(() => {
-        void stopActiveSession(true);
+      const sessionId = playbackSessionIdRef.current;
+      void Promise.resolve(reportPlayback("STOPPED", true, true, undefined, sessionId)).finally(() => {
+        void stopActiveSession(sessionId, true);
       });
     };
     window.addEventListener("pagehide", handlePageHide);
     return () => {
       window.removeEventListener("pagehide", handlePageHide);
-      void Promise.resolve(reportPlayback("STOPPED", true, false, lastVideoRef.current)).finally(() => {
-        void stopActiveSession();
+      const sessionId = playbackSessionIdRef.current;
+      void Promise.resolve(reportPlayback("STOPPED", true, false, lastVideoRef.current, sessionId)).finally(() => {
+        void stopActiveSession(sessionId);
       });
     };
   }, [reportPlayback, stopActiveSession]);
@@ -357,16 +391,17 @@ export function PlayerPage() {
   const restorePlaybackPosition = useCallback(() => {
     if (hasRestoredPositionRef.current) return;
     const video = videoRef.current;
-    if (!video || !playback.data) return;
+    const playbackData = playbackDataRef.current;
+    if (!video || !playbackData) return;
     if (video.readyState < 1 && !Number.isFinite(video.duration)) return;
     hasRestoredPositionRef.current = true;
-    const resumeTicks = playback.data.positionTicks ?? 0;
-    if (playback.data.isPlayed || resumeTicks <= 0) return;
+    const resumeTicks = playbackData.positionTicks ?? 0;
+    if (playbackData.isPlayed || resumeTicks <= 0) return;
     const resumeSeconds = resumeTicks / TICKS_PER_SECOND;
     if (!Number.isFinite(video.duration) || resumeSeconds < video.duration) {
       video.currentTime = resumeSeconds;
     }
-  }, [playback.data]);
+  }, []);
 
   useEffect(() => {
     restorePlaybackPosition();
@@ -382,7 +417,71 @@ export function PlayerPage() {
     let activeEngine: PlaybackEngine = initialEngine;
     let performanceElement: HTMLVideoElement | null = null;
     let cancelled = false;
+    const syncSnapshot = (snapshot: {
+      currentTime: number;
+      duration: number | null;
+      bufferedEnd: number;
+    }) => {
+      if (!isDraggingScrubberRef.current) setCurrentTime(snapshot.currentTime);
+      setDuration(snapshot.duration ?? 0);
+      setBufferedEnd(snapshot.bufferedEnd);
+    };
+    const removeRuntimeSubscription = runtime.subscribeEvents((event) => {
+      if (cancelled) return;
+      switch (event.type) {
+        case "SOURCE_READY":
+          syncSnapshot(event.snapshot);
+          restorePlaybackPosition();
+          break;
+        case "PLAYING":
+          hasStartedRef.current = true;
+          setPlaying(true);
+          void reportPlayback("PLAYING", true, false, initialEngine.element);
+          break;
+        case "PAUSED":
+          if (event.snapshot) syncSnapshot(event.snapshot);
+          setPlaying(false);
+          setControlsVisible(true);
+          if (!event.snapshot?.ended) {
+            void reportPlayback("PAUSED", true, false, initialEngine.element);
+          }
+          break;
+        case "WAITING":
+          setControlsVisible(true);
+          break;
+        case "SEEK_START":
+          setCurrentTime(event.position);
+          break;
+        case "SEEKED":
+          syncSnapshot(event.snapshot);
+          break;
+        case "TIME_UPDATE":
+          syncSnapshot(event.snapshot);
+          void reportPlayback("PLAYING", false, false, initialEngine.element);
+          break;
+        case "ENDED": {
+          syncSnapshot(event.snapshot);
+          setPlaying(false);
+          const sessionId = playbackSessionIdRef.current;
+          void Promise.resolve(reportPlayback("STOPPED", true, false, initialEngine.element, sessionId)).finally(() => {
+            void stopActiveSession(sessionId);
+          });
+          break;
+        }
+        case "ERROR":
+          if (activeEngine.kind === "native" && playbackPlan?.type === "DIRECT") {
+            void requestServerFallback(event.error.message);
+          } else {
+            setFailedStreamUrl(streamUrl);
+            setPlaybackError(`服务端播放失败：${event.error.message} 请尝试其他版本或使用支持该格式的客户端。`);
+          }
+          break;
+        case "CAN_PLAY":
+          break;
+      }
+    });
     const handlePerformance = (event: Event) => {
+      if (cancelled) return;
       const performance = (event as CustomEvent<PlaybackPerformance | null>).detail;
       setFallbackSpeedX(performance && !performance.realtime ? performance.speedX : null);
     };
@@ -402,9 +501,11 @@ export function PlayerPage() {
             initialEngine.destroy();
             if (useMkvFallback) {
               const { ClientMkvEngine } = await import("./mkv-playback-engine");
+              if (cancelled) return;
               activeEngine = new ClientMkvEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
             } else {
               const { ClientHevcEngine } = await import("./hevc-playback-engine");
+              if (cancelled) return;
               activeEngine = new ClientHevcEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
             }
             engineRef.current = activeEngine;
@@ -432,6 +533,7 @@ export function PlayerPage() {
           );
       } catch (cause) {
         if (!cancelled) {
+          if (runtime.state.status === "FAILED") return;
           const reason = cause instanceof Error ? cause.message : "未知错误";
           if (playbackPlan?.type === "DIRECT") {
             requestServerFallback(reason);
@@ -450,11 +552,12 @@ export function PlayerPage() {
     return () => {
       cancelled = true;
       performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
+      removeRuntimeSubscription();
       runtime.destroy();
       if (runtimeRef.current === runtime) runtimeRef.current = null;
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
-  }, [playbackPlan?.type, poster, requestServerFallback, source, streamUrl]);
+  }, [playbackKey, playbackPlan?.type, poster, requestServerFallback, source, streamUrl]);
 
   // Fullscreen change listener
   useEffect(() => {
@@ -641,37 +744,6 @@ export function PlayerPage() {
     volume,
   ]);
 
-  // Video event handlers
-  const handleLoadedMetadata = () => {
-    const video = videoRef.current;
-    if (video) {
-      setDuration(video.duration || 0);
-      setCurrentTime(video.currentTime || 0);
-    }
-    restorePlaybackPosition();
-  };
-
-  const handleTimeUpdate = () => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (!isDraggingScrubberRef.current) {
-      setCurrentTime(video.currentTime || 0);
-    }
-    if (video.duration && !Number.isNaN(video.duration)) {
-      setDuration(video.duration);
-    }
-    if (video.buffered.length > 0) {
-      setBufferedEnd(video.buffered.end(video.buffered.length - 1));
-    }
-    reportPlayback("PLAYING");
-  };
-
-  const handlePause = (event: SyntheticEvent<HTMLVideoElement>) => {
-    setPlaying(false);
-    setControlsVisible(true);
-    if (!event.currentTarget.ended) reportPlayback("PAUSED", true);
-  };
-
   // Scrubber scrubbing handlers
   const handleScrubberPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     const bar = progressBarRef.current;
@@ -812,34 +884,6 @@ export function PlayerPage() {
         onDoubleClick={(event) => {
           event.stopPropagation();
           toggleFullscreen();
-        }}
-        onError={() => {
-          const engine = engineRef.current;
-          const reason = engine?.error?.message;
-          if (engine?.kind === "native") {
-            requestServerFallback(reason);
-          } else {
-            setFailedStreamUrl(streamUrl);
-            setPlaybackError(
-              reason
-                ? `客户端解码失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`
-                : null,
-            );
-          }
-        }}
-        onLoadedMetadata={handleLoadedMetadata}
-        onPlay={() => {
-          hasStartedRef.current = true;
-          setPlaying(true);
-          reportPlayback("PLAYING", true);
-        }}
-        onPause={handlePause}
-        onTimeUpdate={handleTimeUpdate}
-        onEnded={() => {
-          setPlaying(false);
-          void Promise.resolve(reportPlayback("STOPPED", true)).finally(() => {
-            void stopActiveSession();
-          });
         }}
         centerSplash={centerSplash}
         fallbackLoading={fallbackLoading}
