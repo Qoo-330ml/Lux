@@ -41,6 +41,8 @@ import type {
 } from "./components/player-presentation";
 import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
+import { usePlayerAirPlay } from "./components/player-airplay";
+import { PlayerMiniProgressBar } from "./components/player-mini-progress";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -202,6 +204,7 @@ export function PlayerPage() {
   const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
   const [captionStatus, setCaptionStatus] = useState<string | null>(null);
   const [captionOffset, setCaptionOffset] = useState(0);
+  const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
 
   const requestedSourceId = searchParams.get("sourceId");
   const item = useQuery({
@@ -269,6 +272,7 @@ export function PlayerPage() {
   const fallbackRequestedRef = useRef(false);
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
+  const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
     if (!video) {
@@ -281,10 +285,12 @@ export function PlayerPage() {
       }
       engineRef.current = null;
       videoRef.current = null;
+      setAirPlayVideo(null);
       return;
     }
     videoRef.current = video;
     lastVideoRef.current = video;
+    setAirPlayVideo(video);
     engineRef.current = new NativeVideoEngine(video);
   }, []);
 
@@ -1138,6 +1144,12 @@ export function PlayerPage() {
         playbackRate={playbackRate}
         lifecycleKey={playbackKey}
       />
+      <PlayerMiniProgressBar
+        controlsVisible={controlsVisible}
+        currentTime={currentTime}
+        duration={duration}
+        bufferedEnd={bufferedEnd}
+      />
 
       {/* Floating Vignette Shadows */}
       <div className="lux-player-vignette-top" aria-hidden="true" />
@@ -1191,6 +1203,7 @@ export function PlayerPage() {
         sources={sourceOptions}
         selectedSourceId={source?.id ?? ""}
         danmuVisible={danmuVisible}
+        airPlayAvailable={airPlay.available}
         settingsOpen={showSettings}
         remainingTime={isRemainingTime}
         hoverTime={hoverTime}
@@ -1212,6 +1225,7 @@ export function PlayerPage() {
           setDanmuVisible((visible) => !visible);
           resetControlsTimeout();
         }}
+        onAirPlay={airPlay.showPicker}
         onTakeScreenshot={takeScreenshot}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
         onTogglePictureInPicture={togglePictureInPicture}

@@ -1,5 +1,6 @@
 import {
   Camera,
+  Airplay,
   Maximize,
   MessageCircleMore,
   Minimize,
@@ -31,6 +32,7 @@ export type PlayerControlsProps = {
   sources: readonly PlayerControlSourceOption[];
   selectedSourceId: string;
   danmuVisible: boolean;
+  airPlayAvailable?: boolean;
   settingsOpen: boolean;
   remainingTime: boolean;
   hoverTime: number | null;
@@ -49,6 +51,7 @@ export type PlayerControlsProps = {
   onToggleRemainingTime: () => void;
   onSourceChange: (sourceId: string) => void;
   onToggleDanmu: () => void;
+  onAirPlay?: () => void;
   onTakeScreenshot: () => void;
   onToggleSettings: () => void;
   onTogglePictureInPicture: () => void;
@@ -85,6 +88,7 @@ export function PlayerControls({
   sources,
   selectedSourceId,
   danmuVisible,
+  airPlayAvailable = false,
   settingsOpen,
   remainingTime,
   hoverTime,
@@ -103,6 +107,7 @@ export function PlayerControls({
   onToggleRemainingTime,
   onSourceChange,
   onToggleDanmu,
+  onAirPlay = () => undefined,
   onTakeScreenshot,
   onToggleSettings,
   onTogglePictureInPicture,
@@ -224,6 +229,11 @@ export function PlayerControls({
                 </option>
               ))}
             </select>
+          ) : null}
+          {airPlayAvailable ? (
+            <button type="button" className="lux-player-action-btn" aria-label="AirPlay" title="AirPlay" onClick={onAirPlay}>
+              <Airplay size={20} aria-hidden="true" />
+            </button>
           ) : null}
           <button type="button" className="lux-player-action-btn" aria-label="截图" title="截图" onClick={onTakeScreenshot}>
             <Camera size={20} aria-hidden="true" />

@@ -18,3 +18,8 @@ test("LuxPlayer keeps danmaku out of the title and control safe zones", () => {
     /\.lux-player-danmaku-overlay \{[^}]*inset: clamp\(88px, 12vh, 120px\) 0 clamp\(92px, 18vh, 156px\) 0/,
   );
 });
+
+test("LuxPlayer mini progress stays at the edge without taking pointer focus", () => {
+  assert.match(styles, /\.lux-player-mini-progress \{[^}]*bottom: calc\(4px \+ env\(safe-area-inset-bottom\)\)/);
+  assert.match(styles, /\.lux-player-mini-progress \{[^}]*pointer-events: none/);
+});

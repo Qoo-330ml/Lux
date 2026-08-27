@@ -202,6 +202,7 @@ describe("LuxPlayer state components", () => {
         sources={[{ id: "source-1", label: "1080P", detail: "MP4" }]}
         selectedSourceId="source-1"
         danmuVisible
+        airPlayAvailable
         settingsOpen={false}
         remainingTime={false}
         hoverTime={null}
@@ -221,6 +222,7 @@ describe("LuxPlayer state components", () => {
         onToggleRemainingTime={() => undefined}
         onSourceChange={() => undefined}
         onToggleDanmu={() => undefined}
+        onAirPlay={() => undefined}
         onTakeScreenshot={() => undefined}
         onToggleSettings={() => undefined}
         onTogglePictureInPicture={() => undefined}
@@ -237,6 +239,7 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-label="音量调节"');
     expect(markup).toContain('aria-label="隐藏弹幕"');
     expect(markup).toContain('aria-pressed="true"');
+    expect(markup).toContain('aria-label="AirPlay"');
     expect(markup).toContain('aria-label="选择播放版本"');
     expect(markup).toContain('aria-label="截图"');
     expect(markup).toContain('aria-label="播放器设置"');

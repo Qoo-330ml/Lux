@@ -612,6 +612,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-page.controls-hidden .lux-player-topbar { opacity: 0; pointer-events: none; transform: translateY(-12px); }
 .lux-player-page.controls-hidden .lux-player-vignette-bottom,
 .lux-player-page.controls-hidden .lux-player-controls-wrap { opacity: 0; pointer-events: none; transform: translateY(12px); }
+.lux-player-mini-progress { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(4px + env(safe-area-inset-bottom)); left: calc(2% + env(safe-area-inset-left)); height: 3px; overflow: hidden; border-radius: 9999px; background: rgba(255,255,255,.22); pointer-events: none; z-index: 11; }
+.lux-player-mini-progress-buffered, .lux-player-mini-progress-played { position: absolute; top: 0; bottom: 0; left: 0; border-radius: inherit; pointer-events: none; }
+.lux-player-mini-progress-buffered { background: rgba(255,255,255,.32); }
+.lux-player-mini-progress-played { background: var(--lux-accent); }
 
 .lux-player-timeline { position: relative; width: 100%; height: 21px; padding: 10px 0 5px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
 .lux-player-timeline-rail { position: relative; width: 100%; height: 4px; background: rgba(255,255,255,.28); border-radius: 9999px; transition: height .15s ease; }
@@ -1408,6 +1412,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-media-nfo-summary { grid-template-columns: 1fr; }
   .lux-player-topbar { top: calc(14px + env(safe-area-inset-top)); }
   .lux-player-controls-wrap { right: calc(10px + env(safe-area-inset-right)); bottom: calc(6px + env(safe-area-inset-bottom)); left: calc(10px + env(safe-area-inset-left)); }
+  .lux-player-mini-progress { right: calc(10px + env(safe-area-inset-right)); bottom: calc(2px + env(safe-area-inset-bottom)); left: calc(10px + env(safe-area-inset-left)); }
   .lux-player-controls-middle { flex: 0 0 auto; }
   .lux-player-controls-right { width: calc(100vw - 253px); max-width: calc(100vw - 253px); overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-width: none; }
   .lux-player-controls-right::-webkit-scrollbar { display: none; }
