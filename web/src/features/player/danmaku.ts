@@ -63,6 +63,9 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
     throw invalidXml();
   }
   const body = root[1] ?? "";
+  if (/<i\b/i.test(body)) {
+    throw invalidXml();
+  }
   const openingCount = (body.match(/<d\b/gi) ?? []).length;
   const closingCount = (body.match(/<\/d\s*>/gi) ?? []).length;
   if (openingCount !== closingCount) {
@@ -76,7 +79,7 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
   const entryPattern = /<d\b([^>]*)>([\s\S]*?)<\/d\s*>/gi;
   for (const match of body.matchAll(entryPattern)) {
     const entry = parseEntry(match[1] ?? "", match[2] ?? "");
-    if (entry) entries.push(entry);
+    if (entry) entries.push({ id: "", ...entry });
   }
   return entries
     .sort((left, right) => left.start - right.start)
@@ -194,6 +197,7 @@ export function activeDanmaku(
   entries: readonly ScheduledDanmaku[],
   time: number,
   viewport: { width: number; height: number } = { width: 1280, height: 720 },
+  _playbackRate = 1,
 ): DanmakuPlacement[] {
   if (!Number.isFinite(time) || time < 0) return [];
   const width = Math.max(1, viewport.width);

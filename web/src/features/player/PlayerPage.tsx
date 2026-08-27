@@ -35,6 +35,7 @@ import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerTopBar } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
 import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
+import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -1087,6 +1088,14 @@ export function PlayerPage() {
         currentTime={currentTime}
         lifecycleKey={playbackKey}
         onStatusChange={setCaptionStatus}
+      />
+      <PlayerDanmakuOverlay
+        itemId={itemId}
+        sourceId={source?.id ?? ""}
+        visible={danmuVisible}
+        currentTime={currentTime}
+        playbackRate={playbackRate}
+        lifecycleKey={playbackKey}
       />
 
       {/* Floating Vignette Shadows */}

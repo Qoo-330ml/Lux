@@ -5,6 +5,7 @@ import {
   assignDanmakuLanes,
   parseBilibiliDanmaku,
 } from "../src/features/player/danmaku";
+import { parseDanmakuWorkerRequest } from "../src/features/player/danmaku-worker";
 
 describe("LuxPlayer danmaku parser", () => {
   it("normalizes bounded Bilibili XML into text-only supported modes", () => {
@@ -20,9 +21,40 @@ describe("LuxPlayer danmaku parser", () => {
   it("rejects invalid XML and discards unsafe or unsupported entries", () => {
     expect(() => parseBilibiliDanmaku("<html>not danmaku</html>"))
       .toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
+    expect(() => parseBilibiliDanmaku(
+      '<i><i><d p="1,1,25,0,0,0,0,0">nested</d></i></i>',
+    )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
     expect(parseBilibiliDanmaku(
       '<i><d p="1,7,25,0,0,0,0,0">高级模式</d><d p="-1,1,25,0,0,0,0,0">负时间</d><d p="1,1,25,0,0,0,0,0">safe\u0000text</d><d p="1,1,25,0,0,0,0,0"></d></i>',
     )).toEqual([]);
+  });
+
+  it("keeps worker parsing failures scoped to the request generation", () => {
+    expect(parseDanmakuWorkerRequest({
+      type: "PARSE",
+      requestId: 12,
+      xml: '<i><d p="1,1,25,16777215,0,0,0,0">worker</d></i>',
+    })).toEqual({
+      type: "PARSED",
+      requestId: 12,
+      entries: [{
+        id: "danmaku-0",
+        start: 1,
+        mode: "scroll",
+        text: "worker",
+        color: "#ffffff",
+        fontSize: 25,
+      }],
+    });
+    expect(parseDanmakuWorkerRequest({
+      type: "PARSE",
+      requestId: 13,
+      xml: "<bad />",
+    })).toEqual({
+      type: "FAILED",
+      requestId: 13,
+      message: "弹幕 XML 格式无效",
+    });
   });
 });
 

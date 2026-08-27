@@ -656,6 +656,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-player-caption-overlay { position: absolute; right: calc(8% + env(safe-area-inset-right)); bottom: calc(13% + env(safe-area-inset-bottom)); left: calc(8% + env(safe-area-inset-left)); display: flex; justify-content: center; z-index: 8; pointer-events: none; text-align: center; }
 .lux-player-caption-text { max-width: min(100%, 72rem); padding: 4px 9px; border-radius: 4px; color: #fff; background: rgba(0,0,0,.68); box-shadow: 0 1px 2px rgba(0,0,0,.75); font-size: clamp(1rem, 2.2vw, 1.65rem); font-weight: 600; line-height: 1.45; text-wrap: balance; white-space: pre-line; }
+.lux-player-danmaku-overlay { position: absolute; inset: 0; z-index: 7; overflow: hidden; pointer-events: none; }
+.lux-player-danmaku-text { position: absolute; display: block; max-width: 90%; overflow: hidden; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; font-weight: 600; line-height: 1.2; text-shadow: 0 1px 2px rgba(0,0,0,.95), 1px 0 2px rgba(0,0,0,.7), -1px 0 2px rgba(0,0,0,.7); white-space: pre-line; }
+.lux-player-danmaku-top, .lux-player-danmaku-bottom { left: 50% !important; max-width: min(90%, 72rem); transform: translateX(-50%); text-align: center; }
 
 .lux-player-settings-popover { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(70px + env(safe-area-inset-bottom)); width: 270px; padding: 16px; border: 1px solid rgba(255,255,255,.15); border-radius: 16px; background: rgba(18,18,26,.88); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); box-shadow: 0 20px 50px rgba(0,0,0,.6); z-index: 20; color: #fff; animation: lux-popover-in .2s var(--lux-ease); }
 @keyframes lux-popover-in { from { opacity: 0; transform: translateY(8px) scale(.96); } to { opacity: 1; transform: translateY(0) scale(1); } }
