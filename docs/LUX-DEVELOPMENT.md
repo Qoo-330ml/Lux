@@ -5082,10 +5082,10 @@ video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或�
 
 验收：
 
-- [ ] 仅当 `webkitShowPlaybackTargetPicker` 和播放目标可用时显示有可访问名称的 AirPlay 控件；不可用时不显示且无错误。
-- [ ] AirPlay 调用当前引擎 video，不创建会话、不改写 URL；source/engine 变化后能力监听和引用一起更新/释放。
-- [ ] 控制层隐藏时显示当前播放/缓冲比例的细进度条，显示控制层、媒体未就绪或直播时按定义隐藏；不抢占 pointer/focus。
-- [ ] 参考 ArtPlayer `airplayMix.js`、`control/airplay.js`、`miniProgressBar.js` 的边界并更新第三方台账。
+- [x] 仅当 `webkitShowPlaybackTargetPicker` 和播放目标可用时显示有可访问名称的 AirPlay 控件；不可用时不显示且无错误。
+- [x] AirPlay 调用当前引擎 video，不创建会话、不改写 URL；source/engine 变化后能力监听和引用一起更新/释放。
+- [x] 控制层隐藏时显示当前播放/缓冲比例的细进度条，显示控制层、媒体未就绪或直播时按定义隐藏；不抢占 pointer/focus。
+- [x] 参考 ArtPlayer `airplayMix.js`、`control/airplay.js`、`miniProgressBar.js` 的边界并更新第三方台账。
 
 验证：平台能力/组件测试、响应式布局检查、`pnpm --dir web test`、`pnpm --dir web build`，Safari 真机差异记入兼容性记录。
 
