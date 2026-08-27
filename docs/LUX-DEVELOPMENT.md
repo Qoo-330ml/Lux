@@ -4995,10 +4995,10 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 
 验收：
 
-- [ ] 390×844、768×1024、1440×900 下字幕、弹幕、控制栏、安全区、键盘焦点和触摸 seek 不重叠、不产生横向溢出。
-- [ ] Direct/HLS/fallback 的 source 切换、会话停止、页面离开和错误路径不会保留字幕/弹幕；console 为 0 error/0 warning，网络只包含声明的 Lux 端点。
+- [x] 390×844、768×1024、1440×900 下字幕、弹幕、控制栏、安全区、键盘焦点和触摸 seek 不重叠、不产生横向溢出。
+- [x] Direct/HLS/fallback 的 source 切换、会话停止、页面离开和错误路径不会保留字幕/弹幕；console 为 0 error/0 warning，网络只包含声明的 Lux 端点。
 - [x] 记录浏览器/平台/夹具哈希、解析/调度上限、已验证能力和未验证真机项；本机 `arm64` 结论不外推为 NAS/x86 或所有移动浏览器性能。
-- [ ] 全部 Rust/Web 质量门通过，第三方台账和 `docs/COMPATIBILITY.md` 更新；项目所有者确认阶段门后才可以再扩展播放器能力。
+- [x] 全部 Rust/Web 质量门通过，第三方台账和 `docs/COMPATIBILITY.md` 更新；项目所有者确认阶段门后才可以再扩展播放器能力。
 
 验证：相关 Rust 测试、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、`pnpm --dir web build`、Playwright/真实浏览器检查、`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
 
@@ -5007,10 +5007,10 @@ Web Worker 中完成重型解析。SRT/ASS 到 cue 的客户端归一化不改�
 阶段门：
 
 - [x] 所有 Web 字幕与弹幕请求经过独立 Lux API、会话生命周期与媒体库 ACL；没有外部 URL、文件路径或 Emby DTO 泄露到 Lux Web。
-- [ ] 文本字幕与弹幕解析/渲染在 Direct、HLS 和客户端 fallback 下通过安全、功能与性能回归。
-- [ ] 桌面和移动 viewport 下的控制、字幕、弹幕和手势通过真实浏览器验证；真机差异明确记录。
+- [x] 文本字幕与弹幕解析/渲染在 Direct、HLS 和客户端 fallback 下通过安全、功能与性能回归。
+- [x] 桌面和移动 viewport 下的控制、字幕、弹幕和手势通过真实浏览器验证；真机差异明确记录。
 - [x] ArtPlayer 任何复制/改造均有 MIT 追溯；未复制的逻辑标为仅参考，Lux 不依赖 ArtPlayer 包。
-- [ ] LUX-215 的 Rust/Web 全量检查、兼容性记录和 `uname -m` 完成，并由项目所有者确认。
+- [x] LUX-215 的 Rust/Web 全量检查、兼容性记录和 `uname -m` 完成，并由项目所有者确认。
 
 ## 26. 风险与缓解
 
