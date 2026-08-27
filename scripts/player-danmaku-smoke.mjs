@@ -19,15 +19,19 @@ const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
 const consoleErrors = [];
 const consoleWarnings = [];
 const pageErrors = [];
+let captureBrowserDiagnostics = false;
 const externalRequests = [];
 const compatibilityDanmakuRequests = [];
 const danmakuResponses = [];
 
 page.on("console", (message) => {
+  if (!captureBrowserDiagnostics) return;
   if (message.type() === "error") consoleErrors.push(message.text());
   if (message.type() === "warning") consoleWarnings.push(message.text());
 });
-page.on("pageerror", (error) => pageErrors.push(error.message));
+page.on("pageerror", (error) => {
+  if (captureBrowserDiagnostics) pageErrors.push(error.message);
+});
 page.on("request", (request) => {
   const url = new URL(request.url());
   if (url.origin !== new URL(baseUrl).origin) externalRequests.push(url.origin);
@@ -51,6 +55,7 @@ await Promise.all([
   page.waitForResponse((response) => new URL(response.url()).pathname === "/api/v1/auth/login" && response.status() === 200),
   page.getByRole("button", { name: "进入 Lux", exact: true }).click(),
 ]);
+captureBrowserDiagnostics = true;
 
 const playerUrl = `${baseUrl}/watch/${encodeURIComponent(itemId)}${sourceId ? `?sourceId=${encodeURIComponent(sourceId)}` : ""}`;
 await page.goto(playerUrl, { waitUntil: "networkidle" });
@@ -60,10 +65,27 @@ await page.locator("[data-lux-danmaku-overlay]").waitFor({ state: "attached" });
 await page.waitForFunction(() => document.querySelectorAll("[data-lux-danmaku-overlay] .lux-player-danmaku-text").length >= 0);
 
 const video = page.locator("video.lux-video");
-await video.evaluate((element) => {
-  element.currentTime = 0;
-  element.dispatchEvent(new Event("timeupdate"));
+const timeline = page.getByRole("slider", { name: "播放进度", exact: true });
+const timelineBox = await timeline.boundingBox();
+if (!timelineBox) throw new Error("playback timeline is not measurable");
+const timeBeforeSeek = await video.evaluate((element) => element.currentTime);
+await timeline.click({ position: { x: timelineBox.width * 0.6, y: timelineBox.height / 2 } });
+await page.waitForFunction((before) => {
+  const currentTime = document.querySelector("video.lux-video")?.currentTime ?? 0;
+  return currentTime > before + 0.25;
+}, timeBeforeSeek);
+
+const safeZone = await page.evaluate(() => {
+  const topbar = document.querySelector(".lux-player-topbar")?.getBoundingClientRect();
+  const controls = document.querySelector(".lux-player-controls-wrap")?.getBoundingClientRect();
+  if (!topbar || !controls) return false;
+  return [...document.querySelectorAll(".lux-player-danmaku-text")].every((element) => {
+    const bounds = element.getBoundingClientRect();
+    return bounds.top >= topbar.bottom && bounds.bottom <= controls.top;
+  });
 });
+if (!safeZone) throw new Error("danmaku overlaps player chrome");
+
 const toggle = page.getByRole("button", { name: "隐藏弹幕", exact: true });
 await toggle.waitFor({ state: "visible" });
 const requestsBeforeHide = danmakuResponses.length;
@@ -86,6 +108,8 @@ for (const viewport of [{ width: 390, height: 844 }, { width: 768, height: 1024 
     ...viewport,
     noHorizontalOverflow: await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth),
     controlsNamed: await page.getByRole("button", { name: "播放器设置", exact: true }).count() === 1
+      && await page.getByRole("button", { name: "截图", exact: true }).count() === 1
+      && await page.getByRole("button", { name: "画中画", exact: true }).count() === 1
       && await page.getByRole("button", { name: /全屏/ }).count() === 1,
   });
 }
@@ -94,6 +118,7 @@ const result = {
   viewportChecks,
   danmakuResponses: danmakuResponses.map(({ method, path, status }) => ({ method, path, status })),
   hasRawRead: danmakuResponses.some(({ path, status }) => path.endsWith("/danmaku/raw") && status === 200),
+  safeZone,
   compatibilityDanmakuRequests,
   externalRequests,
   consoleErrors,
@@ -105,6 +130,7 @@ await browser.close();
 
 if (
   !result.hasRawRead
+  || !result.safeZone
   || result.compatibilityDanmakuRequests.length > 0
   || result.externalRequests.length > 0
   || result.consoleErrors.length > 0
