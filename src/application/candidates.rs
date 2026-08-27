@@ -2209,7 +2209,12 @@ impl MetadataSelectionService {
             source: MetadataSource::ScraperLocalized,
             metadata: payload.metadata.clone(),
         };
-        match mode {
+        let application_mode = if options.supplemental || options.preserve_identity {
+            MetadataSelectionMode::FillMissing
+        } else {
+            mode
+        };
+        match application_mode {
             MetadataSelectionMode::FillMissing => state.apply_fill_missing(&metadata_candidate),
             MetadataSelectionMode::RefreshUnlocked => {
                 state.apply_refresh_unlocked(&metadata_candidate)
@@ -2223,7 +2228,7 @@ impl MetadataSelectionService {
                 &payload,
                 image_policy,
                 image_source,
-                mode,
+                application_mode,
                 options.supplemental,
             )
             .await?;

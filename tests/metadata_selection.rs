@@ -156,24 +156,15 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     assert!(nfo.contains("<name>演员甲</name>"));
     assert!(nfo.contains("<tmdbid>9</tmdbid>"));
     assert!(nfo.contains("<trailer>https://www.youtube.com/watch?v=abc123</trailer>"));
-    let metadata_item_dir = tokio::fs::canonicalize(library_item_directory(
-        &fixture.config.config_dir,
-        &item_id,
-    )?)
-    .await?;
     assert_eq!(
-        tokio::fs::read(metadata_item_dir.join("poster.png")).await?,
+        tokio::fs::read(fixture.movie_dir.join("poster.png")).await?,
         PNG_1X1
     );
     assert_eq!(
-        tokio::fs::read(metadata_item_dir.join("fanart.webp")).await?,
+        tokio::fs::read(fixture.movie_dir.join("backdrop.webp")).await?,
         b"RIFF\x04\x00\x00\x00WEBP"
     );
-    assert_eq!(
-        tokio::fs::read(metadata_item_dir.join("thumb.png")).await?,
-        PNG_1X1
-    );
-    assert_eq!(tokio::fs::read(&fallback_path).await?, b"ffmpeg-fallback");
+    assert_eq!(tokio::fs::read(&fallback_path).await?, PNG_1X1);
     let status: String =
         sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
             .bind(&item_id)
@@ -608,8 +599,7 @@ async fn fill_missing_skips_a_backoff_image_and_uses_the_next_candidate()
         .await?;
 
     assert_eq!(report.image_types, vec!["POSTER"]);
-    let poster =
-        library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("poster.png");
+    let poster = fixture.movie_dir.join("poster.png");
     assert_eq!(tokio::fs::read(poster).await?, PNG_1X1);
 
     image_server.abort();
@@ -694,6 +684,82 @@ async fn supplemental_selection_preserves_existing_rich_nfo_and_fills_missing_li
             .fetch_one(fixture.database.pool())
             .await?;
     assert_eq!(source, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn supplemental_selection_appends_multiple_backdrops_after_main_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let main_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "主来源标题",
+            "images": { "FANART": [format!("{image_url}/fanart")] }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+    );
+    selection
+        .select(
+            &fixture.item_id,
+            &main_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    let supplemental_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "补充来源标题",
+            "images": {
+                "FANART": [
+                    format!("{image_url}/fanart-supplement-1"),
+                    format!("{image_url}/fanart-supplement-2")
+                ]
+            }
+        }),
+    )
+    .await?;
+    selection
+        .select_with_scraper(
+            &fixture.item_id,
+            &supplemental_candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+            Some("org.lux.supplement"),
+            true,
+        )
+        .await?;
+
+    let images: Vec<(i64, String, String)> = sqlx::query_as(
+        "SELECT image_index, local_path, source
+         FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART'
+         ORDER BY image_index",
+    )
+    .bind(&fixture.item_id)
+    .fetch_all(fixture.database.pool())
+    .await?;
+    assert_eq!(images.len(), 3);
+    assert_eq!(images[0].0, 0);
+    assert!(images[0].1.ends_with("backdrop.webp"));
+    assert_eq!(images[0].2, "TMDB");
+    assert_eq!(images[1].0, 1);
+    assert!(images[1].1.ends_with("backdrop1.webp"));
+    assert_eq!(images[1].2, "org.lux.supplement");
+    assert_eq!(images[2].0, 2);
+    assert!(images[2].1.ends_with("backdrop2.webp"));
+    assert_eq!(images[2].2, "org.lux.supplement");
+
+    let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
+    assert!(nfo.contains("<title>主来源标题</title>"));
+    image_server.abort();
     Ok(())
 }
 
@@ -2362,7 +2428,7 @@ async fn start_image_stub()
                     .header(CONTENT_TYPE, "image/png")
                     .body(Body::from(PNG_1X1.to_vec()))
                     .unwrap(),
-                "fanart" => Response::builder()
+                "fanart" | "fanart-supplement-1" | "fanart-supplement-2" => Response::builder()
                     .header(CONTENT_TYPE, "image/webp")
                     .body(Body::from(b"RIFF\x04\x00\x00\x00WEBP".to_vec()))
                     .unwrap(),
