@@ -29,6 +29,7 @@ function dispatchPointer(
 describe("PlayerPage playback synchronization", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
+  let mediaSessionDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(() => {
     vi.spyOn(api, "progress").mockResolvedValue(undefined);
@@ -53,6 +54,9 @@ describe("PlayerPage playback synchronization", () => {
     vi.useRealTimers();
     if (root) act(() => root?.unmount());
     container?.remove();
+    if (mediaSessionDescriptor) Object.defineProperty(navigator, "mediaSession", mediaSessionDescriptor);
+    else delete (navigator as Navigator & { mediaSession?: unknown }).mediaSession;
+    mediaSessionDescriptor = undefined;
     vi.restoreAllMocks();
   });
 
@@ -458,6 +462,62 @@ describe("PlayerPage playback synchronization", () => {
     await act(async () => video.dispatchEvent(new Event("ended")));
 
     expect(api.stopWebPlaybackSession).toHaveBeenCalledWith("web-source-3", false);
+  });
+
+  it("routes Media Session seek actions through the Lux playback runtime", async () => {
+    mediaSessionDescriptor = Object.getOwnPropertyDescriptor(navigator, "mediaSession");
+    const actions = new Map<string, ((details?: { seekTime?: number }) => void) | null>();
+    Object.defineProperty(navigator, "mediaSession", {
+      configurable: true,
+      value: {
+        metadata: null,
+        playbackState: "none",
+        setActionHandler: (action: string, handler: ((details?: { seekTime?: number }) => void) | null) => actions.set(action, handler),
+        setPositionState: () => undefined,
+      },
+    });
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-media-session",
+      title: "媒体会话测试",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "source-media-session", isDefault: true, durationTicks: 1_200_000_000 }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-media-session"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    if (!video) throw new Error("video element was not rendered");
+    Object.defineProperty(video, "duration", { configurable: true, value: 120 });
+    Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 0 });
+    await act(async () => video.dispatchEvent(new Event("loadedmetadata")));
+    act(() => actions.get("seekto")?.({ seekTime: 45 }));
+
+    expect(actions.get("play")).toBeTypeOf("function");
+    expect(actions.get("pause")).toBeTypeOf("function");
+    expect(video.currentTime).toBe(45);
   });
 
   it("keeps pointer controls active while seeking and uses pointer capture for the timeline", async () => {

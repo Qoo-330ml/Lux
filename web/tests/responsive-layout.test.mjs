@@ -17,12 +17,18 @@ test("primary page surfaces use viewport-relative widths on large displays", () 
     ".lux-page",
     ".lux-page-narrow",
     ".lux-detail-content",
-    ".lux-player-topbar",
-    ".lux-player-frame",
     ".lux-admin-layout",
   ]) {
     assert.match(rule(selector), responsiveWidth, selector);
   }
+});
+
+test("player overlays use viewport-relative safe-area insets", () => {
+  const safeAreaInset = /(?:left|right):\s*calc\(4%\s*\+\s*env\(safe-area-inset-(?:left|right)\)\)/;
+
+  assert.match(rule(".lux-player-topbar"), safeAreaInset);
+  assert.match(rule(".lux-player-frame"), /left:\s*env\(safe-area-inset-left\)/);
+  assert.match(rule(".lux-player-frame"), /right:\s*env\(safe-area-inset-right\)/);
 });
 
 test("large-display page surfaces do not keep fixed pixel width caps", () => {

@@ -113,7 +113,7 @@ describe("PlayerPage client fallback status", () => {
     expect(container?.textContent).toContain("使用原生客户端或降低清晰度");
   });
 
-  it("shows the fallback engine reason when background playback fails", async () => {
+  it("shows safe Lux guidance instead of the fallback engine reason", async () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -138,7 +138,8 @@ describe("PlayerPage client fallback status", () => {
     expect(video).not.toBeNull();
     await act(async () => video?.dispatchEvent(new Event("error")));
 
-    expect(container?.textContent).toContain("MSE SourceBuffer append failed");
+    expect(container?.textContent).toContain("播放器引擎失败");
+    expect(container?.textContent).not.toContain("MSE SourceBuffer append failed");
   });
 
   it("updates the degraded status when fallback throughput arrives after first playback is ready", async () => {

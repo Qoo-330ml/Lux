@@ -84,6 +84,23 @@ High@5.1 (`avc1.640033`) 探测，避免 4K 错误使用 High@4.0 (`avc1.640028`
 正式版。ARM64 与 AMD64 runtime/application 镜像均按固定 SHA-256 构建；容器内 `ffmpeg`、`ffprobe` 来自
 `/usr/lib/jellyfin-ffmpeg`，未安装普通 Debian `ffmpeg`。该记录只证明构建与版本选择，不代表 AMD64/NAS 的转码性能。
 
+## LuxPlayer LUX-203 至 LUX-208 Web 播放器阶段验证（2026-08-27）
+
+本阶段的 LuxPlayer 使用 Lux 自己的 Controller、Engine contract、React UI 和播放会话接口；运行时和业务代码
+不依赖 `artplayer` 包。ArtPlayer 仅作为可追溯的 MIT 实现参考，来源状态见
+`docs/THIRD-PARTY-NOTICES.md`。本机宿主 `uname -m=arm64`；以下浏览器验证不能外推为飞牛 NAS 的
+x86_64 性能或真实 iOS/Android 设备兼容性。
+
+| 浏览器/平台 | 媒体样本 | 已验证能力 | 结果与边界 |
+|---|---|---|---|
+| Playwright Chromium 152.0.7977.8，Android 16 / Pixel 10 mobile emulation，宿主 macOS arm64 | 无个人数据的公开短 H.264/AAC MP4 夹具；播放会话 API 为本地 mock | Lux 播放会话创建、原生 video Direct 加载、Media Session metadata/playback state、播放/暂停 UI、进度事件与 heartbeat | 通过；真实视频请求返回两个 `206` Range 响应，最终 console 为 0 error / 0 warning，所有 Lux mock API 均为 2xx/204。离开播放页后 Media Session 变为 `none` 并清空 metadata；action handler 的 play/pause/seek 参数由组件与页面测试覆盖。未以系统锁屏/耳机按键实测。 |
+| 同上 | 同一短夹具 | 触摸 pointer seek、safe-area/dvh 布局、320×700 / 768×1024 / 1440×900 viewport | 通过；从 0 秒水平触摸 seek 到约 2.53 秒（媒体时长 5.055 秒），三个 viewport 均无横向溢出且控制栏存在。真实刘海设备、横竖屏切换和浏览器全屏的物理 safe-area 仍待真机复测。 |
+| 同上 | 不支持播放计划 mock | 可诊断失败状态 | 通过；显示“浏览器不支持此媒体”及 Lux 恢复建议，不回显后端计划原因、签名 URL 或引擎异常详情。资源过期、引擎失败和服务端计划失败的分类由单元/组件测试覆盖。 |
+
+本阶段没有以本次短夹具宣称 4K、HDR、HEVC、服务端 HLS 或客户端 fallback 的实时播放能力；这些结论继续以各自
+LUX-184、LUX-185 与 LUX-198 的样本和记录为准。页面可见性恢复、方向变化和 Media Session 不可用降级已有
+Web 组件测试；仍需在至少一台真实 iOS 和一台真实 Android 设备上验证系统媒体控件、safe-area 与横竖屏行为。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。

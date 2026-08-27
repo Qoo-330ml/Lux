@@ -11,7 +11,8 @@
 - 版权：Copyright (c) 2018 Harvey Zhao
 - 参考快照：仓库 `master`，commit `02d1ded7b8601b8cc654e33d066d996968c7bdc0`，2026-08-27 核验
 - 许可证原文：https://raw.githubusercontent.com/zhw2590582/ArtPlayer/master/LICENSE
-- 当前 Lux 使用状态：LUX-203 只登记来源，尚未复制 ArtPlayer 源码，也未将 `artplayer` 加入依赖。
+- 当前 Lux 使用状态：LUX-207 已按台账中列出的三个模块借鉴交互与边界处理思路；Lux 未复制 ArtPlayer
+  源码，也未将 `artplayer` 加入依赖。LUX-208 未新增 ArtPlayer 衍生代码。
 
 MIT License 要求在软件的所有副本或实质性部分中保留版权和许可声明。Lux 对 ArtPlayer 的复制或改造必须保留上述信息，并在衍生文件中注明 Lux 修改边界。
 

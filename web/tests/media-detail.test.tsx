@@ -1004,7 +1004,7 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/api/v1/playback/sessions/web-source-strm/direct?expires=1900000000&signature=test");
   });
 
-  it("shows a clear message when the browser cannot play the source", async () => {
+  it("shows classified Lux guidance when the browser cannot play the source", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",
       title: "示例电影",
@@ -1039,8 +1039,10 @@ describe("MediaDetailPage series hierarchy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    expect(container.querySelector(".lux-player-error-card")?.textContent)
+      .toContain("浏览器不支持此媒体");
     expect(container.querySelector(".lux-player-error")?.textContent)
-      .toContain("浏览器无法播放这个媒体源");
+      .toContain("请尝试其他版本");
   });
 
   it("offers the next pending metadata item when opened from the pending filter", async () => {

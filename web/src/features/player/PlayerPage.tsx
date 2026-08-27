@@ -9,7 +9,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { api } from "../../lib/api/client";
+import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type {
   MediaItem,
@@ -34,6 +34,12 @@ import { LuxPlayer } from "./components/lux-player";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerTopBar, type PlayerSourceOption } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
+import {
+  classifyPlayerEngineFailure,
+  playerFailure,
+  type PlayerFailure,
+} from "./components/player-diagnostics";
+import { usePlayerPlatform } from "./components/player-platform";
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
@@ -144,7 +150,7 @@ export function PlayerPage() {
   const [playbackAttempt, setPlaybackAttempt] = useState(0);
   const [directProxyFallbackRequested, setDirectProxyFallbackRequested] = useState(false);
   const [failedStreamUrl, setFailedStreamUrl] = useState<string | null>(null);
-  const [playbackError, setPlaybackError] = useState<string | null>(null);
+  const [playbackFailure, setPlaybackFailure] = useState<PlayerFailure | null>(null);
   const [fallbackLoading, setFallbackLoading] = useState(false);
   const [fallbackSpeedX, setFallbackSpeedX] = useState<number | null>(null);
 
@@ -296,7 +302,7 @@ export function PlayerPage() {
     return api.stopWebPlaybackSession(sessionId, keepalive).catch(() => undefined);
   }, []);
 
-  const requestServerFallback = useCallback(async (reason?: string) => {
+  const requestServerFallback = useCallback(async (reason?: unknown) => {
     if (
       playbackPlan?.type === "DIRECT"
       && directProxyUrl
@@ -304,7 +310,7 @@ export function PlayerPage() {
     ) {
       setDirectProxyFallbackRequested(true);
       setFailedStreamUrl(null);
-      setPlaybackError("外部代理播放失败，正在尝试 Lux 直放…");
+      setPlaybackFailure(null);
       return;
     }
     if (
@@ -313,7 +319,7 @@ export function PlayerPage() {
       fallbackRequestedRef.current
     ) {
       setFailedStreamUrl(streamUrl || null);
-      if (reason) setPlaybackError(`客户端播放失败：${reason}`);
+      setPlaybackFailure(classifyPlayerEngineFailure(reason));
       return;
     }
     fallbackRequestedRef.current = true;
@@ -325,7 +331,7 @@ export function PlayerPage() {
       playbackSessionIdRef.current = null;
       playbackSequenceRef.current = 0;
     }
-    setPlaybackError("浏览器无法播放这个媒体源，正在准备兼容的服务端播放…");
+    setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
   }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, stopActiveSession, streamUrl]);
@@ -339,7 +345,7 @@ export function PlayerPage() {
     setPlaybackAttempt(0);
     setDirectProxyFallbackRequested(false);
     setFailedStreamUrl(null);
-    setPlaybackError(null);
+    setPlaybackFailure(null);
     setFallbackLoading(false);
     setFallbackSpeedX(null);
     setCurrentTime(0);
@@ -484,7 +490,7 @@ export function PlayerPage() {
             void requestServerFallback(event.error.message);
           } else {
             setFailedStreamUrl(streamUrl);
-            setPlaybackError(`服务端播放失败：${event.error.message} 请尝试其他版本或使用支持该格式的客户端。`);
+            setPlaybackFailure(classifyPlayerEngineFailure(event.error));
           }
           break;
         case "CAN_PLAY":
@@ -545,14 +551,11 @@ export function PlayerPage() {
       } catch (cause) {
         if (!cancelled) {
           if (runtime.state.status === "FAILED") return;
-          const reason = cause instanceof Error ? cause.message : "未知错误";
           if (playbackPlan?.type === "DIRECT") {
-            requestServerFallback(reason);
+            requestServerFallback(cause);
           } else {
             setFailedStreamUrl(streamUrl);
-            setPlaybackError(
-              `服务端播放失败：${reason} 请尝试其他版本或使用支持该格式的客户端。`,
-            );
+            setPlaybackFailure(classifyPlayerEngineFailure(cause));
           }
         }
       } finally {
@@ -636,6 +639,33 @@ export function PlayerPage() {
     if (!video) return;
     seekTo(video.currentTime + seconds);
   }, [seekTo]);
+
+  usePlayerPlatform({
+    enabled: Boolean(streamUrl),
+    title: media?.title ?? media?.name ?? "Lux",
+    artist: getSubtitleInfo(media) ?? "Lux",
+    playing,
+    currentTime,
+    duration,
+    onPlay: () => {
+      const video = videoRef.current;
+      if (video?.paused) void video.play();
+    },
+    onPause: () => videoRef.current?.pause(),
+    onSeekRelative: seekRelative,
+    onSeekTo: seekTo,
+    onVisible: resetControlsTimeout,
+  });
+
+  useEffect(() => {
+    const showControlsAfterLayoutChange = () => resetControlsTimeout();
+    window.addEventListener("orientationchange", showControlsAfterLayoutChange);
+    screen.orientation?.addEventListener("change", showControlsAfterLayoutChange);
+    return () => {
+      window.removeEventListener("orientationchange", showControlsAfterLayoutChange);
+      screen.orientation?.removeEventListener("change", showControlsAfterLayoutChange);
+    };
+  }, [resetControlsTimeout]);
 
   const toggleMute = useCallback(() => {
     const video = videoRef.current;
@@ -879,10 +909,14 @@ export function PlayerPage() {
   }
 
   if (webPlaybackSession.error) {
+    const sessionFailure = webPlaybackSession.error instanceof ApiError
+      && [401, 403, 410].includes(webPlaybackSession.error.status)
+      ? classifyPlayerEngineFailure(webPlaybackSession.error, webPlaybackSession.error.status)
+      : playerFailure("SERVER_PLAN_FAILED");
     return (
       <PlayerErrorState
-        title="播放会话创建失败"
-        message={webPlaybackSession.error.message}
+        title={sessionFailure.title}
+        message={sessionFailure.message}
         onBack={handleBack}
       />
     );
@@ -890,9 +924,12 @@ export function PlayerPage() {
 
   const mediaBadgeText = getMediaBadge(source);
   const subtitleInfo = getSubtitleInfo(media);
-  const playbackPlanError = playbackPlan?.type === "UNSUPPORTED"
-    ? `浏览器和服务端都无法播放这个媒体源（${playbackPlan.reason}）。请尝试其他版本或使用支持该格式的客户端。`
+  const planFailure = playbackPlan?.type === "UNSUPPORTED"
+    ? playerFailure("BROWSER_UNSUPPORTED")
     : null;
+  const surfaceFailure = playbackFailure
+    ?? planFailure
+    ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
   const sourceOptions: PlayerSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
@@ -932,7 +969,8 @@ export function PlayerPage() {
         centerSplash={centerSplash}
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
-        errorMessage={playbackError ?? playbackPlanError}
+        errorMessage={null}
+        failure={surfaceFailure}
         showError={failedStreamUrl === streamUrl || !streamUrl}
         onRetry={() => window.location.reload()}
         onBack={handleBack}

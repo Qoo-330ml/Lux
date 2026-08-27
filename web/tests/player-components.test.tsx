@@ -6,6 +6,7 @@ import { PlayerControls } from "../src/features/player/components/player-control
 import { PlayerSettingsPanel } from "../src/features/player/components/player-settings-panel";
 import { PlayerTopBar } from "../src/features/player/components/player-top-bar";
 import { LuxPlayer } from "../src/features/player/components/lux-player";
+import { playerFailure } from "../src/features/player/components/player-diagnostics";
 
 describe("LuxPlayer state components", () => {
   it("renders a busy loading state with its product message", () => {
@@ -69,6 +70,30 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain("正在准备客户端解码…");
     expect(markup).toContain("客户端解码速度低于实时");
     expect(markup).toContain("客户端解码失败");
+  });
+
+  it("renders a classified Lux recovery path instead of an underlying engine error", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerVideoSurface
+        streamUrl="/signed/movie-1"
+        title="示例电影"
+        videoRef={() => undefined}
+        onClick={() => undefined}
+        onDoubleClick={() => undefined}
+        centerSplash={null}
+        fallbackLoading={false}
+        fallbackSpeedX={null}
+        errorMessage="decoder token https://example.test/private"
+        failure={playerFailure("PLAYBACK_EXPIRED")}
+        showError
+        onRetry={() => undefined}
+        onBack={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("播放地址已过期");
+    expect(markup).toContain("请重试以创建新的 Lux 播放会话");
+    expect(markup).not.toContain("https://example.test/private");
   });
 
   it("renders top-level media context and source selection as presentation", () => {
