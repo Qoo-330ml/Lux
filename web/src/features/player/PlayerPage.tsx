@@ -1,25 +1,12 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeft,
-  Check,
-  Maximize,
-  Minimize,
-  Pause,
-  PictureInPicture2,
-  Play,
-  RotateCcw,
-  RotateCw,
-  Settings2,
-  Volume1,
-  Volume2,
-  VolumeX,
-} from "lucide-react";
-import {
   useCallback,
   useEffect,
   useRef,
   useState,
+  type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
   type SyntheticEvent,
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
@@ -42,7 +29,10 @@ import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
 import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
+import { PlayerControls } from "./components/player-controls";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
+import { PlayerSettingsPanel } from "./components/player-settings-panel";
+import { PlayerTopBar, type PlayerSourceOption } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
 
 const TICKS_PER_SECOND = 10_000_000;
@@ -55,18 +45,6 @@ const HEVC_RUNTIME_ASSETS = {
   wasmUrl: "/hevc/hevc-decode-module.js",
   wasmBinaryUrl: "/hevc/hevc-decode.wasm",
 };
-
-function formatTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return "00:00";
-  const s = Math.floor(seconds);
-  const hrs = Math.floor(s / 3600);
-  const mins = Math.floor((s % 3600) / 60);
-  const secs = s % 60;
-  if (hrs > 0) {
-    return `${hrs}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-  }
-  return `${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
-}
 
 function getMediaBadge(source?: MediaSource | null) {
   if (!source) return null;
@@ -694,7 +672,7 @@ export function PlayerPage() {
   };
 
   // Scrubber scrubbing handlers
-  const handleScrubberPointerDown = (e: ReactMouseEvent<HTMLDivElement>) => {
+  const handleScrubberPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
     const bar = progressBarRef.current;
     const video = videoRef.current;
     if (!bar || !video || !duration) return;
@@ -743,6 +721,25 @@ export function PlayerPage() {
     setHoverPercent(null);
   };
 
+  const handleTimelineKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      seekRelative(-5);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      seekRelative(5);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      runtimeRef.current?.seek(0);
+      setCurrentTime(0);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      const target = Math.max(0, duration);
+      runtimeRef.current?.seek(target);
+      setCurrentTime(target);
+    }
+  };
+
   const handleBack = () => {
     if (window.history.length > 1) {
       navigate(-1);
@@ -785,13 +782,16 @@ export function PlayerPage() {
     );
   }
 
-  const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
-  const bufferedPercent = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
   const mediaBadgeText = getMediaBadge(source);
   const subtitleInfo = getSubtitleInfo(media);
   const playbackPlanError = playbackPlan?.type === "UNSUPPORTED"
     ? `浏览器和服务端都无法播放这个媒体源（${playbackPlan.reason}）。请尝试其他版本或使用支持该格式的客户端。`
     : null;
+  const sourceOptions: PlayerSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
+    id: entry.id,
+    label: entry.qualityLabel || `版本 ${index + 1}`,
+    detail: entry.sourceKind === "STRM_URL" ? "STRM" : entry.container || "直链",
+  }));
 
   return (
     <main
@@ -855,290 +855,59 @@ export function PlayerPage() {
       <div className="lux-player-vignette-top" aria-hidden="true" />
       <div className="lux-player-vignette-bottom" aria-hidden="true" />
 
-      {/* Top Bar Overlay */}
-      <div className="lux-player-topbar">
-        <div className="lux-player-topbar-left">
-          <button
-            type="button"
-            className="lux-player-icon-btn"
-            aria-label="返回"
-            title="返回"
-            onClick={handleBack}
-          >
-            <ArrowLeft size={20} />
-          </button>
-          <div className="lux-player-meta">
-            <div className="lux-player-title-row">
-              <span className="lux-player-title">{mediaTitle(media)}</span>
-              {mediaBadgeText && (
-                <span className="lux-player-badge">{mediaBadgeText}</span>
-              )}
-            </div>
-            {subtitleInfo && (
-              <span className="lux-player-subtitle">{subtitleInfo}</span>
-            )}
-          </div>
-        </div>
+      <PlayerTopBar
+        title={mediaTitle(media)}
+        badge={mediaBadgeText}
+        subtitle={subtitleInfo}
+        sources={sourceOptions}
+        selectedSourceId={source?.id ?? ""}
+        settingsOpen={showSettings}
+        fullscreen={isFullscreen}
+        onBack={handleBack}
+        onSourceChange={(sourceId) => setSearchParams({ sourceId })}
+        onToggleSettings={() => setShowSettings((visible) => !visible)}
+        onToggleFullscreen={toggleFullscreen}
+      />
 
-        <div className="lux-player-topbar-right">
-          {media.mediaSources && media.mediaSources.length > 1 && (
-            <div className="lux-player-source-selector">
-              <select
-                aria-label="选择播放源"
-                value={source?.id || ""}
-                onChange={(e) => {
-                  setSearchParams({ sourceId: e.target.value });
-                }}
-              >
-                {media.mediaSources.map((s, idx) => (
-                  <option key={s.id} value={s.id}>
-                    {s.qualityLabel || `版本 ${idx + 1}`} (
-                    {s.sourceKind === "STRM_URL" ? "STRM" : s.container || "直链"})
-                  </option>
-                ))}
-              </select>
-            </div>
-          )}
+      {showSettings ? (
+        <PlayerSettingsPanel
+          playbackRates={PLAYBACK_SPEEDS}
+          playbackRate={playbackRate}
+          onChangeRate={changePlaybackRate}
+          onClose={() => setShowSettings(false)}
+        />
+      ) : null}
 
-          <button
-            type="button"
-            className={`lux-player-icon-btn ${showSettings ? "is-active" : ""}`}
-            aria-label="播放器设置"
-            title="设置"
-            onClick={() => setShowSettings(!showSettings)}
-          >
-            <Settings2 size={20} />
-          </button>
-
-          <button
-            type="button"
-            className="lux-player-icon-btn"
-            aria-label={isFullscreen ? "退出全屏" : "全屏"}
-            title={isFullscreen ? "退出全屏 (F)" : "全屏 (F)"}
-            onClick={toggleFullscreen}
-          >
-            {isFullscreen ? <Minimize size={20} /> : <Maximize size={20} />}
-          </button>
-        </div>
-      </div>
-
-      {/* Settings Popover Menu */}
-      {showSettings && (
-        <div className="lux-player-settings-popover">
-          <div className="lux-player-settings-header">
-            <span>播放设置</span>
-            <button
-              type="button"
-              className="lux-player-settings-close"
-              onClick={() => setShowSettings(false)}
-            >
-              ✕
-            </button>
-          </div>
-          <div className="lux-player-settings-section">
-            <span className="lux-player-settings-label">播放速度</span>
-            <div className="lux-player-speed-grid">
-              {PLAYBACK_SPEEDS.map((speed) => (
-                <button
-                  key={speed}
-                  type="button"
-                  className={`lux-player-speed-pill ${playbackRate === speed ? "is-active" : ""}`}
-                  onClick={() => changePlaybackRate(speed)}
-                >
-                  {speed === 1.0 ? "标准" : `${speed}x`}
-                  {playbackRate === speed && <Check size={14} />}
-                </button>
-              ))}
-            </div>
-          </div>
-          <div className="lux-player-settings-section">
-            <span className="lux-player-settings-label">快捷键提示</span>
-            <div className="lux-player-shortcuts-list">
-              <div>
-                <span>空格 / K</span>
-                <span>播放 / 暂停</span>
-              </div>
-              <div>
-                <span>← / →</span>
-                <span>快退 / 快进 10 秒</span>
-              </div>
-              <div>
-                <span>↑ / ↓</span>
-                <span>音量调节</span>
-              </div>
-              <div>
-                <span>F</span>
-                <span>全屏切换</span>
-              </div>
-              <div>
-                <span>M</span>
-                <span>静音切换</span>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Bottom Controls Overlay */}
-      <div className="lux-player-controls-wrap">
-        {/* Timeline Scrubber */}
-        <div
-          ref={progressBarRef}
-          className="lux-player-timeline"
-          onPointerDown={handleScrubberPointerDown}
-          onMouseMove={handleScrubberMouseMove}
-          onMouseLeave={handleScrubberMouseLeave}
-        >
-          {/* Hover Time Tooltip */}
-          {hoverTime !== null && hoverPercent !== null && (
-            <div
-              className="lux-player-tooltip"
-              style={{ left: `${hoverPercent}%` }}
-            >
-              {formatTime(hoverTime)}
-            </div>
-          )}
-
-          <div className="lux-player-timeline-rail">
-            <div
-              className="lux-player-timeline-buffered"
-              style={{ width: `${bufferedPercent}%` }}
-            />
-            <div
-              className="lux-player-timeline-played"
-              style={{ width: `${progressPercent}%` }}
-            >
-              <div className="lux-player-timeline-handle" />
-            </div>
-          </div>
-        </div>
-
-        {/* Action Buttons Bar */}
-        <div className="lux-player-controls">
-          <div className="lux-player-controls-left">
-            <button
-              type="button"
-              className="lux-player-action-btn lux-player-play-btn"
-              aria-label={playing ? "暂停" : "播放"}
-              title={playing ? "暂停 (空格)" : "播放 (空格)"}
-              onClick={togglePlayPause}
-            >
-              {playing ? (
-                <Pause size={22} fill="currentColor" />
-              ) : (
-                <Play size={22} fill="currentColor" />
-              )}
-            </button>
-
-            <button
-              type="button"
-              className="lux-player-action-btn"
-              aria-label="快退10秒"
-              title="快退 10 秒 (←)"
-              onClick={() => seekRelative(-10)}
-            >
-              <RotateCcw size={19} />
-              <span className="lux-player-step-label">10</span>
-            </button>
-
-            <button
-              type="button"
-              className="lux-player-action-btn"
-              aria-label="快进10秒"
-              title="快进 10 秒 (→)"
-              onClick={() => seekRelative(10)}
-            >
-              <RotateCw size={19} />
-              <span className="lux-player-step-label">10</span>
-            </button>
-
-            <div className="lux-player-volume-group">
-              <button
-                type="button"
-                className="lux-player-action-btn"
-                aria-label={isMuted ? "取消静音" : "静音"}
-                title={isMuted ? "取消静音 (M)" : "静音 (M)"}
-                onClick={toggleMute}
-              >
-                {isMuted || volume === 0 ? (
-                  <VolumeX size={20} />
-                ) : volume < 0.5 ? (
-                  <Volume1 size={20} />
-                ) : (
-                  <Volume2 size={20} />
-                )}
-              </button>
-              <div className="lux-player-volume-slider-wrap">
-                <input
-                  type="range"
-                  min={0}
-                  max={1}
-                  step={0.02}
-                  value={isMuted ? 0 : volume}
-                  onChange={(e) => changeVolume(parseFloat(e.target.value))}
-                  className="lux-player-volume-slider"
-                  aria-label="音量调节"
-                />
-              </div>
-            </div>
-
-            <div
-              className="lux-player-time"
-              onClick={() => setIsRemainingTime(!isRemainingTime)}
-              title="点击切换显示剩余时间"
-            >
-              <span className="lux-player-time-current">
-                {formatTime(currentTime)}
-              </span>
-              <span className="lux-player-time-divider">/</span>
-              <span className="lux-player-time-total">
-                {isRemainingTime
-                  ? `-${formatTime(Math.max(0, duration - currentTime))}`
-                  : formatTime(duration)}
-              </span>
-            </div>
-          </div>
-
-          <div className="lux-player-controls-right">
-            <button
-              type="button"
-              className="lux-player-rate-btn"
-              aria-label="倍速切换"
-              title="切换倍速"
-              onClick={() => {
-                const nextIdx =
-                  (PLAYBACK_SPEEDS.indexOf(playbackRate) + 1) %
-                  PLAYBACK_SPEEDS.length;
-                changePlaybackRate(PLAYBACK_SPEEDS[nextIdx]);
-              }}
-            >
-              {playbackRate === 1.0 ? "倍速" : `${playbackRate}x`}
-            </button>
-
-            {document.pictureInPictureEnabled && (
-              <button
-                type="button"
-                className="lux-player-action-btn"
-                aria-label="画中画"
-                title="画中画"
-                onClick={togglePictureInPicture}
-              >
-                <PictureInPicture2 size={19} />
-              </button>
-            )}
-
-            <button
-              type="button"
-              className="lux-player-action-btn"
-              aria-label={isFullscreen ? "退出全屏" : "全屏"}
-              title={isFullscreen ? "退出全屏 (F)" : "全屏 (F)"}
-              onClick={toggleFullscreen}
-            >
-              {isFullscreen ? <Minimize size={20} /> : <Maximize size={20} />}
-            </button>
-          </div>
-        </div>
-      </div>
+      <PlayerControls
+        playing={playing}
+        currentTime={currentTime}
+        duration={duration}
+        bufferedEnd={bufferedEnd}
+        volume={volume}
+        muted={isMuted}
+        playbackRate={playbackRate}
+        fullscreen={isFullscreen}
+        pictureInPictureEnabled={Boolean(document.pictureInPictureEnabled)}
+        remainingTime={isRemainingTime}
+        hoverTime={hoverTime}
+        hoverPercent={hoverPercent}
+        progressBarRef={progressBarRef}
+        onTimelinePointerDown={handleScrubberPointerDown}
+        onTimelineMouseMove={handleScrubberMouseMove}
+        onTimelineMouseLeave={handleScrubberMouseLeave}
+        onTimelineKeyDown={handleTimelineKeyDown}
+        onTogglePlayPause={togglePlayPause}
+        onSeekRelative={seekRelative}
+        onToggleMute={toggleMute}
+        onVolumeChange={changeVolume}
+        onToggleRemainingTime={() => setIsRemainingTime((remaining) => !remaining)}
+        onCycleRate={() => {
+          const nextIndex = (PLAYBACK_SPEEDS.indexOf(playbackRate) + 1) % PLAYBACK_SPEEDS.length;
+          changePlaybackRate(PLAYBACK_SPEEDS[nextIndex]);
+        }}
+        onTogglePictureInPicture={togglePictureInPicture}
+        onToggleFullscreen={toggleFullscreen}
+      />
     </main>
   );
 }

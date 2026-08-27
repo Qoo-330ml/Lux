@@ -2,6 +2,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it, vi } from "vitest";
 import { PlayerErrorState, PlayerLoadingState } from "../src/features/player/components/player-state";
 import { PlayerVideoSurface } from "../src/features/player/components/player-video-surface";
+import { PlayerControls } from "../src/features/player/components/player-controls";
+import { PlayerSettingsPanel } from "../src/features/player/components/player-settings-panel";
+import { PlayerTopBar } from "../src/features/player/components/player-top-bar";
 
 describe("LuxPlayer state components", () => {
   it("renders a busy loading state with its product message", () => {
@@ -65,5 +68,88 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain("正在准备客户端解码…");
     expect(markup).toContain("客户端解码速度低于实时");
     expect(markup).toContain("客户端解码失败");
+  });
+
+  it("renders top-level media context and source selection as presentation", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerTopBar
+        title="示例电影"
+        badge="1080P • H264"
+        subtitle="2026"
+        sources={[
+          { id: "source-1", label: "1080P", detail: "MP4" },
+          { id: "source-2", label: "4K", detail: "MKV" },
+        ]}
+        selectedSourceId="source-1"
+        settingsOpen
+        fullscreen={false}
+        onBack={() => undefined}
+        onSourceChange={() => undefined}
+        onToggleSettings={() => undefined}
+        onToggleFullscreen={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain("示例电影");
+    expect(markup).toContain("1080P • H264");
+    expect(markup).toContain('aria-label="选择播放源"');
+    expect(markup).toContain('aria-label="播放器设置"');
+    expect(markup).toContain('aria-label="全屏"');
+  });
+
+  it("keeps settings actions in a focused, keyboard-addressable panel", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerSettingsPanel
+        playbackRates={[0.5, 1, 1.5]}
+        playbackRate={1}
+        onChangeRate={() => undefined}
+        onClose={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('role="dialog"');
+    expect(markup).toContain('aria-label="播放设置"');
+    expect(markup).toContain("标准");
+    expect(markup).toContain('aria-label="关闭播放设置"');
+  });
+
+  it("exposes a labeled keyboard timeline alongside the playback controls", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerControls
+        playing={false}
+        currentTime={10}
+        duration={100}
+        bufferedEnd={25}
+        volume={1}
+        muted={false}
+        playbackRate={1}
+        fullscreen={false}
+        pictureInPictureEnabled={false}
+        remainingTime={false}
+        hoverTime={null}
+        hoverPercent={null}
+        progressBarRef={{ current: null }}
+        onTimelinePointerDown={() => undefined}
+        onTimelineMouseMove={() => undefined}
+        onTimelineMouseLeave={() => undefined}
+        onTimelineKeyDown={() => undefined}
+        onTogglePlayPause={() => undefined}
+        onSeekRelative={() => undefined}
+        onToggleMute={() => undefined}
+        onVolumeChange={() => undefined}
+        onToggleRemainingTime={() => undefined}
+        onCycleRate={() => undefined}
+        onTogglePictureInPicture={() => undefined}
+        onToggleFullscreen={() => undefined}
+      />,
+    );
+
+    expect(markup).toContain('role="slider"');
+    expect(markup).toContain('aria-label="播放进度"');
+    expect(markup).toContain('tabindex="0"');
+    expect(markup).toContain('aria-valuenow="10"');
+    expect(markup).toContain('aria-valuemax="100"');
+    expect(markup).toContain('aria-label="播放"');
+    expect(markup).toContain('aria-label="音量调节"');
   });
 });
