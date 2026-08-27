@@ -12,7 +12,8 @@
 - 参考快照：仓库 `master`，commit `02d1ded7b8601b8cc654e33d066d996968c7bdc0`，2026-08-27 核验
 - 许可证原文：https://raw.githubusercontent.com/zhw2590582/ArtPlayer/master/LICENSE
 - 当前 Lux 使用状态：LUX-207 已按台账中列出的三个模块借鉴交互与边界处理思路；Lux 未复制 ArtPlayer
-  源码，也未将 `artplayer` 加入依赖。LUX-208 未新增 ArtPlayer 衍生代码。
+  源码，也未将 `artplayer` 加入依赖。LUX-208 未新增 ArtPlayer 衍生代码；LUX-209 只核验官网演示页的可见
+  布局与控件状态，不复制 ArtPlayer DOM、CSS、图标、品牌或演示资产。
 
 MIT License 要求在软件的所有副本或实质性部分中保留版权和许可声明。Lux 对 ArtPlayer 的复制或改造必须保留上述信息，并在衍生文件中注明 Lux 修改边界。
 
@@ -24,6 +25,7 @@ MIT License 要求在软件的所有副本或实质性部分中保留版权和�
 |---|---|---|---|---|---|
 | 待填 | 待填 | 待填 | 复制 / 改造 / 仅参考 | 待填 | MIT / 本文件 |
 | `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | `packages/artplayer/src/events/gestureInit.js`、`packages/artplayer/src/events/clickInit.js`、`packages/artplayer/src/control/progress.js` | `web/src/features/player/components/player-gestures.ts`、`web/src/features/player/PlayerPage.tsx`、`web/src/features/player/components/player-video-surface.tsx` | 仅参考 | 参考手势方向、时间轴局部坐标与单/双击冲突处理的问题边界；Lux 使用自己的 Pointer Events、pointer capture、状态回调、阈值和测试，未复制上游代码、DOM、CSS、图标或 API。 | MIT / 本文件 |
+| `02d1ded7b8601b8cc654e33d066d996968c7bdc0` | ArtPlayer 官方演示页默认控制层与弹幕插件演示页（2026-08-27 可见布局核验） | `web/src/features/player/components/player-controls.tsx`、`web/src/react.css` | 仅参考 | 核验播放、音量、时间、版本、截图、设置、画中画与全屏控件的可见顺序、46px 节奏、底部渐变层和时间轴密度；Lux 使用自身 React DOM、Lucide 图标、媒体会话和会话接口，未复制上游代码、DOM、CSS、图标或资源。 | MIT / 本文件 |
 
 “仅参考”表示没有复制可受版权保护的代码，可以不放入 `vendor-derived` 目录；但仍应在设计文档中说明参考目的。复制或改造的代码必须经过 Lux 自己的类型、状态和安全边界，不得把上游插件的网络请求、远程资源、品牌资产或默认配置带入 Lux。
 

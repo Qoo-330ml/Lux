@@ -1981,6 +1981,7 @@ services:
 | LUX-206 | web/src/features/player/、web/tests/；拆分 LuxPlayer UI 与播放页面 |
 | LUX-207 | web/src/features/player/、web/tests/；实现来源可追溯的手势、自动隐藏和时间轴交互 |
 | LUX-208 | web/src/features/player/、web/tests/、docs/COMPATIBILITY.md；Media Session、移动端安全区和兼容性收尾 |
+| LUX-209 | web/src/features/player/、web/tests/、docs/；ArtPlayer 风格控制层与无数据管道的弹幕可见性 UI |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4848,6 +4849,29 @@ Rust/WASM 播放增强任务。
 `docs/COMPATIBILITY.md`。
 
 依赖：LUX-207、LUX-184、LUX-185。
+
+#### LUX-209：LuxPlayer ArtPlayer 风格控制层与弹幕可见性开关
+
+范围：在不改变 Lux 播放会话、媒体源、ACL、进度上报、解码引擎或服务端 API 的前提下，按 ArtPlayer 官方演示页已核验的
+控件密度、底部渐变层、时间轴和桌面/移动布局重构 Lux 自有控制层。保留并重新放置 Lux 的版本选择、播放/暂停、音量、
+时间、设置、画中画和浏览器全屏；新增本地截图动作与本地弹幕显示开关。独立的 Lux 播放路由已占满视觉 viewport，
+等价于 ArtPlayer 嵌入式播放器的“网页全屏”状态；不得为此加入无效的重复全屏按钮。
+
+明确不做：弹幕请求、匹配、解析、加载、渲染、发送、持久化或热力图；字幕、循环、镜像、画面比例和 AirPlay 也不因
+本次视觉任务提前实现。弹幕开关只保存本次播放器实例的可访问 UI 状态，不发出网络请求。
+
+验收：
+
+- [ ] 桌面控制栏按 ArtPlayer 已核验的 46px 控件节奏、透明控件层和底部渐变层呈现，并保留 Lux 标题、返回和版本语义。
+- [ ] 版本选择、截图、设置、画中画和全屏均有可访问名称；不可用的平台能力不显示或安全降级。
+- [ ] 弹幕显示开关具有 `aria-pressed` 状态，切换不创建网络请求、不显示输入框或发送按钮，也不渲染弹幕或热力图。
+- [ ] 现有 Direct/HLS/fallback、进度、手势、键盘、Media Session、来源切换及会话停止测试保持通过。
+- [ ] ArtPlayer 仅作视觉与交互参考；不复制其 DOM、CSS、图标、品牌、演示资产或运行时依赖，并在第三方台账留痕。
+
+验证：组件/页面单测、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器在 390×844、768×1024、1440×900
+检查视觉、可访问名称、console 和网络；更新 `docs/COMPATIBILITY.md`。
+
+依赖：LUX-208。
 
 阶段门：
 
