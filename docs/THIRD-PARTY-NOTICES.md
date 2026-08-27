@@ -23,7 +23,8 @@
   LUX-219 的 AirPlay 能力门和隐藏态细进度条继续使用 Lux 自有 hook、React 控制层和 CSS；ArtPlayer 只作为
   WebKit 能力事件监听、当前 video 调用和控制层隐藏时保留细进度的边界参考。
   LUX-221 的章节分段、标题定位和片头跳过继续使用 Lux 自有章节归一化、React DOM 和 seek 命令；ArtPlayer
-  章节插件只作为时间轴分段和标题定位的行为参考。
+ 章节插件只作为时间轴分段和标题定位的行为参考。LUX-222 仅将这些已登记边界固化到可选的阶段门 smoke
+ 断言和兼容性记录，没有新增 ArtPlayer 来源、运行时依赖或衍生代码。
 
 MIT License 要求在软件的所有副本或实质性部分中保留版权和许可声明。Lux 对 ArtPlayer 的复制或改造必须保留上述信息，并在衍生文件中注明 Lux 修改边界。
 

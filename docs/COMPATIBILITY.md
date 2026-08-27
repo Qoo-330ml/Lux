@@ -189,6 +189,26 @@ PostgreSQL 的集成测试按测试声明保持 ignored，不属于本阶段浏�
 （83 个 Node 检查、347 个 Vitest 测试）和 `pnpm --dir web build`，均通过。该记录证明 LUX-217 行为，不代表
 Safari AirPlay、真实 iOS/Android 或其他浏览器的性能兼容性。
 
+## LuxPlayer LUX-222 阶段 18阶段门（2026-08-28）
+
+本次阶段门使用当前提交 `19a785cb` 的 LuxPlayer、Chrome `151.0.7922.174`、macOS `arm64`（`uname -m=arm64`）和
+隔离 Playwright Chromium。播放器页面和媒体响应使用本地 Vite 与一次性无个人数据夹具；没有连接真实账户，不记录
+密码、Cookie、签名 URL 或用户数据。Rust Direct、服务器 HLS、客户端 HEVC fallback 的媒体/会话真实性证据沿用
+LUX-215 的固定夹具和记录；本次只增加阶段 18的播放器交互断言，不改变播放计划或运行时行为。
+
+| 场景 | 结果 | 证据与边界 |
+|---|---|---|
+| 390×844、768×1024、1440×900 | 通过 | 标题栏、字幕和控制层保持安全间距；页面无横向溢出；控制层盒子完整位于 viewport；390px 下右侧控件组使用受限横向滚动；设置、章节、播放进度、弹幕开关、截图、画中画、全屏和版本控件有可访问名称。 |
+| 设置与章节 | 通过 | 循环、`4:3`、水平镜像和 `+1.2s` 字幕偏移应用到当前 video，设置操作前后 session 创建数不变；章节按钮可 focus、带标题和时间，点击 seek 到开场；`CREDITS_START` 可见；片头区间只显示“跳过片头”并 seek 到结束。 |
+| 字幕、弹幕和隐藏态 mini progress | 通过 | SRT 文本覆盖层和 Bilibili XML 弹幕均可见且不进入标题/控制安全区；控制层自动隐藏后 mini progress 显示 played/buffered 比例，`aria-hidden=true`、`pointer-events:none`，重新活动后移除。没有弹幕输入/发送器或热力图。 |
+| AirPlay 能力门 | 通过 | 隔离浏览器分别模拟 WebKit 播放目标 `available` 与缺失能力；可用时 AirPlay 控件出现并调用当前 video picker，不创建 session；不可用时控件不出现且无错误。该模拟不等价于真实 Safari/AirPlay 设备。 |
+| source 生命周期 | 通过 | 从主 source 切到备用 source 后，旧章节、旧片头跳过按钮和旧字幕/弹幕不残留；新 source 章节出现；页面离开后会话清理。Direct/HLS/fallback 引擎销毁和会话事件继续由 LUX-215 与 Web 生命周期测试覆盖。 |
+| 网络与控制台 | 通过 | 当前 fixture 运行的请求均为声明的同源 Lux/Vite/媒体/播放会话路径；无外部请求、无 Emby 弹幕路径；console error/warning、page error 均为 0。正式脚本通过 `LUX_E2E_STAGE18=1`、`LUX_E2E_AIRPLAY_MODE=available|unavailable` 和可选截图目录复现这些断言。 |
+
+本次阶段门没有验证真实 Safari 的 AirPlay picker、iOS/Android 刘海安全区、系统锁屏/耳机按键，也没有把 Chrome 模拟结果
+外推为飞牛 NAS/x86_64 性能。当前没有新增 ArtPlayer 运行时、依赖、代码复制或衍生 notice；ArtPlayer 仍仅按
+`docs/THIRD-PARTY-NOTICES.md` 固定 commit 台账作为交互和生命周期参考。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。

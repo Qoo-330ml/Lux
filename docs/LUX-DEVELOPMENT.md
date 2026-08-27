@@ -5131,10 +5131,10 @@ video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或�
 
 验收：
 
-- [ ] 390×844、768×1024、1440×900 下设置、mini progress、章节、字幕、弹幕和控制栏不重叠且可访问。
-- [ ] Direct/HLS/fallback 下循环、比例、镜像、字幕偏移、章节 seek 和 source 切换生命周期通过；console/network 清洁。
-- [ ] AirPlay 的能力可用/不可用路径有自动化证据，真实 Safari/AirPlay 目标是否验证明确记录，不以 Chrome 结果冒充真机。
-- [ ] Rust/Web 全量质量门、第三方台账、兼容性记录和 `uname -m` 完成；项目所有者确认后关闭阶段 18。
+- [x] 390×844、768×1024、1440×900 下设置、mini progress、章节、字幕、弹幕和控制栏不重叠且可访问。
+- [x] Direct/HLS/fallback 下循环、比例、镜像、字幕偏移、章节 seek 和 source 切换生命周期通过；console/network 清洁。
+- [x] AirPlay 的能力可用/不可用路径有自动化证据，真实 Safari/AirPlay 目标是否验证明确记录，不以 Chrome 结果冒充真机。
+- [x] Rust/Web 全量质量门、第三方台账、兼容性记录和 `uname -m` 完成；项目所有者确认后关闭阶段 18。
 
 验证：相关 Rust/Web 测试、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、
 `pnpm --dir web build`、真实浏览器检查、`cargo build --locked`、`cargo test --locked --all-targets`、
@@ -5144,10 +5144,13 @@ video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或�
 
 阶段门：
 
-- [ ] ArtPlayer 首页适合 Lux 的默认控制和设置已有实现或明确的 Lux 等价能力，没有重复产品功能。
-- [ ] 当前媒体源章节/片头片尾与 Lux 会话、source、字幕、弹幕和引擎生命周期一致。
-- [ ] 无 ArtPlayer 运行时、发送弹幕、热力图、外部播放器 SDK、新解码器或未登记衍生代码。
-- [ ] 真实浏览器、Rust/Web 全量门和兼容性限制记录完成。
+- [x] ArtPlayer 首页适合 Lux 的默认控制和设置已有实现或明确的 Lux 等价能力，没有重复产品功能。
+- [x] 当前媒体源章节/片头片尾与 Lux 会话、source、字幕、弹幕和引擎生命周期一致。
+- [x] 无 ArtPlayer 运行时、发送弹幕、热力图、外部播放器 SDK、新解码器或未登记衍生代码。
+- [x] 真实浏览器、Rust/Web 全量门和兼容性限制记录完成。
+
+阶段 18关闭记录（2026-08-28）：阶段门证据见 `docs/COMPATIBILITY.md` 的 LUX-222 小节。项目所有者已要求继续完成并关闭
+本阶段；Safari/AirPlay 真机和 NAS/x86_64 性能保持为明确的后续验证边界。
 
 ## 26. 风险与缓解
 
