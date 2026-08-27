@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 const TMDB_PLUGIN_ID: &str = "org.lux.tmdb";
 const PLUGIN_CONFIG_DIR: &str = "plugin-config";
+const MIGRATION_MARKER: &str = ".org.lux.tmdb.migration-v1.done";
 const TMDB_API_KEY_FILE: &str = "tmdb_api_key";
 const TMDB_READ_ACCESS_TOKEN_FILE: &str = "tmdb_read_access_token";
 const TMDB_SETTINGS_FILE: &str = "tmdb_settings.json";
@@ -72,6 +73,14 @@ impl From<io::Error> for PluginCompatibilityError {
 pub async fn migrate_legacy_tmdb_config(
     config_dir: &Path,
 ) -> Result<bool, PluginCompatibilityError> {
+    let marker_path = config_dir.join(PLUGIN_CONFIG_DIR).join(MIGRATION_MARKER);
+    if fs::metadata(&marker_path).await.is_ok() {
+        return Ok(false);
+    }
+    if !legacy_config_exists(config_dir).await {
+        return Ok(false);
+    }
+
     let config_path = plugin_config_path(config_dir);
     let mut values = read_existing_config(&config_path).await?;
     let original_len = values.len();
@@ -85,11 +94,24 @@ pub async fn migrate_legacy_tmdb_config(
     .await?;
     merge_settings_file(config_dir.join(TMDB_SETTINGS_FILE), &mut values).await?;
 
-    if values.len() == original_len {
-        return Ok(false);
+    if values.len() != original_len {
+        write_config(&config_path, &values).await?;
     }
-    write_config(&config_path, &values).await?;
-    Ok(true)
+    write_migration_marker(&marker_path).await?;
+    Ok(values.len() != original_len)
+}
+
+async fn legacy_config_exists(config_dir: &Path) -> bool {
+    for file_name in [
+        TMDB_API_KEY_FILE,
+        TMDB_READ_ACCESS_TOKEN_FILE,
+        TMDB_SETTINGS_FILE,
+    ] {
+        if fs::metadata(config_dir.join(file_name)).await.is_ok() {
+            return true;
+        }
+    }
+    false
 }
 
 async fn read_existing_config(path: &Path) -> Result<Map<String, Value>, PluginCompatibilityError> {
@@ -180,6 +202,34 @@ async fn write_config(
     Ok(())
 }
 
+async fn write_migration_marker(path: &Path) -> Result<(), PluginCompatibilityError> {
+    let directory = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "plugin migration marker has no parent",
+        )
+    })?;
+    fs::create_dir_all(directory).await?;
+    let temporary = directory.join(format!(
+        ".{TMDB_PLUGIN_ID}.{uuid}.migration-tmp",
+        uuid = Uuid::now_v7()
+    ));
+    let mut file = fs::File::create(&temporary).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = file.metadata().await?.permissions();
+        permissions.set_mode(0o600);
+        fs::set_permissions(&temporary, permissions).await?;
+    }
+    file.write_all(b"v1\n").await?;
+    file.sync_all().await?;
+    drop(file);
+    fs::rename(temporary, path).await?;
+    Ok(())
+}
+
 fn plugin_config_path(config_dir: &Path) -> PathBuf {
     config_dir
         .join(PLUGIN_CONFIG_DIR)
@@ -239,6 +289,12 @@ mod tests {
         assert!(directory.path().join("tmdb_api_key").exists());
         assert!(directory.path().join("tmdb_read_access_token").exists());
         assert!(directory.path().join("tmdb_settings.json").exists());
+        assert!(
+            directory
+                .path()
+                .join("plugin-config/.org.lux.tmdb.migration-v1.done")
+                .exists()
+        );
 
         assert!(
             !migrate_legacy_tmdb_config(directory.path())
@@ -258,6 +314,38 @@ mod tests {
             !migrate_legacy_tmdb_config(directory.path())
                 .await
                 .expect("migration")
+        );
+        assert!(
+            !directory
+                .path()
+                .join("plugin-config/org.lux.tmdb.json")
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn does_not_reimport_legacy_values_after_migration_marker_is_written() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        tokio::fs::write(directory.path().join("tmdb_api_key"), "first-key\n")
+            .await
+            .expect("legacy api key");
+
+        assert!(
+            migrate_legacy_tmdb_config(directory.path())
+                .await
+                .expect("first migration")
+        );
+        tokio::fs::remove_file(directory.path().join("plugin-config/org.lux.tmdb.json"))
+            .await
+            .expect("remove migrated config");
+        tokio::fs::write(directory.path().join("tmdb_api_key"), "second-key\n")
+            .await
+            .expect("updated legacy api key");
+
+        assert!(
+            !migrate_legacy_tmdb_config(directory.path())
+                .await
+                .expect("second migration")
         );
         assert!(
             !directory
