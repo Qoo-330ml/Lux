@@ -331,21 +331,6 @@ pub(crate) fn ttl_for_method(method: &str) -> i64 {
     }
 }
 
-pub(crate) fn tmdb_ttl_for_endpoint(endpoint: &str) -> i64 {
-    if endpoint.contains("search/") {
-        5 * 60
-    } else if endpoint.contains("/images") || endpoint.contains("/credits") {
-        24 * 60 * 60
-    } else if endpoint.contains("/external_ids")
-        || endpoint.contains("/videos")
-        || endpoint.starts_with("3/person/")
-    {
-        7 * 24 * 60 * 60
-    } else {
-        24 * 60 * 60
-    }
-}
-
 fn evict_oldest(entries: &mut HashMap<String, CacheEntry>) {
     if let Some((key, _)) = entries
         .iter()

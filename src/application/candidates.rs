@@ -11,6 +11,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 use crate::{
     application::{
+        home::HomeService,
         images::{ImageWriteError, ImageWriteService, image_no_candidate_key},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
@@ -29,9 +30,6 @@ use crate::{
         StoredMetadataCapabilityAttempt,
     },
 };
-
-#[cfg(test)]
-use crate::application::tmdb::TmdbCastMember;
 
 const MAX_MOVIE_NFO_ACTORS: usize = 30;
 const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
@@ -1445,11 +1443,7 @@ fn selected_scraper_provider_id(
         .as_deref()
         .or(current.scraper_id.as_deref())?
         .trim();
-    let scraper_matches = match scraper.plugin_id() {
-        Some(plugin_id) => selected_scraper.eq_ignore_ascii_case(plugin_id),
-        None => selected_scraper.eq_ignore_ascii_case(scraper.provider_key()),
-    };
-    if !scraper_matches {
+    if !scraper.matches_scraper_id(selected_scraper) {
         return None;
     }
     let raw = current.provider_ids_json.as_deref()?;
@@ -1818,6 +1812,7 @@ pub struct MetadataSelectionService {
     images: ImageWriteService,
     people: crate::application::people::PeopleService,
     resources: ResourceMetrics,
+    home: Option<HomeService>,
 }
 
 impl MetadataSelectionService {
@@ -1837,7 +1832,13 @@ impl MetadataSelectionService {
             people: crate::application::people::PeopleService::new(config_dir)
                 .with_database(database.clone()),
             resources: ResourceMetrics::new(),
+            home: None,
         }
+    }
+
+    pub(crate) fn with_home(mut self, home: HomeService) -> Self {
+        self.home = Some(home);
+        self
     }
 
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
@@ -2221,6 +2222,10 @@ impl MetadataSelectionService {
             return Err(MetadataSelectionError::CandidateNotPending(
                 "CONCURRENTLY_SELECTED".to_owned(),
             ));
+        }
+        if let Some(home) = &self.home {
+            eprintln!("metadata selection invalidating home");
+            home.invalidate();
         }
         Ok(MetadataSelectionReport {
             item_id: item_id.to_owned(),
@@ -2928,38 +2933,6 @@ fn candidate_rating(value: &Value) -> Result<Option<f64>, MetadataSelectionError
     Ok(Some(rating))
 }
 
-#[cfg(test)]
-fn tmdb_candidate_actors(cast: &[TmdbCastMember]) -> Vec<ActorCredit> {
-    cast.iter()
-        .take(MAX_MOVIE_NFO_ACTORS)
-        .filter_map(|member| {
-            let name = member.name.as_deref()?.trim();
-            if member.id <= 0 || name.is_empty() {
-                return None;
-            }
-            Some(ActorCredit {
-                id: member.id.to_string(),
-                provider: Some("scraper".to_owned()),
-                identities: Vec::new(),
-                name: name.to_owned(),
-                character: member
-                    .character
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_owned),
-                order: member.order,
-                profile_url: member
-                    .profile_path
-                    .as_deref()
-                    .filter(|path| path.starts_with('/') && path.len() > 1)
-                    .map(|path| format!("https://image.tmdb.org/t/p/w185{path}")),
-                person: None,
-            })
-        })
-        .collect()
-}
-
 fn candidate_actors(value: &Value) -> Result<Vec<ActorCredit>, MetadataSelectionError> {
     let Some(raw) = value.get("actors") else {
         return Ok(Vec::new());
@@ -3187,9 +3160,9 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTOR_METADATA_FETCH_CONCURRENCY, TmdbCastMember, candidate_actors, credits_are_missing,
+        ACTOR_METADATA_FETCH_CONCURRENCY, candidate_actors, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
-        metadata_match_score, metadata_request_plan, tmdb_candidate_actors,
+        metadata_match_score, metadata_request_plan,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3460,31 +3433,29 @@ mod tests {
     }
 
     #[test]
-    fn tmdb_cast_becomes_ordered_candidate_actor_data() {
-        let actors = tmdb_candidate_actors(&[
-            TmdbCastMember {
-                id: 9,
-                name: Some(" 演员甲 ".to_owned()),
-                character: Some(" 角色甲 ".to_owned()),
-                profile_path: Some("/profile.jpg".to_owned()),
-                order: Some(0),
-            },
-            TmdbCastMember {
-                id: 10,
-                name: Some("演员乙".to_owned()),
-                character: None,
-                profile_path: None,
-                order: Some(1),
-            },
-        ]);
+    fn scraper_cast_becomes_ordered_candidate_actor_data() {
+        let actors = candidate_actors(&json!({
+            "actors": [
+                {
+                    "id": "person-9",
+                    "provider": "douban",
+                    "name": " 演员甲 ",
+                    "character": "角色甲",
+                    "profileUrl": "https://images.example/profile.jpg",
+                    "order": 0
+                },
+                {"id": "person-10", "name": "演员乙", "order": 1}
+            ]
+        }))
+        .expect("scraper cast should parse");
 
         assert_eq!(actors[0].name, "演员甲");
         assert_eq!(actors[0].character.as_deref(), Some("角色甲"));
         assert_eq!(
             actors[0].profile_url.as_deref(),
-            Some("https://image.tmdb.org/t/p/w185/profile.jpg")
+            Some("https://images.example/profile.jpg")
         );
-        assert_eq!(actors[1].id, "10");
+        assert_eq!(actors[1].id, "person-10");
     }
 
     #[test]

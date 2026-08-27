@@ -17,12 +17,7 @@ pub struct NetworkProbeTarget {
     pub url: &'static str,
 }
 
-pub const NETWORK_PROBE_TARGETS: [NetworkProbeTarget; 4] = [
-    NetworkProbeTarget {
-        id: "tmdb",
-        label: "TMDb",
-        url: "https://api.themoviedb.org/3/configuration",
-    },
+pub const NETWORK_PROBE_TARGETS: [NetworkProbeTarget; 3] = [
     NetworkProbeTarget {
         id: "baidu",
         label: "百度",
@@ -71,16 +66,15 @@ pub async fn test_network(proxy_url: Option<&str>) -> NetworkDiagnostics {
         Err(_) => return failed_diagnostics("client_invalid"),
     };
 
-    let (tmdb, baidu, google, cloudflare) = tokio::join!(
+    let (baidu, google, cloudflare) = tokio::join!(
         probe(&client, NETWORK_PROBE_TARGETS[0]),
         probe(&client, NETWORK_PROBE_TARGETS[1]),
-        probe(&client, NETWORK_PROBE_TARGETS[2]),
-        probe_cloudflare(&client, NETWORK_PROBE_TARGETS[3]),
+        probe_cloudflare(&client, NETWORK_PROBE_TARGETS[2]),
     );
     let (cloudflare, egress_ip, egress_country) = cloudflare;
 
     NetworkDiagnostics {
-        probes: vec![tmdb, baidu, google, cloudflare],
+        probes: vec![baidu, google, cloudflare],
         egress_ip,
         egress_country,
     }
@@ -257,7 +251,7 @@ mod tests {
                 .iter()
                 .map(|target| target.id)
                 .collect::<Vec<_>>(),
-            vec!["tmdb", "baidu", "google", "cloudflare"]
+            vec!["baidu", "google", "cloudflare"]
         );
         assert_eq!(
             NETWORK_PROBE_TARGETS
@@ -265,7 +259,6 @@ mod tests {
                 .map(|target| target.url)
                 .collect::<Vec<_>>(),
             vec![
-                "https://api.themoviedb.org/3/configuration",
                 "https://www.baidu.com/",
                 "https://www.google.com/generate_204",
                 "https://cloudflare.com/cdn-cgi/trace",

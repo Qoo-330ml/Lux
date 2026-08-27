@@ -1,5 +1,8 @@
+mod common;
+
 use std::{sync::Arc, time::Duration};
 
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     application::{
         access::{AccessPrincipal, MediaAccessService},
@@ -11,7 +14,6 @@ use luxd::{
         scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
         scraper::ScraperProvider,
         thumbnails::ThumbnailService,
-        tmdb::{TmdbClient, TmdbClientConfig},
         watch::ChangeKind,
         webhooks::WebhookService,
     },
@@ -1189,7 +1191,7 @@ async fn incremental_scan_only_queues_metadata_when_library_switch_is_enabled()
     let initial = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&initial.id, 100, None).await?;
 
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: "http://127.0.0.1:9".to_owned(),
         proxy_url: None,
         api_key: Some("test-token".to_owned()),
@@ -1201,7 +1203,8 @@ async fn incremental_scan_only_queues_metadata_when_library_switch_is_enabled()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let metadata = MetadataReidentifyService::new(database.clone(), ScraperProvider::from(tmdb));
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
 
     let disabled_path = "Disabled.Movie.2024.mkv";
     tokio::fs::write(root.join(disabled_path), b"disabled").await?;

@@ -1,17 +1,18 @@
 use luxd::application::{
     identification::{IdentificationDecision, IdentificationStatus, MovieIdentity, identify_movie},
-    tmdb::TmdbMovieSummary,
+    scraper::ScraperSearchResult,
 };
 
-fn candidate(id: i64, title: &str, year: Option<&str>) -> TmdbMovieSummary {
-    TmdbMovieSummary {
-        id,
+fn candidate(id: &str, title: &str, year: Option<&str>) -> ScraperSearchResult {
+    ScraperSearchResult {
         title: Some(title.to_owned()),
         original_title: None,
         overview: Some("stub".to_owned()),
-        release_date: year.map(str::to_owned),
+        production_year: year.and_then(|value| value.get(..4)?.parse().ok()),
+        premiere_date: year.map(str::to_owned),
         original_language: Some("en".to_owned()),
-        vote_average: None,
+        provider_ids: [("tmdb".to_owned(), id.to_owned())].into_iter().collect(),
+        ..ScraperSearchResult::default()
     }
 }
 
@@ -20,9 +21,9 @@ fn identification_table_is_conservative_and_deterministic() {
     struct Case {
         name: &'static str,
         identity: MovieIdentity,
-        candidates: Vec<TmdbMovieSummary>,
+        candidates: Vec<ScraperSearchResult>,
         expected_status: IdentificationStatus,
-        expected_id: Option<i64>,
+        expected_id: Option<&'static str>,
     }
 
     let cases = [
@@ -31,11 +32,11 @@ fn identification_table_is_conservative_and_deterministic() {
             identity: MovieIdentity {
                 title: "Different local title".to_owned(),
                 year: None,
-                provider_id: Some(7),
+                provider_id: Some("7".to_owned()),
             },
-            candidates: vec![candidate(7, "TMDb title", Some("1999-01-01"))],
+            candidates: vec![candidate("7", "TMDb title", Some("1999-01-01"))],
             expected_status: IdentificationStatus::Confirmed,
-            expected_id: Some(7),
+            expected_id: Some("7"),
         },
         Case {
             name: "title and year are high confidence",
@@ -44,9 +45,9 @@ fn identification_table_is_conservative_and_deterministic() {
                 year: Some(1999),
                 provider_id: None,
             },
-            candidates: vec![candidate(603, "The Matrix", Some("1999-03-30"))],
+            candidates: vec![candidate("603", "The Matrix", Some("1999-03-30"))],
             expected_status: IdentificationStatus::Confirmed,
-            expected_id: Some(603),
+            expected_id: Some("603"),
         },
         Case {
             name: "normalized chinese title matches",
@@ -55,9 +56,9 @@ fn identification_table_is_conservative_and_deterministic() {
                 year: Some(2019),
                 provider_id: None,
             },
-            candidates: vec![candidate(535167, "流浪地球", Some("2019-02-05"))],
+            candidates: vec![candidate("535167", "流浪地球", Some("2019-02-05"))],
             expected_status: IdentificationStatus::Confirmed,
-            expected_id: Some(535167),
+            expected_id: Some("535167"),
         },
         Case {
             name: "same title without year is pending",
@@ -67,8 +68,8 @@ fn identification_table_is_conservative_and_deterministic() {
                 provider_id: None,
             },
             candidates: vec![
-                candidate(438631, "Dune", Some("2021-09-03")),
-                candidate(841, "Dune", Some("1984-12-14")),
+                candidate("438631", "Dune", Some("2021-09-03")),
+                candidate("841", "Dune", Some("1984-12-14")),
             ],
             expected_status: IdentificationStatus::Pending,
             expected_id: None,
@@ -80,7 +81,7 @@ fn identification_table_is_conservative_and_deterministic() {
                 year: Some(1999),
                 provider_id: None,
             },
-            candidates: vec![candidate(603, "The Matrix", Some("1999-03-30"))],
+            candidates: vec![candidate("603", "The Matrix", Some("1999-03-30"))],
             expected_status: IdentificationStatus::Pending,
             expected_id: None,
         },
@@ -91,7 +92,7 @@ fn identification_table_is_conservative_and_deterministic() {
                 year: None,
                 provider_id: None,
             },
-            candidates: vec![candidate(348, "Alien", Some("1979-05-25"))],
+            candidates: vec![candidate("348", "Alien", Some("1979-05-25"))],
             expected_status: IdentificationStatus::Pending,
             expected_id: None,
         },
@@ -101,7 +102,10 @@ fn identification_table_is_conservative_and_deterministic() {
         let decision = identify_movie(&case.identity, &case.candidates);
         assert_eq!(decision.status, case.expected_status, "{}", case.name);
         assert_eq!(
-            decision.candidate.as_ref().map(|candidate| candidate.id),
+            decision
+                .candidate
+                .as_ref()
+                .and_then(|candidate| candidate.provider_id("tmdb")),
             case.expected_id,
             "{}",
             case.name

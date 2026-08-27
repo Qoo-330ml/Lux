@@ -641,10 +641,12 @@ mod tests {
         assert_eq!(douban.version, "0.1.4");
         assert_eq!(douban.provider_key.as_deref(), Some("douban"));
         assert_eq!(douban.aliases, vec!["douban"]);
-        assert!(douban
-            .capabilities
-            .iter()
-            .any(|capability| capability == "metadata.bundle"));
+        assert!(
+            douban
+                .capabilities
+                .iter()
+                .any(|capability| capability == "metadata.bundle")
+        );
     }
 
     #[test]

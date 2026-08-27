@@ -215,6 +215,18 @@ impl ScraperProvider {
         }
     }
 
+    pub fn matches_scraper_id(&self, selected_scraper: &str) -> bool {
+        match self {
+            Self::Adapter(adapter) => scraper_id_matches_provider(
+                selected_scraper,
+                adapter.plugin_id(),
+                adapter.provider_key(),
+                &[],
+            ),
+            Self::Generic(client) => client.matches_scraper_id(selected_scraper),
+        }
+    }
+
     pub(crate) fn with_resource_metrics(self, resources: ResourceMetrics) -> Self {
         match self {
             Self::Adapter(adapter) => {
@@ -476,7 +488,7 @@ mod tests {
     use super::{
         PluginServiceError, ScraperError, ScraperSearchResult, decode_bundle_response,
         metadata_capability_for_method, provider_id_for_key, provider_key_from_plugin_id,
-        retryable_scraper_error,
+        retryable_scraper_error, scraper_id_matches_provider,
     };
     use crate::application::plugin_runtime::PluginRuntimeError;
     use serde_json::json;
@@ -607,6 +619,34 @@ mod tests {
             "scraper capability unavailable: metadata.images"
         );
     }
+
+    #[test]
+    fn scraper_id_matching_accepts_provider_aliases_and_plugin_id() {
+        assert!(scraper_id_matches_provider(
+            "tmdb",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &["tmdb".to_owned()]
+        ));
+        assert!(scraper_id_matches_provider(
+            "legacy-tmdb",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &["legacy-tmdb".to_owned()]
+        ));
+        assert!(scraper_id_matches_provider(
+            "org.lux.tmdb",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &[]
+        ));
+        assert!(!scraper_id_matches_provider(
+            "douban",
+            Some("org.lux.tmdb"),
+            "tmdb",
+            &["tmdb".to_owned()]
+        ));
+    }
 }
 
 impl ScraperSearchResult {
@@ -675,6 +715,21 @@ pub fn provider_id_for_key<'a>(
                     || provider.eq_ignore_ascii_case(&short_provider))
         })
         .map(|(_, value)| value.as_str())
+}
+
+fn scraper_id_matches_provider(
+    selected_scraper: &str,
+    plugin_id: Option<&str>,
+    provider_key: &str,
+    aliases: &[String],
+) -> bool {
+    let selected_scraper = selected_scraper.trim();
+    !selected_scraper.is_empty()
+        && (plugin_id.is_some_and(|plugin_id| selected_scraper.eq_ignore_ascii_case(plugin_id))
+            || selected_scraper.eq_ignore_ascii_case(provider_key)
+            || aliases
+                .iter()
+                .any(|alias| selected_scraper.eq_ignore_ascii_case(alias)))
 }
 
 pub(crate) fn metadata_capability_for_method(method: &str) -> Option<&'static str> {
@@ -911,6 +966,7 @@ pub struct ScraperPluginClient {
     plugins: PluginService,
     plugin_id: String,
     provider_key: String,
+    aliases: Vec<String>,
     capability_cache: Arc<OnceCell<Option<Vec<String>>>>,
     response_cache: ProviderResponseCache,
     resources: Option<ResourceMetrics>,
@@ -921,6 +977,7 @@ impl ScraperPluginClient {
         plugins: PluginService,
         plugin_id: impl Into<String>,
         provider_key: impl Into<String>,
+        aliases: Vec<String>,
         capabilities: Option<Vec<String>>,
         response_cache: ProviderResponseCache,
     ) -> Self {
@@ -932,6 +989,7 @@ impl ScraperPluginClient {
             plugins,
             plugin_id: plugin_id.into(),
             provider_key: provider_key.into(),
+            aliases,
             capability_cache,
             response_cache,
             resources: None,
@@ -944,6 +1002,15 @@ impl ScraperPluginClient {
 
     pub fn provider_key(&self) -> &str {
         &self.provider_key
+    }
+
+    fn matches_scraper_id(&self, selected_scraper: &str) -> bool {
+        scraper_id_matches_provider(
+            selected_scraper,
+            Some(&self.plugin_id),
+            &self.provider_key,
+            &self.aliases,
+        )
     }
 
     pub(crate) fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {

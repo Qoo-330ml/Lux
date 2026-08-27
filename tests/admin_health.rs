@@ -98,7 +98,7 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     assert_eq!(body["config"]["available"], true);
     assert_eq!(body["config"]["writable"], true);
     assert!(body["ffprobe"]["available"].is_boolean());
-    assert_eq!(body["tmdb"]["configured"], true);
+    assert!(body.get("tmdb").is_none());
     assert!(body["runtime"]["seconds"].is_number());
     assert_eq!(body["resources"]["cpu"]["source"], "cgroup");
     assert_eq!(body["resources"]["memory"]["source"], "cgroup");

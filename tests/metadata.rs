@@ -38,7 +38,7 @@ fn metadata_merge_table_preserves_local_and_locked_values() {
             initial_source: Some((MetadataField::Title, MetadataSource::LocalNfo)),
             locked: None,
             candidate: MetadataCandidate {
-                source: MetadataSource::TmdbLocalized,
+                source: MetadataSource::ScraperLocalized,
                 metadata: NfoMetadata {
                     title: Some("在线标题".to_owned()),
                     production_year: Some(2020),
@@ -51,7 +51,7 @@ fn metadata_merge_table_preserves_local_and_locked_values() {
                 ..NfoMetadata::default()
             },
             expected_source_field: MetadataField::ProductionYear,
-            expected_source: MetadataSource::TmdbLocalized,
+            expected_source: MetadataSource::ScraperLocalized,
         },
         Case {
             name: "locked local value cannot be refreshed",
@@ -62,7 +62,7 @@ fn metadata_merge_table_preserves_local_and_locked_values() {
             initial_source: Some((MetadataField::Overview, MetadataSource::LocalNfo)),
             locked: Some(MetadataField::Overview),
             candidate: MetadataCandidate {
-                source: MetadataSource::TmdbLocalized,
+                source: MetadataSource::ScraperLocalized,
                 metadata: NfoMetadata {
                     overview: Some("在线简介".to_owned()),
                     ..NfoMetadata::default()
@@ -84,7 +84,7 @@ fn metadata_merge_table_preserves_local_and_locked_values() {
             initial_source: Some((MetadataField::Title, MetadataSource::Fallback)),
             locked: None,
             candidate: MetadataCandidate {
-                source: MetadataSource::TmdbLocalized,
+                source: MetadataSource::ScraperLocalized,
                 metadata: NfoMetadata {
                     title: Some("在线标题".to_owned()),
                     ..NfoMetadata::default()
@@ -95,7 +95,7 @@ fn metadata_merge_table_preserves_local_and_locked_values() {
                 ..NfoMetadata::default()
             },
             expected_source_field: MetadataField::Title,
-            expected_source: MetadataSource::TmdbLocalized,
+            expected_source: MetadataSource::ScraperLocalized,
         },
         Case {
             name: "blank online value does not erase local value",
@@ -106,7 +106,7 @@ fn metadata_merge_table_preserves_local_and_locked_values() {
             initial_source: Some((MetadataField::Overview, MetadataSource::LocalNfo)),
             locked: None,
             candidate: MetadataCandidate {
-                source: MetadataSource::TmdbLocalized,
+                source: MetadataSource::ScraperLocalized,
                 metadata: NfoMetadata {
                     overview: Some("   ".to_owned()),
                     ..NfoMetadata::default()
@@ -160,7 +160,7 @@ fn metadata_state_round_trip_keeps_provenance_and_locks() {
     );
     let mut refreshed = restored;
     refreshed.apply_automatic(&MetadataCandidate {
-        source: MetadataSource::TmdbLocalized,
+        source: MetadataSource::ScraperLocalized,
         metadata: NfoMetadata {
             title: Some("在线标题".to_owned()),
             ..NfoMetadata::default()
@@ -176,7 +176,7 @@ fn metadata_state_round_trip_keeps_provenance_and_locks() {
 #[test]
 fn explicit_selection_modes_fill_or_refresh_only_unlocked_fields() {
     let candidate = MetadataCandidate {
-        source: MetadataSource::TmdbLocalized,
+        source: MetadataSource::ScraperLocalized,
         metadata: NfoMetadata {
             title: Some("在线标题".to_owned()),
             overview: Some("在线简介".to_owned()),
@@ -205,7 +205,7 @@ fn explicit_selection_modes_fill_or_refresh_only_unlocked_fields() {
     assert_eq!(refresh.metadata.production_year, Some(2025));
     refresh.lock(MetadataField::Title);
     refresh.apply_refresh_unlocked(&MetadataCandidate {
-        source: MetadataSource::TmdbLocalized,
+        source: MetadataSource::ScraperLocalized,
         metadata: NfoMetadata {
             title: Some("再次在线标题".to_owned()),
             ..NfoMetadata::default()

@@ -664,8 +664,12 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
     );
     assert!(!configured_body.to_string().contains(custom_key));
     let stored_config: Value = serde_json::from_slice(
-        &tokio::fs::read(temp_dir.path().join("config/plugin-config/org.lux.tmdb.json"))
-            .await?,
+        &tokio::fs::read(
+            temp_dir
+                .path()
+                .join("config/plugin-config/org.lux.tmdb.json"),
+        )
+        .await?,
     )?;
     assert_eq!(stored_config["apiKey"], custom_key);
 
@@ -682,8 +686,12 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
         "PLUGIN_CONFIG"
     );
     let reset_config: Value = serde_json::from_slice(
-        &tokio::fs::read(temp_dir.path().join("config/plugin-config/org.lux.tmdb.json"))
-            .await?,
+        &tokio::fs::read(
+            temp_dir
+                .path()
+                .join("config/plugin-config/org.lux.tmdb.json"),
+        )
+        .await?,
     )?;
     assert_eq!(reset_config["apiKey"], "");
 

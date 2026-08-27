@@ -151,6 +151,16 @@ impl PluginCatalog {
                 .any(|candidate| candidate.eq_ignore_ascii_case(alias))
         })
     }
+
+    pub fn get_by_provider_key(&self, provider_key: &str) -> Option<&DiscoveredPlugin> {
+        self.plugins.iter().find(|plugin| {
+            plugin
+                .manifest
+                .provider_key
+                .as_deref()
+                .is_some_and(|candidate| candidate.eq_ignore_ascii_case(provider_key))
+        })
+    }
 }
 
 #[derive(Debug)]

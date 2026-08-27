@@ -1,13 +1,13 @@
+mod common;
+
 use std::time::Duration;
 
 use axum::{Json, Router, routing::any};
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
-        libraries::LibraryService,
-        scanner::LibraryScanner,
-        setup::SetupService,
-        tmdb::{TmdbClient, TmdbClientConfig},
+        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
         webhooks::WebhookService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
@@ -24,13 +24,13 @@ async fn start_server(
     config: Config,
     database: Database,
     setup: SetupService,
-    tmdb: Option<TmdbClient>,
+    tmdb: Option<TestScraper>,
 ) -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
 {
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let state = AppState::ready(config, database, setup, auth, emby_auth);
-    let state = tmdb.map_or(state.clone(), |tmdb| state.with_scraper(tmdb));
+    let state = tmdb.map_or(state.clone(), |tmdb| state.with_scraper(tmdb.provider()));
     let app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -238,12 +238,12 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     .await?;
 
     let (tmdb_url, tmdb_server) = start_tmdb_stub().await?;
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: tmdb_url,
         read_access_token: Some("stub-token".to_owned()),
         requests_per_second: 0,
         max_retries: 0,
-        ..TmdbClientConfig::default()
+        ..TestScraperConfig::default()
     })?;
     let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
     let client = reqwest::Client::builder()
@@ -488,12 +488,12 @@ async fn series_candidate_search_uses_tmdb_tv_endpoint_and_cleaned_year()
     assert_eq!(series, ("暗夜与黎明".to_owned(), 2024));
 
     let (tmdb_url, tmdb_server) = start_tmdb_stub().await?;
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: tmdb_url,
         read_access_token: Some("stub-token".to_owned()),
         requests_per_second: 0,
         max_retries: 0,
-        ..TmdbClientConfig::default()
+        ..TestScraperConfig::default()
     })?;
     let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
     let client = reqwest::Client::new();
@@ -558,12 +558,12 @@ async fn season_and_episode_candidate_search_uses_parent_series_details()
     .await?;
 
     let (tmdb_url, tmdb_server) = start_tmdb_stub().await?;
-    let tmdb = TmdbClient::new(TmdbClientConfig {
+    let tmdb = TestScraper::new(TestScraperConfig {
         base_url: tmdb_url,
         read_access_token: Some("stub-token".to_owned()),
         requests_per_second: 0,
         max_retries: 0,
-        ..TmdbClientConfig::default()
+        ..TestScraperConfig::default()
     })?;
     let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
     let client = reqwest::Client::new();

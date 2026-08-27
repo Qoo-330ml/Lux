@@ -49,8 +49,8 @@ pub enum MetadataField {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MetadataSource {
     LocalNfo,
+    #[serde(alias = "TMDB_LOCALIZED")]
     ScraperLocalized,
-    TmdbLocalized,
     Fallback,
     LockedLocal,
 }
@@ -59,7 +59,7 @@ impl MetadataSource {
     const fn priority(self) -> u8 {
         match self {
             Self::Fallback => 1,
-            Self::ScraperLocalized | Self::TmdbLocalized => 2,
+            Self::ScraperLocalized => 2,
             Self::LocalNfo => 3,
             Self::LockedLocal => 4,
         }

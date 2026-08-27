@@ -1543,11 +1543,16 @@ impl PluginService {
         let capabilities = catalog
             .get(&plugin_id)
             .map(|plugin| plugin.manifest.capabilities.clone());
+        let aliases = catalog
+            .get(&plugin_id)
+            .map(|plugin| plugin.manifest.aliases.clone())
+            .unwrap_or_default();
         Ok(
             crate::application::scraper::ScraperPluginClient::new_with_provider_key_and_capabilities(
                 self.clone(),
                 plugin_id,
                 provider_key,
+                aliases,
                 capabilities,
                 self.provider_cache(),
             ),
@@ -1848,6 +1853,8 @@ impl PluginService {
         } else if catalog.get(plugin_id).is_some() {
             plugin_id.to_owned()
         } else if let Some(plugin) = catalog.get_by_alias(plugin_id) {
+            plugin.manifest.id.clone()
+        } else if let Some(plugin) = catalog.get_by_provider_key(plugin_id) {
             plugin.manifest.id.clone()
         } else {
             plugin_id.to_owned()
