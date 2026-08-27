@@ -686,7 +686,7 @@ async fn supplemental_selection_preserves_existing_rich_nfo_and_fills_missing_li
 
     let nfo = tokio::fs::read_to_string(fixture.movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<genre>本地类型</genre>"));
-    assert!(!nfo.contains("<genre>在线类型</genre>"));
+    assert!(nfo.contains("<genre>在线类型</genre>"));
     assert!(nfo.contains("<studio>补充制作公司</studio>"));
     let source: Option<String> =
         sqlx::query_scalar("SELECT metadata_scraper_id FROM media_items WHERE id = ?")

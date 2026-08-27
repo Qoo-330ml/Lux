@@ -2128,7 +2128,11 @@ impl MetadataSelectionService {
         payload.movie_nfo.actors = payload.actors.clone();
         if matches!(mode, MetadataSelectionMode::FillMissing) || options.supplemental {
             let projection = self.nfo.read_item_projection(item_id).await?;
-            merge_supplemental_movie_nfo(&mut payload.movie_nfo, projection.as_ref());
+            merge_supplemental_movie_nfo(
+                &mut payload.movie_nfo,
+                projection.as_ref(),
+                options.supplemental,
+            );
             payload.actors = payload.movie_nfo.actors.clone();
             if options.supplemental {
                 preserve_supplemental_scalar_values(&mut payload, &current);
@@ -2357,6 +2361,7 @@ impl MetadataSelectionService {
 fn merge_supplemental_movie_nfo(
     candidate: &mut MovieNfoMetadata,
     existing: Option<&crate::application::nfo::LocalNfoProjection>,
+    append_lists: bool,
 ) {
     let Some(existing) = existing else {
         return;
@@ -2369,58 +2374,164 @@ fn merge_supplemental_movie_nfo(
             }
         };
     }
-    preserve!(rating);
-    preserve!(votes);
-    preserve!(tagline);
-    preserve!(premiered);
+    if append_lists {
+        replace_if_present(&mut candidate.rating, details.rating);
+        replace_if_present(&mut candidate.votes, details.votes);
+        replace_if_present(&mut candidate.tagline, details.tagline.clone());
+        replace_if_present(&mut candidate.premiered, details.premiered.clone());
+    } else {
+        preserve!(rating);
+        preserve!(votes);
+        preserve!(tagline);
+        preserve!(premiered);
+    }
     if candidate.releasedate.is_none() {
         candidate.releasedate = details.release_date.clone();
     }
-    preserve!(runtime);
-    preserve!(status);
-    preserve!(original_language);
-    preserve!(website);
-    preserve!(set_name);
-    preserve!(set_id);
-    preserve!(certification);
-    if !details.countries.is_empty() {
-        candidate.countries = details.countries.clone();
-    }
-    if !details.genres.is_empty() {
-        candidate.genres = details.genres.clone();
-    }
-    if !details.studios.is_empty() {
-        candidate.studios = details.studios.clone();
-    }
-    if !details.directors.is_empty() {
-        candidate.directors = details
-            .directors
-            .iter()
-            .map(|credit| MovieNfoCredit {
-                provider_id: credit.provider_id.clone(),
-                name: credit.name.clone(),
-            })
-            .collect();
-    }
-    if !details.writers.is_empty() {
-        candidate.writers = details
-            .writers
-            .iter()
-            .map(|credit| MovieNfoCredit {
-                provider_id: credit.provider_id.clone(),
-                name: credit.name.clone(),
-            })
-            .collect();
-    }
-    if !details.trailers.is_empty() {
-        candidate.trailers = details.trailers.clone();
-    }
-    if !existing.actors.is_empty() {
-        candidate.actors = existing.actors.clone();
+    if append_lists {
+        replace_if_present(&mut candidate.releasedate, details.release_date.clone());
+        replace_if_present(&mut candidate.runtime, details.runtime);
+        replace_if_present(&mut candidate.status, details.status.clone());
+        replace_if_present(
+            &mut candidate.original_language,
+            details.original_language.clone(),
+        );
+        replace_if_present(&mut candidate.website, details.website.clone());
+        replace_if_present(&mut candidate.set_name, details.set_name.clone());
+        replace_if_present(&mut candidate.set_id, details.set_id.clone());
+        replace_if_present(&mut candidate.certification, details.certification.clone());
+        candidate.countries = merge_string_values(&details.countries, &candidate.countries);
+        candidate.genres = merge_string_values(&details.genres, &candidate.genres);
+        candidate.studios = merge_string_values(&details.studios, &candidate.studios);
+        candidate.directors = merge_credit_values(&details.directors, &candidate.directors);
+        candidate.writers = merge_credit_values(&details.writers, &candidate.writers);
+        candidate.trailers = merge_string_values(&details.trailers, &candidate.trailers);
+        candidate.actors = merge_actor_values(&existing.actors, &candidate.actors);
+    } else {
+        preserve!(runtime);
+        preserve!(status);
+        preserve!(original_language);
+        preserve!(website);
+        preserve!(set_name);
+        preserve!(set_id);
+        preserve!(certification);
+        if !details.countries.is_empty() {
+            candidate.countries = details.countries.clone();
+        }
+        if !details.genres.is_empty() {
+            candidate.genres = details.genres.clone();
+        }
+        if !details.studios.is_empty() {
+            candidate.studios = details.studios.clone();
+        }
+        if !details.directors.is_empty() {
+            candidate.directors = details
+                .directors
+                .iter()
+                .map(|credit| MovieNfoCredit {
+                    provider_id: credit.provider_id.clone(),
+                    name: credit.name.clone(),
+                })
+                .collect();
+        }
+        if !details.writers.is_empty() {
+            candidate.writers = details
+                .writers
+                .iter()
+                .map(|credit| MovieNfoCredit {
+                    provider_id: credit.provider_id.clone(),
+                    name: credit.name.clone(),
+                })
+                .collect();
+        }
+        if !details.trailers.is_empty() {
+            candidate.trailers = details.trailers.clone();
+        }
+        if !existing.actors.is_empty() {
+            candidate.actors = existing.actors.clone();
+        }
     }
     for (provider, id) in &details.provider_ids {
-        candidate.provider_ids.insert(provider.clone(), id.clone());
+        candidate
+            .provider_ids
+            .entry(provider.clone())
+            .or_insert_with(|| id.clone());
     }
+}
+
+fn replace_if_present<T>(target: &mut Option<T>, value: Option<T>) {
+    if value.is_some() {
+        *target = value;
+    }
+}
+
+fn merge_string_values(existing: &[String], incoming: &[String]) -> Vec<String> {
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    for value in existing.iter().chain(incoming) {
+        let trimmed = value.trim();
+        if trimmed.is_empty()
+            || merged
+                .iter()
+                .any(|stored: &String| stored.eq_ignore_ascii_case(trimmed))
+        {
+            continue;
+        }
+        merged.push(trimmed.to_owned());
+    }
+    merged
+}
+
+fn merge_credit_values(
+    existing: &[MovieNfoCredit],
+    incoming: &[MovieNfoCredit],
+) -> Vec<MovieNfoCredit> {
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    for credit in existing.iter().chain(incoming) {
+        if credit.name.trim().is_empty() {
+            continue;
+        }
+        let duplicate = merged.iter().any(|stored: &MovieNfoCredit| {
+            if !credit.provider_id.trim().is_empty() && !stored.provider_id.trim().is_empty() {
+                credit.provider_id.eq_ignore_ascii_case(&stored.provider_id)
+            } else {
+                credit.name.trim().eq_ignore_ascii_case(stored.name.trim())
+            }
+        });
+        if !duplicate {
+            merged.push(credit.clone());
+        }
+    }
+    merged
+}
+
+fn merge_actor_values(existing: &[ActorCredit], incoming: &[ActorCredit]) -> Vec<ActorCredit> {
+    let mut merged = Vec::with_capacity(existing.len() + incoming.len());
+    for actor in existing.iter().chain(incoming) {
+        if actor.name.trim().is_empty() {
+            continue;
+        }
+        let duplicate = merged.iter().any(|stored: &ActorCredit| {
+            if !actor.id.trim().is_empty() && !stored.id.trim().is_empty() {
+                actor
+                    .provider
+                    .as_deref()
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case(stored.provider.as_deref().unwrap_or_default())
+                    && actor.id.eq_ignore_ascii_case(&stored.id)
+            } else {
+                actor.name.trim().eq_ignore_ascii_case(stored.name.trim())
+                    && actor
+                        .character
+                        .as_deref()
+                        .unwrap_or_default()
+                        .eq_ignore_ascii_case(stored.character.as_deref().unwrap_or_default())
+            }
+        });
+        if !duplicate {
+            merged.push(actor.clone());
+        }
+    }
+    merged
 }
 
 fn preserve_supplemental_scalar_values(
@@ -3161,7 +3272,7 @@ mod tests {
     use super::{
         ACTOR_METADATA_FETCH_CONCURRENCY, candidate_actors, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
-        metadata_match_score, metadata_request_plan,
+        merge_supplemental_movie_nfo, metadata_match_score, metadata_request_plan,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3533,5 +3644,77 @@ mod tests {
             ),
             45.0
         );
+    }
+
+    #[test]
+    fn supplemental_merge_appends_unique_lists_and_keeps_existing_first() {
+        let mut candidate = crate::application::nfo::MovieNfoMetadata {
+            genres: vec!["动作".to_owned(), "科幻".to_owned()],
+            studios: vec!["主制作公司".to_owned()],
+            directors: vec![crate::application::nfo::MovieNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "主导演".to_owned(),
+            }],
+            actors: vec![super::ActorCredit {
+                id: "actor-2".to_owned(),
+                provider: Some("supplement".to_owned()),
+                identities: Vec::new(),
+                name: "补充演员".to_owned(),
+                character: None,
+                order: Some(1),
+                profile_url: None,
+                person: None,
+            }],
+            provider_ids: [
+                ("tmdb".to_owned(), "main-1".to_owned()),
+                ("imdb".to_owned(), "tt-supplement".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            trailers: vec!["https://video.example/supplement".to_owned()],
+            ..Default::default()
+        };
+        let existing = crate::application::nfo::LocalNfoProjection {
+            details: crate::application::nfo::LocalNfoDetails {
+                genres: vec!["动作".to_owned(), "本地类型".to_owned()],
+                studios: vec!["主制作公司".to_owned(), "本地制作公司".to_owned()],
+                directors: vec![crate::application::nfo::LocalNfoCredit {
+                    provider_id: "director-1".to_owned(),
+                    name: "主导演".to_owned(),
+                }],
+                provider_ids: [("tmdb".to_owned(), "local-1".to_owned())]
+                    .into_iter()
+                    .collect(),
+                trailers: vec!["https://video.example/main".to_owned()],
+                ..Default::default()
+            },
+            actors: vec![super::ActorCredit {
+                id: "actor-1".to_owned(),
+                provider: Some("main".to_owned()),
+                identities: Vec::new(),
+                name: "主演员".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+            ..Default::default()
+        };
+
+        merge_supplemental_movie_nfo(&mut candidate, Some(&existing), true);
+
+        assert_eq!(candidate.genres, ["动作", "本地类型", "科幻"]);
+        assert_eq!(candidate.studios, ["主制作公司", "本地制作公司"]);
+        assert_eq!(candidate.directors.len(), 1);
+        assert_eq!(
+            candidate.trailers,
+            [
+                "https://video.example/main",
+                "https://video.example/supplement"
+            ]
+        );
+        assert_eq!(candidate.actors.len(), 2);
+        assert_eq!(candidate.provider_ids["tmdb"], "main-1");
+        assert_eq!(candidate.provider_ids["imdb"], "tt-supplement");
     }
 }
