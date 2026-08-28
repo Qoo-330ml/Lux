@@ -1550,6 +1550,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 `GET/PATCH /api/v1/admin/settings` 的 `danmaku` 配置只返回脱敏的地址和配置状态；地址中的 token、query secret 和完整外部 URL 不进入日志、审计事件或普通用户 API。
 
 所有管理端点均在服务端检查 can_manage_server。敏感操作写审计事件。删除媒体源时，即使媒体文件已被外部删除，也会清理 Lux 中的媒体源记录；没有其他媒体源时同时标记逻辑条目移除。
+`DELETE /api/v1/admin/items/{id}` 未指定 `sourceId` 时，若 `{id}` 是剧集，则删除该剧集及其季度、分集树下的全部本地/STRM 媒体源和同名旁车文件，并标记整棵层级移除；指定 `sourceId` 时仍只删除当前条目下的该媒体源。
 
 ---
 
