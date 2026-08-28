@@ -131,16 +131,23 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(final_status.0, "RUNNING");
+    assert_eq!(final_status.0, "COMPLETED");
     assert_eq!(final_status.1, 3);
     assert_eq!(final_status.2, None);
-    assert_eq!(final_status.3, None);
+    assert!(final_status.3.is_some());
     let completed_activity: (Option<String>, String) =
         sqlx::query_as("SELECT current_item, scan_phase FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
     assert_eq!(completed_activity, (None, "POSTPROCESSING".to_owned()));
+    assert!(
+        restarted_jobs
+            .active_job_ids()
+            .await?
+            .iter()
+            .any(|id| id == &job.id)
+    );
     restarted_jobs.run_to_completion(&job.id, 10, None).await?;
     let final_status: (String, Option<i64>, String) =
         sqlx::query_as("SELECT status, finished_at, scan_phase FROM scan_jobs WHERE id = ?")
@@ -205,7 +212,7 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
-async fn cancelling_postprocessing_keeps_targets_for_retry()
+async fn cancelling_after_indexing_completion_does_not_cancel_scan()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -231,9 +238,25 @@ async fn cancelling_postprocessing_keeps_targets_for_retry()
             break;
         }
     }
+    let index_status: (String, String) =
+        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        index_status,
+        ("COMPLETED".to_owned(), "POSTPROCESSING".to_owned())
+    );
     jobs.cancel(&job.id).await?;
-    let cancelled = jobs.run_batch(&job.id, 100).await?;
-    assert_eq!(cancelled.status, "CANCELLED");
+    let post_cancel_status: (String, String) =
+        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        post_cancel_status,
+        ("COMPLETED".to_owned(), "POSTPROCESSING".to_owned())
+    );
     let target_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
             .bind(&job.id)
@@ -241,9 +264,6 @@ async fn cancelling_postprocessing_keeps_targets_for_retry()
             .await?;
     assert!(target_count > 0);
 
-    let retried = jobs.retry(&job.id).await?;
-    assert_eq!(retried.id, job.id);
-    assert_eq!(retried.status, "RUNNING");
     jobs.run_to_completion(&job.id, 100, None).await?;
     let final_target_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
@@ -305,6 +325,15 @@ async fn completed_scan_enqueues_new_media_once_for_webhook_destinations()
         serde_json::from_str::<serde_json::Value>(&payload)?["addedCount"],
         1
     );
+    let scan_completed_payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM notification_events WHERE event_type = 'SCAN_COMPLETED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let scan_completed_payload =
+        serde_json::from_str::<serde_json::Value>(&scan_completed_payload)?;
+    assert_eq!(scan_completed_payload["status"], "COMPLETED");
+    assert_eq!(scan_completed_payload["processedCount"], 1);
 
     let second = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&second.id, 100, None).await?;
@@ -1385,7 +1414,7 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
 
 #[cfg(unix)]
 #[tokio::test]
-async fn failed_postprocessing_targets_make_scan_retryable()
+async fn failed_postprocessing_targets_leave_scan_completed_and_retryable()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -1427,14 +1456,9 @@ async fn failed_postprocessing_targets_make_scan_retryable()
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(status.0, "FAILED");
+    assert_eq!(status.0, "COMPLETED");
     assert_eq!(status.1, "IDLE");
-    assert!(
-        status
-            .2
-            .as_deref()
-            .is_some_and(|error| error.contains("postprocessing"))
-    );
+    assert_eq!(status.2, None);
     let target_state: String = sqlx::query_scalar(
         "SELECT probe_state FROM scan_job_targets WHERE job_id = ? AND target_type = 'SOURCE'",
     )
@@ -1442,6 +1466,14 @@ async fn failed_postprocessing_targets_make_scan_retryable()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(target_state, "FAILED");
+    let postprocessing_failed_event: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events
+         WHERE job_id = ? AND event_code = 'POSTPROCESSING_FAILED'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(postprocessing_failed_event, 1);
 
     fs::write(
         &fake_ffprobe,
@@ -1449,7 +1481,8 @@ async fn failed_postprocessing_targets_make_scan_retryable()
     )?;
     let retried = jobs.retry(&job.id).await?;
     assert_eq!(retried.id, job.id);
-    assert_eq!(retried.status, "RUNNING");
+    assert_eq!(retried.status, "COMPLETED");
+    assert_eq!(retried.scan_phase, "POSTPROCESSING");
     let succeeding_probe = MediaProbeService::new(
         database.clone(),
         FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
@@ -1512,7 +1545,15 @@ async fn pending_postprocessing_targets_make_scan_retryable()
         .bind(&job.id)
         .fetch_one(database.pool())
         .await?;
-    assert_eq!(status, "FAILED");
+    assert_eq!(status, "COMPLETED");
+    let event_code: String = sqlx::query_scalar(
+        "SELECT event_code FROM scan_job_events
+         WHERE job_id = ? AND event_code = 'POSTPROCESSING_FAILED'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(event_code, "POSTPROCESSING_FAILED");
     Ok(())
 }
 
@@ -1559,7 +1600,7 @@ async fn metadata_and_thumbnail_failures_are_persisted_per_target()
     assert_eq!(
         states,
         (
-            "FAILED".to_owned(),
+            "COMPLETED".to_owned(),
             "FAILED".to_owned(),
             "FAILED".to_owned()
         )

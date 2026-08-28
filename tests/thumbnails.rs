@@ -175,7 +175,8 @@ async fn existing_series_episode_thumbnail_is_indexed_before_thumbnail_generatio
 }
 
 #[tokio::test]
-async fn ffmpeg_failure_makes_scan_retryable() -> Result<(), Box<dyn std::error::Error>> {
+async fn ffmpeg_failure_does_not_fail_the_completed_scan() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp_dir = tempfile::tempdir()?;
     let database = Database::connect(&config(temp_dir.path())).await?;
     let libraries = LibraryService::new(database.clone());
@@ -203,7 +204,7 @@ async fn ffmpeg_failure_makes_scan_retryable() -> Result<(), Box<dyn std::error:
         .bind(&job.id)
         .fetch_one(database.pool())
         .await?;
-    assert_eq!(status, "FAILED");
+    assert_eq!(status, "COMPLETED");
     let event: (String, String) = sqlx::query_as(
         "SELECT level, event_code FROM scan_job_events
          WHERE job_id = ? AND event_code = 'THUMBNAIL_FAILED'",

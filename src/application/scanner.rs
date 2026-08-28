@@ -2578,17 +2578,20 @@ impl ScanJobService {
             self.database.mark_scan_job_postprocessing(&job.id).await?;
             self.record_event(&job.id, "INFO", "JOB_COMPLETED", "任务已完成", "{}")
                 .await;
-            if removed_count > 0 {
-                self.publish_webhook_event_with_data(
-                    job,
-                    WebhookEventType::MediaRemoved,
-                    None,
-                    json!({ "removedCount": removed_count }),
-                )
-                .await;
+            let completed_job = self.database.find_scan_job(&job.id).await?;
+            if let Some(completed_job) = completed_job.as_ref() {
+                if removed_count > 0 {
+                    self.publish_webhook_event_with_data(
+                        completed_job,
+                        WebhookEventType::MediaRemoved,
+                        None,
+                        json!({ "removedCount": removed_count }),
+                    )
+                    .await;
+                }
+                self.publish_webhook_event(completed_job, WebhookEventType::ScanCompleted, None)
+                    .await;
             }
-            self.publish_webhook_event(job, WebhookEventType::ScanCompleted, None)
-                .await;
             return Ok(ScanBatchReport {
                 status: "COMPLETED".to_owned(),
                 processed: 0,
@@ -4181,19 +4184,7 @@ impl ScanJobService {
     }
 
     pub async fn active_job_ids(&self) -> Result<Vec<String>, ScanJobError> {
-        let mut ids = Vec::new();
-        for status in ["PENDING", "RUNNING"] {
-            ids.extend(
-                self.database
-                    .list_scan_jobs(Some(status), 0, 10_000)
-                    .await?
-                    .into_iter()
-                    .map(|job| job.id),
-            );
-        }
-        ids.sort();
-        ids.dedup();
-        Ok(ids)
+        Ok(self.database.list_scan_job_ids_needing_resume().await?)
     }
 
     pub async fn cancel(&self, job_id: &str) -> Result<(), ScanJobError> {
@@ -4220,7 +4211,21 @@ impl ScanJobService {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Err(ScanJobError::JobNotFound);
         };
-        if !matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
+        let can_retry_completed_postprocessing = if job.status == "COMPLETED"
+            && job.job_type == "RECONCILE_LIBRARY"
+            && job.scan_phase == "IDLE"
+        {
+            !self
+                .database
+                .has_reconciliation_scan_entries(&job.id)
+                .await?
+                && self.database.has_scan_job_targets(&job.id).await?
+        } else {
+            false
+        };
+        if !matches!(job.status.as_str(), "FAILED" | "CANCELLED")
+            && !can_retry_completed_postprocessing
+        {
             return Err(ScanJobError::AlreadyActive(job.id));
         }
         let Ok(library_id) = job.library_id.parse::<LibraryId>() else {

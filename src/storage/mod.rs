@@ -8547,6 +8547,23 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_scan_job_ids_needing_resume(
+        &self,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id FROM scan_jobs
+             WHERE status IN ('PENDING', 'RUNNING')
+                OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING')
+             ORDER BY created_at, id LIMIT 10000",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn metadata_reidentify_job_has_failed_items(
         &self,
         job_id: &str,
@@ -8909,7 +8926,8 @@ impl Database {
     pub(crate) async fn mark_scan_job_postprocessing(&self, id: &str) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
-             SET current_item = NULL, scan_phase = 'POSTPROCESSING',
+             SET status = 'COMPLETED', current_item = NULL, scan_phase = 'POSTPROCESSING',
+                 error = NULL, finished_at = COALESCE(finished_at, unixepoch()),
                  updated_at = unixepoch()
              WHERE id = ? AND status = 'RUNNING'",
         )
@@ -8930,9 +8948,10 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'COMPLETED', current_item = NULL, scan_phase = 'IDLE',
-                     finished_at = unixepoch(), updated_at = unixepoch()
-                 WHERE id = ? AND status = 'RUNNING'
+                 SET status = 'COMPLETED', error = NULL, current_item = NULL,
+                     scan_phase = 'IDLE', finished_at = COALESCE(finished_at, unixepoch()),
+                     updated_at = unixepoch()
+                 WHERE id = ? AND status IN ('RUNNING', 'COMPLETED')
                    AND scan_phase = 'POSTPROCESSING'
                    AND NOT EXISTS (
                        SELECT 1 FROM scan_job_targets
@@ -8962,10 +8981,10 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'FAILED', error = 'postprocessing target failed',
-                     current_item = NULL, scan_phase = 'IDLE',
-                     finished_at = unixepoch(), updated_at = unixepoch()
-                 WHERE id = ? AND status = 'RUNNING'
+                 SET status = 'COMPLETED', error = NULL, current_item = NULL,
+                     scan_phase = 'IDLE', finished_at = COALESCE(finished_at, unixepoch()),
+                     updated_at = unixepoch()
+                 WHERE id = ? AND status IN ('RUNNING', 'COMPLETED')
                    AND scan_phase = 'POSTPROCESSING'
                    AND EXISTS (
                        SELECT 1 FROM scan_job_targets
@@ -9011,12 +9030,15 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'RUNNING', cancel_requested = 0, error = NULL,
+                 SET status = CASE WHEN status = 'COMPLETED' THEN 'COMPLETED' ELSE 'RUNNING' END,
+                     cancel_requested = 0, error = NULL,
                      current_item = NULL, scan_phase = 'POSTPROCESSING',
                      started_at = COALESCE(started_at, unixepoch()),
-                     finished_at = NULL, updated_at = unixepoch()
-                 WHERE id = ? AND status IN ('FAILED', 'CANCELLED')
+                     finished_at = CASE WHEN status = 'COMPLETED' THEN finished_at ELSE NULL END,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND status IN ('COMPLETED', 'FAILED', 'CANCELLED')
                    AND job_type = 'RECONCILE_LIBRARY'
+                   AND scan_phase = 'IDLE'
                    AND NOT EXISTS (
                        SELECT 1 FROM reconciliation_scan_entries
                        WHERE job_id = ?

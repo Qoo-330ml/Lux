@@ -225,7 +225,7 @@ async fn auto_cover_runs_before_unrelated_postprocessing_failure()
         .bind(&job.id)
         .fetch_one(database.pool())
         .await?;
-    assert_eq!(scan_status, "FAILED");
+    assert_eq!(scan_status, "COMPLETED");
 
     let cover_path: Option<String> =
         sqlx::query_scalar("SELECT cover_image_path FROM libraries WHERE id = ?")
