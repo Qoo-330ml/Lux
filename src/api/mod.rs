@@ -7351,7 +7351,11 @@ fn emby_media_source_json_with_resolver_and_chapters(
         "RequiresClosing": false,
         "RequiresOpening": false,
         "RequiresLooping": false,
-        "AddApiKeyToDirectStreamUrl": false,
+        // Some Android clients use an independent media request stack and
+        // drop the Emby auth headers sent to PlaybackInfo. This standard Emby
+        // flag tells them to append the current API key to the direct URL,
+        // while keeping the long-lived token out of the response URL itself.
+        "AddApiKeyToDirectStreamUrl": true,
     });
     if include_chapters && let Value::Object(object) = &mut value {
         object.insert(

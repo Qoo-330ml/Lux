@@ -134,6 +134,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         playback_body["MediaSources"][0]["DirectStreamUrl"],
         format!("/Videos/{item_id}/stream.mkv?MediaSourceId={source_id}")
     );
+    assert_eq!(
+        playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
+        true
+    );
     let standard_stream = client
         .get(format!("{base_url}/Videos/{item_id}/stream.mkv"))
         .query(&[

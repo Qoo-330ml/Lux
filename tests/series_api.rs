@@ -346,6 +346,31 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(episodes_from_season_body["Items"][0]["IndexNumber"], 1);
     assert_eq!(episodes_from_season_body["Items"][0]["Index"], 1);
 
+    // Yamby 2.0.5.5 uses the selected season ID in both the Shows path and
+    // SeasonId query parameter. Emby-compatible servers should still return
+    // that season's episodes instead of treating the season as a series ID.
+    let episodes_from_season_path = client
+        .get(format!(
+            "{base_url}/Shows/{season_id}/Episodes?UserId={}&SeasonId={season_id}&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(episodes_from_season_path.status(), reqwest::StatusCode::OK);
+    let episodes_from_season_path_body: Value = episodes_from_season_path.json().await?;
+    assert_eq!(episodes_from_season_path_body["TotalRecordCount"], 3);
+    assert_eq!(
+        episodes_from_season_path_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(3)
+    );
+    assert_eq!(
+        episodes_from_season_path_body["Items"][0]["SeasonId"],
+        season_id
+    );
+
     let vidhub_episodes = client
         .get(format!(
             "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields=BasicSyncInfo,Overview,ProviderIds,Path,Size,People,RuntimeTicks,Chapters,MediaSources,CanDownload&Limit=10",

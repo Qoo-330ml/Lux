@@ -579,7 +579,23 @@ impl CatalogService {
         if !self.access.can_view_item(principal, series_id).await? {
             return Err(CatalogError::AccessDenied);
         }
-        if let Some(season_id) = season_id {
+        // A few Emby clients (including Yamby) use the selected season ID in
+        // the `/Shows/{id}/Episodes` path, even though the protocol names
+        // that path parameter `seriesId`. Resolve that compatibility shape to
+        // the season's parent series and keep the season filter on the
+        // selected season. Standard requests continue to use the supplied
+        // series ID unchanged.
+        let route_item = assemble_items(self.database.find_catalog_rows(series_id).await?)
+            .into_iter()
+            .next();
+        let (resolved_series_id, resolved_season_id) = match route_item {
+            Some(item) if item.item_type == "SEASON" => (
+                item.parent_id.unwrap_or_else(|| series_id.to_owned()),
+                Some(series_id.to_owned()),
+            ),
+            _ => (series_id.to_owned(), season_id.map(str::to_owned)),
+        };
+        if let Some(season_id) = resolved_season_id.as_deref() {
             let season = self
                 .database
                 .find_catalog_rows(season_id)
@@ -588,7 +604,8 @@ impl CatalogService {
                 .into_iter()
                 .next()
                 .filter(|item| {
-                    item.item_type == "SEASON" && item.parent_id.as_deref() == Some(series_id)
+                    item.item_type == "SEASON"
+                        && item.parent_id.as_deref() == Some(resolved_series_id.as_str())
                 });
             let Some(_) = season else {
                 return Err(CatalogError::LibraryNotFound);
@@ -597,7 +614,12 @@ impl CatalogService {
 
         let (item_ids, total) = self
             .database
-            .list_series_episode_ids(series_id, season_id, offset, limit)
+            .list_series_episode_ids(
+                &resolved_series_id,
+                resolved_season_id.as_deref(),
+                offset,
+                limit,
+            )
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
         let items_by_id = assemble_items(rows)
