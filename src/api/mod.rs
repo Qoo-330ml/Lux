@@ -20143,6 +20143,8 @@ async fn admin_update_library_cover(
     match covers.store(library_id, content_type, &body).await {
         Ok(cover) => {
             let target_id = library_id.to_string();
+            let cover_url =
+                library_cover_url_for_tag(&target_id, Some(cover.etag.trim_matches('"')));
             record_audit_event(
                 &state,
                 &headers,
@@ -20157,7 +20159,7 @@ async fn admin_update_library_cover(
                 Json(json!({
                     "library": {
                         "id": target_id,
-                        "coverImageUrl": format!("/api/v1/libraries/{target_id}/cover"),
+                        "coverImageUrl": cover_url,
                         "contentType": cover.content_type,
                         "contentLength": cover.content_length,
                     }
@@ -20946,10 +20948,16 @@ fn library_media_strategy_json(value: Option<&str>) -> Option<Value> {
 }
 
 fn library_cover_url(library: &LibraryRecord) -> Option<String> {
-    library
-        .cover_image_path
-        .as_ref()
-        .map(|_| format!("/api/v1/libraries/{}/cover", library.id))
+    library.cover_image_path.as_ref().map(|_| {
+        library_cover_url_for_tag(&library.id.to_string(), library.cover_image_tag.as_deref())
+    })
+}
+
+fn library_cover_url_for_tag(library_id: &str, tag: Option<&str>) -> String {
+    let base = format!("/api/v1/libraries/{library_id}/cover");
+    tag.map(str::trim)
+        .filter(|tag| !tag.is_empty())
+        .map_or(base.clone(), |tag| format!("{base}?v={tag}"))
 }
 
 fn root_json(root: &LibraryRootRecord) -> Value {

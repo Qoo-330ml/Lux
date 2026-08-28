@@ -209,7 +209,10 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .await?;
     assert_eq!(cover.status(), reqwest::StatusCode::OK);
     let cover_body = cover.json::<Value>().await?;
-    assert!(cover_body["library"]["coverImageUrl"].is_string());
+    let cover_url = cover_body["library"]["coverImageUrl"]
+        .as_str()
+        .ok_or("missing versioned cover URL")?;
+    assert!(cover_url.contains("/cover?v="));
 
     let public_cover = client
         .get(format!("{base_url}/api/v1/libraries/{library_id}/cover"))
