@@ -2520,13 +2520,20 @@ fn emby_compat_media_source_id<'a>(ids: Option<&'a str>, page: &CatalogPage) -> 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum EmbyClientCompatibility {
     Generic,
-    VidHub,
+    LegacyMixedLibrary,
 }
 
+const LEGACY_MIXED_LIBRARY_CLIENTS: &[&str] = &["vidhub", "yamby"];
+
 fn emby_client_compatibility_from_name(client: Option<&str>) -> EmbyClientCompatibility {
-    match client.map(str::trim) {
-        Some(client) if client.eq_ignore_ascii_case("vidhub") => EmbyClientCompatibility::VidHub,
-        _ => EmbyClientCompatibility::Generic,
+    if client.is_some_and(|client| {
+        LEGACY_MIXED_LIBRARY_CLIENTS
+            .iter()
+            .any(|known_client| client.trim().eq_ignore_ascii_case(known_client))
+    }) {
+        EmbyClientCompatibility::LegacyMixedLibrary
+    } else {
+        EmbyClientCompatibility::Generic
     }
 }
 
@@ -7816,7 +7823,7 @@ fn emby_collection_type(
         LibraryKind::Series => Some("tvshows"),
         LibraryKind::Mixed => match compatibility {
             EmbyClientCompatibility::Generic => Some("mixed"),
-            EmbyClientCompatibility::VidHub => None,
+            EmbyClientCompatibility::LegacyMixedLibrary => None,
         },
     }
 }
@@ -21132,10 +21139,27 @@ mod tests {
     }
 
     #[test]
-    fn emby_collection_type_uses_legacy_null_for_vidhub_mixed_libraries() {
+    fn emby_collection_type_uses_legacy_null_for_legacy_mixed_library_clients() {
         assert_eq!(
-            emby_collection_type(LibraryKind::Mixed, EmbyClientCompatibility::VidHub),
+            emby_collection_type(
+                LibraryKind::Mixed,
+                EmbyClientCompatibility::LegacyMixedLibrary
+            ),
             None
+        );
+    }
+
+    #[test]
+    fn emby_client_compatibility_groups_known_legacy_mixed_library_clients() {
+        for client in ["VidHub", "Yamby", "yamby"] {
+            assert_eq!(
+                super::emby_client_compatibility_from_name(Some(client)),
+                EmbyClientCompatibility::LegacyMixedLibrary
+            );
+        }
+        assert_eq!(
+            super::emby_client_compatibility_from_name(Some("Emby")),
+            EmbyClientCompatibility::Generic
         );
     }
 

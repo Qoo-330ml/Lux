@@ -34,7 +34,7 @@ async fn emby_login(
 }
 
 #[tokio::test]
-async fn mixed_library_uses_vidhub_compatibility_shape_without_changing_emby_shape()
+async fn mixed_library_uses_legacy_compatibility_shape_without_changing_emby_shape()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -105,6 +105,48 @@ async fn mixed_library_uses_vidhub_compatibility_shape_without_changing_emby_sha
     assert!(vidhub_virtual_folders[0]["LibraryOptions"]["ContentType"].is_null());
     assert_eq!(
         vidhub_virtual_folders[0]["LibraryOptions"]["TypeOptions"]
+            .as_array()
+            .map(|items| items
+                .iter()
+                .map(|item| item["Type"].clone())
+                .collect::<Vec<_>>()),
+        Some(vec![json!("Movie"), json!("Series")])
+    );
+
+    let yamby_token = emby_login(&client, &base_url, "Yamby").await?;
+    let yamby_views = client
+        .get(format!("{base_url}/Users/{}/Views", admin.id))
+        .header("X-Emby-Token", &yamby_token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(yamby_views["Items"][0]["Id"], library.id.to_string());
+    assert!(yamby_views["Items"][0]["CollectionType"].is_null());
+
+    let yamby_detail = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/{}",
+            admin.id, library.id
+        ))
+        .header("X-Emby-Token", &yamby_token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(yamby_detail["CollectionType"].is_null());
+
+    let yamby_virtual_folders = client
+        .get(format!("{base_url}/Library/VirtualFolders"))
+        .header("X-Emby-Token", &yamby_token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(yamby_virtual_folders[0]["CollectionType"].is_null());
+    assert!(yamby_virtual_folders[0]["LibraryOptions"]["ContentType"].is_null());
+    assert_eq!(
+        yamby_virtual_folders[0]["LibraryOptions"]["TypeOptions"]
             .as_array()
             .map(|items| items
                 .iter()
