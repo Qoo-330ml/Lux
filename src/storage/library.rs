@@ -996,6 +996,7 @@ impl Database {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn register_plugin_scheduled_task(
         &self,
         owner_type: &str,

@@ -15,6 +15,7 @@ use serde_json::{Map, json};
 
 const PLUGIN_ID: &str = "org.lux.danmaku";
 const GENERIC_PLUGIN_ID: &str = "org.lux.scheduled-example";
+type GenericTaskRow = (Option<String>, i64, String, Option<String>, String);
 
 #[tokio::test]
 async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
@@ -242,7 +243,7 @@ async fn installed_plugin_registers_manifest_task_without_plugin_id_special_case
     let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(GENERIC_PLUGIN_ID).await?;
 
-    let task: Option<(Option<String>, i64, String, Option<String>, String)> = sqlx::query_as(
+    let task: Option<GenericTaskRow> = sqlx::query_as(
         "SELECT cron_or_interval, is_enabled, source_type, plugin_id, resource_limit_json
          FROM scheduled_task_configs
          WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = 'EXAMPLE_TASK'",
