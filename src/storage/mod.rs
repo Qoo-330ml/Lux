@@ -35,7 +35,35 @@ pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
 const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 const BATCH_INSERT_CHUNK_SIZE: usize = 100;
-const DATABASE_POOL_MAX_CONNECTIONS: u32 = 5;
+const DATABASE_POOL_MAX_CONNECTIONS_ENV: &str = "LUX_DB_MAX_CONNECTIONS";
+const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
+const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 20;
+const MIN_DATABASE_POOL_MAX_CONNECTIONS: u32 = 1;
+const MAX_DATABASE_POOL_MAX_CONNECTIONS: u32 = 100;
+
+fn resolve_database_pool_max_connections(
+    backend: DatabaseBackend,
+    configured: Option<&str>,
+) -> Result<u32, DatabaseConfigurationError> {
+    let default = match backend {
+        DatabaseBackend::Sqlite => SQLITE_DATABASE_POOL_MAX_CONNECTIONS,
+        DatabaseBackend::Postgres => POSTGRES_DATABASE_POOL_MAX_CONNECTIONS,
+    };
+    let Some(configured) = configured else {
+        return Ok(default);
+    };
+    let value = configured.trim().parse::<u32>().map_err(|_| {
+        DatabaseConfigurationError::Invalid(format!(
+            "{DATABASE_POOL_MAX_CONNECTIONS_ENV} 必须是 {MIN_DATABASE_POOL_MAX_CONNECTIONS} 到 {MAX_DATABASE_POOL_MAX_CONNECTIONS} 之间的整数"
+        ))
+    })?;
+    if !(MIN_DATABASE_POOL_MAX_CONNECTIONS..=MAX_DATABASE_POOL_MAX_CONNECTIONS).contains(&value) {
+        return Err(DatabaseConfigurationError::Invalid(format!(
+            "{DATABASE_POOL_MAX_CONNECTIONS_ENV} 必须是 {MIN_DATABASE_POOL_MAX_CONNECTIONS} 到 {MAX_DATABASE_POOL_MAX_CONNECTIONS} 之间的整数"
+        )));
+    }
+    Ok(value)
+}
 
 fn database_flag(value: bool) -> i64 {
     i64::from(value)
@@ -104,6 +132,10 @@ impl Database {
             .validate()
             .map_err(StorageError::Configuration)?;
         let backend = configuration.backend();
+        let configured_max_connections = std::env::var(DATABASE_POOL_MAX_CONNECTIONS_ENV).ok();
+        let pool_max_connections =
+            resolve_database_pool_max_connections(backend, configured_max_connections.as_deref())
+                .map_err(StorageError::Configuration)?;
         fs::create_dir_all(&config.config_dir)
             .await
             .map_err(|source| StorageError::Io {
@@ -139,7 +171,7 @@ impl Database {
             DatabaseBackend::Postgres => "SET TIME ZONE 'UTC'",
         };
         let pool = AnyPoolOptions::new()
-            .max_connections(DATABASE_POOL_MAX_CONNECTIONS)
+            .max_connections(pool_max_connections)
             .after_connect(move |connection, _| {
                 Box::pin(async move {
                     connection.execute(after_connect_sql).await?;
@@ -184,7 +216,7 @@ impl Database {
 
         Ok(Self {
             pool,
-            pool_max_connections: DATABASE_POOL_MAX_CONNECTIONS,
+            pool_max_connections,
             path,
             server_id,
             backend,
@@ -19614,9 +19646,47 @@ mod tests {
     use super::*;
     use crate::{
         application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
-        config::{Config, PostgresConnection},
+        config::{Config, DatabaseBackend, PostgresConnection},
         library::LibraryKind,
     };
+
+    #[test]
+    fn database_pool_max_connections_uses_backend_defaults() {
+        assert_eq!(
+            resolve_database_pool_max_connections(DatabaseBackend::Sqlite, None)
+                .expect("SQLite default pool size"),
+            8
+        );
+        assert_eq!(
+            resolve_database_pool_max_connections(DatabaseBackend::Postgres, None)
+                .expect("PostgreSQL default pool size"),
+            20
+        );
+    }
+
+    #[test]
+    fn database_pool_max_connections_accepts_a_bounded_override() {
+        assert_eq!(
+            resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some("12"))
+                .expect("configured pool size"),
+            12
+        );
+        assert_eq!(
+            resolve_database_pool_max_connections(DatabaseBackend::Postgres, Some(" 24 "))
+                .expect("trimmed configured pool size"),
+            24
+        );
+    }
+
+    #[test]
+    fn database_pool_max_connections_rejects_invalid_overrides() {
+        for value in ["", "0", "101", "not-a-number"] {
+            assert!(
+                resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some(value))
+                    .is_err()
+            );
+        }
+    }
 
     #[tokio::test]
     async fn library_listing_uses_constant_number_of_child_queries() {

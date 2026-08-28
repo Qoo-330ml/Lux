@@ -95,7 +95,7 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     assert_eq!(body["database"]["status"], "ok");
     assert_eq!(body["database"]["backend"], "SQLITE");
     assert_eq!(body["database"]["writable"], true);
-    assert_eq!(body["database"]["pool"]["maxConnections"], 5);
+    assert_eq!(body["database"]["pool"]["maxConnections"], 8);
     assert!(body["database"]["pool"]["size"].is_number());
     assert!(body["database"]["pool"]["idle"].is_number());
     assert!(body["database"]["pool"]["inUse"].is_number());

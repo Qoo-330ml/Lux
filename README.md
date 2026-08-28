@@ -38,6 +38,10 @@ Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、�
 - 可选 SQLite 或外部 PostgreSQL；默认使用 `/config/lux.db` 中的 SQLite。
 - 独立进程插件运行时，支持 TMDb、媒体探测和 IP 归属地等插件能力。
 
+数据库连接池默认使用 SQLite 8 个连接、PostgreSQL 20 个连接。可通过
+`LUX_DB_MAX_CONNECTIONS` 为当前 Lux 进程覆盖两种后端的连接数，允许范围为 1-100；SQLite
+增加连接不会突破单写者限制，NAS 上应结合前台 p95、写锁和内存观察后再调整。
+
 ## 快速开始
 
 ### Docker Compose（推荐）

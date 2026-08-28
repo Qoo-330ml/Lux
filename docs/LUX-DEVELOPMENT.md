@@ -503,6 +503,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 地址、用户名和密码属于敏感配置，不得进入日志、普通 API 响应或错误详情。
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
+- 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
 
 ### 6.4 Docker
 
