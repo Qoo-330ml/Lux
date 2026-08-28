@@ -249,6 +249,44 @@ async fn auto_cover_runs_before_unrelated_postprocessing_failure()
 }
 
 #[tokio::test]
+async fn auto_cover_reconciles_existing_eligible_libraries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = config(temp_dir.path());
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("已有海报的电视剧", LibraryKind::Series, true)
+        .await?;
+    let scan_root = temp_dir.path().join("Shows");
+    fs::create_dir_all(&scan_root)?;
+    libraries
+        .add_root(library.id, scan_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    add_posters(
+        &database,
+        &library.id.to_string(),
+        &scan_root.join("posters"),
+        AUTO_LIBRARY_COVER_POSTER_COUNT,
+    )
+    .await?;
+
+    let covers = LibraryCoverService::new(
+        database.clone(),
+        temp_dir.path().join("config/library-covers"),
+    );
+    assert_eq!(covers.reconcile_auto_library_covers().await?, 1);
+
+    let cover_path: Option<String> =
+        sqlx::query_scalar("SELECT cover_image_path FROM libraries WHERE id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert!(cover_path.is_some());
+    Ok(())
+}
+
+#[tokio::test]
 async fn auto_cover_reads_posters_from_metadata_library() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

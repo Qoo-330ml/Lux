@@ -108,6 +108,29 @@ impl LibraryCoverService {
         self.run_job(&job.id).await
     }
 
+    pub async fn reconcile_auto_library_covers(&self) -> Result<usize, LibraryCoverError> {
+        let libraries = self.database.list_libraries().await?;
+        let mut generated = 0_usize;
+        for library in libraries.into_iter().filter(|library| library.is_enabled) {
+            let Ok(library_id) = library.id.parse::<LibraryId>() else {
+                tracing::warn!(library_id = %library.id, "automatic library cover reconciliation skipped invalid library ID");
+                continue;
+            };
+            match self.generate_if_eligible(library_id).await {
+                Ok(AutoLibraryCoverResult::Generated) => generated = generated.saturating_add(1),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        library_id = %library.id,
+                        %error,
+                        "automatic library cover reconciliation failed"
+                    );
+                }
+            }
+        }
+        Ok(generated)
+    }
+
     pub async fn create_manual_job(
         &self,
         library_id: LibraryId,

@@ -572,6 +572,18 @@ impl AppState {
                 }
             });
         }
+        let reconciliation = service.clone();
+        tokio::spawn(async move {
+            match reconciliation.reconcile_auto_library_covers().await {
+                Ok(generated) if generated > 0 => {
+                    tracing::info!(generated, "reconciled automatic library covers at startup");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "automatic library cover startup reconciliation failed");
+                }
+            }
+        });
     }
 
     pub async fn start_scheduled_tasks(&self) {
