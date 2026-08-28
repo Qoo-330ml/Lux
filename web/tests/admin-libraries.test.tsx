@@ -327,6 +327,50 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector('[role="menu"]')?.textContent).toContain("扫描媒体库文件");
   });
 
+  it("shows why a library could not be deleted", async () => {
+    const deleteLibrary = vi.spyOn(api, "deleteAdminLibrary").mockRejectedValue(new Error("媒体库仍有扫描任务运行"));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    const removeAction = [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .find((button) => button.textContent?.includes("移除"));
+    expect(removeAction).toBeTruthy();
+
+    await act(async () => {
+      removeAction?.click();
+      await vi.waitFor(() => expect(deleteLibrary).toHaveBeenCalledWith("library-1"));
+    });
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("媒体库仍有扫描任务运行");
+    expect(container.textContent).toContain("01每日更新");
+  });
+
+  it("removes a library card after the delete request succeeds", async () => {
+    let listedLibraries = [library];
+    vi.mocked(api.adminLibraries).mockImplementation(async () => ({ libraries: listedLibraries }));
+    const deleteLibrary = vi.spyOn(api, "deleteAdminLibrary").mockImplementation(async (libraryId) => {
+      listedLibraries = listedLibraries.filter((item) => item.id !== libraryId);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("[aria-label='打开 01每日更新 操作菜单']")?.click();
+    });
+    const removeAction = [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
+      .find((button) => button.textContent?.includes("移除"));
+    await act(async () => {
+      removeAction?.click();
+      await vi.waitFor(() => expect(deleteLibrary).toHaveBeenCalledWith("library-1"));
+    });
+
+    expect(container.querySelector(".lux-admin-library-card")).toBeNull();
+    expect(container.textContent).toContain("还没有媒体库");
+  });
+
   it("starts metadata refresh from the library actions menu", async () => {
     const refresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
       totalCount: 1,

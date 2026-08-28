@@ -362,6 +362,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
   const [editKind, setEditKind] = useState(library.kind);
   const [editError, setEditError] = useState("");
   const [coverError, setCoverError] = useState("");
+  const [removeError, setRemoveError] = useState("");
   const update = useMutation({
     mutationFn: ({ values }: { values: Record<string, unknown>; close?: boolean }) => api.updateAdminLibrary(library.id, values),
     onSuccess: (_data, variables) => {
@@ -378,7 +379,17 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
     mutationFn: () => api.startLibraryMetadataRefresh(library.id, library.mediaStrategy?.metadataRefreshMode ?? globalStrategy?.metadataRefreshMode ?? "FILL_MISSING"),
     onSuccess: () => { void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() }); },
   });
-  const remove = useMutation({ mutationFn: () => api.deleteAdminLibrary(library.id), onSuccess: () => void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries }) });
+  const remove = useMutation({
+    mutationFn: () => api.deleteAdminLibrary(library.id),
+    onSuccess: () => {
+      setRemoveError("");
+      queryClient.setQueryData<{ libraries?: AdminLibrary[] }>(queryKeys.adminLibraries, (data) => data
+        ? { ...data, libraries: (data.libraries ?? []).filter((item) => item.id !== library.id) }
+        : data);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
+    },
+    onError: (error) => setRemoveError(error.message || "删除媒体库失败，请重试"),
+  });
 
   useEffect(() => {
     if (!menuOpen) return undefined;
@@ -423,7 +434,10 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
   };
   const deleteLibrary = () => {
     setMenuOpen(false);
-    if (window.confirm(`确定删除媒体库“${library.name}”？`)) remove.mutate();
+    if (window.confirm(`确定删除媒体库“${library.name}”？`)) {
+      setRemoveError("");
+      remove.mutate();
+    }
   };
 
   return (
@@ -433,6 +447,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy }: 
         <button className="lux-admin-library-overflow" type="button" aria-label={`打开 ${library.name} 操作菜单`} aria-haspopup="menu" aria-expanded={menuOpen} onClick={() => setMenuOpen((open) => !open)}><MoreHorizontal size={20} /></button>
       </div>
       <div className="lux-admin-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span><small>{library.roots.length > 1 ? `${library.roots.length}个文件夹` : library.roots[0]?.displayPath ?? "尚未配置根路径"}</small></div>
+      {removeError ? <p className="lux-error-copy" role="alert">{removeError}</p> : null}
       {menuOpen ? <LibraryActionMenu library={library} onEdit={openEdit} onRefresh={() => { setMenuOpen(false); refresh.mutate(); }} refreshing={refresh.isPending} onScan={() => { setMenuOpen(false); scan.mutate(); }} onRemove={deleteLibrary} /> : null}
       {editOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setEditOpen(false); }} onKeyDown={(event) => { if (event.key === "Escape") setEditOpen(false); }}>
         <div className="lux-library-dialog" role="dialog" aria-modal="true" aria-labelledby={`edit-library-title-${library.id}`}>
