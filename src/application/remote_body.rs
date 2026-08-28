@@ -18,11 +18,7 @@ pub(crate) async fn read_response_body_limited(
         });
     }
 
-    let initial_capacity = declared_length
-        .map(|length| length.min(max_bytes))
-        .and_then(|length| usize::try_from(length).ok())
-        .unwrap_or_default();
-    let mut body = Vec::with_capacity(initial_capacity);
+    let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await

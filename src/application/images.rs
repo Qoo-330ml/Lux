@@ -741,6 +741,15 @@ impl ImageWriteService {
                 status: status.as_u16(),
             });
         }
+        if response
+            .content_length()
+            .is_some_and(|size| size > self.max_bytes)
+        {
+            return Err(ImageWriteError::TooLarge {
+                size: response.content_length().unwrap_or_default(),
+                max: self.max_bytes,
+            });
+        }
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
