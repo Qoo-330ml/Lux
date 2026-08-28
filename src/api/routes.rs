@@ -8,35 +8,41 @@ pub(super) fn app_with_state(state: AppState) -> Router {
     let catalog_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
     Router::new()
         .route("/logo.svg", get(web_logo))
-        .route("/health/live", get(live))
-        .route("/health/ready", get(ready))
-        .route("/api/v1/version", get(version))
-        .route("/api/v1/setup/status", get(setup_status))
-        .route("/api/v1/setup/database", get(setup_database_status))
-        .route("/api/v1/setup/database/test", post(setup_database_test))
-        .route("/api/v1/setup/database/select", post(setup_database_select))
-        .route("/api/v1/setup/complete", post(setup_complete))
-        .route("/api/v1/auth/login", post(auth_login))
-        .route("/api/v1/auth/logout", post(auth_logout))
-        .route("/api/v1/auth/me", get(auth_me))
+        .route("/health/live", get(users::live))
+        .route("/health/ready", get(users::ready))
+        .route("/api/v1/version", get(users::version))
+        .route("/api/v1/setup/status", get(users::setup_status))
+        .route("/api/v1/setup/database", get(users::setup_database_status))
+        .route(
+            "/api/v1/setup/database/test",
+            post(users::setup_database_test),
+        )
+        .route(
+            "/api/v1/setup/database/select",
+            post(users::setup_database_select),
+        )
+        .route("/api/v1/setup/complete", post(users::setup_complete))
+        .route("/api/v1/auth/login", post(users::auth_login))
+        .route("/api/v1/auth/logout", post(users::auth_logout))
+        .route("/api/v1/auth/me", get(users::auth_me))
         .route(
             "/api/v1/auth/settings",
-            get(auth_settings).patch(auth_update_settings),
+            get(users::auth_settings).patch(users::auth_update_settings),
         )
         .route(
             "/api/v1/auth/library-order",
-            get(auth_library_order).patch(auth_update_library_order),
+            get(users::auth_library_order).patch(users::auth_update_library_order),
         )
         .route(
             "/api/v1/auth/avatar",
-            get(auth_avatar)
-                .put(auth_update_avatar)
+            get(users::auth_avatar)
+                .put(users::auth_update_avatar)
                 .layer(DefaultBodyLimit::max(MAX_USER_AVATAR_BYTES as usize)),
         )
-        .route("/api/v1/auth/sessions", get(auth_sessions))
+        .route("/api/v1/auth/sessions", get(users::auth_sessions))
         .route(
             "/api/v1/auth/sessions/{session_id}",
-            delete(auth_revoke_session),
+            delete(users::auth_revoke_session),
         )
         .route(
             "/api/v1/admin/libraries",
