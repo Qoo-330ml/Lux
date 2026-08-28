@@ -631,7 +631,7 @@ function isSchedulableTask(task: AdminScheduledTask) {
 }
 
 function isExternallyScheduledTask(task: AdminScheduledTask) {
-  return task.taskType === "STRM_MEDIA_INFO" || task.taskType === "CHAPTER_DETECTION";
+  return ["STRM_MEDIA_INFO", "CHAPTER_DETECTION", "DANMAKU_MATCH"].includes(task.taskType);
 }
 
 async function runRegisteredTask(task: AdminScheduledTask) {

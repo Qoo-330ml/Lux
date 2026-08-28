@@ -171,6 +171,96 @@ fn accepts_a_danmaku_plugin_manifest_and_path_free_match_contract() {
 }
 
 #[test]
+fn accepts_manifest_scheduled_task_declaration() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.scheduled",
+        "name": "Scheduled plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "configFields": [
+            {"key": "schedule", "label": "Schedule", "type": "text", "defaultValue": "0 6 * * *"},
+            {"key": "libraryIds", "label": "Libraries", "type": "select", "multiple": true, "optionsSource": "media-libraries"}
+        ],
+        "scheduledTasks": [{
+            "taskType": "EXAMPLE_TASK",
+            "ownerType": "GLOBAL",
+            "name": "Example task",
+            "description": "Runs the example task.",
+            "scheduleConfigKey": "schedule",
+            "defaultSchedule": "0 6 * * *",
+            "requiredConfigKeys": ["libraryIds"],
+            "resourceLimit": {"concurrency": 2, "overwrite": false}
+        }],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect("manifest scheduled task should validate");
+
+    assert_eq!(manifest.scheduled_tasks.len(), 1);
+    assert_eq!(manifest.scheduled_tasks[0].task_type, "EXAMPLE_TASK");
+    assert_eq!(manifest.scheduled_tasks[0].owner_type, "GLOBAL");
+    assert_eq!(manifest.scheduled_tasks[0].schedule_config_key, "schedule");
+    assert_eq!(
+        manifest.scheduled_tasks[0].required_config_keys,
+        vec!["libraryIds".to_owned()]
+    );
+    assert_eq!(manifest.scheduled_tasks[0].resource_limit["concurrency"], 2);
+}
+
+#[test]
+fn rejects_manifest_scheduled_task_with_invalid_owner_or_schedule() {
+    let base = json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.scheduled",
+        "name": "Scheduled plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "configFields": [{"key": "schedule", "label": "Schedule", "type": "text"}],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    });
+
+    let mut invalid_owner = base.clone();
+    invalid_owner["scheduledTasks"] = json!([{
+        "taskType": "EXAMPLE_TASK",
+        "ownerType": "USER",
+        "name": "Example task",
+        "description": "Runs the example task.",
+        "scheduleConfigKey": "schedule",
+        "defaultSchedule": "0 6 * * *"
+    }]);
+    assert!(PluginManifest::from_value(invalid_owner).is_err());
+
+    let mut invalid_schedule = base.clone();
+    invalid_schedule["scheduledTasks"] = json!([{
+        "taskType": "EXAMPLE_TASK",
+        "ownerType": "GLOBAL",
+        "name": "Example task",
+        "description": "Runs the example task.",
+        "scheduleConfigKey": "schedule",
+        "defaultSchedule": "0 6 * *"
+    }]);
+    assert!(PluginManifest::from_value(invalid_schedule).is_err());
+
+    let mut invalid_resource_limit = base;
+    invalid_resource_limit["scheduledTasks"] = json!([{
+        "taskType": "EXAMPLE_TASK",
+        "ownerType": "GLOBAL",
+        "name": "Example task",
+        "description": "Runs the example task.",
+        "scheduleConfigKey": "schedule",
+        "defaultSchedule": "0 6 * * *",
+        "resourceLimit": {"concurrency": "2"}
+    }]);
+    assert!(PluginManifest::from_value(invalid_resource_limit).is_err());
+}
+
+#[test]
 fn accepts_a_chapter_detector_manifest_and_bounded_rpc_contract() {
     let manifest = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,
@@ -181,6 +271,7 @@ fn accepts_a_chapter_detector_manifest_and_bounded_rpc_contract() {
         "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
         "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
         "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["LOCAL_FILE"],
         "capabilities": [CHAPTER_DETECT_CAPABILITY],
         "permissions": {"network": [], "filesystem": []},
         "files": []
@@ -236,6 +327,7 @@ fn accepts_a_chapter_detector_manifest_and_bounded_rpc_contract() {
         ChapterDetectMarkerType::IntroStart
     );
     assert_eq!(manifest.plugin_type, PLUGIN_TYPE_CHAPTER_DETECTOR);
+    assert_eq!(manifest.supported_media_source_kinds, ["LOCAL_FILE"]);
 }
 
 #[test]
@@ -249,6 +341,7 @@ fn accepts_a_metadata_lookup_chapter_contract_without_media_paths() {
         "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
         "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
         "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["LOCAL_FILE", "STRM_URL"],
         "capabilities": [CHAPTER_LOOKUP_CAPABILITY],
         "permissions": {"network": ["api.theintrodb.org"], "filesystem": []},
         "files": []
@@ -275,6 +368,52 @@ fn accepts_a_metadata_lookup_chapter_contract_without_media_paths() {
     request_with_path["episodes"][0]["path"] = json!("/media/episode.mkv");
     assert!(serde_json::from_value::<ChapterLookupRpcRequest>(request_with_path).is_err());
     assert_eq!(manifest.capabilities, vec![CHAPTER_LOOKUP_CAPABILITY]);
+    assert_eq!(
+        manifest.supported_media_source_kinds,
+        ["LOCAL_FILE", "STRM_URL"]
+    );
+}
+
+#[test]
+fn rejects_chapter_manifest_with_an_unknown_media_source_kind() {
+    let error = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-chapter-source-kind",
+        "name": "Invalid chapter source kind",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["REMOTE_STREAM"],
+        "capabilities": [CHAPTER_LOOKUP_CAPABILITY],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect_err("unknown chapter source kind must be rejected");
+
+    assert!(error.to_string().contains("media source kind"));
+}
+
+#[test]
+fn rejects_a_fingerprint_detector_that_declares_strm_support() {
+    let error = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-strm-detector",
+        "name": "Invalid STRM detector",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["STRM_URL"],
+        "capabilities": [CHAPTER_DETECT_CAPABILITY],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect_err("fingerprint detector must not claim unsupported STRM input");
+
+    assert!(error.to_string().contains("only LOCAL_FILE"));
 }
 
 #[test]

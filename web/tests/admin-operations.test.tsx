@@ -562,6 +562,73 @@ describe("AdminOperationsPage", () => {
     });
   });
 
+  it("edits and runs the global danmaku task without exposing a task toggle", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    const updateSchedule = vi.spyOn(api, "updateAdminScheduledTask").mockResolvedValue({
+      scheduledTask: {
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        ownerName: "全局",
+        taskType: "DANMAKU_MATCH",
+        name: "弹幕匹配",
+        schedule: "0 2 * * *",
+        isEnabled: true,
+      },
+    });
+    const runScheduledTask = vi.spyOn(api, "runAdminScheduledTask").mockResolvedValue({ status: "ACCEPTED", taskType: "DANMAKU_MATCH" });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({
+      scheduledTasks: [{
+        id: "GLOBAL:global:DANMAKU_MATCH",
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        ownerName: "全局",
+        taskType: "DANMAKU_MATCH",
+        name: "弹幕匹配",
+        description: "按插件配置匹配选定媒体库的弹幕。",
+        sourceType: "PLUGIN",
+        pluginId: "org.lux.danmaku",
+        schedule: "0 6 * * *",
+        isEnabled: true,
+      }],
+      total: 1,
+      page: 1,
+      pageSize: 100,
+    });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("弹幕匹配"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑弹幕匹配"]')?.click());
+    const input = container.querySelector<HTMLInputElement>("input[id^='schedule-GLOBAL']");
+    expect(input).not.toBeNull();
+    expect(container.querySelector<HTMLInputElement>("input[id^='enabled-GLOBAL']")).toBeNull();
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "0 2 * * *");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".lux-registered-task-editor button[type='submit']")?.click();
+      await vi.waitFor(() => expect(updateSchedule).toHaveBeenCalledWith({
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        taskType: "DANMAKU_MATCH",
+        schedule: "0 2 * * *",
+        isEnabled: undefined,
+      }));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行弹幕匹配"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(runScheduledTask).toHaveBeenCalledWith({
+        ownerType: "GLOBAL",
+        ownerId: "global",
+        taskType: "DANMAKU_MATCH",
+      }));
+    });
+  });
+
   it("runs every registered task immediately through the common task worker", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });

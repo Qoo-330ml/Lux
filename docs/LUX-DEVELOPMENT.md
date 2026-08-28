@@ -211,6 +211,8 @@ Lux 的核心价值不是功能数量，而是：
 - 弹幕匹配策略支持使用原始文件名、尝试本地已登记的简体/繁体标题、尝试本地已登记的英文/原始标题；按原始文件名、简繁标题、英文/原始标题的顺序逐个回退，仅在前一个候选没有匹配时请求下一个候选。
 - 弹幕文字的简繁转换由上游 `danmu_api` 的部署配置负责；Lux 不引入 OpenCC、不把简繁转换伪装成所有 Dandanplay 兼容服务都支持的请求参数，也不在首版筛选弹幕语言。
 - 后台匹配任务优先使用上游 `/api/v2/match`，不支持时回退到 Dandanplay 兼容的搜索、详情和弹幕接口。
+- 插件安装后宿主立即注册一个全局 `DANMAKU_MATCH` 任务，默认按 UTC 每天 `0 6 * * *` 执行；未配置有效 API 或未选择媒体库时任务保留但停用。配置有效且至少选择一个媒体库后，启用任务；每次执行按所选媒体库创建匹配作业，已运行的同类作业不重复创建。
+- 管理员可以在“任务与日志”中立即执行或修改该任务的 Cron；修改会同步回弹幕插件配置。插件停用或卸载后保留注册记录但停用任务，服务重启后从持久化注册记录恢复调度。
 - 匹配成功的 XML 弹幕写回视频同目录、同 basename 的 `.xml` 旁车；使用临时文件、刷盘和原子重命名。
 - 只承诺支持弹幕接口的第三方客户端可以通过 Lux 的 Emby 接口读取；其他客户端是否识别 `.xml` 不属于 Lux 兼容承诺。
 - LUX-150 本身不实现 Web 播放器弹幕、ASS 写回、Lux 侧弹幕文字转换、实时发送、代理播放或非弹幕客户端适配；
@@ -358,7 +360,10 @@ Lux 的核心价值不是功能数量，而是：
   `StartPositionTicks`、可选 `Name`、可选 `ImageTag`、`MarkerType` 和 `ChapterIndex`。
 - 自动片头片尾章节由独立 `chapter_detector` 插件提供。本地音频检测插件在后台对已校验的本地媒体运行
   ffmpeg/chromaprint；在线章节源插件只接收已保存的 provider ID、季号、集号和时长，从固定远程服务
-  获取已标注结果。两种插件都不能接收媒体路径、数据库或任务对象。
+  获取已标注结果。每个章节插件必须在 manifest 的 `supportedMediaSourceKinds` 中声明自己支持的
+  `LOCAL_FILE`/`STRM_URL` 媒体源，宿主按声明筛选候选，不按插件 ID 推断。在线章节源可以声明两者，
+  不读取媒体路径或 `.strm` 目标；指纹检测合同当前只能声明 `LOCAL_FILE`。两种插件都不能接收数据库
+  或任务对象。
 - 检测插件按季度批次比较至少两个可用分集，返回 `IntroStart`、`IntroEnd`、`CreditsStart` 候选。
   Lux 校验时间范围、顺序、数量和来源后原子替换 `provider_id` 等于该插件 ID 的隐藏标记；低置信度结果不落库。
 - 媒体文件指纹变化时，旧检测标记失效；重新检测只在后台任务中发生。
@@ -1595,7 +1600,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - 扫描计划与元数据计划，明确分开。
 - 扫描/任务页。
 - 任务与日志页集中查看所有已注册的任务、运行记录和脱敏日志。任务不能由 Web 管理员凭空创建，只能由 Lux 系统或插件注册；管理员只能维护已注册任务的立即执行、计划、启停和资源配置。
-- 空库初始没有注册任务。创建媒体库时由系统原子注册“全量校验媒体库”和“元数据刮削”两个任务；插件启用后注册插件提供的计划任务。所有已注册任务都由管理员在任务页支持立即执行和配置或清除 Cron 执行时间；实时增量扫描由文件系统监听触发，不注册为计划任务。
+- 空库初始没有注册任务。创建媒体库时由系统原子注册“全量校验媒体库”和“元数据刮削”两个任务；插件安装或启用后注册插件提供的计划任务。所有已注册任务都由管理员在任务页支持立即执行和配置或清除 Cron 执行时间；插件拥有的必需 Cron 任务不提供独立启用开关，配置是否有效由插件状态决定；实时增量扫描由文件系统监听触发，不注册为计划任务。
 - 待处理匹配页。
 - 元数据编辑与锁定。
 - 图片管理。
@@ -1629,7 +1634,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 - WRITE_NFO
 - DOWNLOAD_IMAGE
 - AUTO_LIBRARY_COVER（每个媒体库首次达到海报阈值时注册并自动执行一次；注册后与其他任务一样支持管理员手动执行和 Cron 计划重跑）
-- MATCH_DANMAKU
+- DANMAKU_MATCH（全局插件注册任务；每次按所选媒体库创建弹幕匹配作业）
 - WRITE_DANMAKU_XML
 - REBUILD_SEARCH
 - PURGE_MISSING
@@ -2001,6 +2006,7 @@ services:
 | LUX-220 | src/api/mod.rs、web/src/lib/api/types.ts、tests/chapters.rs、docs/；Lux source-scoped 章节合同 |
 | LUX-221 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；章节时间轴与片头跳过体验 |
 | LUX-222 | scripts/player-danmaku-smoke.mjs、web/tests/、docs/COMPATIBILITY.md；阶段 18 真实浏览器和全量质量门 |
+| LUX-223 | src/api/、src/storage/、src/application/people/、docs/；内部领域模块化重构，不改变公共协议或数据库模型 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3405,7 +3411,7 @@ Dandanplay 兼容搜索、详情和评论接口。插件负责并发请求、超
 错误分类；主进程不得保留一份直接请求弹幕上游的实现。主进程对插件返回的 XML 仍执行最终
 大小和路径安全校验，并通过临时文件加原子重命名写入旁车。
 
-管理员通过 `POST /api/v1/admin/libraries/{libraryId}/danmaku/match` 创建持久化任务，支持分页列表、详情、取消、失败重试、服务重启恢复、并发上限和默认不覆盖已有 XML。任务只领取已索引的本地视频源；`.strm`、用户请求中的整库扫描、弹幕实时发送和上游任意 URL 均不进入范围。
+弹幕插件 manifest 通过 `scheduledTasks` 声明全局 `DANMAKU_MATCH` 任务，包括展示名称、描述、`scheduleConfigKey`、默认 Cron、启用所需的配置键和资源限制；Lux 使用通用 manifest 任务注册机制写入任务记录，不按弹幕插件 ID 特判。默认 Cron 为 UTC 每天 `0 6 * * *`；任务配置有效且选择媒体库后才启用。管理员可以通过“任务与日志”立即执行或修改 Cron，任务页的修改同步写回插件配置；一次全局执行按每个选定媒体库创建一个持久化弹幕匹配任务，已存在运行中任务的媒体库跳过。管理员也可以通过 `POST /api/v1/admin/libraries/{libraryId}/danmaku/match` 创建单库持久化任务，支持分页列表、详情、取消、失败重试、服务重启恢复、并发上限和默认不覆盖已有 XML。任务只领取已索引的本地视频源；`.strm`、用户请求中的整库扫描、弹幕实时发送和上游任意 URL 均不进入范围。
 
 Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保留 `option=Refresh` 和 `option=GetJsonById` 兼容别名。端点执行现有用户/媒体库 ACL；普通 Emby 字幕端点和不支持弹幕协议的客户端不属于本任务验收范围。
 
@@ -3434,7 +3440,7 @@ Emby 兼容层提供 `/api/danmu/{itemId}`、`/api/danmu/{itemId}/raw`，并保�
 
 - 不把弹幕 XML 当作普通字幕，不新增 Emby 标准字幕类型或强制客户端显示。
 - 插件不执行用户输入的上游 URL，不授予插件任意文件系统权限；不做代理播放，不保存完整 XML 到 SQLite，不在 Web 播放器中渲染弹幕。
-- 不生成 ASS、不做颜色/位置转换、不实现弹幕发送、实时推送或计划任务。
+- 不生成 ASS、不做颜色/位置转换、不实现弹幕发送、实时推送或用户请求中的即时上游匹配；后台 `DANMAKU_MATCH` 计划任务属于本任务范围。
 
 #### LUX-151：播放会话 IP 归属地
 
@@ -4142,7 +4148,9 @@ provider 切换由后台身份解析任务处理：优先使用已知 provider �
 
 #### LUX-175：片头片尾检测插件宿主
 
-范围：扩展 Plugin SDK v1，支持 `chapter_detector` 类型与 `chapters.detect` 能力。Lux 在持久化后台
+范围：扩展 Plugin SDK v1，支持 `chapter_detector` 类型与 `chapters.detect` 能力。章节插件 manifest
+必须声明 `supportedMediaSourceKinds`；该字段描述宿主可以为该插件提交的媒体源类型，不代表插件会收到
+路径或 URL。Lux 在持久化后台
 任务中按季度分页读取本地分集，使用现有 ffmpeg 的 chromaprint muxer 提取开头/结尾的有界原始指纹，
 只把指纹、采样率、窗口相对时间和请求内临时键发送给插件。插件不接收路径、URL、媒体源 ID、凭据或任务对象。
 宿主校验插件结果并把高置信度标记保存为插件来源特殊章节（`provider_id` 为插件 ID）。单季度超过
@@ -4161,7 +4169,8 @@ RPC 上限时批次保留一个分集的上下文重叠，但只对未处理分�
 
 #### LUX-176：外置片头片尾检测插件
 
-范围：在独立 `Lux-plugins` 仓库实现 `org.lux.intro-outro-detector`。插件比较同季度至少两个分集的
+范围：在独立 `Lux-plugins` 仓库实现 `org.lux.intro-outro-detector`。manifest 声明
+`supportedMediaSourceKinds: ["LOCAL_FILE"]`。插件比较同季度至少两个分集的
 Chromaprint 原始指纹，在配置的开头/结尾窗口内寻找满足最小时长和匹配阈值的公共序列，返回
 `IntroStart`、`IntroEnd` 和可选 `CreditsStart`。插件不执行 ffmpeg、不读取媒体路径、不联网。
 
@@ -4178,7 +4187,8 @@ Chromaprint 原始指纹，在配置的开头/结尾窗口内寻找满足最小�
 
 #### LUX-177：TheIntroDB 在线章节源插件
 
-范围：在独立 `Lux-plugins` 仓库实现 `org.lux.theintrodb-chapter-source`。插件通过新增的
+范围：在独立 `Lux-plugins` 仓库实现 `org.lux.theintrodb-chapter-source`。manifest 声明
+`supportedMediaSourceKinds: ["LOCAL_FILE", "STRM_URL"]`。插件通过新增的
 `chapters.lookup` 合同，按 Lux 已保存的 TMDb/TVDb/IMDb ID、季号、集号和可选时长请求
 TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接收媒体路径、`.strm` URL、音频指纹或
 任务对象，不运行 ffmpeg/ffprobe；无数据响应不会清除已有章节。
@@ -5153,6 +5163,43 @@ video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或�
 
 阶段 18关闭记录（2026-08-28）：阶段门证据见 `docs/COMPATIBILITY.md` 的 LUX-222 小节。项目所有者已要求继续完成并关闭
 本阶段；Safari/AirPlay 真机和 NAS/x86_64 性能保持为明确的后续验证边界。
+
+### 阶段 19：服务端领域模块化维护
+
+#### LUX-223：拆分超大 API、Storage 和 People 实现
+
+范围：在不改变 HTTP 路由、DTO、领域模型、数据库 schema、SQL 语义和运行时行为的前提下，
+将 `src/api/mod.rs`、`src/storage/mod.rs` 和 `src/application/people.rs` 的实现按领域移动到子模块。
+facade 只保留模块声明、共享状态/类型、路由组合和稳定 re-export；领域模块负责自己的 handler、DTO 映射、
+repository 方法或 People 用例。此任务不引入新依赖、不新增端点、不修改迁移，也不提前实现其他 LUX 任务。
+
+验收：
+
+- [x] API facade 不再承载完整领域 handler；Emby 路由/DTO、Lux API、管理员、用户、媒体和播放实现位于明确子模块。
+- [x] Storage facade 不再承载完整 SQL repository；媒体、人物、会话、迁移和共享查询/模型边界清晰。
+- [x] PeopleService 的关系/匹配、元数据、资源和索引恢复实现分离，外部调用路径保持不变。
+- [x] 现有 Rust/Web 行为测试不变且通过；模块移动没有改变公开 HTTP 合同、错误码或数据库行为。（最终 Rust/Web 全量质量门通过；此前曾观察到 `tests/users.rs::admin_can_manage_users_and_last_manager_is_protected` 的非确定性 503，见下方记录。）
+- [x] 每个增量独立可编译、可回滚，并记录模块边界和未纳入本任务的后续拆分。
+
+验证：每个增量运行对应的窄 Rust 测试和 `cargo check --locked`；任务完成时运行 `cargo build --locked`、
+`cargo test --locked --all-targets`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+依赖：LUX-222 阶段门已关闭。
+
+阶段门：
+
+- [x] 三个超大入口文件均降为 facade 或共享模型层，单个领域实现文件保持可审阅规模。
+- [x] API、Storage 和 People 的模块边界已由 ADR-030 记录，未改变模块化单体部署边界。
+- [ ] 全量 Rust 质量门通过，并由项目所有者确认后再进入下一阶段。（质量门已通过，待项目所有者确认。）
+
+验证记录（2026-08-28）：`src/storage/repository.rs` 已降至约 2,660 行，Storage Repository 方法拆至
+`catalog.rs`、`jobs.rs`、`library.rs`、`media.rs`、`metadata.rs`、`migration.rs`、`notifications.rs`、
+`people.rs`、`sessions.rs` 和 `users.rs`，最大领域文件约 5,100 行；共享模型、数据库初始化、SQL 适配和错误仍由
+`repository.rs` 持有。`uname -m` 为 `arm64`；`cargo build --locked`、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`、Storage 定向测试以及 Web 安装/测试/构建
+均通过。最终 `cargo test --locked --all-targets` 通过（库测试 285 passed、1 ignored，所有集成目标通过）；此前
+一次全量运行和一次隔离重复运行曾收到用户管理测试 503，但最终全量复跑通过，说明该测试仍存在启动/后台任务
+时序不稳定风险，未在本任务范围内修改测试行为。此 ARM64 结果不外推 NAS/x86_64 性能。
 
 ## 26. 风险与缓解
 

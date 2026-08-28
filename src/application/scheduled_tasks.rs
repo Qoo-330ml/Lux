@@ -14,6 +14,7 @@ use crate::{
             ChapterDetectionError, ChapterDetectionJob, ChapterDetectionOptions,
             ChapterDetectionService,
         },
+        danmaku::{DanmakuMatchJob, DanmakuService, DanmakuServiceError},
         library_covers::{
             AUTO_LIBRARY_COVER_TASK_TYPE, LibraryCoverError, LibraryCoverJob, LibraryCoverService,
         },
@@ -25,7 +26,8 @@ use crate::{
         },
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::{
-            CHAPTER_DETECTION_TASK_TYPE, CronSchedule, STRM_MEDIA_INFO_TASK_TYPE, parse_cron,
+            CHAPTER_DETECTION_TASK_TYPE, CronSchedule, DANMAKU_MATCH_TASK_TYPE,
+            STRM_MEDIA_INFO_TASK_TYPE, parse_cron,
         },
         strm_probe::{StrmProbeError, StrmProbeJob, StrmProbeService},
         thumbnails::ThumbnailService,
@@ -51,6 +53,7 @@ pub struct ScheduledTaskService {
     probe: Option<MediaProbeService>,
     thumbnails: Option<ThumbnailService>,
     library_covers: Option<LibraryCoverService>,
+    danmaku: Option<DanmakuService>,
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
 }
 
@@ -77,6 +80,9 @@ pub enum ScheduledTaskRun {
     AutoLibraryCover {
         job: LibraryCoverJob,
     },
+    DanmakuMatch {
+        jobs: Vec<DanmakuMatchJob>,
+    },
 }
 
 impl ScheduledTaskRun {
@@ -87,6 +93,7 @@ impl ScheduledTaskRun {
             Self::StrmMediaInfo { .. } => STRM_MEDIA_INFO_TASK_TYPE,
             Self::ChapterDetection { .. } => CHAPTER_DETECTION_TASK_TYPE,
             Self::AutoLibraryCover { .. } => AUTO_LIBRARY_COVER_TASK_TYPE,
+            Self::DanmakuMatch { .. } => DANMAKU_MATCH_TASK_TYPE,
         }
     }
 }
@@ -103,6 +110,7 @@ pub enum ScheduledTaskError {
     Strm(StrmProbeError),
     Chapter(ChapterDetectionError),
     Cover(LibraryCoverError),
+    Danmaku(DanmakuServiceError),
     Storage(StorageError),
 }
 
@@ -121,6 +129,7 @@ impl fmt::Display for ScheduledTaskError {
             Self::Strm(error) => error.fmt(formatter),
             Self::Chapter(error) => error.fmt(formatter),
             Self::Cover(error) => error.fmt(formatter),
+            Self::Danmaku(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
         }
     }
@@ -151,6 +160,7 @@ impl ScheduledTaskService {
             probe: None,
             thumbnails: None,
             library_covers: None,
+            danmaku: None,
             cursors: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -171,6 +181,11 @@ impl ScheduledTaskService {
 
     pub fn with_library_covers(mut self, library_covers: Option<LibraryCoverService>) -> Self {
         self.library_covers = library_covers;
+        self
+    }
+
+    pub fn with_danmaku(mut self, danmaku: DanmakuService) -> Self {
+        self.danmaku = Some(danmaku);
         self
     }
 
@@ -275,7 +290,12 @@ impl ScheduledTaskService {
         if owner_type == "LIBRARY" && owner_id.parse::<LibraryId>().is_err() {
             return Err(ScheduledTaskError::InvalidOwner);
         }
-        if owner_type == "GLOBAL" && task_type != STRM_MEDIA_INFO_TASK_TYPE {
+        if owner_type == "GLOBAL"
+            && !matches!(
+                task_type.as_str(),
+                STRM_MEDIA_INFO_TASK_TYPE | DANMAKU_MATCH_TASK_TYPE
+            )
+        {
             return Err(ScheduledTaskError::UnsupportedTask);
         }
         if owner_type == "LIBRARY"
@@ -298,6 +318,7 @@ impl ScheduledTaskService {
             ("LIBRARY", RECONCILIATION_TASK_TYPE) => self.run_reconciliation(owner_id).await,
             ("LIBRARY", METADATA_TASK_TYPE) => self.run_metadata(owner_id).await,
             ("GLOBAL", STRM_MEDIA_INFO_TASK_TYPE) => self.run_strm_media_info().await,
+            ("GLOBAL", DANMAKU_MATCH_TASK_TYPE) => self.run_danmaku_match().await,
             ("LIBRARY", CHAPTER_DETECTION_TASK_TYPE) => {
                 self.run_chapter_detection(owner_id, task.plugin_id.as_deref())
                     .await
@@ -383,6 +404,27 @@ impl ScheduledTaskService {
             .map(|job| job.operation_id.clone())
             .unwrap_or_default();
         Ok(ScheduledTaskRun::StrmMediaInfo { operation_id, jobs })
+    }
+
+    async fn run_danmaku_match(&self) -> Result<ScheduledTaskRun, ScheduledTaskError> {
+        let service = self
+            .danmaku
+            .as_ref()
+            .ok_or(ScheduledTaskError::ServiceUnavailable)?;
+        let jobs = service
+            .create_configured_jobs()
+            .await
+            .map_err(ScheduledTaskError::Danmaku)?;
+        for job in &jobs {
+            let worker = service.clone();
+            let job_id = job.id.clone();
+            tokio::spawn(async move {
+                if let Err(error) = worker.run(&job_id).await {
+                    tracing::error!(%error, job_id = %job_id, "scheduled danmaku match stopped");
+                }
+            });
+        }
+        Ok(ScheduledTaskRun::DanmakuMatch { jobs })
     }
 
     async fn run_chapter_detection(
@@ -475,6 +517,7 @@ fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> 
                 | STRM_MEDIA_INFO_TASK_TYPE
                 | CHAPTER_DETECTION_TASK_TYPE
                 | AUTO_LIBRARY_COVER_TASK_TYPE
+                | DANMAKU_MATCH_TASK_TYPE
         )
     {
         return None;

@@ -423,6 +423,7 @@ describe("AdminLibrariesPage library cards", () => {
         version: "1.0.0",
         capabilities: ["chapters.detect"],
         lookup: false,
+        supportedMediaSourceKinds: ["LOCAL_FILE"],
       }],
     });
     await renderPage();
@@ -438,6 +439,10 @@ describe("AdminLibrariesPage library cards", () => {
 
     const sourceSelect = container.querySelector<HTMLButtonElement>("[aria-label='片头片尾数据源']");
     expect(sourceSelect?.disabled).toBe(false);
+    await act(async () => {
+      sourceSelect?.click();
+    });
+    expect(document.body.textContent).toContain("片头片尾检测（本地文件）");
     expect(container.textContent).toContain("选择后，该媒体库的检测任务和章节输出只使用此来源。");
   });
 

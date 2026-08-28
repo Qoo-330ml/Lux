@@ -34,6 +34,7 @@ const MAX_PROVIDER_BASE_URL_CHARS: usize = 4096;
 const MAX_CONCURRENCY: i64 = 64;
 const MAX_EFFECTIVE_CONCURRENCY: usize = 4;
 const WORK_PAGE_SIZE: i64 = 100;
+pub const DEFAULT_DANMAKU_CONCURRENCY: i64 = 2;
 
 #[derive(Clone, Eq, PartialEq)]
 pub struct ProviderBaseUrl {
@@ -412,6 +413,33 @@ impl DanmakuService {
             })
             .await?;
         self.get(&id).await
+    }
+
+    pub async fn create_configured_jobs(
+        &self,
+    ) -> Result<Vec<DanmakuMatchJob>, DanmakuServiceError> {
+        let Some(plugins) = &self.plugins else {
+            return Err(DanmakuServiceError::ProviderNotConfigured);
+        };
+        let settings = plugins
+            .danmaku_settings()
+            .await
+            .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?;
+        let mut jobs = Vec::with_capacity(settings.library_ids.len());
+        for library_id in settings.library_ids {
+            let library_id = library_id
+                .parse::<LibraryId>()
+                .map_err(|_| DanmakuServiceError::LibraryNotFound)?;
+            match self
+                .create_job(library_id, DEFAULT_DANMAKU_CONCURRENCY, false)
+                .await
+            {
+                Ok(job) => jobs.push(job),
+                Err(DanmakuServiceError::AlreadyActive) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(jobs)
     }
 
     pub async fn run(&self, job_id: &str) -> Result<(), DanmakuServiceError> {
@@ -1137,7 +1165,7 @@ fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{effective_danmaku_concurrency, match_file_name_candidates};
-    use crate::application::plugins::DanmakuSettings;
+    use crate::application::{plugins::DanmakuSettings, schedule::DEFAULT_DANMAKU_MATCH_SCHEDULE};
     use crate::storage::StoredDanmakuSource;
 
     #[test]
@@ -1164,6 +1192,7 @@ mod tests {
             match_original_filename: true,
             match_simplified_traditional_titles: true,
             match_english_title: true,
+            schedule: DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned(),
         };
 
         assert_eq!(

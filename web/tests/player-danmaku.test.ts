@@ -54,6 +54,12 @@ describe("LuxPlayer danmaku parser", () => {
     )).toThrowError(new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多"));
   });
 
+  it("reports malformed XML before the entry limit", () => {
+    expect(() => parseBilibiliDanmaku(
+      `<i>${"<d".repeat(5_001)}</i>`,
+    )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
+  });
+
   it("keeps worker parsing failures scoped to the request generation", () => {
     expect(parseDanmakuWorkerRequest({
       type: "PARSE",

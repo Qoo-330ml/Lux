@@ -361,6 +361,30 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .send()
         .await?;
     assert_eq!(favorite.status(), reqwest::StatusCode::NO_CONTENT);
+    let favorites = client
+        .get(format!("{base_url}/Users/{admin_id}/FavoriteItems"))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("StartIndex", "0"),
+            ("Limit", "10"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(favorites.status(), reqwest::StatusCode::OK);
+    let favorites_body = favorites.json::<Value>().await?;
+    assert_eq!(favorites_body["TotalRecordCount"], 1);
+    assert_eq!(favorites_body["Items"][0]["Id"], eligible_id);
+
+    let filmly_favorites = client
+        .get(format!("{base_url}/emby/Users/{admin_id}/FavoriteItems"))
+        .query(&[("X-Emby-Token", token.as_str()), ("Limit", "10")])
+        .send()
+        .await?;
+    assert_eq!(filmly_favorites.status(), reqwest::StatusCode::OK);
+    let filmly_favorites_body = filmly_favorites.json::<Value>().await?;
+    assert_eq!(filmly_favorites_body["TotalRecordCount"], 1);
+    assert_eq!(filmly_favorites_body["Items"][0]["Id"], eligible_id);
+
     let detail = client
         .get(format!("{base_url}/Items/{eligible_id}"))
         .header("X-Emby-Token", &token)
@@ -415,6 +439,12 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .as_str()
         .ok_or("missing viewer token")?
         .to_owned();
+    let denied_favorites = client
+        .get(format!("{base_url}/Users/{admin_id}/FavoriteItems"))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(denied_favorites.status(), reqwest::StatusCode::FORBIDDEN);
     let denied = client
         .post(format!(
             "{base_url}/Users/{}/FavoriteItems/{eligible_id}",

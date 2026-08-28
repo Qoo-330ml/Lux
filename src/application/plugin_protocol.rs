@@ -5,6 +5,8 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::schedule::validate_cron;
+
 pub const PLUGIN_FORMAT_VERSION: u32 = 1;
 pub const PLUGIN_API_VERSION: u32 = 1;
 pub const PLUGIN_CATEGORY_SCRAPER: &str = "SCRAPER";
@@ -24,6 +26,8 @@ pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
 pub const STRM_RESOLVE_CAPABILITY: &str = "strm.resolve";
 pub const CHAPTER_DETECT_CAPABILITY: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_CAPABILITY: &str = "chapters.lookup";
+pub const MEDIA_SOURCE_KIND_LOCAL_FILE: &str = "LOCAL_FILE";
+pub const MEDIA_SOURCE_KIND_STRM_URL: &str = "STRM_URL";
 pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const DANMAKU_MATCH_CAPABILITY: &str = "danmaku.match";
 pub const EMBY_MIGRATION_CAPABILITY: &str = "migration.emby";
@@ -71,9 +75,13 @@ pub struct PluginManifest {
     #[serde(default)]
     pub supported_item_types: Vec<String>,
     #[serde(default)]
+    pub supported_media_source_kinds: Vec<String>,
+    #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
     pub config_fields: Vec<PluginConfigField>,
+    #[serde(default)]
+    pub scheduled_tasks: Vec<PluginScheduledTask>,
     #[serde(default)]
     pub permissions: PluginPermissions,
     #[serde(default)]
@@ -175,6 +183,36 @@ impl PluginManifest {
                             .to_owned(),
                     ));
                 }
+                let has_detect = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == CHAPTER_DETECT_CAPABILITY);
+                let has_lookup = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == CHAPTER_LOOKUP_CAPABILITY);
+                if has_detect == has_lookup {
+                    return Err(PluginManifestError::Invalid(
+                        "chapter detector plugins must declare exactly one chapter capability"
+                            .to_owned(),
+                    ));
+                }
+                if self.supported_media_source_kinds.is_empty() {
+                    return Err(PluginManifestError::Invalid(
+                        "chapter detector plugins must declare supportedMediaSourceKinds"
+                            .to_owned(),
+                    ));
+                }
+                if has_detect
+                    && self
+                        .supported_media_source_kinds
+                        .iter()
+                        .any(|source_kind| source_kind != MEDIA_SOURCE_KIND_LOCAL_FILE)
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "chapters.detect plugins currently support only LOCAL_FILE".to_owned(),
+                    ));
+                }
             }
             PLUGIN_TYPE_NOTIFICATION => {
                 if self.category != PLUGIN_CATEGORY_NOTIFICATION {
@@ -233,12 +271,24 @@ impl PluginManifest {
         }
         self.runtime.validate()?;
         if self.supported_item_types.len() > 32
+            || self.supported_media_source_kinds.len() > 8
             || self.capabilities.len() > 64
             || self.aliases.len() > 16
         {
             return Err(PluginManifestError::Invalid(
-                "manifest declares too many item types, capabilities or aliases".to_owned(),
+                "manifest declares too many item types, media source kinds, capabilities or aliases"
+                    .to_owned(),
             ));
+        }
+        for source_kind in &self.supported_media_source_kinds {
+            if !matches!(
+                source_kind.as_str(),
+                MEDIA_SOURCE_KIND_LOCAL_FILE | MEDIA_SOURCE_KIND_STRM_URL
+            ) {
+                return Err(PluginManifestError::Invalid(format!(
+                    "unsupported media source kind: {source_kind}"
+                )));
+            }
         }
         for alias in &self.aliases {
             validate_identifier("plugin alias", alias, 64)?;
@@ -304,6 +354,26 @@ impl PluginManifest {
                         ));
                     }
                 }
+            }
+        }
+        if self.scheduled_tasks.len() > 32 {
+            return Err(PluginManifestError::Invalid(
+                "manifest declares too many scheduled tasks".to_owned(),
+            ));
+        }
+        let config_fields = self
+            .config_fields
+            .iter()
+            .map(|field| (field.key.as_str(), field))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut task_types = std::collections::HashSet::new();
+        for task in &self.scheduled_tasks {
+            task.validate(&config_fields)?;
+            if !task_types.insert(task.task_type.as_str()) {
+                return Err(PluginManifestError::Invalid(format!(
+                    "duplicate scheduled task type: {}",
+                    task.task_type
+                )));
             }
         }
         self.permissions.validate()?;
@@ -403,6 +473,145 @@ pub struct PluginConfigField {
 pub struct PluginConfigOption {
     pub value: String,
     pub label: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginScheduledTask {
+    pub task_type: String,
+    pub owner_type: String,
+    pub name: String,
+    pub description: String,
+    pub schedule_config_key: String,
+    pub default_schedule: String,
+    #[serde(default)]
+    pub required_config_keys: Vec<String>,
+    #[serde(default)]
+    pub owner_config_key: Option<String>,
+    #[serde(default = "default_resource_limit")]
+    pub resource_limit: Value,
+}
+
+impl PluginScheduledTask {
+    fn validate(
+        &self,
+        config_fields: &std::collections::HashMap<&str, &PluginConfigField>,
+    ) -> Result<(), PluginManifestError> {
+        validate_identifier("scheduled task type", &self.task_type, 128)?;
+        validate_text("scheduled task name", &self.name, 256)?;
+        validate_text("scheduled task description", &self.description, 1024)?;
+        if !matches!(self.owner_type.as_str(), "GLOBAL" | "LIBRARY") {
+            return Err(PluginManifestError::Invalid(format!(
+                "unsupported scheduled task owner type: {}",
+                self.owner_type
+            )));
+        }
+        validate_identifier(
+            "scheduled task scheduleConfigKey",
+            &self.schedule_config_key,
+            64,
+        )?;
+        let Some(schedule_field) = config_fields.get(self.schedule_config_key.as_str()) else {
+            return Err(PluginManifestError::Invalid(format!(
+                "scheduled task scheduleConfigKey does not reference a config field: {}",
+                self.schedule_config_key
+            )));
+        };
+        if schedule_field.input_type != "text" {
+            return Err(PluginManifestError::Invalid(
+                "scheduled task scheduleConfigKey must reference a text config field".to_owned(),
+            ));
+        }
+        validate_cron(&self.default_schedule).map_err(|error| {
+            PluginManifestError::Invalid(format!("invalid scheduled task defaultSchedule: {error}"))
+        })?;
+        if self.required_config_keys.len() > 32 {
+            return Err(PluginManifestError::Invalid(
+                "scheduled task declares too many required config keys".to_owned(),
+            ));
+        }
+        let mut required_keys = std::collections::HashSet::new();
+        for key in &self.required_config_keys {
+            validate_identifier("scheduled task requiredConfigKey", key, 64)?;
+            if !required_keys.insert(key.as_str()) {
+                return Err(PluginManifestError::Invalid(format!(
+                    "duplicate scheduled task required config key: {key}"
+                )));
+            }
+            if !config_fields.contains_key(key.as_str()) {
+                return Err(PluginManifestError::Invalid(format!(
+                    "scheduled task requiredConfigKey does not reference a config field: {key}"
+                )));
+            }
+        }
+        match (&self.owner_type[..], self.owner_config_key.as_deref()) {
+            ("GLOBAL", None) => {}
+            ("GLOBAL", Some(_)) => {
+                return Err(PluginManifestError::Invalid(
+                    "global scheduled tasks cannot declare ownerConfigKey".to_owned(),
+                ));
+            }
+            ("LIBRARY", Some(key)) => {
+                validate_identifier("scheduled task ownerConfigKey", key, 64)?;
+                let Some(field) = config_fields.get(key) else {
+                    return Err(PluginManifestError::Invalid(format!(
+                        "scheduled task ownerConfigKey does not reference a config field: {key}"
+                    )));
+                };
+                if field.input_type != "select" || !field.multiple {
+                    return Err(PluginManifestError::Invalid(
+                        "scheduled task ownerConfigKey must reference a multiple select config field"
+                            .to_owned(),
+                    ));
+                }
+            }
+            ("LIBRARY", None) => {
+                return Err(PluginManifestError::Invalid(
+                    "library scheduled tasks must declare ownerConfigKey".to_owned(),
+                ));
+            }
+            _ => {
+                return Err(PluginManifestError::Invalid(
+                    "unsupported scheduled task owner type".to_owned(),
+                ));
+            }
+        }
+        let resource_limit = serde_json::to_vec(&self.resource_limit).map_err(|error| {
+            PluginManifestError::Invalid(format!("invalid scheduled task resourceLimit: {error}"))
+        })?;
+        if !self.resource_limit.is_object() || resource_limit.len() > 4096 {
+            return Err(PluginManifestError::Invalid(
+                "scheduled task resourceLimit must be an object no larger than 4096 bytes"
+                    .to_owned(),
+            ));
+        }
+        if let Some(value) = self.resource_limit.get("concurrency") {
+            let Some(concurrency) = value.as_i64() else {
+                return Err(PluginManifestError::Invalid(
+                    "scheduled task resourceLimit concurrency must be an integer".to_owned(),
+                ));
+            };
+            if !(1..=256).contains(&concurrency) {
+                return Err(PluginManifestError::Invalid(
+                    "scheduled task resourceLimit concurrency must be between 1 and 256".to_owned(),
+                ));
+            }
+        }
+        if self
+            .resource_limit
+            .get("overwrite")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return Err(PluginManifestError::Invalid(
+                "scheduled task resourceLimit overwrite must be a boolean".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn default_resource_limit() -> Value {
+    Value::Object(serde_json::Map::new())
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

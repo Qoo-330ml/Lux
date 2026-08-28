@@ -104,6 +104,7 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
   let openingCount = 0;
   let closingCount = 0;
   let malformed = false;
+  let entryLimitExceeded = false;
   for (const match of body.matchAll(tagPattern)) {
     const tag = match[0];
     const attributes = match[1];
@@ -111,14 +112,15 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
     if (attributes !== undefined && rawText !== undefined) {
       openingCount += 1;
       closingCount += 1;
-      if (openingCount > DANMAKU_LIMITS.maxEntries) {
-        throw new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多");
-      }
       if (
         (attributes.includes("<") && /<d\b/i.test(attributes))
         || (rawText.includes("<") && /<d\b/i.test(rawText))
       ) {
         malformed = true;
+      }
+      if (openingCount > DANMAKU_LIMITS.maxEntries) {
+        entryLimitExceeded = true;
+        continue;
       }
       const entry = parseEntry(attributes, rawText);
       if (entry) entries.push({ id: "", ...entry });
@@ -131,11 +133,14 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
 
     openingCount += 1;
     if (openingCount > DANMAKU_LIMITS.maxEntries) {
-      throw new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多");
+      entryLimitExceeded = true;
     }
   }
   if (malformed || openingCount !== closingCount) {
     throw invalidXml();
+  }
+  if (entryLimitExceeded) {
+    throw new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多");
   }
   entries.sort((left, right) => left.start - right.start);
   entries.forEach((entry, index) => {
