@@ -119,6 +119,7 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/Users/{user_id}/PlayedItems/{item_id}",
             post(emby_mark_played).delete(emby_unmark_played),
         )
+        .route("/Users/{user_id}/FavoriteItems", get(emby_user_favorites))
         .route(
             "/Users/{user_id}/FavoriteItems/{item_id}",
             post(emby_mark_favorite).delete(emby_unmark_favorite),

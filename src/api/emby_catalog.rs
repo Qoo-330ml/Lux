@@ -729,6 +729,24 @@ pub(super) async fn emby_user_latest(
     }
 }
 
+pub(super) async fn emby_user_favorites(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(mut query): Query<EmbyItemsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
+        return status.into_response();
+    }
+    query.is_favorite = Some(true);
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    emby_list_items(&headers, &state, principal, user.can_download, &query).await
+}
+
 pub(super) async fn emby_parent_is_library(state: &AppState, parent_id: &str) -> bool {
     let Ok(library_id) = parent_id.parse::<crate::domain::ids::LibraryId>() else {
         return false;
