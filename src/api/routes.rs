@@ -11,8 +11,8 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         .merge(users::api_routes())
         .merge(admin::api_routes())
         .merge(lux_api::api_routes())
-        .merge(emby_routes())
-        .nest("/emby", emby_routes())
+        .merge(emby::api_routes())
+        .nest("/emby", emby::api_routes())
         .fallback_service(
             ServeDir::new(web_root.clone())
                 .append_index_html_on_directories(true)
