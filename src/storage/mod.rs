@@ -49,10 +49,13 @@ fn resolve_database_pool_max_connections(
         DatabaseBackend::Sqlite => SQLITE_DATABASE_POOL_MAX_CONNECTIONS,
         DatabaseBackend::Postgres => POSTGRES_DATABASE_POOL_MAX_CONNECTIONS,
     };
-    let Some(configured) = configured else {
+    let Some(configured) = configured
+        .map(str::trim)
+        .filter(|configured| !configured.is_empty())
+    else {
         return Ok(default);
     };
-    let value = configured.trim().parse::<u32>().map_err(|_| {
+    let value = configured.parse::<u32>().map_err(|_| {
         DatabaseConfigurationError::Invalid(format!(
             "{DATABASE_POOL_MAX_CONNECTIONS_ENV} 必须是 {MIN_DATABASE_POOL_MAX_CONNECTIONS} 到 {MAX_DATABASE_POOL_MAX_CONNECTIONS} 之间的整数"
         ))
@@ -19667,6 +19670,11 @@ mod tests {
     #[test]
     fn database_pool_max_connections_accepts_a_bounded_override() {
         assert_eq!(
+            resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some(""))
+                .expect("empty pool override uses the default"),
+            8
+        );
+        assert_eq!(
             resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some("12"))
                 .expect("configured pool size"),
             12
@@ -19680,7 +19688,7 @@ mod tests {
 
     #[test]
     fn database_pool_max_connections_rejects_invalid_overrides() {
-        for value in ["", "0", "101", "not-a-number"] {
+        for value in ["0", "101", "not-a-number"] {
             assert!(
                 resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some(value))
                     .is_err()

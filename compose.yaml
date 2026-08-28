@@ -6,6 +6,7 @@ services:
     mem_limit: ${LUX_MEMORY_LIMIT:-2g}
     environment:
       MALLOC_ARENA_MAX: ${LUX_MALLOC_ARENA_MAX:-2}
+      LUX_DB_MAX_CONNECTIONS: ${LUX_DB_MAX_CONNECTIONS-}
     ports:
       - "8097:8097"
     volumes:
