@@ -220,7 +220,7 @@ esac
 }
 
 #[tokio::test]
-async fn online_chapter_source_uses_metadata_without_running_ffmpeg()
+async fn online_chapter_source_supports_strm_without_running_ffmpeg()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
@@ -286,8 +286,8 @@ done
     tokio::fs::create_dir_all(&season_root).await?;
     for episode in 1..=2 {
         tokio::fs::write(
-            season_root.join(format!("Example.Show.S01E0{episode}.mkv")),
-            format!("episode-{episode}"),
+            season_root.join(format!("Example.Show.S01E0{episode}.strm")),
+            format!("https://media.example/episode-{episode}.mkv"),
         )
         .await?;
     }
@@ -298,9 +298,6 @@ done
         .scan_series_library(library.id)
         .await?;
     sqlx::query("UPDATE media_sources SET duration_ticks = 1800000000, probe_status = 'READY'")
-        .execute(database.pool())
-        .await?;
-    sqlx::query("UPDATE filesystem_entries SET fingerprint = NULL")
         .execute(database.pool())
         .await?;
     sqlx::query(
@@ -336,6 +333,7 @@ done
             ChapterDetectionOptions::default(),
         )
         .await?;
+    assert_eq!(job.total_count, 2);
     service.run(&job.id).await?;
     let completed = service.get(&job.id).await?;
     assert_eq!(completed.status, "COMPLETED");

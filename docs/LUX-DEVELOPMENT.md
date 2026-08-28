@@ -358,7 +358,8 @@ Lux 的核心价值不是功能数量，而是：
   `StartPositionTicks`、可选 `Name`、可选 `ImageTag`、`MarkerType` 和 `ChapterIndex`。
 - 自动片头片尾章节由独立 `chapter_detector` 插件提供。本地音频检测插件在后台对已校验的本地媒体运行
   ffmpeg/chromaprint；在线章节源插件只接收已保存的 provider ID、季号、集号和时长，从固定远程服务
-  获取已标注结果。两种插件都不能接收媒体路径、数据库或任务对象。
+  获取已标注结果。在线章节源对 `LOCAL_FILE` 和 `STRM_URL` 媒体源都适用，不读取媒体路径或
+  `.strm` 目标；两种插件都不能接收数据库或任务对象。
 - 检测插件按季度批次比较至少两个可用分集，返回 `IntroStart`、`IntroEnd`、`CreditsStart` 候选。
   Lux 校验时间范围、顺序、数量和来源后原子替换 `provider_id` 等于该插件 ID 的隐藏标记；低置信度结果不落库。
 - 媒体文件指纹变化时，旧检测标记失效；重新检测只在后台任务中发生。

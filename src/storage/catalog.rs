@@ -3336,7 +3336,7 @@ impl Database {
                AND episode.item_type = 'EPISODE'
                AND season.item_type = 'SEASON'
                AND series.item_type = 'SERIES'
-               AND ms.source_kind = 'LOCAL_FILE'
+               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND episode.removed_at IS NULL
                AND fe.is_missing = 0
                AND (ms.is_default = 1 OR NOT EXISTS (
@@ -3720,7 +3720,7 @@ impl Database {
              LEFT JOIN chapter_detection_source_states states
                ON states.source_id = cdi.source_id AND states.plugin_id = job.plugin_id
              WHERE cdi.job_id = ? AND cdi.status = 'PENDING'
-               AND ms.source_kind = 'LOCAL_FILE'
+               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
              ORDER BY cdi.season_id, cdi.source_id
              LIMIT ?",
         )
@@ -3882,7 +3882,9 @@ impl Database {
                 "SELECT fe.fingerprint
                  FROM media_sources ms
                  JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-                 WHERE ms.id = ? AND ms.source_kind = 'LOCAL_FILE' AND fe.is_missing = 0",
+                 WHERE ms.id = ?
+                   AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+                   AND fe.is_missing = 0",
             )
             .bind(source_id)
             .fetch_optional(&mut *transaction)
