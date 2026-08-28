@@ -201,7 +201,9 @@ export function PlayerControls({
           </button>
         </div>
 
-        <div className="lux-player-controls-middle">
+        <div className="lux-player-controls-middle" />
+
+        <div className="lux-player-controls-right">
           <button
             type="button"
             className={`lux-player-action-btn lux-player-danmu-btn ${danmuVisible ? "is-active" : ""}`}
@@ -212,9 +214,6 @@ export function PlayerControls({
           >
             <MessageCircleMore size={20} aria-hidden="true" />
           </button>
-        </div>
-
-        <div className="lux-player-controls-right">
           {airPlayAvailable ? (
             <button type="button" className="lux-player-action-btn lux-player-mobile-top-control" aria-label="AirPlay" title="AirPlay" onClick={onAirPlay}>
               <Airplay size={20} aria-hidden="true" />
