@@ -125,6 +125,8 @@ use tokio::{
 
 #[path = "admin.rs"]
 mod admin;
+#[path = "lux_api.rs"]
+mod lux_api;
 #[path = "routes.rs"]
 mod routes;
 #[path = "users.rs"]
