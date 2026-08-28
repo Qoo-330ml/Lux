@@ -336,6 +336,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - 本地 NFO 派生缓存回归：详情接口只读取数据库快照；快照损坏或过大时会清理该派生行并继续返回基础条目，演员关系或人物头像损坏时保留演员文字信息并由 Web 使用人物占位图标。该行为已由 `tests/catalog.rs`、`tests/metadata.rs` 和人物单元测试覆盖，尚未替代第三方客户端现场复测。
 - LUX-166 元数据对象路径回归：Rust 路径契约测试已验证 `collections`、`genres`、`studios`、`tags` 的展示名桶、provider/object ID 身份和越界拒绝；本任务不改变客户端 API 行为。
 - LUX-167 元数据对象快照回归：合集刷新协议测试已验证数据库关系更新后生成 `collection.json`，快照写入失败映射为可重试的服务错误；genres、studios、tags 尚无在线对象数据源，因此仅验证共用存储能力。
+- 2026-08-28 VidHub 长时间播放恢复兼容：Emby 直放入口的短期 HMAC 票据有效期延长至 12 小时，覆盖 VidHub 暂停、切后台或网络恢复后复用播放地址的场景；该期限只保护重新进入 Lux 播放入口的请求，不限制已建立的上游直连播放时长。`src/application/playback/session.rs` 增加了有效期回归测试，远端实例需重新部署后复测。
 
 ## LUX-025 本机探针进度（2026-08-02）
 

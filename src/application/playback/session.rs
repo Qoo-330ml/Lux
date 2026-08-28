@@ -25,7 +25,7 @@ use super::hls::{HlsError, HlsManager};
 type HmacSha256 = Hmac<Sha256>;
 
 pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
-pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 15 * 60;
+pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 12 * 60 * 60;
 const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
 const EMBY_DIRECT_STREAM_SESSION_ID: &str = "emby-direct-stream";
 
@@ -513,7 +513,9 @@ fn emby_direct_stream_resource(
 mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
-    use super::{ResourceSigner, apply_server_capabilities, unix_timestamp};
+    use super::{
+        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, apply_server_capabilities, unix_timestamp,
+    };
     use crate::{
         application::{
             libraries::LibraryService,
@@ -573,6 +575,11 @@ mod tests {
             &signature,
             unix_timestamp()
         ));
+    }
+
+    #[test]
+    fn emby_direct_stream_tickets_last_twelve_hours() {
+        assert_eq!(EMBY_DIRECT_STREAM_TTL_SECONDS, 12 * 60 * 60);
     }
 
     #[test]
