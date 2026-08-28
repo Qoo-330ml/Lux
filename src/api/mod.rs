@@ -21450,7 +21450,7 @@ mod tests {
     }
 
     #[test]
-    fn filmly_episode_normalization_is_scoped_to_filmly_user_agents() {
+    fn filmly_user_agent_detection_recognizes_known_clients() {
         assert!(is_filmly_user_agent("Filmly/2.12.3-423"));
         assert!(is_filmly_user_agent("网易爆米花/2.12.3-423"));
         assert!(!is_filmly_user_agent("VidHub/1.0"));
