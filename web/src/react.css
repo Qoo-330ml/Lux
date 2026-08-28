@@ -651,7 +651,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-volume-slider-wrap { width: 0; opacity: 0; overflow: hidden; transition: width .25s var(--lux-ease), opacity .25s var(--lux-ease); display: flex; align-items: center; }
 .lux-player-volume-group:hover .lux-player-volume-slider-wrap,
 .lux-player-volume-slider-wrap:focus-within { width: 75px; opacity: 1; }
-.lux-player-volume-slider { width: 75px; height: 4px; border-radius: 2px; accent-color: var(--lux-accent); cursor: pointer; }
+.lux-player-volume-slider { width: 75px; height: 4px; min-height: 0; padding: 0; border: 0; border-radius: 2px; background: transparent; accent-color: var(--lux-accent); cursor: pointer; }
 
 .lux-player-time { display: flex; align-items: center; gap: 6px; min-width: max-content; height: 46px; padding: 0 10px; border: 0; color: rgba(255,255,255,.72); background: transparent; font-size: 14px; font-variant-numeric: tabular-nums; user-select: none; cursor: pointer; }
 .lux-player-time:hover, .lux-player-time:focus-visible { color: #fff; background: rgba(255,255,255,.08); }

@@ -42,6 +42,14 @@ test("center playback action uses a smaller visual footprint", () => {
   assert.match(stylesheet, /@media\s*\(max-width:\s*560px\)[\s\S]*?\.lux-player-center-play, \.lux-player-center-splash\s*\{[^}]*width:\s*68px;[^}]*height:\s*68px/);
 });
 
+test("volume slider keeps its full track available for both endpoints", () => {
+  const volumeRule = rule(".lux-player-volume-slider");
+
+  assert.match(volumeRule, /padding:\s*0/);
+  assert.match(volumeRule, /min-height:\s*0/);
+  assert.match(volumeRule, /border:\s*0/);
+});
+
 test("large-display page surfaces do not keep fixed pixel width caps", () => {
   for (const selector of [
     ".lux-home-content",
