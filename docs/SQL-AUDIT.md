@@ -26,11 +26,17 @@ FTS 搜索：
 |--SCAN media_search VIRTUAL TABLE INDEX 0:M5
 |--SEARCH mi USING INDEX sqlite_autoindex_media_items_1 (id=?)
 `--SEARCH l USING INDEX sqlite_autoindex_libraries_1 (id=?)
+
+收藏列表（user_id + is_favorite）：
+|--SEARCH user_item_state USING COVERING INDEX idx_user_item_state_favorites (user_id=? AND is_favorite=?)
+|--SEARCH mi USING INDEX sqlite_autoindex_media_items_1 (id=?)
+`--USE TEMP B-TREE FOR ORDER BY
 ```
 
 ## 结论与边界
 
 - 目录、扫描游标和批量用户状态查询均命中复合索引；FTS 查询使用 FTS5 虚拟表并通过媒体/库主键回查。
+- 收藏列表先从用户收藏状态索引枚举候选，再回查媒体条目并执行可见性过滤；因此收藏数量很少时不会先扫描整个媒体库。
 - Web/Emby 列表的用户状态读取使用 `Database::list_user_item_states` 分块批量查询，单块上限为 500 个 ID；媒体源、流和图片标签由目录查询联结/子查询一次取回。
 - 本记录不宣称所有业务路径都没有 N+1；集合刷新、识别候选等后台流程仍需按真实数据量继续审计。
 - 该结果是本机 ARM64 的查询计划证据，不代表 NAS 上的耗时、锁竞争或磁盘吞吐。

@@ -18499,14 +18499,24 @@ fn catalog_filter_where_clause<'a>(
         binds.push(CatalogBind::Integer(i64::from(is_played)));
     }
     if let Some(is_favorite) = is_favorite {
-        where_clause.push_str(
-            " AND COALESCE(
-                (SELECT state_filter.is_favorite
-                 FROM user_item_state state_filter
-                 WHERE state_filter.user_id = ? AND state_filter.item_id = mi.id),
-                0
-            ) = ?",
-        );
+        if is_favorite {
+            where_clause.push_str(
+                " AND mi.id IN (
+                    SELECT state_filter.item_id
+                    FROM user_item_state state_filter
+                    WHERE state_filter.user_id = ? AND state_filter.is_favorite = ?
+                )",
+            );
+        } else {
+            where_clause.push_str(
+                " AND COALESCE(
+                    (SELECT state_filter.is_favorite
+                     FROM user_item_state state_filter
+                     WHERE state_filter.user_id = ? AND state_filter.item_id = mi.id),
+                    0
+                ) = ?",
+            );
+        }
         binds.push(CatalogBind::Text(user_id));
         binds.push(CatalogBind::Integer(i64::from(is_favorite)));
     }
@@ -19456,6 +19466,64 @@ mod tests {
             std::collections::HashSet::from(["recent-first-new", "recent-second-new"])
         );
         assert_eq!(database.query_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn favorite_catalog_filter_uses_favorite_state_index() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let library_ids = vec!["library".to_owned()];
+        let empty_item_types = Vec::new();
+        let empty_excluded_item_types = Vec::new();
+        let empty_years = Vec::new();
+        let filter = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: "user",
+            item_types: &empty_item_types,
+            excluded_item_types: &empty_excluded_item_types,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            years: &empty_years,
+            is_played: None,
+            is_favorite: Some(true),
+            metadata_pending: false,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 0,
+            limit: 24,
+        };
+        let (where_clause, binds) = catalog_filter_where_clause(&filter);
+        let query = format!(
+            "EXPLAIN QUERY PLAN
+             SELECT COUNT(*) FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             {where_clause}"
+        );
+        let mut statement = database.query(sqlx::AssertSqlSafe(query));
+        for bind in &binds {
+            statement = match bind {
+                CatalogBind::Text(value) => statement.bind(*value),
+                CatalogBind::Integer(value) => statement.bind(*value),
+            };
+        }
+        let plan = statement
+            .fetch_all(database.pool())
+            .await
+            .expect("favorite query plan")
+            .into_iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+
+        assert!(
+            plan.iter()
+                .any(|detail| detail.contains("idx_user_item_state_favorites")),
+            "favorite query did not use the favorite state index: {plan:?}"
+        );
     }
 
     #[tokio::test]
