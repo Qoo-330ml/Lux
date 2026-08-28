@@ -458,14 +458,6 @@ impl LibraryService {
         {
             return Err(LibraryServiceError::LibraryNotFound);
         }
-        if self
-            .database
-            .find_active_scan_job_for_library(&library_id_text)
-            .await?
-            .is_some()
-        {
-            return Err(LibraryServiceError::LibraryBusy);
-        }
         if !self.database.delete_library(&library_id_text).await? {
             return Err(LibraryServiceError::LibraryNotFound);
         }
@@ -531,7 +523,6 @@ pub enum LibraryServiceError {
     InvalidScraperOrder(String),
     InvalidChapterSourceId,
     LibraryNotFound,
-    LibraryBusy,
     RootNotFound,
     RootNotFoundAfterInsert,
     DuplicateRoot,
@@ -568,7 +559,6 @@ impl fmt::Display for LibraryServiceError {
                 formatter.write_str("invalid library chapter source ID")
             }
             Self::LibraryNotFound => formatter.write_str("library not found"),
-            Self::LibraryBusy => formatter.write_str("library has an active scan"),
             Self::RootNotFound => formatter.write_str("library root not found"),
             Self::RootNotFoundAfterInsert => {
                 formatter.write_str("library root was inserted but could not be read back")
@@ -600,7 +590,6 @@ impl std::error::Error for LibraryServiceError {
             | Self::InvalidScraperOrder(_)
             | Self::InvalidChapterSourceId
             | Self::LibraryNotFound
-            | Self::LibraryBusy
             | Self::RootNotFound
             | Self::RootNotFoundAfterInsert
             | Self::DuplicateRoot

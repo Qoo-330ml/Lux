@@ -20244,6 +20244,25 @@ async fn admin_delete_library(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    if let Some(scan_jobs) = state.scan_jobs.as_ref()
+        && let Err(error) = scan_jobs.prepare_library_deletion(library_id).await
+    {
+        match error {
+            ScanJobError::Storage(error) => {
+                return library_error(&headers, LibraryServiceError::Storage(error));
+            }
+            error => {
+                tracing::error!(library_id = %library_id, %error, "failed to prepare library deletion");
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "媒体库删除准备失败",
+                )
+                .into_response();
+            }
+        }
+    }
     match libraries.delete_library(library_id).await {
         Ok(()) => {
             if let Some(plugins) = state.plugins.as_ref()
@@ -20430,11 +20449,6 @@ fn library_error(headers: &HeaderMap, error: LibraryServiceError) -> Response {
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
             "媒体库不存在",
-        ),
-        LibraryServiceError::LibraryBusy => (
-            StatusCode::CONFLICT,
-            lux::ApiErrorCode::InvalidRequest,
-            "媒体库仍有扫描任务运行",
         ),
         LibraryServiceError::RootNotFound => (
             StatusCode::NOT_FOUND,

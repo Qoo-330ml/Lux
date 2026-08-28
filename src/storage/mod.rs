@@ -4159,6 +4159,21 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        self.query(
+            "DELETE FROM strm_probe_jobs
+             WHERE library_id = ?
+                OR target_scan_job_id IN (
+                    SELECT id FROM scan_jobs WHERE library_id = ?
+                )",
+        )
+        .bind(id)
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         let deleted = self
             .query("DELETE FROM libraries WHERE id = ?")
             .bind(id)

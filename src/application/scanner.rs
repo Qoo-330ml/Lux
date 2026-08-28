@@ -1986,7 +1986,45 @@ impl ScanJobService {
         flags.remove(job_id);
     }
 
+    fn cancellation_requested_in_memory(&self, job_id: &str) -> bool {
+        let flags = match self.cancellation_flags.lock() {
+            Ok(flags) => flags,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        flags
+            .get(job_id)
+            .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    pub async fn prepare_library_deletion(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<(), ScanJobError> {
+        let library_id = library_id.to_string();
+        for status in ["PENDING", "RUNNING"] {
+            let jobs = self
+                .database
+                .list_scan_jobs(Some(status), 0, 10_000)
+                .await?;
+            for job in jobs.into_iter().filter(|job| job.library_id == library_id) {
+                self.cancellation_flag(&job.id)
+                    .store(true, Ordering::Release);
+                self.database.request_scan_job_cancel(&job.id).await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn cancel_running_job(&self, job_id: &str) -> Result<ScanBatchReport, ScanJobError> {
+        if self.database.find_scan_job(job_id).await?.is_none() {
+            self.clear_cancellation_flag(job_id);
+            return Ok(ScanBatchReport {
+                status: "CANCELLED".to_owned(),
+                processed: 0,
+                created_items: 0,
+                completed: true,
+            });
+        }
         self.database
             .clear_reconciliation_scan_entries(job_id)
             .await?;
@@ -2012,6 +2050,10 @@ impl ScanJobService {
         flag: &AtomicBool,
     ) -> Result<bool, ScanJobError> {
         if job_cancel_requested || flag.load(Ordering::Acquire) {
+            flag.store(true, Ordering::Release);
+            return Ok(true);
+        }
+        if self.database.find_scan_job(job_id).await?.is_none() {
             flag.store(true, Ordering::Release);
             return Ok(true);
         }
@@ -2252,6 +2294,15 @@ impl ScanJobService {
         batch_size: usize,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
+            if self.cancellation_requested_in_memory(job_id) {
+                self.clear_cancellation_flag(job_id);
+                return Ok(ScanBatchReport {
+                    status: "CANCELLED".to_owned(),
+                    processed: 0,
+                    created_items: 0,
+                    completed: true,
+                });
+            }
             return Err(ScanJobError::JobNotFound);
         };
         let cancellation = self.cancellation_flag(job_id);
@@ -3523,13 +3574,19 @@ impl ScanJobService {
                 continue;
             }
             if report.status == "COMPLETED" {
-                let completed_job = self
-                    .database
-                    .find_scan_job(job_id)
-                    .await?
-                    .ok_or(ScanJobError::JobNotFound)?;
+                let Some(completed_job) = self.database.find_scan_job(job_id).await? else {
+                    if self.cancellation_requested_in_memory(job_id) {
+                        self.clear_cancellation_flag(job_id);
+                        return Ok(());
+                    }
+                    return Err(ScanJobError::JobNotFound);
+                };
                 let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
                 drop(_scan_permit);
+                if self.cancellation_requested_in_memory(job_id) {
+                    self.cancel_running_job(job_id).await?;
+                    return Ok(());
+                }
                 if incremental {
                     self.run_metadata_after_incremental_scan(job_id).await?;
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
@@ -3604,7 +3661,7 @@ impl ScanJobService {
             return Ok(());
         };
         let Some(job) = self.database.find_scan_job(job_id).await? else {
-            return Err(ScanJobError::JobNotFound);
+            return Ok(());
         };
         let Ok(library_id) = job.library_id.parse::<LibraryId>() else {
             tracing::warn!(
@@ -3665,7 +3722,7 @@ impl ScanJobService {
         thumbnails: Option<ThumbnailService>,
     ) -> Result<(), ScanJobError> {
         if self.database.find_scan_job(job_id).await?.is_none() {
-            return Err(ScanJobError::JobNotFound);
+            return Ok(());
         }
         let Some(thumbnails) = thumbnails else {
             self.database
@@ -3928,10 +3985,10 @@ impl ScanJobService {
 
     async fn run_metadata_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
-            return Err(ScanJobError::JobNotFound);
+            return Ok(());
         };
         if self.database.find_library(&job.library_id).await?.is_none() {
-            return Err(ScanJobError::LibraryNotFound);
+            return Ok(());
         }
         let enricher = MetadataEnricher::new(self.database.clone());
         let enricher = match self.people.clone() {
@@ -3977,6 +4034,9 @@ impl ScanJobService {
     }
 
     async fn run_metadata_after_incremental_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
+        if self.database.find_scan_job(job_id).await?.is_none() {
+            return Ok(());
+        }
         let enricher = MetadataEnricher::new(self.database.clone());
         let enricher = match self.people.clone() {
             Some(people) => enricher.with_people(people),
@@ -4025,6 +4085,9 @@ impl ScanJobService {
         job_id: &str,
         thumbnails: Option<ThumbnailService>,
     ) -> Result<(), ScanJobError> {
+        if self.database.find_scan_job(job_id).await?.is_none() {
+            return Ok(());
+        }
         let Some(thumbnails) = thumbnails else {
             return Ok(());
         };
@@ -4086,7 +4149,7 @@ impl ScanJobService {
         probe: Option<MediaProbeService>,
     ) -> Result<(), ScanJobError> {
         if self.database.find_scan_job(job_id).await?.is_none() {
-            return Err(ScanJobError::JobNotFound);
+            return Ok(());
         }
         let Some(probe) = probe else {
             self.database

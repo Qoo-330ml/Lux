@@ -616,6 +616,42 @@ async fn cancelling_a_pending_scan_finishes_immediately_and_cleans_work()
 }
 
 #[tokio::test]
+async fn deleted_library_scan_worker_exits_as_cancelled_without_touching_media_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let media_file = root.join("Movie.2024.mkv");
+    tokio::fs::write(&media_file, b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.prepare_library_deletion(library.id).await?;
+    libraries.delete_library(library.id).await?;
+
+    let report = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(report.status, "CANCELLED");
+    assert!(report.completed);
+    assert!(
+        media_file.exists(),
+        "library deletion must not delete media files"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

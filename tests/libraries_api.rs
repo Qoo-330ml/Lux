@@ -318,6 +318,99 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
 }
 
 #[tokio::test]
+async fn admin_can_delete_disabled_library_with_active_scan_and_probe_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(
+            &json!({ "username": "Admin", "displayName": "Admin", "password": "correct password" }),
+        )
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/libraries"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "name": "Busy Movies", "kind": "MOVIE" }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let library_id = created.json::<Value>().await?["library"]["id"]
+        .as_str()
+        .ok_or("missing library ID")?
+        .to_owned();
+
+    let disabled = client
+        .patch(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "isEnabled": false }))
+        .send()
+        .await?;
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', ?)",
+    )
+    .bind("active-scan-job")
+    .bind(&library_id)
+    .bind("scan-generation")
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO strm_probe_jobs
+            (id, operation_id, library_id, status, concurrency, target_scan_job_id)
+         VALUES (?, ?, ?, 'RUNNING', 1, ?)",
+    )
+    .bind("active-probe-job")
+    .bind("probe-operation")
+    .bind(&library_id)
+    .bind("active-scan-job")
+    .execute(database.pool())
+    .await?;
+
+    let deleted = client
+        .delete(format!("{base_url}/api/v1/admin/libraries/{library_id}"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let remaining_libraries: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM libraries WHERE id = ?")
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_libraries, 0);
+    let remaining_scan_jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE id = 'active-scan-job'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_scan_jobs, 0);
+    let remaining_probe_jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM strm_probe_jobs WHERE id = 'active-probe-job'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_probe_jobs, 0);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn deleting_library_removes_it_from_strm_media_info_plugin_config()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
