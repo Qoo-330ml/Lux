@@ -1581,6 +1581,27 @@ pub(crate) struct StoredExternalSubtitle {
     pub(crate) root_path: String,
 }
 
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredSubtitleStream {
+    pub(crate) media_source_id: String,
+    pub(crate) item_id: String,
+    pub(crate) source_kind: String,
+    pub(crate) probe_status: String,
+    pub(crate) root_path: String,
+    pub(crate) relative_path: String,
+    pub(crate) stream_index: i64,
+    pub(crate) stream_type: String,
+    pub(crate) codec: Option<String>,
+    pub(crate) language: Option<String>,
+    pub(crate) title: Option<String>,
+    pub(crate) details_json: Option<String>,
+    pub(crate) external_path: Option<String>,
+    pub(crate) is_external: bool,
+    pub(crate) is_default: bool,
+    pub(crate) is_forced: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredItemImageCandidate {
     pub(crate) id: String,

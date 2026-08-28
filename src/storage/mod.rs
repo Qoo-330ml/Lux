@@ -34,7 +34,8 @@ pub(crate) use repository::{
     StoredPersonIndexRebuildJob, StoredPersonMatchCandidate, StoredPlaybackHistoryEvent,
     StoredPlaybackSession, StoredPlaybackSource, StoredReconciliationScanEntry, StoredScanJob,
     StoredScanJobEvent, StoredScanJobPath, StoredScheduledTaskConfig, StoredSeriesMetadataSource,
-    StoredStrmMediaSource, StoredStrmProbeJob, StoredThumbnailSource, StoredUser,
-    StoredUserItemState, StoredWebPlaybackSession, StoredWebSession, StoredWebSessionSummary,
-    UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim, movie_parent_folder_identity,
+    StoredStrmMediaSource, StoredStrmProbeJob, StoredSubtitleStream, StoredThumbnailSource,
+    StoredUser, StoredUserItemState, StoredWebPlaybackSession, StoredWebSession,
+    StoredWebSessionSummary, UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
+    movie_parent_folder_identity,
 };

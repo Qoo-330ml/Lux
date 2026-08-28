@@ -2756,6 +2756,90 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn list_subtitle_streams(
+        &self,
+        item_id: &str,
+        media_source_id: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredSubtitleStream>, StorageError> {
+        let limit = limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE);
+        let offset = offset.max(0);
+        let rows = if let Some(media_source_id) = media_source_id {
+            self.query(
+                "SELECT ms.id AS media_source_id, ms.item_id, ms.source_kind, ms.probe_status,
+                        lr.canonical_path AS root_path, fe.relative_path,
+                        mt.stream_index, mt.stream_type, mt.codec, mt.language, mt.title,
+                        mt.details_json, mt.external_path, mt.is_external,
+                        mt.is_default, mt.is_forced
+                 FROM media_streams mt
+                 JOIN media_sources ms ON ms.id = mt.media_source_id
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE ms.id = ? AND mi.id = ? AND mi.removed_at IS NULL
+                   AND mt.stream_type = 'SUBTITLE' AND fe.is_missing = 0
+                 ORDER BY mt.stream_index
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(media_source_id)
+            .bind(item_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query(
+                "SELECT ms.id AS media_source_id, ms.item_id, ms.source_kind, ms.probe_status,
+                        lr.canonical_path AS root_path, fe.relative_path,
+                        mt.stream_index, mt.stream_type, mt.codec, mt.language, mt.title,
+                        mt.details_json, mt.external_path, mt.is_external,
+                        mt.is_default, mt.is_forced
+                 FROM media_streams mt
+                 JOIN media_sources ms ON ms.id = mt.media_source_id
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE mi.id = ? AND mi.removed_at IS NULL
+                   AND mt.stream_type = 'SUBTITLE' AND fe.is_missing = 0
+                 ORDER BY ms.is_default DESC, ms.id, mt.stream_index
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(item_id)
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        };
+        rows.map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredSubtitleStream {
+                    media_source_id: row.get("media_source_id"),
+                    item_id: row.get("item_id"),
+                    source_kind: row.get("source_kind"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                    stream_index: row.get("stream_index"),
+                    stream_type: row.get("stream_type"),
+                    codec: row.get("codec"),
+                    language: row.get("language"),
+                    title: row.get("title"),
+                    details_json: row.get("details_json"),
+                    external_path: row.get("external_path"),
+                    is_external: row.get::<i64, _>("is_external") != 0,
+                    is_default: row.get::<i64, _>("is_default") != 0,
+                    is_forced: row.get::<i64, _>("is_forced") != 0,
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn update_external_subtitle(
         &self,
         update: ExternalSubtitleUpdate<'_>,
