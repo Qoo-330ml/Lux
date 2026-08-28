@@ -22,7 +22,34 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 | VidHub | 2.1.8 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目详情通过 | 通过 | 通过 | 未测试 | 2026-08-05 本机 ARM64 真实 UI 播放本地 MKV，Playing/Progress/Stopped 回传和 Resume 读回通过；收藏/已观看状态另有 2026-08-03 证据 |
 | SenPlayer | 6.0.6 | macOS arm64 | 通过 | 通过 | 首页、电影列表通过 | 通过 | 未测试 | 未测试 | 2026-08-07 本机 ARM64 真实 UI 播放 `.strm` 电影通过；服务端兼容客户端生成的小写 `/emby/videos` 和路径内编码查询参数，并对远程源返回 307 直连重定向 |
 | Harbor | 1.4.6 | macOS arm64 | 通过 | 通过 | 媒体库浏览、条目列表通过 | 未测试 | 未测试 | 未测试 | 2026-08-09 本机 Harbor 连接本机 Lux 后，媒体库详情请求 `/Users/:userId/Items/:libraryId` 从 404 修复为 200，并进入电影库显示条目 |
+| Yamby | 2.0.5.5 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 未单独验证（已有连接） | 未单独验证（已有会话） | 通过 | 通过 | 进度/继续播放/收藏通过 | 轨道枚举通过；字幕渲染和多版本未测 | 2026-08-28 adb/scrcpy 真机实测《飞驰人生》；详情显示 1080p H264、DTS-HD MA 5.1 和 PGSSUB，播放器实际出画面并读回进度 |
+| CapyPlayer | 1.1.3 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 通过（隔离测试服务器） | 通过 | 媒体库、条目详情通过 | 通过 | 进度通过；收藏/已观看另有实测 | 未测试 | 2026-08-28 使用独立临时媒体 `CapyPlayer Blue Compatibility` 进入 Exo 播放器并出画面；12 秒媒体退出后进度回传为约 12.091 秒 |
+| Hills | 1.8.0 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 未单独验证（已有连接） | 未单独验证（已有会话） | 通过 | 通过 | 未单独验证 | 未测试 | 2026-08-28 使用独立资源《7天》进入 Hills MPV 播放器并稳定出画面；此前其他资源已观察到中英文字幕显示；新增服务器流程受现有配置/Pro 限制未重测 |
+| VidHub | 3.0.1 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 通过（隔离测试服务器） | 通过 | 媒体库、条目详情通过 | 通过 | 进度/已观看通过；收藏另有实测 | 未测试 | 2026-08-28 使用独立临时媒体 `VidHub Green Compatibility` 进入 VideoPlayActivity；DirectPlay 会话播放完成，进度约 20 秒且 `Played=true` |
+| 网易爆米花 | 2.12.5 | Android 17，23127PN0CC，arm64-v8a；宿主 macOS arm64 | 未单独验证（已有远程连接） | 未单独验证（已有会话） | 通过 | 通过（资源差异） | 进度通过；收藏未测试 | 未测试 | 2026-08-28 使用现有远程 Lux 服务器播放《黑色月光》第 1 集；画面稳定，进度由约 00:56 推进至 02:00，退出后详情页读回约 03:14，未出现网络错误提示。此前《风柜来的人》和另一资源曾出现网络提示，暂按资源相关风险记录 |
 | Lux Web | Chrome 151 smoke | macOS arm64 | 通过 | 通过 | 基础浏览/详情/筛选/账户会话通过 | Direct、服务器 HLS、客户端 HEVC fallback 通过 | 进度/收藏接口与收藏浏览器 smoke 通过 | 多版本 source 切换、SRT 字幕、已登记 Bilibili XML 弹幕和可见性开关通过 | Chrome headless：普通用户无管理入口、Direct Range、HLS manifest/init/segment、HEVC Worker/WASM/MSE、390/768/1440 viewport、键盘/触摸 seek、覆盖层和会话清理通过；播放器联合 smoke 为 0 error / 0 warning、无外部请求；`scripts/browser-smoke.mjs`、`scripts/admin-smoke.mjs` 和 `scripts/player-danmaku-smoke.mjs` 已固化 |
+
+## Android 真机实测（2026-08-28）
+
+本次使用 Android 17（SDK 37）、设备 `23127PN0CC`、`arm64-v8a`，通过 adb/scrcpy 操作，宿主机
+`uname -m=arm64`；记录基准为工作树提交 `12bd91ac20e5`。播放测试使用同一设备上的不同媒体资源，避免
+客户端之间因复用播放缓存或进度状态造成误判；临时测试服务、媒体和 adb reverse 映射在测试后已清理。
+
+| 客户端 | 最终播放资源 | 现场结果 |
+|---|---|---|
+| Yamby 2.0.5.5 | 《飞驰人生》 | 已有 Lux 连接下进入详情和播放器，1080p H264 画面正常；继续播放位置从约 05:02 推进到 05:35，详情页保留继续播放状态；收藏开关可用，测试后恢复原状态 |
+| CapyPlayer 1.1.3 | `CapyPlayer Blue Compatibility` | 添加隔离测试服务器并登录后进入 Exo 播放器，画面正常；退出后服务端读到约 12.091 秒播放位置 |
+| Hills 1.8.0 | 《7天》 | 已有 Lux 连接下进入详情，由 Hills 内置 MPV 播放器出画面；本次未单独验收进度和收藏 |
+| VidHub 3.0.1 | `VidHub Green Compatibility` | 添加隔离测试服务器并登录后进入播放页；服务端会话为 `DirectPlay`，播放约 20 秒完成，进度和 `Played=true` 均回传 |
+| 网易爆米花 2.12.5 | 《黑色月光》第 1 集 | 使用已有远程 Lux 服务器直接播放；播放器稳定显示画面，时间从约 00:56 推进到 02:00，退出后详情页读回约 03:14；本次未出现网络错误提示 |
+
+本次实测确认：Yamby、CapyPlayer、Hills、VidHub 和网易爆米花均能完成至少一条本地/远程 Lux 媒体的
+基础播放链路。网易爆米花此前在《风柜来的人》和另一条资源上出现过“网络异常，请确保网络正常后重试”提示，
+但画面仍曾推进；本次《黑色月光》第 1 集未复现，因此当前将其记录为资源相关风险，而不是整体播放不兼容。
+
+Yamby、Hills 和网易爆米花在本次测试中沿用应用已有的 Lux 服务器配置，没有清除数据重新添加服务器；因此
+矩阵中的添加服务器/登录字段仅表示已有连接状态，不等同于全新配置流程验收。字幕、多版本和特定编码的支持
+仍需按客户端分别补充实测。以上结果来自本机 ARM64 宿主，不外推为 NAS/x86_64 性能或所有 Android 设备兼容性。
 
 ## Lux Web 4K 媒体能力探针
 
