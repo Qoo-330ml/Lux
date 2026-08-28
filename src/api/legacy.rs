@@ -123,6 +123,8 @@ use tokio::{
     process::Command,
 };
 
+#[path = "admin.rs"]
+mod admin;
 #[path = "routes.rs"]
 mod routes;
 #[path = "users.rs"]
