@@ -104,6 +104,29 @@ describe("MediaActionMenu", () => {
     expect(onDelete).toHaveBeenCalledOnce();
   });
 
+  it("does not offer source deletion for series items", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaActionMenu
+            item={{ id: "series-1", title: "示例剧集", itemType: "SERIES" }}
+            onEditMetadata={() => undefined}
+            onEditImages={() => undefined}
+            onDelete={() => undefined}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-media-actions-trigger")?.click());
+
+    expect(document.body.querySelector("[data-action=delete]")).toBeNull();
+  });
+
   it("keeps a menu opened from the first resource inside the viewport", () => {
     const position = positionMediaActionMenu(
       { top: 40, bottom: 74, left: 20, right: 54 },

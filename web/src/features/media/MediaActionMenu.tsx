@@ -22,6 +22,8 @@ type MediaActionRect = Pick<DOMRect, "top" | "bottom" | "left" | "right">;
 type MediaActionSize = Pick<DOMRect, "width" | "height">;
 type MediaViewport = Pick<DOMRect, "width" | "height">;
 
+const NON_MEDIA_ITEM_TYPES = new Set(["SERIES", "SEASON", "BOX_SET", "FOLDER"]);
+
 export function positionMediaActionMenu(
   trigger: MediaActionRect,
   menu: MediaActionSize,
@@ -47,6 +49,10 @@ export function mediaDownloadUrl(item: MediaItem, sourceId?: string) {
     : item.mediaSources?.find((entry) => entry.isDefault) ?? item.mediaSources?.[0];
   const query = source ? `?sourceId=${encodeURIComponent(source.id)}` : "";
   return `/api/v1/items/${encodeURIComponent(item.id)}/download${query}`;
+}
+
+function canDeleteMediaSource(item: MediaItem) {
+  return !NON_MEDIA_ITEM_TYPES.has(item.itemType ?? "");
 }
 
 export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanFolder, className = "", sourceId }: MediaActionMenuProps) {
@@ -176,7 +182,7 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
               <span>编辑字幕</span>
             </button>
           ) : null}
-          {onDelete ? (
+          {onDelete && canDeleteMediaSource(item) ? (
             <button
               className="lux-media-action lux-media-action-danger"
               data-action="delete"
