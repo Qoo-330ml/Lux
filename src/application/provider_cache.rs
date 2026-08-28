@@ -355,11 +355,6 @@ fn unix_now() -> i64 {
         .unwrap_or(0)
 }
 
-#[allow(dead_code)]
-fn _cache_path_is_safe(path: &Path) -> bool {
-    path.components().next().is_some()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{CacheLookup, ProviderResponseCache};

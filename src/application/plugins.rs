@@ -2702,3 +2702,22 @@ mod plugin_update_tests {
         assert!(!is_newer_version("1.0.1", "01.0.0"));
     }
 }
+
+#[cfg(test)]
+mod plugin_discovery_tests {
+    use tempfile::tempdir;
+
+    use super::discover_plugin_catalog;
+
+    #[tokio::test]
+    async fn discovers_a_catalog_through_the_async_boundary() {
+        let root = tempdir().expect("temporary plugin directory should be created");
+
+        let catalog = discover_plugin_catalog(root.path().to_owned(), None)
+            .await
+            .expect("plugin discovery should complete");
+
+        assert!(catalog.plugins.is_empty());
+        assert!(catalog.failures.is_empty());
+    }
+}

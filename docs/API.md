@@ -32,7 +32,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 当前阶段的 cookie 始终标记 `Secure`，部署时应使用 HTTPS；本机 HTTP 集成测试只验证协议和服务端行为，不代表浏览器会在不安全来源发送 Secure cookie。
 
 数据库连接池的 `maxConnections` 默认值为 SQLite 8、PostgreSQL 20；可通过进程环境变量
-`LUX_DB_MAX_CONNECTIONS` 在 1-100 范围内覆盖。管理员健康接口的
+`LUX_DB_MAX_CONNECTIONS` 在 1-100 范围内覆盖，未设置或为空时使用默认值。管理员健康接口的
 `database.pool.maxConnections` 返回当前生效值。
 
 ## 媒体库管理（LUX-030）

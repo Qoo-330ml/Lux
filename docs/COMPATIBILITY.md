@@ -323,7 +323,8 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - 2026-08-14 Filmly 图片兼容修复：实测 Android/Filmly 图片加载不携带 Emby token，且部分集只有 `THUMB` 图片却在 DTO 中作为 `ImageTags.Primary` 使用，导致 `/Items/{id}/Images/Primary` 返回 401/404。Emby 图片端点现在在 Primary 无 Poster 时回退到 Thumb，覆盖带 tag、无 tag 和已认证请求；`tests/series_api.rs` 已加入三种路径回归，真实设备需部署后复测。
 - STRM 兜底图片兼容修复：没有刮削器、刮削器无候选或候选没有主图时，启用 STRM 截图会生成同一文件并同时登记为 `POSTER` 与 `THUMB`，因此 Emby `ImageTags.Primary`、`Thumb` 和 Lux Web 海报入口都能读取；相关数据库迁移、无刮削器集成回归和共享文件删除保护已覆盖，目标第三方客户端需部署后复测。
 - 2026-08-14 Filmly 详情状态请求补齐：`Shows/NextUp` 现在按请求的 `SeriesId` 过滤，并遵守 `EnableTotalRecordCount=false` 的分页 shape；季度列表请求 `Genres` 时补齐 `Genres`/`GenreItems` 空集合，避免客户端收到错误剧集状态或不完整季度 DTO。
-- 2026-08-14 Filmly Android 详情页根因定位：部分媒体源的 `MediaStreams[].Language` 为 JSON `null` 时，爆米花详情页显示“尝试连接时发生错误”；仅将剧集分集接口对 Filmly User-Agent 的空语言规范化为 `"und"` 后，失败资源恢复正常。VidHub/其他客户端及播放接口保持原始字段；`tests/series_api.rs` 已覆盖两种客户端响应差异。
+- 2026-08-14 Filmly Android 详情页根因定位：部分媒体源的 `MediaStreams[].Language` 为 JSON `null` 时，爆米花详情页显示“尝试连接时发生错误”；该日期的临时方案曾仅将剧集分集接口对 Filmly User-Agent 的空语言规范化为 `"und"`。该方案已由 2026-08-28 的统一媒体流序列化修复取代。
+- 2026-08-28 Filmly Android 详情页兼容修复：媒体探测结果中的空白/缺失流语言统一输出为 `"und"`，缺失/空白 `DisplayTitle` 按流类型输出 `Video`、`Audio`、`Subtitle` 或 `Unknown`；规则位于统一 Emby `MediaStream` 序列化入口，覆盖分集列表、详情和媒体源响应，不再依赖客户端 User-Agent 后处理。`tests/series_api.rs` 已覆盖空标题的 Filmly 与 VidHub 分集响应。
 - 2026-08-11 Filmly 2.12.3 首页请求修复：`/Users/{userId}/Items` 现在支持 `ExcludeItemTypes`，未指定递归和类型时按 Emby 根层级返回电影/剧集，列表 DTO 补充用户 `CanDownload` 和请求的 `Chapters` 字段；已用真实请求参数加入剧集层级协议回归，真实设备刷新复测仍待完成。
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。

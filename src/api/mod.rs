@@ -3256,8 +3256,6 @@ async fn emby_show_episodes(
     let episodes = catalog
         .list_series_episodes(principal, &series_id, season_id, offset, limit)
         .await;
-    let normalize_filmly_null_languages =
-        header_str(&headers, "user-agent").is_some_and(is_filmly_user_agent);
     match episodes {
         Ok(page) => {
             emby_catalog_page_for_user_with_preferred_source_and_options(
@@ -3269,7 +3267,6 @@ async fn emby_show_episodes(
                 EmbyCatalogPageOptions {
                     preferred_source_id: None,
                     include_start_index: true,
-                    normalize_filmly_null_languages,
                 },
             )
             .await
@@ -3291,7 +3288,6 @@ async fn emby_show_episodes(
                     EmbyCatalogPageOptions {
                         preferred_source_id: None,
                         include_start_index: true,
-                        normalize_filmly_null_languages,
                     },
                 )
                 .await
@@ -3388,7 +3384,6 @@ async fn emby_catalog_page_for_user_with_preferred_source(
         EmbyCatalogPageOptions {
             preferred_source_id,
             include_start_index,
-            normalize_filmly_null_languages: false,
         },
     )
     .await
@@ -3397,7 +3392,6 @@ async fn emby_catalog_page_for_user_with_preferred_source(
 struct EmbyCatalogPageOptions<'a> {
     preferred_source_id: Option<&'a str>,
     include_start_index: bool,
-    normalize_filmly_null_languages: bool,
 }
 
 async fn emby_catalog_page_for_user_with_preferred_source_and_options(
@@ -3418,10 +3412,7 @@ async fn emby_catalog_page_for_user_with_preferred_source_and_options(
     )
     .await
     {
-        Ok(mut items) => {
-            if options.normalize_filmly_null_languages {
-                normalize_filmly_null_languages(&mut items);
-            }
+        Ok(items) => {
             let mut body = json!({
                 "Items": items,
                 "TotalRecordCount": page.total,
@@ -7032,26 +7023,6 @@ fn emby_insert_optional(
     }
 }
 
-fn normalize_filmly_null_languages(items: &mut [Value]) {
-    for item in items {
-        let Some(sources) = item.get_mut("MediaSources").and_then(Value::as_array_mut) else {
-            continue;
-        };
-        for source in sources {
-            let Some(streams) = source.get_mut("MediaStreams").and_then(Value::as_array_mut) else {
-                continue;
-            };
-            for stream in streams {
-                if let Some(object) = stream.as_object_mut()
-                    && object.get("Language").is_some_and(Value::is_null)
-                {
-                    object.insert("Language".to_owned(), json!("und"));
-                }
-            }
-        }
-    }
-}
-
 /// Stable, server-local identifier that mirrors Emby's per-item Etag. Emby uses
 /// a content hash; Lux derives one from the item id so it stays stable across
 /// requests without leaking library paths.
@@ -7430,12 +7401,22 @@ fn normalize_strm_http_location(value: &str) -> Option<HeaderValue> {
 }
 
 fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
+    let language = stream
+        .language
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("und");
+    let display_title = stream
+        .title
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(emby_stream_type(&stream.stream_type));
     let mut value = json!({
         "Index": stream.index,
         "Type": emby_stream_type(&stream.stream_type),
         "Codec": stream.codec,
-        "Language": stream.language,
-        "DisplayTitle": stream.title,
+        "Language": language,
+        "DisplayTitle": display_title,
         "AttachmentSize": 0,
         "IsAnamorphic": false,
         "Protocol": if stream.is_external { "Http" } else { "File" },
@@ -12686,8 +12667,6 @@ struct ItemImageSearchRequest {
 struct ItemImageSelectRequest {
     image_type: String,
     url: String,
-    #[allow(dead_code)]
-    language: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -21046,9 +21025,8 @@ mod tests {
         is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
         is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
         is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        normalize_filmly_null_languages, normalize_strm_http_location, playback_client_label,
-        playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, validate_media_strategy,
+        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
+        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -21450,36 +21428,27 @@ mod tests {
     }
 
     #[test]
-    fn filmly_episode_stream_normalization_replaces_only_null_languages() {
-        let mut items = vec![json!({
-            "MediaSources": [{
-                "MediaStreams": [
-                    {"Type": "Video", "Language": null},
-                    {"Type": "Audio", "Language": "chi"},
-                    {"Type": "Subtitle"}
-                ]
-            }]
-        })];
+    fn emby_media_stream_json_uses_safe_text_defaults_for_missing_probe_metadata() {
+        let stream = CatalogStream {
+            index: 0,
+            stream_type: "VIDEO".to_owned(),
+            codec: None,
+            language: None,
+            title: None,
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::new(),
+        };
 
-        normalize_filmly_null_languages(&mut items);
+        let body = emby_media_stream_json(&stream);
 
-        assert_eq!(
-            items[0]["MediaSources"][0]["MediaStreams"][0]["Language"],
-            "und"
-        );
-        assert_eq!(
-            items[0]["MediaSources"][0]["MediaStreams"][1]["Language"],
-            "chi"
-        );
-        assert!(
-            items[0]["MediaSources"][0]["MediaStreams"][2]
-                .get("Language")
-                .is_none()
-        );
+        assert_eq!(body["Language"], "und");
+        assert_eq!(body["DisplayTitle"], "Video");
     }
 
     #[test]
-    fn filmly_episode_normalization_is_scoped_to_filmly_user_agents() {
+    fn filmly_user_agent_detection_recognizes_known_clients() {
         assert!(is_filmly_user_agent("Filmly/2.12.3-423"));
         assert!(is_filmly_user_agent("网易爆米花/2.12.3-423"));
         assert!(!is_filmly_user_agent("VidHub/1.0"));

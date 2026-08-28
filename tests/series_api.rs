@@ -103,7 +103,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     sqlx::query(
         "INSERT INTO media_streams
          (id, media_source_id, stream_index, stream_type, codec, title, details_json, is_default)
-         VALUES (?, ?, 0, 'VIDEO', 'h264', '1080p', ?, 1)",
+         VALUES (?, ?, 0, 'VIDEO', 'h264', NULL, ?, 1)",
     )
     .bind("filmly-episode-video")
     .bind(&episode_source_id)
@@ -382,9 +382,13 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .await?;
     assert_eq!(vidhub_episodes.status(), reqwest::StatusCode::OK);
     let vidhub_episodes_body: Value = vidhub_episodes.json().await?;
-    assert!(
-        vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Language"]
-            .is_null()
+    assert_eq!(
+        vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Language"],
+        "und"
+    );
+    assert_eq!(
+        vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
+        "Video"
     );
 
     let filmly_episodes = client
@@ -437,6 +441,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(
         filmly_episode["MediaSources"][0]["MediaStreams"][0]["Language"],
         "und"
+    );
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
+        "Video"
     );
 
     let episode_primary_image = client
