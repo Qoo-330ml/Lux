@@ -12667,8 +12667,6 @@ struct ItemImageSearchRequest {
 struct ItemImageSelectRequest {
     image_type: String,
     url: String,
-    #[allow(dead_code)]
-    language: Option<String>,
 }
 
 #[derive(Deserialize)]
