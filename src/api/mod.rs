@@ -13991,15 +13991,22 @@ async fn admin_delete_item(
     if let Some(home) = state.home.as_ref() {
         home.invalidate();
     }
+    let audit_target = if report.source_ids.len() == 1 {
+        ("media_source", report.source_ids[0].as_str())
+    } else {
+        ("media_item", report.item_id.as_str())
+    };
     record_audit_event(
         &state,
         &headers,
         "MEDIA_DELETED",
-        Some("media_source"),
-        Some(&report.source_id),
+        Some(audit_target.0),
+        Some(audit_target.1),
         &format!(
-            r#"{{"itemId":"{}","fileCount":{}}}"#,
-            report.item_id, report.deleted_file_count
+            r#"{{"itemId":"{}","fileCount":{},"sourceCount":{}}}"#,
+            report.item_id,
+            report.deleted_file_count,
+            report.source_ids.len()
         ),
     )
     .await;

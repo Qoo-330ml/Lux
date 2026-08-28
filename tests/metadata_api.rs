@@ -889,3 +889,96 @@ async fn admin_can_remove_a_missing_media_source_from_lux() -> Result<(), Box<dy
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_delete_a_series_and_all_episode_media() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season_dir = root.join("Example Show (2024)").join("Season 1");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    let episode_one = season_dir.join("Example.Show.S01E01.mkv");
+    let episode_one_subtitle = season_dir.join("Example.Show.S01E01.zh.srt");
+    let episode_two = season_dir.join("Example.Show.S01E02.mkv");
+    let episode_two_nfo = season_dir.join("Example.Show.S01E02.nfo");
+    tokio::fs::write(&episode_one, b"fixture").await?;
+    tokio::fs::write(&episode_one_subtitle, b"subtitle").await?;
+    tokio::fs::write(&episode_two, b"fixture").await?;
+    tokio::fs::write(&episode_two_nfo, b"nfo").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let series_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SERIES' AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources ms
+         JOIN media_items mi ON mi.id = ms.item_id
+         WHERE mi.series_id = ? OR mi.id = ?",
+    )
+    .bind(&series_id)
+    .bind(&series_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source_count, 2);
+
+    let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
+    let client = reqwest::Client::new();
+    let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
+    let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
+    let response = client
+        .delete(format!("{base_url}/api/v1/admin/items/{series_id}"))
+        .header(COOKIE, &admin_cookie)
+        .header("x-csrf-token", csrf)
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(!episode_one.exists());
+    assert!(!episode_one_subtitle.exists());
+    assert!(!episode_two.exists());
+    assert!(!episode_two_nfo.exists());
+    let remaining_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources ms
+         JOIN media_items mi ON mi.id = ms.item_id
+         WHERE mi.series_id = ? OR mi.id = ?",
+    )
+    .bind(&series_id)
+    .bind(&series_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_sources, 0);
+    let visible_items: i64 = sqlx::query_scalar(
+        "WITH RECURSIVE descendants(id) AS (
+             SELECT id FROM media_items WHERE id = ?
+             UNION ALL
+             SELECT child.id FROM media_items child
+             JOIN descendants parent ON child.parent_id = parent.id
+         )
+         SELECT COUNT(*) FROM media_items
+         WHERE id IN (SELECT id FROM descendants) AND removed_at IS NULL",
+    )
+    .bind(&series_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(visible_items, 0);
+
+    server.abort();
+    Ok(())
+}

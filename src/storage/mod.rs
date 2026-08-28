@@ -14646,31 +14646,40 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_deletable_media_source_path(
+    pub(crate) async fn find_deletable_media_source_paths(
         &self,
         item_id: &str,
-    ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
         self.query(
-            "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+            "WITH RECURSIVE descendants(id) AS (
+                 SELECT id FROM media_items WHERE id = ?
+                 UNION ALL
+                 SELECT child.id
+                 FROM media_items child
+                 JOIN descendants parent ON child.parent_id = parent.id
+             )
+             SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
-             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN descendants d ON d.id = ms.item_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE mi.id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
-             ORDER BY ms.is_default DESC, ms.id LIMIT 1",
+             WHERE ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+             ORDER BY ms.item_id, ms.is_default DESC, ms.id",
         )
         .bind(item_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            })
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
         })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
