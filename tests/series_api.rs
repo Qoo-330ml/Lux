@@ -103,7 +103,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     sqlx::query(
         "INSERT INTO media_streams
          (id, media_source_id, stream_index, stream_type, codec, title, details_json, is_default)
-         VALUES (?, ?, 0, 'VIDEO', 'h264', '1080p', ?, 1)",
+         VALUES (?, ?, 0, 'VIDEO', 'h264', NULL, ?, 1)",
     )
     .bind("filmly-episode-video")
     .bind(&episode_source_id)
@@ -437,6 +437,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(
         filmly_episode["MediaSources"][0]["MediaStreams"][0]["Language"],
         "und"
+    );
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
+        "Video"
     );
 
     let episode_primary_image = client
