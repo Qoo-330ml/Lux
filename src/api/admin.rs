@@ -1,5 +1,9 @@
 use super::*;
 
+#[path = "admin_handlers.rs"]
+mod admin_handlers;
+pub(super) use admin_handlers::*;
+
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
         .route(
