@@ -592,3 +592,112 @@ pub(super) async fn emby_logout(
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
+
+fn emby_user_json(
+    user: &UserRecord,
+    server_id: &str,
+    server_name: &str,
+    ordered_views: &[String],
+) -> Value {
+    json!({
+        "Id": user.id.to_string(),
+        "ServerId": server_id,
+        "ServerName": server_name,
+        "Name": user.display_name,
+        "HasPassword": true,
+        "HasConfiguredPassword": true,
+        "HasConfiguredEasyPassword": false,
+        "EnableAutoLogin": false,
+        "LastLoginDate": "1970-01-01T00:00:00.0000000Z",
+        "LastActivityDate": "1970-01-01T00:00:00.0000000Z",
+        "Configuration": emby_user_configuration_json(ordered_views),
+        "Policy": emby_user_policy_json(user),
+    })
+}
+
+fn emby_user_configuration_json(ordered_views: &[String]) -> Value {
+    json!({
+        "AudioLanguagePreference": "",
+        "PlayDefaultAudioTrack": true,
+        "SubtitleLanguagePreference": "",
+        "DisplayMissingEpisodes": false,
+        "GroupedFolders": [],
+        "SubtitleMode": "Default",
+        "DisplayCollectionsView": true,
+        "EnableLocalPassword": false,
+        "OrderedViews": ordered_views,
+        "LatestItemsExcludes": [],
+        "MyMediaExcludes": [],
+        "HidePlayedInLatest": false,
+        "RememberAudioSelections": true,
+        "RememberSubtitleSelections": true,
+        "EnableNextEpisodeAutoPlay": true,
+    })
+}
+
+fn emby_user_policy_json(user: &UserRecord) -> Value {
+    json!({
+        "IsAdministrator": user.is_admin,
+        "IsHidden": false,
+        "IsHiddenRemotely": false,
+        "IsDisabled": user.is_disabled,
+        "BlockedTags": [],
+        "EnableUserPreferenceAccess": true,
+        "AccessSchedules": [],
+        "BlockUnratedItems": [],
+        "EnableRemoteControlOfOtherUsers": user.can_manage_server,
+        "EnableSharedDeviceControl": true,
+        "EnableRemoteAccess": user.can_remote_access,
+        "EnableLiveTvManagement": false,
+        "EnableLiveTvAccess": false,
+        "EnableMediaPlayback": true,
+        "EnableAudioPlaybackTranscoding": false,
+        "EnableVideoPlaybackTranscoding": false,
+        "EnablePlaybackRemuxing": false,
+        "EnableContentDeletion": false,
+        "EnableContentDeletionFromFolders": [],
+        "EnableContentDownloading": user.can_download,
+        "EnableSubtitleDownloading": false,
+        "EnableSubtitleManagement": user.can_manage_server,
+        "EnableSyncTranscoding": false,
+        "EnableMediaConversion": false,
+        "EnabledDevices": [],
+        "EnableAllDevices": true,
+        "EnabledChannels": [],
+        "EnableAllChannels": false,
+        "EnabledFolders": [],
+        "EnableAllFolders": true,
+        "InvalidLoginAttemptCount": 0,
+        "EnablePublicSharing": false,
+        "BlockedMediaFolders": [],
+        "BlockedChannels": [],
+        "RemoteClientBitrateLimit": 0,
+        "AuthenticationProviderId": "Lux",
+        "ExcludedSubFolders": [],
+        "DisablePremiumFeatures": true,
+    })
+}
+
+fn emby_login_session_json(result: &crate::auth::emby::EmbyAuthResult, server_id: &str) -> Value {
+    json!({
+        "Id": result.session_id,
+        "ServerId": server_id,
+        "UserId": result.user.id.to_string(),
+        "UserName": result.user.display_name,
+        "Client": result.device.client,
+        "DeviceId": result.device.device_id,
+        "DeviceName": result.device.device,
+        "DeviceType": result.device.device,
+        "ApplicationVersion": result.device.version,
+        "AdditionalUsers": [],
+        "PlayableMediaTypes": ["Audio", "Video"],
+        "SupportedCommands": [],
+        "SupportsRemoteControl": false,
+        "RemoteEndPoint": "",
+        "UserPrimaryImageTag": serde_json::Value::Null,
+        "AppIconUrl": serde_json::Value::Null,
+        "PlaylistItemId": serde_json::Value::Null,
+        "PlayState": {},
+        "Capabilities": {},
+    })
+}

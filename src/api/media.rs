@@ -2898,3 +2898,73 @@ pub(super) fn lux_user_data_json(state: Option<&crate::storage::StoredUserItemSt
         "isPlayed": state.map(|value| value.is_played).unwrap_or(false),
     })
 }
+
+pub(super) const MAX_LUX_CHAPTERS_PER_SOURCE: usize = 1_000;
+
+pub(super) fn lux_catalog_source_json(
+    source: &crate::application::catalog::CatalogSource,
+) -> Value {
+    let mut chapters = source
+        .chapters
+        .iter()
+        .filter(|chapter| chapter.start_position_ticks >= 0 && chapter.chapter_index >= 0)
+        .collect::<Vec<_>>();
+    chapters.sort_by(|left, right| {
+        left.start_position_ticks
+            .cmp(&right.start_position_ticks)
+            .then_with(|| {
+                lux_chapter_marker_rank(&left.marker_type)
+                    .cmp(&lux_chapter_marker_rank(&right.marker_type))
+            })
+            .then(left.chapter_index.cmp(&right.chapter_index))
+    });
+    json!({
+        "id": source.id,
+        "sourceKind": source.source_kind,
+        "container": source.container,
+        "size": source.size,
+        "bitrate": source.bitrate,
+        "durationTicks": source.duration_ticks,
+        "externalUrl": source.external_url,
+        "editionName": source.edition_name,
+        "qualityLabel": source.quality_label,
+        "isDefault": source.is_default,
+        "probeStatus": source.probe_status,
+        "streams": source.streams.iter().map(|stream| json!({
+            "index": stream.index,
+            "type": stream.stream_type,
+            "codec": stream.codec,
+            "language": stream.language,
+            "title": stream.title,
+            "isExternal": stream.is_external,
+            "isDefault": stream.is_default,
+            "isForced": stream.is_forced,
+            "details": &stream.details,
+        })).collect::<Vec<_>>(),
+        "chapters": chapters
+            .into_iter()
+            .take(MAX_LUX_CHAPTERS_PER_SOURCE)
+            .map(lux_catalog_chapter_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
+pub(super) fn lux_chapter_marker_rank(marker_type: &str) -> u8 {
+    match marker_type {
+        "INTRO_START" => 0,
+        "INTRO_END" => 1,
+        "CREDITS_START" => 2,
+        _ => 99,
+    }
+}
+
+pub(super) fn lux_catalog_chapter_json(
+    chapter: &crate::application::catalog::CatalogChapter,
+) -> Value {
+    json!({
+        "startPositionTicks": chapter.start_position_ticks,
+        "name": chapter.name,
+        "markerType": chapter.marker_type,
+        "chapterIndex": chapter.chapter_index,
+    })
+}

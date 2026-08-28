@@ -6404,7 +6404,7 @@ pub(crate) enum MetadataCandidateFailureKind {
 }
 
 impl MetadataCandidateFailureKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ItemNotFound => "ITEM_NOT_FOUND",
             Self::InvalidSearch => "INVALID_SEARCH",
