@@ -22,7 +22,7 @@ type MediaActionRect = Pick<DOMRect, "top" | "bottom" | "left" | "right">;
 type MediaActionSize = Pick<DOMRect, "width" | "height">;
 type MediaViewport = Pick<DOMRect, "width" | "height">;
 
-const NON_MEDIA_ITEM_TYPES = new Set(["SERIES", "SEASON", "BOX_SET", "FOLDER"]);
+const NON_MEDIA_ITEM_TYPES = new Set(["SEASON", "BOX_SET", "FOLDER"]);
 
 export function positionMediaActionMenu(
   trigger: MediaActionRect,

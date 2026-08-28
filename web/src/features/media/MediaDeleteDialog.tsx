@@ -15,6 +15,7 @@ export function MediaDeleteDialog({ item, onClose, onConfirm, onDeleted }: Media
   const closeRef = useRef<HTMLButtonElement>(null);
   const [deleting, setDeleting] = useState(false);
   const [error, setError] = useState<string>();
+  const isSeries = item.itemType === "SERIES";
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -55,8 +56,10 @@ export function MediaDeleteDialog({ item, onClose, onConfirm, onDeleted }: Media
         </header>
         <div className="lux-delete-dialog-body">
           <div className="lux-delete-dialog-icon" aria-hidden="true"><Trash2 size={26} /></div>
-          <p id="lux-delete-description">确定要删除“{mediaTitle(item)}”的当前视频版本吗？</p>
-          <small>视频文件以及同名的字幕、NFO 和图片旁车文件都会被删除。这个操作无法撤销。</small>
+          <p id="lux-delete-description">
+            {isSeries ? `确定要删除“${mediaTitle(item)}”整部剧及所有分集吗？` : `确定要删除“${mediaTitle(item)}”的当前视频版本吗？`}
+          </p>
+          <small>{isSeries ? "整部剧下所有季度和分集的视频文件，以及同名的字幕、NFO 和图片旁车文件都会被删除。这个操作无法撤销。" : "视频文件以及同名的字幕、NFO 和图片旁车文件都会被删除。这个操作无法撤销。"}</small>
           {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
           <div className="lux-delete-dialog-actions">
             <button className="lux-button lux-button-secondary" type="button" disabled={deleting} onClick={onClose}>取消</button>
