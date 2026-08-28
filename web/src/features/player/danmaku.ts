@@ -58,11 +58,32 @@ export class DanmakuParseError extends Error {
   }
 }
 
+export function exceedsUtf8ByteLimit(input: string, limit: number): boolean {
+  if (input.length > limit) return true;
+
+  let bytes = 0;
+  for (let index = 0; index < input.length; index += 1) {
+    const codePoint = input.codePointAt(index) ?? 0;
+    if (codePoint <= 0x7f) {
+      bytes += 1;
+    } else if (codePoint <= 0x7ff) {
+      bytes += 2;
+    } else if (codePoint <= 0xffff) {
+      bytes += 3;
+    } else {
+      bytes += 4;
+      index += 1;
+    }
+    if (bytes > limit) return true;
+  }
+  return false;
+}
+
 export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
   if (typeof input !== "string") {
     throw invalidXml();
   }
-  if (new TextEncoder().encode(input).byteLength > DANMAKU_LIMITS.maxBytes) {
+  if (exceedsUtf8ByteLimit(input, DANMAKU_LIMITS.maxBytes)) {
     throw new DanmakuParseError("INPUT_TOO_LARGE", "弹幕文件过大");
   }
   if (/<!(?:DOCTYPE|ENTITY)\b/i.test(input)) {
@@ -77,24 +98,50 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
   if (/<i\b/i.test(body)) {
     throw invalidXml();
   }
-  const openingCount = (body.match(/<d\b/gi) ?? []).length;
-  const closingCount = (body.match(/<\/d\s*>/gi) ?? []).length;
-  if (openingCount !== closingCount) {
-    throw invalidXml();
-  }
-  if (openingCount > DANMAKU_LIMITS.maxEntries) {
-    throw new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多");
-  }
 
   const entries: LuxDanmakuEntry[] = [];
-  const entryPattern = /<d\b([^>]*)>([\s\S]*?)<\/d\s*>/gi;
-  for (const match of body.matchAll(entryPattern)) {
-    const entry = parseEntry(match[1] ?? "", match[2] ?? "");
-    if (entry) entries.push({ id: "", ...entry });
+  const tagPattern = /<d\b([^>]*)>([\s\S]*?)<\/d\s*>|<d\b|<\/d\s*>/gi;
+  let openingCount = 0;
+  let closingCount = 0;
+  let malformed = false;
+  for (const match of body.matchAll(tagPattern)) {
+    const tag = match[0];
+    const attributes = match[1];
+    const rawText = match[2];
+    if (attributes !== undefined && rawText !== undefined) {
+      openingCount += 1;
+      closingCount += 1;
+      if (openingCount > DANMAKU_LIMITS.maxEntries) {
+        throw new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多");
+      }
+      if (
+        (attributes.includes("<") && /<d\b/i.test(attributes))
+        || (rawText.includes("<") && /<d\b/i.test(rawText))
+      ) {
+        malformed = true;
+      }
+      const entry = parseEntry(attributes, rawText);
+      if (entry) entries.push({ id: "", ...entry });
+      continue;
+    }
+    if (tag.startsWith("</")) {
+      closingCount += 1;
+      continue;
+    }
+
+    openingCount += 1;
+    if (openingCount > DANMAKU_LIMITS.maxEntries) {
+      throw new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多");
+    }
   }
-  return entries
-    .sort((left, right) => left.start - right.start)
-    .map((entry, index) => ({ ...entry, id: `danmaku-${index}` }));
+  if (malformed || openingCount !== closingCount) {
+    throw invalidXml();
+  }
+  entries.sort((left, right) => left.start - right.start);
+  entries.forEach((entry, index) => {
+    entry.id = `danmaku-${index}`;
+  });
+  return entries;
 }
 
 function parseEntry(attributes: string, rawText: string): Omit<LuxDanmakuEntry, "id"> | null {

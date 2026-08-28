@@ -3,11 +3,23 @@ import {
   DanmakuParseError,
   activeDanmaku,
   assignDanmakuLanes,
+  exceedsUtf8ByteLimit,
   parseBilibiliDanmaku,
 } from "../src/features/player/danmaku";
 import { parseDanmakuWorkerRequest } from "../src/features/player/danmaku-worker";
 
 describe("LuxPlayer danmaku parser", () => {
+  it("checks UTF-8 byte limits without changing Unicode byte semantics", () => {
+    expect(exceedsUtf8ByteLimit("ascii", 5)).toBe(false);
+    expect(exceedsUtf8ByteLimit("ascii", 4)).toBe(true);
+    expect(exceedsUtf8ByteLimit("中文", 5)).toBe(true);
+    expect(exceedsUtf8ByteLimit("中文", 6)).toBe(false);
+    expect(exceedsUtf8ByteLimit("🙂", 3)).toBe(true);
+    expect(exceedsUtf8ByteLimit("🙂", 4)).toBe(false);
+    expect(exceedsUtf8ByteLimit("\uD800", 2)).toBe(true);
+    expect(exceedsUtf8ByteLimit("\uD800", 3)).toBe(false);
+  });
+
   it("normalizes bounded Bilibili XML into text-only supported modes", () => {
     expect(parseBilibiliDanmaku(
       '<i><d p="2,1,25,16711680,0,0,0,0">&lt;b&gt;滚动&lt;/b&gt;</d><d p="3,5,30,16777215,0,0,0,0">顶部</d><d p="4,4,20,255,0,0,0,0">底部</d></i>',
@@ -27,6 +39,19 @@ describe("LuxPlayer danmaku parser", () => {
     expect(parseBilibiliDanmaku(
       '<i><d p="1,7,25,0,0,0,0,0">高级模式</d><d p="-1,1,25,0,0,0,0,0">负时间</d><d p="1,1,25,0,0,0,0,0">safe\u0000text</d><d p="1,1,25,0,0,0,0,0"></d></i>',
     )).toEqual([]);
+    expect(() => parseBilibiliDanmaku(
+      '<i><d p="1,1,25,0,0,0,0,0">unclosed</i>',
+    )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
+    expect(() => parseBilibiliDanmaku(
+      '<i><d p="1,1,25,0,0,0,0,0">outer<d p="1,1,25,0,0,0,0,0">inner</d></d></i>',
+    )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
+  });
+
+  it("rejects more raw entries than the parser limit", () => {
+    const entry = '<d p="1,1,25,0,0,0,0,0">entry</d>';
+    expect(() => parseBilibiliDanmaku(
+      `<i>${entry.repeat(5_001)}</i>`,
+    )).toThrowError(new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多"));
   });
 
   it("keeps worker parsing failures scoped to the request generation", () => {

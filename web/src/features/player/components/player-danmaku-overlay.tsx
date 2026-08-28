@@ -5,6 +5,7 @@ import {
   assignDanmakuLanes,
   DANMAKU_LIMITS,
   parseBilibiliDanmaku,
+  exceedsUtf8ByteLimit,
   type DanmakuPlacement,
   type LuxDanmakuEntry,
 } from "../danmaku";
@@ -166,7 +167,7 @@ async function readDanmakuResponse(response: Response, signal: AbortSignal) {
   }
   if (!response.body) {
     const text = await response.text();
-    if (new TextEncoder().encode(text).byteLength > DANMAKU_LIMITS.maxBytes) {
+    if (exceedsUtf8ByteLimit(text, DANMAKU_LIMITS.maxBytes)) {
       throw new Error("弹幕文件过大");
     }
     return text;
