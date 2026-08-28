@@ -8,7 +8,11 @@ use std::{
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value, json};
-use tokio::{fs, io::AsyncWriteExt, sync::RwLock};
+use tokio::{
+    fs,
+    io::AsyncWriteExt,
+    sync::{Mutex, RwLock},
+};
 use uuid::Uuid;
 
 use crate::network::is_public_address;
@@ -105,6 +109,7 @@ pub struct PluginService {
     database: Database,
     config_dir: PathBuf,
     catalog: Arc<RwLock<PluginCatalog>>,
+    catalog_refresh_lock: Arc<Mutex<()>>,
     supervisor: PluginSupervisor,
     store: Option<PluginStore>,
     provider_cache: ProviderResponseCache,
@@ -131,6 +136,7 @@ impl PluginService {
             database,
             config_dir: config_dir.clone(),
             catalog,
+            catalog_refresh_lock: Arc::new(Mutex::new(())),
             supervisor,
             store,
             provider_cache: ProviderResponseCache::new(Some(
@@ -298,6 +304,7 @@ impl PluginService {
         remove_plugin_config(&self.config_dir, &plugin_id)
             .await
             .map_err(PluginServiceError::ConfigIo)?;
+        let _catalog_refresh_guard = self.catalog_refresh_lock.lock().await;
         self.supervisor.stop(&plugin_id).await;
         remove_plugin_files(plugin)
             .await
@@ -308,7 +315,8 @@ impl PluginService {
         } else if is_chapter_detector_plugin(plugin) {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
-        *self.catalog.write().await = PluginCatalog::discover(&self.config_dir.join("plugins"));
+        let catalog = discover_plugin_catalog(self.config_dir.join("plugins"), None).await?;
+        *self.catalog.write().await = catalog;
         Ok(())
     }
 
@@ -1653,11 +1661,18 @@ impl PluginService {
             let _ = fs::remove_dir_all(&validation_dir).await;
             return Err(PluginServiceError::ConfigIo(error));
         }
-        let validation_catalog = PluginCatalog::discover(&validation_dir);
+        let validation_catalog = match discover_plugin_catalog(validation_dir.clone(), None).await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let _ = fs::remove_dir_all(&validation_dir).await;
+                return Err(error);
+            }
+        };
         if validation_catalog.get(&entry.id).is_none() {
             let _ = fs::remove_dir_all(&validation_dir).await;
             return Err(PluginServiceError::Store(PluginStoreError::InvalidPackage));
         }
+        let _catalog_refresh_guard = self.catalog_refresh_lock.lock().await;
         if stop_running {
             self.supervisor.stop(&entry.id).await;
         }
@@ -1676,7 +1691,19 @@ impl PluginService {
         // Keep the previous archives until the newly moved archive is visible in a
         // fresh catalog. This matters for updates: a discovery failure must leave
         // the old package available for the next attempt.
-        let catalog = PluginCatalog::discover_prefer(&plugin_dir, &entry.id, &entry.version);
+        let catalog = match discover_plugin_catalog(
+            plugin_dir.clone(),
+            Some((entry.id.clone(), entry.version.clone())),
+        )
+        .await
+        {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let _ = fs::remove_file(&destination).await;
+                let _ = fs::remove_dir_all(&validation_dir).await;
+                return Err(error);
+            }
+        };
         if !catalog
             .get(&entry.id)
             .is_some_and(|plugin| plugin.manifest.version == entry.version)
@@ -1860,6 +1887,24 @@ impl PluginService {
             plugin_id.to_owned()
         }
     }
+}
+
+async fn discover_plugin_catalog(
+    plugin_dir: PathBuf,
+    preferred_plugin: Option<(String, String)>,
+) -> Result<PluginCatalog, PluginServiceError> {
+    tokio::task::spawn_blocking(move || match preferred_plugin {
+        Some((plugin_id, plugin_version)) => {
+            PluginCatalog::discover_prefer(&plugin_dir, &plugin_id, &plugin_version)
+        }
+        None => PluginCatalog::discover(&plugin_dir),
+    })
+    .await
+    .map_err(|error| {
+        PluginServiceError::ConfigIo(io::Error::other(format!(
+            "plugin discovery task failed: {error}"
+        )))
+    })
 }
 
 fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> Map<String, Value> {
