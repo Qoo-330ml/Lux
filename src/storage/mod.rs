@@ -3237,35 +3237,83 @@ impl Database {
                 source,
             })?;
         let list_query = format!(
-            "SELECT MIN(pc.item_id) AS item_id,
-                    MIN(pc.person_id) AS person_id,
-                    MIN(pc.lux_person_id) AS lux_person_id,
-                    MIN(pc.provider) AS provider,
-                    MIN(pc.person_name) AS person_name,
-                    MIN(pc.role) AS role,
-                    MIN(mi.added_at) AS date_created,
-                    MIN(pc.biography) AS biography,
-                    MIN(pc.birthday) AS birthday,
-                    MIN(pc.deathday) AS deathday,
-                    MIN(pc.known_for_department) AS known_for_department,
-                    MIN(pc.place_of_birth) AS place_of_birth,
-                    MIN(pc.provider_ids_json) AS provider_ids_json,
-                    MIN(pc.genres_json) AS genres_json,
-                    MIN(pc.tags_json) AS tags_json,
-                    MIN(pc.production_locations_json) AS production_locations_json,
-                    MIN(pc.premiere_date) AS premiere_date,
-                    MIN(pc.production_year) AS production_year,
-                    MIN(pc.taglines_json) AS taglines_json
-             FROM person_credits pc
-             JOIN media_items mi ON mi.id = pc.item_id
-             LEFT JOIN person_identities pi
-               ON pi.provider = pc.provider
-              AND pi.provider_id = pc.person_id
-             WHERE mi.library_id IN ({placeholders})
-               AND mi.removed_at IS NULL
-               {recursive_clause}
-               AND pc.person_type = ?
-             GROUP BY {person_group}
+            "WITH eligible_person_credits AS (
+                 SELECT pc.item_id,
+                        pc.person_type,
+                        pc.provider,
+                        pc.person_id,
+                        pc.role,
+                        mi.added_at,
+                        {person_group} AS person_group
+                 FROM person_credits pc
+                 JOIN media_items mi ON mi.id = pc.item_id
+                 LEFT JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
+                 WHERE mi.library_id IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   {recursive_clause}
+                   AND pc.person_type = ?
+             ), ranked_person_credits AS (
+                 SELECT eligible_person_credits.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY person_group
+                            ORDER BY item_id ASC,
+                                     provider ASC,
+                                     person_id ASC,
+                                     role ASC
+                        ) AS representative_rank,
+                        MIN(added_at) OVER (PARTITION BY person_group) AS date_created
+                 FROM eligible_person_credits
+             )
+             SELECT representative.item_id,
+                    representative.person_id,
+                    representative.lux_person_id,
+                    representative.provider,
+                    representative.person_name,
+                    representative.role,
+                    representative.date_created,
+                    representative.biography,
+                    representative.birthday,
+                    representative.deathday,
+                    representative.known_for_department,
+                    representative.place_of_birth,
+                    representative.provider_ids_json,
+                    representative.genres_json,
+                    representative.tags_json,
+                    representative.production_locations_json,
+                    representative.premiere_date,
+                    representative.production_year,
+                    representative.taglines_json
+             FROM (
+                 SELECT pc.item_id,
+                        pc.person_id,
+                        pc.lux_person_id,
+                        pc.provider,
+                        pc.person_name,
+                        pc.role,
+                        ranked.date_created,
+                        pc.biography,
+                        pc.birthday,
+                        pc.deathday,
+                        pc.known_for_department,
+                        pc.place_of_birth,
+                        pc.provider_ids_json,
+                        pc.genres_json,
+                        pc.tags_json,
+                        pc.production_locations_json,
+                        pc.premiere_date,
+                        pc.production_year,
+                        pc.taglines_json
+                 FROM ranked_person_credits ranked
+                 JOIN person_credits pc
+                   ON pc.item_id = ranked.item_id
+                  AND pc.person_type = ranked.person_type
+                  AND pc.provider = ranked.provider
+                  AND pc.person_id = ranked.person_id
+                  AND pc.role = ranked.role
+                 WHERE ranked.representative_rank = 1
+             ) AS representative
              ORDER BY {person_sort_order}
              LIMIT ? OFFSET ?"
         );
@@ -3349,41 +3397,89 @@ impl Database {
                 source,
             })?;
         let list_query = format!(
-            "SELECT MIN(pc.item_id) AS item_id,
-                    MIN(pc.person_id) AS person_id,
-                    MIN(pc.lux_person_id) AS lux_person_id,
-                    MIN(pc.provider) AS provider,
-                    MIN(pc.person_name) AS person_name,
-                    MIN(pc.role) AS role,
-                    MIN(mi.added_at) AS date_created,
-                    MIN(pc.biography) AS biography,
-                    MIN(pc.birthday) AS birthday,
-                    MIN(pc.deathday) AS deathday,
-                    MIN(pc.known_for_department) AS known_for_department,
-                    MIN(pc.place_of_birth) AS place_of_birth,
-                    MIN(pc.provider_ids_json) AS provider_ids_json,
-                    MIN(pc.genres_json) AS genres_json,
-                    MIN(pc.tags_json) AS tags_json,
-                    MIN(pc.production_locations_json) AS production_locations_json,
-                    MIN(pc.premiere_date) AS premiere_date,
-                    MIN(pc.production_year) AS production_year,
-                    MIN(pc.taglines_json) AS taglines_json
-             FROM person_credits pc
-             JOIN media_items mi ON mi.id = pc.item_id
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             LEFT JOIN person_identities pi
-               ON pi.provider = pc.provider
-              AND pi.provider_id = pc.person_id
-             WHERE mi.library_id IN ({placeholders})
-               AND mi.removed_at IS NULL
-               {CATALOG_VISIBLE_PREDICATE}
-               AND pc.person_type = ?
-               AND pc.person_name LIKE ? ESCAPE '\\'
-             GROUP BY {person_group}
-             ORDER BY CASE WHEN LOWER(MIN(pc.person_name)) = LOWER(?) THEN 0 ELSE 1 END,
-                      LOWER(MIN(pc.person_name)) ASC,
-                      MIN(pc.provider) ASC,
-                      MIN(pc.person_id) ASC
+            "WITH eligible_person_credits AS (
+                 SELECT pc.item_id,
+                        pc.person_type,
+                        pc.provider,
+                        pc.person_id,
+                        pc.role,
+                        mi.added_at,
+                        {person_group} AS person_group
+                 FROM person_credits pc
+                 JOIN media_items mi ON mi.id = pc.item_id
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 LEFT JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
+                 WHERE mi.library_id IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   {CATALOG_VISIBLE_PREDICATE}
+                   AND pc.person_type = ?
+                   AND pc.person_name LIKE ? ESCAPE '\\'
+             ), ranked_person_credits AS (
+                 SELECT eligible_person_credits.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY person_group
+                            ORDER BY item_id ASC,
+                                     provider ASC,
+                                     person_id ASC,
+                                     role ASC
+                        ) AS representative_rank,
+                        MIN(added_at) OVER (PARTITION BY person_group) AS date_created
+                 FROM eligible_person_credits
+             )
+             SELECT representative.item_id,
+                    representative.person_id,
+                    representative.lux_person_id,
+                    representative.provider,
+                    representative.person_name,
+                    representative.role,
+                    representative.date_created,
+                    representative.biography,
+                    representative.birthday,
+                    representative.deathday,
+                    representative.known_for_department,
+                    representative.place_of_birth,
+                    representative.provider_ids_json,
+                    representative.genres_json,
+                    representative.tags_json,
+                    representative.production_locations_json,
+                    representative.premiere_date,
+                    representative.production_year,
+                    representative.taglines_json
+             FROM (
+                 SELECT pc.item_id,
+                        pc.person_id,
+                        pc.lux_person_id,
+                        pc.provider,
+                        pc.person_name,
+                        pc.role,
+                        ranked.date_created,
+                        pc.biography,
+                        pc.birthday,
+                        pc.deathday,
+                        pc.known_for_department,
+                        pc.place_of_birth,
+                        pc.provider_ids_json,
+                        pc.genres_json,
+                        pc.tags_json,
+                        pc.production_locations_json,
+                        pc.premiere_date,
+                        pc.production_year,
+                        pc.taglines_json
+                 FROM ranked_person_credits ranked
+                 JOIN person_credits pc
+                   ON pc.item_id = ranked.item_id
+                  AND pc.person_type = ranked.person_type
+                  AND pc.provider = ranked.provider
+                  AND pc.person_id = ranked.person_id
+                  AND pc.role = ranked.role
+                 WHERE ranked.representative_rank = 1
+             ) AS representative
+             ORDER BY CASE WHEN LOWER(representative.person_name) = LOWER(?) THEN 0 ELSE 1 END,
+                      LOWER(representative.person_name) ASC,
+                      representative.provider ASC,
+                      representative.person_id ASC
              LIMIT ? OFFSET ?"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(list_query));
@@ -18787,10 +18883,10 @@ fn person_sort_order(sort_by: PersonSort, descending: bool) -> String {
     let direction = if descending { "DESC" } else { "ASC" };
     match sort_by {
         PersonSort::Name => format!(
-            "MIN(pc.person_name) {direction}, MIN(mi.added_at) DESC, MIN(pc.provider) ASC, MIN(pc.person_id) ASC"
+            "representative.person_name {direction}, representative.date_created DESC, representative.provider ASC, representative.person_id ASC"
         ),
         PersonSort::DateCreated => format!(
-            "MIN(mi.added_at) {direction}, MIN(pc.person_name) ASC, MIN(pc.provider) ASC, MIN(pc.person_id) ASC"
+            "representative.date_created {direction}, representative.person_name ASC, representative.provider ASC, representative.person_id ASC"
         ),
     }
 }
@@ -20070,6 +20166,115 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn person_credit_list_uses_one_consistent_representative_row() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        for (item_id, added_at) in [("item-a", 200_i64), ("item-b", 100_i64)] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .bind(added_at)
+            .execute(database.pool())
+            .await
+            .expect("media item");
+        }
+        database
+            .replace_person_credits(
+                "item-a",
+                &[NewPersonCredit {
+                    person_id: "1".to_owned(),
+                    lux_person_id: Some("lux-000001".to_owned()),
+                    person_type: "Actor".to_owned(),
+                    person_name: "同一演员".to_owned(),
+                    provider: "tmdb".to_owned(),
+                    role: "alpha-role".to_owned(),
+                    sort_order: 0,
+                    biography: Some("z-biography".to_owned()),
+                    birthday: None,
+                    deathday: None,
+                    known_for_department: None,
+                    place_of_birth: None,
+                    provider_ids: BTreeMap::new(),
+                    genres: Vec::new(),
+                    tags: Vec::new(),
+                    production_locations: Vec::new(),
+                    premiere_date: None,
+                    production_year: None,
+                    taglines: Vec::new(),
+                }],
+            )
+            .await
+            .expect("first person credit");
+        database
+            .replace_person_credits(
+                "item-b",
+                &[NewPersonCredit {
+                    person_id: "9".to_owned(),
+                    lux_person_id: Some("lux-000001".to_owned()),
+                    person_type: "Actor".to_owned(),
+                    person_name: "同一演员".to_owned(),
+                    provider: "douban".to_owned(),
+                    role: "zeta-role".to_owned(),
+                    sort_order: 0,
+                    biography: Some("a-biography".to_owned()),
+                    birthday: None,
+                    deathday: None,
+                    known_for_department: None,
+                    place_of_birth: None,
+                    provider_ids: BTreeMap::new(),
+                    genres: Vec::new(),
+                    tags: Vec::new(),
+                    production_locations: Vec::new(),
+                    premiere_date: None,
+                    production_year: None,
+                    taglines: Vec::new(),
+                }],
+            )
+            .await
+            .expect("second person credit");
+
+        let (credits, total) = database
+            .list_person_credits_for_library(
+                &library_id,
+                "Actor",
+                PersonListOptions {
+                    recursive: true,
+                    sort_by: PersonSort::Name,
+                    descending: false,
+                    offset: 0,
+                    limit: 10,
+                },
+            )
+            .await
+            .expect("list person credits");
+
+        assert_eq!(total, 1);
+        let credit = credits.first().expect("representative person credit");
+        assert_eq!(credit.provider, "tmdb");
+        assert_eq!(credit.person_id, "1");
+        assert_eq!(credit.role, "alpha-role");
+        assert_eq!(credit.biography.as_deref(), Some("z-biography"));
+        assert_eq!(credit.date_created, 100);
     }
 
     #[tokio::test]
