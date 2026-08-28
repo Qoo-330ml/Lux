@@ -35,6 +35,8 @@ const AUTO_LIBRARY_COVER_WIDTH: u32 = 1280;
 const AUTO_LIBRARY_COVER_HEIGHT: u32 = 720;
 const AUTO_LIBRARY_COVER_TITLE_FONT_SIZE: f32 = 240.0;
 const AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE: f32 = 100.0;
+const AUTO_LIBRARY_COVER_TITLE_Y: i32 = 416;
+const AUTO_LIBRARY_COVER_SUBTITLE_Y: i32 = 646;
 const SMILEY_SANS_FONT: &[u8] = include_bytes!("../../assets/fonts/SmileySans-Oblique.ttf");
 
 #[derive(Clone)]
@@ -976,8 +978,8 @@ fn draw_library_text(canvas: &mut RgbaImage, name: &str, subtitle: &str, font: &
     let line_height = font.as_scaled(scale).height().ceil() as i32;
     let subtitle_scale =
         PxScale::from(scale_cover_font_size(AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE));
-    let subtitle_y = scale_cover_coordinate(626);
-    let title_y = scale_cover_coordinate(432);
+    let subtitle_y = scale_cover_coordinate(AUTO_LIBRARY_COVER_SUBTITLE_Y);
+    let title_y = scale_cover_coordinate(AUTO_LIBRARY_COVER_TITLE_Y);
     draw_accent_bar(
         canvas,
         scale_cover_coordinate(113),
@@ -1157,9 +1159,10 @@ mod tests {
     use image::Rgba;
 
     use super::{
-        AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE, AUTO_LIBRARY_COVER_TITLE_FONT_SIZE, RgbaImage,
-        add_shadow, bundled_cover_font, library_kind_subtitle, rotate_cover_column,
-        scale_cover_coordinate, scale_cover_dimension, scale_cover_font_size,
+        AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE, AUTO_LIBRARY_COVER_SUBTITLE_Y,
+        AUTO_LIBRARY_COVER_TITLE_FONT_SIZE, AUTO_LIBRARY_COVER_TITLE_Y, RgbaImage, add_shadow,
+        bundled_cover_font, library_kind_subtitle, rotate_cover_column, scale_cover_coordinate,
+        scale_cover_dimension, scale_cover_font_size,
     };
 
     #[test]
@@ -1194,6 +1197,17 @@ mod tests {
         assert_eq!(scale_cover_dimension(610), 407);
         assert_eq!(scale_cover_coordinate(350), 233);
         assert_eq!(scale_cover_coordinate(-200), -133);
+    }
+
+    #[test]
+    fn cover_text_layout_moves_title_up_and_opens_the_gap() {
+        let title_y = scale_cover_coordinate(AUTO_LIBRARY_COVER_TITLE_Y);
+        let subtitle_y = scale_cover_coordinate(AUTO_LIBRARY_COVER_SUBTITLE_Y);
+        assert!(title_y < scale_cover_coordinate(432));
+        assert!(subtitle_y > scale_cover_coordinate(626));
+        assert!(subtitle_y - title_y >= scale_cover_coordinate(220));
+        assert_eq!(title_y, 277);
+        assert_eq!(subtitle_y, 431);
     }
 
     #[test]
