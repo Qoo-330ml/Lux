@@ -70,6 +70,7 @@ describe("LuxPlayer state components", () => {
 
     expect(markup).toContain('class="lux-player-frame"');
     expect(markup).toContain('src="/signed/movie-1"');
+    expect(markup).toContain('crossorigin="anonymous"');
     expect(markup).toContain('poster="/images/movie-1"');
     expect(markup).toContain('aria-label="播放 示例电影"');
     expect(markup).toContain("正在准备客户端解码…");

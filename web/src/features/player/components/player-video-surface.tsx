@@ -184,6 +184,7 @@ export function PlayerVideoSurface({
         <video
           ref={videoRef}
           className="lux-video"
+          crossOrigin="anonymous"
           src={streamUrl}
           poster={poster ?? undefined}
           preload="metadata"
