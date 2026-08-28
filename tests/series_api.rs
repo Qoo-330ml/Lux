@@ -382,9 +382,13 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .await?;
     assert_eq!(vidhub_episodes.status(), reqwest::StatusCode::OK);
     let vidhub_episodes_body: Value = vidhub_episodes.json().await?;
-    assert!(
-        vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Language"]
-            .is_null()
+    assert_eq!(
+        vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["Language"],
+        "und"
+    );
+    assert_eq!(
+        vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
+        "Video"
     );
 
     let filmly_episodes = client
