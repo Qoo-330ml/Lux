@@ -1,5 +1,5 @@
 import { AlertCircle, ArrowLeft, Pause, Play } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -8,7 +8,11 @@ import type {
 } from "react";
 import type { PlayerFailure } from "./player-diagnostics";
 import { usePlayerSurfaceGestures } from "./player-gestures";
-import type { PlayerNativeCaptionTrack } from "./player-captions";
+import {
+  readPlayerRuntimeCaptionTracks,
+  type PlayerNativeCaptionTrack,
+  type PlayerRuntimeCaptionTrack,
+} from "./player-captions";
 import { createNativeCaptionOffsetController } from "../caption-offset";
 import {
   DEFAULT_VIDEO_PRESENTATION,
@@ -31,6 +35,8 @@ type PlayerVideoSurfaceProps = {
   onTimeUpdate?: () => void;
   onEnded?: () => void;
   captionTrack?: PlayerNativeCaptionTrack | null;
+  nativeCaptionTrackId?: string | null;
+  onNativeCaptionTracksChange?: (tracks: PlayerRuntimeCaptionTrack[]) => void;
   captionOffset?: number;
   captionDuration?: number | null;
   captionLifecycleKey?: string;
@@ -74,6 +80,8 @@ export function PlayerVideoSurface({
   onTimeUpdate,
   onEnded,
   captionTrack = null,
+  nativeCaptionTrackId = null,
+  onNativeCaptionTracksChange,
   captionOffset = 0,
   captionDuration = null,
   captionLifecycleKey = "",
@@ -93,6 +101,7 @@ export function PlayerVideoSurface({
   gestureOptions,
 }: PlayerVideoSurfaceProps) {
   const frameRef = useRef<HTMLDivElement>(null);
+  const videoElementRef = useRef<HTMLVideoElement | null>(null);
   const captionTrackRef = useRef<HTMLTrackElement>(null);
   const captionOffsetControllerRef = useRef<ReturnType<typeof createNativeCaptionOffsetController> | null>(null);
   const [presentationSize, setPresentationSize] = useState<ReturnType<typeof playerVideoPresentationSize>>(null);
@@ -108,6 +117,69 @@ export function PlayerVideoSurface({
     onActivity: gestureOptions?.onActivity ?? (() => undefined),
     onInteractionChange: gestureOptions?.onInteractionChange ?? (() => undefined),
   });
+
+  const setVideoElementRef = useCallback((video: HTMLVideoElement | null) => {
+    videoElementRef.current = video;
+    videoRef(video);
+  }, [videoRef]);
+
+  useEffect(() => {
+    const video = videoElementRef.current;
+    if (!video) {
+      onNativeCaptionTracksChange?.([]);
+      return;
+    }
+    const publishTracks = () => onNativeCaptionTracksChange?.(readPlayerRuntimeCaptionTracks(video));
+    const textTracks = video.textTracks;
+    publishTracks();
+    video.addEventListener("loadedmetadata", publishTracks);
+    const supportsTrackEvents = typeof textTracks.addEventListener === "function";
+    if (supportsTrackEvents) {
+      textTracks.addEventListener("addtrack", publishTracks);
+      textTracks.addEventListener("removetrack", publishTracks);
+    }
+    return () => {
+      video.removeEventListener("loadedmetadata", publishTracks);
+      if (supportsTrackEvents) {
+        textTracks.removeEventListener("addtrack", publishTracks);
+        textTracks.removeEventListener("removetrack", publishTracks);
+      }
+      onNativeCaptionTracksChange?.([]);
+    };
+  }, [captionLifecycleKey, onNativeCaptionTracksChange, streamUrl]);
+
+  useEffect(() => {
+    const video = videoElementRef.current;
+    if (!video) return;
+    let runtimeTracks: PlayerRuntimeCaptionTrack[];
+    try {
+      runtimeTracks = readPlayerRuntimeCaptionTracks(video);
+    } catch {
+      return;
+    }
+    let tracks: TextTrack[];
+    try {
+      const ownedTracks = new Set<TextTrack>();
+      for (const element of Array.from(video.querySelectorAll("track"))) {
+        const track = element.track;
+        if (track) ownedTracks.add(track);
+      }
+      tracks = Array.from(video.textTracks).filter(
+        (track) => (track.kind === "subtitles" || track.kind === "captions")
+          && !ownedTracks.has(track),
+      );
+    } catch {
+      return;
+    }
+    tracks.forEach((track, index) => {
+      track.mode = runtimeTracks[index]?.id === nativeCaptionTrackId ? "showing" : "disabled";
+    });
+    return () => {
+      tracks.forEach((track) => {
+        track.mode = "disabled";
+      });
+    };
+  }, [captionLifecycleKey, nativeCaptionTrackId, streamUrl]);
 
   useEffect(() => {
     if (presentation.aspectRatio === "default") {
@@ -182,7 +254,7 @@ export function PlayerVideoSurface({
     <div ref={frameRef} className="lux-player-frame">
       {streamUrl ? (
         <video
-          ref={videoRef}
+          ref={setVideoElementRef}
           className="lux-video"
           crossOrigin="anonymous"
           src={streamUrl}
@@ -208,6 +280,7 @@ export function PlayerVideoSurface({
             <track
               key={`${captionTrack.src}:${captionLifecycleKey}`}
               ref={captionTrackRef}
+              id={captionTrack.id}
               kind="subtitles"
               label={captionTrack.label}
               srcLang={captionTrack.language}

@@ -1,7 +1,15 @@
 import type { MediaSource, MediaStream } from "../../../lib/api/types";
 import type { CaptionFormat } from "../caption-parser";
 
-export type PlayerCaptionRenderMode = "native" | "overlay";
+export type PlayerCaptionRenderMode = "native" | "native-inband" | "overlay";
+
+export type PlayerRuntimeCaptionTrack = {
+  id: string;
+  label: string;
+  language?: string;
+  kind: string;
+  ordinal: number;
+};
 
 export type PlayerCaptionOption = {
   streamIndex: number;
@@ -14,6 +22,7 @@ export type PlayerCaptionOption = {
   isForced: boolean;
   format?: CaptionFormat;
   renderMode?: PlayerCaptionRenderMode;
+  runtimeTrackId?: string;
 };
 
 export type PlayerNativeCaptionTrack = {
@@ -30,14 +39,21 @@ export type PlayerOverlayCaptionSource = PlayerNativeCaptionTrack & {
 export function playerCaptionOptions(
   source: MediaSource | undefined,
   nativeTracksSupported: boolean,
+  runtimeTracks: readonly PlayerRuntimeCaptionTrack[] = [],
 ): PlayerCaptionOption[] {
+  let embeddedTextOrdinal = 0;
   return (source?.streams ?? [])
     .filter(isSubtitleStream)
     .filter((stream): stream is MediaStream & { index: number } => Number.isInteger(stream.index) && stream.index >= 0)
     .map((stream) => {
       const format = captionFormat(stream);
-      const renderMode = format === "vtt" && nativeTracksSupported ? "native" : "overlay";
-      const unavailableReason = captionUnavailableReason(stream, format);
+      const runtimeTrack = !stream.isExternal && format ? runtimeTracks[embeddedTextOrdinal++] : undefined;
+      const renderMode = runtimeTrack
+        ? "native-inband"
+        : stream.isExternal && format === "vtt" && nativeTracksSupported
+          ? "native"
+          : "overlay";
+      const unavailableReason = captionUnavailableReason(source, stream, format, runtimeTrack);
       const name = captionName(stream);
       return {
         streamIndex: stream.index,
@@ -50,6 +66,7 @@ export function playerCaptionOptions(
         isForced: stream.isForced === true,
         format,
         renderMode,
+        runtimeTrackId: runtimeTrack?.id,
       };
     });
 }
@@ -58,6 +75,27 @@ export function defaultCaptionSelection(options: readonly PlayerCaptionOption[])
   return options.find((option) => option.available && option.isDefault)
     ?? options.find((option) => option.available)
     ?? null;
+}
+
+export function readPlayerRuntimeCaptionTracks(video: HTMLVideoElement): PlayerRuntimeCaptionTrack[] {
+  try {
+    const ownedTracks = new Set<TextTrack>();
+    for (const element of Array.from(video.querySelectorAll("track"))) {
+      const track = element.track;
+      if (track) ownedTracks.add(track);
+    }
+    return Array.from(video.textTracks)
+      .filter((track) => (track.kind === "subtitles" || track.kind === "captions") && !ownedTracks.has(track))
+      .map((track, ordinal) => ({
+        id: normalizedText(track.id) ?? `inband-caption-${ordinal}`,
+        label: normalizedText(track.label) ?? `字幕轨道 ${ordinal + 1}`,
+        language: normalizedText(track.language),
+        kind: track.kind,
+        ordinal,
+      }));
+  } catch {
+    return [];
+  }
 }
 
 export function nativeCaptionTrack(
@@ -95,16 +133,28 @@ function isSubtitleStream(stream: MediaStream) {
   return stream.type?.toUpperCase() === "SUBTITLE";
 }
 
-function captionUnavailableReason(stream: MediaStream, format: CaptionFormat | undefined) {
-  if (stream.isExternal !== true) return "内嵌字幕将在后续支持";
+function captionUnavailableReason(
+  source: MediaSource | undefined,
+  stream: MediaStream,
+  format: CaptionFormat | undefined,
+  runtimeTrack: PlayerRuntimeCaptionTrack | undefined,
+) {
   if (!format) return "当前不支持此字幕格式";
+  if (stream.isExternal !== true) {
+    if (runtimeTrack) return undefined;
+    if (source?.sourceKind === "LOCAL_FILE" && ["srt", "ass", "ssa"].includes(format)) return undefined;
+    if (source?.sourceKind === "STRM_URL") return "浏览器未暴露远程内嵌字幕";
+    return "浏览器未暴露内嵌字幕";
+  }
   return undefined;
 }
 
 function captionFormat(stream: MediaStream): CaptionFormat | undefined {
   const codec = stream.codec?.trim().toLowerCase();
-  return codec === "srt" || codec === "ass" || codec === "ssa" || codec === "vtt"
-    ? codec
+  return codec === "srt" || codec === "subrip"
+    ? "srt"
+    : codec === "ass" || codec === "ssa" || codec === "vtt"
+      ? codec
     : undefined;
 }
 
