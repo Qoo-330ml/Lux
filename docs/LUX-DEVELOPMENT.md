@@ -5166,11 +5166,11 @@ repository 方法或 People 用例。此任务不引入新依赖、不新增端�
 
 验收：
 
-- [ ] API facade 不再承载完整领域 handler；Emby 路由/DTO、Lux API、管理员、用户、媒体和播放实现位于明确子模块。
-- [ ] Storage facade 不再承载完整 SQL repository；媒体、人物、会话、迁移和共享查询/模型边界清晰。
-- [ ] PeopleService 的关系/匹配、元数据、资源和索引恢复实现分离，外部调用路径保持不变。
-- [ ] 现有 Rust/Web 行为测试不变且通过；模块移动没有改变公开 HTTP 合同、错误码或数据库行为。
-- [ ] 每个增量独立可编译、可回滚，并记录模块边界和未纳入本任务的后续拆分。
+- [x] API facade 不再承载完整领域 handler；Emby 路由/DTO、Lux API、管理员、用户、媒体和播放实现位于明确子模块。
+- [x] Storage facade 不再承载完整 SQL repository；媒体、人物、会话、迁移和共享查询/模型边界清晰。
+- [x] PeopleService 的关系/匹配、元数据、资源和索引恢复实现分离，外部调用路径保持不变。
+- [ ] 现有 Rust/Web 行为测试不变且通过；模块移动没有改变公开 HTTP 合同、错误码或数据库行为。（Web 质量门通过；Rust 全量命令唯一失败项为已有的 `tests/users.rs::admin_can_manage_users_and_last_manager_is_protected` 非确定性 503，见下方记录。）
+- [x] 每个增量独立可编译、可回滚，并记录模块边界和未纳入本任务的后续拆分。
 
 验证：每个增量运行对应的窄 Rust 测试和 `cargo check --locked`；任务完成时运行 `cargo build --locked`、
 `cargo test --locked --all-targets`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings`。
@@ -5179,9 +5179,18 @@ repository 方法或 People 用例。此任务不引入新依赖、不新增端�
 
 阶段门：
 
-- [ ] 三个超大入口文件均降为 facade 或共享模型层，单个领域实现文件保持可审阅规模。
-- [ ] API、Storage 和 People 的模块边界已由 ADR-030 记录，未改变模块化单体部署边界。
-- [ ] 全量 Rust 质量门通过，并由项目所有者确认后再进入下一阶段。
+- [x] 三个超大入口文件均降为 facade 或共享模型层，单个领域实现文件保持可审阅规模。
+- [x] API、Storage 和 People 的模块边界已由 ADR-030 记录，未改变模块化单体部署边界。
+- [ ] 全量 Rust 质量门通过，并由项目所有者确认后再进入下一阶段。（当前仅剩上述既有测试竞态。）
+
+验证记录（2026-08-28）：`src/storage/repository.rs` 已降至约 2,950 行，Storage Repository 方法拆至
+`catalog.rs`、`jobs.rs`、`library.rs`、`media.rs`、`metadata.rs`、`migration.rs`、`notifications.rs`、
+`people.rs`、`sessions.rs` 和 `users.rs`，最大领域文件约 5,100 行；共享模型、数据库初始化、SQL 适配和错误仍由
+`repository.rs` 持有。`uname -m` 为 `arm64`；`cargo build --locked`、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`、Storage 定向测试以及 Web 安装/测试/构建
+均通过。`cargo test --locked --all-targets` 的 Rust 单元测试和其余集成目标通过，但用户管理集成测试在全量
+运行时收到一次 503；该测试单独运行有时通过、重复运行仍可失败，属于未由本次模块移动引入的启动/后台任务
+时序不稳定，未在本任务范围内修改测试行为。此 ARM64 结果不外推 NAS/x86_64 性能。
 
 ## 26. 风险与缓解
 

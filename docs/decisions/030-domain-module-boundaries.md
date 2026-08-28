@@ -30,7 +30,9 @@ Use thin facade modules with explicit domain children:
 - `api` keeps `AppState`, shared middleware/error helpers, route composition, and stable re-exports;
   domain children own admin, Emby, media, playback, and user handlers.
 - `storage` keeps `Database`, shared records, backend helpers, and stable re-exports;
-  domain children own media, people, sessions, and migration repositories.
+  domain children own catalog, jobs, library, media, metadata, notifications, people, sessions,
+  and users repositories. The Emby migration repository remains an explicitly named compatibility
+  child alongside them.
 - `application::people` keeps the public People types and service construction;
   child modules own relationship/matching, metadata, assets, and index-rebuild/recovery logic.
 
@@ -67,7 +69,8 @@ first release; deployment and transaction costs would be disproportionate to thi
 - Existing callers continue using the facade paths, so this refactor does not require API or
   database migration compatibility work.
 - Some shared implementation helpers need explicit visibility declarations between sibling modules.
-- The first migration may temporarily leave a legacy implementation child; later increments must
-  remove it as each domain is moved and must keep the facade free of duplicate logic.
+- The repository facade intentionally retains shared storage models and backend-specific helpers;
+  domain children contain the Database methods and the facade contains no duplicate repository
+  implementation.
 - File boundaries alone do not guarantee faster builds; compile-time impact must be measured after
   the split rather than assumed.
