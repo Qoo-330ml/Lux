@@ -213,6 +213,19 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .as_str()
         .ok_or("missing versioned cover URL")?;
     assert!(cover_url.contains("/cover?v="));
+    let listed_libraries: Value = client
+        .get(format!("{base_url}/api/v1/libraries"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    let listed_cover_url = listed_libraries["libraries"]
+        .as_array()
+        .and_then(|libraries| libraries.iter().find(|library| library["id"] == library_id))
+        .and_then(|library| library["coverImageUrl"].as_str())
+        .ok_or("missing versioned cover URL in library list")?;
+    assert_eq!(listed_cover_url, cover_url);
 
     let public_cover = client
         .get(format!("{base_url}/api/v1/libraries/{library_id}/cover"))
