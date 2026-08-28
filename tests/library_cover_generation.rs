@@ -1,4 +1,4 @@
-use std::{fs, io::Cursor, path::Path};
+use std::{fs, io::Cursor, path::Path, time::Duration};
 
 use image::{DynamicImage, GenericImageView, ImageFormat, Rgba, RgbaImage};
 
@@ -9,6 +9,7 @@ use luxd::{
             AUTO_LIBRARY_COVER_POSTER_COUNT, AutoLibraryCoverResult, LibraryCoverService,
         },
         scanner::ScanJobService,
+        thumbnails::ThumbnailService,
     },
     config::Config,
     library::LibraryKind,
@@ -182,6 +183,68 @@ async fn auto_cover_waits_for_nine_posters_then_runs_only_once()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(task, (None, 0, r#"{}"#.to_owned()));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn auto_cover_runs_before_unrelated_postprocessing_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = config(temp_dir.path());
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("中文电视剧", LibraryKind::Series, true)
+        .await?;
+    let scan_root = temp_dir.path().join("Shows");
+    fs::create_dir_all(&scan_root)?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, scan_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    add_posters(
+        &database,
+        &library.id.to_string(),
+        &scan_root.join("posters"),
+        AUTO_LIBRARY_COVER_POSTER_COUNT,
+    )
+    .await?;
+    fs::write(scan_root.join("Broken.Show.S01E01.mkv"), b"fixture")?;
+
+    let covers = LibraryCoverService::new(
+        database.clone(),
+        temp_dir.path().join("config/library-covers"),
+    );
+    let thumbnails =
+        ThumbnailService::with_runner(database.clone(), "false", Duration::from_secs(5));
+    let jobs = ScanJobService::new(database.clone()).with_library_covers(covers);
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion_with_metadata_and_thumbnails(&job.id, 100, None, None, Some(thumbnails))
+        .await?;
+
+    let scan_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(scan_status, "FAILED");
+
+    let cover_path: Option<String> =
+        sqlx::query_scalar("SELECT cover_image_path FROM libraries WHERE id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        cover_path.is_some(),
+        "cover generation must not depend on thumbnails"
+    );
+
+    let registered: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_task_configs
+         WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = 'AUTO_LIBRARY_COVER'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(registered, 1);
     Ok(())
 }
 

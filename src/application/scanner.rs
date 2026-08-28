@@ -3617,6 +3617,7 @@ impl ScanJobService {
                 self.database.retry_failed_scan_job_targets(job_id).await?;
                 self.run_probe_after_scan(job_id, probe).await?;
                 self.run_metadata_after_scan(job_id).await?;
+                self.run_auto_library_cover_after_scan(job_id).await?;
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
                 self.database
                     .clear_completed_scan_job_targets(job_id)
@@ -3638,7 +3639,6 @@ impl ScanJobService {
                     }
                     return Ok(());
                 }
-                self.run_auto_library_cover_after_scan(job_id).await?;
                 if completed_job.auto_metadata_match {
                     if let Some(metadata) = metadata {
                         self.schedule_online_metadata_after_scan(job_id, metadata)
