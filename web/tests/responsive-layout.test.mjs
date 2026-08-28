@@ -50,6 +50,21 @@ test("volume slider keeps its full track available for both endpoints", () => {
   assert.match(volumeRule, /border:\s*0/);
 });
 
+test("volume slider keeps a visible drag thumb across its full range", () => {
+  const volumeRule = rule(".lux-player-volume-slider");
+  const webkitThumbRule = rule(".lux-player-volume-slider::-webkit-slider-thumb");
+  const mozThumbRule = rule(".lux-player-volume-slider::-moz-range-thumb");
+
+  assert.match(volumeRule, /appearance:\s*none/);
+  assert.match(volumeRule, /-webkit-appearance:\s*none/);
+  assert.match(volumeRule, /height:\s*18px/);
+  assert.match(webkitThumbRule, /width:\s*12px/);
+  assert.match(webkitThumbRule, /height:\s*12px/);
+  assert.match(webkitThumbRule, /border-radius:\s*50%/);
+  assert.match(mozThumbRule, /border-radius:\s*50%/);
+  assert.match(stylesheet, /\.lux-player-volume-slider-wrap:focus-within\s*\{[^}]*overflow:\s*visible/);
+});
+
 test("large-display page surfaces do not keep fixed pixel width caps", () => {
   for (const selector of [
     ".lux-home-content",

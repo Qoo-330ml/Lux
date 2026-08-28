@@ -14,6 +14,7 @@ import {
 } from "lucide-react";
 import type {
   ChangeEvent,
+  CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
   MouseEvent as ReactMouseEvent,
   PointerEvent as ReactPointerEvent,
@@ -113,6 +114,8 @@ export function PlayerControls({
 }: PlayerControlsProps) {
   const progressPercent = duration > 0 ? (currentTime / duration) * 100 : 0;
   const bufferedPercent = duration > 0 ? (bufferedEnd / duration) * 100 : 0;
+  const normalizedVolume = Number.isFinite(volume) ? Math.max(0, Math.min(1, muted ? 0 : volume)) : 0;
+  const volumePercent = `${normalizedVolume * 100}%`;
 
   return (
     <div className="lux-player-controls-wrap">
@@ -180,6 +183,7 @@ export function PlayerControls({
                 step={0.02}
                 value={muted ? 0 : volume}
                 onChange={(event: ChangeEvent<HTMLInputElement>) => onVolumeChange(parseFloat(event.target.value))}
+                style={{ "--lux-volume-percent": volumePercent } as CSSProperties}
                 className="lux-player-volume-slider"
                 aria-label="音量调节"
               />

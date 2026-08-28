@@ -254,6 +254,7 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-valuemax="100"');
     expect(markup).toContain('aria-label="播放"');
     expect(markup).toContain('aria-label="音量调节"');
+    expect(markup).toContain('style="--lux-volume-percent:100%"');
     expect(markup).toContain('aria-label="隐藏弹幕"');
     expect(markup).toContain('aria-pressed="true"');
     expect(markup).toMatch(/<div class="lux-player-controls-middle"><\/div><div class="lux-player-controls-right">[\s\S]*class="lux-player-action-btn lux-player-danmu-btn/);
