@@ -2001,6 +2001,7 @@ services:
 | LUX-220 | src/api/mod.rs、web/src/lib/api/types.ts、tests/chapters.rs、docs/；Lux source-scoped 章节合同 |
 | LUX-221 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；章节时间轴与片头跳过体验 |
 | LUX-222 | scripts/player-danmaku-smoke.mjs、web/tests/、docs/COMPATIBILITY.md；阶段 18 真实浏览器和全量质量门 |
+| LUX-223 | src/api/、src/storage/、src/application/people/、docs/；内部领域模块化重构，不改变公共协议或数据库模型 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5153,6 +5154,34 @@ video 的 WebKit 播放目标选择器；不引入 Chromecast、远程 SDK 或�
 
 阶段 18关闭记录（2026-08-28）：阶段门证据见 `docs/COMPATIBILITY.md` 的 LUX-222 小节。项目所有者已要求继续完成并关闭
 本阶段；Safari/AirPlay 真机和 NAS/x86_64 性能保持为明确的后续验证边界。
+
+### 阶段 19：服务端领域模块化维护
+
+#### LUX-223：拆分超大 API、Storage 和 People 实现
+
+范围：在不改变 HTTP 路由、DTO、领域模型、数据库 schema、SQL 语义和运行时行为的前提下，
+将 `src/api/mod.rs`、`src/storage/mod.rs` 和 `src/application/people.rs` 的实现按领域移动到子模块。
+facade 只保留模块声明、共享状态/类型、路由组合和稳定 re-export；领域模块负责自己的 handler、DTO 映射、
+repository 方法或 People 用例。此任务不引入新依赖、不新增端点、不修改迁移，也不提前实现其他 LUX 任务。
+
+验收：
+
+- [ ] API facade 不再承载完整领域 handler；Emby 路由/DTO、Lux API、管理员、用户、媒体和播放实现位于明确子模块。
+- [ ] Storage facade 不再承载完整 SQL repository；媒体、人物、会话、迁移和共享查询/模型边界清晰。
+- [ ] PeopleService 的关系/匹配、元数据、资源和索引恢复实现分离，外部调用路径保持不变。
+- [ ] 现有 Rust/Web 行为测试不变且通过；模块移动没有改变公开 HTTP 合同、错误码或数据库行为。
+- [ ] 每个增量独立可编译、可回滚，并记录模块边界和未纳入本任务的后续拆分。
+
+验证：每个增量运行对应的窄 Rust 测试和 `cargo check --locked`；任务完成时运行 `cargo build --locked`、
+`cargo test --locked --all-targets`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+依赖：LUX-222 阶段门已关闭。
+
+阶段门：
+
+- [ ] 三个超大入口文件均降为 facade 或共享模型层，单个领域实现文件保持可审阅规模。
+- [ ] API、Storage 和 People 的模块边界已由 ADR-030 记录，未改变模块化单体部署边界。
+- [ ] 全量 Rust 质量门通过，并由项目所有者确认后再进入下一阶段。
 
 ## 26. 风险与缓解
 
