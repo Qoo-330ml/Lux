@@ -333,6 +333,9 @@ impl AppState {
                 None => service,
             }
         };
+        let danmaku = DanmakuService::new(database.clone())
+            .with_plugins(plugins.clone())
+            .with_resource_metrics(resources.clone());
         let scheduled_tasks = ScheduledTaskService::new(
             database.clone(),
             plugins.clone(),
@@ -345,7 +348,8 @@ impl AppState {
             probe.clone(),
             thumbnails.clone(),
         )
-        .with_library_covers(library_covers.clone());
+        .with_library_covers(library_covers.clone())
+        .with_danmaku(danmaku.clone());
         Self {
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
@@ -395,11 +399,7 @@ impl AppState {
             chapter_detection: Some(chapter_detection),
             scheduled_tasks: Some(scheduled_tasks),
             webhooks,
-            danmaku: Some(
-                DanmakuService::new(database.clone())
-                    .with_plugins(plugins.clone())
-                    .with_resource_metrics(resources.clone()),
-            ),
+            danmaku: Some(danmaku),
             plugins: Some(plugins.clone()),
             emby_migration,
             scraper_resolver: Some(scraper_resolver),
@@ -626,6 +626,11 @@ impl AppState {
             && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
         {
             tracing::error!(%error, "failed to synchronize chapter detection scheduled tasks");
+        }
+        if let Some(plugins) = self.plugins.as_ref()
+            && let Err(error) = plugins.sync_danmaku_scheduled_task().await
+        {
+            tracing::error!(%error, "failed to synchronize danmaku scheduled task");
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
             scheduled_tasks.spawn();

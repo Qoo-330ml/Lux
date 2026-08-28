@@ -4,6 +4,7 @@ use luxd::application::{
     chapter_detector::{ChapterDetectionService, DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID},
     libraries::LibrarySettingsPatch,
     plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
+    schedule::DANMAKU_MATCH_TASK_TYPE,
     scheduled_tasks::ScheduledTaskService,
     strm_probe::StrmProbeService,
 };
@@ -166,5 +167,58 @@ async fn enabled_chapter_task_creates_one_detection_job_per_matching_minute()
         .fetch_one(database.pool())
         .await?;
     assert_eq!(jobs, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn registered_danmaku_task_uses_the_danmaku_service() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let plugin_dir = config_dir.join("plugins/org.lux.danmaku");
+    tokio::fs::create_dir_all(plugin_dir.join("binaries")).await?;
+    fs::write(plugin_dir.join("binaries/plugin"), b"placeholder")?;
+    tokio::fs::write(
+        plugin_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&json!({
+            "formatVersion": 1,
+            "id": "org.lux.danmaku",
+            "name": "弹幕匹配",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "danmaku",
+            "category": "MEDIA",
+            "capabilities": ["danmaku.match"],
+            "configFields": [
+                {"key": "providerBaseUrl", "label": "弹幕 API 地址", "type": "text", "required": true, "sensitive": true},
+                {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []}
+            ],
+            "permissions": {"network": ["*"], "filesystem": []},
+            "files": []
+        }))?,
+    )
+    .await?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    })
+    .await?;
+    let plugins = PluginService::new(database.clone(), config_dir);
+    plugins.install("org.lux.danmaku").await?;
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database, plugins.clone()),
+        None,
+    );
+    let error = scheduler
+        .run_task("GLOBAL", "global", DANMAKU_MATCH_TASK_TYPE)
+        .await
+        .expect_err("danmaku task must be dispatched to its service");
+    assert!(matches!(
+        error,
+        luxd::application::scheduled_tasks::ScheduledTaskError::ServiceUnavailable
+    ));
     Ok(())
 }

@@ -14,6 +14,8 @@ use luxd::application::{
     libraries::LibraryService,
     plugins::{DANMAKU_PLUGIN_ID, PluginService},
     scanner::LibraryScanner,
+    scheduled_tasks::ScheduledTaskService,
+    strm_probe::StrmProbeService,
 };
 use luxd::domain::ids::LibraryId;
 use luxd::library::LibraryKind;
@@ -195,7 +197,8 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
                 {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []},
                 {"key": "matchOriginalFilename", "label": "使用原始文件名", "type": "toggle", "defaultValue": true},
                 {"key": "matchSimplifiedTraditionalTitles", "label": "尝试简繁标题", "type": "toggle", "defaultValue": true},
-                {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false}
+                {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false},
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "* * * * *"}
             ],
             "permissions": {"network": ["*"], "filesystem": []},
             "files": []
@@ -207,16 +210,46 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
         config_dir.join("plugin-config/org.lux.danmaku.json"),
         serde_json::to_vec(&serde_json::json!({
             "providerBaseUrl": format!("http://127.0.0.1:{}", address.port()),
-            "libraryIds": [library.id.to_string()]
+            "libraryIds": [library.id.to_string()],
+            "schedule": "* * * * *"
         }))?,
     )
     .await?;
     let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(DANMAKU_PLUGIN_ID).await?;
-    let service = DanmakuService::new(database.clone()).with_plugins(plugins);
-    let job = service.create_job(library.id, 1, false).await?;
-    service.run(&job.id).await?;
-    let completed = service.get(&job.id).await?;
+    let service = DanmakuService::new(database.clone()).with_plugins(plugins.clone());
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database.clone(), plugins),
+        None,
+    )
+    .with_danmaku(service.clone());
+    scheduler.run_once().await;
+    scheduler.run_once().await;
+    let job_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM danmaku_match_jobs WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(job_count, 1);
+    let job_id: String = sqlx::query_scalar(
+        "SELECT id FROM danmaku_match_jobs WHERE library_id = ? ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let completed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let job = service.get(&job_id).await?;
+            if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
+                return Ok::<_, DanmakuServiceError>(job);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .map_err(|_| std::io::Error::other("timed out waiting for scheduled danmaku job"))??;
     assert_eq!(completed.status, "COMPLETED");
     assert_eq!(completed.success_count, 1);
     assert_eq!(

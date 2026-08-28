@@ -2326,6 +2326,9 @@ pub(crate) fn scheduled_task_run_json(run: &ScheduledTaskRun) -> Value {
         ScheduledTaskRun::AutoLibraryCover { job } => {
             json!({ "jobId": job.id, "libraryId": job.library_id })
         }
+        ScheduledTaskRun::DanmakuMatch { jobs } => {
+            json!({ "jobIds": jobs.iter().map(|job| job.id.clone()).collect::<Vec<_>>() })
+        }
     }
 }
 
@@ -2346,7 +2349,8 @@ pub(crate) fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskErro
         ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
         | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive)
         | ScheduledTaskError::Chapter(ChapterDetectionError::AlreadyActive)
-        | ScheduledTaskError::Cover(LibraryCoverError::AlreadyActive) => (
+        | ScheduledTaskError::Cover(LibraryCoverError::AlreadyActive)
+        | ScheduledTaskError::Danmaku(DanmakuServiceError::AlreadyActive) => (
             StatusCode::CONFLICT,
             lux::ApiErrorCode::InvalidRequest,
             "同类任务已有运行中的作业",
@@ -2357,6 +2361,7 @@ pub(crate) fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskErro
         | ScheduledTaskError::Strm(_)
         | ScheduledTaskError::Chapter(_)
         | ScheduledTaskError::Cover(_)
+        | ScheduledTaskError::Danmaku(_)
         | ScheduledTaskError::Storage(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
             lux::ApiErrorCode::DatabaseUnavailable,
