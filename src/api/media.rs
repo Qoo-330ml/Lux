@@ -2414,7 +2414,53 @@ pub(super) async fn serve_subtitle(
         .await
     {
         Ok(Some(subtitle)) => subtitle,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(None) => {
+            let streams = match database
+                .list_subtitle_streams(item_id, media_source_id, 0, 500)
+                .await
+            {
+                Ok(streams) => streams,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let Some(stream) = streams
+                .into_iter()
+                .find(|stream| stream.stream_index == stream_index)
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if stream.is_external {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            let Some(service) = state.embedded_subtitle.as_ref() else {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            };
+            if method == Method::HEAD {
+                let Some(content_type) = embedded_subtitle_content_type(stream.codec.as_deref())
+                else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header("Content-Type", content_type)
+                    .body(Body::empty())
+                    .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            }
+            let language = stream.language.clone();
+            let result = match service.extract(&stream).await {
+                Ok(result) => result,
+                Err(error) => return embedded_subtitle_error(error),
+            };
+            let mut response = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", result.content_type)
+                .header("Content-Length", result.bytes.len());
+            if let Some(language) = language {
+                response = response.header("Content-Language", language);
+            }
+            return response
+                .body(Body::from(result.bytes))
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let relative = std::path::Path::new(&subtitle.external_path);
@@ -2471,6 +2517,33 @@ pub(super) async fn serve_subtitle(
     builder
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn embedded_subtitle_content_type(codec: Option<&str>) -> Option<&'static str> {
+    match codec.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("srt" | "subrip") => Some("text/plain; charset=utf-8"),
+        Some("ass" | "ssa") => Some("text/x-ass; charset=utf-8"),
+        _ => None,
+    }
+}
+
+fn embedded_subtitle_error(
+    error: crate::application::embedded_subtitle::EmbeddedSubtitleError,
+) -> Response {
+    use crate::application::embedded_subtitle::EmbeddedSubtitleError;
+
+    let status = match error {
+        EmbeddedSubtitleError::InvalidSource
+        | EmbeddedSubtitleError::UnsupportedFormat
+        | EmbeddedSubtitleError::Missing => StatusCode::NOT_FOUND,
+        EmbeddedSubtitleError::Forbidden => StatusCode::FORBIDDEN,
+        EmbeddedSubtitleError::Limit => StatusCode::PAYLOAD_TOO_LARGE,
+        EmbeddedSubtitleError::Timeout
+        | EmbeddedSubtitleError::Spawn
+        | EmbeddedSubtitleError::Io
+        | EmbeddedSubtitleError::ProcessFailed => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    status.into_response()
 }
 
 pub(super) async fn serve_image(
