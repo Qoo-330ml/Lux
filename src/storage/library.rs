@@ -1046,6 +1046,58 @@ impl Database {
         })
     }
 
+    pub(crate) async fn upsert_danmaku_match_task(
+        &self,
+        schedule: &str,
+        is_enabled: bool,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO scheduled_task_configs (
+                owner_type, owner_id, task_type, task_name, task_description,
+                source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
+             ) VALUES (
+                'GLOBAL', 'global', 'DANMAKU_MATCH', '弹幕匹配',
+                '按计划为选定媒体库匹配并下载 Bilibili XML 弹幕旁车。',
+                'PLUGIN', 'org.lux.danmaku', ?, ?,
+                '{\"concurrency\":2,\"overwrite\":false}'
+             )
+             ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                task_name = excluded.task_name,
+                task_description = excluded.task_description,
+                source_type = excluded.source_type,
+                plugin_id = excluded.plugin_id,
+                cron_or_interval = excluded.cron_or_interval,
+                is_enabled = excluded.is_enabled,
+                resource_limit_json = excluded.resource_limit_json,
+                updated_at = unixepoch()",
+        )
+        .bind(schedule)
+        .bind(database_flag(is_enabled))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn disable_danmaku_match_task(&self) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scheduled_task_configs
+             SET is_enabled = 0, cron_or_interval = NULL, updated_at = unixepoch()
+             WHERE owner_type = 'GLOBAL' AND owner_id = 'global'
+               AND task_type = 'DANMAKU_MATCH'",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn disable_chapter_detection_tasks(&self) -> Result<(), StorageError> {
         self.query(
             "UPDATE scheduled_task_configs

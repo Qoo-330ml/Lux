@@ -5,6 +5,7 @@ use luxd::{
         danmaku::{DanmakuService, DanmakuServiceError},
         libraries::LibraryService,
         plugins::PluginService,
+        schedule::{DANMAKU_MATCH_TASK_TYPE, DEFAULT_DANMAKU_MATCH_SCHEDULE},
     },
     config::Config,
     library::LibraryKind,
@@ -39,7 +40,8 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
                 {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []},
                 {"key": "matchOriginalFilename", "label": "使用原始文件名", "type": "toggle", "defaultValue": true},
                 {"key": "matchSimplifiedTraditionalTitles", "label": "尝试简繁标题", "type": "toggle", "defaultValue": true},
-                {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false}
+                {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false},
+                {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 6 * * *"}
             ],
             "permissions": {"network": ["*"], "filesystem": []},
             "files": []
@@ -60,6 +62,22 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
         .await?;
     let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(PLUGIN_ID).await?;
+
+    let registered: (Option<String>, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT cron_or_interval, is_enabled, source_type, plugin_id
+         FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = ?",
+    )
+    .bind(DANMAKU_MATCH_TASK_TYPE)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        registered.0.as_deref(),
+        Some(DEFAULT_DANMAKU_MATCH_SCHEDULE)
+    );
+    assert_eq!(registered.1, 0);
+    assert_eq!(registered.2, "PLUGIN");
+    assert_eq!(registered.3.as_deref(), Some(PLUGIN_ID));
 
     let page = plugins.list_installed(0, 20).await?;
     let plugin = page
@@ -108,6 +126,30 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
         false
     );
     assert_eq!(updated.config_values["matchEnglishTitle"], true);
+
+    let enabled: (Option<String>, i64) = sqlx::query_as(
+        "SELECT cron_or_interval, is_enabled
+         FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = ?",
+    )
+    .bind(DANMAKU_MATCH_TASK_TYPE)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        enabled,
+        (Some(DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned()), 1)
+    );
+
+    plugins.set_enabled(PLUGIN_ID, false).await?;
+    let disabled: i64 = sqlx::query_scalar(
+        "SELECT is_enabled FROM scheduled_task_configs
+         WHERE owner_type = 'GLOBAL' AND owner_id = 'global' AND task_type = ?",
+    )
+    .bind(DANMAKU_MATCH_TASK_TYPE)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(disabled, 0);
+    plugins.set_enabled(PLUGIN_ID, true).await?;
 
     let settings = plugins.danmaku_settings().await?;
     assert_eq!(settings.library_ids, vec![library.id.to_string()]);

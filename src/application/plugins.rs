@@ -42,8 +42,9 @@ use crate::{
         },
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
         schedule::{
-            DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE,
-            DEFAULT_STRM_MEDIA_INFO_SCHEDULE, validate_cron,
+            DEFAULT_CHAPTER_DETECTION_SCHEDULE, DEFAULT_DANMAKU_MATCH_SCHEDULE,
+            DEFAULT_ONLINE_CHAPTER_DETECTION_SCHEDULE, DEFAULT_STRM_MEDIA_INFO_SCHEDULE,
+            validate_cron,
         },
         strm_target::{StrmTargetKind, classify_strm_target},
     },
@@ -88,6 +89,7 @@ pub struct DanmakuSettings {
     pub match_original_filename: bool,
     pub match_simplified_traditional_titles: bool,
     pub match_english_title: bool,
+    pub schedule: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -277,6 +279,8 @@ impl PluginService {
         let current_catalog = self.catalog_snapshot().await;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
+        } else if plugin_id == DANMAKU_PLUGIN_ID {
+            self.sync_danmaku_scheduled_task().await?;
         } else if current_catalog
             .get(&plugin_id)
             .is_some_and(is_chapter_detector_plugin)
@@ -312,6 +316,8 @@ impl PluginService {
         self.database.uninstall_plugin(&plugin_id).await?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.database.disable_strm_media_info_task().await?;
+        } else if plugin_id == DANMAKU_PLUGIN_ID {
+            self.sync_danmaku_scheduled_task().await?;
         } else if is_chapter_detector_plugin(plugin) {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
@@ -369,7 +375,8 @@ impl PluginService {
         if library_ids.len() == before {
             return Ok(());
         }
-        self.write_plugin_config(DANMAKU_PLUGIN_ID, &values).await
+        self.write_plugin_config(DANMAKU_PLUGIN_ID, &values).await?;
+        self.sync_danmaku_scheduled_task().await
     }
 
     pub async fn update(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
@@ -396,6 +403,8 @@ impl PluginService {
         let current_catalog = self.catalog_snapshot().await;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
+        } else if plugin_id == DANMAKU_PLUGIN_ID {
+            self.sync_danmaku_scheduled_task().await?;
         } else if current_catalog
             .get(&plugin_id)
             .is_some_and(is_chapter_detector_plugin)
@@ -429,6 +438,8 @@ impl PluginService {
         }
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
+        } else if plugin_id == DANMAKU_PLUGIN_ID {
+            self.sync_danmaku_scheduled_task().await?;
         } else if catalog
             .get(&plugin_id)
             .is_some_and(is_chapter_detector_plugin)
@@ -917,12 +928,16 @@ impl PluginService {
         validate_dynamic_plugin_config(&plugin_id, &values)?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             media_info_schedule(&values)?;
+        } else if plugin_id == DANMAKU_PLUGIN_ID {
+            danmaku_schedule(&values)?;
         } else if is_chapter_detector_plugin(plugin) {
             chapter_detector_settings_from_values(&plugin_id, &fields, &values)?;
         }
         self.write_plugin_config(&plugin_id, &values).await?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
+        } else if plugin_id == DANMAKU_PLUGIN_ID {
+            self.sync_danmaku_scheduled_task().await?;
         } else if is_chapter_detector_plugin(plugin) {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
@@ -986,7 +1001,31 @@ impl PluginService {
                 .get("matchEnglishTitle")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            schedule: danmaku_schedule(&values)?,
         })
+    }
+
+    pub async fn update_danmaku_schedule(&self, schedule: &str) -> Result<(), PluginServiceError> {
+        let schedule = schedule.trim();
+        validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(DANMAKU_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(DANMAKU_PLUGIN_ID.to_owned()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let mut values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(
+                DANMAKU_PLUGIN_ID,
+                self.read_plugin_config(DANMAKU_PLUGIN_ID).await?,
+            ),
+        );
+        values.insert("schedule".to_owned(), Value::String(schedule.to_owned()));
+        let values = validate_config_values(&fields, &values)?;
+        validate_dynamic_plugin_config(DANMAKU_PLUGIN_ID, &values)?;
+        danmaku_schedule(&values)?;
+        self.write_plugin_config(DANMAKU_PLUGIN_ID, &values).await?;
+        self.sync_danmaku_scheduled_task().await
     }
 
     pub async fn update_media_info_schedule(
@@ -1271,6 +1310,37 @@ impl PluginService {
             .upsert_strm_media_info_task(&schedule, enabled && configured)
             .await?;
         Ok(())
+    }
+
+    pub async fn sync_danmaku_scheduled_task(&self) -> Result<(), PluginServiceError> {
+        let (installed, enabled) = self.plugin_state(DANMAKU_PLUGIN_ID).await?;
+        if !installed {
+            self.database.disable_danmaku_match_task().await?;
+            return Ok(());
+        }
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(DANMAKU_PLUGIN_ID)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(DANMAKU_PLUGIN_ID.to_owned()))?;
+        let fields = self.config_fields_for_plugin(plugin).await?;
+        let values = merge_default_config_values(
+            &fields,
+            normalize_plugin_config(
+                DANMAKU_PLUGIN_ID,
+                self.read_plugin_config(DANMAKU_PLUGIN_ID).await?,
+            ),
+        );
+        let schedule =
+            danmaku_schedule(&values).unwrap_or_else(|_| DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned());
+        let configured = validate_config_values(&fields, &values).is_ok()
+            && self
+                .danmaku_settings()
+                .await
+                .is_ok_and(|settings| !settings.library_ids.is_empty());
+        self.database
+            .upsert_danmaku_match_task(&schedule, enabled && configured)
+            .await
+            .map_err(PluginServiceError::from)
     }
 
     async fn config_fields_for_plugin(
@@ -1980,6 +2050,16 @@ fn media_info_schedule(values: &Map<String, Value>) -> Result<String, PluginServ
         .get("schedule")
         .and_then(Value::as_str)
         .unwrap_or(DEFAULT_STRM_MEDIA_INFO_SCHEDULE)
+        .trim();
+    validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
+    Ok(schedule.to_owned())
+}
+
+fn danmaku_schedule(values: &Map<String, Value>) -> Result<String, PluginServiceError> {
+    let schedule = values
+        .get("schedule")
+        .and_then(Value::as_str)
+        .unwrap_or(DEFAULT_DANMAKU_MATCH_SCHEDULE)
         .trim();
     validate_cron(schedule).map_err(|_| PluginServiceError::InvalidConfig)?;
     Ok(schedule.to_owned())
