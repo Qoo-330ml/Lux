@@ -30,6 +30,7 @@ pub const MAX_LIBRARY_COVER_BYTES: u64 = 5 * 1024 * 1024;
 pub const AUTO_LIBRARY_COVER_TASK_TYPE: &str = "AUTO_LIBRARY_COVER";
 pub const AUTO_LIBRARY_COVER_POSTER_COUNT: usize = 9;
 const AUTO_LIBRARY_COVER_CANDIDATE_LIMIT: i64 = 64;
+const AUTO_LIBRARY_COVER_DESIGN_WIDTH: f32 = 1920.0;
 const AUTO_LIBRARY_COVER_WIDTH: u32 = 1280;
 const AUTO_LIBRARY_COVER_HEIGHT: u32 = 720;
 const AUTO_LIBRARY_COVER_TITLE_FONT_SIZE: f32 = 240.0;
@@ -749,18 +750,28 @@ fn render_auto_library_cover(
     posters.truncate(AUTO_LIBRARY_COVER_POSTER_COUNT);
 
     let mut canvas = gradient_background(&posters[0]);
+    let card_width = scale_cover_dimension(410);
+    let card_height = scale_cover_dimension(610);
+    let corner_radius = scale_cover_dimension(46);
+    let shadow_offset = scale_cover_coordinate(15);
+    let shadow_blur = scale_cover_font_size(15.0);
     let mut processed = posters
         .iter()
         .map(|poster| {
-            let card = fit_cover(poster, 410, 610);
-            add_shadow(&rounded_corners(card, 46), 15, 15, 15.0)
+            let card = fit_cover(poster, card_width, card_height);
+            add_shadow(
+                &rounded_corners(card, corner_radius),
+                shadow_offset,
+                shadow_offset,
+                shadow_blur,
+            )
         })
         .collect::<Vec<_>>();
 
     let card_w = processed[0].width();
     let card_h = processed[0].height();
-    let stack_gap = -30_i32;
-    let margin_y = 22_u32;
+    let stack_gap = scale_cover_coordinate(-30);
+    let margin_y = scale_cover_dimension(22);
     let column_height = card_h
         .saturating_mul(3)
         .saturating_add(margin_y.saturating_mul(3));
@@ -772,8 +783,8 @@ fn render_auto_library_cover(
             overlay(&mut stack, &processed[index], 0, y as i32);
         }
         let rotated = rotate_cover_column(&stack);
-        let x = 350 + column as i32 * (410 - 50 + 50);
-        let y = -200 - column as i32 * 80;
+        let x = scale_cover_coordinate(350 + column as i32 * 410);
+        let y = scale_cover_coordinate(-200 - column as i32 * 80);
         overlay(&mut canvas, &rotated, x, y);
     }
     processed.clear();
@@ -960,23 +971,46 @@ fn overlay(base: &mut RgbaImage, layer: &RgbaImage, left: i32, top: i32) {
 }
 
 fn draw_library_text(canvas: &mut RgbaImage, name: &str, subtitle: &str, font: &FontArc) {
-    let scale = PxScale::from(AUTO_LIBRARY_COVER_TITLE_FONT_SIZE);
-    let lines = wrap_text(font, scale, name, 960.0);
+    let scale = PxScale::from(scale_cover_font_size(AUTO_LIBRARY_COVER_TITLE_FONT_SIZE));
+    let lines = wrap_text(font, scale, name, scale_cover_font_size(960.0));
     let line_height = font.as_scaled(scale).height().ceil() as i32;
-    let subtitle_scale = PxScale::from(AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE);
-    let subtitle_y = canvas.height() as i32 - 120;
-    let title_y = subtitle_y - lines.len() as i32 * line_height - 24;
-    draw_accent_bar(canvas, 113, subtitle_y, 20, 100);
+    let subtitle_scale =
+        PxScale::from(scale_cover_font_size(AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE));
+    let subtitle_y = scale_cover_coordinate(626);
+    let title_y = scale_cover_coordinate(432);
+    draw_accent_bar(
+        canvas,
+        scale_cover_coordinate(113),
+        subtitle_y,
+        scale_cover_dimension(20),
+        scale_cover_dimension(100),
+    );
     for (index, line) in lines.iter().enumerate() {
         let y = title_y + index as i32 * line_height;
-        draw_text_mut(canvas, Rgba([0, 0, 0, 100]), 101, y + 5, scale, font, line);
-        draw_text_mut(canvas, Rgba([255, 255, 255, 255]), 96, y, scale, font, line);
+        draw_text_mut(
+            canvas,
+            Rgba([0, 0, 0, 100]),
+            scale_cover_coordinate(101),
+            y + scale_cover_coordinate(5),
+            scale,
+            font,
+            line,
+        );
+        draw_text_mut(
+            canvas,
+            Rgba([255, 255, 255, 255]),
+            scale_cover_coordinate(96),
+            y,
+            scale,
+            font,
+            line,
+        );
     }
     draw_text_mut(
         canvas,
         Rgba([0, 0, 0, 100]),
-        156,
-        subtitle_y + 3,
+        scale_cover_coordinate(156),
+        subtitle_y + scale_cover_coordinate(3),
         subtitle_scale,
         font,
         subtitle,
@@ -984,12 +1018,28 @@ fn draw_library_text(canvas: &mut RgbaImage, name: &str, subtitle: &str, font: &
     draw_text_mut(
         canvas,
         Rgba([255, 255, 255, 255]),
-        153,
+        scale_cover_coordinate(153),
         subtitle_y,
         subtitle_scale,
         font,
         subtitle,
     );
+}
+
+fn cover_layout_scale() -> f32 {
+    AUTO_LIBRARY_COVER_WIDTH as f32 / AUTO_LIBRARY_COVER_DESIGN_WIDTH
+}
+
+fn scale_cover_coordinate(value: i32) -> i32 {
+    (value as f32 * cover_layout_scale()).round() as i32
+}
+
+fn scale_cover_dimension(value: u32) -> u32 {
+    (value as f32 * cover_layout_scale()).round().max(1.0) as u32
+}
+
+fn scale_cover_font_size(value: f32) -> f32 {
+    value * cover_layout_scale()
 }
 
 fn draw_accent_bar(canvas: &mut RgbaImage, left: i32, top: i32, width: u32, height: u32) {
@@ -1109,6 +1159,7 @@ mod tests {
     use super::{
         AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE, AUTO_LIBRARY_COVER_TITLE_FONT_SIZE, RgbaImage,
         add_shadow, bundled_cover_font, library_kind_subtitle, rotate_cover_column,
+        scale_cover_coordinate, scale_cover_dimension, scale_cover_font_size,
     };
 
     #[test]
@@ -1127,8 +1178,22 @@ mod tests {
 
     #[test]
     fn cover_text_uses_the_requested_emphasis() {
-        assert_eq!(AUTO_LIBRARY_COVER_TITLE_FONT_SIZE, 240.0);
-        assert_eq!(AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE, 100.0);
+        assert_eq!(
+            scale_cover_font_size(AUTO_LIBRARY_COVER_TITLE_FONT_SIZE),
+            160.0
+        );
+        assert!(
+            (scale_cover_font_size(AUTO_LIBRARY_COVER_SUBTITLE_FONT_SIZE) - 200.0 / 3.0).abs()
+                < 0.0001
+        );
+    }
+
+    #[test]
+    fn smaller_cover_scales_the_original_layout() {
+        assert_eq!(scale_cover_dimension(410), 273);
+        assert_eq!(scale_cover_dimension(610), 407);
+        assert_eq!(scale_cover_coordinate(350), 233);
+        assert_eq!(scale_cover_coordinate(-200), -133);
     }
 
     #[test]
