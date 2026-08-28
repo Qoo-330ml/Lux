@@ -171,6 +171,84 @@ fn accepts_a_danmaku_plugin_manifest_and_path_free_match_contract() {
 }
 
 #[test]
+fn accepts_manifest_scheduled_task_declaration() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.scheduled",
+        "name": "Scheduled plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "configFields": [
+            {"key": "schedule", "label": "Schedule", "type": "text", "defaultValue": "0 6 * * *"},
+            {"key": "libraryIds", "label": "Libraries", "type": "select", "multiple": true, "optionsSource": "media-libraries"}
+        ],
+        "scheduledTasks": [{
+            "taskType": "EXAMPLE_TASK",
+            "ownerType": "GLOBAL",
+            "name": "Example task",
+            "description": "Runs the example task.",
+            "scheduleConfigKey": "schedule",
+            "defaultSchedule": "0 6 * * *",
+            "requiredConfigKeys": ["libraryIds"],
+            "resourceLimit": {"concurrency": 2, "overwrite": false}
+        }],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect("manifest scheduled task should validate");
+
+    assert_eq!(manifest.scheduled_tasks.len(), 1);
+    assert_eq!(manifest.scheduled_tasks[0].task_type, "EXAMPLE_TASK");
+    assert_eq!(manifest.scheduled_tasks[0].owner_type, "GLOBAL");
+    assert_eq!(manifest.scheduled_tasks[0].schedule_config_key, "schedule");
+    assert_eq!(
+        manifest.scheduled_tasks[0].required_config_keys,
+        vec!["libraryIds".to_owned()]
+    );
+    assert_eq!(manifest.scheduled_tasks[0].resource_limit["concurrency"], 2);
+}
+
+#[test]
+fn rejects_manifest_scheduled_task_with_invalid_owner_or_schedule() {
+    let base = json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.scheduled",
+        "name": "Scheduled plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "configFields": [{"key": "schedule", "label": "Schedule", "type": "text"}],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    });
+
+    let mut invalid_owner = base.clone();
+    invalid_owner["scheduledTasks"] = json!([{
+        "taskType": "EXAMPLE_TASK",
+        "ownerType": "USER",
+        "name": "Example task",
+        "description": "Runs the example task.",
+        "scheduleConfigKey": "schedule",
+        "defaultSchedule": "0 6 * * *"
+    }]);
+    assert!(PluginManifest::from_value(invalid_owner).is_err());
+
+    let mut invalid_schedule = base;
+    invalid_schedule["scheduledTasks"] = json!([{
+        "taskType": "EXAMPLE_TASK",
+        "ownerType": "GLOBAL",
+        "name": "Example task",
+        "description": "Runs the example task.",
+        "scheduleConfigKey": "schedule",
+        "defaultSchedule": "0 6 * *"
+    }]);
+    assert!(PluginManifest::from_value(invalid_schedule).is_err());
+}
+
+#[test]
 fn accepts_a_chapter_detector_manifest_and_bounded_rpc_contract() {
     let manifest = PluginManifest::from_value(json!({
         "formatVersion": PLUGIN_FORMAT_VERSION,
