@@ -236,7 +236,7 @@ fn rejects_manifest_scheduled_task_with_invalid_owner_or_schedule() {
     }]);
     assert!(PluginManifest::from_value(invalid_owner).is_err());
 
-    let mut invalid_schedule = base;
+    let mut invalid_schedule = base.clone();
     invalid_schedule["scheduledTasks"] = json!([{
         "taskType": "EXAMPLE_TASK",
         "ownerType": "GLOBAL",
@@ -246,6 +246,18 @@ fn rejects_manifest_scheduled_task_with_invalid_owner_or_schedule() {
         "defaultSchedule": "0 6 * *"
     }]);
     assert!(PluginManifest::from_value(invalid_schedule).is_err());
+
+    let mut invalid_resource_limit = base;
+    invalid_resource_limit["scheduledTasks"] = json!([{
+        "taskType": "EXAMPLE_TASK",
+        "ownerType": "GLOBAL",
+        "name": "Example task",
+        "description": "Runs the example task.",
+        "scheduleConfigKey": "schedule",
+        "defaultSchedule": "0 6 * * *",
+        "resourceLimit": {"concurrency": "2"}
+    }]);
+    assert!(PluginManifest::from_value(invalid_resource_limit).is_err());
 }
 
 #[test]

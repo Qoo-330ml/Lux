@@ -585,15 +585,17 @@ impl PluginScheduledTask {
                     .to_owned(),
             ));
         }
-        if let Some(concurrency) = self
-            .resource_limit
-            .get("concurrency")
-            .and_then(Value::as_i64)
-            && !(1..=256).contains(&concurrency)
-        {
-            return Err(PluginManifestError::Invalid(
-                "scheduled task resourceLimit concurrency must be between 1 and 256".to_owned(),
-            ));
+        if let Some(value) = self.resource_limit.get("concurrency") {
+            let Some(concurrency) = value.as_i64() else {
+                return Err(PluginManifestError::Invalid(
+                    "scheduled task resourceLimit concurrency must be an integer".to_owned(),
+                ));
+            };
+            if !(1..=256).contains(&concurrency) {
+                return Err(PluginManifestError::Invalid(
+                    "scheduled task resourceLimit concurrency must be between 1 and 256".to_owned(),
+                ));
+            }
         }
         if self
             .resource_limit
