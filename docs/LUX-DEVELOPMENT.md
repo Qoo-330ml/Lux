@@ -5183,7 +5183,7 @@ repository 方法或 People 用例。此任务不引入新依赖、不新增端�
 - [x] API、Storage 和 People 的模块边界已由 ADR-030 记录，未改变模块化单体部署边界。
 - [ ] 全量 Rust 质量门通过，并由项目所有者确认后再进入下一阶段。（质量门已通过，待项目所有者确认。）
 
-验证记录（2026-08-28）：`src/storage/repository.rs` 已降至约 2,950 行，Storage Repository 方法拆至
+验证记录（2026-08-28）：`src/storage/repository.rs` 已降至约 2,660 行，Storage Repository 方法拆至
 `catalog.rs`、`jobs.rs`、`library.rs`、`media.rs`、`metadata.rs`、`migration.rs`、`notifications.rs`、
 `people.rs`、`sessions.rs` 和 `users.rs`，最大领域文件约 5,100 行；共享模型、数据库初始化、SQL 适配和错误仍由
 `repository.rs` 持有。`uname -m` 为 `arm64`；`cargo build --locked`、`cargo fmt --all -- --check`、
