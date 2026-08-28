@@ -226,16 +226,16 @@ export function PlayerVideoSurface({
           title="播放 (空格)"
           onClick={onTogglePlayback}
         >
-          <Play size={42} fill="currentColor" aria-hidden="true" />
+          <Play size={34} fill="currentColor" aria-hidden="true" />
         </button>
       ) : null}
 
       {centerSplash ? (
         <div className="lux-player-center-splash" aria-hidden="true">
           {centerSplash === "play" ? (
-            <Play size={48} fill="currentColor" />
+            <Play size={38} fill="currentColor" />
           ) : (
-            <Pause size={48} fill="currentColor" />
+            <Pause size={38} fill="currentColor" />
           )}
         </div>
       ) : null}

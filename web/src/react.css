@@ -588,11 +588,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-player-topbar { position: absolute; top: calc(24px + env(safe-area-inset-top)); right: calc(4% + env(safe-area-inset-right)); left: calc(4% + env(safe-area-inset-left)); display: flex; align-items: center; justify-content: space-between; gap: 20px; z-index: 10; pointer-events: auto; color: #fff; transition: opacity .3s var(--lux-ease), transform .3s var(--lux-ease); }
 .lux-player-topbar-left { display: flex; align-items: center; gap: 16px; min-width: 0; }
+.lux-player-topbar-actions { display: none; align-items: center; gap: 8px; flex: 0 0 auto; }
 
 .lux-player-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .lux-player-title-row { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .lux-player-title { font-size: 1.15rem; font-weight: 600; color: #fff; text-shadow: 0 2px 10px rgba(0,0,0,.7); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.lux-player-badge { display: inline-flex; align-items: center; padding: 2px 8px; font-size: .7rem; font-weight: 700; letter-spacing: .04em; color: var(--lux-accent); background: color-mix(in srgb, var(--lux-accent) 16%, rgba(0,0,0,.65)); border: 1px solid color-mix(in srgb, var(--lux-accent) 36%, transparent); border-radius: 6px; backdrop-filter: blur(8px); flex-shrink: 0; }
 .lux-player-subtitle { font-size: .8rem; color: var(--lux-muted); text-shadow: 0 1px 6px rgba(0,0,0,.8); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .lux-player-icon-btn { display: inline-grid; place-items: center; width: 42px; height: 42px; border: 1px solid var(--lux-line-soft); border-radius: 50%; color: #fff; background: rgba(20,20,26,.6); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); transition: transform .2s var(--lux-ease), background .2s ease, border-color .2s ease; cursor: pointer; }
@@ -600,7 +600,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-icon-btn:active { transform: scale(.94); }
 .lux-player-icon-btn.is-active { background: color-mix(in srgb, var(--lux-accent) 25%, rgba(20,20,26,.8)); border-color: var(--lux-accent); color: #fff; }
 
-.lux-player-center-play, .lux-player-center-splash { position: absolute; top: 50%; left: 50%; display: flex; align-items: center; justify-content: center; width: 112px; height: 112px; border-radius: 50%; transform: translate(-50%, -50%); color: rgba(58,82,130,.86); background: rgba(255,255,255,.86); box-shadow: 0 10px 34px rgba(0,0,0,.18); z-index: 6; }
+.lux-player-center-play, .lux-player-center-splash { position: absolute; top: 50%; left: 50%; display: flex; align-items: center; justify-content: center; width: 88px; height: 88px; border-radius: 50%; transform: translate(-50%, -50%); color: rgba(58,82,130,.86); background: rgba(255,255,255,.86); box-shadow: 0 8px 26px rgba(0,0,0,.18); z-index: 6; }
 .lux-player-center-play { border: 0; cursor: pointer; transition: transform .18s var(--lux-ease), background .18s ease; }
 .lux-player-center-play:hover, .lux-player-center-play:focus-visible { transform: translate(-50%, -50%) scale(1.06); background: #fff; }
 .lux-player-center-play:focus-visible { outline: 3px solid rgba(255,255,255,.78); outline-offset: 5px; }
@@ -658,10 +658,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-time:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: -4px; }
 .lux-player-time-current { color: #fff; font-weight: 500; }
 .lux-player-time-divider { opacity: .4; }
-
-.lux-player-source-control { display: block; width: 76px; height: 46px; padding: 0 6px; overflow: hidden; border: 0; border-radius: 0; outline: 0; color: #fff; background: transparent; font-size: 14px; font-weight: 500; text-align: center; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
-.lux-player-source-control:hover, .lux-player-source-control:focus-visible { background: rgba(255,255,255,.12); }
-.lux-player-source-control option { color: #fff; background: #24242a; }
 
 .lux-player-screenshot-status { position: absolute; bottom: calc(77px + env(safe-area-inset-bottom)); left: 50%; max-width: min(90vw, 420px); padding: 8px 13px; border: 1px solid rgba(255,255,255,.18); border-radius: 5px; transform: translateX(-50%); color: #fff; background: rgba(16,16,18,.8); box-shadow: 0 8px 22px rgba(0,0,0,.3); font-size: .78rem; z-index: 15; }
 
@@ -1424,9 +1420,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-player-controls-right { width: calc(100vw - 253px); max-width: calc(100vw - 253px); overflow-x: auto; overscroll-behavior-inline: contain; scrollbar-width: none; }
   .lux-player-controls-right::-webkit-scrollbar { display: none; }
   .lux-player-time { gap: 4px; padding: 0 5px; font-size: 13px; }
-  .lux-player-source-control { width: 70px; }
-  .lux-player-center-play, .lux-player-center-splash { width: 84px; height: 84px; }
-  .lux-player-center-play svg { width: 34px; height: 34px; }
+  .lux-player-center-play, .lux-player-center-splash { width: 68px; height: 68px; }
+  .lux-player-center-play svg { width: 28px; height: 28px; }
   .lux-player-settings-popover { right: calc(10px + env(safe-area-inset-right)); bottom: calc(62px + env(safe-area-inset-bottom)); width: min(270px, calc(100vw - 20px - env(safe-area-inset-left) - env(safe-area-inset-right))); }
   .lux-admin-page-heading:has(> .lux-button) { align-items: center; flex-direction: row; margin-bottom: 22px; }
   .lux-admin-layout { padding-top: var(--lux-header-height); }
@@ -2209,4 +2204,9 @@ html[data-lux-theme="light"] .lux-library-cover-preview { background: #e7e6e3; }
   .lux-account-profile-editor { align-items: flex-start; }
   .lux-account-footer-card { grid-template-columns: 1fr 1fr; }
   .lux-account-footer-card .lux-button { grid-column: 1 / -1; width: 100%; }
+}
+
+@media (max-width: 720px) and (orientation: portrait) {
+  .lux-player-topbar-actions { display: flex; }
+  .lux-player-controls .lux-player-mobile-top-control { display: none; }
 }

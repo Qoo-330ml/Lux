@@ -138,15 +138,21 @@ describe("LuxPlayer state components", () => {
     const markup = renderToStaticMarkup(
       <PlayerTopBar
         title="示例电影"
-        badge="1080P • H264"
         subtitle="2026"
         onBack={() => undefined}
+        airPlayAvailable
+        pictureInPictureEnabled
+        onAirPlay={() => undefined}
+        onTogglePictureInPicture={() => undefined}
       />,
     );
 
     expect(markup).toContain("示例电影");
-    expect(markup).toContain("1080P • H264");
+    expect(markup).not.toContain("1080P • H264");
     expect(markup).toContain('aria-label="返回"');
+    expect(markup).toContain('class="lux-player-topbar-actions"');
+    expect(markup).toContain('aria-label="AirPlay"');
+    expect(markup).toContain('aria-label="画中画"');
   });
 
   it("keeps settings actions in a focused, keyboard-addressable panel", () => {
@@ -155,6 +161,9 @@ describe("LuxPlayer state components", () => {
         playbackRates={[0.5, 1, 1.5]}
         playbackRate={1}
         onChangeRate={() => undefined}
+        sources={[{ id: "source-1", label: "1080P", detail: "MP4" }]}
+        selectedSourceId="source-1"
+        onSourceChange={() => undefined}
         captionOffset={-1.2}
         onChangeCaptionOffset={() => undefined}
         presentation={{
@@ -171,6 +180,8 @@ describe("LuxPlayer state components", () => {
 
     expect(markup).toContain('role="dialog"');
     expect(markup).toContain('aria-label="播放设置"');
+    expect(markup).toContain('aria-label="选择播放版本"');
+    expect(markup).toContain("1080P (MP4)");
     expect(markup).toContain("标准");
     expect(markup).toContain("循环播放");
     expect(markup).toContain('role="switch"');
@@ -204,8 +215,6 @@ describe("LuxPlayer state components", () => {
         muted={false}
         fullscreen={false}
         pictureInPictureEnabled
-        sources={[{ id: "source-1", label: "1080P", detail: "MP4" }]}
-        selectedSourceId="source-1"
         danmuVisible
         chapters={chapters}
         introSkip={{ start: 0, end: 20 }}
@@ -223,11 +232,9 @@ describe("LuxPlayer state components", () => {
         onTimelineMouseLeave={() => undefined}
         onTimelineKeyDown={() => undefined}
         onTogglePlayPause={() => undefined}
-        onSeekRelative={() => undefined}
         onToggleMute={() => undefined}
         onVolumeChange={() => undefined}
         onToggleRemainingTime={() => undefined}
-        onSourceChange={() => undefined}
         onToggleDanmu={() => undefined}
         onChapterSeek={() => undefined}
         onSkipIntro={() => undefined}
@@ -253,7 +260,7 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('aria-label="章节：片尾开始"');
     expect(markup).toContain('data-marker-type="CREDITS_START"');
     expect(markup).toContain('aria-label="跳过片头"');
-    expect(markup).toContain('aria-label="选择播放版本"');
+    expect(markup).not.toContain('aria-label="选择播放版本"');
     expect(markup).toContain('aria-label="截图"');
     expect(markup).toContain('aria-label="播放器设置"');
     expect(markup).not.toContain("发送弹幕");

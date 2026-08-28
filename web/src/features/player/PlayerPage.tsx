@@ -30,10 +30,11 @@ import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
 import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
-import { type PlayerControlSourceOption, PlayerControls } from "./components/player-controls";
+import { PlayerControls } from "./components/player-controls";
+import { PlayerSettingsPanel } from "./components/player-settings-panel";
+import type { PlayerSettingsSourceOption } from "./components/player-settings-panel";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
 import { LuxPlayer } from "./components/lux-player";
-import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerTopBar } from "./components/player-top-bar";
 import { PlayerVideoSurface } from "./components/player-video-surface";
 import type {
@@ -69,22 +70,6 @@ const HEVC_RUNTIME_ASSETS = {
   wasmModuleUrl: "/hevc/hevc-decode-module.js",
   wasmBinaryUrl: "/hevc/hevc-decode.wasm",
 };
-
-function getMediaBadge(source?: MediaSource | null) {
-  if (!source) return null;
-  const badges: string[] = [];
-  if (source.qualityLabel) badges.push(source.qualityLabel);
-  const videoStream = source.streams?.find((s) => s.type === "VIDEO");
-  if (videoStream?.codec) {
-    badges.push(videoStream.codec.toUpperCase());
-  }
-  if (source.sourceKind === "STRM_URL") {
-    badges.push("STRM");
-  } else if (source.container) {
-    badges.push(source.container.toUpperCase());
-  }
-  return badges.length > 0 ? badges.slice(0, 3).join(" • ") : null;
-}
 
 function getSubtitleInfo(media?: MediaItem | null) {
   if (!media) return null;
@@ -1075,7 +1060,6 @@ export function PlayerPage() {
     );
   }
 
-  const mediaBadgeText = getMediaBadge(source);
   const subtitleInfo = getSubtitleInfo(media);
   const planFailure = playbackPlan?.type === "UNSUPPORTED"
     ? playerFailure("BROWSER_UNSUPPORTED")
@@ -1083,7 +1067,7 @@ export function PlayerPage() {
   const surfaceFailure = playbackFailure
     ?? planFailure
     ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
-  const sourceOptions: PlayerControlSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
+  const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
     detail: entry.sourceKind === "STRM_URL" ? "STRM" : entry.container || "直链",
@@ -1166,9 +1150,12 @@ export function PlayerPage() {
 
       <PlayerTopBar
         title={mediaTitle(media)}
-        badge={mediaBadgeText}
         subtitle={subtitleInfo}
         onBack={handleBack}
+        airPlayAvailable={airPlay.available}
+        onAirPlay={airPlay.showPicker}
+        pictureInPictureEnabled={Boolean(document.pictureInPictureEnabled)}
+        onTogglePictureInPicture={togglePictureInPicture}
       />
 
       {showSettings ? (
@@ -1176,6 +1163,9 @@ export function PlayerPage() {
           playbackRates={PLAYBACK_SPEEDS}
           playbackRate={playbackRate}
           onChangeRate={changePlaybackRate}
+          sources={sourceOptions}
+          selectedSourceId={source?.id ?? ""}
+          onSourceChange={(sourceId) => setSearchParams({ sourceId })}
           presentation={{
             loop: loopPlayback,
             aspectRatio,
@@ -1209,8 +1199,6 @@ export function PlayerPage() {
         muted={isMuted}
         fullscreen={isFullscreen}
         pictureInPictureEnabled={Boolean(document.pictureInPictureEnabled)}
-        sources={sourceOptions}
-        selectedSourceId={source?.id ?? ""}
         danmuVisible={danmuVisible}
         airPlayAvailable={airPlay.available}
         chapters={chapterTimeline.segments}
@@ -1231,7 +1219,6 @@ export function PlayerPage() {
         onToggleMute={toggleMute}
         onVolumeChange={changeVolume}
         onToggleRemainingTime={() => setIsRemainingTime((remaining) => !remaining)}
-        onSourceChange={(sourceId) => setSearchParams({ sourceId })}
         onToggleDanmu={() => {
           setDanmuVisible((visible) => !visible);
           resetControlsTimeout();

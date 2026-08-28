@@ -31,8 +31,6 @@ export type PlayerControlsProps = {
   muted: boolean;
   fullscreen: boolean;
   pictureInPictureEnabled: boolean;
-  sources: readonly PlayerControlSourceOption[];
-  selectedSourceId: string;
   danmuVisible: boolean;
   airPlayAvailable?: boolean;
   chapters?: readonly PlayerChapterSegment[];
@@ -53,7 +51,6 @@ export type PlayerControlsProps = {
   onToggleMute: () => void;
   onVolumeChange: (volume: number) => void;
   onToggleRemainingTime: () => void;
-  onSourceChange: (sourceId: string) => void;
   onToggleDanmu: () => void;
   onAirPlay?: () => void;
   onChapterSeek?: (seconds: number) => void;
@@ -62,12 +59,6 @@ export type PlayerControlsProps = {
   onToggleSettings: () => void;
   onTogglePictureInPicture: () => void;
   onToggleFullscreen: () => void;
-};
-
-export type PlayerControlSourceOption = {
-  id: string;
-  label: string;
-  detail: string;
 };
 
 export function formatTime(seconds: number): string {
@@ -91,8 +82,6 @@ export function PlayerControls({
   muted,
   fullscreen,
   pictureInPictureEnabled,
-  sources,
-  selectedSourceId,
   danmuVisible,
   airPlayAvailable = false,
   chapters = [],
@@ -113,7 +102,6 @@ export function PlayerControls({
   onToggleMute,
   onVolumeChange,
   onToggleRemainingTime,
-  onSourceChange,
   onToggleDanmu,
   onAirPlay = () => undefined,
   onChapterSeek = () => undefined,
@@ -227,23 +215,8 @@ export function PlayerControls({
         </div>
 
         <div className="lux-player-controls-right">
-          {sources.length > 0 ? (
-            <select
-              className="lux-player-source-control"
-              aria-label="选择播放版本"
-              title="选择播放版本"
-              value={selectedSourceId}
-              onChange={(event) => onSourceChange(event.target.value)}
-            >
-              {sources.map((source) => (
-                <option key={source.id} value={source.id}>
-                  {source.label} ({source.detail})
-                </option>
-              ))}
-            </select>
-          ) : null}
           {airPlayAvailable ? (
-            <button type="button" className="lux-player-action-btn" aria-label="AirPlay" title="AirPlay" onClick={onAirPlay}>
+            <button type="button" className="lux-player-action-btn lux-player-mobile-top-control" aria-label="AirPlay" title="AirPlay" onClick={onAirPlay}>
               <Airplay size={20} aria-hidden="true" />
             </button>
           ) : null}
@@ -262,7 +235,7 @@ export function PlayerControls({
             <Settings2 size={20} aria-hidden="true" />
           </button>
           {pictureInPictureEnabled ? (
-            <button type="button" className="lux-player-action-btn" aria-label="画中画" title="画中画" onClick={onTogglePictureInPicture}>
+            <button type="button" className="lux-player-action-btn lux-player-mobile-top-control" aria-label="画中画" title="画中画" onClick={onTogglePictureInPicture}>
               <PictureInPicture2 size={19} aria-hidden="true" />
             </button>
           ) : null}

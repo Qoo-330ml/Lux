@@ -340,6 +340,9 @@ describe("PlayerPage playback synchronization", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
     const sourceSelector = container.querySelector<HTMLSelectElement>('select[aria-label="选择播放版本"]');
     expect(sourceSelector).not.toBeNull();
     if (!sourceSelector) throw new Error("source selector was not rendered");
@@ -604,8 +607,11 @@ describe("PlayerPage playback synchronization", () => {
     });
 
     const video = container.querySelector<HTMLVideoElement>("video");
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!video || !settings) throw new Error("chapter player was not rendered");
+    await act(async () => settings.click());
     const sourceSelector = container.querySelector<HTMLSelectElement>("[aria-label='选择播放版本']");
-    if (!video || !sourceSelector) throw new Error("chapter player was not rendered");
+    if (!sourceSelector) throw new Error("source selector was not rendered");
     Object.defineProperty(video, "duration", { configurable: true, value: 10 });
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 3 });
     await act(async () => video.dispatchEvent(new Event("durationchange")));

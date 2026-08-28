@@ -31,6 +31,17 @@ test("player overlays use viewport-relative safe-area insets", () => {
   assert.match(rule(".lux-player-frame"), /right:\s*env\(safe-area-inset-right\)/);
 });
 
+test("portrait phone players move AirPlay and picture-in-picture to the top bar", () => {
+  assert.match(stylesheet, /\.lux-player-topbar-actions\s*\{[^}]*display:\s*none/);
+  assert.match(stylesheet, /@media\s*\(max-width:\s*720px\)\s+and\s+\(orientation:\s*portrait\)[\s\S]*?\.lux-player-topbar-actions\s*\{[^}]*display:\s*flex/);
+  assert.match(stylesheet, /@media\s*\(max-width:\s*720px\)\s+and\s+\(orientation:\s*portrait\)[\s\S]*?\.lux-player-controls \.lux-player-mobile-top-control\s*\{[^}]*display:\s*none/);
+});
+
+test("center playback action uses a smaller visual footprint", () => {
+  assert.match(stylesheet, /\.lux-player-center-play, \.lux-player-center-splash\s*\{[^}]*width:\s*88px;[^}]*height:\s*88px/);
+  assert.match(stylesheet, /@media\s*\(max-width:\s*560px\)[\s\S]*?\.lux-player-center-play, \.lux-player-center-splash\s*\{[^}]*width:\s*68px;[^}]*height:\s*68px/);
+});
+
 test("large-display page surfaces do not keep fixed pixel width caps", () => {
   for (const selector of [
     ".lux-home-content",

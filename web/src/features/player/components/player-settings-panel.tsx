@@ -19,10 +19,19 @@ type PlayerPresentationSettings = PlayerVideoPresentation & {
   onChangeFlip: (flip: PlayerFlip) => void;
 };
 
+export type PlayerSettingsSourceOption = {
+  id: string;
+  label: string;
+  detail: string;
+};
+
 type PlayerSettingsPanelProps = {
   playbackRates: readonly number[];
   playbackRate: number;
   onChangeRate: (rate: number) => void;
+  sources?: readonly PlayerSettingsSourceOption[];
+  selectedSourceId?: string;
+  onSourceChange?: (sourceId: string) => void;
   captions?: readonly PlayerCaptionOption[];
   selectedCaptionStreamIndex?: number | null;
   captionStatus?: string | null;
@@ -49,6 +58,9 @@ export function PlayerSettingsPanel({
   playbackRates,
   playbackRate,
   onChangeRate,
+  sources = [],
+  selectedSourceId = "",
+  onSourceChange = () => undefined,
   captions = [],
   selectedCaptionStreamIndex = null,
   captionStatus = null,
@@ -79,6 +91,25 @@ export function PlayerSettingsPanel({
           <X size={16} aria-hidden="true" />
         </button>
       </div>
+      {sources.length > 0 ? (
+        <div className="lux-player-settings-section">
+          <label className="lux-player-settings-label" htmlFor="lux-player-source-select">播放版本</label>
+          <select
+            id="lux-player-source-select"
+            className="lux-player-caption-select"
+            aria-label="选择播放版本"
+            title="选择播放版本"
+            value={selectedSourceId}
+            onChange={(event) => onSourceChange(event.target.value)}
+          >
+            {sources.map((source) => (
+              <option key={source.id} value={source.id}>
+                {source.label} ({source.detail})
+              </option>
+            ))}
+          </select>
+        </div>
+      ) : null}
       <div className="lux-player-settings-section">
         <span className="lux-player-settings-label" id="lux-player-speed-label">播放速度</span>
         <div className="lux-player-speed-grid" aria-labelledby="lux-player-speed-label">
