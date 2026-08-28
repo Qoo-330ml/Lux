@@ -416,6 +416,9 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraryCoverJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminTaskActivity });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminLogs });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.home });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminLibraries });
       onSaved();
     },
   });

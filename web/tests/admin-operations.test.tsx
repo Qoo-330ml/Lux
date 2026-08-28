@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminOperationsPage } from "../src/features/admin/AdminOperationsPage";
 import { api } from "../src/lib/api/client";
+import { queryKeys } from "../src/lib/api/query-keys";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -609,7 +610,10 @@ describe("AdminOperationsPage", () => {
       page: 1,
       pageSize: 100,
     });
-    renderPage();
+    const queryClient = renderPage();
+    queryClient.setQueryData(queryKeys.home, { libraries: [] });
+    queryClient.setQueryData(queryKeys.libraries, { libraries: [] });
+    const adminLibraryCallsBeforeRun = vi.mocked(api.adminLibraries).mock.calls.length;
 
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("元数据刮削"));
@@ -628,6 +632,11 @@ describe("AdminOperationsPage", () => {
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行自动生成媒体库封面"]')?.click());
     await act(async () => {
       await vi.waitFor(() => expect(runScheduledTask).toHaveBeenCalledWith({ ownerType: "LIBRARY", ownerId: "library-1", taskType: "AUTO_LIBRARY_COVER" }));
+    });
+    await vi.waitFor(() => {
+      expect(queryClient.getQueryState(queryKeys.home)?.isInvalidated).toBe(true);
+      expect(queryClient.getQueryState(queryKeys.libraries)?.isInvalidated).toBe(true);
+      expect(vi.mocked(api.adminLibraries).mock.calls.length).toBeGreaterThan(adminLibraryCallsBeforeRun);
     });
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="编辑自动生成媒体库封面"]')).not.toBeNull();
   });
@@ -669,5 +678,6 @@ describe("AdminOperationsPage", () => {
         </QueryClientProvider>,
       );
     });
+    return queryClient;
   }
 });
