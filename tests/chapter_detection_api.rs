@@ -36,6 +36,7 @@ async fn chapter_detection_http_api_enforces_admin_csrf_and_persists_jobs()
             "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
             "type": "chapter_detector",
             "category": "MEDIA",
+            "supportedMediaSourceKinds": ["LOCAL_FILE"],
             "supportedItemTypes": ["Episode"],
             "capabilities": ["chapters.detect"],
             "configFields": [
@@ -153,9 +154,11 @@ async fn chapter_detection_http_api_enforces_admin_csrf_and_persists_jobs()
         .send()
         .await?;
     assert_eq!(sources.status(), reqwest::StatusCode::OK);
+    let sources_body = sources.json::<Value>().await?;
+    assert_eq!(sources_body["sources"][0]["id"], PLUGIN_ID);
     assert_eq!(
-        sources.json::<Value>().await?["sources"][0]["id"],
-        PLUGIN_ID
+        sources_body["sources"][0]["supportedMediaSourceKinds"],
+        json!(["LOCAL_FILE"])
     );
 
     let selected = client

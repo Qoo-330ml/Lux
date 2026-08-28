@@ -24,6 +24,8 @@ pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
 pub const STRM_RESOLVE_CAPABILITY: &str = "strm.resolve";
 pub const CHAPTER_DETECT_CAPABILITY: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_CAPABILITY: &str = "chapters.lookup";
+pub const MEDIA_SOURCE_KIND_LOCAL_FILE: &str = "LOCAL_FILE";
+pub const MEDIA_SOURCE_KIND_STRM_URL: &str = "STRM_URL";
 pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const DANMAKU_MATCH_CAPABILITY: &str = "danmaku.match";
 pub const EMBY_MIGRATION_CAPABILITY: &str = "migration.emby";
@@ -70,6 +72,8 @@ pub struct PluginManifest {
     pub aliases: Vec<String>,
     #[serde(default)]
     pub supported_item_types: Vec<String>,
+    #[serde(default)]
+    pub supported_media_source_kinds: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<String>,
     #[serde(default)]
@@ -175,6 +179,36 @@ impl PluginManifest {
                             .to_owned(),
                     ));
                 }
+                let has_detect = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == CHAPTER_DETECT_CAPABILITY);
+                let has_lookup = self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability == CHAPTER_LOOKUP_CAPABILITY);
+                if has_detect == has_lookup {
+                    return Err(PluginManifestError::Invalid(
+                        "chapter detector plugins must declare exactly one chapter capability"
+                            .to_owned(),
+                    ));
+                }
+                if self.supported_media_source_kinds.is_empty() {
+                    return Err(PluginManifestError::Invalid(
+                        "chapter detector plugins must declare supportedMediaSourceKinds"
+                            .to_owned(),
+                    ));
+                }
+                if has_detect
+                    && self
+                        .supported_media_source_kinds
+                        .iter()
+                        .any(|source_kind| source_kind != MEDIA_SOURCE_KIND_LOCAL_FILE)
+                {
+                    return Err(PluginManifestError::Invalid(
+                        "chapters.detect plugins currently support only LOCAL_FILE".to_owned(),
+                    ));
+                }
             }
             PLUGIN_TYPE_NOTIFICATION => {
                 if self.category != PLUGIN_CATEGORY_NOTIFICATION {
@@ -233,12 +267,24 @@ impl PluginManifest {
         }
         self.runtime.validate()?;
         if self.supported_item_types.len() > 32
+            || self.supported_media_source_kinds.len() > 8
             || self.capabilities.len() > 64
             || self.aliases.len() > 16
         {
             return Err(PluginManifestError::Invalid(
-                "manifest declares too many item types, capabilities or aliases".to_owned(),
+                "manifest declares too many item types, media source kinds, capabilities or aliases"
+                    .to_owned(),
             ));
+        }
+        for source_kind in &self.supported_media_source_kinds {
+            if !matches!(
+                source_kind.as_str(),
+                MEDIA_SOURCE_KIND_LOCAL_FILE | MEDIA_SOURCE_KIND_STRM_URL
+            ) {
+                return Err(PluginManifestError::Invalid(format!(
+                    "unsupported media source kind: {source_kind}"
+                )));
+            }
         }
         for alias in &self.aliases {
             validate_identifier("plugin alias", alias, 64)?;

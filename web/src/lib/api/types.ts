@@ -361,6 +361,7 @@ export type ChapterSource = {
   version?: string | null;
   capabilities: string[];
   lookup: boolean;
+  supportedMediaSourceKinds: string[];
 };
 
 export type AdminPluginStore = {

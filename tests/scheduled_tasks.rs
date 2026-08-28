@@ -102,6 +102,7 @@ async fn enabled_chapter_task_creates_one_detection_job_per_matching_minute()
             "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
             "type": "chapter_detector",
             "category": "MEDIA",
+            "supportedMediaSourceKinds": ["LOCAL_FILE"],
             "supportedItemTypes": ["Episode"],
             "capabilities": ["chapters.detect"],
             "configFields": [

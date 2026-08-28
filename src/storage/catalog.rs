@@ -3276,8 +3276,16 @@ impl Database {
         after_source_id: Option<&str>,
         limit: i64,
         require_fingerprint: bool,
+        supported_media_source_kinds: &[String],
     ) -> Result<Vec<StoredChapterDetectionSource>, StorageError> {
-        let query_with_fingerprint =
+        let source_kind_placeholders = if supported_media_source_kinds.is_empty() {
+            "NULL".to_owned()
+        } else {
+            std::iter::repeat_n("?", supported_media_source_kinds.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let query_with_fingerprint = format!(
             "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
                     fe.fingerprint, ms.duration_ticks,
                     episode.provider_ids_json,
@@ -3301,7 +3309,7 @@ impl Database {
                AND episode.item_type = 'EPISODE'
                AND season.item_type = 'SEASON'
                AND series.item_type = 'SERIES'
-               AND ms.source_kind = 'LOCAL_FILE'
+               AND ms.source_kind IN ({source_kind_placeholders})
                AND episode.removed_at IS NULL
                AND fe.is_missing = 0
                AND fe.fingerprint IS NOT NULL
@@ -3310,9 +3318,10 @@ impl Database {
                    WHERE preferred.item_id = episode.id AND preferred.is_default = 1
                ))
                AND (? IS NULL OR ms.id > ?)
-             ORDER BY ms.id
-             LIMIT ?";
-        let query_without_fingerprint =
+               ORDER BY ms.id
+             LIMIT ?"
+        );
+        let query_without_fingerprint = format!(
             "SELECT ms.id AS source_id, episode.id AS item_id, season.id AS season_id,
                     fe.fingerprint, ms.duration_ticks,
                     episode.provider_ids_json,
@@ -3336,7 +3345,7 @@ impl Database {
                AND episode.item_type = 'EPISODE'
                AND season.item_type = 'SEASON'
                AND series.item_type = 'SERIES'
-               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND ms.source_kind IN ({source_kind_placeholders})
                AND episode.removed_at IS NULL
                AND fe.is_missing = 0
                AND (ms.is_default = 1 OR NOT EXISTS (
@@ -3344,22 +3353,33 @@ impl Database {
                    WHERE preferred.item_id = episode.id AND preferred.is_default = 1
                ))
                AND (? IS NULL OR ms.id > ?)
-             ORDER BY ms.id
-             LIMIT ?";
+               ORDER BY ms.id
+             LIMIT ?"
+        );
         let limit = limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE);
         let rows = if require_fingerprint {
-            self.query(query_with_fingerprint)
+            let mut query = self
+                .query(sqlx::AssertSqlSafe(query_with_fingerprint))
                 .bind(plugin_id)
-                .bind(library_id)
+                .bind(library_id);
+            for source_kind in supported_media_source_kinds {
+                query = query.bind(source_kind);
+            }
+            query
                 .bind(after_source_id)
                 .bind(after_source_id)
                 .bind(limit)
                 .fetch_all(&self.pool)
                 .await
         } else {
-            self.query(query_without_fingerprint)
+            let mut query = self
+                .query(sqlx::AssertSqlSafe(query_without_fingerprint))
                 .bind(plugin_id)
-                .bind(library_id)
+                .bind(library_id);
+            for source_kind in supported_media_source_kinds {
+                query = query.bind(source_kind);
+            }
+            query
                 .bind(after_source_id)
                 .bind(after_source_id)
                 .bind(limit)
@@ -3699,8 +3719,16 @@ impl Database {
         &self,
         job_id: &str,
         limit: i64,
+        supported_media_source_kinds: &[String],
     ) -> Result<Vec<StoredChapterDetectionItem>, StorageError> {
-        self.query(
+        let source_kind_placeholders = if supported_media_source_kinds.is_empty() {
+            "NULL".to_owned()
+        } else {
+            std::iter::repeat_n("?", supported_media_source_kinds.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let query = format!(
             "SELECT cdi.source_id, cdi.season_id,
                     cdi.source_fingerprint,
                     cdi.input_fingerprint, cdi.is_context,
@@ -3720,38 +3748,42 @@ impl Database {
              LEFT JOIN chapter_detection_source_states states
                ON states.source_id = cdi.source_id AND states.plugin_id = job.plugin_id
              WHERE cdi.job_id = ? AND cdi.status = 'PENDING'
-               AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+               AND ms.source_kind IN ({source_kind_placeholders})
              ORDER BY cdi.season_id, cdi.source_id
-             LIMIT ?",
-        )
-        .bind(job_id)
-        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredChapterDetectionItem {
-                    source_id: row.get("source_id"),
-                    season_id: row.get("season_id"),
-                    source_fingerprint: row.get("source_fingerprint"),
-                    input_fingerprint: row.get("input_fingerprint"),
-                    is_context: row.get::<i64, _>("is_context") != 0,
-                    intro_fingerprint: row.get("intro_fingerprint"),
-                    credits_fingerprint: row.get("credits_fingerprint"),
-                    duration_ticks: row.get("duration_ticks"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                    provider_ids_json: row.get("provider_ids_json"),
-                    series_provider_ids_json: row.get("series_provider_ids_json"),
-                    season_number: row.get("season_number"),
-                    episode_number: row.get("episode_number"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+             LIMIT ?"
+        );
+        let mut query = self.query(sqlx::AssertSqlSafe(query)).bind(job_id);
+        for source_kind in supported_media_source_kinds {
+            query = query.bind(source_kind);
+        }
+        query
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredChapterDetectionItem {
+                        source_id: row.get("source_id"),
+                        season_id: row.get("season_id"),
+                        source_fingerprint: row.get("source_fingerprint"),
+                        input_fingerprint: row.get("input_fingerprint"),
+                        is_context: row.get::<i64, _>("is_context") != 0,
+                        intro_fingerprint: row.get("intro_fingerprint"),
+                        credits_fingerprint: row.get("credits_fingerprint"),
+                        duration_ticks: row.get("duration_ticks"),
+                        root_path: row.get("root_path"),
+                        relative_path: row.get("relative_path"),
+                        provider_ids_json: row.get("provider_ids_json"),
+                        series_provider_ids_json: row.get("series_provider_ids_json"),
+                        season_number: row.get("season_number"),
+                        episode_number: row.get("episode_number"),
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn set_chapter_detection_item_status(

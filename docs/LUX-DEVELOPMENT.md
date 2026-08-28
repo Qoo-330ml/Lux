@@ -360,8 +360,10 @@ Lux 的核心价值不是功能数量，而是：
   `StartPositionTicks`、可选 `Name`、可选 `ImageTag`、`MarkerType` 和 `ChapterIndex`。
 - 自动片头片尾章节由独立 `chapter_detector` 插件提供。本地音频检测插件在后台对已校验的本地媒体运行
   ffmpeg/chromaprint；在线章节源插件只接收已保存的 provider ID、季号、集号和时长，从固定远程服务
-  获取已标注结果。在线章节源对 `LOCAL_FILE` 和 `STRM_URL` 媒体源都适用，不读取媒体路径或
-  `.strm` 目标；两种插件都不能接收数据库或任务对象。
+  获取已标注结果。每个章节插件必须在 manifest 的 `supportedMediaSourceKinds` 中声明自己支持的
+  `LOCAL_FILE`/`STRM_URL` 媒体源，宿主按声明筛选候选，不按插件 ID 推断。在线章节源可以声明两者，
+  不读取媒体路径或 `.strm` 目标；指纹检测合同当前只能声明 `LOCAL_FILE`。两种插件都不能接收数据库
+  或任务对象。
 - 检测插件按季度批次比较至少两个可用分集，返回 `IntroStart`、`IntroEnd`、`CreditsStart` 候选。
   Lux 校验时间范围、顺序、数量和来源后原子替换 `provider_id` 等于该插件 ID 的隐藏标记；低置信度结果不落库。
 - 媒体文件指纹变化时，旧检测标记失效；重新检测只在后台任务中发生。
@@ -4146,7 +4148,9 @@ provider 切换由后台身份解析任务处理：优先使用已知 provider �
 
 #### LUX-175：片头片尾检测插件宿主
 
-范围：扩展 Plugin SDK v1，支持 `chapter_detector` 类型与 `chapters.detect` 能力。Lux 在持久化后台
+范围：扩展 Plugin SDK v1，支持 `chapter_detector` 类型与 `chapters.detect` 能力。章节插件 manifest
+必须声明 `supportedMediaSourceKinds`；该字段描述宿主可以为该插件提交的媒体源类型，不代表插件会收到
+路径或 URL。Lux 在持久化后台
 任务中按季度分页读取本地分集，使用现有 ffmpeg 的 chromaprint muxer 提取开头/结尾的有界原始指纹，
 只把指纹、采样率、窗口相对时间和请求内临时键发送给插件。插件不接收路径、URL、媒体源 ID、凭据或任务对象。
 宿主校验插件结果并把高置信度标记保存为插件来源特殊章节（`provider_id` 为插件 ID）。单季度超过
@@ -4165,7 +4169,8 @@ RPC 上限时批次保留一个分集的上下文重叠，但只对未处理分�
 
 #### LUX-176：外置片头片尾检测插件
 
-范围：在独立 `Lux-plugins` 仓库实现 `org.lux.intro-outro-detector`。插件比较同季度至少两个分集的
+范围：在独立 `Lux-plugins` 仓库实现 `org.lux.intro-outro-detector`。manifest 声明
+`supportedMediaSourceKinds: ["LOCAL_FILE"]`。插件比较同季度至少两个分集的
 Chromaprint 原始指纹，在配置的开头/结尾窗口内寻找满足最小时长和匹配阈值的公共序列，返回
 `IntroStart`、`IntroEnd` 和可选 `CreditsStart`。插件不执行 ffmpeg、不读取媒体路径、不联网。
 
@@ -4182,7 +4187,8 @@ Chromaprint 原始指纹，在配置的开头/结尾窗口内寻找满足最小�
 
 #### LUX-177：TheIntroDB 在线章节源插件
 
-范围：在独立 `Lux-plugins` 仓库实现 `org.lux.theintrodb-chapter-source`。插件通过新增的
+范围：在独立 `Lux-plugins` 仓库实现 `org.lux.theintrodb-chapter-source`。manifest 声明
+`supportedMediaSourceKinds: ["LOCAL_FILE", "STRM_URL"]`。插件通过新增的
 `chapters.lookup` 合同，按 Lux 已保存的 TMDb/TVDb/IMDb ID、季号、集号和可选时长请求
 TheIntroDB `/v3/media`，只映射片头和片尾为特殊章节。插件不接收媒体路径、`.strm` URL、音频指纹或
 任务对象，不运行 ffmpeg/ffprobe；无数据响应不会清除已有章节。

@@ -787,6 +787,10 @@ impl PluginService {
                     version: view.version,
                     capabilities: view.capabilities,
                     lookup: is_chapter_lookup_plugin(plugin),
+                    supported_media_source_kinds: plugin
+                        .manifest
+                        .supported_media_source_kinds
+                        .clone(),
                 });
             }
         }
@@ -815,6 +819,20 @@ impl PluginService {
     ) -> Result<bool, PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
         Ok(catalog.get(plugin_id).is_some_and(is_chapter_lookup_plugin))
+    }
+
+    pub async fn chapter_source_media_source_kinds(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Vec<String>, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin = catalog
+            .get(plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.to_owned()))?;
+        if !is_chapter_detector_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id.to_owned()));
+        }
+        Ok(plugin.manifest.supported_media_source_kinds.clone())
     }
 
     pub async fn resolve_strm_target(
@@ -2346,6 +2364,7 @@ pub struct ChapterSourceView {
     pub version: Option<String>,
     pub capabilities: Vec<String>,
     pub lookup: bool,
+    pub supported_media_source_kinds: Vec<String>,
 }
 
 #[derive(Debug)]

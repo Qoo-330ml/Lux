@@ -614,7 +614,7 @@ function ScraperSelect({ id, value, plugins, onChange }: { id: string; value: st
 function ChapterSourceSelect({ id, kind, value, sources, onChange }: { id: string; kind: string; value: string; sources: ChapterSource[]; onChange: (value: string) => void }) {
   const supported = supportsChapterSource(kind);
   const options = [
-    ...sources.map((source) => ({ value: source.id, label: `${source.name}${source.lookup ? "（在线）" : "（本地）"}` })),
+    ...sources.map((source) => ({ value: source.id, label: `${source.name}${chapterSourceKindLabel(source.supportedMediaSourceKinds)}` })),
     ...(value && !sources.some((source) => source.id === value)
       ? [{ value, label: "已配置来源（暂不可用）", disabled: true }]
       : []),
@@ -625,6 +625,15 @@ function ChapterSourceSelect({ id, kind, value, sources, onChange }: { id: strin
     {value ? <button className="lux-library-dialog-icon" type="button" aria-label="清除片头片尾数据源配置" onClick={() => onChange("")}>清除配置</button> : null}
     <small>{supported ? "选择后，该媒体库的检测任务和章节输出只使用此来源。" : "电影库不支持片头片尾数据源。"}</small>
   </label>;
+}
+
+function chapterSourceKindLabel(kinds: string[] | undefined) {
+  const labels = (kinds ?? []).map((kind) => {
+    if (kind === "LOCAL_FILE") return "本地文件";
+    if (kind === "STRM_URL") return ".strm";
+    return kind;
+  }).filter(Boolean);
+  return labels.length > 0 ? `（${labels.join("、")}）` : "（未声明媒体类型）";
 }
 
 function supportsChapterSource(kind: string) {

@@ -6566,6 +6566,7 @@ pub(crate) async fn admin_list_chapter_sources(
                 "version": source.version,
                 "capabilities": source.capabilities,
                 "lookup": source.lookup,
+                "supportedMediaSourceKinds": source.supported_media_source_kinds,
             })).collect::<Vec<_>>(),
             "total": page.total,
             "page": page.offset / page.limit + 1,

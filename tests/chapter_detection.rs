@@ -15,7 +15,7 @@ use luxd::{
 };
 use serde_json::json;
 
-const THEINTRODB_CHAPTER_SOURCE_ID: &str = "org.lux.theintrodb-chapter-source";
+const STRM_ONLY_CHAPTER_SOURCE_ID: &str = "org.lux.example-strm-chapter-source";
 
 #[tokio::test]
 async fn detector_job_recovers_running_items_and_preserves_other_marker_sources()
@@ -59,6 +59,7 @@ done
             "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
             "type": "chapter_detector",
             "category": "MEDIA",
+            "supportedMediaSourceKinds": ["LOCAL_FILE"],
             "supportedItemTypes": ["Episode"],
             "capabilities": ["chapters.detect"],
             "permissions": {"network": [], "filesystem": []},
@@ -220,11 +221,11 @@ esac
 }
 
 #[tokio::test]
-async fn online_chapter_source_supports_strm_without_running_ffmpeg()
+async fn chapter_source_honors_declared_media_source_kinds()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
-    let plugin_dir = config_dir.join(format!("plugins/{THEINTRODB_CHAPTER_SOURCE_ID}"));
+    let plugin_dir = config_dir.join(format!("plugins/{STRM_ONLY_CHAPTER_SOURCE_ID}"));
     tokio::fs::create_dir_all(plugin_dir.join("binaries")).await?;
     let plugin = plugin_dir.join("binaries/plugin");
     fs::write(
@@ -251,13 +252,14 @@ done
         plugin_dir.join("manifest.json"),
         serde_json::to_vec_pretty(&json!({
             "formatVersion": 1,
-            "id": THEINTRODB_CHAPTER_SOURCE_ID,
+            "id": STRM_ONLY_CHAPTER_SOURCE_ID,
             "name": "TheIntroDB chapter source",
             "version": "1.0.0",
             "apiVersion": 1,
             "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
             "type": "chapter_detector",
             "category": "MEDIA",
+            "supportedMediaSourceKinds": ["STRM_URL"],
             "supportedItemTypes": ["Episode"],
             "capabilities": ["chapters.lookup"],
             "configFields": [
@@ -291,6 +293,7 @@ done
         )
         .await?;
     }
+    tokio::fs::write(season_root.join("Example.Show.S01E03.mkv"), b"local-media").await?;
     libraries
         .add_root(library.id, media_root.to_str().ok_or("non-utf8 root")?)
         .await?;
@@ -306,12 +309,12 @@ done
     .execute(database.pool())
     .await?;
     let plugins = PluginService::new(database.clone(), config_dir);
-    plugins.install(THEINTRODB_CHAPTER_SOURCE_ID).await?;
+    plugins.install(STRM_ONLY_CHAPTER_SOURCE_ID).await?;
     libraries
         .update_settings(
             library.id,
             LibrarySettingsPatch {
-                chapter_source_id: Some(Some(THEINTRODB_CHAPTER_SOURCE_ID.to_owned())),
+                chapter_source_id: Some(Some(STRM_ONLY_CHAPTER_SOURCE_ID.to_owned())),
                 ..Default::default()
             },
         )
@@ -329,7 +332,7 @@ done
     let job = service
         .create_library_job(
             library.id,
-            THEINTRODB_CHAPTER_SOURCE_ID,
+            STRM_ONLY_CHAPTER_SOURCE_ID,
             ChapterDetectionOptions::default(),
         )
         .await?;
@@ -339,14 +342,14 @@ done
     assert_eq!(completed.status, "COMPLETED");
     let marker_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_chapters WHERE provider_id = ?")
-            .bind(THEINTRODB_CHAPTER_SOURCE_ID)
+            .bind(STRM_ONLY_CHAPTER_SOURCE_ID)
             .fetch_one(database.pool())
             .await?;
     assert_eq!(marker_count, 2);
     let skipped_job = service
         .create_library_job(
             library.id,
-            THEINTRODB_CHAPTER_SOURCE_ID,
+            STRM_ONLY_CHAPTER_SOURCE_ID,
             ChapterDetectionOptions::default(),
         )
         .await?;
@@ -355,7 +358,7 @@ done
     let forced_job = service
         .create_library_job(
             library.id,
-            THEINTRODB_CHAPTER_SOURCE_ID,
+            STRM_ONLY_CHAPTER_SOURCE_ID,
             ChapterDetectionOptions {
                 force_refresh: true,
                 ..ChapterDetectionOptions::default()

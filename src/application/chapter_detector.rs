@@ -159,11 +159,16 @@ impl ChapterDetectionService {
             return Err(ChapterDetectionError::AlreadyActive);
         }
         let remote_lookup = self.plugins.is_chapter_lookup_plugin(plugin_id).await?;
+        let supported_media_source_kinds = self
+            .plugins
+            .chapter_source_media_source_kinds(plugin_id)
+            .await?;
         let candidates = self
             .eligible_sources(
                 &library_id_text,
                 plugin_id,
                 remote_lookup,
+                &supported_media_source_kinds,
                 options,
                 options.force_refresh,
             )
@@ -222,6 +227,7 @@ impl ChapterDetectionService {
         library_id: &str,
         plugin_id: &str,
         remote_lookup: bool,
+        supported_media_source_kinds: &[String],
         options: ChapterDetectionOptions,
         force_refresh: bool,
     ) -> Result<Vec<EligibleChapterDetectionSource>, ChapterDetectionError> {
@@ -236,6 +242,7 @@ impl ChapterDetectionService {
                     after_source_id.as_deref(),
                     SOURCE_PAGE_SIZE,
                     !remote_lookup,
+                    supported_media_source_kinds,
                 )
                 .await?;
             let Some(last_source_id) = page.last().map(|source| source.source_id.clone()) else {
@@ -442,6 +449,10 @@ impl ChapterDetectionService {
             .plugins
             .is_chapter_lookup_plugin(&job.plugin_id)
             .await?;
+        let supported_media_source_kinds = self
+            .plugins
+            .chapter_source_media_source_kinds(&job.plugin_id)
+            .await?;
         let mut processed_source_ids = HashSet::new();
         let mut season_contexts = HashMap::<String, StoredChapterDetectionItem>::new();
         loop {
@@ -455,7 +466,11 @@ impl ChapterDetectionService {
             }
             let pending = self
                 .database
-                .list_pending_chapter_detection_items(&job.id, SOURCE_PAGE_SIZE)
+                .list_pending_chapter_detection_items(
+                    &job.id,
+                    SOURCE_PAGE_SIZE,
+                    &supported_media_source_kinds,
+                )
                 .await?;
             if pending.is_empty() {
                 break;

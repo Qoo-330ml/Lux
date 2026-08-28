@@ -181,6 +181,7 @@ fn accepts_a_chapter_detector_manifest_and_bounded_rpc_contract() {
         "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
         "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
         "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["LOCAL_FILE"],
         "capabilities": [CHAPTER_DETECT_CAPABILITY],
         "permissions": {"network": [], "filesystem": []},
         "files": []
@@ -236,6 +237,7 @@ fn accepts_a_chapter_detector_manifest_and_bounded_rpc_contract() {
         ChapterDetectMarkerType::IntroStart
     );
     assert_eq!(manifest.plugin_type, PLUGIN_TYPE_CHAPTER_DETECTOR);
+    assert_eq!(manifest.supported_media_source_kinds, ["LOCAL_FILE"]);
 }
 
 #[test]
@@ -249,6 +251,7 @@ fn accepts_a_metadata_lookup_chapter_contract_without_media_paths() {
         "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
         "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
         "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["LOCAL_FILE", "STRM_URL"],
         "capabilities": [CHAPTER_LOOKUP_CAPABILITY],
         "permissions": {"network": ["api.theintrodb.org"], "filesystem": []},
         "files": []
@@ -275,6 +278,52 @@ fn accepts_a_metadata_lookup_chapter_contract_without_media_paths() {
     request_with_path["episodes"][0]["path"] = json!("/media/episode.mkv");
     assert!(serde_json::from_value::<ChapterLookupRpcRequest>(request_with_path).is_err());
     assert_eq!(manifest.capabilities, vec![CHAPTER_LOOKUP_CAPABILITY]);
+    assert_eq!(
+        manifest.supported_media_source_kinds,
+        ["LOCAL_FILE", "STRM_URL"]
+    );
+}
+
+#[test]
+fn rejects_chapter_manifest_with_an_unknown_media_source_kind() {
+    let error = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-chapter-source-kind",
+        "name": "Invalid chapter source kind",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["REMOTE_STREAM"],
+        "capabilities": [CHAPTER_LOOKUP_CAPABILITY],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect_err("unknown chapter source kind must be rejected");
+
+    assert!(error.to_string().contains("media source kind"));
+}
+
+#[test]
+fn rejects_a_fingerprint_detector_that_declares_strm_support() {
+    let error = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-strm-detector",
+        "name": "Invalid STRM detector",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": PLUGIN_TYPE_CHAPTER_DETECTOR,
+        "category": PLUGIN_CATEGORY_MEDIA,
+        "supportedMediaSourceKinds": ["STRM_URL"],
+        "capabilities": [CHAPTER_DETECT_CAPABILITY],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect_err("fingerprint detector must not claim unsupported STRM input");
+
+    assert!(error.to_string().contains("only LOCAL_FILE"));
 }
 
 #[test]
