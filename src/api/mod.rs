@@ -2517,48 +2517,6 @@ fn emby_compat_media_source_id<'a>(ids: Option<&'a str>, page: &CatalogPage) -> 
         })
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EmbyClientCompatibility {
-    Generic,
-    LegacyMixedLibrary,
-}
-
-const LEGACY_MIXED_LIBRARY_CLIENTS: &[&str] = &["vidhub", "yamby"];
-
-fn emby_client_compatibility_from_name(client: Option<&str>) -> EmbyClientCompatibility {
-    if client.is_some_and(|client| {
-        LEGACY_MIXED_LIBRARY_CLIENTS
-            .iter()
-            .any(|known_client| client.trim().eq_ignore_ascii_case(known_client))
-    }) {
-        EmbyClientCompatibility::LegacyMixedLibrary
-    } else {
-        EmbyClientCompatibility::Generic
-    }
-}
-
-async fn emby_client_compatibility(
-    headers: &HeaderMap,
-    api_key: Option<&str>,
-    state: &AppState,
-) -> EmbyClientCompatibility {
-    let header_device = emby_device_info_from_headers(headers);
-    if !header_device.client.is_empty() {
-        return emby_client_compatibility_from_name(Some(&header_device.client));
-    }
-    let Some(token) = emby_token_from_headers(headers).or_else(|| api_key.map(str::to_owned))
-    else {
-        return EmbyClientCompatibility::Generic;
-    };
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return EmbyClientCompatibility::Generic;
-    };
-    match auth.device_info(&token).await {
-        Ok(Some(device)) => emby_client_compatibility_from_name(Some(&device.client)),
-        Ok(None) | Err(_) => EmbyClientCompatibility::Generic,
-    }
-}
-
 async fn emby_user_views(
     headers: HeaderMap,
     Path(user_id): Path<String>,
@@ -2573,8 +2531,7 @@ async fn emby_user_views(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
-    match emby_visible_library_items(&state, principal, compatibility).await {
+    match emby_visible_library_items(&state, principal).await {
         Ok(items) => {
             let total = items.len();
             Json(json!({
@@ -2617,7 +2574,6 @@ async fn emby_library_virtual_folders(
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
@@ -2636,7 +2592,6 @@ async fn emby_library_virtual_folders(
                         &media_strategy,
                         resume_played_percent,
                         resume_min_ticks,
-                        compatibility,
                     )
                 })
                 .collect::<Vec<_>>(),
@@ -2796,13 +2751,7 @@ async fn emby_user_root(
     if let Err(status) = ensure_emby_user_scope(&user, &user_id) {
         return status.into_response();
     }
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
-    emby_user_root_response(
-        &state,
-        AccessPrincipal::new(user.id, user.is_admin),
-        compatibility,
-    )
-    .await
+    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
 }
 
 async fn emby_items_root(
@@ -2818,21 +2767,11 @@ async fn emby_items_root(
     if let Err(status) = ensure_emby_user_scope(&user, &requested_user_id) {
         return status.into_response();
     }
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
-    emby_user_root_response(
-        &state,
-        AccessPrincipal::new(user.id, user.is_admin),
-        compatibility,
-    )
-    .await
+    emby_user_root_response(&state, AccessPrincipal::new(user.id, user.is_admin)).await
 }
 
-async fn emby_user_root_response(
-    state: &AppState,
-    principal: AccessPrincipal,
-    compatibility: EmbyClientCompatibility,
-) -> Response {
-    let items = match emby_visible_library_items(state, principal, compatibility).await {
+async fn emby_user_root_response(state: &AppState, principal: AccessPrincipal) -> Response {
+    let items = match emby_visible_library_items(state, principal).await {
         Ok(items) => items,
         Err(status) => return status.into_response(),
     };
@@ -2861,7 +2800,6 @@ async fn emby_user_root_response(
 async fn emby_visible_library_items(
     state: &AppState,
     principal: AccessPrincipal,
-    compatibility: EmbyClientCompatibility,
 ) -> Result<Vec<Value>, StatusCode> {
     let Some(access) = state.access.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -2886,7 +2824,6 @@ async fn emby_visible_library_items(
             &view.library,
             &state.server_id,
             child_count,
-            compatibility,
         ));
     }
     Ok(items)
@@ -3700,7 +3637,7 @@ async fn emby_items_counts(
 }
 
 async fn emby_list_items(
-    headers: &HeaderMap,
+    _headers: &HeaderMap,
     state: &AppState,
     principal: AccessPrincipal,
     can_download: bool,
@@ -3708,9 +3645,7 @@ async fn emby_list_items(
 ) -> Response {
     let root_id = principal.user_id.to_string();
     if emby_query_targets_user_root_views(query, &root_id) {
-        let compatibility =
-            emby_client_compatibility(headers, query.api_key.as_deref(), state).await;
-        return match emby_visible_library_items(state, principal, compatibility).await {
+        return match emby_visible_library_items(state, principal).await {
             Ok(items) => Json(json!({
                 "Items": items,
                 "TotalRecordCount": items.len(),
@@ -4075,14 +4010,12 @@ async fn emby_item(
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let fields = emby_detail_fields(query.fields.as_deref());
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
     emby_item_response(
         &state,
         principal,
         &item_id,
         user.can_download,
         fields.as_deref(),
-        compatibility,
     )
     .await
 }
@@ -4206,14 +4139,12 @@ async fn emby_user_item(
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let fields = emby_detail_fields(query.fields.as_deref());
-    let compatibility = emby_client_compatibility(&headers, query.api_key.as_deref(), &state).await;
     emby_item_response(
         &state,
         principal,
         &item_id,
         user.can_download,
         fields.as_deref(),
-        compatibility,
     )
     .await
 }
@@ -4224,10 +4155,9 @@ async fn emby_item_response(
     item_id: &str,
     can_download: bool,
     fields: Option<&str>,
-    compatibility: EmbyClientCompatibility,
 ) -> Response {
     if item_id == principal.user_id.to_string() {
-        return emby_user_root_response(state, principal, compatibility).await;
+        return emby_user_root_response(state, principal).await;
     }
     if let Ok(library_id) = item_id.parse::<crate::domain::ids::LibraryId>()
         && let Some(libraries) = state.libraries.as_ref()
@@ -4254,7 +4184,6 @@ async fn emby_item_response(
                     &library,
                     &state.server_id,
                     child_count,
-                    compatibility,
                 ))
                 .into_response();
             }
@@ -7592,12 +7521,7 @@ fn emby_boolean_value(value: &Value) -> Option<Value> {
     }
 }
 
-fn emby_library_view_json(
-    library: &LibraryRecord,
-    server_id: &str,
-    child_count: i64,
-    compatibility: EmbyClientCompatibility,
-) -> Value {
+fn emby_library_view_json(library: &LibraryRecord, server_id: &str, child_count: i64) -> Value {
     json!({
         "Name": library.name,
         "SortName": library.name,
@@ -7606,7 +7530,7 @@ fn emby_library_view_json(
         "Type": "CollectionFolder",
         "IsFolder": true,
         "MediaType": "Video",
-        "CollectionType": emby_collection_type(library.kind, compatibility),
+        "CollectionType": emby_collection_type(library.kind),
         "ChildCount": child_count,
         "RecursiveItemCount": child_count,
         "PrimaryImageItemId": library.cover_image_tag.as_ref().map(|_| library.id.to_string()),
@@ -7631,7 +7555,6 @@ fn emby_virtual_folder_json(
     global_media_strategy: &MediaStrategySettings,
     resume_played_percent: i64,
     resume_min_ticks: i64,
-    compatibility: EmbyClientCompatibility,
 ) -> Value {
     let media_strategy = view
         .library
@@ -7639,7 +7562,7 @@ fn emby_virtual_folder_json(
         .as_deref()
         .and_then(|value| serde_json::from_str::<MediaStrategySettings>(value).ok())
         .unwrap_or_else(|| global_media_strategy.clone());
-    let collection_type = emby_collection_type(view.library.kind, compatibility);
+    let collection_type = emby_collection_type(view.library.kind);
     json!({
         "Name": view.library.name,
         "Locations": view
@@ -7653,7 +7576,6 @@ fn emby_virtual_folder_json(
             &media_strategy,
             resume_played_percent,
             resume_min_ticks,
-            compatibility,
         ),
         "Id": view.library.id,
         "Guid": view.library.id,
@@ -7673,9 +7595,8 @@ fn emby_virtual_folder_options_json(
     media_strategy: &MediaStrategySettings,
     resume_played_percent: i64,
     resume_min_ticks: i64,
-    compatibility: EmbyClientCompatibility,
 ) -> Value {
-    let collection_type = emby_collection_type(view.library.kind, compatibility);
+    let collection_type = emby_collection_type(view.library.kind);
     let type_options = match view.library.kind {
         LibraryKind::Movie => vec![emby_library_type_options_json("Movie", media_strategy)],
         LibraryKind::Series => vec![emby_library_type_options_json("Series", media_strategy)],
@@ -7814,17 +7735,11 @@ fn emby_subtitle_language_code(language: &str) -> String {
     }
 }
 
-fn emby_collection_type(
-    kind: LibraryKind,
-    compatibility: EmbyClientCompatibility,
-) -> Option<&'static str> {
+fn emby_collection_type(kind: LibraryKind) -> Option<&'static str> {
     match kind {
         LibraryKind::Movie => Some("movies"),
         LibraryKind::Series => Some("tvshows"),
-        LibraryKind::Mixed => match compatibility {
-            EmbyClientCompatibility::Generic => Some("mixed"),
-            EmbyClientCompatibility::LegacyMixedLibrary => None,
-        },
+        LibraryKind::Mixed => None,
     }
 }
 
@@ -21089,18 +21004,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        CatalogSort, EmbyClientCompatibility, EmbyItemDetailWorkPlan, FilmlyImageCompatMode,
-        MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
-        catalog_filter_from_emby, emby_collection_type, emby_item_detail_work_plan,
-        emby_media_source_json, emby_media_source_json_with_resolver, emby_media_stream_item_id,
-        emby_media_stream_json, emby_playback_info_item_id, emby_single_id_lookup,
-        emby_source_needs_strm_resolver, filmly_image_compat_mode_from_env_value,
-        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
-        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
-        metadata_candidate_failure_kind, normalize_filmly_null_languages,
-        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
-        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
+        CatalogSort, EmbyItemDetailWorkPlan, FilmlyImageCompatMode, MediaStrategySettings,
+        MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby, emby_collection_type,
+        emby_item_detail_work_plan, emby_media_source_json, emby_media_source_json_with_resolver,
+        emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
+        emby_single_id_lookup, emby_source_needs_strm_resolver,
+        filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
+        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
+        is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
+        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
+        normalize_filmly_null_languages, normalize_strm_http_location, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -21131,36 +21046,10 @@ mod tests {
     }
 
     #[test]
-    fn emby_collection_type_uses_mixed_for_mixed_libraries() {
-        assert_eq!(
-            emby_collection_type(LibraryKind::Mixed, EmbyClientCompatibility::Generic),
-            Some("mixed")
-        );
-    }
-
-    #[test]
-    fn emby_collection_type_uses_legacy_null_for_legacy_mixed_library_clients() {
-        assert_eq!(
-            emby_collection_type(
-                LibraryKind::Mixed,
-                EmbyClientCompatibility::LegacyMixedLibrary
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn emby_client_compatibility_groups_known_legacy_mixed_library_clients() {
-        for client in ["VidHub", "Yamby", "yamby"] {
-            assert_eq!(
-                super::emby_client_compatibility_from_name(Some(client)),
-                EmbyClientCompatibility::LegacyMixedLibrary
-            );
-        }
-        assert_eq!(
-            super::emby_client_compatibility_from_name(Some("Emby")),
-            EmbyClientCompatibility::Generic
-        );
+    fn emby_collection_type_uses_standard_types_for_each_library_kind() {
+        assert_eq!(emby_collection_type(LibraryKind::Movie), Some("movies"));
+        assert_eq!(emby_collection_type(LibraryKind::Series), Some("tvshows"));
+        assert_eq!(emby_collection_type(LibraryKind::Mixed), None);
     }
 
     #[test]

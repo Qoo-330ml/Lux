@@ -34,7 +34,7 @@ async fn emby_login(
 }
 
 #[tokio::test]
-async fn mixed_library_uses_legacy_compatibility_shape_without_changing_emby_shape()
+async fn all_emby_clients_use_the_standard_mixed_library_shape()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -69,7 +69,7 @@ async fn mixed_library_uses_legacy_compatibility_shape_without_changing_emby_sha
         .json::<Value>()
         .await?;
     assert_eq!(emby_views["Items"][0]["Id"], library.id.to_string());
-    assert_eq!(emby_views["Items"][0]["CollectionType"], "mixed");
+    assert!(emby_views["Items"][0]["CollectionType"].is_null());
 
     let vidhub_token = emby_login(&client, &base_url, "VidHub").await?;
     let vidhub_views = client
