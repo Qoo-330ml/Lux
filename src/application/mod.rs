@@ -36,6 +36,7 @@ pub mod probe;
 pub(crate) mod provider_cache;
 pub mod recommendations;
 pub mod reidentify;
+pub(crate) mod remote_body;
 pub mod remote_url_policy;
 pub mod scanner;
 pub mod schedule;

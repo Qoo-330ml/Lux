@@ -23,6 +23,7 @@ use crate::{
         metadata::series_directory,
         metadata_paths::{library_item_directory, metadata_root},
         metadata_writeback::item_metadata_writeback_enabled,
+        remote_body::{LimitedBodyError, read_response_body_limited},
         scraper::{
             ScraperError, ScraperImage, ScraperImageRequest, ScraperItemType, ScraperProvider,
             ScraperResolver,
@@ -740,15 +741,6 @@ impl ImageWriteService {
                 status: status.as_u16(),
             });
         }
-        if response
-            .content_length()
-            .is_some_and(|size| size > self.max_bytes)
-        {
-            return Err(ImageWriteError::TooLarge {
-                size: response.content_length().unwrap_or_default(),
-                max: self.max_bytes,
-            });
-        }
         let content_type = response
             .headers()
             .get(CONTENT_TYPE)
@@ -764,10 +756,15 @@ impl ImageWriteService {
                 content_type: content_type.to_owned(),
             }
         })?;
-        let body = response
-            .bytes()
+        let body = read_response_body_limited(response, self.max_bytes)
             .await
-            .map_err(|error| ImageWriteError::Download(error.to_string()))?;
+            .map_err(|error| match error {
+                LimitedBodyError::Download(error) => ImageWriteError::Download(error),
+                LimitedBodyError::TooLarge { observed, max } => ImageWriteError::TooLarge {
+                    size: observed,
+                    max,
+                },
+            })?;
         let size = u64::try_from(body.len()).unwrap_or(u64::MAX);
         if size > self.max_bytes {
             return Err(ImageWriteError::TooLarge {

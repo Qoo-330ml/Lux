@@ -31,6 +31,7 @@ use crate::application::metadata_paths::{
     metadata_root, people_directory, people_index_directory, people_index_path,
     people_index_path_for_provider, readable_component,
 };
+use crate::application::remote_body::{LimitedBodyError, read_response_body_limited};
 use crate::storage::{
     Database, NewPersonCredit, PersonListOptions, PersonMatchCandidateRestore,
     StoredCanonicalPerson, StoredPersonCredit, StoredPersonIndexRebuildJob,
@@ -4421,10 +4422,14 @@ impl PeopleService {
                 )));
             }
         };
-        let bytes = response
-            .bytes()
+        let bytes = read_response_body_limited(response, MAX_PROFILE_BYTES as u64)
             .await
-            .map_err(|source| PeopleError::Download(source.to_string()))?;
+            .map_err(|error| match error {
+                LimitedBodyError::Download(error) => PeopleError::Download(error),
+                LimitedBodyError::TooLarge { .. } => {
+                    PeopleError::InvalidImage("profile image payload is invalid".to_owned())
+                }
+            })?;
         if bytes.is_empty()
             || bytes.len() > MAX_PROFILE_BYTES
             || !valid_image(expected_type, &bytes)

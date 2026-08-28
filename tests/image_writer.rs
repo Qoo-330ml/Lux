@@ -21,8 +21,8 @@ use luxd::{
 };
 use reqwest::header::CONTENT_TYPE;
 use sha2::{Digest, Sha256};
-use tokio::net::TcpListener;
 use tokio::time::{Duration, sleep};
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 
 const PNG_1X1: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
@@ -826,6 +826,47 @@ async fn rejects_bad_content_type_content_and_size_without_writing()
         .fetch_one(database.pool())
         .await?;
     assert_eq!(count, 0);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn stops_chunked_image_download_at_the_configured_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, movie_dir) = prepared_movie().await?;
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await?;
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nTransfer-Encoding: chunked\r\n\r\n",
+            )
+            .await?;
+        socket.write_all(b"9\r\n123456789\r\n").await?;
+        sleep(Duration::from_secs(1)).await;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let service = ImageWriteService::with_config(
+        database,
+        ImageDownloadConfig {
+            timeout: Duration::from_millis(100),
+            max_bytes: 8,
+        },
+    )?;
+    let result = tokio::time::timeout(
+        Duration::from_millis(500),
+        service.download_item_image(&item_id, "poster", &format!("http://{address}/image")),
+    )
+    .await
+    .expect("limited image download should stop before the client timeout");
+
+    assert!(matches!(
+        result,
+        Err(ImageWriteError::TooLarge { size: 9, max: 8 })
+    ));
+    assert!(!movie_dir.join("poster.png").exists());
     server.abort();
     Ok(())
 }
