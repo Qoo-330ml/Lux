@@ -9902,7 +9902,7 @@ impl Database {
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
         files: &[NewMovieFile],
-    ) -> Result<HashMap<(String, Option<i64>), String>, StorageError> {
+    ) -> Result<HashMap<(String, Option<i64>), PrefetchedMovieItem>, StorageError> {
         let mut sort_titles = files
             .iter()
             .map(|file| file.sort_title.clone())
@@ -9916,7 +9916,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT id, sort_title, production_year
+                "SELECT id, sort_title, production_year, parent_id, provider_ids_json
                  FROM media_items
                  WHERE library_id = ? AND item_type = 'MOVIE'
                    AND removed_at IS NULL AND sort_title IN ({placeholders})"
@@ -9951,7 +9951,26 @@ impl Database {
                             path: self.path.clone(),
                             source,
                         })?;
-                movie_items.insert((sort_title, production_year), id);
+                let parent_id =
+                    row.try_get::<Option<String>, _>("parent_id")
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                let provider_ids_json = row
+                    .try_get::<Option<String>, _>("provider_ids_json")
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                movie_items.insert(
+                    (sort_title, production_year),
+                    PrefetchedMovieItem {
+                        id,
+                        parent_id,
+                        provider_ids_json,
+                    },
+                );
             }
         }
         Ok(movie_items)
@@ -10027,6 +10046,84 @@ impl Database {
             }
         }
         Ok(folders)
+    }
+
+    async fn update_movie_parents_in_batches(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        updates: &[(String, Option<String>)],
+    ) -> Result<(), StorageError> {
+        for chunk in updates.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let cases = std::iter::repeat_n("WHEN ? THEN ?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ids = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE media_items
+                 SET parent_id = CASE id {cases} END
+                 WHERE item_type = 'MOVIE' AND id IN ({ids})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (item_id, parent_id) in chunk {
+                statement = statement.bind(item_id).bind(parent_id.as_deref());
+            }
+            for (item_id, _) in chunk {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn update_movie_provider_ids_in_batches(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        updates: &[(String, String)],
+    ) -> Result<(), StorageError> {
+        for chunk in updates.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let cases = std::iter::repeat_n("WHEN ? THEN ?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let ids = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE media_items
+                 SET provider_ids_json = CASE id {cases} END
+                 WHERE item_type = 'MOVIE'
+                   AND id IN ({ids})
+                   AND (provider_ids_json IS NULL OR provider_ids_json = '{{}}')"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (item_id, provider_ids_json) in chunk {
+                statement = statement.bind(item_id).bind(provider_ids_json);
+            }
+            for (item_id, _) in chunk {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
     }
 
     async fn ensure_movie_parent_folder_cached(
@@ -10219,6 +10316,15 @@ impl Database {
         let mut movie_cache = self
             .prefetch_movie_items_in_transaction(&mut transaction, library_id, files)
             .await?;
+        let existing_movie_items = movie_cache
+            .values()
+            .cloned()
+            .map(|item| (item.id.clone(), item))
+            .collect::<HashMap<_, _>>();
+        let mut provider_baselines = existing_movie_items
+            .iter()
+            .map(|(item_id, item)| (item_id.clone(), item.provider_ids_json.clone()))
+            .collect::<HashMap<_, _>>();
 
         for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
             let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
@@ -10268,11 +10374,19 @@ impl Database {
                 )
                 .await?;
             let identity = (file.sort_title.clone(), file.production_year);
-            let (item_id, is_new_item) = if let Some(item_id) = movie_cache.get(&identity) {
-                (item_id.clone(), false)
+            let (item_id, is_new_item) = if let Some(item) = movie_cache.get(&identity) {
+                (item.id.clone(), false)
             } else {
                 let item_id = Uuid::now_v7().to_string();
-                movie_cache.insert(identity, item_id.clone());
+                movie_cache.insert(
+                    identity,
+                    PrefetchedMovieItem {
+                        id: item_id.clone(),
+                        parent_id: None,
+                        provider_ids_json: None,
+                    },
+                );
+                provider_baselines.insert(item_id.clone(), file.provider_ids_json.clone());
                 new_items.push((item_id.clone(), index));
                 new_item_ids.insert(item_id.clone());
                 (item_id, true)
@@ -10321,37 +10435,32 @@ impl Database {
                 })?;
         }
 
-        for (item_id, parent_id) in &parent_updates {
-            if !new_item_ids.contains(item_id) {
-                self.query(
-                    "UPDATE media_items SET parent_id = ?
-                     WHERE id = ? AND item_type = 'MOVIE'",
-                )
-                .bind(parent_id.as_deref())
-                .bind(item_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            }
-        }
-        for (item_id, provider_ids_json) in provider_updates {
-            self.query(
-                "UPDATE media_items
-                 SET provider_ids_json = ?
-                 WHERE id = ? AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
-            )
-            .bind(provider_ids_json)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
+        let parent_updates = parent_updates
+            .into_iter()
+            .filter(|(item_id, parent_id)| {
+                !new_item_ids.contains(item_id)
+                    && existing_movie_items
+                        .get(item_id)
+                        .is_some_and(|item| item.parent_id.as_deref() != parent_id.as_deref())
+            })
+            .collect::<Vec<_>>();
+        self.update_movie_parents_in_batches(&mut transaction, &parent_updates)
+            .await?;
+
+        let provider_updates = provider_updates
+            .into_iter()
+            .filter(|(item_id, provider_ids_json)| {
+                !provider_ids_json.is_empty()
+                    && provider_ids_json != "{}"
+                    && provider_baselines.get(item_id).is_some_and(|value| {
+                        value
+                            .as_deref()
+                            .is_none_or(|value| value.is_empty() || value == "{}")
+                    })
+            })
+            .collect::<Vec<_>>();
+        self.update_movie_provider_ids_in_batches(&mut transaction, &provider_updates)
+            .await?;
 
         for chunk in source_rows.chunks(BATCH_INSERT_CHUNK_SIZE) {
             let values =
@@ -17752,6 +17861,13 @@ pub(crate) struct StoredMediaItem {
     pub(crate) id: String,
 }
 
+#[derive(Clone, Debug)]
+struct PrefetchedMovieItem {
+    id: String,
+    parent_id: Option<String>,
+    provider_ids_json: Option<String>,
+}
+
 #[derive(Debug)]
 pub(crate) struct NewPersonCredit {
     pub(crate) person_id: String,
@@ -20647,12 +20763,14 @@ mod tests {
                 external_url: None,
             },
         ];
+        database.reset_query_count();
         let created_items = database
             .insert_movie_files_batch(&library.id.to_string(), &root.id, "generation", &files)
             .await
             .expect("batch insert");
 
         assert_eq!(created_items, 1);
+        assert_eq!(database.query_count(), 7);
         let item_count: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type <> 'FOLDER'")
                 .fetch_one(database.pool())
@@ -20693,6 +20811,40 @@ mod tests {
                 .await
                 .expect("provider ids");
         assert_eq!(provider_ids.as_deref(), Some(r#"{"tmdb":"1"}"#));
+
+        let follow_up_file = NewMovieFile {
+            filesystem_entry_id: "entry-3".to_owned(),
+            source_id: "source-3".to_owned(),
+            relative_path: "Another.Movie.2025.mkv".to_owned(),
+            size: 3,
+            modified_at: 3,
+            fingerprint: vec![3],
+            title: "Another Movie".to_owned(),
+            sort_title: "another movie".to_owned(),
+            original_title: "Another Movie".to_owned(),
+            production_year: Some(2025),
+            provider_ids_json: Some(r#"{"tmdb":"2"}"#.to_owned()),
+            source_kind: "LOCAL_FILE".to_owned(),
+            strm_target_kind: None,
+            edition_name: None,
+            quality_label: None,
+            container: "mkv".to_owned(),
+            external_url: None,
+        };
+        database.reset_query_count();
+        assert_eq!(
+            database
+                .insert_movie_files_batch(
+                    &library.id.to_string(),
+                    &root.id,
+                    "generation-2",
+                    &[follow_up_file],
+                )
+                .await
+                .expect("follow-up batch insert"),
+            1
+        );
+        assert_eq!(database.query_count(), 4);
     }
 
     #[tokio::test]
