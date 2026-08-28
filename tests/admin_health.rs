@@ -95,6 +95,18 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     assert_eq!(body["database"]["status"], "ok");
     assert_eq!(body["database"]["backend"], "SQLITE");
     assert_eq!(body["database"]["writable"], true);
+    assert_eq!(body["database"]["pool"]["maxConnections"], 5);
+    assert!(body["database"]["pool"]["size"].is_number());
+    assert!(body["database"]["pool"]["idle"].is_number());
+    assert!(body["database"]["pool"]["inUse"].is_number());
+    assert!(body["database"]["pool"]["saturated"].is_boolean());
+    let in_use = body["database"]["pool"]["inUse"]
+        .as_u64()
+        .expect("pool in-use count should be numeric");
+    let max_connections = body["database"]["pool"]["maxConnections"]
+        .as_u64()
+        .expect("pool max connections should be numeric");
+    assert!(in_use <= max_connections);
     assert_eq!(body["config"]["available"], true);
     assert_eq!(body["config"]["writable"], true);
     assert!(body["ffprobe"]["available"].is_boolean());

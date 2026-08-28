@@ -17031,6 +17031,7 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
     };
     let resources = state.resources.snapshot().await;
     let database_writable = database.probe_write().await.is_ok();
+    let database_pool = database.pool_snapshot();
     let config_available = match state.config_dir.as_deref() {
         Some(path) => fs::metadata(path)
             .await
@@ -17097,6 +17098,13 @@ async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
             "backend": database_backend,
             "journalMode": journal_mode,
             "writable": database_writable,
+            "pool": {
+                "maxConnections": database_pool.max_connections,
+                "size": database_pool.size,
+                "idle": database_pool.idle,
+                "inUse": database_pool.in_use,
+                "saturated": database_pool.saturated,
+            },
         },
         "config": { "available": config_available, "writable": config_writable },
         "ffprobe": { "available": ffprobe_available },

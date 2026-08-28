@@ -35,6 +35,7 @@ pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
 const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 const BATCH_INSERT_CHUNK_SIZE: usize = 100;
+const DATABASE_POOL_MAX_CONNECTIONS: u32 = 5;
 
 fn database_flag(value: bool) -> i64 {
     i64::from(value)
@@ -71,6 +72,7 @@ fn playback_reached_played_threshold(
 #[derive(Clone)]
 pub struct Database {
     pool: AnyPool,
+    pool_max_connections: u32,
     path: PathBuf,
     server_id: String,
     backend: DatabaseBackend,
@@ -78,6 +80,15 @@ pub struct Database {
     metadata_write_lock: Arc<AsyncMutex<()>>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DatabasePoolSnapshot {
+    pub max_connections: u32,
+    pub size: u32,
+    pub idle: u32,
+    pub in_use: u32,
+    pub saturated: bool,
 }
 
 impl Database {
@@ -128,7 +139,7 @@ impl Database {
             DatabaseBackend::Postgres => "SET TIME ZONE 'UTC'",
         };
         let pool = AnyPoolOptions::new()
-            .max_connections(5)
+            .max_connections(DATABASE_POOL_MAX_CONNECTIONS)
             .after_connect(move |connection, _| {
                 Box::pin(async move {
                     connection.execute(after_connect_sql).await?;
@@ -173,6 +184,7 @@ impl Database {
 
         Ok(Self {
             pool,
+            pool_max_connections: DATABASE_POOL_MAX_CONNECTIONS,
             path,
             server_id,
             backend,
@@ -260,6 +272,19 @@ impl Database {
 
     pub fn pool(&self) -> &AnyPool {
         &self.pool
+    }
+
+    pub(crate) fn pool_snapshot(&self) -> DatabasePoolSnapshot {
+        let size = self.pool.size();
+        let idle = self.pool.num_idle().min(size as usize) as u32;
+        let in_use = size.saturating_sub(idle);
+        DatabasePoolSnapshot {
+            max_connections: self.pool_max_connections,
+            size,
+            idle,
+            in_use,
+            saturated: size >= self.pool_max_connections && idle == 0,
+        }
     }
 
     pub fn server_id(&self) -> &str {
@@ -19691,6 +19716,7 @@ mod tests {
 
         let database = Database {
             pool,
+            pool_max_connections: 1,
             path: PathBuf::from("metadata-summary-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
@@ -20690,6 +20716,7 @@ mod tests {
 
         let database = Database {
             pool,
+            pool_max_connections: 1,
             path: PathBuf::from("query-only-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
@@ -20748,6 +20775,7 @@ mod tests {
         }
         let database = Database {
             pool,
+            pool_max_connections: 1,
             path: PathBuf::from("metadata-order-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
@@ -20835,6 +20863,7 @@ mod tests {
         }
         let database = Database {
             pool,
+            pool_max_connections: 1,
             path: PathBuf::from("metadata-reconcile-test.db"),
             server_id: "test".to_owned(),
             backend: DatabaseBackend::Sqlite,
