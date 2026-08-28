@@ -253,12 +253,6 @@ impl LibraryWatchService {
                 Some(result) = watcher_tasks.join_next() => {
                     if let Ok(result) = result {
                         remove_completed_watcher(&mut active_roots, result);
-                        self.refresh_roots(
-                            &mut active_roots,
-                            &mut watcher_tasks,
-                            &running_jobs,
-                            &mut next_token,
-                        ).await;
                     }
                 }
             }
