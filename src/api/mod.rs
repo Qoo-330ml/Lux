@@ -4721,9 +4721,6 @@ async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
-    let yamby_client = emby_device_info_from_headers(&headers)
-        .client
-        .eq_ignore_ascii_case("Yamby");
     let strm_resolver_available = if sources
         .iter()
         .any(|source| emby_source_needs_strm_resolver(source))
@@ -4749,13 +4746,18 @@ async fn emby_playback_info(
                     true,
                     strm_resolver_available,
                 );
-                if yamby_client
+                let has_direct_stream_url = value
+                    .get("DirectStreamUrl")
+                    .is_some_and(Value::is_string);
+                if has_direct_stream_url
                     && let Some(service) = state.web_playback.as_ref()
-                    && let Some(url) =
-                        emby_yamby_direct_stream_url(service, &item.id, source, &user)
+                    && let Some(url) = emby_signed_direct_stream_url(service, &item.id, source, &user)
                     && let Value::Object(object) = &mut value
                 {
                     object.insert("DirectStreamUrl".to_owned(), json!(url));
+                    // The signed URL is already authorized. Do not ask clients
+                    // to append a long-lived Emby token to it as well.
+                    object.insert("AddApiKeyToDirectStreamUrl".to_owned(), json!(false));
                 }
                 value
             })
@@ -7412,7 +7414,7 @@ fn emby_media_source_stream_url(
     )
 }
 
-fn emby_yamby_direct_stream_url(
+fn emby_signed_direct_stream_url(
     service: &WebPlaybackSessionService,
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,

@@ -121,9 +121,16 @@ fi
         .await?;
     assert_eq!(playback.status(), reqwest::StatusCode::OK);
     let playback_body = playback.json::<Value>().await?;
+    let direct_url = playback_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing signed direct stream URL")?;
+    assert!(direct_url.starts_with(&format!(
+        "/Videos/{item_id}/stream?MediaSourceId={source_id}&luxPlayback"
+    )));
+    assert!(!direct_url.contains(&token));
     assert_eq!(
-        playback_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{item_id}/stream?MediaSourceId={source_id}")
+        playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
+        false
     );
     assert_eq!(playback_body["MediaSources"][0]["Protocol"], "Http");
     assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
@@ -136,10 +143,8 @@ fi
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let stream = no_redirect_client
-        .get(format!(
-            "http://{address}/Videos/{item_id}/{source_id}/stream"
-        ))
-        .query(&[("api_key", token.as_str())])
+        .get(format!("http://{address}{direct_url}"))
+        .header(reqwest::header::USER_AGENT, "Hills/1.8.0 (android; 17)")
         .send()
         .await?;
     assert_eq!(stream.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);

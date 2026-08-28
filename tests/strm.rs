@@ -223,9 +223,16 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         popcorn_playback_body["MediaSources"][0]["SupportsDirectPlay"],
         true
     );
+    let popcorn_direct_url = popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing signed popcorn direct stream URL")?;
+    assert!(popcorn_direct_url.starts_with(&format!(
+        "/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}&luxPlayback"
+    )));
+    assert!(!popcorn_direct_url.contains(&token));
     assert_eq!(
-        popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}")
+        popcorn_playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
+        false
     );
 
     let playback = client
@@ -241,10 +248,14 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(body["MediaSources"][0]["IsRemote"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
-    assert_eq!(
-        body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}")
-    );
+    let remote_direct_url = body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing signed remote direct stream URL")?;
+    assert!(remote_direct_url.starts_with(&format!(
+        "/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}&luxPlayback"
+    )));
+    assert!(!remote_direct_url.contains(&token));
+    assert_eq!(body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"], false);
 
     let path_playback = client
         .get(format!(
@@ -258,15 +269,35 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(path_body["MediaSources"][0]["Protocol"], "File");
     assert_eq!(path_body["MediaSources"][0]["IsRemote"], false);
     assert_eq!(path_body["MediaSources"][0]["SupportsDirectPlay"], true);
+    let path_direct_url = path_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing signed path direct stream URL")?;
+    assert!(path_direct_url.starts_with(&format!(
+        "/Videos/{path_item_id}/stream?MediaSourceId={path_source_id}&luxPlayback"
+    )));
+    assert!(!path_direct_url.contains(&token));
     assert_eq!(
-        path_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{path_item_id}/stream?MediaSourceId={path_source_id}")
+        path_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
+        false
     );
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let player_user_agent = "VidHub/9.0 (iPhone; iOS 18.0)";
+    let signed_remote_stream = no_redirect_client
+        .get(format!("http://{address}{remote_direct_url}"))
+        .header(reqwest::header::USER_AGENT, player_user_agent)
+        .send()
+        .await?;
+    assert_eq!(
+        signed_remote_stream.status(),
+        reqwest::StatusCode::TEMPORARY_REDIRECT
+    );
+    assert_eq!(
+        signed_remote_stream.headers()[reqwest::header::LOCATION],
+        "http://media.example.test/cdn.mkv"
+    );
     let senplayer_stream = no_redirect_client
         .get(format!(
             "http://{address}/emby/videos/{remote_item_id}/stream.mkv%3FMediaSourceId={remote_source_id}&X-Emby-Token={token}"
