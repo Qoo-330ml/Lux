@@ -8,42 +8,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
     let catalog_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
     Router::new()
         .route("/logo.svg", get(web_logo))
-        .route("/health/live", get(users::live))
-        .route("/health/ready", get(users::ready))
-        .route("/api/v1/version", get(users::version))
-        .route("/api/v1/setup/status", get(users::setup_status))
-        .route("/api/v1/setup/database", get(users::setup_database_status))
-        .route(
-            "/api/v1/setup/database/test",
-            post(users::setup_database_test),
-        )
-        .route(
-            "/api/v1/setup/database/select",
-            post(users::setup_database_select),
-        )
-        .route("/api/v1/setup/complete", post(users::setup_complete))
-        .route("/api/v1/auth/login", post(users::auth_login))
-        .route("/api/v1/auth/logout", post(users::auth_logout))
-        .route("/api/v1/auth/me", get(users::auth_me))
-        .route(
-            "/api/v1/auth/settings",
-            get(users::auth_settings).patch(users::auth_update_settings),
-        )
-        .route(
-            "/api/v1/auth/library-order",
-            get(users::auth_library_order).patch(users::auth_update_library_order),
-        )
-        .route(
-            "/api/v1/auth/avatar",
-            get(users::auth_avatar)
-                .put(users::auth_update_avatar)
-                .layer(DefaultBodyLimit::max(MAX_USER_AVATAR_BYTES as usize)),
-        )
-        .route("/api/v1/auth/sessions", get(users::auth_sessions))
-        .route(
-            "/api/v1/auth/sessions/{session_id}",
-            delete(users::auth_revoke_session),
-        )
+        .merge(users::api_routes())
         .route(
             "/api/v1/admin/libraries",
             get(admin_list_libraries).post(admin_create_library),
