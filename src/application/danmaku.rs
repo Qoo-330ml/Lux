@@ -1165,7 +1165,7 @@ fn danmaku_plugin_error_code(error: &PluginServiceError) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{effective_danmaku_concurrency, match_file_name_candidates};
-    use crate::application::plugins::DanmakuSettings;
+    use crate::application::{plugins::DanmakuSettings, schedule::DEFAULT_DANMAKU_MATCH_SCHEDULE};
     use crate::storage::StoredDanmakuSource;
 
     #[test]
@@ -1192,6 +1192,7 @@ mod tests {
             match_original_filename: true,
             match_simplified_traditional_titles: true,
             match_english_title: true,
+            schedule: DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned(),
         };
 
         assert_eq!(
