@@ -40,8 +40,8 @@ use crate::{
     application::home::{HomeError, HomeService},
     application::playback::decision::{PlaybackCapabilities, PlaybackSourceKind},
     application::playback::session::{
-        CreateWebPlaybackSession, WebPlaybackEvent, WebPlaybackPlan, WebPlaybackSessionError,
-        WebPlaybackSessionService,
+        CreateWebPlaybackSession, EMBY_DIRECT_STREAM_TTL_SECONDS, WebPlaybackEvent,
+        WebPlaybackPlan, WebPlaybackSessionError, WebPlaybackSessionService,
     },
     application::playback::{ByteRange, RangeError, parse_single_range},
     application::probe::{FfprobeRunner, MediaProbeService},
@@ -4721,6 +4721,9 @@ async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
+    let yamby_client = emby_device_info_from_headers(&headers)
+        .client
+        .eq_ignore_ascii_case("Yamby");
     let strm_resolver_available = if sources
         .iter()
         .any(|source| emby_source_needs_strm_resolver(source))
@@ -4740,12 +4743,21 @@ async fn emby_playback_info(
         "MediaSources": sources
             .into_iter()
             .map(|source| {
-                emby_media_source_json_with_resolver(
+                let mut value = emby_media_source_json_with_resolver(
                     &item.id,
                     source,
                     true,
                     strm_resolver_available,
-                )
+                );
+                if yamby_client
+                    && let Some(service) = state.web_playback.as_ref()
+                    && let Some(url) =
+                        emby_yamby_direct_stream_url(service, &item.id, source, &user)
+                    && let Value::Object(object) = &mut value
+                {
+                    object.insert("DirectStreamUrl".to_owned(), json!(url));
+                }
+                value
             })
             .collect::<Vec<_>>(),
     }))
@@ -7398,6 +7410,33 @@ fn emby_media_source_stream_url(
         "/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={}",
         source.id
     )
+}
+
+fn emby_yamby_direct_stream_url(
+    service: &WebPlaybackSessionService,
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+    user: &UserRecord,
+) -> Option<String> {
+    let expires_at = current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
+    let user_id = user.id.to_string();
+    let signature = service.sign_emby_direct_stream(
+        &user_id,
+        user.is_admin,
+        item_id,
+        &source.id,
+        expires_at,
+    )?;
+    let mut url = emby_media_source_stream_url(item_id, source);
+    url.push_str("&luxPlaybackUserId=");
+    url.push_str(&percent_encode_filename(&user_id));
+    url.push_str("&luxPlaybackAdmin=");
+    url.push_str(if user.is_admin { "1" } else { "0" });
+    url.push_str("&luxPlaybackExpires=");
+    url.push_str(&expires_at.to_string());
+    url.push_str("&luxPlaybackSignature=");
+    url.push_str(&percent_encode_filename(&signature));
+    Some(url)
 }
 
 fn emby_chapter_json(chapter: &crate::application::catalog::CatalogChapter) -> Value {
@@ -10869,6 +10908,10 @@ async fn emby_subtitle_without_source(
 struct EmbyStreamQuery {
     api_key: Option<String>,
     media_source_id: Option<String>,
+    playback_user_id: Option<String>,
+    playback_is_admin: Option<bool>,
+    playback_expires: Option<i64>,
+    playback_signature: Option<String>,
 }
 
 fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery {
@@ -10893,10 +10936,35 @@ fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery {
                 || name.eq_ignore_ascii_case("media_source_id"))
         {
             query.media_source_id = Some(value.into_owned());
+        } else if query.playback_user_id.is_none() && name.eq_ignore_ascii_case("luxPlaybackUserId")
+        {
+            query.playback_user_id = Some(value.into_owned());
+        } else if query.playback_is_admin.is_none() && name.eq_ignore_ascii_case("luxPlaybackAdmin")
+        {
+            query.playback_is_admin = match value.as_ref() {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            };
+        } else if query.playback_expires.is_none()
+            && name.eq_ignore_ascii_case("luxPlaybackExpires")
+        {
+            query.playback_expires = value.parse().ok();
+        } else if query.playback_signature.is_none()
+            && name.eq_ignore_ascii_case("luxPlaybackSignature")
+        {
+            query.playback_signature = Some(value.into_owned());
         }
     }
 
     query
+}
+
+fn emby_stream_query_has_playback_ticket(query: &EmbyStreamQuery) -> bool {
+    query.playback_user_id.is_some()
+        || query.playback_is_admin.is_some()
+        || query.playback_expires.is_some()
+        || query.playback_signature.is_some()
 }
 
 fn emby_stream_query_from_path(
@@ -10913,7 +10981,59 @@ fn emby_stream_query_from_path(
     if query.media_source_id.is_none() {
         query.media_source_id = embedded.media_source_id;
     }
+    if query.playback_user_id.is_none() {
+        query.playback_user_id = embedded.playback_user_id;
+    }
+    if query.playback_is_admin.is_none() {
+        query.playback_is_admin = embedded.playback_is_admin;
+    }
+    if query.playback_expires.is_none() {
+        query.playback_expires = embedded.playback_expires;
+    }
+    if query.playback_signature.is_none() {
+        query.playback_signature = embedded.playback_signature;
+    }
     (container.to_owned(), query)
+}
+
+async fn emby_stream_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+    query: &EmbyStreamQuery,
+    item_id: &str,
+    media_source_id: Option<&str>,
+) -> Result<AccessPrincipal, StatusCode> {
+    if emby_stream_query_has_playback_ticket(query) {
+        let (Some(user_id), Some(is_admin), Some(expires_at), Some(signature), Some(source_id)) = (
+            query.playback_user_id.as_deref(),
+            query.playback_is_admin,
+            query.playback_expires,
+            query.playback_signature.as_deref(),
+            media_source_id,
+        ) else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
+            return Err(StatusCode::UNAUTHORIZED);
+        };
+        let Some(service) = state.web_playback.as_ref() else {
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        };
+        if !service.verify_emby_direct_stream(
+            &user_id.to_string(),
+            is_admin,
+            item_id,
+            source_id,
+            expires_at,
+            signature,
+        ) {
+            return Err(StatusCode::UNAUTHORIZED);
+        }
+        return Ok(AccessPrincipal::new(user_id, is_admin));
+    }
+
+    let user = require_emby_user(headers, state, query.api_key.as_deref()).await?;
+    Ok(AccessPrincipal::new(user.id, user.is_admin))
 }
 
 async fn emby_stream(
@@ -10924,13 +11044,21 @@ async fn emby_stream(
     State(state): State<AppState>,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let principal = match emby_stream_principal(
+        &headers,
+        &state,
+        &query,
+        &item_id,
+        query.media_source_id.as_deref(),
+    )
+    .await
+    {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     serve_media_file(
         &state,
-        AccessPrincipal::new(user.id, user.is_admin),
+        principal,
         &headers,
         &method,
         &item_id,
@@ -10949,13 +11077,21 @@ async fn emby_stream_with_container(
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
+    let principal = match emby_stream_principal(
+        &headers,
+        &state,
+        &query,
+        &item_id,
+        query.media_source_id.as_deref(),
+    )
+    .await
+    {
+        Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
     serve_media_file(
         &state,
-        AccessPrincipal::new(user.id, user.is_admin),
+        principal,
         &headers,
         &method,
         &item_id,
@@ -10973,13 +11109,16 @@ async fn emby_stream_with_source(
     State(state): State<AppState>,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let principal =
+        match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     serve_media_file(
         &state,
-        AccessPrincipal::new(user.id, user.is_admin),
+        principal,
         &headers,
         &method,
         &item_id,
@@ -10998,13 +11137,16 @@ async fn emby_stream_with_source_and_container(
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
-    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
-        Ok(user) => user,
-        Err(status) => return status.into_response(),
-    };
+    let principal =
+        match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
+            .await
+        {
+            Ok(principal) => principal,
+            Err(status) => return status.into_response(),
+        };
     serve_media_file(
         &state,
-        AccessPrincipal::new(user.id, user.is_admin),
+        principal,
         &headers,
         &method,
         &item_id,

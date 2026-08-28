@@ -25,7 +25,9 @@ use super::hls::{HlsError, HlsManager};
 type HmacSha256 = Hmac<Sha256>;
 
 pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
+pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 15 * 60;
 const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+const EMBY_DIRECT_STREAM_SESSION_ID: &str = "emby-direct-stream";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WebPlaybackPlan {
@@ -257,6 +259,39 @@ impl WebPlaybackSessionService {
         })
     }
 
+    pub(crate) fn sign_emby_direct_stream(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        item_id: &str,
+        media_source_id: &str,
+        expires_at: i64,
+    ) -> Option<String> {
+        self.signer.sign(
+            EMBY_DIRECT_STREAM_SESSION_ID,
+            &emby_direct_stream_resource(user_id, is_admin, item_id, media_source_id),
+            expires_at,
+        )
+    }
+
+    pub(crate) fn verify_emby_direct_stream(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+        item_id: &str,
+        media_source_id: &str,
+        expires_at: i64,
+        signature: &str,
+    ) -> bool {
+        self.signer.verify(
+            EMBY_DIRECT_STREAM_SESSION_ID,
+            &emby_direct_stream_resource(user_id, is_admin, item_id, media_source_id),
+            expires_at,
+            signature,
+            unix_timestamp(),
+        )
+    }
+
     pub(crate) async fn authorize_resource(
         &self,
         session_id: &str,
@@ -463,6 +498,15 @@ pub fn unix_timestamp() -> i64 {
 
 fn signed_message(session_id: &str, resource: &str, expires_at: i64) -> String {
     format!("lux-web-playback\n{session_id}\n{resource}\n{expires_at}")
+}
+
+fn emby_direct_stream_resource(
+    user_id: &str,
+    is_admin: bool,
+    item_id: &str,
+    media_source_id: &str,
+) -> String {
+    format!("emby-direct-stream\n{user_id}\n{is_admin}\n{item_id}\n{media_source_id}")
 }
 
 #[cfg(test)]

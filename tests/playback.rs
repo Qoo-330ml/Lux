@@ -138,6 +138,41 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
         true
     );
+    let yamby_playback = client
+        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .header(
+            "X-Emby-Authorization",
+            format!(
+                "Emby UserId={},Client=Yamby,Device=Android,DeviceId=yamby-test,Version=2.0.5.5",
+                admin.id
+            ),
+        )
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(yamby_playback.status(), reqwest::StatusCode::OK);
+    let yamby_playback_body = yamby_playback.json::<Value>().await?;
+    let yamby_direct_url = yamby_playback_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing Yamby direct stream URL")?;
+    assert!(yamby_direct_url.contains("luxPlayback"));
+    assert!(!yamby_direct_url.contains(&token));
+    let yamby_stream = client
+        .get(format!("{base_url}{yamby_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(yamby_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(yamby_stream.bytes().await?.as_ref(), b"0123456789");
+    let tampered_yamby_url =
+        yamby_direct_url.replacen("luxPlaybackSignature=", "luxPlaybackSignature=invalid", 1);
+    let tampered_yamby_stream = client
+        .get(format!("{base_url}{tampered_yamby_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        tampered_yamby_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let standard_stream = client
         .get(format!("{base_url}/Videos/{item_id}/stream.mkv"))
         .query(&[
