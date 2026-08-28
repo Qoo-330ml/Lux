@@ -2569,7 +2569,9 @@ pub(crate) async fn admin_upsert_scheduled_task(
     let task_type = request.task_type.trim().to_ascii_uppercase();
     let is_global_strm = owner_type == "GLOBAL"
         && task_type == crate::application::schedule::STRM_MEDIA_INFO_TASK_TYPE;
-    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) && !is_global_strm {
+    let is_global_danmaku = owner_type == "GLOBAL"
+        && task_type == crate::application::schedule::DANMAKU_MATCH_TASK_TYPE;
+    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) && !is_global_strm && !is_global_danmaku {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
@@ -2588,7 +2590,7 @@ pub(crate) async fn admin_upsert_scheduled_task(
             )
             .into_response();
         }
-        if is_global_strm {
+        if is_global_strm || is_global_danmaku {
             let Some(database) = state.database.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
@@ -2618,14 +2620,23 @@ pub(crate) async fn admin_upsert_scheduled_task(
                     &headers,
                     StatusCode::BAD_REQUEST,
                     lux::ApiErrorCode::InvalidRequest,
-                    "STRM 媒体信息任务必须保留 Cron 执行计划",
+                    if is_global_strm {
+                        "STRM 媒体信息任务必须保留 Cron 执行计划"
+                    } else {
+                        "弹幕匹配任务必须保留 Cron 执行计划"
+                    },
                 )
                 .into_response();
             };
             let Some(plugins) = state.plugins.as_ref() else {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             };
-            if let Err(error) = plugins.update_media_info_schedule(schedule).await {
+            let result = if is_global_strm {
+                plugins.update_media_info_schedule(schedule).await
+            } else {
+                plugins.update_danmaku_schedule(schedule).await
+            };
+            if let Err(error) = result {
                 return plugin_error(&headers, error);
             }
             let task = match database
@@ -2649,7 +2660,7 @@ pub(crate) async fn admin_upsert_scheduled_task(
                 &headers,
                 "SCHEDULE_UPDATED",
                 Some("scheduled_task"),
-                Some("global:STRM_MEDIA_INFO"),
+                Some(&format!("global:{task_type}")),
                 "{}",
             )
             .await;
