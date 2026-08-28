@@ -279,14 +279,13 @@ impl PluginService {
         let current_catalog = self.catalog_snapshot().await;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
-        } else if plugin_id == DANMAKU_PLUGIN_ID {
-            self.sync_danmaku_scheduled_task().await?;
         } else if current_catalog
             .get(&plugin_id)
             .is_some_and(is_chapter_detector_plugin)
         {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
+        self.sync_manifest_scheduled_tasks().await?;
         let plugin = self.view_for_id(&plugin_id, true, true).await?;
         Ok(PluginInstall {
             plugin,
@@ -316,11 +315,10 @@ impl PluginService {
         self.database.uninstall_plugin(&plugin_id).await?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.database.disable_strm_media_info_task().await?;
-        } else if plugin_id == DANMAKU_PLUGIN_ID {
-            self.sync_danmaku_scheduled_task().await?;
         } else if is_chapter_detector_plugin(plugin) {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
+        self.sync_manifest_scheduled_tasks().await?;
         let catalog = discover_plugin_catalog(self.config_dir.join("plugins"), None).await?;
         *self.catalog.write().await = catalog;
         Ok(())
@@ -376,7 +374,7 @@ impl PluginService {
             return Ok(());
         }
         self.write_plugin_config(DANMAKU_PLUGIN_ID, &values).await?;
-        self.sync_danmaku_scheduled_task().await
+        self.sync_manifest_scheduled_tasks().await
     }
 
     pub async fn update(&self, plugin_id: &str) -> Result<PluginView, PluginServiceError> {
@@ -403,14 +401,13 @@ impl PluginService {
         let current_catalog = self.catalog_snapshot().await;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
-        } else if plugin_id == DANMAKU_PLUGIN_ID {
-            self.sync_danmaku_scheduled_task().await?;
         } else if current_catalog
             .get(&plugin_id)
             .is_some_and(is_chapter_detector_plugin)
         {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
+        self.sync_manifest_scheduled_tasks().await?;
         let enabled = self
             .database
             .plugin_installation_status(&plugin_id)
@@ -438,14 +435,13 @@ impl PluginService {
         }
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
-        } else if plugin_id == DANMAKU_PLUGIN_ID {
-            self.sync_danmaku_scheduled_task().await?;
         } else if catalog
             .get(&plugin_id)
             .is_some_and(is_chapter_detector_plugin)
         {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
+        self.sync_manifest_scheduled_tasks().await?;
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
     }
@@ -954,11 +950,10 @@ impl PluginService {
         self.write_plugin_config(&plugin_id, &values).await?;
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
-        } else if plugin_id == DANMAKU_PLUGIN_ID {
-            self.sync_danmaku_scheduled_task().await?;
         } else if is_chapter_detector_plugin(plugin) {
             self.sync_chapter_detection_scheduled_tasks().await?;
         }
+        self.sync_manifest_scheduled_tasks().await?;
         let (installed, enabled) = self.plugin_state(&plugin_id).await?;
         self.view_for_id(&plugin_id, installed, enabled).await
     }
@@ -1043,7 +1038,7 @@ impl PluginService {
         validate_dynamic_plugin_config(DANMAKU_PLUGIN_ID, &values)?;
         danmaku_schedule(&values)?;
         self.write_plugin_config(DANMAKU_PLUGIN_ID, &values).await?;
-        self.sync_danmaku_scheduled_task().await
+        self.sync_manifest_scheduled_tasks().await
     }
 
     pub async fn update_media_info_schedule(
@@ -1330,35 +1325,82 @@ impl PluginService {
         Ok(())
     }
 
-    pub async fn sync_danmaku_scheduled_task(&self) -> Result<(), PluginServiceError> {
-        let (installed, enabled) = self.plugin_state(DANMAKU_PLUGIN_ID).await?;
-        if !installed {
-            self.database.disable_danmaku_match_task().await?;
-            return Ok(());
-        }
+    pub async fn sync_manifest_scheduled_tasks(&self) -> Result<(), PluginServiceError> {
         let catalog = self.catalog_snapshot().await;
-        let plugin = catalog
-            .get(DANMAKU_PLUGIN_ID)
-            .ok_or_else(|| PluginServiceError::UnknownPlugin(DANMAKU_PLUGIN_ID.to_owned()))?;
-        let fields = self.config_fields_for_plugin(plugin).await?;
-        let values = merge_default_config_values(
-            &fields,
-            normalize_plugin_config(
-                DANMAKU_PLUGIN_ID,
-                self.read_plugin_config(DANMAKU_PLUGIN_ID).await?,
-            ),
-        );
-        let schedule =
-            danmaku_schedule(&values).unwrap_or_else(|_| DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned());
-        let configured = validate_config_values(&fields, &values).is_ok()
-            && self
-                .danmaku_settings()
-                .await
-                .is_ok_and(|settings| !settings.library_ids.is_empty());
-        self.database
-            .upsert_danmaku_match_task(&schedule, enabled && configured)
-            .await
-            .map_err(PluginServiceError::from)
+        for plugin in &catalog.plugins {
+            let plugin_id = &plugin.manifest.id;
+            if plugin.manifest.scheduled_tasks.is_empty() {
+                continue;
+            }
+            let (installed, enabled) = self.plugin_state(plugin_id).await?;
+            if !installed {
+                for task in &plugin.manifest.scheduled_tasks {
+                    self.database
+                        .disable_plugin_scheduled_task(plugin_id, &task.task_type)
+                        .await?;
+                }
+                continue;
+            }
+            let fields = self.config_fields_for_plugin(plugin).await?;
+            let values = merge_default_config_values(
+                &fields,
+                normalize_plugin_config(plugin_id, self.read_plugin_config(plugin_id).await?),
+            );
+            let config_valid = validate_config_values(&fields, &values).is_ok()
+                && validate_dynamic_plugin_config(plugin_id, &values).is_ok();
+            for task in &plugin.manifest.scheduled_tasks {
+                self.database
+                    .disable_plugin_scheduled_task(plugin_id, &task.task_type)
+                    .await?;
+                let schedule = values
+                    .get(&task.schedule_config_key)
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|schedule| validate_cron(schedule).is_ok())
+                    .unwrap_or(task.default_schedule.as_str());
+                let resource_limit_json = serde_json::to_string(&task.resource_limit)
+                    .map_err(|_| PluginServiceError::InvalidConfig)?;
+                let required_values_present = task
+                    .required_config_keys
+                    .iter()
+                    .all(|key| config_value_is_present(values.get(key)));
+                let task_enabled = enabled && config_valid && required_values_present;
+                let owner_ids = match task.owner_type.as_str() {
+                    "GLOBAL" => vec!["global".to_owned()],
+                    "LIBRARY" => task
+                        .owner_config_key
+                        .as_deref()
+                        .and_then(|key| values.get(key))
+                        .and_then(Value::as_array)
+                        .map(|owners| {
+                            owners
+                                .iter()
+                                .filter_map(Value::as_str)
+                                .filter(|owner_id| !owner_id.trim().is_empty())
+                                .map(str::to_owned)
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default(),
+                    _ => Vec::new(),
+                };
+                for owner_id in owner_ids {
+                    self.database
+                        .register_plugin_scheduled_task(
+                            &task.owner_type,
+                            &owner_id,
+                            &task.task_type,
+                            &task.name,
+                            &task.description,
+                            plugin_id,
+                            schedule,
+                            task_enabled,
+                            &resource_limit_json,
+                        )
+                        .await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     async fn config_fields_for_plugin(
@@ -2061,6 +2103,16 @@ fn validate_dynamic_plugin_config(
     crate::application::danmaku::validate_provider_base_url(provider_url)
         .map(|_| ())
         .map_err(|_| PluginServiceError::InvalidConfig)
+}
+
+fn config_value_is_present(value: Option<&Value>) -> bool {
+    match value {
+        Some(Value::String(value)) => !value.trim().is_empty(),
+        Some(Value::Array(values)) => !values.is_empty(),
+        Some(Value::Bool(value)) => *value,
+        Some(Value::Null) | None => false,
+        Some(_) => true,
+    }
 }
 
 fn media_info_schedule(values: &Map<String, Value>) -> Result<String, PluginServiceError> {

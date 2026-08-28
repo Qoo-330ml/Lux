@@ -200,6 +200,16 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
                 {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false},
                 {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "* * * * *"}
             ],
+            "scheduledTasks": [{
+                "taskType": "DANMAKU_MATCH",
+                "ownerType": "GLOBAL",
+                "name": "弹幕匹配",
+                "description": "按计划为选定媒体库匹配并下载 Bilibili XML 弹幕旁车。",
+                "scheduleConfigKey": "schedule",
+                "defaultSchedule": "* * * * *",
+                "requiredConfigKeys": ["providerBaseUrl", "libraryIds"],
+                "resourceLimit": {"concurrency": 2, "overwrite": false}
+            }],
             "permissions": {"network": ["*"], "filesystem": []},
             "files": []
         }))?,

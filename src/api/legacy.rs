@@ -628,9 +628,9 @@ impl AppState {
             tracing::error!(%error, "failed to synchronize chapter detection scheduled tasks");
         }
         if let Some(plugins) = self.plugins.as_ref()
-            && let Err(error) = plugins.sync_danmaku_scheduled_task().await
+            && let Err(error) = plugins.sync_manifest_scheduled_tasks().await
         {
-            tracing::error!(%error, "failed to synchronize danmaku scheduled task");
+            tracing::error!(%error, "failed to synchronize manifest scheduled tasks");
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
             scheduled_tasks.spawn();

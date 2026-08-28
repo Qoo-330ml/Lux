@@ -84,6 +84,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/plugin-store`：读取当前插件商店来源和默认来源。默认来源为 `https://github.com/Qoo-330ml/Lux-plugins`，GitHub 仓库地址解析为 `main/index.json`；读取需要管理员权限。
 - `PUT /api/v1/admin/plugin-store`：管理员发送 `{ "url": "https://example.com/lux/index.json" }` 保存插件目录来源，需要 CSRF。只接受无凭据、无 fragment、无控制字符且不超过 2048 个字符的 HTTPS 地址；成功返回 `url` 和 `defaultUrl`。
 - `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回当前插件商店目录和 `/config/plugins` 本地发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、非敏感 `configValues`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 包含输入类型、是否多选、默认值、数值范围和选项来源；`media-libraries` 选项由当前媒体库动态填充。敏感配置值不会返回。目录不可用时，已发现的本地插件仍可用于已安装管理页。
+- 插件 manifest 可通过 `scheduledTasks` 声明宿主计划任务。每项至少包含 `taskType`、`ownerType`、`name`、`description`、`scheduleConfigKey` 和五段式 `defaultSchedule`，还可以声明 `requiredConfigKeys` 与 `resourceLimit`；`GLOBAL` 任务使用 `global` owner，`LIBRARY` 任务必须通过 `ownerConfigKey` 指向多选媒体库配置。安装、启停、配置更新和服务启动均由 Lux 通用机制同步这些声明，不按具体插件 ID 注册任务；配置无效或插件未启用时任务记录保留但停用。
 - `POST /api/v1/admin/plugins/{pluginId}/install`：安装本地发现的插件，或下载当前插件商店目录声明的 `.zip` 包并校验大小、路径、manifest、平台入口和 SHA-256 后原子写入 `/config/plugins`，默认启用。首次安装返回 201，重复请求返回 200；下载失败或未知插件返回相应错误，不改变安装状态。
 - `PATCH /api/v1/admin/plugins/{pluginId}/enabled`：更新已安装插件的启用状态，请求体为 `{ "enabled": true }` 或 `{ "enabled": false }`。禁用只改变运行/选择状态，不删除安装记录；已安装管理列表仍会返回该插件。未安装或未知插件返回相应错误，成功返回更新后的插件状态。
 - `PUT /api/v1/admin/plugins/{pluginId}/config`：按该插件 manifest 的 `configFields` 替换或更新配置；宿主将

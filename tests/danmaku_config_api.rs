@@ -38,6 +38,16 @@ async fn danmaku_scheduled_task_api_updates_plugin_schedule()
                 {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []},
                 {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 6 * * *"}
             ],
+            "scheduledTasks": [{
+                "taskType": "DANMAKU_MATCH",
+                "ownerType": "GLOBAL",
+                "name": "弹幕匹配",
+                "description": "按计划为选定媒体库匹配并下载 Bilibili XML 弹幕旁车。",
+                "scheduleConfigKey": "schedule",
+                "defaultSchedule": "0 6 * * *",
+                "requiredConfigKeys": ["providerBaseUrl", "libraryIds"],
+                "resourceLimit": {"concurrency": 2, "overwrite": false}
+            }],
             "permissions": {"network": ["*"], "filesystem": []},
             "files": []
         }))?,
