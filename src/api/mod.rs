@@ -512,12 +512,18 @@ impl AppState {
         let Some(scan_jobs) = self.scan_jobs.clone() else {
             return;
         };
-        LibraryWatchService::with_scan_jobs_and_metadata(
+        let watch_service = LibraryWatchService::with_scan_jobs_and_metadata(
             database,
             scan_jobs,
             self.metadata_reidentify.clone(),
-        )
-        .spawn();
+        );
+        let watch_service = match self.libraries.as_ref() {
+            Some(libraries) => {
+                watch_service.with_library_change_notifications(libraries.change_notifier())
+            }
+            None => watch_service,
+        };
+        watch_service.spawn();
     }
 
     pub async fn resume_strm_probe_jobs(&self) {

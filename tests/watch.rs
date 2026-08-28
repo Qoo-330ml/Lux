@@ -138,3 +138,47 @@ async fn realtime_service_indexes_only_the_file_that_changed()
     let _ = watch_task.await;
     Ok(())
 }
+
+#[tokio::test]
+async fn realtime_service_refreshes_roots_after_library_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+
+    let watch_task = LibraryWatchService::new(database.clone())
+        .with_library_change_notifications(libraries.change_notifier())
+        .spawn();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::fs::write(root.join("New.Movie.2024.mkv"), b"new").await?;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+                .fetch_one(database.pool())
+                .await?;
+            if count == 1 {
+                break Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await??;
+
+    watch_task.abort();
+    let _ = watch_task.await;
+    Ok(())
+}

@@ -15,13 +15,14 @@ use notify::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::{
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, Semaphore, watch},
     task::{AbortHandle, JoinSet},
-    time::sleep,
+    time::interval,
 };
 
 use crate::{
     application::{
+        libraries::LibraryChangeNotifier,
         reidentify::MetadataReidentifyService,
         scanner::{IncrementalScanChange, ScanJobService},
     },
@@ -32,6 +33,7 @@ use crate::{
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
 const WATCHER_INIT_CONCURRENCY: usize = 2;
+const LIBRARY_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 async fn initialize_watcher_on_dedicated_thread(
     root: PathBuf,
@@ -169,6 +171,8 @@ pub struct LibraryWatchService {
     scan_jobs: ScanJobService,
     metadata: Option<MetadataReidentifyService>,
     watcher_init_permits: Arc<Semaphore>,
+    library_change_notifier: LibraryChangeNotifier,
+    library_change_receiver: watch::Receiver<u64>,
 }
 
 impl LibraryWatchService {
@@ -186,12 +190,22 @@ impl LibraryWatchService {
         scan_jobs: ScanJobService,
         metadata: Option<MetadataReidentifyService>,
     ) -> Self {
+        let library_change_notifier = LibraryChangeNotifier::new();
+        let library_change_receiver = library_change_notifier.subscribe();
         Self {
             scan_jobs,
             database,
             metadata,
             watcher_init_permits: Arc::new(Semaphore::new(WATCHER_INIT_CONCURRENCY)),
+            library_change_notifier,
+            library_change_receiver,
         }
+    }
+
+    pub fn with_library_change_notifications(mut self, notifier: LibraryChangeNotifier) -> Self {
+        self.library_change_receiver = notifier.subscribe();
+        self.library_change_notifier = notifier;
+        self
     }
 
     pub fn spawn(self) -> tokio::task::JoinHandle<()> {
@@ -212,9 +226,23 @@ impl LibraryWatchService {
             &mut next_token,
         )
         .await;
+        let mut refresh_interval = interval(LIBRARY_ROOT_REFRESH_INTERVAL);
+        refresh_interval.tick().await;
+        let mut library_change_receiver = self.library_change_receiver.clone();
         loop {
             tokio::select! {
-                _ = sleep(Duration::from_secs(1)) => {
+                _ = refresh_interval.tick() => {
+                    self.refresh_roots(
+                        &mut active_roots,
+                        &mut watcher_tasks,
+                        &running_jobs,
+                        &mut next_token,
+                    ).await;
+                }
+                changed = library_change_receiver.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
                     self.refresh_roots(
                         &mut active_roots,
                         &mut watcher_tasks,
@@ -225,6 +253,12 @@ impl LibraryWatchService {
                 Some(result) = watcher_tasks.join_next() => {
                     if let Ok(result) = result {
                         remove_completed_watcher(&mut active_roots, result);
+                        self.refresh_roots(
+                            &mut active_roots,
+                            &mut watcher_tasks,
+                            &running_jobs,
+                            &mut next_token,
+                        ).await;
                     }
                 }
             }

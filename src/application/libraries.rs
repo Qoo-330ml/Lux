@@ -4,6 +4,8 @@ use std::{
     path::Path,
 };
 
+use tokio::sync::watch;
+
 use crate::{
     application::{
         probe::{
@@ -31,13 +33,49 @@ const MAX_SCHEDULE_LENGTH: usize = 128;
 const MAX_LIBRARY_SCRAPERS: usize = 16;
 
 #[derive(Clone)]
+pub struct LibraryChangeNotifier {
+    sender: watch::Sender<u64>,
+}
+
+impl LibraryChangeNotifier {
+    pub fn new() -> Self {
+        let (sender, _) = watch::channel(0_u64);
+        Self { sender }
+    }
+
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.sender.subscribe()
+    }
+
+    fn notify(&self) {
+        self.sender.send_modify(|version| {
+            *version = version.wrapping_add(1);
+        });
+    }
+}
+
+impl Default for LibraryChangeNotifier {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone)]
 pub struct LibraryService {
     database: Database,
+    change_notifier: LibraryChangeNotifier,
 }
 
 impl LibraryService {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            change_notifier: LibraryChangeNotifier::new(),
+        }
+    }
+
+    pub fn change_notifier(&self) -> LibraryChangeNotifier {
+        self.change_notifier.clone()
     }
 
     pub async fn create_library(
@@ -157,7 +195,9 @@ impl LibraryService {
             .find_library(&id.to_string())
             .await?
             .ok_or(LibraryServiceError::LibraryNotFound)?;
-        stored_library(stored)
+        let library = stored_library(stored)?;
+        self.change_notifier.notify();
+        Ok(library)
     }
 
     pub async fn list_libraries(&self) -> Result<Vec<LibraryView>, LibraryServiceError> {
@@ -358,6 +398,7 @@ impl LibraryService {
             .into_iter()
             .map(stored_library_root)
             .collect::<Result<Vec<_>, _>>()?;
+        self.change_notifier.notify();
         Ok(LibraryView { library, roots })
     }
 
@@ -430,6 +471,7 @@ impl LibraryService {
             .await?
             .ok_or(LibraryServiceError::RootNotFoundAfterInsert)
             .and_then(stored_library_root)?;
+        self.change_notifier.notify();
         Ok(AddRootResult { root, warnings })
     }
 
@@ -445,6 +487,7 @@ impl LibraryService {
         {
             return Err(LibraryServiceError::RootNotFound);
         }
+        self.change_notifier.notify();
         Ok(())
     }
 
@@ -461,6 +504,7 @@ impl LibraryService {
         if !self.database.delete_library(&library_id_text).await? {
             return Err(LibraryServiceError::LibraryNotFound);
         }
+        self.change_notifier.notify();
         Ok(())
     }
 }
