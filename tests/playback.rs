@@ -130,14 +130,24 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         playback_body["MediaSources"][0]["SupportsTranscoding"],
         false
     );
-    assert_eq!(
-        playback_body["MediaSources"][0]["DirectStreamUrl"],
-        format!("/Videos/{item_id}/stream.mkv?MediaSourceId={source_id}")
-    );
+    let generic_direct_url = playback_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing generic direct stream URL")?;
+    assert!(generic_direct_url.starts_with(&format!(
+        "/Videos/{item_id}/stream.mkv?MediaSourceId={source_id}&luxPlayback"
+    )));
+    assert!(!generic_direct_url.contains(&token));
     assert_eq!(
         playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
-        true
+        false
     );
+    let generic_stream = client
+        .get(format!("{base_url}{generic_direct_url}"))
+        .header("User-Agent", "Hills/1.8.0 (android; 17)")
+        .send()
+        .await?;
+    assert_eq!(generic_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(generic_stream.bytes().await?.as_ref(), b"0123456789");
     let yamby_playback = client
         .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
         .header(
