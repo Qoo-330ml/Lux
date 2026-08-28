@@ -32,6 +32,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复媒体库在后台扫描或 STRM 探测运行时无法删除的问题；删除会请求取消相关任务且不会修改媒体文件，管理台会显示失败原因并即时移除已删除卡片。",
         "修复部分 Emby Android 客户端丢失播放鉴权头，以及 Yamby 使用季 ID 请求剧集分集时无法返回正确分集的问题。",
         "修复媒体库删除期间后台扫描任务清理不完整，以及 Yamby 无 token 直连播放时的兼容问题。",
+        "修复 HILLS 等通用 Emby Android 播放器在独立媒体请求中丢失鉴权头导致 401 的问题；PlaybackInfo 现在为可播放媒体源生成绑定用户、条目和媒体源的短期 HMAC 直连票据，并关闭 AddApiKeyToDirectStreamUrl，避免长期 token 进入 URL，同时继续兼容标准 Emby 鉴权头和 api_key。",
       ] },
       { kind: "changed", items: [
         "Lux Web 播放页改用模块化 LuxPlayer 呈现层；既有播放能力、鉴权、媒体访问控制和服务端会话接口保持兼容。",
