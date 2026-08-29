@@ -17,6 +17,7 @@ pub(crate) struct StoredEmbyMigrationJob {
     pub phase: String,
     pub dry_run: bool,
     pub merge_policy: String,
+    pub scope_json: String,
     pub emby_user_ids_json: String,
     pub history_capability: String,
     pub cursor_json: String,
@@ -37,6 +38,7 @@ pub(crate) struct NewEmbyMigrationJob<'a> {
     pub secret_ref: &'a str,
     pub dry_run: bool,
     pub merge_policy: &'a str,
+    pub scope_json: &'a str,
     pub emby_user_ids_json: &'a str,
 }
 
@@ -323,8 +325,8 @@ impl Database {
         self.query(
             "INSERT INTO emby_migration_jobs (
                  id, plugin_id, created_by_user_id, source_label, source_base_url,
-                 secret_ref, status, phase, dry_run, merge_policy, emby_user_ids_json
-             ) VALUES (?, 'org.lux.emby-migration', ?, ?, ?, ?, 'PENDING', 'TESTING', ?, ?, ?)",
+                 secret_ref, status, phase, dry_run, merge_policy, scope_json, emby_user_ids_json
+             ) VALUES (?, 'org.lux.emby-migration', ?, ?, ?, ?, 'PENDING', 'TESTING', ?, ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.created_by_user_id)
@@ -333,6 +335,7 @@ impl Database {
         .bind(job.secret_ref)
         .bind(if job.dry_run { 1_i64 } else { 0_i64 })
         .bind(job.merge_policy)
+        .bind(job.scope_json)
         .bind(job.emby_user_ids_json)
         .execute(self.pool())
         .await
@@ -346,7 +349,7 @@ impl Database {
     ) -> Result<Option<StoredEmbyMigrationJob>, StorageError> {
         self.query(
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
-                    secret_ref, status, phase, dry_run, merge_policy, cursor_json,
+                    secret_ref, status, phase, dry_run, merge_policy, scope_json, cursor_json,
                     emby_user_ids_json,
                     processed_count, total_count, matched_count, skipped_count, failed_count,
                     cancel_requested, error, history_capability
@@ -366,7 +369,7 @@ impl Database {
     ) -> Result<Vec<StoredEmbyMigrationJob>, StorageError> {
         self.query(
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
-                    secret_ref, status, phase, dry_run, merge_policy, cursor_json,
+                    secret_ref, status, phase, dry_run, merge_policy, scope_json, cursor_json,
                     emby_user_ids_json,
                     processed_count, total_count, matched_count, skipped_count, failed_count,
                     cancel_requested, error, history_capability
@@ -1019,6 +1022,7 @@ fn stored_migration_job(row: sqlx::any::AnyRow) -> StoredEmbyMigrationJob {
         phase: row.get("phase"),
         dry_run: row.get::<i64, _>("dry_run") != 0,
         merge_policy: row.get("merge_policy"),
+        scope_json: row.get("scope_json"),
         emby_user_ids_json: row.get("emby_user_ids_json"),
         history_capability: row.get("history_capability"),
         cursor_json: row.get("cursor_json"),
@@ -1192,6 +1196,7 @@ mod tests {
                 secret_ref: "emby-migration/test",
                 dry_run: true,
                 merge_policy: "MERGE",
+                scope_json: r#"{"userProfile":true,"libraryAccess":true,"itemState":true,"personFavorites":true}"#,
                 emby_user_ids_json: r#"["emby-user"]"#,
             })
             .await?;
@@ -1239,6 +1244,7 @@ mod tests {
                 secret_ref: "emby-migration/test",
                 dry_run: true,
                 merge_policy: "MERGE",
+                scope_json: r#"{"userProfile":true,"libraryAccess":true,"itemState":true,"personFavorites":true}"#,
                 emby_user_ids_json: r#"["emby-user"]"#,
             })
             .await?;

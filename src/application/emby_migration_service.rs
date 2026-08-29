@@ -16,8 +16,8 @@ use crate::{
     application::emby_migration::{
         EmbyMigrationPluginClient, EmbyMigrationSource, HistoryCapability, MigrationConnectionInfo,
         MigrationInputError, MigrationItem, MigrationItemPage, MigrationLibraryFolder,
-        MigrationMergePolicy, MigrationUser, MigrationUserData, MigrationUserStateFilter,
-        StoredItemState,
+        MigrationMergePolicy, MigrationScope, MigrationUser, MigrationUserData,
+        MigrationUserStateFilter, StoredItemState,
     },
     application::plugin_runtime::PluginRuntimeError,
     application::plugins::PluginServiceError,
@@ -44,6 +44,8 @@ pub struct CreateMigrationRequest {
     pub dry_run: bool,
     #[serde(default)]
     pub merge_policy: MigrationMergePolicy,
+    #[serde(default)]
+    pub scope: MigrationScope,
     pub emby_user_ids: Vec<String>,
 }
 
@@ -57,6 +59,7 @@ pub struct MigrationJobView {
     pub phase: String,
     pub dry_run: bool,
     pub merge_policy: String,
+    pub scope: MigrationScope,
     pub history_capability: String,
     pub processed_count: i64,
     pub total_count: i64,
@@ -253,6 +256,7 @@ impl From<StoredEmbyMigrationJob> for MigrationJobView {
             phase: job.phase,
             dry_run: job.dry_run,
             merge_policy: job.merge_policy,
+            scope: migration_scope_from_json(&job.scope_json),
             history_capability: job.history_capability,
             processed_count: job.processed_count,
             total_count: job.total_count,
@@ -348,6 +352,8 @@ impl EmbyMigrationService {
         request: CreateMigrationRequest,
     ) -> Result<MigrationJobView, EmbyMigrationServiceError> {
         let emby_user_ids = normalize_selected_user_ids(&request.emby_user_ids)?;
+        let scope_json = serde_json::to_string(&request.scope)
+            .map_err(|_| EmbyMigrationServiceError::InvalidState)?;
         let emby_user_ids_json = serde_json::to_string(&emby_user_ids)
             .map_err(|_| EmbyMigrationServiceError::InvalidState)?;
         let source = self.plugin.configured_source().await?;
@@ -383,6 +389,7 @@ impl EmbyMigrationService {
                 secret_ref: &secret_ref,
                 dry_run: request.dry_run,
                 merge_policy: merge_policy_name(request.merge_policy),
+                scope_json: &scope_json,
                 emby_user_ids_json: &emby_user_ids_json,
             })
             .await
@@ -666,6 +673,7 @@ impl EmbyMigrationService {
             return Ok(());
         }
         let source = self.read_source(&job).await?;
+        let scope = migration_scope_from_json(&job.scope_json);
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "TESTING", None)
             .await?;
@@ -724,7 +732,9 @@ impl EmbyMigrationService {
             if self.is_cancelled(job_id).await? {
                 return self.cancelled(job_id, "USERS").await;
             }
-            let link = self.prepare_user(&user_store, &job, user).await?;
+            let link = self
+                .prepare_user(&user_store, &job, user, scope.user_profile)
+                .await?;
             self.database.upsert_emby_migration_user_link(&link).await?;
             user_links.push((user.clone(), link.lux_user_id.clone()));
         }
@@ -732,8 +742,18 @@ impl EmbyMigrationService {
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "ITEMS", None)
             .await?;
-        let identity_index = MigrationMediaIdentityIndex::new(self.load_media_identities().await?);
-        let lux_library_identities = self.load_library_identities().await?;
+        let identity_index = if scope.item_state {
+            Some(MigrationMediaIdentityIndex::new(
+                self.load_media_identities().await?,
+            ))
+        } else {
+            None
+        };
+        let lux_library_identities = if scope.library_access {
+            Some(self.load_library_identities().await?)
+        } else {
+            None
+        };
         let mut processed = job.processed_count;
         let mut matched = job.matched_count;
         let mut skipped = job.skipped_count;
@@ -742,147 +762,154 @@ impl EmbyMigrationService {
         for (user, lux_user_id) in user_links {
             let mut accessible_library_ids = HashSet::new();
             let mut seen_emby_item_ids = HashSet::new();
-            for state_filter in MigrationUserStateFilter::ALL {
-                let filter_base = processed;
-                let mut filter_total_recorded = false;
-                let mut start_index = 0_u32;
-                loop {
-                    if self.is_cancelled(job_id).await? {
-                        return self.cancelled(job_id, "ITEMS").await;
-                    }
-                    let recovered_page = self
-                        .recover_migration_page(
-                            &source,
-                            &user.id,
-                            start_index,
-                            500,
-                            MigrationPageKind::UserState(state_filter),
-                        )
-                        .await?;
-                    if !recovered_page.invalid_items.is_empty() {
-                        self.record_invalid_migration_items(job_id, &recovered_page.invalid_items)
-                            .await?;
-                        let invalid_item_count = recovered_page.invalid_items.len() as i64;
-                        processed += invalid_item_count;
-                        failed += invalid_item_count;
-                        tracing::warn!(
-                            job_id = %job_id,
-                            user_id = %user.id,
-                            start_index,
-                            invalid_items = invalid_item_count,
-                            "skipping invalid Emby migration items and continuing"
-                        );
-                    }
-                    let page = recovered_page.page;
-                    if !filter_total_recorded {
-                        if let Some(page_total) = page.total_record_count {
-                            total = total.max(filter_base + page_total as i64);
-                            filter_total_recorded = true;
+            if let Some(identity_index) = identity_index.as_ref() {
+                for state_filter in MigrationUserStateFilter::ALL {
+                    let filter_base = processed;
+                    let mut filter_total_recorded = false;
+                    let mut start_index = 0_u32;
+                    loop {
+                        if self.is_cancelled(job_id).await? {
+                            return self.cancelled(job_id, "ITEMS").await;
                         }
-                    }
-                    for item in page.items {
-                        let Some(user_data) =
-                            recorded_state_for_migration(&item, &mut seen_emby_item_ids)
-                        else {
-                            continue;
-                        };
-                        processed += 1;
-                        let outcome = match_item(&item, &identity_index);
-                        let detail = serde_json::to_string(&migration_item_detail(
-                            &item,
-                            &outcome,
-                            &identity_index.identities,
-                        ))
-                        .unwrap_or_else(|_| "{}".to_owned());
-                        self.database
-                            .upsert_emby_migration_item_match(&NewEmbyMigrationItemMatch {
-                                job_id,
-                                emby_item_id: &item.id,
-                                emby_item_type: &item.item_type,
-                                lux_item_id: outcome.lux_item_id.as_deref(),
-                                match_method: outcome.method,
-                                confidence: outcome.confidence,
-                                status: outcome.status,
-                                detail_json: &detail,
-                            })
-                            .await?;
-                        let Some(lux_item_id) = outcome.lux_item_id else {
-                            skipped += 1;
-                            continue;
-                        };
-                        matched += 1;
-                        if let Some(library_id) = identity_index.library_id(&lux_item_id) {
-                            accessible_library_ids.insert(library_id);
-                        }
-                        if job.dry_run {
-                            continue;
-                        }
-                        let Some(lux_user_id) = lux_user_id.as_deref() else {
-                            skipped += 1;
-                            continue;
-                        };
-                        let incoming = incoming_state(&user_data)?;
-                        self.database
-                            .merge_imported_user_item_state(
-                                &NewImportedUserItemState {
-                                    user_id: lux_user_id,
-                                    item_id: &lux_item_id,
-                                    position_ticks: incoming.position_ticks,
-                                    is_played: incoming.is_played,
-                                    is_favorite: incoming.is_favorite,
-                                    play_count: incoming.play_count,
-                                    last_played_at: incoming.last_played_at,
-                                },
-                                &job.merge_policy,
+                        let recovered_page = self
+                            .recover_migration_page(
+                                &source,
+                                &user.id,
+                                start_index,
+                                500,
+                                MigrationPageKind::UserState(state_filter),
                             )
                             .await?;
-                        let state_hash = hex_sha256(&user_data)?;
-                        self.database
-                            .upsert_emby_migration_import_record(&NewEmbyMigrationImportRecord {
+                        if !recovered_page.invalid_items.is_empty() {
+                            self.record_invalid_migration_items(
                                 job_id,
-                                emby_user_id: &user.id,
-                                emby_item_id: &item.id,
-                                lux_user_id,
-                                lux_item_id: &lux_item_id,
-                                state_hash: &state_hash,
-                                status: "IMPORTED",
-                                error: None,
+                                &recovered_page.invalid_items,
+                            )
+                            .await?;
+                            let invalid_item_count = recovered_page.invalid_items.len() as i64;
+                            processed += invalid_item_count;
+                            failed += invalid_item_count;
+                            tracing::warn!(
+                                job_id = %job_id,
+                                user_id = %user.id,
+                                start_index,
+                                invalid_items = invalid_item_count,
+                                "skipping invalid Emby migration items and continuing"
+                            );
+                        }
+                        let page = recovered_page.page;
+                        if !filter_total_recorded {
+                            if let Some(page_total) = page.total_record_count {
+                                total = total.max(filter_base + page_total as i64);
+                                filter_total_recorded = true;
+                            }
+                        }
+                        for item in page.items {
+                            let Some(user_data) =
+                                recorded_state_for_migration(&item, &mut seen_emby_item_ids)
+                            else {
+                                continue;
+                            };
+                            processed += 1;
+                            let outcome = match_item(&item, identity_index);
+                            let detail = serde_json::to_string(&migration_item_detail(
+                                &item,
+                                &outcome,
+                                &identity_index.identities,
+                            ))
+                            .unwrap_or_else(|_| "{}".to_owned());
+                            self.database
+                                .upsert_emby_migration_item_match(&NewEmbyMigrationItemMatch {
+                                    job_id,
+                                    emby_item_id: &item.id,
+                                    emby_item_type: &item.item_type,
+                                    lux_item_id: outcome.lux_item_id.as_deref(),
+                                    match_method: outcome.method,
+                                    confidence: outcome.confidence,
+                                    status: outcome.status,
+                                    detail_json: &detail,
+                                })
+                                .await?;
+                            let Some(lux_item_id) = outcome.lux_item_id else {
+                                skipped += 1;
+                                continue;
+                            };
+                            matched += 1;
+                            if let Some(library_id) = identity_index.library_id(&lux_item_id) {
+                                accessible_library_ids.insert(library_id);
+                            }
+                            if job.dry_run {
+                                continue;
+                            }
+                            let Some(lux_user_id) = lux_user_id.as_deref() else {
+                                skipped += 1;
+                                continue;
+                            };
+                            let incoming = incoming_state(&user_data)?;
+                            self.database
+                                .merge_imported_user_item_state(
+                                    &NewImportedUserItemState {
+                                        user_id: lux_user_id,
+                                        item_id: &lux_item_id,
+                                        position_ticks: incoming.position_ticks,
+                                        is_played: incoming.is_played,
+                                        is_favorite: incoming.is_favorite,
+                                        play_count: incoming.play_count,
+                                        last_played_at: incoming.last_played_at,
+                                    },
+                                    &job.merge_policy,
+                                )
+                                .await?;
+                            let state_hash = hex_sha256(&user_data)?;
+                            self.database
+                                .upsert_emby_migration_import_record(
+                                    &NewEmbyMigrationImportRecord {
+                                        job_id,
+                                        emby_user_id: &user.id,
+                                        emby_item_id: &item.id,
+                                        lux_user_id,
+                                        lux_item_id: &lux_item_id,
+                                        state_hash: &state_hash,
+                                        status: "IMPORTED",
+                                        error: None,
+                                    },
+                                )
+                                .await?;
+                        }
+                        self.database
+                            .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
+                                id: job_id,
+                                cursor_json: &serde_json::to_string(&json!({
+                                    "userId": user.id,
+                                    "stateFilter": state_filter,
+                                    "startIndex": page.start_index,
+                                }))
+                                .unwrap_or_else(|_| "{}".to_owned()),
+                                processed_count: processed,
+                                total_count: total,
+                                matched_count: matched,
+                                skipped_count: skipped,
+                                failed_count: failed,
                             })
                             .await?;
+                        let Some(next_start_index) = page.next_start_index else {
+                            break;
+                        };
+                        if next_start_index <= start_index {
+                            break;
+                        }
+                        start_index = next_start_index;
                     }
-                    self.database
-                        .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
-                            id: job_id,
-                            cursor_json: &serde_json::to_string(&json!({
-                                "userId": user.id,
-                                "stateFilter": state_filter,
-                                "startIndex": page.start_index,
-                            }))
-                            .unwrap_or_else(|_| "{}".to_owned()),
-                            processed_count: processed,
-                            total_count: total,
-                            matched_count: matched,
-                            skipped_count: skipped,
-                            failed_count: failed,
-                        })
-                        .await?;
-                    let Some(next_start_index) = page.next_start_index else {
-                        break;
-                    };
-                    if next_start_index <= start_index {
-                        break;
-                    }
-                    start_index = next_start_index;
                 }
             }
-            if !job.dry_run {
+            if scope.library_access && !job.dry_run {
                 let (library_ids, exact_library_access) = if user.enable_all_folders {
                     (self.database.list_enabled_library_ids().await?, true)
                 } else if let Some(source_folders) = library_folders.as_deref() {
                     let allowed_library_ids = map_enabled_library_ids(
                         &user,
                         Some(source_folders),
-                        &lux_library_identities,
+                        lux_library_identities.as_deref().unwrap_or_default(),
                     );
                     (allowed_library_ids.into_iter().collect(), true)
                 } else {
@@ -907,141 +934,144 @@ impl EmbyMigrationService {
                 }
             }
 
-            let person_filter_base = processed;
-            let mut person_total_recorded = false;
-            let mut start_index = 0_u32;
-            loop {
-                if self.is_cancelled(job_id).await? {
-                    return self.cancelled(job_id, "ITEMS").await;
-                }
-                let recovered_page = self
-                    .recover_migration_page(
-                        &source,
-                        &user.id,
-                        start_index,
-                        500,
-                        MigrationPageKind::PersonFavorites,
-                    )
-                    .await?;
-                if !recovered_page.invalid_items.is_empty() {
-                    self.record_invalid_migration_items(job_id, &recovered_page.invalid_items)
+            if scope.person_favorites {
+                let person_filter_base = processed;
+                let mut person_total_recorded = false;
+                let mut start_index = 0_u32;
+                loop {
+                    if self.is_cancelled(job_id).await? {
+                        return self.cancelled(job_id, "ITEMS").await;
+                    }
+                    let recovered_page = self
+                        .recover_migration_page(
+                            &source,
+                            &user.id,
+                            start_index,
+                            500,
+                            MigrationPageKind::PersonFavorites,
+                        )
                         .await?;
-                    let invalid_item_count = recovered_page.invalid_items.len() as i64;
-                    processed += invalid_item_count;
-                    failed += invalid_item_count;
-                    tracing::warn!(
-                        job_id = %job_id,
-                        user_id = %user.id,
-                        start_index,
-                        invalid_items = invalid_item_count,
-                        "skipping invalid Emby migration items and continuing"
-                    );
-                }
-                let page = recovered_page.page;
-                if !person_total_recorded {
-                    if let Some(page_total) = page.total_record_count {
-                        total = total.max(person_filter_base + page_total as i64);
-                        person_total_recorded = true;
+                    if !recovered_page.invalid_items.is_empty() {
+                        self.record_invalid_migration_items(job_id, &recovered_page.invalid_items)
+                            .await?;
+                        let invalid_item_count = recovered_page.invalid_items.len() as i64;
+                        processed += invalid_item_count;
+                        failed += invalid_item_count;
+                        tracing::warn!(
+                            job_id = %job_id,
+                            user_id = %user.id,
+                            start_index,
+                            invalid_items = invalid_item_count,
+                            "skipping invalid Emby migration items and continuing"
+                        );
                     }
-                }
-                for person in page.items {
-                    if person.item_type != "Person" {
-                        continue;
-                    }
-                    let user_data = person.user_data.clone().unwrap_or(MigrationUserData {
-                        playback_position_ticks: 0,
-                        played: false,
-                        is_favorite: true,
-                        play_count: 0,
-                        last_played_date: None,
-                    });
-                    if !user_data.is_favorite {
-                        continue;
-                    }
-                    processed += 1;
-                    let outcome = self.match_person(&person).await?;
-                    let provider_ids_json = serde_json::to_string(&person.provider_ids)
-                        .unwrap_or_else(|_| "{}".to_owned());
-                    let detail_json = serde_json::to_string(&json!({
-                        "sourceName": person.name,
-                        "sourceType": "Person",
-                        "providerIds": person.provider_ids,
-                        "matchMethod": outcome.method,
-                    }))
-                    .unwrap_or_else(|_| "{}".to_owned());
-                    let state_hash = hex_sha256(&user_data)?;
-                    let mut status = outcome.status;
-                    let mut error = None;
-                    if outcome.lux_person_id.is_some() {
-                        matched += 1;
-                        if !job.dry_run {
-                            if let Some(lux_user_id) = lux_user_id.as_deref() {
-                                if migration_merge_policy(&job.merge_policy)
-                                    == MigrationMergePolicy::Skip
-                                {
-                                    status = "SKIPPED";
-                                } else {
-                                    self.database
-                                        .set_user_person_favorite(
-                                            lux_user_id,
-                                            outcome
-                                                .lux_person_id
-                                                .as_deref()
-                                                .ok_or(EmbyMigrationServiceError::InvalidState)?,
-                                            true,
-                                        )
-                                        .await?;
-                                    status = "IMPORTED";
-                                }
-                            } else {
-                                status = "SKIPPED";
-                                error = Some("no Lux user mapping".to_owned());
-                            }
+                    let page = recovered_page.page;
+                    if !person_total_recorded {
+                        if let Some(page_total) = page.total_record_count {
+                            total = total.max(person_filter_base + page_total as i64);
+                            person_total_recorded = true;
                         }
-                    } else {
-                        skipped += 1;
+                    }
+                    for person in page.items {
+                        if person.item_type != "Person" {
+                            continue;
+                        }
+                        let user_data = person.user_data.clone().unwrap_or(MigrationUserData {
+                            playback_position_ticks: 0,
+                            played: false,
+                            is_favorite: true,
+                            play_count: 0,
+                            last_played_date: None,
+                        });
+                        if !user_data.is_favorite {
+                            continue;
+                        }
+                        processed += 1;
+                        let outcome = self.match_person(&person).await?;
+                        let provider_ids_json = serde_json::to_string(&person.provider_ids)
+                            .unwrap_or_else(|_| "{}".to_owned());
+                        let detail_json = serde_json::to_string(&json!({
+                            "sourceName": person.name,
+                            "sourceType": "Person",
+                            "providerIds": person.provider_ids,
+                            "matchMethod": outcome.method,
+                        }))
+                        .unwrap_or_else(|_| "{}".to_owned());
+                        let state_hash = hex_sha256(&user_data)?;
+                        let mut status = outcome.status;
+                        let mut error = None;
+                        if outcome.lux_person_id.is_some() {
+                            matched += 1;
+                            if !job.dry_run {
+                                if let Some(lux_user_id) = lux_user_id.as_deref() {
+                                    if migration_merge_policy(&job.merge_policy)
+                                        == MigrationMergePolicy::Skip
+                                    {
+                                        status = "SKIPPED";
+                                    } else {
+                                        self.database
+                                            .set_user_person_favorite(
+                                                lux_user_id,
+                                                outcome.lux_person_id.as_deref().ok_or(
+                                                    EmbyMigrationServiceError::InvalidState,
+                                                )?,
+                                                true,
+                                            )
+                                            .await?;
+                                        status = "IMPORTED";
+                                    }
+                                } else {
+                                    status = "SKIPPED";
+                                    error = Some("no Lux user mapping".to_owned());
+                                }
+                            }
+                        } else {
+                            skipped += 1;
+                        }
+                        self.database
+                            .upsert_emby_migration_person_favorite(
+                                &NewEmbyMigrationPersonFavorite {
+                                    job_id,
+                                    emby_user_id: &user.id,
+                                    emby_person_id: &person.id,
+                                    emby_person_name: &person.name,
+                                    lux_user_id: lux_user_id.as_deref(),
+                                    lux_person_id: outcome.lux_person_id.as_deref(),
+                                    provider_ids_json: &provider_ids_json,
+                                    match_method: outcome.method,
+                                    confidence: outcome.confidence,
+                                    status,
+                                    state_hash: &state_hash,
+                                    detail_json: &detail_json,
+                                    error: error.as_deref(),
+                                },
+                            )
+                            .await?;
                     }
                     self.database
-                        .upsert_emby_migration_person_favorite(&NewEmbyMigrationPersonFavorite {
-                            job_id,
-                            emby_user_id: &user.id,
-                            emby_person_id: &person.id,
-                            emby_person_name: &person.name,
-                            lux_user_id: lux_user_id.as_deref(),
-                            lux_person_id: outcome.lux_person_id.as_deref(),
-                            provider_ids_json: &provider_ids_json,
-                            match_method: outcome.method,
-                            confidence: outcome.confidence,
-                            status,
-                            state_hash: &state_hash,
-                            detail_json: &detail_json,
-                            error: error.as_deref(),
+                        .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
+                            id: job_id,
+                            cursor_json: &serde_json::to_string(&json!({
+                                "kind": "PERSON_FAVORITES",
+                                "userId": user.id,
+                                "startIndex": page.start_index,
+                            }))
+                            .unwrap_or_else(|_| "{}".to_owned()),
+                            processed_count: processed,
+                            total_count: total,
+                            matched_count: matched,
+                            skipped_count: skipped,
+                            failed_count: failed,
                         })
                         .await?;
+                    let Some(next_start_index) = page.next_start_index else {
+                        break;
+                    };
+                    if next_start_index <= start_index {
+                        break;
+                    }
+                    start_index = next_start_index;
                 }
-                self.database
-                    .update_emby_migration_job_progress(&EmbyMigrationJobProgress {
-                        id: job_id,
-                        cursor_json: &serde_json::to_string(&json!({
-                            "kind": "PERSON_FAVORITES",
-                            "userId": user.id,
-                            "startIndex": page.start_index,
-                        }))
-                        .unwrap_or_else(|_| "{}".to_owned()),
-                        processed_count: processed,
-                        total_count: total,
-                        matched_count: matched,
-                        skipped_count: skipped,
-                        failed_count: failed,
-                    })
-                    .await?;
-                let Some(next_start_index) = page.next_start_index else {
-                    break;
-                };
-                if next_start_index <= start_index {
-                    break;
-                }
-                start_index = next_start_index;
             }
         }
         self.database
@@ -1078,6 +1108,7 @@ impl EmbyMigrationService {
         user_store: &UserStore,
         job: &StoredEmbyMigrationJob,
         source_user: &MigrationUser,
+        sync_profile: bool,
     ) -> Result<StoredEmbyMigrationUserLink, EmbyMigrationServiceError> {
         let source_user_name = source_user.name.trim();
         if source_user_name.is_empty() {
@@ -1101,6 +1132,28 @@ impl EmbyMigrationService {
             });
         }
         let existing = user_store.find_by_username(source_user_name).await?;
+        if !sync_profile {
+            let Some(existing) = existing else {
+                return Ok(StoredEmbyMigrationUserLink {
+                    job_id: job.id.clone(),
+                    emby_user_id: source_user.id.clone(),
+                    emby_username: source_user_name.to_owned(),
+                    lux_user_id: None,
+                    status: "SKIPPED".to_owned(),
+                    error: Some(
+                        "Lux user does not exist and user profile migration is disabled".to_owned(),
+                    ),
+                });
+            };
+            return Ok(StoredEmbyMigrationUserLink {
+                job_id: job.id.clone(),
+                emby_user_id: source_user.id.clone(),
+                emby_username: source_user_name.to_owned(),
+                lux_user_id: Some(existing.id.to_string()),
+                status: "LINKED".to_owned(),
+                error: None,
+            });
+        }
         let (lux_user, status) = match existing {
             Some(user) => (user, "LINKED"),
             None => {
@@ -1826,6 +1879,10 @@ fn migration_merge_policy(value: &str) -> MigrationMergePolicy {
     }
 }
 
+fn migration_scope_from_json(value: &str) -> MigrationScope {
+    serde_json::from_str(value).unwrap_or_default()
+}
+
 fn normalize_selected_user_ids(values: &[String]) -> Result<Vec<String>, MigrationInputError> {
     let mut selected = Vec::with_capacity(values.len().min(MAX_SELECTED_USER_COUNT));
     let mut seen = HashSet::with_capacity(values.len());
@@ -1936,6 +1993,14 @@ mod tests {
     #[test]
     fn create_request_requires_user_ids() {
         assert!(serde_json::from_str::<CreateMigrationRequest>(r#"{"dryRun":false}"#).is_err());
+    }
+
+    #[test]
+    fn create_request_defaults_scope_for_legacy_clients() {
+        let request: CreateMigrationRequest =
+            serde_json::from_str(r#"{"dryRun":false,"embyUserIds":["user-1"]}"#)
+                .expect("legacy migration request should remain valid");
+        assert_eq!(request.scope, MigrationScope::default());
     }
 
     #[test]

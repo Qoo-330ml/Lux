@@ -104,6 +104,34 @@ pub enum MigrationMergePolicy {
     Skip,
 }
 
+fn default_scope_enabled() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MigrationScope {
+    #[serde(default = "default_scope_enabled")]
+    pub user_profile: bool,
+    #[serde(default = "default_scope_enabled")]
+    pub library_access: bool,
+    #[serde(default = "default_scope_enabled")]
+    pub item_state: bool,
+    #[serde(default = "default_scope_enabled")]
+    pub person_favorites: bool,
+}
+
+impl Default for MigrationScope {
+    fn default() -> Self {
+        Self {
+            user_profile: true,
+            library_access: true,
+            item_state: true,
+            person_favorites: true,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum HistoryCapability {
@@ -206,7 +234,26 @@ impl MigrationUserStateFilter {
 
 #[cfg(test)]
 mod user_data_tests {
-    use super::MigrationUserData;
+    use super::{MigrationScope, MigrationUserData};
+
+    #[test]
+    fn migration_scope_defaults_to_all_categories() {
+        let scope = MigrationScope::default();
+        assert!(scope.user_profile);
+        assert!(scope.library_access);
+        assert!(scope.item_state);
+        assert!(scope.person_favorites);
+    }
+
+    #[test]
+    fn migration_scope_allows_partial_json_without_disabling_other_categories() {
+        let scope: MigrationScope = serde_json::from_str(r#"{"itemState":false}"#)
+            .expect("partial migration scope should deserialize");
+        assert!(scope.user_profile);
+        assert!(scope.library_access);
+        assert!(!scope.item_state);
+        assert!(scope.person_favorites);
+    }
 
     #[test]
     fn empty_user_data_is_not_a_recorded_state() {
