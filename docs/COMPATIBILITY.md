@@ -257,11 +257,16 @@ LUX-215 的固定夹具和记录；本次只增加阶段 18的播放器交互断
 | 单次媒体读取实验关闭/失败 | 通过 | 默认关闭；失败回归只消费调用方提供的同一 `ReadableStream`，不在实验内 `fetch`、不重试第二条连接、不切换 HLS/媒体代理；视频保持原 Direct Play |
 | Rust 播放边界 | 通过 | `cargo test --locked --test web_playback` 验证固定本地字幕轨从 Web item 合同读回；`tests/strm_resolver_playback.rs` 验证远程解析响应为 307 且响应体为空，未携带媒体字节 |
 
-Web 定向证据为 LUX-229、字幕实验和字幕选择共 18 个 Vitest 测试通过；Rust 定向播放测试 1 个通过。现有 Chrome 151
+Web 定向证据为 LUX-229、字幕实验和字幕选择共 18 个 Vitest 测试通过；最终 Web 全量为 Node 88/88、Vitest 401/401，
+TypeScript 检查和生产构建通过；Rust 定向播放测试 1 个通过，Rust all-targets 为 297 个主库测试通过、1 个按约定忽略，
+所有集成目标通过。现有 Chrome 151
 播放器阶段门已验证 Direct/HLS/fallback 的控制台和请求清洁度，但本次没有真实一次性 UA/令牌网盘资源可供安全复测，因此
 没有把合成夹具升级为真实远程 `.strm` 兼容声明。Chrome/Playwright 真实浏览器的通用播放、字幕 overlay 生命周期和请求观察
 结果继续以 LUX-215/LUX-222 记录为准；真实 Safari、Firefox、移动端浏览器，以及远程资源是否暴露 native Matroska 文本轨，
 仍未验证。
+
+`cargo fmt --all -- --check` 通过；在干净的 LUX-229 修订 `1ef52303` 工作树中，`cargo clippy --locked --all-targets
+--all-features -- -D warnings` 通过。当前共享分支后续无关扫描批处理代码另有两处 clippy lint，未纳入本任务修复。
 
 本阶段没有新增字幕专用 302/Redia 接口、远程媒体代理、ffmpeg/ffprobe 读取、PGS/SUP 支持或 ArtPlayer 运行时依赖。Rust
 测试和本机 `arm64` 结果不外推为 NAS/x86_64 性能；发布前仍需项目所有者确认后关闭阶段。
