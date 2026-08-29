@@ -54,6 +54,7 @@ pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 100;
 const DISCOVERY_BATCH_SIZE: usize = 16;
 const FILE_PREPARATION_CONCURRENCY: usize = 8;
 const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
+const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -2728,6 +2729,97 @@ impl ScanJobService {
             .await
     }
 
+    async fn discover_reconciliation_directory_batches(
+        &self,
+        job_id: &str,
+        root: &StoredLibraryRoot,
+        relative_directory: &str,
+        cancellation: &AtomicBool,
+    ) -> Result<Option<usize>, ScannerError> {
+        let relative = Path::new(relative_directory);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ScannerError::InvalidRelativePath(
+                relative_directory.to_owned(),
+            ));
+        }
+        let root_path = Path::new(&root.canonical_path);
+        let directory_path = root_path.join(relative);
+        let mut entries =
+            fs::read_dir(&directory_path)
+                .await
+                .map_err(|source| ScannerError::Io {
+                    path: directory_path.clone(),
+                    source,
+                })?;
+        let mut directories = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
+        let mut media_files = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
+        let mut discovered_media_files = 0_usize;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: directory_path.clone(),
+                source,
+            })?
+        {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let path = entry.path();
+            let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !(file_type.is_dir()
+                || file_type.is_file()
+                    && (is_supported_movie_file(&path) || is_supported_sidecar_file(&path)))
+            {
+                continue;
+            }
+            let relative_path = path
+                .strip_prefix(root_path)
+                .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                .to_str()
+                .ok_or(ScannerError::NonUtf8Path)?
+                .to_owned();
+            if file_type.is_dir() {
+                directories.push(relative_path);
+            } else {
+                media_files.push(relative_path);
+                discovered_media_files = discovered_media_files.saturating_add(1);
+            }
+            if directories.len() >= DISCOVERY_ENTRY_BATCH_SIZE
+                || media_files.len() >= DISCOVERY_ENTRY_BATCH_SIZE
+            {
+                directories.sort_unstable();
+                media_files.sort_unstable();
+                self.database
+                    .append_reconciliation_directory_entries(
+                        job_id,
+                        &root.id,
+                        &directories,
+                        &media_files,
+                    )
+                    .await?;
+                directories.clear();
+                media_files.clear();
+            }
+        }
+        directories.sort_unstable();
+        media_files.sort_unstable();
+        self.database
+            .append_reconciliation_directory_entries(job_id, &root.id, &directories, &media_files)
+            .await?;
+        Ok(Some(discovered_media_files))
+    }
+
     async fn run_reconciliation_discovery_batch(
         &self,
         job: &StoredScanJob,
@@ -2766,12 +2858,18 @@ impl ScanJobService {
                     .await?;
                 continue;
             };
-            match discover_reconciliation_directory(&root, &directory.relative_path, cancellation)
+            match self
+                .discover_reconciliation_directory_batches(
+                    &job.id,
+                    &root,
+                    &directory.relative_path,
+                    cancellation,
+                )
                 .await
             {
-                Ok(Some(discovered)) => {
+                Ok(Some(discovered_count_for_directory)) => {
                     discovered_count = discovered_count.saturating_add(
-                        i64::try_from(discovered.media_files.len()).unwrap_or(i64::MAX),
+                        i64::try_from(discovered_count_for_directory).unwrap_or(i64::MAX),
                     );
                     if !root.is_available {
                         self.database
@@ -2783,8 +2881,8 @@ impl ScanJobService {
                             &job.id,
                             &root.id,
                             &directory.relative_path,
-                            &discovered.directories,
-                            &discovered.media_files,
+                            &[],
+                            &[],
                         )
                         .await?;
                 }
@@ -5676,81 +5774,6 @@ impl FileBatchWalker {
             Ok(Some(files))
         }
     }
-}
-
-#[derive(Debug)]
-struct ReconciliationDirectoryEntries {
-    directories: Vec<String>,
-    media_files: Vec<String>,
-}
-
-async fn discover_reconciliation_directory(
-    root: &StoredLibraryRoot,
-    relative_directory: &str,
-    cancellation: &AtomicBool,
-) -> Result<Option<ReconciliationDirectoryEntries>, ScannerError> {
-    let relative = Path::new(relative_directory);
-    if relative.is_absolute()
-        || relative.components().any(|component| {
-            matches!(
-                component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
-            )
-        })
-    {
-        return Err(ScannerError::InvalidRelativePath(
-            relative_directory.to_owned(),
-        ));
-    }
-    let root_path = Path::new(&root.canonical_path);
-    let directory_path = root_path.join(relative);
-    let mut entries = fs::read_dir(&directory_path)
-        .await
-        .map_err(|source| ScannerError::Io {
-            path: directory_path.clone(),
-            source,
-        })?;
-    let mut discovered = ReconciliationDirectoryEntries {
-        directories: Vec::new(),
-        media_files: Vec::new(),
-    };
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|source| ScannerError::Io {
-            path: directory_path.clone(),
-            source,
-        })?
-    {
-        if cancellation.load(Ordering::Acquire) {
-            return Ok(None);
-        }
-        let path = entry.path();
-        let file_type = entry.file_type().await.map_err(|source| ScannerError::Io {
-            path: path.clone(),
-            source,
-        })?;
-        if !(file_type.is_dir()
-            || file_type.is_file()
-                && (is_supported_movie_file(&path) || is_supported_sidecar_file(&path)))
-        {
-            continue;
-        }
-        let relative_path = path
-            .strip_prefix(root_path)
-            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
-            .to_str()
-            .ok_or(ScannerError::NonUtf8Path)?
-            .to_owned();
-        if file_type.is_dir() {
-            discovered.directories.push(relative_path);
-        } else {
-            discovered.media_files.push(relative_path);
-        }
-    }
-    discovered.directories.sort();
-    discovered.media_files.sort();
-    Ok(Some(discovered))
 }
 
 fn is_supported_movie_file(path: &Path) -> bool {
