@@ -181,6 +181,7 @@ pub(crate) struct NewImportedUserItemState<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredMigrationMediaIdentity {
     pub id: String,
+    pub library_id: String,
     pub item_type: String,
     pub title: String,
     pub production_year: Option<i64>,
@@ -528,7 +529,7 @@ impl Database {
     ) -> Result<Vec<StoredMigrationMediaIdentity>, StorageError> {
         let mut query = self.query(
             "SELECT id, item_type, title, production_year, provider_ids_json,
-                    series_id, season_number, episode_number
+                    series_id, season_number, episode_number, library_id
              FROM media_items
              WHERE removed_at IS NULL AND id > ?
              ORDER BY id LIMIT ?",
@@ -541,6 +542,7 @@ impl Database {
                 rows.into_iter()
                     .map(|row| StoredMigrationMediaIdentity {
                         id: row.get("id"),
+                        library_id: row.get("library_id"),
                         item_type: row.get("item_type"),
                         title: row.get("title"),
                         production_year: row.get("production_year"),
@@ -836,6 +838,97 @@ impl Database {
         .map_err(storage_error)
     }
 
+    pub(crate) async fn merge_imported_user_item_state(
+        &self,
+        state: &NewImportedUserItemState<'_>,
+        merge_policy: &str,
+    ) -> Result<(), StorageError> {
+        let (position_ticks, is_played, is_favorite, play_count, last_played_at) =
+            match merge_policy {
+                "OVERWRITE" => (
+                    "excluded.position_ticks",
+                    "excluded.is_played",
+                    "excluded.is_favorite",
+                    "excluded.play_count",
+                    "excluded.last_played_at",
+                ),
+                "SKIP" => (
+                    "user_item_state.position_ticks",
+                    "user_item_state.is_played",
+                    "user_item_state.is_favorite",
+                    "user_item_state.play_count",
+                    "user_item_state.last_played_at",
+                ),
+                _ => (
+                    "CASE
+                        WHEN excluded.last_played_at IS NOT NULL
+                         AND user_item_state.last_played_at IS NULL
+                            THEN excluded.position_ticks
+                        WHEN excluded.last_played_at IS NOT NULL
+                         AND user_item_state.last_played_at IS NOT NULL
+                         AND excluded.last_played_at > user_item_state.last_played_at
+                            THEN excluded.position_ticks
+                        WHEN (excluded.last_played_at = user_item_state.last_played_at
+                           OR (excluded.last_played_at IS NULL
+                           AND user_item_state.last_played_at IS NULL))
+                            THEN CASE WHEN excluded.position_ticks > user_item_state.position_ticks
+                                      THEN excluded.position_ticks
+                                      ELSE user_item_state.position_ticks END
+                        ELSE user_item_state.position_ticks
+                     END",
+                    "CASE WHEN user_item_state.is_played = 1 OR excluded.is_played = 1
+                          THEN 1 ELSE 0 END",
+                    "CASE WHEN user_item_state.is_favorite = 1 OR excluded.is_favorite = 1
+                          THEN 1 ELSE 0 END",
+                    "CASE WHEN excluded.play_count > user_item_state.play_count
+                          THEN excluded.play_count ELSE user_item_state.play_count END",
+                    "CASE
+                        WHEN user_item_state.last_played_at IS NULL
+                            THEN excluded.last_played_at
+                        WHEN excluded.last_played_at IS NULL
+                            THEN user_item_state.last_played_at
+                        WHEN excluded.last_played_at > user_item_state.last_played_at
+                            THEN excluded.last_played_at
+                        ELSE user_item_state.last_played_at
+                     END",
+                ),
+            };
+        let query = format!(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, position_ticks, is_played, is_favorite,
+                 play_count, last_played_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id, item_id) DO UPDATE SET
+                 position_ticks = {position_ticks},
+                 is_played = {is_played},
+                 is_favorite = {is_favorite},
+                 play_count = {play_count},
+                 last_played_at = {last_played_at},
+                 version = user_item_state.version + CASE
+                     WHEN {position_ticks} != user_item_state.position_ticks
+                       OR {is_played} != user_item_state.is_played
+                       OR {is_favorite} != user_item_state.is_favorite
+                       OR {play_count} != user_item_state.play_count
+                       OR NOT (
+                           ({last_played_at} = user_item_state.last_played_at)
+                           OR ({last_played_at} IS NULL AND user_item_state.last_played_at IS NULL)
+                       )
+                     THEN 1 ELSE 0 END",
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .bind(state.user_id)
+            .bind(state.item_id)
+            .bind(state.position_ticks)
+            .bind(if state.is_played { 1_i64 } else { 0_i64 })
+            .bind(if state.is_favorite { 1_i64 } else { 0_i64 })
+            .bind(state.play_count)
+            .bind(state.last_played_at)
+            .execute(self.pool())
+            .await
+            .map(|_| ())
+            .map_err(storage_error)
+    }
+
     // Reserved for a future EVENT_HISTORY-capable source plugin. ITEM_STATE imports
     // intentionally never synthesize rows in this table.
     #[allow(dead_code)]
@@ -1030,6 +1123,53 @@ mod tests {
             .fetch_one(database.pool())
             .await?;
         assert_eq!(event_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn imported_state_merge_is_atomic_and_preserves_merge_semantics()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, item_id) = insert_test_user_and_item(&database).await?;
+        database
+            .upsert_imported_user_item_state(&NewImportedUserItemState {
+                user_id: &user_id,
+                item_id: &item_id,
+                position_ticks: 120,
+                is_played: true,
+                is_favorite: false,
+                play_count: 3,
+                last_played_at: Some(200),
+            })
+            .await?;
+
+        database.reset_query_count();
+        database
+            .merge_imported_user_item_state(
+                &NewImportedUserItemState {
+                    user_id: &user_id,
+                    item_id: &item_id,
+                    position_ticks: 80,
+                    is_played: false,
+                    is_favorite: true,
+                    play_count: 5,
+                    last_played_at: Some(300),
+                },
+                "MERGE",
+            )
+            .await?;
+        assert_eq!(database.query_count(), 1);
+
+        let state = database
+            .find_user_item_state_for_migration(&user_id, &item_id)
+            .await?
+            .expect("merged state should be stored");
+        assert_eq!(state.position_ticks, 80);
+        assert!(state.is_played);
+        assert!(state.is_favorite);
+        assert_eq!(state.play_count, 5);
+        assert_eq!(state.last_played_at, Some(300));
+        assert_eq!(state.version, 1);
         Ok(())
     }
 

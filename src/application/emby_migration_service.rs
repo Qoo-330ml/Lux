@@ -17,7 +17,7 @@ use crate::{
         EmbyMigrationPluginClient, EmbyMigrationSource, HistoryCapability, MigrationConnectionInfo,
         MigrationInputError, MigrationItem, MigrationItemPage, MigrationLibraryFolder,
         MigrationMergePolicy, MigrationUser, MigrationUserData, MigrationUserStateFilter,
-        StoredItemState, merge_item_state,
+        StoredItemState,
     },
     application::plugin_runtime::PluginRuntimeError,
     application::plugins::PluginServiceError,
@@ -811,9 +811,7 @@ impl EmbyMigrationService {
                             continue;
                         };
                         matched += 1;
-                        if let Some(library_id) =
-                            self.database.find_item_library_id(&lux_item_id).await?
-                        {
+                        if let Some(library_id) = identity_index.library_id(&lux_item_id) {
                             accessible_library_ids.insert(library_id);
                         }
                         if job.dry_run {
@@ -824,33 +822,19 @@ impl EmbyMigrationService {
                             continue;
                         };
                         let incoming = incoming_state(&user_data)?;
-                        let existing = self
-                            .database
-                            .find_user_item_state_for_migration(lux_user_id, &lux_item_id)
-                            .await?
-                            .map(|state| StoredItemState {
-                                position_ticks: state.position_ticks,
-                                is_played: state.is_played,
-                                is_favorite: state.is_favorite,
-                                play_count: state.play_count,
-                                last_played_at: state.last_played_at,
-                            });
-                        let merged = merge_item_state(
-                            existing,
-                            incoming,
-                            migration_merge_policy(&job.merge_policy),
-                        )
-                        .ok_or(EmbyMigrationServiceError::InvalidState)?;
                         self.database
-                            .upsert_imported_user_item_state(&NewImportedUserItemState {
-                                user_id: lux_user_id,
-                                item_id: &lux_item_id,
-                                position_ticks: merged.position_ticks,
-                                is_played: merged.is_played,
-                                is_favorite: merged.is_favorite,
-                                play_count: merged.play_count,
-                                last_played_at: merged.last_played_at,
-                            })
+                            .merge_imported_user_item_state(
+                                &NewImportedUserItemState {
+                                    user_id: lux_user_id,
+                                    item_id: &lux_item_id,
+                                    position_ticks: incoming.position_ticks,
+                                    is_played: incoming.is_played,
+                                    is_favorite: incoming.is_favorite,
+                                    play_count: incoming.play_count,
+                                    last_played_at: incoming.last_played_at,
+                                },
+                                &job.merge_policy,
+                            )
                             .await?;
                         let state_hash = hex_sha256(&user_data)?;
                         self.database
@@ -1586,6 +1570,7 @@ struct MatchOutcome {
 
 struct MigrationMediaIdentityIndex {
     identities: Vec<StoredMigrationMediaIdentity>,
+    by_id: HashMap<String, usize>,
     by_provider: HashMap<(String, String, String), Vec<usize>>,
     by_title: HashMap<(String, String), Vec<usize>>,
 }
@@ -1594,7 +1579,9 @@ impl MigrationMediaIdentityIndex {
     fn new(identities: Vec<StoredMigrationMediaIdentity>) -> Self {
         let mut by_provider = HashMap::new();
         let mut by_title = HashMap::new();
+        let mut by_id = HashMap::new();
         for (index, identity) in identities.iter().enumerate() {
+            by_id.insert(identity.id.clone(), index);
             by_title
                 .entry((identity.item_type.clone(), normalize_title(&identity.title)))
                 .or_insert_with(Vec::new)
@@ -1620,9 +1607,17 @@ impl MigrationMediaIdentityIndex {
         }
         Self {
             identities,
+            by_id,
             by_provider,
             by_title,
         }
+    }
+
+    fn library_id(&self, item_id: &str) -> Option<String> {
+        self.by_id
+            .get(item_id)
+            .and_then(|index| self.identities.get(*index))
+            .map(|identity| identity.library_id.clone())
     }
 }
 
@@ -2107,6 +2102,7 @@ mod tests {
     fn identity(id: &str, provider_ids: &str) -> StoredMigrationMediaIdentity {
         StoredMigrationMediaIdentity {
             id: id.to_owned(),
+            library_id: "library-1".to_owned(),
             item_type: "MOVIE".to_owned(),
             title: "The Film".to_owned(),
             production_year: Some(2024),
@@ -2181,6 +2177,7 @@ mod tests {
         let identities = vec![
             StoredMigrationMediaIdentity {
                 id: "lux-series-1".to_owned(),
+                library_id: "library-1".to_owned(),
                 item_type: "SERIES".to_owned(),
                 title: "西游记".to_owned(),
                 production_year: Some(1986),
@@ -2191,6 +2188,7 @@ mod tests {
             },
             StoredMigrationMediaIdentity {
                 id: "lux-episode-1".to_owned(),
+                library_id: "library-1".to_owned(),
                 item_type: "EPISODE".to_owned(),
                 title: "第十集".to_owned(),
                 production_year: Some(1986),
