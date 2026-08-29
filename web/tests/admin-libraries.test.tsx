@@ -251,10 +251,8 @@ describe("AdminLibrariesPage library cards", () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(rootInput, "/shows");
       rootInput.dispatchEvent(new Event("input", { bubbles: true }));
       rootInput.dispatchEvent(new Event("change", { bubbles: true }));
-      dialog?.querySelector<HTMLButtonElement>("[aria-label='添加新媒体库路径']")?.click();
     });
-    expect(rootInput?.value).toBe("");
-    expect(dialog?.textContent).toContain("/shows");
+    expect(rootInput?.value).toBe("/shows");
     await act(async () => {
       [...(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])]
         .find((button) => button.textContent?.includes("创建媒体库"))
@@ -272,6 +270,30 @@ describe("AdminLibrariesPage library cards", () => {
     expect(addRoot).toHaveBeenNthCalledWith(1, "library-2", "/media");
     expect(addRoot).toHaveBeenNthCalledWith(2, "library-2", "/shows");
     expect(container.querySelector("#new-library-title")).toBeNull();
+  });
+
+  it("keeps only the directory picker beside the new root path input", async () => {
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("新增媒体库"))
+        ?.click();
+    });
+
+    const dialog = container.querySelector('[role="dialog"]');
+    const rootForm = dialog?.querySelector<HTMLDivElement>(".lux-library-root-form");
+    const rootInput = rootForm?.querySelector<HTMLInputElement>("[aria-label='新媒体库根路径']");
+    const browseButton = rootForm?.querySelector<HTMLButtonElement>("[aria-label='浏览服务器目录']");
+
+    expect(rootForm).toBeTruthy();
+    expect(rootInput).toBeTruthy();
+    expect(browseButton).toBeTruthy();
+    expect(rootForm?.querySelector("[aria-label='添加新媒体库路径']")).toBeNull();
+    expect(rootInput?.parentElement).toBe(rootForm);
+    expect(browseButton?.parentElement).toBe(rootForm);
+    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    expect(stylesheet).toContain(".lux-library-root-form { display: grid; grid-template-columns: minmax(0, 1fr) 40px; gap: 8px; margin-top: 14px; }");
   });
 
   it("keeps the create dialog form scrollable when the directory picker is open", async () => {

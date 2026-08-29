@@ -1709,8 +1709,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-library-dialog-icon { display: grid; place-items: center; width: 32px; height: 32px; padding: 0; border: 0; border-radius: 50%; color: var(--lux-muted); background: transparent; }
 .lux-library-dialog-icon:hover:not(:disabled) { color: #fff; background: rgba(255,255,255,.08); }
 .lux-library-dialog-icon:disabled { color: var(--lux-subtle); }
-.lux-library-root-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
-.lux-library-root-form input { flex: 1 1 calc(100% - 48px); min-width: 0; }
+.lux-library-root-form { display: grid; grid-template-columns: minmax(0, 1fr) 40px; gap: 8px; margin-top: 14px; }
+.lux-library-root-form input { min-width: 0; }
 .lux-library-root-form .lux-library-toolbar-button.lux-library-root-browser-button { flex: 0 0 40px; width: 40px; min-height: var(--lux-button-height); padding: 0; }
 .lux-directory-picker { display: grid; gap: 12px; margin-top: 12px; padding: 14px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(255,255,255,.025); }
 .lux-directory-picker-header, .lux-directory-picker-actions, .lux-directory-picker-selected { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
