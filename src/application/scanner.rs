@@ -2993,7 +2993,7 @@ impl ScanJobService {
         let mut new_works_by_root = HashMap::<String, Vec<ReconciliationScanWork>>::new();
         let mut root_has_existing_index = HashMap::<String, bool>::new();
         let mut quick_seen_entry_ids = Vec::<String>::new();
-        let mut refreshed_series = HashSet::new();
+        let mut regular_works = Vec::<ReconciliationRegularWork>::new();
         let mut classification_cache = MixedClassificationCache::default();
         for entry in &batch {
             batch_paths_by_root
@@ -3028,6 +3028,8 @@ impl ScanJobService {
                 continue;
             };
             if !root.is_available {
+                regular_works.retain(|work| work.root.id != root.id);
+                new_works_by_root.remove(&root.id);
                 self.database
                     .update_library_root_availability(&root.id, false)
                     .await?;
@@ -3049,6 +3051,8 @@ impl ScanJobService {
                     .await
                     .is_ok_and(|metadata| metadata.is_dir());
                 if !root_is_available {
+                    regular_works.retain(|work| work.root.id != root.id);
+                    new_works_by_root.remove(&root.id);
                     self.database
                         .update_library_root_availability(&root.id, false)
                         .await?;
@@ -3190,80 +3194,86 @@ impl ScanJobService {
                 .or_default()
                 .push(entry.relative_path.clone());
 
-            let result = match library_kind {
-                "MOVIE" => {
-                    self.scanner
-                        .scan_movie_file(
-                            &job.library_id,
-                            root,
-                            Path::new(&root.canonical_path),
-                            &path,
-                            &job.generation,
-                        )
-                        .await
-                }
-                "SERIES" => {
-                    self.scanner
-                        .scan_episode_file_with_provider_cache(
-                            &job.library_id,
-                            root,
-                            Path::new(&root.canonical_path),
-                            &path,
-                            &job.generation,
-                            Some(&mut refreshed_series),
-                        )
-                        .await
-                }
-                "MIXED" => match classification {
+            regular_works.push(ReconciliationRegularWork {
+                entry: entry.clone(),
+                root: root.clone(),
+                path,
+                classification,
+            });
+        }
+        let mut regular_tasks: JoinSet<ReconciliationRegularTask> = JoinSet::new();
+        let mut regular_results = (0..regular_works.len()).map(|_| None).collect::<Vec<_>>();
+        for (index, work) in regular_works.iter().enumerate() {
+            if cancellation.load(Ordering::Acquire) {
+                regular_tasks.abort_all();
+                return self.cancel_running_job(&job.id).await;
+            }
+            while regular_tasks.len() >= concurrency {
+                collect_reconciliation_regular_task(&mut regular_tasks, &mut regular_results)
+                    .await
+                    .map_err(ScanJobError::from)?;
+            }
+            let scanner = self.scanner.clone();
+            let library_id = job.library_id.clone();
+            let generation = job.generation.clone();
+            let root = work.root.clone();
+            let path = work.path.clone();
+            let classification = work.classification;
+            regular_tasks.spawn(async move {
+                let report = match classification {
                     MixedClassification::Movie => {
-                        self.scanner
+                        scanner
                             .scan_movie_file(
-                                &job.library_id,
-                                root,
+                                &library_id,
+                                &root,
                                 Path::new(&root.canonical_path),
                                 &path,
-                                &job.generation,
+                                &generation,
                             )
-                            .await
+                            .await?
                     }
                     MixedClassification::Episode => {
-                        self.scanner
-                            .scan_episode_file_with_provider_cache(
-                                &job.library_id,
-                                root,
+                        scanner
+                            .scan_episode_file(
+                                &library_id,
+                                &root,
                                 Path::new(&root.canonical_path),
                                 &path,
-                                &job.generation,
-                                Some(&mut refreshed_series),
+                                &generation,
                             )
-                            .await
+                            .await?
                     }
                     MixedClassification::Unresolved => {
-                        self.scanner
+                        scanner
                             .scan_unresolved_file(
-                                &job.library_id,
-                                root,
+                                &library_id,
+                                &root,
                                 Path::new(&root.canonical_path),
                                 &path,
-                                &job.generation,
+                                &generation,
                             )
-                            .await
+                            .await?
                     }
-                },
-                _ => Err(ScannerError::LibraryNotFound),
-            };
-            let report = match result {
-                Ok(report) => report,
-                Err(error) => {
-                    return self
-                        .fail_reconciliation_job(job, error, &completed_entries, next_count)
-                        .await;
-                }
-            };
+                };
+                Ok((index, report))
+            });
+        }
+        while !regular_tasks.is_empty() {
+            collect_reconciliation_regular_task(&mut regular_tasks, &mut regular_results)
+                .await
+                .map_err(ScanJobError::from)?;
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return self.cancel_running_job(&job.id).await;
+        }
+        for (work, report) in regular_works
+            .into_iter()
+            .zip(regular_results.into_iter().flatten())
+        {
             created_items = created_items.saturating_add(report.created_items);
             next_count = next_count.saturating_add(1);
             processed = processed.saturating_add(1);
-            completed_entries.push(entry.clone());
+            completed_entries.push(work.entry);
         }
         let mut prepared_movie_files = HashMap::<String, Vec<NewMovieFile>>::new();
         let mut prepared_episode_files = HashMap::<String, Vec<NewEpisodeFile>>::new();
@@ -4926,6 +4936,7 @@ type MoviePreparationOutput = (
 type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
 type MovieFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
 type ReconciliationFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
+type ReconciliationRegularTask = Result<(usize, ScanReport), ScannerError>;
 
 async fn collect_movie_fingerprint_task(
     tasks: &mut JoinSet<MovieFingerprintTask>,
@@ -4973,6 +4984,31 @@ async fn collect_reconciliation_fingerprint_task(
     };
     if let Some(slot) = results.get_mut(index) {
         *slot = result;
+    }
+    Ok(())
+}
+
+async fn collect_reconciliation_regular_task(
+    tasks: &mut JoinSet<ReconciliationRegularTask>,
+    results: &mut [Option<ScanReport>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-task>"),
+                source: std::io::Error::other("reconciliation regular task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = Some(result);
     }
     Ok(())
 }
@@ -5300,6 +5336,13 @@ enum MixedClassification {
 
 struct ReconciliationScanWork {
     entry: StoredReconciliationScanEntry,
+    path: PathBuf,
+    classification: MixedClassification,
+}
+
+struct ReconciliationRegularWork {
+    entry: StoredReconciliationScanEntry,
+    root: StoredLibraryRoot,
     path: PathBuf,
     classification: MixedClassification,
 }

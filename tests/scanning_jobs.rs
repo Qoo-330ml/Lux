@@ -350,6 +350,51 @@ async fn mixed_reconciliation_batches_known_media_and_keeps_unresolved()
 }
 
 #[tokio::test]
+async fn series_reconciliation_updates_changed_episode_without_duplicate_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let episode = root
+        .join("Example Show")
+        .join("Season 01")
+        .join("Example.Show.S01E01.mkv");
+    if let Some(parent) = episode.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(&episode, b"before").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first.id, 100, None).await?;
+    tokio::fs::write(&episode, b"after with a different size").await?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&second.id, 100, None).await?;
+    let source_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_sources")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(source_count, 1);
+    let missing_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM filesystem_entries WHERE is_missing = 1")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(missing_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelling_after_indexing_completion_does_not_cancel_scan()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

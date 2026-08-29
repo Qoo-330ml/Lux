@@ -709,7 +709,7 @@ pub(crate) struct NewNotificationEvent<'a> {
     pub(crate) payload_json: &'a str,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredLibraryRoot {
     pub(crate) id: String,
     pub(crate) library_id: String,
