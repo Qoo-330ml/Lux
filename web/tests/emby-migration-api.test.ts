@@ -22,7 +22,8 @@ describe("LuxApiClient Emby migration methods", () => {
 
     const client = new LuxApiClient();
     await expect(client.testAdminEmbyMigration()).resolves.toMatchObject({ serverName: "Home Emby" });
-    await expect(client.createAdminEmbyMigration({ dryRun: true, mergePolicy: "MERGE", embyUserIds: ["user-1"] })).resolves.toMatchObject({ job: { id: "job-1" } });
+    const scope = { userProfile: false, libraryAccess: false, itemState: true, itemStateFilters: ["FAVORITE"] as const, personFavorites: false, targetLibraryIds: ["library-a"] };
+    await expect(client.createAdminEmbyMigration({ dryRun: true, mergePolicy: "MERGE", embyUserIds: ["user-1"], scope })).resolves.toMatchObject({ job: { id: "job-1" } });
     await client.adminEmbyMigrationUsers("job-1", 2);
     await client.adminEmbyMigrationPersonFavorites("job-1", 3);
 
@@ -31,7 +32,7 @@ describe("LuxApiClient Emby migration methods", () => {
     expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual({});
     expect(calls[1]?.[0]).toBe("/api/v1/admin/emby-migration");
     expect((calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
-    expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({ dryRun: true, mergePolicy: "MERGE", embyUserIds: ["user-1"] });
+    expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({ dryRun: true, mergePolicy: "MERGE", embyUserIds: ["user-1"], scope });
     expect(calls[2]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/users?page=2&pageSize=50");
     expect(calls[3]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/person-favorites?page=3&pageSize=50");
   });
@@ -47,6 +48,19 @@ describe("LuxApiClient Emby migration methods", () => {
     });
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "/api/v1/admin/emby-migration/source-users?page=2&pageSize=100",
+    );
+  });
+
+  it("forwards a bounded source-user search without changing legacy calls", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ users: [], total: 0, page: 1, pageSize: 100 }), { status: 200 }),
+    );
+    const client = new LuxApiClient();
+
+    await client.adminEmbyMigrationSourceUsers(1, " Alice Smith ");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/emby-migration/source-users?page=1&pageSize=100&search=Alice+Smith",
     );
   });
 });

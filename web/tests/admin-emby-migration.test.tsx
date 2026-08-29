@@ -7,7 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { EmbyMigrationPluginConfig } from "../src/features/admin/EmbyMigrationPluginConfig";
 import { api } from "../src/lib/api/client";
-import type { AdminPlugin } from "../src/lib/api/types";
+import type { AdminLibrary, AdminPlugin } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -46,6 +46,7 @@ describe("EmbyMigrationPluginConfig", () => {
         phase: "TESTING",
         dryRun: false,
         mergePolicy: "MERGE",
+        scope: { userProfile: false, libraryAccess: false, itemState: true, itemStateFilters: ["FAVORITE"], personFavorites: false, targetLibraryIds: ["library-a"] },
         historyCapability: "ITEM_STATE",
         processedCount: 0,
         totalCount: 0,
@@ -56,6 +57,16 @@ describe("EmbyMigrationPluginConfig", () => {
         error: null,
     } as const;
     const createJob = vi.spyOn(api, "createAdminEmbyMigration").mockResolvedValue({ job: migrationJob });
+    const targetLibraries: AdminLibrary[] = [{
+      id: "library-a",
+      name: "电影库",
+      kind: "MOVIE",
+      isEnabled: true,
+      realtimeWatchEnabled: false,
+      realtimeMetadataAutoMatchEnabled: false,
+      roots: [],
+    }];
+    const adminLibraries = vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: targetLibraries });
     vi.spyOn(api, "adminEmbyMigration").mockResolvedValue({ job: migrationJob });
     vi.spyOn(api, "adminEmbyMigrationUsers").mockResolvedValue({ users: [], page: 1, pageSize: 50 });
     vi.spyOn(api, "adminEmbyMigrationMatches").mockResolvedValue({
@@ -160,11 +171,24 @@ describe("EmbyMigrationPluginConfig", () => {
     await act(async () => {
       await vi.waitFor(() => expect(sourceUsers).toHaveBeenCalledWith(1));
     });
+    expect(adminLibraries).not.toHaveBeenCalled();
     expect(api.adminEmbyMigrations).not.toHaveBeenCalled();
     expect(container.textContent).toContain("Alice");
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="下一步：确认迁移"]')?.disabled).toBe(true);
     act(() => {
       container.querySelector<HTMLInputElement>('input[aria-label="选择 Emby 用户 Alice"]')?.click();
+    });
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="下一步：确认迁移"]')?.disabled).toBe(true);
+    act(() => {
+      container.querySelector<HTMLInputElement>('input[aria-label="选择迁移媒体状态收藏"]')?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(adminLibraries).toHaveBeenCalledWith());
+      await vi.waitFor(() => expect(container.querySelector('input[aria-label="选择目标 Lux 媒体库 电影库"]')).not.toBeNull());
+    });
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="下一步：确认迁移"]')?.disabled).toBe(true);
+    act(() => {
+      container.querySelector<HTMLInputElement>('input[aria-label="选择目标 Lux 媒体库 电影库"]')?.click();
     });
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="下一步：确认迁移"]')?.disabled).toBe(false);
 
@@ -187,9 +211,16 @@ describe("EmbyMigrationPluginConfig", () => {
     expect(container.textContent).toContain("合并");
     expect(container.textContent).toContain("覆盖");
     expect(container.textContent).toContain("跳过");
+    expect(container.textContent).toContain("媒体状态");
+    expect(container.textContent).toContain("电影库");
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="开始 Emby 迁移"]')?.click());
     await act(async () => {
-      await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({ dryRun: false, mergePolicy: "MERGE", embyUserIds: ["user-1"] }));
+      await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({
+        dryRun: false,
+        mergePolicy: "MERGE",
+        embyUserIds: ["user-1"],
+        scope: { userProfile: false, libraryAccess: false, itemState: true, itemStateFilters: ["FAVORITE"], personFavorites: false, targetLibraryIds: ["library-a"] },
+      }));
     });
     expect(container.textContent).toContain("迁移任务已创建");
     await act(async () => {
@@ -220,5 +251,38 @@ describe("EmbyMigrationPluginConfig", () => {
     await act(async () => {
       await vi.waitFor(() => expect(api.adminEmbyMigrationPersonFavorites).toHaveBeenCalledWith("job-1", 1));
     });
+
+    // Changing the source connection must invalidate the old migration scope;
+    // otherwise a later submit could silently migrate stale users or libraries.
+    act(() => {
+      Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.trim() === "上一步")
+        ?.click();
+    });
+    expect(container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]')?.dataset.step).toBe("2");
+    act(() => {
+      Array.from(container.querySelectorAll<HTMLButtonElement>("button"))
+        .find((button) => button.textContent?.trim() === "上一步")
+        ?.click();
+    });
+    const changedBaseUrl = container.querySelector<HTMLInputElement>("#emby-plugin-base-url");
+    expect(changedBaseUrl).not.toBeNull();
+    act(() => {
+      if (changedBaseUrl) {
+        const valueSetter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set;
+        valueSetter?.call(changedBaseUrl, "http://new-emby.local:8096");
+        changedBaseUrl.dispatchEvent(new Event("input", { bubbles: true }));
+        changedBaseUrl.dispatchEvent(new Event("change", { bubbles: true }));
+      }
+    });
+    expect(container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]')?.dataset.step).toBe("1");
+    act(() => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="保存并测试 Emby 连接"]')?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]')?.dataset.step).toBe("2"));
+    });
+    expect(container.querySelector<HTMLInputElement>('input[aria-label="选择 Emby 用户 Alice"]')?.checked).toBe(false);
+    expect(container.querySelector<HTMLInputElement>('input[aria-label="选择迁移媒体状态收藏"]')?.checked).toBe(false);
   });
 });

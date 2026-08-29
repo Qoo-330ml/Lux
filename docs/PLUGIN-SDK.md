@@ -232,10 +232,12 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   `historyCapability`。较新的插件可以额外返回可选布尔值 `supportsFilteredReads: true`，表示插件能够在发起
   Emby 请求前执行宿主传入的用户、来源库和字段投影；缺省或 `false` 表示不支持。基础地址不得含凭据、查询参数或片段；
   API key 不得出现在结果、日志或错误消息中。
-- `migration.list_users`：分页边界由宿主提供，插件调用 Emby 用户接口并返回用户名、显示名、启用状态、管理员标记、
-  远程访问/内容下载策略、媒体库文件夹策略和头像标签；同时返回 Emby 虚拟媒体库文件夹的稳定 ID、名称和位置，
-  用于将受限用户的库权限映射到 Lux；不返回 Emby token、密码或完整原始响应。支持过滤的插件可接收可选 `userIds`
-  数组，只读取这些用户；未提供时保持列出全部用户的兼容行为。
+- `migration.list_users`：宿主可传入有界的 `startIndex`、`limit` 和可选 `search`，插件应在 Emby 用户查询阶段执行
+  分页和名称筛选，并在结果中返回可选的 `startIndex`、`totalRecordCount`、`nextStartIndex` 元数据。插件调用 Emby 用户
+  接口并返回用户名、显示名、启用状态、管理员标记、远程访问/内容下载策略、媒体库文件夹策略和头像标签；同时返回
+  Emby 虚拟媒体库文件夹的稳定 ID、名称和位置，用于将受限用户的库权限映射到 Lux；不返回 Emby token、密码或完整
+  原始响应。支持过滤的插件可接收可选 `userIds` 数组，只读取这些用户；未提供时保持列出全部用户的兼容行为。旧插件
+  忽略分页字段并返回完整列表时，宿主会在本地执行搜索和切页。
 - `migration.list_items`：接收一个 Emby 用户 ID 和有界分页参数，返回 Movie、Series、Season、Episode 的稳定 ID、
   ProviderIds、层级字段和可选的用户状态；未知条目类型不得被伪造成支持类型。
 - `migration.user_state`：接收一个 Emby 用户 ID、有界分页参数和必填的 `stateFilter`；筛选值为

@@ -426,6 +426,7 @@ export type AdminEmbyMigrationConnection = {
   version?: string | null;
   serverId?: string | null;
   historyCapability: "ITEM_STATE" | "EVENT_HISTORY" | string;
+  supportsFilteredReads?: boolean;
 };
 
 export type AdminEmbyMigrationSourceUser = {
@@ -442,6 +443,17 @@ export type AdminEmbyMigrationSourceUserPage = {
   pageSize?: number;
 };
 
+export type AdminEmbyMigrationScope = {
+  userProfile: boolean;
+  libraryAccess: boolean;
+  itemState: boolean;
+  /** Omitted by jobs created before media-state selection was introduced. */
+  itemStateFilters?: Array<"PLAYED" | "FAVORITE" | "RESUMABLE">;
+  personFavorites: boolean;
+  /** Omitted by jobs created before target-library selection was introduced. */
+  targetLibraryIds?: string[];
+};
+
 export type AdminEmbyMigrationJob = {
   id: string;
   sourceLabel: string;
@@ -450,6 +462,7 @@ export type AdminEmbyMigrationJob = {
   phase: "TESTING" | "USERS" | "ITEMS" | "IMPORTING" | "FINALIZING" | string;
   dryRun: boolean;
   mergePolicy: "MERGE" | "OVERWRITE" | "SKIP" | string;
+  scope: AdminEmbyMigrationScope;
   historyCapability: "ITEM_STATE" | "EVENT_HISTORY" | string;
   processedCount: number;
   totalCount: number;

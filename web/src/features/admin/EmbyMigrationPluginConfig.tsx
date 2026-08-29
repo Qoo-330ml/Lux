@@ -3,14 +3,23 @@ import { AlertTriangle, CheckCircle2, CloudDownload, LoaderCircle, RefreshCw, Sa
 import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminPlugin, AdminEmbyMigrationJob, AdminEmbyMigrationSourceUser } from "../../lib/api/types";
+import type { AdminPlugin, AdminEmbyMigrationJob, AdminEmbyMigrationScope, AdminEmbyMigrationSourceUser } from "../../lib/api/types";
 import { EmbyMigrationReports, type ReportTab, useMigrationReport } from "./EmbyMigrationReports";
 
 type MergePolicy = "MERGE" | "OVERWRITE" | "SKIP";
 type MigrationStep = 1 | 2 | 3;
 type ConnectionInfo = Awaited<ReturnType<typeof api.testAdminEmbyMigration>>;
+type ItemStateFilter = "PLAYED" | "FAVORITE" | "RESUMABLE";
 
 const reportTabs: ReportTab[] = ["users", "matches", "imports", "personFavorites"];
+const defaultMigrationScope: AdminEmbyMigrationScope = {
+  userProfile: false,
+  libraryAccess: false,
+  itemState: false,
+  itemStateFilters: [],
+  personFavorites: false,
+  targetLibraryIds: [],
+};
 const stepDefinitions = [
   { number: 1, title: "连接 Emby" },
   { number: 2, title: "选择迁移范围" },
@@ -29,6 +38,7 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
   const [currentStep, setCurrentStep] = useState<MigrationStep>(1);
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [mergePolicy, setMergePolicy] = useState<MergePolicy>("MERGE");
+  const [scope, setScope] = useState<AdminEmbyMigrationScope>(defaultMigrationScope);
   const connectionRef = useRef<ConnectionInfo | null>(null);
   const baseUrlField = plugin.configFields.find((field) => field.key === "baseUrl");
   const apiKeyField = plugin.configFields.find((field) => field.key === "apiKey");
@@ -41,6 +51,8 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
   const markConnectionDirty = () => {
     clearConnection();
     setSelectedUserIds([]);
+    setScope(defaultMigrationScope);
+    setMergePolicy("MERGE");
     setConnectionDirty(true);
     setCurrentStep(1);
   };
@@ -118,7 +130,7 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
             {connection ? <ConnectionResult connection={connection} /> : null}
           </section>
         ) : (
-          <MigrationWorkspace connection={connection} currentStep={currentStep} onStepChange={setCurrentStep} selectedUserIds={selectedUserIds} onSelectedUserIdsChange={setSelectedUserIds} mergePolicy={mergePolicy} onMergePolicyChange={setMergePolicy} />
+          <MigrationWorkspace connection={connection} currentStep={currentStep} onStepChange={setCurrentStep} selectedUserIds={selectedUserIds} onSelectedUserIdsChange={setSelectedUserIds} mergePolicy={mergePolicy} onMergePolicyChange={setMergePolicy} scope={scope} onScopeChange={setScope} />
         )}
       </div>
     </div>
@@ -141,17 +153,21 @@ function MigrationStepper({ currentStep }: { currentStep: MigrationStep }) {
   );
 }
 
-function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUserIds, onSelectedUserIdsChange, mergePolicy, onMergePolicyChange }: { connection: ConnectionInfo | null; currentStep: MigrationStep; onStepChange: (step: MigrationStep) => void; selectedUserIds: string[]; onSelectedUserIdsChange: (ids: string[]) => void; mergePolicy: MergePolicy; onMergePolicyChange: (policy: MergePolicy) => void }) {
+function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUserIds, onSelectedUserIdsChange, mergePolicy, onMergePolicyChange, scope, onScopeChange }: { connection: ConnectionInfo | null; currentStep: MigrationStep; onStepChange: (step: MigrationStep) => void; selectedUserIds: string[]; onSelectedUserIdsChange: (ids: string[]) => void; mergePolicy: MergePolicy; onMergePolicyChange: (policy: MergePolicy) => void; scope: AdminEmbyMigrationScope; onScopeChange: (scope: AdminEmbyMigrationScope) => void }) {
   const queryClient = useQueryClient();
   const [sourceUserPage, setSourceUserPage] = useState(1);
+  const [sourceUserSearchInput, setSourceUserSearchInput] = useState("");
+  const [sourceUserSearch, setSourceUserSearch] = useState("");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [tab, setTab] = useState<ReportTab>("users");
   const [reportPage, setReportPage] = useState<Record<ReportTab, number>>(() => initialReportPages());
   const [historyOpen, setHistoryOpen] = useState(false);
 
   const sourceUsers = useQuery({
-    queryKey: queryKeys.adminEmbyMigrationSourceUsers(sourceUserPage),
-    queryFn: () => api.adminEmbyMigrationSourceUsers(sourceUserPage),
+    queryKey: queryKeys.adminEmbyMigrationSourceUsers(sourceUserPage, sourceUserSearch),
+    queryFn: () => sourceUserSearch.trim()
+      ? api.adminEmbyMigrationSourceUsers(sourceUserPage, sourceUserSearch)
+      : api.adminEmbyMigrationSourceUsers(sourceUserPage),
     enabled: Boolean(connection && currentStep === 2),
     staleTime: 5 * 60_000,
     retry: false,
@@ -161,6 +177,18 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
   const sourceUserTotal = sourceUsers.data?.total ?? 0;
   const sourceUserPages = Math.max(1, Math.ceil(sourceUserTotal / sourceUserPageSize));
   const allVisibleUsersSelected = users.length > 0 && users.every((user) => selectedUserIds.includes(user.id));
+  const targetLibraries = useQuery({
+    queryKey: queryKeys.adminLibraries,
+    queryFn: () => api.adminLibraries(),
+    // A target-library lookup is only useful for the two scopes that write
+    // library-bound data.  Keep the default (no scope selected) genuinely
+    // read-free so choosing only a profile or person favorites does not
+    // trigger an unrelated Lux library request.
+    enabled: Boolean(connection && currentStep === 2 && (scope.libraryAccess || scope.itemState)),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  const enabledTargetLibraries = targetLibraries.data?.libraries?.filter((library) => library.isEnabled) ?? [];
 
   const jobs = useQuery({
     queryKey: queryKeys.adminEmbyMigrations(),
@@ -177,18 +205,38 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
   });
   const job = detail.data?.job ?? selectedFromList;
   const active = isActiveJob(job);
-  const canCreate = Boolean(connection && selectedUserIds.length > 0 && !active);
+  const selectedItemStateFilters = scope.itemStateFilters ?? [];
+  const hasSelectedMediaState = scope.itemState && selectedItemStateFilters.length > 0;
+  const hasSelectedScope = scope.userProfile || scope.libraryAccess || hasSelectedMediaState || scope.personFavorites;
+  const requiresTargetLibraries = scope.libraryAccess || hasSelectedMediaState;
+  const selectedTargetLibraryIds = scope.targetLibraryIds ?? [];
+  const hasSelectedTargetLibraries = !requiresTargetLibraries || selectedTargetLibraryIds.length > 0;
+  const targetLibrariesReady = !requiresTargetLibraries || targetLibraries.isSuccess;
+  const canAdvance = Boolean(connection && selectedUserIds.length > 0 && hasSelectedScope && hasSelectedTargetLibraries && targetLibrariesReady);
+  const canCreate = canAdvance && !active;
 
   useEffect(() => {
     setSourceUserPage(1);
+    setSourceUserSearchInput("");
+    setSourceUserSearch("");
     setSelectedJobId(null);
   }, [connection]);
+
+  useEffect(() => {
+    setSourceUserPage(1);
+  }, [sourceUserSearch]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => setSourceUserSearch(sourceUserSearchInput.trim()), 250);
+    return () => window.clearTimeout(timeout);
+  }, [sourceUserSearchInput]);
 
   const createJob = useMutation({
     mutationFn: (dryRun: boolean) => api.createAdminEmbyMigration({
       dryRun,
       mergePolicy,
       embyUserIds: selectedUserIds,
+      scope,
     }),
     onSuccess: ({ job: created }) => {
       selectJob(created.id);
@@ -221,6 +269,38 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
       : [...selectedUserIds, user.id]);
   };
 
+  const toggleScopeCategory = (
+    category: "userProfile" | "libraryAccess" | "personFavorites",
+    checked: boolean,
+  ) => {
+    const nextScope = { ...scope, [category]: checked };
+    if (!nextScope.libraryAccess && !hasSelectedMediaState) nextScope.targetLibraryIds = [];
+    onScopeChange(nextScope);
+  };
+
+  const toggleItemStateFilter = (filter: ItemStateFilter, checked: boolean) => {
+    const nextFilters = checked
+      ? [...new Set([...selectedItemStateFilters, filter])]
+      : selectedItemStateFilters.filter((candidate) => candidate !== filter);
+    const nextScope = {
+      ...scope,
+      itemState: nextFilters.length > 0,
+      itemStateFilters: nextFilters,
+    };
+    if (!nextScope.libraryAccess && !nextScope.itemState) nextScope.targetLibraryIds = [];
+    onScopeChange(nextScope);
+  };
+
+  const toggleTargetLibrary = (libraryId: string) => {
+    const currentTargetLibraryIds = scope.targetLibraryIds ?? [];
+    onScopeChange({
+      ...scope,
+      targetLibraryIds: currentTargetLibraryIds.includes(libraryId)
+        ? currentTargetLibraryIds.filter((id) => id !== libraryId)
+        : [...currentTargetLibraryIds, libraryId],
+    });
+  };
+
   return (
     <>
       {currentStep === 2 ? (
@@ -230,6 +310,7 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
             <>
               <div className="lux-emby-user-selection-toolbar">
                 <span>已选 {selectedUserIds.length} / {sourceUserTotal} 位用户</span>
+                <label className="lux-emby-user-search"><span>搜索用户</span><input type="search" value={sourceUserSearchInput} onChange={(event) => setSourceUserSearchInput(event.target.value)} placeholder="按名称筛选" /></label>
                 <div>
                   <button className="lux-button lux-button-secondary" type="button" disabled={users.length === 0 || allVisibleUsersSelected} onClick={() => onSelectedUserIdsChange(Array.from(new Set([...selectedUserIds, ...users.map((user) => user.id)])))}>全选当前页</button>
                   <button className="lux-button lux-button-secondary" type="button" disabled={selectedUserIds.length === 0} onClick={() => onSelectedUserIdsChange([])}>清空</button>
@@ -247,21 +328,51 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
                 <span>第 {sourceUserPage} / {sourceUserPages} 页</span>
                 <button className="lux-button lux-button-secondary" type="button" disabled={sourceUserPage >= sourceUserPages} onClick={() => setSourceUserPage((page) => page + 1)}>下一页</button>
               </div> : null}
-              <div className="lux-emby-migration-scope-note"><CheckCircle2 size={15} /><span>将迁移用户资料、媒体库权限、已看状态、播放进度、播放次数、最近播放时间、收藏和人物收藏。</span></div>
+              <fieldset className="lux-emby-migration-scope">
+                <legend>迁移内容</legend>
+                <div className="lux-emby-scope-options">
+                  <MigrationScopeOption checked={scope.userProfile} onChange={(checked) => toggleScopeCategory("userProfile", checked)} title="用户资料" detail="账号状态、远程访问和下载权限" />
+                  <MigrationScopeOption checked={scope.libraryAccess} onChange={(checked) => toggleScopeCategory("libraryAccess", checked)} title="媒体库权限" detail="按来源媒体库映射 Lux 访问权限" />
+                  <MigrationScopeOption checked={scope.personFavorites} onChange={(checked) => toggleScopeCategory("personFavorites", checked)} title="人物收藏" detail="迁移 Emby 中收藏的演员和人物" />
+                </div>
+                <div className="lux-emby-state-fields" role="group" aria-labelledby="emby-migration-media-state-heading">
+                  <div><strong id="emby-migration-media-state-heading">媒体状态</strong><small>只勾选需要迁移的字段；未勾选字段不会请求、不会写入。</small></div>
+                  <div className="lux-emby-scope-options">
+                    <MigrationScopeOption checked={selectedItemStateFilters.includes("PLAYED")} onChange={(checked) => toggleItemStateFilter("PLAYED", checked)} title="媒体状态已看与播放次数" detail="已看、播放次数和最近播放时间" />
+                    <MigrationScopeOption checked={selectedItemStateFilters.includes("FAVORITE")} onChange={(checked) => toggleItemStateFilter("FAVORITE", checked)} title="媒体状态收藏" detail="电影、剧集等媒体收藏" />
+                    <MigrationScopeOption checked={selectedItemStateFilters.includes("RESUMABLE")} onChange={(checked) => toggleItemStateFilter("RESUMABLE", checked)} title="继续观看进度" detail="只迁移可继续观看的播放位置" />
+                  </div>
+                </div>
+                {!hasSelectedScope ? <p className="lux-emby-scope-warning" role="alert">至少选择一项迁移内容</p> : null}
+              </fieldset>
+              {requiresTargetLibraries ? <fieldset className="lux-emby-migration-scope">
+                <legend>目标 Lux 媒体库</legend>
+                <p className="lux-emby-target-library-hint">只会写入勾选媒体库中的状态和访问权限；未勾选的库不会迁移。</p>
+                {targetLibraries.isPending ? <LoadingState label="正在读取 Lux 媒体库…" /> : targetLibraries.error ? <InlineError message={targetLibraries.error.message} /> : enabledTargetLibraries.length ? <div className="lux-emby-scope-options">
+                  {enabledTargetLibraries.map((library) => <label key={library.id} className={`lux-emby-scope-option${selectedTargetLibraryIds.includes(library.id) ? " is-selected" : ""}`}>
+                    <input type="checkbox" aria-label={`选择目标 Lux 媒体库 ${library.name}`} checked={selectedTargetLibraryIds.includes(library.id)} onChange={() => toggleTargetLibrary(library.id)} />
+                    <span><strong>{library.name}</strong><small>{library.kind}</small></span>
+                  </label>)}
+                </div> : <EmptyState label="没有可用的 Lux 媒体库" detail="请先启用至少一个媒体库，再迁移媒体状态或库权限。" />}
+                {!targetLibraries.isPending && !targetLibraries.error && selectedTargetLibraryIds.length === 0 ? <p className="lux-emby-scope-warning" role="alert">请选择至少一个目标 Lux 媒体库</p> : null}
+              </fieldset> : null}
+              <div className="lux-emby-migration-scope-note"><CheckCircle2 size={15} /><span>只读取勾选用户和迁移类别；未选择的类别不会向 Emby 发起请求。</span></div>
             </>
           )}
           <div className="lux-emby-wizard-actions">
             <button className="lux-button lux-button-secondary" type="button" onClick={() => onStepChange(1)}>上一步</button>
-            <button className="lux-button lux-button-primary" type="button" aria-label="下一步：确认迁移" disabled={selectedUserIds.length === 0} onClick={() => onStepChange(3)}>下一步：确认迁移</button>
+            <button className="lux-button lux-button-primary" type="button" aria-label="下一步：确认迁移" disabled={!canAdvance} onClick={() => onStepChange(3)}>下一步：确认迁移</button>
           </div>
         </section>
       ) : (
         <section aria-labelledby="emby-migration-action-heading">
-          <StepHeading number="3" headingId="emby-migration-action-heading" title="确认并开始" description="确认迁移范围和已有状态处理策略，然后启动后台任务。" icon={<CloudDownload size={18} />} />
+          <StepHeading number="3" headingId="emby-migration-action-heading" title="确认并开始" description="核对第二步已选择的范围和已有状态处理策略，然后启动后台任务。" icon={<CloudDownload size={18} />} />
           <div className="lux-emby-confirm-summary" aria-label="迁移摘要">
             <div><small>来源</small><strong>{connection?.serverName || "Emby 服务器"}</strong><span>{[connection?.productName, connection?.version].filter(Boolean).join(" · ") || "已验证连接"}</span></div>
             <div><small>迁移用户</small><strong>{selectedUserIds.length} 位</strong><span>不会迁移未勾选的用户</span></div>
             <div><small>历史能力</small><strong>{connection?.historyCapability === "EVENT_HISTORY" ? "完整历史" : "条目状态"}</strong><span>{connection?.historyCapability === "EVENT_HISTORY" ? "可导入原始播放时间线" : "不生成虚假的历史时间线"}</span></div>
+            <div><small>迁移内容</small><strong>{selectedScopeCount(scope)} 项</strong><span>{selectedScopeLabels(scope).join("、") || "未选择"}</span></div>
+            {requiresTargetLibraries ? <div><small>目标媒体库</small><strong>{selectedTargetLibraryIds.length} 个</strong><span>{enabledTargetLibraries.filter((library) => selectedTargetLibraryIds.includes(library.id)).map((library) => library.name).join("、")}</span></div> : null}
           </div>
           <fieldset className="lux-emby-merge-policy">
             <legend>已有播放状态</legend>
@@ -272,14 +383,14 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
             </div>
           </fieldset>
           <div className="lux-emby-migration-action">
-            <div><strong>{selectedUserIds.length > 0 ? `准备迁移 ${selectedUserIds.length} 位用户` : "请返回第二步选择用户"}</strong><span>迁移会在后台运行，可以在下方查看进度和报告。</span></div>
+            <div><strong>{selectedUserIds.length > 0 ? `准备迁移 ${selectedUserIds.length} 位用户` : "请返回第二步选择用户"}</strong><span>迁移会在后台运行；媒体数据只会写入已选目标库。</span></div>
             <div className="lux-emby-migration-action-buttons">
-              <button className="lux-button lux-button-secondary" type="button" aria-label="生成 Emby 迁移预览" disabled={!canCreate || createJob.isPending} onClick={() => createJob.mutate(true)}><RefreshCw size={15} /> 先生成预览</button>
+              <button className="lux-button lux-button-secondary" type="button" aria-label="生成 Emby 完整诊断预览" title="完整诊断会读取所选来源数据，但不会写入 Lux 媒体状态" disabled={!canCreate || createJob.isPending} onClick={() => createJob.mutate(true)}><RefreshCw size={15} /> 完整诊断预览</button>
               <button className="lux-button lux-button-primary" type="button" aria-label="开始 Emby 迁移" disabled={!canCreate || createJob.isPending} onClick={() => createJob.mutate(false)}><CloudDownload size={15} /> {createJob.isPending ? "创建中…" : active ? "迁移进行中" : "开始迁移"}</button>
             </div>
           </div>
           {createJob.error ? <InlineError message={createJob.error.message} /> : null}
-          {createJob.data ? <p className="lux-emby-migration-success" role="status"><CheckCircle2 size={15} /> {createJob.data.job.dryRun ? "预览任务已创建，可在下方查看报告" : "迁移任务已创建"}</p> : null}
+          {createJob.data ? <p className="lux-emby-migration-success" role="status"><CheckCircle2 size={15} /> {createJob.data.job.dryRun ? "完整诊断任务已创建，可在下方查看报告" : "迁移任务已创建"}</p> : null}
           <div className="lux-emby-wizard-actions">
             <button className="lux-button lux-button-secondary" type="button" onClick={() => onStepChange(2)}>上一步</button>
           </div>
@@ -298,6 +409,29 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
       {job ? <MigrationDetails key={job.id} job={job} tab={tab} page={reportPage[tab]} onTabChange={(nextTab) => { setTab(nextTab); setReportPage((current) => ({ ...current, [nextTab]: 1 })); }} onPageChange={(page) => setReportPage((current) => ({ ...current, [tab]: page }))} onCancel={() => cancelJob.mutate(job.id)} onRetry={() => retryJob.mutate(job.id)} actionPending={cancelJob.isPending || retryJob.isPending} /> : null}
     </>
   );
+}
+
+function MigrationScopeOption({ checked, onChange, title, detail }: { checked: boolean; onChange: (checked: boolean) => void; title: string; detail: string }) {
+  return <label className={`lux-emby-scope-option${checked ? " is-selected" : ""}`}><input type="checkbox" aria-label={`选择迁移${title}`} checked={checked} onChange={(event) => onChange(event.target.checked)} /><span><strong>{title}</strong><small>{detail}</small></span></label>;
+}
+
+function selectedScopeLabels(scope: AdminEmbyMigrationScope) {
+  return [
+    scope.userProfile ? "用户资料" : null,
+    scope.libraryAccess ? "媒体库权限" : null,
+    scope.itemState && scope.itemStateFilters?.length
+      ? `媒体状态：${scope.itemStateFilters.map(itemStateFilterLabel).join("、")}`
+      : scope.itemState ? "媒体状态（全部）" : null,
+    scope.personFavorites ? "人物收藏" : null,
+  ].filter((label): label is string => label !== null);
+}
+
+function itemStateFilterLabel(filter: ItemStateFilter) {
+  return ({ PLAYED: "已看与播放次数", FAVORITE: "收藏", RESUMABLE: "继续观看进度" } as const)[filter];
+}
+
+function selectedScopeCount(scope: AdminEmbyMigrationScope) {
+  return selectedScopeLabels(scope).length;
 }
 
 function MergePolicyOption({ value, selected, onChange, title, detail }: { value: MergePolicy; selected: MergePolicy; onChange: (value: MergePolicy) => void; title: string; detail: string }) {

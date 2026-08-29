@@ -841,6 +841,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-emby-connection-result small { color: currentColor; font-size: .67rem; text-align: right; }
 .lux-emby-user-selection-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; color: var(--lux-muted); font-size: .7rem; }
 .lux-emby-user-selection-toolbar > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.lux-emby-user-search { display: flex; align-items: center; gap: 7px; color: var(--lux-subtle); white-space: nowrap; }
+.lux-emby-user-search input { width: min(220px, 35vw); min-height: 30px; padding: 5px 9px; border: 1px solid var(--lux-line-soft); border-radius: 7px; color: var(--lux-text); background: rgba(255,255,255,.04); }
 .lux-emby-user-selection { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; }
 .lux-emby-user-option { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 10px 11px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); background: rgba(255,255,255,.025); cursor: pointer; }
 .lux-emby-user-option:has(input:checked) { border-color: color-mix(in srgb, var(--lux-accent) 55%, var(--lux-line-soft)); background: color-mix(in srgb, var(--lux-accent) 8%, transparent); }
@@ -850,7 +852,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-emby-user-option small { color: var(--lux-subtle); font-size: .65rem; }
 .lux-emby-migration-scope-note { display: flex; align-items: flex-start; gap: 8px; margin-top: 14px; color: var(--lux-muted); font-size: .69rem; line-height: 1.5; }
 .lux-emby-migration-scope-note svg { flex: 0 0 auto; margin-top: 1px; color: #9bdcb3; }
-.lux-emby-confirm-summary { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; margin-bottom: 17px; }
+.lux-emby-confirm-summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 17px; }
 .lux-emby-confirm-summary > div { display: grid; gap: 4px; min-width: 0; padding: 11px 12px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.025); }
 .lux-emby-confirm-summary small { color: var(--lux-subtle); font-size: .63rem; }
 .lux-emby-confirm-summary strong { overflow: hidden; color: #fff; font-size: .76rem; text-overflow: ellipsis; white-space: nowrap; }
@@ -864,6 +866,21 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-emby-merge-option span { display: grid; gap: 3px; min-width: 0; }
 .lux-emby-merge-option strong { color: #fff; font-size: .73rem; }
 .lux-emby-merge-option small { color: var(--lux-subtle); font-size: .64rem; line-height: 1.4; }
+.lux-emby-migration-scope { min-width: 0; margin: 0 0 16px; padding: 0; border: 0; }
+.lux-emby-migration-scope legend { margin-bottom: 8px; color: var(--lux-muted); font-size: .73rem; }
+.lux-emby-scope-options { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.lux-emby-scope-option { display: flex; align-items: flex-start; gap: 9px; min-width: 0; padding: 10px 11px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); background: rgba(255,255,255,.025); cursor: pointer; }
+.lux-emby-scope-option:has(input:checked), .lux-emby-scope-option.is-selected { border-color: color-mix(in srgb, var(--lux-accent) 55%, var(--lux-line-soft)); background: color-mix(in srgb, var(--lux-accent) 8%, transparent); }
+.lux-emby-scope-option input { flex: 0 0 auto; width: 16px; height: 16px; margin-top: 1px; accent-color: var(--lux-accent); }
+.lux-emby-scope-option span { display: grid; gap: 3px; min-width: 0; }
+.lux-emby-scope-option strong { color: #fff; font-size: .73rem; }
+.lux-emby-scope-option small { color: var(--lux-subtle); font-size: .64rem; line-height: 1.4; }
+.lux-emby-state-fields { display: grid; gap: 8px; margin-top: 10px; padding: 10px 11px; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: rgba(255,255,255,.018); }
+.lux-emby-state-fields > div:first-child { display: grid; gap: 3px; }
+.lux-emby-state-fields strong { color: #fff; font-size: .73rem; }
+.lux-emby-state-fields small { color: var(--lux-subtle); font-size: .64rem; line-height: 1.4; }
+.lux-emby-scope-warning { margin: 8px 0 0; color: #f3c788; font-size: .67rem; }
+.lux-emby-target-library-hint { margin: -1px 0 9px; color: var(--lux-subtle); font-size: .67rem; line-height: 1.45; }
 .lux-emby-migration-action { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px; border: 1px solid var(--lux-line-soft); border-radius: 9px; background: rgba(255,255,255,.025); }
 .lux-emby-migration-action div { display: grid; gap: 4px; min-width: 0; }
 .lux-emby-migration-action strong { color: #fff; font-size: .76rem; }
@@ -2078,6 +2095,7 @@ html[data-lux-theme="light"] .lux-emby-job-progress strong,
 html[data-lux-theme="light"] .lux-emby-job-stats strong,
 html[data-lux-theme="light"] .lux-emby-confirm-summary strong,
 html[data-lux-theme="light"] .lux-emby-merge-option strong,
+html[data-lux-theme="light"] .lux-emby-scope-option strong,
 html[data-lux-theme="light"] .lux-emby-step-heading h3,
 html[data-lux-theme="light"] .lux-emby-history > summary h3,
 html[data-lux-theme="light"] .lux-emby-migration-action strong,
@@ -2087,6 +2105,7 @@ html[data-lux-theme="light"] .lux-emby-plugin-settings-form input:not([type="che
 html[data-lux-theme="light"] .lux-emby-advanced-options select { color: var(--lux-text); background: rgba(255,255,255,.72); }
 html[data-lux-theme="light"] .lux-emby-confirm-summary > div,
 html[data-lux-theme="light"] .lux-emby-merge-option,
+html[data-lux-theme="light"] .lux-emby-scope-option,
 html[data-lux-theme="light"] .lux-emby-migration-action { background: rgba(255,255,255,.68); }
 html[data-lux-theme="light"] .lux-emby-stepper li.is-active .lux-emby-stepper-copy strong { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-emby-job-summary { background: rgba(255,255,255,.68); }
@@ -2115,7 +2134,7 @@ html[data-lux-theme="light"] .lux-emby-job-summary.is-selected { background: rgb
   .lux-emby-report-row > span:last-child { grid-column: 1 / -1; }
   .lux-emby-connection-result { grid-template-columns: auto minmax(0, 1fr); }
   .lux-emby-connection-result small { grid-column: 2; text-align: left; }
-  .lux-emby-confirm-summary, .lux-emby-merge-options { grid-template-columns: 1fr; }
+  .lux-emby-confirm-summary, .lux-emby-merge-options, .lux-emby-scope-options { grid-template-columns: 1fr; }
 }
 html[data-lux-theme="light"] .lux-operations-stat strong,
 html[data-lux-theme="light"] .lux-operations-section-heading h2,

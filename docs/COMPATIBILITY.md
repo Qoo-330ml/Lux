@@ -305,7 +305,8 @@ Lux 匹配；重叠结果按 Emby 条目 ID 去重。该优化不改变 `ITEM_ST
 出现后按需加载只读的、分页的媒体身份索引；它不触发扫描、NFO、`ffprobe` 或写入，且只在选择媒体状态时加载。
 
 支持 `supportsFilteredReads` 的新插件会进一步在来源端限制已选用户、来源虚拟媒体库和 UserData 字段；宿主在
-`migration.list_users` 转发已选用户 ID，在 `migration.user_state` 转发 `stateFilter`、`stateFields` 和
+`migration.list_users` 支持可选 `startIndex`、`limit`、`search` 及分页元数据；旧插件返回完整列表时宿主本地切页并
+保留兼容行为。宿主转发已选用户 ID，在 `migration.user_state` 转发 `stateFilter`、`stateFields` 和
 `sourceLibraryIds`。多个状态筛选同时启用时，`stateFields` 是已选字段并集，跨筛选按 Emby 条目 ID 去重仍能完整
 保留已选状态；未选字段不会发送或写入。旧插件缺少该可选能力时不会收到新字段，可能仍读取较大范围，但宿主仍严格
 禁止未选目标库的状态、导入记录和 ACL 写入。按页 Provider 候选查询使用 schema 107 的 `media_item_provider_ids` 索引，

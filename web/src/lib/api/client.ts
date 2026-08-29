@@ -19,6 +19,7 @@ import type {
   AdminSettingsPatch,
   AdminEmbyMigrationConnection,
   AdminEmbyMigrationSourceUserPage,
+  AdminEmbyMigrationScope,
   AdminEmbyMigrationImport,
   AdminEmbyMigrationJob,
   AdminEmbyMigrationMatch,
@@ -546,9 +547,12 @@ export class LuxApiClient {
     });
   }
 
-  adminEmbyMigrationSourceUsers(page = 1) {
+  adminEmbyMigrationSourceUsers(page = 1, search?: string) {
+    const params = new URLSearchParams({ page: String(page), pageSize: "100" });
+    const normalizedSearch = search?.trim();
+    if (normalizedSearch) params.set("search", normalizedSearch);
     return this.request<AdminEmbyMigrationSourceUserPage>(
-      `/api/v1/admin/emby-migration/source-users?page=${page}&pageSize=100`,
+      `/api/v1/admin/emby-migration/source-users?${params.toString()}`,
     );
   }
 
@@ -556,6 +560,7 @@ export class LuxApiClient {
     dryRun: boolean;
     mergePolicy: "MERGE" | "OVERWRITE" | "SKIP";
     embyUserIds: string[];
+    scope: AdminEmbyMigrationScope;
   }) {
     return this.request<{ job: AdminEmbyMigrationJob }>("/api/v1/admin/emby-migration", {
       method: "POST",
