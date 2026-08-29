@@ -7,6 +7,7 @@ import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRa
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { HomeResponse, LuxUser, MediaItem } from "../../lib/api/types";
+import { readAccountSettings } from "../account/account-settings";
 import { HERO_CAROUSEL_INTERVAL_MS, heroSlides, heroTitleScale } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
@@ -16,6 +17,7 @@ const HOME_CACHE_TTL_MS = 5 * 60_000;
 
 export function HomePage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
+  const accountSettings = useMemo(() => readAccountSettings(user.id), [user.id]);
   const cachedHome = useMemo(() => readHomeCache(user.id), [user.id]);
   const home = useQuery({
     queryKey: queryKeys.home,
@@ -46,15 +48,17 @@ export function HomePage({ user }: { user: LuxUser }) {
     <div className="lux-home">
       <HeroCarousel items={slides} continueWatching={data.continueWatching ?? []} />
       <div className="lux-home-content">
-        <section className="lux-section lux-library-section" aria-label="我的媒体库">
-          <div className="lux-section-heading"><h2>我的媒体库</h2><span>{libraries.length} 个库</span></div>
-          <HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">
-            <div className="lux-library-rail">
-              {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} onPrefetch={() => void prefetchLibraryPage(queryClient, library)} />) : <EmptyLibraries />}
-            </div>
-          </HorizontalScrollRail>
-        </section>
-        <ContinueWatchingRail items={data.continueWatching ?? []} total={data.continueWatchingTotal} />
+        {accountSettings.showMediaLibraries ? (
+          <section className="lux-section lux-library-section" aria-label="我的媒体库">
+            <div className="lux-section-heading"><h2>我的媒体库</h2><span>{libraries.length} 个库</span></div>
+            <HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">
+              <div className="lux-library-rail">
+                {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} onPrefetch={() => void prefetchLibraryPage(queryClient, library)} />) : <EmptyLibraries />}
+              </div>
+            </HorizontalScrollRail>
+          </section>
+        ) : null}
+        {accountSettings.showContinueWatching ? <ContinueWatchingRail items={data.continueWatching ?? []} total={data.continueWatchingTotal} /> : null}
         {libraries.map((library) => <MediaRail key={`latest-${library.id}`} title={`最新${library.name}`} items={library.latest ?? []} linkTo={`/libraries/${library.id}`} />)}
       </div>
     </div>

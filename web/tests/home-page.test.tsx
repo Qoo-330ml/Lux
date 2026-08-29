@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HomePage } from "../src/features/home/HomePage";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
+import { accountSettingsStorageKey } from "../src/features/account/account-settings";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -117,6 +118,45 @@ describe("HomePage shelves", () => {
       .toEqual(["剧集库", "电影库"]);
     expect([...container.querySelectorAll(".lux-home-content .lux-section h2")].map((heading) => heading.textContent))
       .toEqual(["我的媒体库", "最新剧集库", "最新电影库"]);
+  });
+
+  it("hides homepage media-library and continue-watching sections when the account disables them", async () => {
+    localStorage.setItem(accountSettingsStorageKey(user.id), JSON.stringify({
+      showMediaLibraries: false,
+      showContinueWatching: false,
+    }));
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [{
+        id: "library-1",
+        name: "电影库",
+        kind: "MOVIE",
+        latest: [{ id: "latest-1", title: "最新电影", itemType: "MOVIE" }],
+      }],
+      recommended: [],
+      continueWatching: [{ id: "resume-1", title: "继续中的电影", itemType: "MOVIE" }],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector('[aria-label="我的媒体库"]')).toBeNull();
+    expect(container.querySelector('[aria-label="继续观看"]')).toBeNull();
+    expect(container.querySelector('[aria-label="最新电影库"]')).not.toBeNull();
   });
 
   it("renders every returned continue-watching item and shows the server total", async () => {
