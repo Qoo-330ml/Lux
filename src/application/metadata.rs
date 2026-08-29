@@ -1091,14 +1091,15 @@ impl MetadataEnricher {
         } else {
             false
         };
-        let rich_cache_missing = if let Some(local_nfo) = &self.local_nfo {
-            !local_nfo
-                .is_usable(item_id)
+        let cached_nfo = if let Some(local_nfo) = &self.local_nfo {
+            local_nfo
+                .read_item_if_usable(item_id)
                 .await
                 .map_err(MetadataError::NfoCache)?
         } else {
-            false
+            None
         };
+        let rich_cache_missing = self.local_nfo.is_some() && cached_nfo.is_none();
         let actor_relation_missing = if let Some(people) = &self.people {
             match people.nfo_relation_snapshot_exists(item_id).await {
                 Ok(exists) => !exists,
@@ -1115,6 +1116,11 @@ impl MetadataEnricher {
             false
         };
         if already_checked && !rich_cache_missing && !actor_relation_missing {
+            if let Some(details) = cached_nfo {
+                self.database
+                    .merge_local_provider_ids(item_id, &details.provider_ids)
+                    .await?;
+            }
             report.nfo_skipped = 1;
             return Ok(report);
         }
@@ -1197,6 +1203,9 @@ impl MetadataEnricher {
                     .map_err(MetadataError::NfoCache)?;
             }
         }
+        self.database
+            .merge_local_provider_ids(item_id, &projection.details.provider_ids)
+            .await?;
         if let Some(people) = &self.people {
             let relation_current = match people
                 .item_actor_relation_is_current(item_id, &source_fingerprint)

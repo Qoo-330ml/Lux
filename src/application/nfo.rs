@@ -756,6 +756,13 @@ impl LocalNfoMetadataStore {
     }
 
     pub async fn is_usable(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {
+        Ok(self.read_item_if_usable(item_id).await?.is_some())
+    }
+
+    pub async fn read_item_if_usable(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<LocalNfoDetails>, LocalNfoMetadataStoreError> {
         let state = self.state(item_id).await?;
         if !state.has_snapshot
             || !state
@@ -763,9 +770,9 @@ impl LocalNfoMetadataStore {
                 .as_deref()
                 .is_some_and(valid_nfo_content_fingerprint)
         {
-            return Ok(false);
+            return Ok(None);
         }
-        Ok(self.read_item(item_id).await?.is_some())
+        self.read_item(item_id).await
     }
 
     pub async fn exists(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {

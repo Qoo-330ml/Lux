@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use luxd::{
     application::{
         libraries::LibraryService,
@@ -25,7 +27,7 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
     tokio::fs::create_dir_all(&season_dir).await?;
     tokio::fs::write(
         series_dir.join("tvshow.nfo"),
-        "<tvshow><title>本地剧集</title><plot>剧集简介</plot><rating>8.7</rating><votes>456</votes><tagline>剧集标语</tagline><premiered>2020-01-01</premiered><status>Ended</status><language>zh</language><genre>剧情</genre><studio>示例剧厂</studio><tmdbid>60625</tmdbid><director tmdbid=\"88\">导演甲</director><actor><name>演员甲</name><role>角色甲</role><tmdbid>9</tmdbid><order>0</order></actor><custom>keep</custom></tvshow>",
+        "<tvshow><title>本地剧集</title><plot>剧集简介</plot><rating>8.7</rating><votes>456</votes><tagline>剧集标语</tagline><premiered>2020-01-01</premiered><status>Ended</status><language>zh</language><genre>剧情</genre><studio>示例剧厂</studio><tmdbid>60625</tmdbid><imdbid>tt1234567</imdbid><director tmdbid=\"88\">导演甲</director><actor><name>演员甲</name><role>角色甲</role><tmdbid>9</tmdbid><order>0</order></actor><custom>keep</custom></tvshow>",
     )
     .await?;
     tokio::fs::write(series_dir.join("poster.jpg"), b"series-poster").await?;
@@ -55,6 +57,16 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
     let scanner = LibraryScanner::new(database.clone());
     scanner.scan_series_library(library.id).await?;
 
+    let series_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SERIES'")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = ? WHERE id = ?")
+        .bind(r#"{"tmdb":"preexisting-tmdb","tvdb":"existing-tvdb"}"#)
+        .bind(&series_id)
+        .execute(database.pool())
+        .await?;
+
     let report = MetadataEnricher::new(database.clone())
         .with_people(PeopleService::new(config.config_dir.clone()))
         .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
@@ -79,6 +91,25 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
     assert_eq!(series_title, "本地剧集");
     assert_eq!(season_title, "本地第一季");
     assert_eq!(episode_title, "本地第一集");
+    let series_provider_ids: String =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&series_id)
+            .fetch_one(database.pool())
+            .await?;
+    let series_provider_ids =
+        serde_json::from_str::<BTreeMap<String, String>>(&series_provider_ids)?;
+    assert_eq!(
+        series_provider_ids.get("tmdb"),
+        Some(&"preexisting-tmdb".to_owned())
+    );
+    assert_eq!(
+        series_provider_ids.get("tvdb"),
+        Some(&"existing-tvdb".to_owned())
+    );
+    assert_eq!(
+        series_provider_ids.get("imdb"),
+        Some(&"tt1234567".to_owned())
+    );
     let rich_nfo: Vec<(String, Option<String>)> = sqlx::query_as(
         "SELECT item_type, nfo_metadata_json
          FROM media_items
@@ -121,10 +152,31 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
     assert_eq!(second.nfo_skipped, 3);
     assert_eq!(second.images_found, 0);
 
-    let series_id: String =
-        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'SERIES'")
+    sqlx::query("UPDATE media_items SET provider_ids_json = NULL WHERE id = ?")
+        .bind(&series_id)
+        .execute(database.pool())
+        .await?;
+    let third = MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_series_library(library.id)
+        .await?;
+    assert_eq!(third.nfo_loaded, 0);
+    assert_eq!(third.nfo_skipped, 3);
+    let restored_provider_ids: Option<String> =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&series_id)
             .fetch_one(database.pool())
             .await?;
+    let restored_provider_ids = serde_json::from_str::<BTreeMap<String, String>>(
+        restored_provider_ids
+            .as_deref()
+            .ok_or("provider IDs were not restored")?,
+    )?;
+    assert_eq!(restored_provider_ids.get("tmdb"), Some(&"60625".to_owned()));
+    assert_eq!(
+        restored_provider_ids.get("imdb"),
+        Some(&"tt1234567".to_owned())
+    );
     let actors = PeopleService::new(config.config_dir.clone())
         .list_item_actors(&series_id)
         .await?;
