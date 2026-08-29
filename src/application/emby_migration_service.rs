@@ -43,6 +43,8 @@ const MAX_JOB_PAGE_SIZE: i64 = 100;
 const MAX_SELECTED_USER_COUNT: usize = 1_000;
 const MAX_SELECTED_LIBRARY_COUNT: usize = 1_000;
 const MAX_MIGRATION_PAGE_RECOVERY_RPCS: u64 = 32;
+const MAX_MEDIA_IDENTITY_CACHE_ENTRIES: usize = 64;
+const MAX_MEDIA_IDENTITY_CACHE_IDENTITIES: usize = 8_192;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -916,6 +918,11 @@ impl EmbyMigrationService {
         let mut skipped = job.skipped_count;
         let mut failed = job.failed_count;
         let mut total = job.total_count.max(users.len() as i64);
+        let mut media_identity_cache = MigrationMediaIdentityCache::new(
+            MAX_MEDIA_IDENTITY_CACHE_ENTRIES,
+            MAX_MEDIA_IDENTITY_CACHE_IDENTITIES,
+        );
+        let mut media_identity_cache_hits = 0_u64;
         let user_ids = user_links
             .iter()
             .map(|(user, _)| user.id.clone())
@@ -1101,9 +1108,11 @@ impl EmbyMigrationService {
                         let identity_index = if !state_items.is_empty() {
                             let candidate_started = Instant::now();
                             let identity_index = Some(
-                                self.load_media_identity_index(
+                                self.load_media_identity_index_cached(
                                     &state_items,
                                     target_library_filter.as_deref(),
+                                    &mut media_identity_cache,
+                                    &mut media_identity_cache_hits,
                                 )
                                 .await?,
                             );
@@ -1508,6 +1517,7 @@ impl EmbyMigrationService {
             items_ms,
             finalizing_ms,
             candidate_query_ms,
+            media_identity_cache_hits,
             database_write_ms,
             processed,
             matched,
@@ -1693,6 +1703,28 @@ impl EmbyMigrationService {
             }
         }
         Ok(MigrationMediaIdentityIndex::new(identities))
+    }
+
+    async fn load_media_identity_index_cached(
+        &self,
+        items: &[MigrationItem],
+        target_library_filter: Option<&[String]>,
+        cache: &mut MigrationMediaIdentityCache,
+        cache_hits: &mut u64,
+    ) -> Result<MigrationMediaIdentityIndex, EmbyMigrationServiceError> {
+        let key = MigrationMediaIdentityCacheKey {
+            lookups: migration_media_identity_lookups(items),
+            target_library_ids: target_library_filter.map(ToOwned::to_owned),
+        };
+        if let Some(index) = cache.get(&key) {
+            *cache_hits += 1;
+            return Ok(index.clone());
+        }
+        let index = self
+            .load_media_identity_index(items, target_library_filter)
+            .await?;
+        cache.insert(key, index.clone());
+        Ok(index)
     }
 
     #[allow(dead_code)]
@@ -2390,6 +2422,70 @@ struct MatchOutcome {
     status: &'static str,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MigrationMediaIdentityCacheKey {
+    lookups: Vec<MigrationMediaIdentityLookup>,
+    target_library_ids: Option<Vec<String>>,
+}
+
+struct MigrationMediaIdentityCache {
+    max_entries: usize,
+    max_identities: usize,
+    identity_count: usize,
+    entries: HashMap<MigrationMediaIdentityCacheKey, MigrationMediaIdentityIndex>,
+}
+
+impl MigrationMediaIdentityCache {
+    fn new(max_entries: usize, max_identities: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            max_identities: max_identities.max(1),
+            identity_count: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, key: &MigrationMediaIdentityCacheKey) -> Option<&MigrationMediaIdentityIndex> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: MigrationMediaIdentityCacheKey, index: MigrationMediaIdentityIndex) {
+        let identity_count = index.identities.len();
+        if identity_count > self.max_identities {
+            return;
+        }
+        let existing_identity_count = self
+            .entries
+            .get(&key)
+            .map(|previous| previous.identities.len())
+            .unwrap_or_default();
+        let projected_identity_count = self
+            .identity_count
+            .saturating_sub(existing_identity_count)
+            .saturating_add(identity_count);
+        if (!self.entries.contains_key(&key) && self.entries.len() >= self.max_entries)
+            || projected_identity_count > self.max_identities
+        {
+            // A whole-cache eviction is deliberate: the cache is a bounded
+            // acceleration layer for one migration run, not a second index.
+            self.entries.clear();
+            self.identity_count = 0;
+        }
+        if let Some(previous) = self.entries.insert(key, index) {
+            self.identity_count = self
+                .identity_count
+                .saturating_sub(previous.identities.len());
+        }
+        self.identity_count = self.identity_count.saturating_add(identity_count);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Clone)]
 struct MigrationMediaIdentityIndex {
     identities: Vec<StoredMigrationMediaIdentity>,
     by_id: HashMap<String, usize>,
@@ -3289,6 +3385,68 @@ mod tests {
                 "libraryFolders"
             ]
         );
+    }
+
+    #[test]
+    fn media_identity_page_cache_is_bounded_and_reuses_equivalent_keys() {
+        let mut cache = MigrationMediaIdentityCache::new(2, 2);
+        let first_key = MigrationMediaIdentityCacheKey {
+            lookups: Vec::new(),
+            target_library_ids: None,
+        };
+        let first_index = MigrationMediaIdentityIndex::new(Vec::new());
+
+        cache.insert(first_key.clone(), first_index);
+        assert!(cache.get(&first_key).is_some());
+
+        for target_library_id in ["library-1", "library-2", "library-3"] {
+            cache.insert(
+                MigrationMediaIdentityCacheKey {
+                    lookups: Vec::new(),
+                    target_library_ids: Some(vec![target_library_id.to_owned()]),
+                },
+                MigrationMediaIdentityIndex::new(Vec::new()),
+            );
+        }
+
+        assert!(cache.len() <= 2);
+
+        let mut identity_limited_cache = MigrationMediaIdentityCache::new(4, 1);
+        identity_limited_cache.insert(
+            MigrationMediaIdentityCacheKey {
+                lookups: Vec::new(),
+                target_library_ids: None,
+            },
+            MigrationMediaIdentityIndex::new(vec![StoredMigrationMediaIdentity {
+                id: "identity-1".to_owned(),
+                library_id: "library-1".to_owned(),
+                item_type: "MOVIE".to_owned(),
+                title: "Film".to_owned(),
+                production_year: None,
+                provider_ids_json: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+            }]),
+        );
+        identity_limited_cache.insert(
+            MigrationMediaIdentityCacheKey {
+                lookups: Vec::new(),
+                target_library_ids: Some(vec!["library-2".to_owned()]),
+            },
+            MigrationMediaIdentityIndex::new(vec![StoredMigrationMediaIdentity {
+                id: "identity-2".to_owned(),
+                library_id: "library-2".to_owned(),
+                item_type: "MOVIE".to_owned(),
+                title: "Film 2".to_owned(),
+                production_year: None,
+                provider_ids_json: None,
+                series_id: None,
+                season_number: None,
+                episode_number: None,
+            }]),
+        );
+        assert!(identity_limited_cache.len() <= 1);
     }
 
     #[test]

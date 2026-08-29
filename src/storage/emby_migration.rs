@@ -298,7 +298,7 @@ pub(crate) struct StoredMigrationMediaIdentity {
 /// Exact lookup keys extracted from one bounded Emby page.  Keeping the query
 /// shape in storage avoids leaking application DTOs across the persistence
 /// boundary while allowing the provider index to remain parameterized.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MigrationMediaIdentityLookup {
     pub item_type: String,
     pub title: String,
