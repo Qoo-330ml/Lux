@@ -415,6 +415,67 @@ impl Database {
         .map_err(storage_error)
     }
 
+    /// Upsert user bindings in bounded transactions so a large migration does
+    /// not pay one SQLite write transaction per user.
+    pub(crate) async fn upsert_emby_migration_user_bindings_batch(
+        &self,
+        bindings: &[StoredEmbyMigrationUserBinding],
+    ) -> Result<(), StorageError> {
+        for bindings in bindings.chunks(EMBY_MIGRATION_WRITE_BATCH_SIZE) {
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            let mut sql = String::from(
+                "INSERT INTO emby_migration_user_bindings (
+                 lux_user_id, source_base_url, secret_ref, emby_user_id,
+                 emby_username, password_pending
+             ) VALUES ",
+            );
+            for index in 0..bindings.len() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(" (?, ?, ?, ?, ?, ?)");
+            }
+            let secret_ref_changed = sql_is_distinct(
+                "emby_migration_user_bindings.secret_ref",
+                "excluded.secret_ref",
+            );
+            sql.push_str(&format!(
+                " ON CONFLICT(lux_user_id) DO UPDATE SET
+                     source_base_url = excluded.source_base_url,
+                     secret_ref = excluded.secret_ref,
+                     emby_user_id = excluded.emby_user_id,
+                     emby_username = excluded.emby_username,
+                     password_pending = excluded.password_pending,
+                     updated_at = unixepoch()
+                 WHERE emby_migration_user_bindings.source_base_url <> excluded.source_base_url
+                    OR {secret_ref_changed}
+                    OR emby_migration_user_bindings.emby_user_id <> excluded.emby_user_id
+                    OR emby_migration_user_bindings.emby_username <> excluded.emby_username
+                    OR emby_migration_user_bindings.password_pending <> excluded.password_pending"
+            ));
+            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            for binding in bindings {
+                query = query
+                    .bind(&binding.lux_user_id)
+                    .bind(&binding.source_base_url)
+                    .bind(&binding.secret_ref)
+                    .bind(&binding.emby_user_id)
+                    .bind(&binding.emby_username)
+                    .bind(if binding.password_pending {
+                        1_i64
+                    } else {
+                        0_i64
+                    });
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            transaction.commit().await.map_err(storage_error)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn find_emby_migration_user_binding_by_username(
         &self,
         username: &str,
@@ -2288,6 +2349,66 @@ mod tests {
                 .fetch_one(database.pool())
                 .await?;
         assert_eq!(count, 205);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_user_bindings_are_upserted_in_bounded_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let mut bindings = Vec::with_capacity(205);
+        for index in 0..205 {
+            let lux_user_id = Uuid::now_v7().to_string();
+            database
+                .insert_user(
+                    &lux_user_id,
+                    &format!("migration-{index}"),
+                    &format!("Migration {index}"),
+                    "hash",
+                    false,
+                )
+                .await?;
+            bindings.push(StoredEmbyMigrationUserBinding {
+                lux_user_id,
+                source_base_url: "https://emby.example.test/".to_owned(),
+                secret_ref: Some("emby-migration/test.json".to_owned()),
+                emby_user_id: format!("emby-{index}"),
+                emby_username: format!("User {index}"),
+                password_pending: index % 2 == 0,
+            });
+        }
+        let unchanged_lux_user_id = bindings[0].lux_user_id.clone();
+
+        database.reset_query_count();
+        database
+            .upsert_emby_migration_user_bindings_batch(&bindings)
+            .await?;
+
+        assert_eq!(database.query_count(), 3);
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM emby_migration_user_bindings WHERE source_base_url = ?",
+        )
+        .bind("https://emby.example.test/")
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(count, 205);
+
+        sqlx::query(
+            "UPDATE emby_migration_user_bindings SET updated_at = 123 WHERE lux_user_id = ?",
+        )
+        .bind(&unchanged_lux_user_id)
+        .execute(database.pool())
+        .await?;
+        database
+            .upsert_emby_migration_user_bindings_batch(&bindings)
+            .await?;
+        let updated_at: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM emby_migration_user_bindings WHERE lux_user_id = ?",
+        )
+        .bind(unchanged_lux_user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(updated_at, 123);
         Ok(())
     }
 

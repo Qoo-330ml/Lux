@@ -47,6 +47,12 @@ const MAX_MEDIA_IDENTITY_CACHE_ENTRIES: usize = 64;
 const MAX_MEDIA_IDENTITY_CACHE_IDENTITIES: usize = 8_192;
 const MAX_PERSON_IDENTITY_CACHE_ENTRIES: usize = 64;
 const MAX_PERSON_IDENTITY_CACHE_IDENTITIES: usize = 8_192;
+const MAX_MIGRATION_USER_BINDING_BATCH_SIZE: usize = 100;
+
+struct PreparedMigrationUser {
+    link: StoredEmbyMigrationUserLink,
+    binding: Option<StoredEmbyMigrationUserBinding>,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -853,12 +859,15 @@ impl EmbyMigrationService {
         };
         let mut user_links = Vec::with_capacity(users.len());
         let mut user_links_reports = Vec::with_capacity(users.len());
+        let mut pending_user_bindings = Vec::with_capacity(MAX_MIGRATION_USER_BINDING_BATCH_SIZE);
         for user in &users {
             if self.is_cancelled(job_id).await? {
+                self.flush_user_bindings(&mut pending_user_bindings, &mut database_write_ms)
+                    .await?;
                 return self.cancelled(job_id, "USERS").await;
             }
             let write_started = Instant::now();
-            let link = self
+            let prepared = self
                 .prepare_user(
                     &user_store,
                     &mut lux_users_by_username,
@@ -868,9 +877,18 @@ impl EmbyMigrationService {
                 )
                 .await?;
             database_write_ms += write_started.elapsed().as_millis();
-            user_links.push((user.clone(), link.lux_user_id.clone()));
-            user_links_reports.push(link);
+            user_links.push((user.clone(), prepared.link.lux_user_id.clone()));
+            user_links_reports.push(prepared.link);
+            if let Some(binding) = prepared.binding {
+                pending_user_bindings.push(binding);
+                if pending_user_bindings.len() >= MAX_MIGRATION_USER_BINDING_BATCH_SIZE {
+                    self.flush_user_bindings(&mut pending_user_bindings, &mut database_write_ms)
+                        .await?;
+                }
+            }
         }
+        self.flush_user_bindings(&mut pending_user_bindings, &mut database_write_ms)
+            .await?;
         let write_started = Instant::now();
         self.database
             .upsert_emby_migration_user_links_batch(&user_links_reports)
@@ -1576,26 +1594,32 @@ impl EmbyMigrationService {
         job: &StoredEmbyMigrationJob,
         source_user: &MigrationUser,
         sync_profile: bool,
-    ) -> Result<StoredEmbyMigrationUserLink, EmbyMigrationServiceError> {
+    ) -> Result<PreparedMigrationUser, EmbyMigrationServiceError> {
         let source_user_name = source_user.name.trim();
         if source_user_name.is_empty() {
-            return Ok(StoredEmbyMigrationUserLink {
-                job_id: job.id.clone(),
-                emby_user_id: source_user.id.clone(),
-                emby_username: source_user.name.clone(),
-                lux_user_id: None,
-                status: "SKIPPED".to_owned(),
-                error: Some("empty Emby username".to_owned()),
+            return Ok(PreparedMigrationUser {
+                link: StoredEmbyMigrationUserLink {
+                    job_id: job.id.clone(),
+                    emby_user_id: source_user.id.clone(),
+                    emby_username: source_user.name.clone(),
+                    lux_user_id: None,
+                    status: "SKIPPED".to_owned(),
+                    error: Some("empty Emby username".to_owned()),
+                },
+                binding: None,
             });
         }
         if job.dry_run {
-            return Ok(StoredEmbyMigrationUserLink {
-                job_id: job.id.clone(),
-                emby_user_id: source_user.id.clone(),
-                emby_username: source_user_name.to_owned(),
-                lux_user_id: None,
-                status: "SKIPPED".to_owned(),
-                error: Some("DRY_RUN".to_owned()),
+            return Ok(PreparedMigrationUser {
+                link: StoredEmbyMigrationUserLink {
+                    job_id: job.id.clone(),
+                    emby_user_id: source_user.id.clone(),
+                    emby_username: source_user_name.to_owned(),
+                    lux_user_id: None,
+                    status: "SKIPPED".to_owned(),
+                    error: Some("DRY_RUN".to_owned()),
+                },
+                binding: None,
             });
         }
         if source_user_name.chars().count() > 128 {
@@ -1607,24 +1631,31 @@ impl EmbyMigrationService {
             .cloned();
         if !sync_profile {
             let Some(existing) = existing else {
-                return Ok(StoredEmbyMigrationUserLink {
+                return Ok(PreparedMigrationUser {
+                    link: StoredEmbyMigrationUserLink {
+                        job_id: job.id.clone(),
+                        emby_user_id: source_user.id.clone(),
+                        emby_username: source_user_name.to_owned(),
+                        lux_user_id: None,
+                        status: "SKIPPED".to_owned(),
+                        error: Some(
+                            "Lux user does not exist and user profile migration is disabled"
+                                .to_owned(),
+                        ),
+                    },
+                    binding: None,
+                });
+            };
+            return Ok(PreparedMigrationUser {
+                link: StoredEmbyMigrationUserLink {
                     job_id: job.id.clone(),
                     emby_user_id: source_user.id.clone(),
                     emby_username: source_user_name.to_owned(),
-                    lux_user_id: None,
-                    status: "SKIPPED".to_owned(),
-                    error: Some(
-                        "Lux user does not exist and user profile migration is disabled".to_owned(),
-                    ),
-                });
-            };
-            return Ok(StoredEmbyMigrationUserLink {
-                job_id: job.id.clone(),
-                emby_user_id: source_user.id.clone(),
-                emby_username: source_user_name.to_owned(),
-                lux_user_id: Some(existing.id.to_string()),
-                status: "LINKED".to_owned(),
-                error: None,
+                    lux_user_id: Some(existing.id.to_string()),
+                    status: "LINKED".to_owned(),
+                    error: None,
+                },
+                binding: None,
             });
         }
         let (lux_user, status) = match existing {
@@ -1646,24 +1677,42 @@ impl EmbyMigrationService {
             lux_user
         };
         lux_users_by_username.insert(source_user_name_normalized, lux_user.clone());
-        self.database
-            .upsert_emby_migration_user_binding(&StoredEmbyMigrationUserBinding {
-                lux_user_id: lux_user.id.to_string(),
-                source_base_url: job.source_base_url.clone(),
-                secret_ref: Some(job.secret_ref.clone()),
-                emby_user_id: source_user.id.clone(),
-                emby_username: source_user_name.to_owned(),
-                password_pending: source_user.has_password && !source_user.is_disabled,
-            })
-            .await?;
-        Ok(StoredEmbyMigrationUserLink {
-            job_id: job.id.clone(),
+        let binding = StoredEmbyMigrationUserBinding {
+            lux_user_id: lux_user.id.to_string(),
+            source_base_url: job.source_base_url.clone(),
+            secret_ref: Some(job.secret_ref.clone()),
             emby_user_id: source_user.id.clone(),
             emby_username: source_user_name.to_owned(),
-            lux_user_id: Some(lux_user.id.to_string()),
-            status: status.to_owned(),
-            error: None,
+            password_pending: source_user.has_password && !source_user.is_disabled,
+        };
+        Ok(PreparedMigrationUser {
+            link: StoredEmbyMigrationUserLink {
+                job_id: job.id.clone(),
+                emby_user_id: source_user.id.clone(),
+                emby_username: source_user_name.to_owned(),
+                lux_user_id: Some(lux_user.id.to_string()),
+                status: status.to_owned(),
+                error: None,
+            },
+            binding: Some(binding),
         })
+    }
+
+    async fn flush_user_bindings(
+        &self,
+        bindings: &mut Vec<StoredEmbyMigrationUserBinding>,
+        database_write_ms: &mut u128,
+    ) -> Result<(), EmbyMigrationServiceError> {
+        if bindings.is_empty() {
+            return Ok(());
+        }
+        let write_started = Instant::now();
+        self.database
+            .upsert_emby_migration_user_bindings_batch(bindings)
+            .await?;
+        *database_write_ms += write_started.elapsed().as_millis();
+        bindings.clear();
+        Ok(())
     }
 
     async fn load_library_identities(
