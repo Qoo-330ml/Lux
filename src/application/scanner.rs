@@ -445,8 +445,10 @@ impl LibraryScanner {
                 let mut seen_entry_ids = Vec::with_capacity(files.len());
                 let mut new_movie_paths = Vec::new();
                 let mut new_episode_paths = Vec::new();
+                let mut classification_cache = MixedClassificationCache::default();
                 for path in files {
-                    let classification = classify_mixed_file(&root_path, &path).await;
+                    let classification =
+                        classify_mixed_file(&root_path, &path, &mut classification_cache).await;
                     let quick_report = match classification {
                         MixedClassification::Movie => {
                             let relative_path = path
@@ -2995,6 +2997,7 @@ impl ScanJobService {
         let mut root_has_existing_index = HashMap::<String, bool>::new();
         let mut quick_seen_entry_ids = Vec::<String>::new();
         let mut refreshed_series = HashSet::new();
+        let mut classification_cache = MixedClassificationCache::default();
         for entry in &batch {
             batch_paths_by_root
                 .entry(entry.library_root_id.clone())
@@ -3115,7 +3118,14 @@ impl ScanJobService {
             }
             let classification = match library_kind {
                 "SERIES" => MixedClassification::Episode,
-                "MIXED" => classify_mixed_file(Path::new(&root.canonical_path), &path).await,
+                "MIXED" => {
+                    classify_mixed_file(
+                        Path::new(&root.canonical_path),
+                        &path,
+                        &mut classification_cache,
+                    )
+                    .await
+                }
                 _ => return Err(ScanJobError::LibraryNotFound),
             };
             let is_new = !existing_entries.contains_key(&entry.relative_path);
@@ -3989,6 +3999,7 @@ impl ScanJobService {
             .ok_or(ScannerError::LibraryNotFound)?;
         let root_path = Path::new(&root.canonical_path);
         let media_path = root_path.join(&path.relative_path);
+        let mut classification_cache = MixedClassificationCache::default();
         if path.change_kind == "REMOVE" || fs::metadata(&media_path).await.is_err() {
             self.database
                 .mark_filesystem_entry_missing_by_path(&root.id, &path.relative_path)
@@ -4010,8 +4021,15 @@ impl ScanJobService {
                         return Ok(created_items);
                     }
                     created_items = created_items.saturating_add(
-                        self.process_incremental_file(library_kind, job, &root, root_path, &file)
-                            .await?,
+                        self.process_incremental_file(
+                            library_kind,
+                            job,
+                            &root,
+                            root_path,
+                            &file,
+                            &mut classification_cache,
+                        )
+                        .await?,
                     );
                 }
             }
@@ -4020,8 +4038,15 @@ impl ScanJobService {
             if cancellation.load(Ordering::Acquire) {
                 return Ok(0);
             }
-            self.process_incremental_file(library_kind, job, &root, root_path, &media_path)
-                .await
+            self.process_incremental_file(
+                library_kind,
+                job,
+                &root,
+                root_path,
+                &media_path,
+                &mut classification_cache,
+            )
+            .await
         } else {
             Ok(0)
         }
@@ -4034,6 +4059,7 @@ impl ScanJobService {
         root: &StoredLibraryRoot,
         root_path: &Path,
         file: &Path,
+        classification_cache: &mut MixedClassificationCache,
     ) -> Result<usize, ScannerError> {
         let generation = &job.generation;
         let report = match library_kind {
@@ -4047,7 +4073,7 @@ impl ScanJobService {
                     .scan_episode_file(&job.library_id, root, root_path, file, generation)
                     .await?
             }
-            "MIXED" => match classify_mixed_file(root_path, file).await {
+            "MIXED" => match classify_mixed_file(root_path, file, classification_cache).await {
                 MixedClassification::Movie => {
                     self.scanner
                         .scan_movie_file(&job.library_id, root, root_path, file, generation)
@@ -5208,7 +5234,17 @@ struct ReconciliationScanWork {
     classification: MixedClassification,
 }
 
-async fn classify_mixed_file(root: &Path, path: &Path) -> MixedClassification {
+#[derive(Default)]
+struct MixedClassificationCache {
+    nfo_exists: HashMap<PathBuf, bool>,
+    nfo_roots: HashMap<(PathBuf, String), bool>,
+}
+
+async fn classify_mixed_file(
+    root: &Path,
+    path: &Path,
+    cache: &mut MixedClassificationCache,
+) -> MixedClassification {
     let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
         return MixedClassification::Unresolved;
     };
@@ -5221,20 +5257,23 @@ async fn classify_mixed_file(root: &Path, path: &Path) -> MixedClassification {
         .and_then(|relative| relative.components().next())
         .map(|first| root.join(first.as_os_str()).join("tvshow.nfo"));
     if let Some(series_nfo) = series_nfo
-        && nfo_root_is(&series_nfo, "tvshow").await
+        && cached_nfo_root_is(cache, &series_nfo, "tvshow").await
     {
         return MixedClassification::Unresolved;
     }
-    let movie_nfo = path
-        .parent()
-        .map(|directory| directory.join("movie.nfo"))
-        .filter(|candidate| candidate.exists())
-        .or_else(|| {
-            let candidate = path.with_extension("nfo");
-            candidate.exists().then_some(candidate)
-        });
+    let movie_nfo = if let Some(candidate) =
+        path.parent().map(|directory| directory.join("movie.nfo"))
+        && cached_nfo_exists(cache, &candidate).await
+    {
+        Some(candidate)
+    } else {
+        let candidate = path.with_extension("nfo");
+        cached_nfo_exists(cache, &candidate)
+            .await
+            .then_some(candidate)
+    };
     if let Some(movie_nfo) = movie_nfo
-        && nfo_root_is(&movie_nfo, "movie").await
+        && cached_nfo_root_is(cache, &movie_nfo, "movie").await
     {
         return MixedClassification::Movie;
     }
@@ -5243,6 +5282,31 @@ async fn classify_mixed_file(root: &Path, path: &Path) -> MixedClassification {
     } else {
         MixedClassification::Unresolved
     }
+}
+
+async fn cached_nfo_exists(cache: &mut MixedClassificationCache, path: &Path) -> bool {
+    if let Some(exists) = cache.nfo_exists.get(path) {
+        return *exists;
+    }
+    let exists = fs::metadata(path)
+        .await
+        .is_ok_and(|metadata| metadata.is_file());
+    cache.nfo_exists.insert(path.to_owned(), exists);
+    exists
+}
+
+async fn cached_nfo_root_is(
+    cache: &mut MixedClassificationCache,
+    path: &Path,
+    expected: &str,
+) -> bool {
+    let key = (path.to_owned(), expected.to_owned());
+    if let Some(is_expected) = cache.nfo_roots.get(&key) {
+        return *is_expected;
+    }
+    let is_expected = nfo_root_is(path, expected).await;
+    cache.nfo_roots.insert(key, is_expected);
+    is_expected
 }
 
 async fn nfo_root_is(path: &Path, expected: &str) -> bool {
@@ -5713,7 +5777,10 @@ impl From<StorageError> for ScannerError {
 
 #[cfg(test)]
 mod tests {
-    use super::{media_source_folder, safe_scan_activity_label};
+    use super::{
+        MixedClassification, MixedClassificationCache, classify_mixed_file, media_source_folder,
+        safe_scan_activity_label,
+    };
 
     #[test]
     fn media_source_folder_uses_the_source_parent_directory() {
@@ -5735,5 +5802,31 @@ mod tests {
             Some("Secret.strm")
         );
         assert_eq!(safe_scan_activity_label("/"), None);
+    }
+
+    #[tokio::test]
+    async fn mixed_classification_cache_reuses_the_series_nfo_probe() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path();
+        let series_dir = root.join("Example Show");
+        tokio::fs::create_dir_all(&series_dir)
+            .await
+            .expect("series directory");
+        tokio::fs::write(series_dir.join("tvshow.nfo"), "<tvshow />")
+            .await
+            .expect("series NFO");
+        let first = series_dir.join("first.mkv");
+        let second = series_dir.join("second.mkv");
+        let mut cache = MixedClassificationCache::default();
+
+        assert!(matches!(
+            classify_mixed_file(root, &first, &mut cache).await,
+            MixedClassification::Unresolved
+        ));
+        assert!(matches!(
+            classify_mixed_file(root, &second, &mut cache).await,
+            MixedClassification::Unresolved
+        ));
+        assert_eq!(cache.nfo_roots.len(), 1);
     }
 }
