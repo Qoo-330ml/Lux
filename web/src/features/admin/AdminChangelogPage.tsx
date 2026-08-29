@@ -20,6 +20,7 @@ export const changelogReleases: ChangelogRelease[] = [
     sections: [
       { kind: "added", items: [
         "增加窄屏播放顶部栏的 AirPlay 和画中画快捷入口，并将播放版本选择整合到播放器设置面板，减少移动端底部控制栏拥挤。",
+        "增加本地媒体内嵌 SRT/ASS/SSA 字幕的 source-scoped 按需抽取与浏览器原生 in-band 字幕轨道识别；字幕选择复用当前媒体源，不改变 Direct/HLS/fallback 播放会话，远程 .strm 继续不由 Lux 拉取或代理字幕。",
       ] },
       { kind: "fixed", items: [
         "修复移动端播放器控制布局过于拥挤、弹幕按钮与右侧操作排列不一致，以及音量滑块可用范围和滑块圆点不可见的问题；现在会显示完整音量范围、当前填充进度和可操作圆点。",
@@ -27,6 +28,7 @@ export const changelogReleases: ChangelogRelease[] = [
       ] },
       { kind: "changed", items: [
         "调整播放页移动端控制层和中心播放提示的尺寸与响应式行为，保留桌面端完整操作并提升窄屏可用性。",
+        "移除播放器设置面板中的快捷键提示，简化设置内容并减少移动端占用空间。",
       ] },
     ],
   },
