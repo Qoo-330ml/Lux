@@ -2547,6 +2547,34 @@ pub(crate) struct NewMovieFile {
     pub(crate) external_url: Option<String>,
 }
 
+pub(crate) struct NewEpisodeFile {
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) source_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Vec<u8>,
+    pub(crate) series_identity: String,
+    pub(crate) series_title: String,
+    pub(crate) series_sort_title: String,
+    pub(crate) series_production_year: Option<i64>,
+    pub(crate) series_provider_ids_json: Option<String>,
+    pub(crate) season_identity: String,
+    pub(crate) season_number: i64,
+    pub(crate) episode_identity: String,
+    pub(crate) episode_title: String,
+    pub(crate) episode_sort_title: String,
+    pub(crate) episode_number: i64,
+    pub(crate) episode_absolute_number: Option<i64>,
+    pub(crate) source_kind: String,
+    pub(crate) strm_target_kind: Option<String>,
+    pub(crate) edition_name: Option<String>,
+    pub(crate) quality_label: Option<String>,
+    pub(crate) container: String,
+    pub(crate) external_url: Option<String>,
+}
+
 pub(crate) struct MediaProbeUpdate<'a> {
     pub(crate) source_id: &'a str,
     pub(crate) container: Option<&'a str>,

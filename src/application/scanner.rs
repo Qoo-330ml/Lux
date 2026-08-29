@@ -41,8 +41,8 @@ use crate::{
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     observability::resources::ResourceMetrics,
     storage::{
-        Database, FilesystemEntryMove, NewFilesystemEntry, NewHierarchyItem, NewMediaItem,
-        NewMediaSource, NewMovieFile, NewScanJobEvent, StorageError,
+        Database, FilesystemEntryMove, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem,
+        NewMediaItem, NewMediaSource, NewMovieFile, NewScanJobEvent, StorageError,
         StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
         movie_parent_folder_identity,
@@ -52,7 +52,7 @@ use crate::{
 const FILE_BATCH_SIZE: usize = 500;
 pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 100;
 const DISCOVERY_BATCH_SIZE: usize = 16;
-const MOVIE_PREPARATION_CONCURRENCY: usize = 8;
+const FILE_PREPARATION_CONCURRENCY: usize = 8;
 const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
 
 #[derive(Clone)]
@@ -306,6 +306,7 @@ impl LibraryScanner {
                     .list_filesystem_entries_for_paths(&root.id, &relative_paths)
                     .await?;
                 let mut seen_entry_ids = Vec::with_capacity(files.len());
+                let mut new_paths = Vec::new();
                 for path in files {
                     if let Some((entry_id, quick_report)) = self
                         .scan_episode_file_if_unchanged(&root, &root_path, &path, &existing_entries)
@@ -313,6 +314,40 @@ impl LibraryScanner {
                     {
                         seen_entry_ids.push(entry_id);
                         report.merge(quick_report);
+                        continue;
+                    }
+                    let relative_path = path
+                        .strip_prefix(&root_path)
+                        .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                        .to_str()
+                        .ok_or(ScannerError::NonUtf8Path)?;
+                    if !existing_entries.contains_key(relative_path) {
+                        let requires_regular_scan = self
+                            .episode_file_has_moved_entry(
+                                &library_id_text,
+                                &root,
+                                &root_path,
+                                &path,
+                            )
+                            .await?
+                            || self
+                                .episode_path_has_legacy_identity(&root, &root_path, &path)
+                                .await?;
+                        if requires_regular_scan {
+                            report.merge(
+                                self.scan_episode_file_with_provider_cache(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                    &generation,
+                                    Some(&mut refreshed_series),
+                                )
+                                .await?,
+                            );
+                        } else {
+                            new_paths.push(path);
+                        }
                         continue;
                     }
                     report.merge(
@@ -326,6 +361,26 @@ impl LibraryScanner {
                         )
                         .await?,
                     );
+                }
+                let new_episode_files = self
+                    .prepare_new_episode_files(&root, &root_path, &new_paths)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if !new_episode_files.is_empty() {
+                    let file_count = new_episode_files.len();
+                    report.created_items += self
+                        .database
+                        .insert_episode_files_batch(
+                            &library_id_text,
+                            &root.id,
+                            &generation,
+                            &new_episode_files,
+                        )
+                        .await?;
+                    report.discovered_files += file_count;
+                    report.created_sources += file_count;
                 }
                 self.database
                     .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
@@ -1014,6 +1069,14 @@ impl LibraryScanner {
         hierarchy: &EpisodeHierarchy,
         parsed: &ParsedEpisodeFilename,
     ) -> String {
+        Self::episode_identity_key_for_root(&root.id, hierarchy, parsed)
+    }
+
+    fn episode_identity_key_for_root(
+        root_id: &str,
+        hierarchy: &EpisodeHierarchy,
+        parsed: &ParsedEpisodeFilename,
+    ) -> String {
         let edition_key = parsed
             .edition_name
             .as_deref()
@@ -1021,7 +1084,7 @@ impl LibraryScanner {
             .to_ascii_lowercase();
         format!(
             "episode:{}:{}:season:{}:episode:{}:edition:{}",
-            root.id, hierarchy.series_path, hierarchy.season_number, parsed.episode, edition_key
+            root_id, hierarchy.series_path, hierarchy.season_number, parsed.episode, edition_key
         )
     }
 
@@ -1370,6 +1433,74 @@ impl LibraryScanner {
         )))
     }
 
+    async fn episode_file_has_moved_entry(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+    ) -> Result<bool, ScannerError> {
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let Some(inode) = file_identity(&metadata)
+            .1
+            .and_then(|value| i64::try_from(value).ok())
+        else {
+            return Ok(false);
+        };
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?;
+        Ok(self
+            .database
+            .find_filesystem_entry_by_inode(library_id_text, &root.id, inode, relative_path)
+            .await?
+            .is_some())
+    }
+
+    async fn episode_path_has_legacy_identity(
+        &self,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+    ) -> Result<bool, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(false);
+        };
+        let Some(parsed) = parse_episode_filename(file_name) else {
+            return Ok(false);
+        };
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?;
+        let hierarchy = episode_hierarchy(relative_path, &parsed);
+        let legacy_series = legacy_series_identity(root, &hierarchy);
+        let legacy_season = legacy_series
+            .as_deref()
+            .map(|identity| format!("{identity}:season:{}", hierarchy.season_number));
+        let legacy_episode = format!("episode:{}:{relative_path}", root.id);
+        for identity in [legacy_series, legacy_season, Some(legacy_episode)] {
+            if let Some(identity) = identity
+                && self
+                    .database
+                    .find_media_item_by_identity(&identity)
+                    .await?
+                    .is_some()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn scan_unresolved_file_if_unchanged(
         &self,
         root: &StoredLibraryRoot,
@@ -1560,6 +1691,128 @@ impl LibraryScanner {
         }))
     }
 
+    async fn prepare_new_episode_file(
+        &self,
+        root_id: &str,
+        root_path: &Path,
+        path: &Path,
+    ) -> Result<Option<NewEpisodeFile>, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        let Some(parsed) = parse_episode_filename(file_name) else {
+            return Ok(None);
+        };
+        let is_strm = is_strm_file(path);
+        let strm_target = if is_strm {
+            Some(read_strm_target(path).await?)
+        } else {
+            None
+        };
+        let external_url = strm_target
+            .as_ref()
+            .and_then(|target| target.value.as_deref());
+        let strm_target_kind = strm_target.as_ref().map(strm_target_kind_name);
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (device, inode) = file_identity(&metadata);
+        let fingerprint =
+            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let hierarchy = episode_hierarchy(&relative_path, &parsed);
+        let series_identity = format!("series:{root_id}:{}", hierarchy.series_path);
+        let season_identity = format!("{series_identity}:season:{}", hierarchy.season_number);
+        let episode_identity = Self::episode_identity_key_for_root(root_id, &hierarchy, &parsed);
+        let series_provider_ids_json = provider_ids_json(&hierarchy.provider_ids);
+        let container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let series_title = hierarchy.series_title;
+        let series_sort_title = series_title.to_lowercase();
+        Ok(Some(NewEpisodeFile {
+            filesystem_entry_id: FilesystemEntryId::new().to_string(),
+            source_id: SourceId::new().to_string(),
+            relative_path,
+            size,
+            modified_at,
+            inode: inode.and_then(|value| i64::try_from(value).ok()),
+            fingerprint,
+            series_identity,
+            series_title,
+            series_sort_title,
+            series_production_year: hierarchy.production_year.map(i64::from),
+            series_provider_ids_json,
+            season_identity,
+            season_number: i64::from(hierarchy.season_number),
+            episode_identity,
+            episode_title: parsed.title.clone(),
+            episode_sort_title: parsed.title.to_lowercase(),
+            episode_number: i64::from(parsed.episode),
+            episode_absolute_number: parsed.absolute_number.map(i64::from),
+            source_kind: if is_strm {
+                "STRM_URL".to_owned()
+            } else {
+                "LOCAL_FILE".to_owned()
+            },
+            strm_target_kind: strm_target_kind.map(str::to_owned),
+            edition_name: parsed.edition_name,
+            quality_label: parsed.quality_label,
+            container,
+            external_url: external_url.map(str::to_owned),
+        }))
+    }
+
+    async fn prepare_new_episode_files(
+        &self,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Vec<Option<NewEpisodeFile>>, ScannerError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tasks: JoinSet<Result<(usize, Option<NewEpisodeFile>), ScannerError>> =
+            JoinSet::new();
+        let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
+        for (index, path) in paths.iter().cloned().enumerate() {
+            if tasks.len() >= FILE_PREPARATION_CONCURRENCY {
+                collect_episode_preparation_task(&mut tasks, &mut results).await?;
+            }
+            let scanner = self.clone();
+            let root_id = root.id.clone();
+            let root_path = root_path.to_owned();
+            tasks.spawn(async move {
+                let prepared = scanner
+                    .prepare_new_episode_file(&root_id, &root_path, &path)
+                    .await?;
+                Ok((index, prepared))
+            });
+        }
+        while !tasks.is_empty() {
+            collect_episode_preparation_task(&mut tasks, &mut results).await?;
+        }
+        Ok(results)
+    }
+
     async fn prepare_new_movie_files(
         &self,
         root_path: &Path,
@@ -1580,7 +1833,7 @@ impl LibraryScanner {
             JoinSet::new();
         let mut results = Vec::with_capacity(paths.len());
         for (index, path) in paths.iter().cloned().enumerate() {
-            if tasks.len() >= MOVIE_PREPARATION_CONCURRENCY {
+            if tasks.len() >= FILE_PREPARATION_CONCURRENCY {
                 collect_movie_preparation_task(&mut tasks, &mut results).await?;
             }
             let scanner = self.clone();
@@ -4375,6 +4628,31 @@ async fn collect_movie_preparation_task(
         }
     };
     results.push(result);
+    Ok(())
+}
+
+async fn collect_episode_preparation_task(
+    tasks: &mut JoinSet<Result<(usize, Option<NewEpisodeFile>), ScannerError>>,
+    results: &mut [Option<NewEpisodeFile>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-preparation-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-preparation-task>"),
+                source: std::io::Error::other("episode preparation task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
     Ok(())
 }
 
