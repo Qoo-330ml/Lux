@@ -2132,6 +2132,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn next_metadata_reidentify_item(
         &self,
         job_id: &str,
@@ -2169,33 +2170,68 @@ impl Database {
         })
     }
 
-    pub(crate) async fn claim_metadata_reidentify_item(
+    /// Claims up to `limit` metadata items in one write transaction.
+    ///
+    /// Keeping the priority selection and status updates in the same
+    /// transaction avoids one read, one write transaction, and one commit per
+    /// worker slot while preserving the existing series/season/episode order.
+    pub(crate) async fn claim_next_metadata_reidentify_items(
         &self,
         job_id: &str,
-        item_id: &str,
-    ) -> Result<bool, StorageError> {
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        let result = self
-            .query(
-                "UPDATE metadata_reidentify_job_items
-             SET status = 'RUNNING', updated_at = unixepoch()
-             WHERE job_id = ? AND item_id = ? AND status = 'PENDING'
-               AND EXISTS (
-                   SELECT 1 FROM metadata_reidentify_jobs
-                   WHERE id = ? AND status IN ('QUEUED', 'RUNNING')
-                     AND cancel_requested = 0
-               )",
+        let mut claimed = self
+            .query_scalar::<String>(
+                "WITH prioritized AS (
+                     SELECT job_items.item_id, job_items.status,
+                            CASE
+                                WHEN items.item_type IN ('MOVIE', 'SERIES') THEN 0
+                                WHEN items.item_type = 'SEASON' THEN 1
+                                WHEN items.item_type = 'EPISODE' THEN 2
+                                ELSE 3
+                            END AS priority
+                     FROM metadata_reidentify_job_items job_items
+                     JOIN media_items items ON items.id = job_items.item_id
+                     WHERE job_items.job_id = ?
+                 ), eligible AS (
+                     SELECT item_id
+                     FROM prioritized
+                     WHERE status = 'PENDING'
+                       AND priority = (
+                           SELECT MIN(priority)
+                           FROM prioritized
+                           WHERE status IN ('PENDING', 'RUNNING')
+                       )
+                     ORDER BY item_id
+                     LIMIT ?
+                 )
+                 UPDATE metadata_reidentify_job_items
+                 SET status = 'RUNNING', updated_at = unixepoch()
+                 WHERE job_id = ? AND status = 'PENDING'
+                   AND item_id IN (SELECT item_id FROM eligible)
+                   AND EXISTS (
+                       SELECT 1 FROM metadata_reidentify_jobs
+                       WHERE id = ? AND status IN ('QUEUED', 'RUNNING')
+                         AND cancel_requested = 0
+                   )
+                 RETURNING item_id",
             )
             .bind(job_id)
-            .bind(item_id)
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
             .bind(job_id)
-            .execute(&mut *transaction)
+            .bind(job_id)
+            .fetch_all(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
+        claimed.sort_unstable();
         transaction
             .commit()
             .await
@@ -2203,7 +2239,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(result.rows_affected() == 1)
+        Ok(claimed)
     }
 
     pub(crate) async fn finish_metadata_reidentify_item(

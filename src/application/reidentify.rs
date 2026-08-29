@@ -521,41 +521,43 @@ impl MetadataReidentifyService {
             let mut queue_exhausted = false;
             while workers.len() < concurrency {
                 let queue_wait_started = Instant::now();
-                let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
+                let available = concurrency.saturating_sub(workers.len());
+                let mut worker_permits = Vec::with_capacity(available);
+                for _ in 0..available {
+                    let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
+                    else {
+                        queue_exhausted = true;
+                        break;
+                    };
+                    worker_permits.push(worker_permit);
+                }
+                if queue_exhausted {
+                    break;
+                }
+                let Ok(item_ids) = self
+                    .database
+                    .claim_next_metadata_reidentify_items(job_id, available)
+                    .await
                 else {
                     queue_exhausted = true;
                     break;
                 };
-                if self
-                    .database
-                    .metadata_reidentify_job_cancel_requested(job_id)
-                    .await
-                    .unwrap_or(true)
-                {
+                if item_ids.is_empty() {
                     queue_exhausted = true;
                     break;
                 }
-                let Ok(Some(item_id)) = self.database.next_metadata_reidentify_item(job_id).await
-                else {
-                    queue_exhausted = true;
-                    break;
-                };
-                if !self
-                    .database
-                    .claim_metadata_reidentify_item(job_id, &item_id)
-                    .await
-                    .unwrap_or(false)
-                {
-                    continue;
+                for _ in 0..item_ids.len() {
+                    self.resources
+                        .record_metadata_stage("queue_wait", queue_wait_started.elapsed());
                 }
-                let service = self.clone();
-                let job_id = job_id.to_owned();
-                self.resources
-                    .record_metadata_stage("queue_wait", queue_wait_started.elapsed());
-                workers.spawn(async move {
-                    let _worker_permit = worker_permit;
-                    service.process_item(&job_id, &item_id, mode).await;
-                });
+                for (item_id, worker_permit) in item_ids.into_iter().zip(worker_permits) {
+                    let service = self.clone();
+                    let job_id = job_id.to_owned();
+                    workers.spawn(async move {
+                        let _worker_permit = worker_permit;
+                        service.process_item(&job_id, &item_id, mode).await;
+                    });
+                }
             }
             if workers.is_empty() && queue_exhausted {
                 break;
