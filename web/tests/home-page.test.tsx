@@ -18,6 +18,7 @@ describe("HomePage shelves", () => {
 
   beforeEach(() => {
     localStorage.clear();
+    sessionStorage.clear();
     vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
   });
 
@@ -325,5 +326,100 @@ describe("HomePage shelves", () => {
     expect(container.querySelector(".lux-hero-title")?.textContent).toBe("");
     expect(container.querySelector(".lux-hero-title")?.querySelector("img")?.getAttribute("alt"))
       .toBe("精选电影");
+  });
+
+  it("shows the previous homepage immediately while a hard-refresh request is pending", async () => {
+    const response = {
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE", latest: [] }],
+      recommended: [],
+      continueWatching: [],
+    };
+    const home = vi.spyOn(api, "home").mockResolvedValueOnce(response);
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const firstQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={firstQueryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    const cachedLibraryCard = container.querySelector('[aria-label="我的媒体库"] .lux-library-card');
+    expect(cachedLibraryCard).not.toBeNull();
+    expect(cachedLibraryCard?.textContent).toContain("电影库");
+
+    act(() => root?.unmount());
+    root = undefined;
+
+    let resolveRefresh: ((value: typeof response) => void) | undefined;
+    home.mockReturnValueOnce(new Promise((resolve) => { resolveRefresh = resolve; }));
+    const secondQueryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={secondQueryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    const refreshedLibraryCard = container.querySelector('[aria-label="我的媒体库"] .lux-library-card');
+    expect(refreshedLibraryCard).not.toBeNull();
+    expect(refreshedLibraryCard?.textContent).toContain("电影库");
+    expect(container.querySelector(".lux-skeleton-page")).toBeNull();
+
+    await act(async () => {
+      resolveRefresh?.(response);
+    });
+  });
+
+  it("prefetches the first library page when a homepage library is focused", async () => {
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影库", kind: "MOVIE", latest: [] }],
+      recommended: [],
+      continueWatching: [],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({ items: [], page: 1, pageSize: 24, total: 0 });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const prefetch = vi.spyOn(queryClient, "prefetchInfiniteQuery");
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const libraryLink = container.querySelector<HTMLAnchorElement>(".lux-library-card-link");
+    expect(libraryLink).not.toBeNull();
+    await act(async () => {
+      libraryLink?.focus();
+    });
+
+    expect(prefetch).toHaveBeenCalledWith(expect.objectContaining({
+      queryKey: queryKeys.library("library-1", 1, "MOVIE", "Name", "Ascending", "all"),
+      initialPageParam: 1,
+    }));
   });
 });

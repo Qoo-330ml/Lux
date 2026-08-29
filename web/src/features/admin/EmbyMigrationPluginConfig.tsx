@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { AlertTriangle, CheckCircle2, CloudDownload, LoaderCircle, RefreshCw, Save, ShieldCheck, XCircle } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminPlugin, AdminEmbyMigrationJob, AdminEmbyMigrationSourceUser } from "../../lib/api/types";
@@ -29,6 +29,7 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
   const [currentStep, setCurrentStep] = useState<MigrationStep>(1);
   const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
   const [mergePolicy, setMergePolicy] = useState<MergePolicy>("MERGE");
+  const connectionRef = useRef<ConnectionInfo | null>(null);
   const baseUrlField = plugin.configFields.find((field) => field.key === "baseUrl");
   const apiKeyField = plugin.configFields.find((field) => field.key === "apiKey");
   const privateNetworkField = plugin.configFields.find((field) => field.key === "allowPrivateNetwork");
@@ -68,14 +69,18 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
   });
 
   useEffect(() => {
-    if (connection) return;
+    connectionRef.current = connection;
+  }, [connection]);
+
+  useEffect(() => {
+    if (connectionRef.current) return;
     const values = plugin.configValues ?? {};
     setBaseUrl(typeof values.baseUrl === "string" ? values.baseUrl : "");
     setAllowPrivateNetwork(values.allowPrivateNetwork === true);
     setApiKey("");
     setApiKeyDirty(false);
     setConnectionDirty(false);
-  }, [connection, plugin.configValues]);
+  }, [plugin.configValues]);
 
   return (
     <div className="lux-emby-migration-plugin-config">

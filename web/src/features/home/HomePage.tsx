@@ -2,19 +2,26 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
 import { ChevronLeft, ChevronRight, Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { LuxUser, MediaItem } from "../../lib/api/types";
+import type { HomeResponse, Library, LuxUser, MediaItem, PageResponse } from "../../lib/api/types";
 import { HERO_CAROUSEL_INTERVAL_MS, heroSlides, heroTitleScale } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 
+const HOME_CACHE_VERSION = 1;
+const HOME_CACHE_TTL_MS = 5 * 60_000;
+
 export function HomePage({ user }: { user: LuxUser }) {
   const queryClient = useQueryClient();
+  const cachedHome = useMemo(() => readHomeCache(user.id), [user.id]);
   const home = useQuery({
     queryKey: queryKeys.home,
     queryFn: () => api.home(),
+    initialData: cachedHome?.data,
+    initialDataUpdatedAt: cachedHome?.savedAt,
+    staleTime: 0,
     refetchInterval: queryRefreshIntervals.mediaSurface,
     refetchIntervalInBackground: false,
   });
@@ -24,15 +31,38 @@ export function HomePage({ user }: { user: LuxUser }) {
       queryClient.setQueryData(queryKeys.libraries, {
         libraries: home.data.libraries ?? [],
       });
+      writeHomeCache(user.id, home.data);
     }
-  }, [home.data, queryClient]);
+  }, [home.data, queryClient, user.id]);
 
-  if (home.isPending) return <HomeSkeleton />;
-  if (home.error) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
+  if (home.isPending && !home.data) return <HomeSkeleton />;
+  if (home.error && !home.data) return <section className="lux-page-state"><h1>首页加载失败</h1><p>{home.error.message}</p></section>;
 
-  const data = home.data;
+  const data = home.data ?? {};
   const libraries = data.libraries ?? [];
   const slides = heroSlides(data);
+  const prefetchLibrary = (library: Library) => {
+    const itemTypes = library.kind === "SERIES"
+      ? "SERIES"
+      : library.kind === "MOVIE"
+        ? "MOVIE"
+        : library.kind === "MIXED"
+          ? "MOVIE,SERIES"
+          : undefined;
+    const sortBy = "Name" as const;
+    const sortOrder = "Ascending" as const;
+    void queryClient.prefetchInfiniteQuery({
+      queryKey: queryKeys.library(library.id, 1, itemTypes, sortBy, sortOrder, "all"),
+      queryFn: ({ pageParam }) => api.libraryItems(library.id, pageParam, itemTypes, { sortBy, sortOrder }),
+      initialPageParam: 1,
+      getNextPageParam: (lastPage: PageResponse<MediaItem>) => {
+        const page = lastPage.page ?? 1;
+        const pageSize = lastPage.pageSize ?? 24;
+        const total = lastPage.total ?? 0;
+        return page * pageSize < total ? page + 1 : undefined;
+      },
+    });
+  };
   return (
     <div className="lux-home">
       <HeroCarousel items={slides} continueWatching={data.continueWatching ?? []} />
@@ -41,7 +71,7 @@ export function HomePage({ user }: { user: LuxUser }) {
           <div className="lux-section-heading"><h2>我的媒体库</h2><span>{libraries.length} 个库</span></div>
           <HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">
             <div className="lux-library-rail">
-              {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} />) : <EmptyLibraries />}
+              {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} onPrefetch={() => prefetchLibrary(library)} />) : <EmptyLibraries />}
             </div>
           </HorizontalScrollRail>
         </section>
@@ -50,6 +80,42 @@ export function HomePage({ user }: { user: LuxUser }) {
       </div>
     </div>
   );
+}
+
+function homeCacheKey(userId: string) {
+  return `lux.home.v${HOME_CACHE_VERSION}:${encodeURIComponent(userId)}`;
+}
+
+function readHomeCache(userId: string): { data: HomeResponse; savedAt: number } | undefined {
+  if (!userId || typeof window === "undefined") return undefined;
+  try {
+    const raw = window.sessionStorage.getItem(homeCacheKey(userId));
+    if (!raw) return undefined;
+    const parsed: unknown = JSON.parse(raw);
+    if (!isRecord(parsed) || parsed.version !== HOME_CACHE_VERSION || !isRecord(parsed.data)) return undefined;
+    if (typeof parsed.savedAt !== "number" || !Number.isFinite(parsed.savedAt)) return undefined;
+    if (Date.now() - parsed.savedAt > HOME_CACHE_TTL_MS) return undefined;
+    return { data: parsed.data as HomeResponse, savedAt: parsed.savedAt };
+  } catch {
+    return undefined;
+  }
+}
+
+function writeHomeCache(userId: string, data: HomeResponse) {
+  if (!userId || typeof window === "undefined") return;
+  try {
+    window.sessionStorage.setItem(homeCacheKey(userId), JSON.stringify({
+      version: HOME_CACHE_VERSION,
+      savedAt: Date.now(),
+      data,
+    }));
+  } catch {
+    // Storage can be unavailable in private browsing or when the quota is exhausted.
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
 }
 
 function HeroCarousel({ items, continueWatching }: { items: MediaItem[]; continueWatching: MediaItem[] }) {
