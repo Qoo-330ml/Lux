@@ -1663,15 +1663,15 @@ impl EmbyMigrationService {
             .collect())
     }
 
-    async fn load_media_identity_index(
+    async fn load_media_identity_index_with_lookups(
         &self,
         items: &[MigrationItem],
+        lookups: &[MigrationMediaIdentityLookup],
         target_library_filter: Option<&[String]>,
     ) -> Result<MigrationMediaIdentityIndex, EmbyMigrationServiceError> {
-        let lookups = migration_media_identity_lookups(items);
         let mut identities = self
             .database
-            .list_migration_media_identity_candidates_filtered(&lookups, target_library_filter)
+            .list_migration_media_identity_candidates_filtered(lookups, target_library_filter)
             .await?;
 
         // Keep the explicit TARGET_LIBRARY_EXCLUDED report for items that are
@@ -1721,7 +1721,7 @@ impl EmbyMigrationService {
             return Ok(index.clone());
         }
         let index = self
-            .load_media_identity_index(items, target_library_filter)
+            .load_media_identity_index_with_lookups(items, &key.lookups, target_library_filter)
             .await?;
         cache.insert(key, index.clone());
         Ok(index)
