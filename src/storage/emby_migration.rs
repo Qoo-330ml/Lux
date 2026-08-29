@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use super::{Database, StorageError, StoredUserItemState};
+#[cfg(test)]
+use super::StoredUserItemState;
+use super::{Database, StorageError};
 use sqlx::Row;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -775,6 +777,7 @@ impl Database {
         .map_err(storage_error)
     }
 
+    #[cfg(test)]
     pub(crate) async fn find_user_item_state_for_migration(
         &self,
         user_id: &str,
@@ -802,6 +805,7 @@ impl Database {
         .map_err(storage_error)
     }
 
+    #[cfg(test)]
     pub(crate) async fn upsert_imported_user_item_state(
         &self,
         state: &NewImportedUserItemState<'_>,
