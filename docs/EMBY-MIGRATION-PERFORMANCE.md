@@ -54,7 +54,7 @@ cargo test --locked --lib migration_page_batch_benchmark_records_operation_count
 
 按预期收益和风险排序：
 
-1. **Provider 优先候选查询**：当前页候选 SQL 仍会对整页执行 Provider 查询后再执行标题/年份回退，即使 Provider 已唯一命中。先用索引确定唯一 Provider 命中，仅对未命中条目发起标题回退；保持冲突报告和白名单外诊断不变。
+1. **Provider 优先候选查询（已完成）**：当前页先通过 `media_item_provider_ids` 索引解析 Provider 候选，只有完全没有 Provider 候选的 lookup 才发起标题/年份回退；Provider 命中（包括多候选冲突）不会再触发标题查询。白名单外诊断仍对当前页未解析条目执行一次无过滤回退，不改变报告语义。
 
 2. **来源用户分页/搜索**：扩展 `migration.list_users` 的可选 `startIndex`、`limit`、`search`，配置页只请求当前页；旧插件继续返回完整列表。需要同步更新插件 SDK、协议兼容测试和真实 Emby 插件。
 3. **用户链接批量写入**：将用户映射报告按 100 条一批写入单事务；用户创建/资料变更仍逐用户执行，以保留密码占位和最后管理员保护。先增加查询/事务计数基准，再替换逐条 link upsert。
