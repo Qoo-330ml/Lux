@@ -68,3 +68,6 @@ cargo test --locked --lib migration_page_batch_benchmark_records_operation_count
 
 同一合成 500 条页面在本轮代码上复测结果为：17 条数据库语句、1 个事务、7 ms、67,285 items/s、峰值 RSS
 23,707,648 bytes（macOS `aarch64`，SQLite 临时库）。该数据集没有重复匹配键，因此主要用于确认新增去重逻辑没有让基线退化；重复键折叠和恢复页跳过已分别由回归测试覆盖。
+
+字段投影修复后的再次复测（同一数据集）为：17 条数据库语句、1 个事务、7 ms、68,426 items/s、峰值 RSS
+24,150,016 bytes（macOS `aarch64`，SQLite 临时库）。该波动属于本机合成基准的正常抖动，未观察到写入路径退化。
