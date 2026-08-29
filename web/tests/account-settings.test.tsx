@@ -120,6 +120,37 @@ describe("account settings", () => {
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
   });
 
+  it("keeps logout beside the sidebar account identity without the device and permission card", async () => {
+    const logout = vi.spyOn(api, "logout").mockResolvedValue();
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={{ ...user, canManageServer: true }} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const profileCard = container.querySelector(".lux-account-profile-card");
+    expect(profileCard?.querySelector(".lux-account-logout-button")?.textContent).toContain("退出登录");
+    expect(profileCard?.textContent).toContain(user.usernameNormalized);
+    expect(container.querySelector(".lux-account-footer-card")).toBeNull();
+    expect(container.textContent).not.toContain("当前设备");
+    expect(container.textContent).not.toContain("账户权限");
+
+    await act(async () => {
+      profileCard?.querySelector<HTMLButtonElement>(".lux-account-logout-button")?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(logout).toHaveBeenCalledOnce();
+  });
+
   it("saves the personal automatic watched threshold", async () => {
     const update = vi.spyOn(api, "updateUserSettings").mockResolvedValue({ playedPercent: 82 });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });

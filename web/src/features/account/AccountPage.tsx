@@ -219,6 +219,14 @@ export function AccountPage({ user }: { user: LuxUser }) {
               <strong>{displayName}</strong>
               <span>{user.usernameNormalized}</span>
             </div>
+            <button
+              className="lux-button lux-button-compact lux-button-secondary lux-account-logout-button"
+              type="button"
+              onClick={() => logout.mutate()}
+              disabled={logout.isPending}
+            >
+              <LogOut size={15} />{logout.isPending ? "正在退出…" : "退出登录"}
+            </button>
           </div>
           <nav className="lux-account-settings-nav">
             <a href="#appearance"><Palette size={16} />外观</a>
@@ -410,11 +418,6 @@ export function AccountPage({ user }: { user: LuxUser }) {
             </form>
           </SettingsSection>
 
-          <div className="lux-account-footer-card">
-            <div><Monitor size={18} /><div><strong>当前设备</strong><span>Web 浏览器</span></div></div>
-            <div><ShieldCheck size={18} /><div><strong>账户权限</strong><span>{user.canManageServer ? "服务器管理员" : "普通用户"}</span></div></div>
-            <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => logout.mutate()} disabled={logout.isPending}><LogOut size={17} />{logout.isPending ? "正在退出…" : "退出登录"}</button>
-          </div>
           {logout.error ? <p className="lux-error-copy">{logout.error.message}</p> : null}
         </div>
       </div>
