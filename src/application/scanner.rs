@@ -1443,12 +1443,9 @@ impl LibraryScanner {
         &self,
         root_path: &Path,
         path: &Path,
-        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+        existing_entry: &StoredFilesystemEntry,
     ) -> Result<Option<(String, ScanReport)>, ScannerError> {
-        let (relative_path, fingerprint) = current_file_fingerprint(root_path, path).await?;
-        let Some(existing_entry) = existing_entries.get(&relative_path) else {
-            return Ok(None);
-        };
+        let (_, fingerprint) = current_file_fingerprint(root_path, path).await?;
         if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
             return Ok(None);
         }
@@ -3011,7 +3008,16 @@ impl ScanJobService {
                 .await?;
             existing_entries_by_root.insert(root_id, existing_entries);
         }
-        for entry in &batch {
+        let concurrency = self.effective_scan_concurrency(scan_concurrency).await;
+        let mut quick_results = self
+            .scan_reconciliation_file_fingerprints(
+                &roots,
+                &batch,
+                &existing_entries_by_root,
+                concurrency,
+            )
+            .await?;
+        for (entry_index, entry) in batch.iter().enumerate() {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(&job.id).await;
             }
@@ -3100,15 +3106,7 @@ impl ScanJobService {
             let existing_entries = existing_entries_by_root
                 .get(&root.id)
                 .ok_or_else(|| ScannerError::LibraryNotFound)?;
-            if let Some((entry_id, quick_report)) = self
-                .scanner
-                .scan_file_if_fingerprint_unchanged(
-                    Path::new(&root.canonical_path),
-                    &path,
-                    existing_entries,
-                )
-                .await?
-            {
+            if let Some((entry_id, quick_report)) = quick_results[entry_index].take() {
                 quick_seen_entry_ids.push(entry_id);
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
@@ -3267,7 +3265,6 @@ impl ScanJobService {
             processed = processed.saturating_add(1);
             completed_entries.push(entry.clone());
         }
-        let concurrency = self.effective_scan_concurrency(scan_concurrency).await;
         let mut prepared_movie_files = HashMap::<String, Vec<NewMovieFile>>::new();
         let mut prepared_episode_files = HashMap::<String, Vec<NewEpisodeFile>>::new();
         for (root_id, works) in new_works_by_root {
@@ -3407,6 +3404,53 @@ impl ScanJobService {
         .await
     }
 
+    async fn scan_reconciliation_file_fingerprints(
+        &self,
+        roots: &[StoredLibraryRoot],
+        batch: &[StoredReconciliationScanEntry],
+        existing_entries_by_root: &HashMap<String, HashMap<String, StoredFilesystemEntry>>,
+        concurrency: usize,
+    ) -> Result<Vec<Option<(String, ScanReport)>>, ScannerError> {
+        let mut results = (0..batch.len()).map(|_| None).collect::<Vec<_>>();
+        let mut tasks: JoinSet<ReconciliationFingerprintTask> = JoinSet::new();
+        for (index, entry) in batch.iter().enumerate() {
+            let Some(root) = roots.iter().find(|root| root.id == entry.library_root_id) else {
+                continue;
+            };
+            let path = Path::new(&root.canonical_path).join(&entry.relative_path);
+            if !is_supported_movie_file(&path) {
+                continue;
+            }
+            let Some(existing_entry) = existing_entries_by_root
+                .get(&root.id)
+                .and_then(|entries| entries.get(&entry.relative_path))
+                .cloned()
+            else {
+                continue;
+            };
+            while tasks.len() >= concurrency.max(1) {
+                collect_reconciliation_fingerprint_task(&mut tasks, &mut results).await?;
+            }
+            let scanner = self.scanner.clone();
+            let root_path = PathBuf::from(&root.canonical_path);
+            tasks.spawn(async move {
+                let result = match scanner
+                    .scan_file_if_fingerprint_unchanged(&root_path, &path, &existing_entry)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(ScannerError::Io { .. }) => None,
+                    Err(error) => return Err(error),
+                };
+                Ok((index, result))
+            });
+        }
+        while !tasks.is_empty() {
+            collect_reconciliation_fingerprint_task(&mut tasks, &mut results).await?;
+        }
+        Ok(results)
+    }
+
     async fn run_movie_reconciliation_file_batch(
         &self,
         job: &StoredScanJob,
@@ -3450,6 +3494,17 @@ impl ScanJobService {
                 .await?;
             existing_entries_by_root.insert(root_id, existing_entries);
         }
+        let concurrency = self
+            .effective_scan_concurrency(configured_concurrency)
+            .await;
+        let mut quick_results = self
+            .scan_reconciliation_file_fingerprints(
+                roots,
+                batch,
+                &existing_entries_by_root,
+                concurrency,
+            )
+            .await?;
 
         for (index, entry) in batch.iter().enumerate() {
             if cancellation.load(Ordering::Acquire) {
@@ -3547,15 +3602,7 @@ impl ScanJobService {
             let existing_entries = existing_entries_by_root
                 .get(&root.id)
                 .ok_or_else(|| ScannerError::LibraryNotFound)?;
-            if let Some((entry_id, quick_report)) = self
-                .scanner
-                .scan_file_if_fingerprint_unchanged(
-                    Path::new(&root.canonical_path),
-                    &path,
-                    existing_entries,
-                )
-                .await?
-            {
+            if let Some((entry_id, quick_report)) = quick_results[index].take() {
                 quick_seen_entry_ids.push(entry_id);
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
@@ -3606,9 +3653,6 @@ impl ScanJobService {
             ));
         }
 
-        let concurrency = self
-            .effective_scan_concurrency(configured_concurrency)
-            .await;
         let mut preparation_tasks: JoinSet<MoviePreparationTask> = JoinSet::new();
         let mut active_tasks = 0_usize;
         let mut prepared_files = HashMap::<String, Vec<NewMovieFile>>::new();
@@ -4881,6 +4925,7 @@ type MoviePreparationOutput = (
 );
 type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
 type MovieFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
+type ReconciliationFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
 
 async fn collect_movie_fingerprint_task(
     tasks: &mut JoinSet<MovieFingerprintTask>,
@@ -4898,6 +4943,31 @@ async fn collect_movie_fingerprint_task(
             return Err(ScannerError::Io {
                 path: PathBuf::from("<movie-fingerprint-task>"),
                 source: std::io::Error::other("movie fingerprint task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
+    Ok(())
+}
+
+async fn collect_reconciliation_fingerprint_task(
+    tasks: &mut JoinSet<ReconciliationFingerprintTask>,
+    results: &mut [Option<(String, ScanReport)>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-fingerprint-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-fingerprint-task>"),
+                source: std::io::Error::other("reconciliation fingerprint task set is empty"),
             });
         }
     };
