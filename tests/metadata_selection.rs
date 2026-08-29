@@ -25,7 +25,7 @@ use luxd::{
         libraries::LibraryService,
         metadata::MetadataEnricher,
         metadata_paths::{library_item_directory, lux_person_directory, people_directory},
-        people::PeopleService,
+        people::{ActorCredit, PeopleService},
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
         scanner::LibraryScanner,
         scraper::ScraperProvider,
@@ -50,6 +50,62 @@ const PNG_1X1: &[u8] = &[
     0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
     0x42, 0x60, 0x82,
 ];
+
+#[tokio::test]
+async fn selecting_candidate_without_credits_preserves_existing_people_relation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    PeopleService::new(fixture.config.config_dir.clone())
+        .with_database(fixture.database.clone())
+        .persist_item_actors(
+            &fixture.item_id,
+            "tmdb",
+            &[ActorCredit {
+                id: "9".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "Existing actor".to_owned(),
+                character: None,
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    let relation_path =
+        library_item_directory(&fixture.config.config_dir, &fixture.item_id)?.join("people.json");
+    let before = tokio::fs::read(&relation_path).await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Online title",
+            "overview": "Online overview",
+            "providerIds": {"Tmdb": "603"}
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::with_config_dir(
+        fixture.database.clone(),
+        ImageWriteService::new_with_config_dir(
+            fixture.database.clone(),
+            fixture.config.config_dir.clone(),
+        )?,
+        fixture.config.config_dir.clone(),
+    );
+
+    selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    let after = tokio::fs::read(&relation_path).await?;
+    assert_eq!(after, before);
+    Ok(())
+}
 
 #[tokio::test]
 async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()

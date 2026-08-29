@@ -2237,10 +2237,20 @@ impl MetadataSelectionService {
             .any(|image_type| matches!(*image_type, "POSTER" | "THUMB"))
             || self.images.has_local_image(item_id, "POSTER").await?
             || self.images.has_local_image(item_id, "THUMB").await?;
-        let actor_count = self
-            .people
-            .persist_item_actors(item_id, &candidate.provider, &payload.actors)
-            .await?;
+        // An empty credits response means the provider did not supply cast data;
+        // avoid rewriting the persisted relation (and its database index) on
+        // every fill-missing refresh. Existing local/NFO credits remain intact.
+        // Full refresh keeps its replacement semantics for an explicit empty
+        // credits result.
+        let actor_count = if payload.actors.is_empty()
+            && matches!(application_mode, MetadataSelectionMode::FillMissing)
+        {
+            0
+        } else {
+            self.people
+                .persist_item_actors(item_id, &candidate.provider, &payload.actors)
+                .await?
+        };
         let nfo_started = std::time::Instant::now();
         let nfo_report = if current.item_type == "MOVIE" {
             self.nfo.write_item_movie_nfo(item_id, &movie_nfo).await?
