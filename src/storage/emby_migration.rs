@@ -966,6 +966,7 @@ impl Database {
         }
         let mut identities = Vec::new();
         let mut seen = HashSet::<(String, Option<String>, Option<String>)>::new();
+        let mut resolved_provider_keys = HashSet::<(String, String)>::new();
         let mut provider_keys = lookups
             .iter()
             .flat_map(|lookup| lookup.provider_ids.iter().cloned())
@@ -991,11 +992,14 @@ impl Database {
                 query = query.bind(provider).bind(provider_id);
             }
             for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
+                let provider: String = row.get("provider");
+                let provider_id: String = row.get("provider_id");
+                resolved_provider_keys.insert((provider.clone(), provider_id.clone()));
                 let identity = StoredMigrationPersonIdentity {
                     id: row.get("id"),
                     display_name: row.get("display_name"),
-                    provider: row.try_get("provider").ok(),
-                    provider_id: row.try_get("provider_id").ok(),
+                    provider: Some(provider),
+                    provider_id: Some(provider_id),
                 };
                 let key = (
                     identity.id.clone(),
@@ -1010,6 +1014,14 @@ impl Database {
 
         let mut names = lookups
             .iter()
+            .filter(|lookup| {
+                // Provider identity is authoritative for migration matching;
+                // once any provider key resolves, a name query cannot change
+                // the outcome (including a provider conflict).
+                !lookup.provider_ids.iter().any(|(provider, provider_id)| {
+                    resolved_provider_keys.contains(&(provider.clone(), provider_id.clone()))
+                })
+            })
             .map(|lookup| lookup.normalized_name.as_str())
             .filter(|name| !name.is_empty())
             .collect::<Vec<_>>();
@@ -2274,13 +2286,52 @@ mod tests {
             .await?;
 
         assert!(database.query_count() <= 3);
-        assert_eq!(identities.len(), 3);
+        assert_eq!(identities.len(), 2);
         assert!(
             identities
                 .iter()
                 .any(|identity| identity.id == provider_person)
         );
         assert!(identities.iter().any(|identity| identity.id == name_person));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_person_candidates_skip_name_lookup_when_provider_resolves()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let person_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO people (
+                id, display_name, directory_name, normalized_name, status, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'ACTIVE', unixepoch(), unixepoch())",
+        )
+        .bind(&person_id)
+        .bind("Actor A")
+        .bind("Actor A")
+        .bind("actora")
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO person_identities (
+                person_id, provider, provider_id, match_method, confidence, evidence_json,
+                created_at, updated_at
+             ) VALUES (?, 'tmdb', '42', 'TEST', 100, '{}', unixepoch(), unixepoch())",
+        )
+        .bind(&person_id)
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        let identities = database
+            .list_migration_person_identity_candidates(&[MigrationPersonIdentityLookup {
+                normalized_name: "actora".to_owned(),
+                provider_ids: vec![("tmdb".to_owned(), "42".to_owned())],
+            }])
+            .await?;
+
+        assert_eq!(identities.len(), 1);
+        assert_eq!(database.query_count(), 1);
         Ok(())
     }
 
