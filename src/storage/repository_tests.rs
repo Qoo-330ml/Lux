@@ -86,6 +86,55 @@ async fn library_listing_uses_constant_number_of_child_queries() {
 }
 
 #[tokio::test]
+async fn migration_library_identity_listing_reads_only_enabled_libraries_once() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let service = LibraryService::new(database.clone());
+
+    let enabled = service
+        .create_library("Enabled", LibraryKind::Movie, false)
+        .await
+        .expect("enabled library");
+    let disabled = service
+        .create_library("Disabled", LibraryKind::Movie, false)
+        .await
+        .expect("disabled library");
+    let root = temp_dir.path().join("enabled-root");
+    tokio::fs::create_dir(&root).await.expect("library root");
+    let canonical_root = tokio::fs::canonicalize(&root)
+        .await
+        .expect("canonical library root");
+    service
+        .add_root(enabled.id, root.to_str().expect("utf-8 root"))
+        .await
+        .expect("enabled library root");
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(disabled.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("disable library");
+
+    database.reset_query_count();
+    let identities = database
+        .list_enabled_library_identities()
+        .await
+        .expect("migration identities");
+
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(identities.len(), 1);
+    assert_eq!(identities[0].id, enabled.id.to_string());
+    assert_eq!(identities[0].name, "Enabled");
+    assert_eq!(
+        identities[0].root_paths,
+        vec![canonical_root.to_string_lossy().into_owned()]
+    );
+}
+
+#[tokio::test]
 async fn recent_catalog_rows_use_one_query_for_multiple_libraries() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

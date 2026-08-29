@@ -45,6 +45,8 @@ const MAX_SELECTED_LIBRARY_COUNT: usize = 1_000;
 const MAX_MIGRATION_PAGE_RECOVERY_RPCS: u64 = 32;
 const MAX_MEDIA_IDENTITY_CACHE_ENTRIES: usize = 64;
 const MAX_MEDIA_IDENTITY_CACHE_IDENTITIES: usize = 8_192;
+const MAX_PERSON_IDENTITY_CACHE_ENTRIES: usize = 64;
+const MAX_PERSON_IDENTITY_CACHE_IDENTITIES: usize = 8_192;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -923,6 +925,11 @@ impl EmbyMigrationService {
             MAX_MEDIA_IDENTITY_CACHE_IDENTITIES,
         );
         let mut media_identity_cache_hits = 0_u64;
+        let mut person_identity_cache = MigrationPersonIdentityCache::new(
+            MAX_PERSON_IDENTITY_CACHE_ENTRIES,
+            MAX_PERSON_IDENTITY_CACHE_IDENTITIES,
+        );
+        let mut person_identity_cache_hits = 0_u64;
         let user_ids = user_links
             .iter()
             .map(|(user, _)| user.id.clone())
@@ -1375,13 +1382,21 @@ impl EmbyMigrationService {
                         MigrationPersonIdentityIndex::new(Vec::new())
                     } else {
                         let lookups = migration_person_identity_lookups(&people);
-                        let candidate_started = Instant::now();
-                        let identities = self
-                            .database
-                            .list_migration_person_identity_candidates(&lookups)
-                            .await?;
-                        candidate_query_ms += candidate_started.elapsed().as_millis();
-                        MigrationPersonIdentityIndex::new(identities)
+                        let cache_key = MigrationPersonIdentityCacheKey { lookups };
+                        if let Some(index) = person_identity_cache.get(&cache_key) {
+                            person_identity_cache_hits += 1;
+                            index.clone()
+                        } else {
+                            let candidate_started = Instant::now();
+                            let identities = self
+                                .database
+                                .list_migration_person_identity_candidates(&cache_key.lookups)
+                                .await?;
+                            candidate_query_ms += candidate_started.elapsed().as_millis();
+                            let index = MigrationPersonIdentityIndex::new(identities);
+                            person_identity_cache.insert(cache_key, index.clone());
+                            index
+                        }
                     };
                     for person in people {
                         let user_data = person.user_data.clone().unwrap_or(MigrationUserData {
@@ -1518,6 +1533,7 @@ impl EmbyMigrationService {
             finalizing_ms,
             candidate_query_ms,
             media_identity_cache_hits,
+            person_identity_cache_hits,
             database_write_ms,
             processed,
             matched,
@@ -1638,27 +1654,15 @@ impl EmbyMigrationService {
     async fn load_library_identities(
         &self,
     ) -> Result<Vec<MigrationLuxLibraryIdentity>, EmbyMigrationServiceError> {
-        let libraries = self.database.list_libraries().await?;
-        let library_ids = libraries
-            .iter()
-            .map(|library| library.id.clone())
-            .collect::<Vec<_>>();
-        let mut roots_by_library = self
+        Ok(self
             .database
-            .list_library_roots_by_library_ids(&library_ids)
-            .await?;
-        Ok(libraries
+            .list_enabled_library_identities()
+            .await?
             .into_iter()
-            .filter(|library| library.is_enabled)
             .map(|library| MigrationLuxLibraryIdentity {
-                id: library.id.clone(),
+                id: library.id,
                 name: library.name,
-                root_paths: roots_by_library
-                    .remove(&library.id)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|root| root.canonical_path)
-                    .collect(),
+                root_paths: library.root_paths,
             })
             .collect())
     }
@@ -2485,6 +2489,72 @@ impl MigrationMediaIdentityCache {
     }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct MigrationPersonIdentityCacheKey {
+    lookups: Vec<MigrationPersonIdentityLookup>,
+}
+
+struct MigrationPersonIdentityCache {
+    max_entries: usize,
+    max_identities: usize,
+    identity_count: usize,
+    entries: HashMap<MigrationPersonIdentityCacheKey, MigrationPersonIdentityIndex>,
+}
+
+impl MigrationPersonIdentityCache {
+    fn new(max_entries: usize, max_identities: usize) -> Self {
+        Self {
+            max_entries: max_entries.max(1),
+            max_identities: max_identities.max(1),
+            identity_count: 0,
+            entries: HashMap::new(),
+        }
+    }
+
+    fn get(&self, key: &MigrationPersonIdentityCacheKey) -> Option<&MigrationPersonIdentityIndex> {
+        self.entries.get(key)
+    }
+
+    fn insert(
+        &mut self,
+        key: MigrationPersonIdentityCacheKey,
+        index: MigrationPersonIdentityIndex,
+    ) {
+        let identity_count = index.identity_count();
+        if identity_count > self.max_identities {
+            return;
+        }
+        let existing_identity_count = self
+            .entries
+            .get(&key)
+            .map(MigrationPersonIdentityIndex::identity_count)
+            .unwrap_or_default();
+        let projected_identity_count = self
+            .identity_count
+            .saturating_sub(existing_identity_count)
+            .saturating_add(identity_count);
+        if (!self.entries.contains_key(&key) && self.entries.len() >= self.max_entries)
+            || projected_identity_count > self.max_identities
+        {
+            // The cache is a bounded acceleration layer for one migration run,
+            // not a second copy of the canonical people index.
+            self.entries.clear();
+            self.identity_count = 0;
+        }
+        if let Some(previous) = self.entries.insert(key, index) {
+            self.identity_count = self
+                .identity_count
+                .saturating_sub(previous.identity_count());
+        }
+        self.identity_count = self.identity_count.saturating_add(identity_count);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 #[derive(Clone)]
 struct MigrationMediaIdentityIndex {
     identities: Vec<StoredMigrationMediaIdentity>,
@@ -2621,16 +2691,20 @@ fn migration_person_identity_lookups(
     lookups
 }
 
+#[derive(Clone)]
 struct MigrationPersonIdentityIndex {
     by_provider: HashMap<(String, String), Vec<String>>,
     by_name: HashMap<String, Vec<String>>,
+    identity_count: usize,
 }
 
 impl MigrationPersonIdentityIndex {
     fn new(identities: Vec<StoredMigrationPersonIdentity>) -> Self {
         let mut by_provider: HashMap<(String, String), Vec<String>> = HashMap::new();
         let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+        let mut identity_ids = HashSet::new();
         for identity in identities {
+            identity_ids.insert(identity.id.clone());
             let normalized_name = normalize_person_name(&identity.display_name);
             if !normalized_name.is_empty() {
                 let ids = by_name.entry(normalized_name).or_default();
@@ -2656,7 +2730,12 @@ impl MigrationPersonIdentityIndex {
         Self {
             by_provider,
             by_name,
+            identity_count: identity_ids.len(),
         }
+    }
+
+    fn identity_count(&self) -> usize {
+        self.identity_count
     }
 }
 
@@ -3444,6 +3523,63 @@ mod tests {
                 series_id: None,
                 season_number: None,
                 episode_number: None,
+            }]),
+        );
+        assert!(identity_limited_cache.len() <= 1);
+    }
+
+    #[test]
+    fn person_identity_page_cache_is_bounded_and_reuses_equivalent_keys() {
+        let mut cache = MigrationPersonIdentityCache::new(2, 2);
+        let first_key = MigrationPersonIdentityCacheKey {
+            lookups: vec![MigrationPersonIdentityLookup {
+                normalized_name: "actor".to_owned(),
+                provider_ids: vec![("tmdb".to_owned(), "42".to_owned())],
+            }],
+        };
+        let first_index = MigrationPersonIdentityIndex::new(vec![]);
+
+        cache.insert(first_key.clone(), first_index);
+        assert!(cache.get(&first_key).is_some());
+
+        for name in ["actor-a", "actor-b", "actor-c"] {
+            cache.insert(
+                MigrationPersonIdentityCacheKey {
+                    lookups: vec![MigrationPersonIdentityLookup {
+                        normalized_name: name.to_owned(),
+                        provider_ids: Vec::new(),
+                    }],
+                },
+                MigrationPersonIdentityIndex::new(Vec::new()),
+            );
+        }
+
+        assert!(cache.len() <= 2);
+
+        let mut identity_limited_cache = MigrationPersonIdentityCache::new(4, 1);
+        identity_limited_cache.insert(
+            MigrationPersonIdentityCacheKey {
+                lookups: Vec::new(),
+            },
+            MigrationPersonIdentityIndex::new(vec![StoredMigrationPersonIdentity {
+                id: "person-1".to_owned(),
+                display_name: "Actor".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                provider_id: Some("42".to_owned()),
+            }]),
+        );
+        identity_limited_cache.insert(
+            MigrationPersonIdentityCacheKey {
+                lookups: vec![MigrationPersonIdentityLookup {
+                    normalized_name: "actor-2".to_owned(),
+                    provider_ids: Vec::new(),
+                }],
+            },
+            MigrationPersonIdentityIndex::new(vec![StoredMigrationPersonIdentity {
+                id: "person-2".to_owned(),
+                display_name: "Actor 2".to_owned(),
+                provider: None,
+                provider_id: None,
             }]),
         );
         assert!(identity_limited_cache.len() <= 1);

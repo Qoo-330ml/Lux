@@ -272,6 +272,47 @@ impl Database {
         Ok(libraries)
     }
 
+    /// Return only the identity data needed to map an external migration
+    /// library.  The migration path must not load disabled libraries,
+    /// scraper configuration, or other administrative settings.
+    pub(crate) async fn list_enabled_library_identities(
+        &self,
+    ) -> Result<Vec<StoredLibraryIdentity>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT l.id, l.name, r.canonical_path
+                 FROM libraries l
+                 LEFT JOIN library_roots r ON r.library_id = l.id
+                 WHERE l.is_enabled = 1
+                 ORDER BY l.name, l.id, r.canonical_path, r.id",
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut identities = Vec::<StoredLibraryIdentity>::new();
+        for row in rows {
+            let id: String = row.get("id");
+            if let Some(identity) = identities.last_mut().filter(|identity| identity.id == id) {
+                if let Some(root_path) = row.get::<Option<String>, _>("canonical_path") {
+                    identity.root_paths.push(root_path);
+                }
+                continue;
+            }
+            identities.push(StoredLibraryIdentity {
+                id,
+                name: row.get("name"),
+                root_paths: row
+                    .get::<Option<String>, _>("canonical_path")
+                    .into_iter()
+                    .collect(),
+            });
+        }
+        Ok(identities)
+    }
+
     pub(crate) async fn find_library(
         &self,
         id: &str,

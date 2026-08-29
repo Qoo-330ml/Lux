@@ -312,7 +312,7 @@ pub(crate) struct MigrationMediaIdentityLookup {
 /// Exact person keys extracted from one bounded Emby favorites page. Provider
 /// IDs and normalized names are resolved in batches so the migration runner
 /// never needs to materialize the complete people identity table.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct MigrationPersonIdentityLookup {
     pub normalized_name: String,
     pub provider_ids: Vec<(String, String)>,

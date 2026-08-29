@@ -620,6 +620,13 @@ pub(crate) struct StoredLibrary {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredLibraryIdentity {
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) root_paths: Vec<String>,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredLibraryScraper {
     pub(crate) scraper_id: String,
     pub(crate) position: i64,
