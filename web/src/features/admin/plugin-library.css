@@ -322,7 +322,7 @@
   width: min(100%, 1080px);
 }
 
-.lux-admin-plugin-migration-dialog .lux-emby-migration-workspace {
+.lux-admin-plugin-migration-dialog .lux-emby-migration-plugin-config {
   padding-bottom: 0;
 }
 

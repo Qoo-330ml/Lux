@@ -1,29 +1,15 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, CircleHelp, CloudDownload, LoaderCircle, RefreshCw, Save, ShieldCheck, XCircle } from "lucide-react";
-import { useEffect, useState, type ReactNode } from "react";
+import { AlertTriangle, CheckCircle2, CloudDownload, LoaderCircle, RefreshCw, Save, ShieldCheck, XCircle } from "lucide-react";
+import { useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type {
-  AdminPlugin,
-  AdminEmbyMigrationImport,
-  AdminEmbyMigrationJob,
-  AdminEmbyMigrationMatch,
-  AdminEmbyMigrationPersonFavorite,
-  AdminEmbyMigrationUserLink,
-} from "../../lib/api/types";
+import type { AdminPlugin, AdminEmbyMigrationJob } from "../../lib/api/types";
+import { EmbyMigrationReports, type ReportTab, useMigrationReport } from "./EmbyMigrationReports";
 
-type ReportTab = "users" | "matches" | "imports" | "personFavorites";
-type MigrationReportEntry = AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport | AdminEmbyMigrationPersonFavorite;
-type MigrationReportData = {
-  page?: number;
-  pageSize?: number;
-  users?: MigrationReportEntry[];
-  matches?: MigrationReportEntry[];
-  imports?: MigrationReportEntry[];
-  personFavorites?: MigrationReportEntry[];
-};
+type MergePolicy = "MERGE" | "OVERWRITE" | "SKIP";
+type ConnectionInfo = Awaited<ReturnType<typeof api.testAdminEmbyMigration>>;
 
-const pageSize = 50;
+const reportTabs: ReportTab[] = ["users", "matches", "imports", "personFavorites"];
 
 export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
   const queryClient = useQueryClient();
@@ -31,9 +17,21 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyDirty, setApiKeyDirty] = useState(false);
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
+  const [connection, setConnection] = useState<ConnectionInfo | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [connectionDirty, setConnectionDirty] = useState(false);
   const baseUrlField = plugin.configFields.find((field) => field.key === "baseUrl");
   const apiKeyField = plugin.configFields.find((field) => field.key === "apiKey");
   const privateNetworkField = plugin.configFields.find((field) => field.key === "allowPrivateNetwork");
+
+  const clearConnection = () => {
+    setConnection(null);
+    setConnectionError(null);
+  };
+  const markConnectionDirty = () => {
+    clearConnection();
+    setConnectionDirty(true);
+  };
   const save = useMutation({
     mutationFn: () => api.updateAdminPluginConfig(plugin.id, {
       baseUrl: baseUrl.trim(),
@@ -43,6 +41,8 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
     onSuccess: () => {
       setApiKey("");
       setApiKeyDirty(false);
+      clearConnection();
+      setConnectionDirty(false);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
     },
@@ -54,36 +54,59 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
     setAllowPrivateNetwork(values.allowPrivateNetwork === true);
     setApiKey("");
     setApiKeyDirty(false);
+    clearConnection();
+    setConnectionDirty(false);
   }, [plugin.configValues]);
 
   return (
     <div className="lux-emby-migration-plugin-config">
-      <section className="lux-emby-plugin-settings-panel" aria-labelledby="emby-plugin-settings-heading">
-        <PanelHeading headingId="emby-plugin-settings-heading" icon={<ShieldCheck size={19} />} title="连接设置" description="地址和 API Key 只在此插件配置中管理，迁移页面不再单独出现。" />
+      <div className="lux-emby-migration-intro">
+        <div>
+          <span className="lux-admin-eyebrow">Emby → Lux</span>
+          <p>保存并测试连接，先预览匹配结果，再执行导入。</p>
+        </div>
+        <span className="lux-emby-flow-label">3 步完成</span>
+      </div>
+
+      <section className="lux-emby-migration-section" aria-labelledby="emby-plugin-settings-heading">
+        <StepHeading number="1" headingId="emby-plugin-settings-heading" title="连接 Emby" description="连接信息只保存在这个插件中。" icon={<ShieldCheck size={18} />} />
         <form className="lux-emby-plugin-settings-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); save.mutate(); }}>
-          {baseUrlField ? <label htmlFor="emby-plugin-base-url">{baseUrlField.label}<input id="emby-plugin-base-url" type="url" required={baseUrlField.required} value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="http://emby.local:8096" autoComplete="url" /><small>{baseUrlField.description}</small></label> : null}
-          {apiKeyField ? <label htmlFor="emby-plugin-api-key">{apiKeyField.label}<input id="emby-plugin-api-key" type="password" required={apiKeyField.required && !plugin.configured} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空保留已保存的 API Key" autoComplete="new-password" /><small>{apiKeyField.description}</small></label> : null}
-          {privateNetworkField ? <label className="lux-admin-toggle lux-emby-private-toggle"><input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => setAllowPrivateNetwork(event.target.checked)} /><span><strong>{privateNetworkField.label}</strong><small>{privateNetworkField.description}</small></span></label> : null}
-          <div className="lux-emby-plugin-settings-actions">
-            <button className="lux-button lux-button-primary" type="submit" disabled={save.isPending}><Save size={15} /> {save.isPending ? "保存中…" : "保存连接设置"}</button>
-            <span>连接凭据由 Emby 迁移插件配置管理。</span>
+          <div className="lux-emby-connection-fields">
+            {baseUrlField ? <label htmlFor="emby-plugin-base-url">{baseUrlField.label}<input id="emby-plugin-base-url" type="url" required={baseUrlField.required} value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); markConnectionDirty(); }} placeholder="http://emby.local:8096" autoComplete="url" /><small>{baseUrlField.description}</small></label> : null}
+            {apiKeyField ? <label htmlFor="emby-plugin-api-key">{apiKeyField.label}<input id="emby-plugin-api-key" type="password" required={apiKeyField.required && !plugin.configured} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); markConnectionDirty(); }} placeholder="留空保留已保存的 API Key" autoComplete="new-password" /><small>{apiKeyField.description}</small></label> : null}
           </div>
+          {privateNetworkField ? <label className="lux-admin-toggle lux-emby-private-toggle"><input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => { setAllowPrivateNetwork(event.target.checked); markConnectionDirty(); }} /><span><strong>{privateNetworkField.label}</strong><small>{privateNetworkField.description}</small></span></label> : null}
+          <div className="lux-emby-plugin-settings-actions">
+            <button className="lux-button lux-button-secondary" type="submit" disabled={save.isPending}><Save size={15} /> {save.isPending ? "保存中…" : "保存设置"}</button>
+            <TestConnectionButton onStart={clearConnection} onSuccess={(result) => { setConnectionError(null); setConnection(result); }} onError={setConnectionError} disabled={save.isPending || connectionDirty} />
+          </div>
+          {connectionDirty ? <span className="lux-emby-unsaved-hint">保存更改后才能测试连接</span> : null}
           {save.error ? <InlineError message={save.error.message} /> : null}
         </form>
+        {connectionError ? <InlineError message={connectionError} /> : null}
+        {connection ? <ConnectionResult connection={connection} /> : null}
       </section>
-      <MigrationWorkspace />
+
+      <MigrationWorkspace connection={connection} />
     </div>
   );
 }
 
-function MigrationWorkspace() {
+function TestConnectionButton({ onStart, onSuccess, onError, disabled }: { onStart: () => void; onSuccess: (connection: ConnectionInfo) => void; onError: (message: string) => void; disabled: boolean }) {
+  const testConnection = useMutation({
+    mutationFn: () => api.testAdminEmbyMigration(),
+    onSuccess,
+    onError: (error) => onError(error instanceof Error ? error.message : "连接测试失败"),
+  });
+  return <button className="lux-button lux-button-primary" type="button" aria-label="测试 Emby 连接" disabled={disabled || testConnection.isPending} onClick={() => { onStart(); testConnection.mutate(); }}><RefreshCw size={15} className={testConnection.isPending ? "lux-spin" : undefined} /> {testConnection.isPending ? "测试中…" : "测试连接"}</button>;
+}
+
+function MigrationWorkspace({ connection }: { connection: ConnectionInfo | null }) {
   const queryClient = useQueryClient();
-  const [dryRun, setDryRun] = useState(true);
-  const [mergePolicy, setMergePolicy] = useState<"MERGE" | "OVERWRITE" | "SKIP">("MERGE");
-  const [connection, setConnection] = useState<Awaited<ReturnType<typeof api.testAdminEmbyMigration>> | null>(null);
+  const [mergePolicy, setMergePolicy] = useState<MergePolicy>("MERGE");
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [tab, setTab] = useState<ReportTab>("users");
-  const [reportPage, setReportPage] = useState<Record<ReportTab, number>>({ users: 1, matches: 1, imports: 1, personFavorites: 1 });
+  const [reportPage, setReportPage] = useState<Record<ReportTab, number>>(() => initialReportPages());
 
   const jobs = useQuery({
     queryKey: queryKeys.adminEmbyMigrations(),
@@ -98,27 +121,27 @@ function MigrationWorkspace() {
     refetchInterval: (query) => isActiveJob(query.state.data?.job) ? 5_000 : false,
   });
   const job = detail.data?.job ?? selectedFromList;
+  const previewReady = job?.dryRun === true && job.status === "COMPLETED";
+  const active = isActiveJob(job);
+  const canCreate = Boolean(connection && !active);
 
   useEffect(() => {
-    if (!selectedJobId && jobs.data?.jobs?.[0]) setSelectedJobId(jobs.data.jobs[0].id);
+    if (!selectedJobId && jobs.data?.jobs?.[0]) selectJob(jobs.data.jobs[0].id);
   }, [jobs.data?.jobs, selectedJobId]);
 
-  const testConnection = useMutation({
-    mutationFn: () => api.testAdminEmbyMigration(),
-    onSuccess: setConnection,
-  });
   const createJob = useMutation({
-    mutationFn: () => api.createAdminEmbyMigration({ dryRun, mergePolicy }),
+    mutationFn: (dryRun: boolean) => api.createAdminEmbyMigration({ dryRun, mergePolicy }),
     onSuccess: ({ job: created }) => {
-      setSelectedJobId(created.id);
-      setTab("users");
-      setReportPage({ users: 1, matches: 1, imports: 1, personFavorites: 1 });
+      selectJob(created.id);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminEmbyMigrations() });
     },
   });
   const cancelJob = useMutation({
     mutationFn: (jobId: string) => api.cancelAdminEmbyMigration(jobId),
-    onSuccess: (_, jobId) => void queryClient.invalidateQueries({ queryKey: queryKeys.adminEmbyMigration(jobId) }),
+    onSuccess: (_, jobId) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminEmbyMigration(jobId) });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminEmbyMigrations() });
+    },
   });
   const retryJob = useMutation({
     mutationFn: (jobId: string) => api.retryAdminEmbyMigration(jobId),
@@ -127,123 +150,79 @@ function MigrationWorkspace() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminEmbyMigrations() });
     },
   });
+  function selectJob(jobId: string) {
+    setSelectedJobId(jobId);
+    setTab("users");
+    setReportPage(initialReportPages());
+  }
 
-  const report = useMigrationReport(selectedJobId, tab, reportPage[tab]);
-  const canStart = Boolean(connection && !createJob.isPending);
+  const actionIsPreview = !previewReady;
+  const actionDisabled = !canCreate || createJob.isPending;
+  const actionLabel = createJob.isPending
+    ? "创建中…"
+    : active
+      ? "迁移进行中"
+      : previewReady
+        ? "执行迁移"
+        : connection
+          ? "生成预览"
+          : "先测试连接";
 
   return (
-    <div className="lux-emby-migration-workspace">
-      <section className="lux-admin-panel lux-emby-migration-panel" aria-labelledby="emby-connection-heading">
-        <PanelHeading headingId="emby-connection-heading" icon={<CloudDownload size={19} />} title="测试连接" description="使用上方插件配置中已保存的 Emby 连接信息。" />
-        <div className="lux-emby-plugin-settings-notice">
-          <p>保存连接设置后，先测试读取权限和历史播放能力，再创建预览或正式迁移任务。</p>
-          <button className="lux-button lux-button-secondary" type="button" aria-label="测试 Emby 连接" disabled={testConnection.isPending} onClick={() => testConnection.mutate()}>
-            {testConnection.isPending ? <LoaderCircle size={16} className="lux-spin" /> : <RefreshCw size={16} />}
-            {testConnection.isPending ? "测试中…" : "测试连接"}
+    <>
+      <section className="lux-emby-migration-section" aria-labelledby="emby-migration-action-heading">
+        <StepHeading number="2" headingId="emby-migration-action-heading" title="迁移数据" description={previewReady ? "预览已完成，确认匹配结果后执行导入。" : "默认先生成预览，不会创建用户或修改播放状态。"} icon={<CloudDownload size={18} />} />
+        <div className="lux-emby-migration-action">
+          <div>
+            <strong>{previewReady ? "预览已完成" : "先从预览开始"}</strong>
+            <span>{previewReady ? "确认报告无误后，可以执行正式迁移。" : "默认合并已有播放状态。"}</span>
+          </div>
+          <button className="lux-button lux-button-primary" type="button" aria-label={previewReady ? "执行 Emby 迁移" : "开始 Emby 迁移"} disabled={actionDisabled} onClick={() => createJob.mutate(actionIsPreview)}>
+            {previewReady ? <CloudDownload size={15} /> : <RefreshCw size={15} />}
+            {actionLabel}
           </button>
         </div>
-        {testConnection.error ? <InlineError message={testConnection.error.message} /> : null}
-        {connection ? <ConnectionResult connection={connection} /> : null}
-      </section>
-
-      <section className="lux-admin-panel lux-emby-migration-panel" aria-labelledby="emby-migration-settings-heading">
-        <PanelHeading headingId="emby-migration-settings-heading" icon={<CloudDownload size={19} />} title="迁移设置" description="建议先用预览任务确认用户和媒体匹配结果。" />
-        <div className="lux-emby-migration-settings">
-          <label className="lux-admin-toggle lux-emby-dry-run">
-            <input type="checkbox" checked={dryRun} onChange={(event) => setDryRun(event.target.checked)} />
-            <span><strong>先创建预览任务（推荐）</strong><small>只读取并生成报告，不创建用户、不导入播放状态。</small></span>
-          </label>
+        <details className="lux-emby-advanced-options">
+          <summary>高级选项 <span>默认：合并</span></summary>
           <label>
             <span>已有播放状态</span>
-            <select value={mergePolicy} onChange={(event) => setMergePolicy(event.target.value as typeof mergePolicy)}>
+            <select value={mergePolicy} onChange={(event) => setMergePolicy(event.target.value as MergePolicy)}>
               <option value="MERGE">合并：保留两边更完整的状态</option>
               <option value="OVERWRITE">覆盖：使用 Emby 状态</option>
               <option value="SKIP">跳过：不修改已有状态</option>
             </select>
           </label>
-          <button className="lux-button lux-button-primary" type="button" aria-label="开始 Emby 迁移" disabled={!canStart} onClick={() => createJob.mutate()}>
-            <CloudDownload size={16} /> {createJob.isPending ? "创建中…" : dryRun ? "创建预览任务" : "开始正式迁移"}
-          </button>
-        </div>
+        </details>
         {createJob.error ? <InlineError message={createJob.error.message} /> : null}
-        {createJob.data ? <p className="lux-emby-migration-success"><CheckCircle2 size={16} /> {createJob.data.job.dryRun ? "预览任务已创建" : "正式迁移任务已创建"}</p> : null}
+        {createJob.data ? <p className="lux-emby-migration-success" role="status"><CheckCircle2 size={15} /> {createJob.data.job.dryRun ? "预览任务已创建" : "正式迁移任务已创建"}</p> : null}
       </section>
 
-      <CapabilityNotice capability={connection?.historyCapability ?? job?.historyCapability} />
-
-      <section className="lux-admin-panel lux-emby-migration-panel" aria-labelledby="emby-migration-jobs-heading">
-        <PanelHeading headingId="emby-migration-jobs-heading" icon={<RefreshCw size={19} />} title="迁移任务" description="运行中的任务每 5 秒自动刷新。" />
-        {jobs.isPending ? <LoadingState label="正在读取迁移任务…" /> : jobs.error ? <InlineError message={jobs.error.message} /> : jobs.data?.jobs?.length ? (
+      <section className="lux-emby-migration-section" aria-labelledby="emby-migration-jobs-heading">
+        <StepHeading number="3" headingId="emby-migration-jobs-heading" title="任务与结果" description="任务会自动保存，运行中每 5 秒更新一次。" icon={<RefreshCw size={18} />} />
+        {jobs.isPending ? <LoadingState label="正在读取任务…" /> : jobs.error ? <InlineError message={jobs.error.message} /> : jobs.data?.jobs?.length ? (
           <div className="lux-emby-job-list">
-            {jobs.data.jobs.map((candidate) => <JobSummary key={candidate.id} job={candidate} selected={candidate.id === selectedJobId} onSelect={() => setSelectedJobId(candidate.id)} />)}
+            {jobs.data.jobs.map((candidate) => <JobSummary key={candidate.id} job={candidate} selected={candidate.id === selectedJobId} onSelect={() => selectJob(candidate.id)} />)}
           </div>
-        ) : <EmptyState label="还没有迁移任务" detail="测试连接后，可以从上方创建一个预览任务。" />}
+        ) : <EmptyState label="还没有任务" detail="测试连接后，点击“生成预览”开始。" />}
       </section>
 
-      {job ? <MigrationDetails
-        job={job}
-        tab={tab}
-        report={report}
-        onTabChange={(nextTab) => { setTab(nextTab); setReportPage((current) => ({ ...current, [nextTab]: 1 })); }}
-        onPageChange={(page) => setReportPage((current) => ({ ...current, [tab]: page }))}
-        onCancel={() => cancelJob.mutate(job.id)}
-        onRetry={() => retryJob.mutate(job.id)}
-        actionPending={cancelJob.isPending || retryJob.isPending}
-      /> : null}
-    </div>
+      {job ? <MigrationDetails key={job.id} job={job} tab={tab} page={reportPage[tab]} onTabChange={(nextTab) => { setTab(nextTab); setReportPage((current) => ({ ...current, [nextTab]: 1 })); }} onPageChange={(page) => setReportPage((current) => ({ ...current, [tab]: page }))} onCancel={() => cancelJob.mutate(job.id)} onRetry={() => retryJob.mutate(job.id)} actionPending={cancelJob.isPending || retryJob.isPending} /> : null}
+    </>
   );
 }
 
-function useMigrationReport(jobId: string | null, tab: ReportTab, page: number) {
-  return useQuery<MigrationReportData>({
-    queryKey: jobId ? reportKey(tab, jobId, page) : ["admin", "emby-migration-report", "none", tab, page],
-    queryFn: (): Promise<MigrationReportData> => {
-      if (!jobId) return Promise.resolve({ page, pageSize, users: [], matches: [], imports: [], personFavorites: [] });
-      if (tab === "users") return api.adminEmbyMigrationUsers(jobId, page);
-      if (tab === "matches") return api.adminEmbyMigrationMatches(jobId, page);
-      if (tab === "personFavorites") return api.adminEmbyMigrationPersonFavorites(jobId, page);
-      return api.adminEmbyMigrationImports(jobId, page);
-    },
-    enabled: Boolean(jobId),
-    retry: false,
-  });
-}
-
-function reportKey(tab: ReportTab, jobId: string, page: number) {
-  if (tab === "users") return queryKeys.adminEmbyMigrationUsers(jobId, page);
-  if (tab === "matches") return queryKeys.adminEmbyMigrationMatches(jobId, page);
-  if (tab === "personFavorites") return queryKeys.adminEmbyMigrationPersonFavorites(jobId, page);
-  return queryKeys.adminEmbyMigrationImports(jobId, page);
-}
-
-function MigrationDetails({
-  job,
-  tab,
-  report,
-  onTabChange,
-  onPageChange,
-  onCancel,
-  onRetry,
-  actionPending,
-}: {
-  job: AdminEmbyMigrationJob;
-  tab: ReportTab;
-  report: ReturnType<typeof useMigrationReport>;
-  onTabChange: (tab: ReportTab) => void;
-  onPageChange: (page: number) => void;
-  onCancel: () => void;
-  onRetry: () => void;
-  actionPending: boolean;
-}) {
+function MigrationDetails({ job, tab, page, onTabChange, onPageChange, onCancel, onRetry, actionPending }: { job: AdminEmbyMigrationJob; tab: ReportTab; page: number; onTabChange: (tab: ReportTab) => void; onPageChange: (page: number) => void; onCancel: () => void; onRetry: () => void; actionPending: boolean }) {
   const progress = job.totalCount > 0 ? Math.min(100, Math.round((job.processedCount / job.totalCount) * 100)) : 0;
   const active = isActiveJob(job);
+  const [reportsOpen, setReportsOpen] = useState(false);
+  const report = useMigrationReport(job.id, tab, page, reportsOpen);
   return (
-    <section className="lux-admin-panel lux-emby-migration-panel" aria-labelledby="emby-migration-detail-heading">
-      <div className="lux-admin-panel-heading">
-        <div><span className="lux-admin-eyebrow">任务详情</span><h2 id="emby-migration-detail-heading">{job.sourceLabel}</h2><p>{statusLabel(job.status)} · {phaseLabel(job.phase)} · {job.dryRun ? "预览" : "正式迁移"}</p></div>
+    <section className="lux-emby-migration-section lux-emby-migration-details" aria-labelledby="emby-migration-detail-heading">
+      <div className="lux-emby-detail-heading">
+        <div><span className="lux-admin-eyebrow">当前任务</span><h3 id="emby-migration-detail-heading">{job.sourceLabel}</h3><p>{statusLabel(job.status)} · {phaseLabel(job.phase)} · {job.dryRun ? "预览" : "正式迁移"}</p></div>
         <div className="lux-emby-job-actions">
-          {active ? <button className="lux-button lux-button-secondary" type="button" disabled={actionPending || job.cancelRequested} onClick={onCancel}><XCircle size={15} /> {job.cancelRequested ? "取消中…" : "取消任务"}</button> : null}
-          {job.status === "FAILED" || job.status === "CANCELLED" ? <button className="lux-button lux-button-secondary" type="button" disabled={actionPending} onClick={onRetry}><RefreshCw size={15} /> 重试</button> : null}
+          {active ? <button className="lux-button lux-button-secondary" type="button" disabled={actionPending || job.cancelRequested} onClick={onCancel}><XCircle size={14} /> {job.cancelRequested ? "取消中…" : "取消"}</button> : null}
+          {job.status === "FAILED" || job.status === "CANCELLED" ? <button className="lux-button lux-button-secondary" type="button" disabled={actionPending} onClick={onRetry}><RefreshCw size={14} /> 重试</button> : null}
         </div>
       </div>
       <div className="lux-emby-job-progress" aria-label={`迁移进度 ${progress}%`}>
@@ -252,61 +231,33 @@ function MigrationDetails({
       </div>
       <div className="lux-emby-job-stats"><Stat label="已匹配" value={job.matchedCount} /><Stat label="已跳过" value={job.skippedCount} /><Stat label="失败" value={job.failedCount} /></div>
       {job.error ? <InlineError message={job.error} /> : null}
-      <div className="lux-emby-reports">
-        <div className="lux-emby-report-tabs" role="tablist" aria-label="迁移报告">
-          <ReportTabButton active={tab === "users"} onClick={() => onTabChange("users")}>用户关联</ReportTabButton>
-          <ReportTabButton active={tab === "matches"} onClick={() => onTabChange("matches")}>媒体匹配</ReportTabButton>
-          <ReportTabButton active={tab === "imports"} onClick={() => onTabChange("imports")}>导入结果</ReportTabButton>
-          <ReportTabButton active={tab === "personFavorites"} onClick={() => onTabChange("personFavorites")}>人物收藏</ReportTabButton>
-        </div>
-        {report.isPending ? <LoadingState label="正在读取报告…" /> : report.error ? <InlineError message={report.error.message} /> : <ReportContent tab={tab} data={report.data} page={reportPageFrom(report.data)} onPageChange={onPageChange} />}
-      </div>
+      <details className="lux-emby-reports" open={reportsOpen} onToggle={(event) => setReportsOpen(event.currentTarget.open)}>
+        <summary>查看迁移报告 <span>用户、媒体、导入、人物收藏</span></summary>
+        {reportsOpen ? <EmbyMigrationReports jobId={job.id} tab={tab} report={report} onTabChange={onTabChange} onPageChange={onPageChange} /> : null}
+      </details>
     </section>
   );
 }
 
-function ReportContent({ tab, data, page, onPageChange }: { tab: ReportTab; data: unknown; page: number; onPageChange: (page: number) => void }) {
-  const entries = tab === "users" ? ((data as { users?: AdminEmbyMigrationUserLink[] })?.users ?? []) : tab === "matches" ? ((data as { matches?: AdminEmbyMigrationMatch[] })?.matches ?? []) : tab === "imports" ? ((data as { imports?: AdminEmbyMigrationImport[] })?.imports ?? []) : ((data as { personFavorites?: AdminEmbyMigrationPersonFavorite[] })?.personFavorites ?? []);
-  const response = data as { page?: number; pageSize?: number };
-  const currentPage = response.page ?? page;
-  const hasNext = entries.length >= (response.pageSize ?? pageSize);
-  if (!entries.length) return <EmptyState label="此报告暂无记录" detail="任务运行后，这里会显示可核对的迁移结果。" />;
-  return <>
-    <div className="lux-emby-report-table">{tab === "users" ? entries.map((entry, index) => <UserReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationUserLink} />) : tab === "matches" ? entries.map((entry, index) => <MatchReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationMatch} />) : tab === "imports" ? entries.map((entry, index) => <ImportReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationImport} />) : entries.map((entry, index) => <PersonFavoriteReportRow key={`${entry.jobId}-${index}`} entry={entry as AdminEmbyMigrationPersonFavorite} />)}</div>
-    <div className="lux-emby-pagination"><button className="lux-button lux-button-secondary" type="button" disabled={currentPage <= 1} onClick={() => onPageChange(currentPage - 1)}>上一页</button><span>第 {currentPage} 页</span><button className="lux-button lux-button-secondary" type="button" disabled={!hasNext} onClick={() => onPageChange(currentPage + 1)}>下一页</button></div>
-  </>;
+function ConnectionResult({ connection }: { connection: ConnectionInfo }) {
+  const eventHistory = connection.historyCapability === "EVENT_HISTORY";
+  return <div className={`lux-emby-connection-result ${eventHistory ? "is-complete" : "is-limited"}`} role="status"><CheckCircle2 size={17} /><div><strong>{connection.serverName || "Emby 服务器"}</strong><span>{[connection.productName, connection.version].filter(Boolean).join(" · ")}</span></div><small>{eventHistory ? "完整历史时间线可用" : "完整历史播放时间线不可用"}</small></div>;
 }
 
-function UserReportRow({ entry }: { entry: AdminEmbyMigrationUserLink }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyUsername}</strong><small>Emby ID：{entry.embyUserId}</small></div><ReportStatus status={entry.status} /><span>{entry.luxUserId ? `Lux 用户：${entry.luxUserId}` : entry.error ?? "未关联"}</span></div>; }
-function MatchReportRow({ entry }: { entry: AdminEmbyMigrationMatch }) { return <div className="lux-emby-report-row"><div><strong>{entry.detail.title ? String(entry.detail.title) : entry.embyItemId}</strong><small>{entry.embyItemType} · {entry.matchMethod}{entry.confidence == null ? "" : ` · ${entry.confidence}%`}</small></div><ReportStatus status={entry.status} /><span>{entry.luxItemId ? `Lux 媒体：${luxMediaLabel(entry.detail, entry.luxItemId)}` : safeDetail(entry.detail)}</span></div>; }
-function ImportReportRow({ entry }: { entry: AdminEmbyMigrationImport }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyItemId}</strong><small>Emby 用户：{entry.embyUserId}</small></div><ReportStatus status={entry.status} /><span>{entry.error ?? "状态已写入 Lux"}</span></div>; }
-function PersonFavoriteReportRow({ entry }: { entry: AdminEmbyMigrationPersonFavorite }) { return <div className="lux-emby-report-row"><div><strong>{entry.embyPersonName}</strong><small>Emby 用户：{entry.embyUserId} · Person ID：{entry.embyPersonId}</small></div><ReportStatus status={entry.status} /><span>{entry.luxPersonId ? `Lux 人物：${entry.luxPersonId}` : `${entry.matchMethod}${entry.confidence == null ? "" : ` · ${entry.confidence}%`} · ${entry.error ?? "未匹配"}`}</span></div>; }
+function StepHeading({ number, headingId, title, description, icon }: { number: string; headingId: string; title: string; description: string; icon: React.ReactNode }) {
+  return <div className="lux-emby-step-heading"><span className="lux-emby-step-number" aria-hidden="true">{number}</span><div><span className="lux-emby-step-caption">第 {number} 步</span><h3 id={headingId}>{title}</h3><p>{description}</p></div><span className="lux-emby-step-icon" aria-hidden="true">{icon}</span></div>;
+}
 
-function ConnectionResult({ connection }: { connection: Awaited<ReturnType<typeof api.testAdminEmbyMigration>> }) { return <div className="lux-emby-connection-result"><CheckCircle2 size={18} /><div><strong>{connection.serverName || "Emby 服务器"}</strong><span>{[connection.productName, connection.version, connection.serverId ? `Server ID：${connection.serverId}` : null].filter(Boolean).join(" · ")}</span></div></div>; }
-function CapabilityNotice({ capability }: { capability?: string }) { if (!capability) return null; const eventHistory = capability === "EVENT_HISTORY"; return <section className={`lux-emby-capability ${eventHistory ? "is-ok" : "is-warning"}`}><div className="lux-emby-capability-icon">{eventHistory ? <CheckCircle2 size={19} /> : <AlertTriangle size={19} />}</div><div><strong>{eventHistory ? "Emby 历史事件可用" : "完整历史播放时间线不可用"}</strong><p>{eventHistory ? "将按用户和媒体导入可获得的播放事件及进度。" : "Emby API 当前只能提供每个用户-媒体的聚合状态：已看、播放位置、播放次数、最近播放时间和收藏。旧的逐次播放事件（例如每次看到第几集的几分几秒）无法恢复。"}</p></div><CircleHelp size={17} aria-label="能力说明" /></section>; }
-function JobSummary({ job, selected, onSelect }: { job: AdminEmbyMigrationJob; selected: boolean; onSelect: () => void }) { return <button className={`lux-emby-job-summary ${selected ? "is-selected" : ""}`} type="button" onClick={onSelect}><span><strong>{job.sourceLabel}</strong><small>{job.dryRun ? "预览" : "正式迁移"} · {phaseLabel(job.phase)}</small></span><span><ReportStatus status={job.status} /><small>{job.processedCount} / {job.totalCount}</small></span></button>; }
-function ReportTabButton({ active, children, onClick }: { active: boolean; children: string; onClick: () => void }) { return <button className={active ? "is-active" : ""} type="button" role="tab" aria-selected={active} onClick={onClick}>{children}</button>; }
-function PanelHeading({ headingId, icon, title, description }: { headingId: string; icon: ReactNode; title: string; description: string }) { return <div className="lux-admin-panel-heading"><div><span className="lux-admin-eyebrow">Emby → Lux</span><h2 id={headingId}>{title}</h2><p>{description}</p></div><span className="lux-emby-panel-icon">{icon}</span></div>; }
+function JobSummary({ job, selected, onSelect }: { job: AdminEmbyMigrationJob; selected: boolean; onSelect: () => void }) {
+  return <button className={`lux-emby-job-summary ${selected ? "is-selected" : ""}`} type="button" aria-label={`查看迁移任务 ${job.sourceLabel}`} onClick={onSelect}><span><strong>{job.sourceLabel}</strong><small>{job.dryRun ? "预览" : "正式迁移"} · {phaseLabel(job.phase)}</small></span><span><ReportStatus status={job.status} /><small>{job.processedCount} / {job.totalCount}</small></span></button>;
+}
+
 function Stat({ label, value }: { label: string; value: number }) { return <div><small>{label}</small><strong>{value.toLocaleString()}</strong></div>; }
 function ReportStatus({ status }: { status: string }) { return <span className={`lux-emby-report-status is-${status.toLowerCase()}`}>{statusLabel(status)}</span>; }
-function InlineError({ message }: { message: string }) { return <p className="lux-error-copy lux-emby-inline-error"><AlertTriangle size={15} /> {message}</p>; }
-function LoadingState({ label }: { label: string }) { return <div className="lux-emby-state"><LoaderCircle size={18} className="lux-spin" /> <span>{label}</span></div>; }
+function InlineError({ message }: { message: string }) { return <p className="lux-error-copy lux-emby-inline-error" role="alert"><AlertTriangle size={15} /> {message}</p>; }
+function LoadingState({ label }: { label: string }) { return <div className="lux-emby-state" role="status"><LoaderCircle size={17} className="lux-spin" /> <span>{label}</span></div>; }
 function EmptyState({ label, detail }: { label: string; detail: string }) { return <div className="lux-emby-empty"><strong>{label}</strong><span>{detail}</span></div>; }
+function initialReportPages(): Record<ReportTab, number> { return Object.fromEntries(reportTabs.map((tab) => [tab, 1])) as Record<ReportTab, number>; }
 function isActiveJob(job?: AdminEmbyMigrationJob | null) { return Boolean(job && (job.status === "PENDING" || job.status === "RUNNING")); }
 function statusLabel(status: string) { return ({ PENDING: "等待中", RUNNING: "进行中", COMPLETED: "已完成", CANCELLED: "已取消", FAILED: "失败" } as Record<string, string>)[status] ?? status; }
 function phaseLabel(phase: string) { return ({ TESTING: "连接测试", USERS: "读取用户", ITEMS: "匹配媒体", IMPORTING: "导入状态", FINALIZING: "收尾" } as Record<string, string>)[phase] ?? phase; }
-function safeDetail(detail: Record<string, unknown>) { const copy = Object.fromEntries(Object.entries(detail).filter(([key]) => !key.toLowerCase().includes("url") && !key.toLowerCase().includes("token"))); return JSON.stringify(copy); }
-function luxMediaLabel(detail: Record<string, unknown>, luxItemId: string) {
-  const title = detailText(detail.luxTitle);
-  const seriesTitle = detailText(detail.luxSeriesTitle);
-  const season = detailNumber(detail.luxSeasonNumber);
-  const episode = detailNumber(detail.luxEpisodeNumber);
-  const parts = [seriesTitle || title];
-  if (season != null) parts.push(`第 ${season} 季`);
-  if (episode != null) parts.push(`第 ${episode} 集`);
-  if (title && title !== seriesTitle && (season != null || episode != null)) parts.push(title);
-  return parts.filter(Boolean).join(" · ") || luxItemId;
-}
-function detailText(value: unknown) { return typeof value === "string" && value.trim() ? value.trim() : null; }
-function detailNumber(value: unknown) { return typeof value === "number" && Number.isFinite(value) ? value : null; }
-function reportPageFrom(data: unknown) { return (data as { page?: number } | undefined)?.page ?? 1; }

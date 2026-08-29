@@ -122,8 +122,12 @@ describe("EmbyMigrationPluginConfig", () => {
     });
 
     await act(async () => {
-      await vi.waitFor(() => expect(container.textContent).toContain("连接设置"));
+      await vi.waitFor(() => expect(container.textContent).toContain("连接 Emby"));
     });
+    expect(container.textContent).toContain("第 1 步");
+    expect(container.textContent).toContain("第 2 步");
+    expect(container.textContent).not.toContain("迁移设置");
+    expect(container.querySelector("details")?.open).toBe(false);
     expect(container.querySelector("#emby-plugin-base-url")).not.toBeNull();
     expect(container.querySelector("#emby-plugin-api-key")).not.toBeNull();
     expect(container.querySelector("#emby-migration-base-url")).toBeNull();
@@ -141,8 +145,17 @@ describe("EmbyMigrationPluginConfig", () => {
       await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({ dryRun: true, mergePolicy: "MERGE" }));
     });
     expect(container.textContent).toContain("预览任务已创建");
+    expect(container.textContent).not.toContain("执行迁移");
     await act(async () => {
-      await vi.waitFor(() => expect(container.textContent).toContain("任务详情"));
+      await vi.waitFor(() => expect(container.textContent).toContain("当前任务"));
+    });
+    expect(api.adminEmbyMigrationUsers).not.toHaveBeenCalled();
+    act(() => {
+      const details = container.querySelector<HTMLDetailsElement>("details.lux-emby-reports");
+      if (details) {
+        details.open = true;
+        details.dispatchEvent(new Event("toggle", { bubbles: true }));
+      }
     });
     act(() => {
       const button = Array.from(container.querySelectorAll("button")).find((candidate) => candidate.textContent?.includes("媒体匹配"));
