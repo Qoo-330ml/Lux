@@ -864,7 +864,7 @@ async fn deleted_library_scan_worker_exits_as_cancelled_without_touching_media_f
 }
 
 #[tokio::test]
-async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dyn std::error::Error>>
+async fn active_full_scan_allows_incremental_scan_enqueue() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -885,7 +885,7 @@ async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dy
 
     let jobs = ScanJobService::new(database.clone());
     let full_scan = jobs.create_movie_scan_job(library.id).await?;
-    let error = jobs
+    let incremental_scan = jobs
         .enqueue_incremental_changes(
             library.id,
             vec![IncrementalScanChange {
@@ -894,16 +894,14 @@ async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dy
                 kind: ChangeKind::Create,
             }],
         )
-        .await
-        .expect_err("an active full scan must exclude incremental index work");
+        .await?;
+    assert_ne!(incremental_scan.id, full_scan.id);
+    assert_eq!(incremental_scan.job_type, "INCREMENTAL_SCAN");
 
-    assert!(matches!(
-        error,
-        ScanJobError::AlreadyActive(id) if id == full_scan.id
-    ));
-
+    jobs.run_to_completion(&incremental_scan.id, 100, None)
+        .await?;
     jobs.run_to_completion(&full_scan.id, 100, None).await?;
-    let incremental_scan = jobs
+    let active_incremental_scan = jobs
         .enqueue_incremental_changes(
             library.id,
             vec![IncrementalScanChange {
@@ -919,8 +917,95 @@ async fn active_full_scan_blocks_incremental_scan_enqueue() -> Result<(), Box<dy
         .expect_err("an active incremental scan must exclude full index work");
     assert!(matches!(
         error,
-        ScanJobError::AlreadyActive(id) if id == incremental_scan.id
+        ScanJobError::AlreadyActive(id) if id == active_incremental_scan.id
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_incremental_scan_preempts_running_full_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let scan_lock = Arc::new(Semaphore::new(1));
+    let jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
+    let full_scan = jobs.create_movie_scan_job(library.id).await?;
+    let first_batch = jobs.run_batch(&full_scan.id, 1).await?;
+    assert!(!first_batch.completed);
+    let full_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&full_scan.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(full_status, "RUNNING");
+
+    let held_permit = scan_lock.clone().acquire_owned().await?;
+    let full_job_id = full_scan.id.clone();
+    let full_jobs = jobs.clone();
+    let full_worker =
+        tokio::spawn(async move { full_jobs.run_to_completion(&full_job_id, 1, None).await });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let incremental_scan = ScanJobService::new(database.clone())
+        .with_scan_lock(scan_lock.clone())
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Realtime.Movie.2024.mkv".to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    let incremental_job_id = incremental_scan.id.clone();
+    let incremental_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock);
+    let incremental_worker = tokio::spawn(async move {
+        incremental_jobs
+            .run_to_completion(&incremental_job_id, 1, None)
+            .await
+    });
+
+    drop(held_permit);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        full_worker.await??;
+        incremental_worker.await??;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .await??;
+
+    let events: Vec<(String, String)> = sqlx::query_as(
+        "SELECT job_id, event_code
+         FROM scan_job_events
+         WHERE job_id IN (?, ?)
+           AND event_code IN ('JOB_STARTED', 'JOB_COMPLETED')
+         ORDER BY created_at, id",
+    )
+    .bind(&full_scan.id)
+    .bind(&incremental_scan.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(events.len(), 4);
+    assert_eq!(events[0], (full_scan.id.clone(), "JOB_STARTED".to_owned()));
+    assert_eq!(
+        events[1],
+        (incremental_scan.id.clone(), "JOB_STARTED".to_owned())
+    );
+    assert_eq!(events[2], (incremental_scan.id, "JOB_COMPLETED".to_owned()));
+    assert_eq!(events[3], (full_scan.id, "JOB_COMPLETED".to_owned()));
     Ok(())
 }
 

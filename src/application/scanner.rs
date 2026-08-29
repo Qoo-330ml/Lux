@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use quick_xml::{events::Event, reader::Reader};
@@ -2718,12 +2718,9 @@ impl ScanJobService {
     ) -> Result<StoredScanJob, ScanJobError> {
         if let Some(active) = self
             .database
-            .find_active_scan_job_for_library(library_id)
+            .find_active_scan_job(library_id, "INCREMENTAL_SCAN")
             .await?
         {
-            if active.job_type != "INCREMENTAL_SCAN" {
-                return Err(ScanJobError::AlreadyActive(active.id));
-            }
             if auto_metadata_match && !active.auto_metadata_match {
                 self.database
                     .enable_scan_job_auto_metadata_match(&active.id)
@@ -2748,7 +2745,7 @@ impl ScanJobService {
             if error.is_unique_violation()
                 && let Some(active) = self
                     .database
-                    .find_active_scan_job_for_library(library_id)
+                    .find_active_scan_job(library_id, "INCREMENTAL_SCAN")
                     .await?
             {
                 return Err(ScanJobError::AlreadyActive(active.id));
@@ -2827,7 +2824,7 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
-        let _scan_permit = self.acquire_scan_lock().await?;
+        let _scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
         let report = self
             .run_batch_with_failure_handling(job_id, batch_size)
             .await?;
@@ -4551,7 +4548,7 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
-        let _scan_permit = self.acquire_scan_lock().await?;
+        let mut scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
         let mut created_items = 0_usize;
         loop {
             let report = self
@@ -4565,6 +4562,10 @@ impl ScanJobService {
             }
             created_items = created_items.saturating_add(report.created_items);
             if !report.completed {
+                if self.should_yield_to_realtime(job_id).await? {
+                    drop(scan_permit);
+                    scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
+                }
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -4577,7 +4578,7 @@ impl ScanJobService {
                     return Err(ScanJobError::JobNotFound);
                 };
                 let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
-                drop(_scan_permit);
+                drop(scan_permit);
                 if self.cancellation_requested_in_memory(job_id) {
                     self.cancel_running_job(job_id).await?;
                     return Ok(());
@@ -4711,6 +4712,60 @@ impl ScanJobService {
             .acquire_owned()
             .await
             .map_err(|_| ScanJobError::ScanLockClosed)
+    }
+
+    async fn acquire_scan_lock_for_job(
+        &self,
+        job_id: &str,
+    ) -> Result<OwnedSemaphorePermit, ScanJobError> {
+        loop {
+            let job = self.database.find_scan_job(job_id).await?;
+            let Some(job) = job else {
+                return self.acquire_scan_lock().await;
+            };
+            let is_full_scan = job.job_type != "INCREMENTAL_SCAN"
+                && matches!(job.status.as_str(), "PENDING" | "RUNNING")
+                && job.scan_phase != "POSTPROCESSING"
+                && !job.cancel_requested;
+            if is_full_scan
+                && self
+                    .database
+                    .has_active_scan_job_type("INCREMENTAL_SCAN")
+                    .await?
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                continue;
+            }
+
+            let permit = self.acquire_scan_lock().await?;
+            if !is_full_scan
+                || !self
+                    .database
+                    .has_active_scan_job_type("INCREMENTAL_SCAN")
+                    .await?
+            {
+                return Ok(permit);
+            }
+            drop(permit);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn should_yield_to_realtime(&self, job_id: &str) -> Result<bool, ScanJobError> {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Ok(false);
+        };
+        if job.job_type == "INCREMENTAL_SCAN"
+            || !matches!(job.status.as_str(), "PENDING" | "RUNNING")
+            || job.scan_phase == "POSTPROCESSING"
+            || job.cancel_requested
+        {
+            return Ok(false);
+        }
+        self.database
+            .has_active_scan_job_type("INCREMENTAL_SCAN")
+            .await
+            .map_err(ScanJobError::from)
     }
 
     async fn effective_scan_concurrency(&self, configured: i64) -> usize {

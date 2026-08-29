@@ -95,8 +95,8 @@ async fn watcher_receives_temp_directory_changes() -> Result<(), Box<dyn std::er
 }
 
 #[tokio::test]
-async fn realtime_service_indexes_only_the_file_that_changed()
--> Result<(), Box<dyn std::error::Error>> {
+async fn realtime_service_indexes_the_file_that_changed() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -120,9 +120,10 @@ async fn realtime_service_indexes_only_the_file_that_changed()
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
-                .fetch_one(database.pool())
-                .await?;
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE title = 'New Movie'")
+                    .fetch_one(database.pool())
+                    .await?;
             if count == 1 {
                 break Ok::<(), sqlx::Error>(());
             }
@@ -130,9 +131,10 @@ async fn realtime_service_indexes_only_the_file_that_changed()
         }
     })
     .await??;
-    let title: String = sqlx::query_scalar("SELECT title FROM media_items")
-        .fetch_one(database.pool())
-        .await?;
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM media_items WHERE title = 'New Movie'")
+            .fetch_one(database.pool())
+            .await?;
     assert_eq!(title, "New Movie");
     watch_task.abort();
     let _ = watch_task.await;

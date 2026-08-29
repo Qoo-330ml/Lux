@@ -2736,6 +2736,26 @@ impl Database {
         })
     }
 
+    pub(crate) async fn has_active_scan_job_type(
+        &self,
+        job_type: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM scan_jobs
+                 WHERE job_type = ? AND status IN ('PENDING', 'RUNNING')
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_type)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn claim_scan_job(&self, id: &str) -> Result<bool, StorageError> {
         self.query(
             "UPDATE scan_jobs
