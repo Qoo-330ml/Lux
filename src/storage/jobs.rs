@@ -394,24 +394,46 @@ impl Database {
         job_id: &str,
     ) -> Result<Vec<String>, StorageError> {
         self.query_scalar(
-            "SELECT DISTINCT ms.item_id
-             FROM scan_job_paths sjp
-             JOIN filesystem_entries fe
-             ON fe.library_root_id = sjp.library_root_id
-              AND (
-                    sjp.relative_path = '.'
-                    OR
-                    fe.relative_path = sjp.relative_path
-                    OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                       = sjp.relative_path || '/'
-                  )
-             JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
-             JOIN media_items mi ON mi.id = ms.item_id
-             WHERE sjp.job_id = ?
-               AND sjp.processed_at IS NOT NULL
-               AND fe.is_missing = 0
-               AND mi.removed_at IS NULL
-             ORDER BY ms.item_id",
+            "WITH affected_items AS (
+                 SELECT DISTINCT ms.item_id
+                 FROM scan_job_paths sjp
+                 JOIN filesystem_entries fe
+                   ON fe.library_root_id = sjp.library_root_id
+                  AND (
+                        sjp.relative_path = '.'
+                        OR
+                        fe.relative_path = sjp.relative_path
+                        OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                           = sjp.relative_path || '/'
+                      )
+                 JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                 JOIN media_items mi ON mi.id = ms.item_id
+                 WHERE sjp.job_id = ?
+                   AND sjp.processed_at IS NOT NULL
+                   AND fe.is_missing = 0
+                   AND mi.removed_at IS NULL
+             ),
+             metadata_targets AS (
+                 SELECT item_id
+                 FROM affected_items
+                 UNION
+                 SELECT mi.parent_id
+                 FROM media_items mi
+                 JOIN affected_items affected ON affected.item_id = mi.id
+                 WHERE mi.item_type = 'EPISODE'
+                   AND mi.parent_id IS NOT NULL
+                 UNION
+                 SELECT mi.series_id
+                 FROM media_items mi
+                 JOIN affected_items affected ON affected.item_id = mi.id
+                 WHERE mi.item_type = 'EPISODE'
+                   AND mi.series_id IS NOT NULL
+             )
+             SELECT DISTINCT target.id
+             FROM metadata_targets targets
+             JOIN media_items target ON target.id = targets.item_id
+             WHERE target.removed_at IS NULL
+             ORDER BY target.id",
         )
         .bind(job_id)
         .fetch_all(&self.pool)

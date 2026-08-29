@@ -1640,6 +1640,94 @@ async fn incremental_scan_processes_only_queued_file() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
+async fn incremental_series_scan_queues_episode_and_hierarchy_metadata()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library_with_scraper("Shows", LibraryKind::Series, false, Some("tmdb"), true)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season = root.join("Example Show (2024)").join("Season 01");
+    tokio::fs::create_dir_all(&season).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    let tmdb = TestScraper::new(TestScraperConfig {
+        timeout: Duration::from_millis(1),
+        ..TestScraperConfig::default()
+    })?;
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
+
+    for episode_number in [1, 2] {
+        tokio::fs::write(
+            season.join(format!("Example.Show.S01E{episode_number:02}.mkv")),
+            b"episode",
+        )
+        .await?;
+    }
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            [1, 2]
+                .into_iter()
+                .map(|episode_number| IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: format!(
+                        "Example Show (2024)/Season 01/Example.Show.S01E{episode_number:02}.mkv"
+                    ),
+                    kind: ChangeKind::Create,
+                })
+                .collect(),
+        )
+        .await?;
+    jobs.run_to_completion_with_metadata(&incremental.id, 100, None, Some(metadata))
+        .await?;
+
+    let metadata_job: (String, String, i64) = sqlx::query_as(
+        "SELECT id, mode, total_count FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(metadata_job.1, "FILL_MISSING");
+    assert_eq!(metadata_job.2, 4);
+
+    let item_types: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT mi.item_type, mi.episode_number
+         FROM metadata_reidentify_job_items ji
+         JOIN media_items mi ON mi.id = ji.item_id
+         WHERE ji.job_id = ?
+         ORDER BY CASE mi.item_type WHEN 'SERIES' THEN 0 WHEN 'SEASON' THEN 1 ELSE 2 END,
+                  mi.episode_number",
+    )
+    .bind(&metadata_job.0)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        item_types,
+        vec![
+            ("SERIES".to_owned(), None),
+            ("SEASON".to_owned(), None),
+            ("EPISODE".to_owned(), Some(1)),
+            ("EPISODE".to_owned(), Some(2)),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn incremental_scan_only_queues_metadata_when_library_switch_is_enabled()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
