@@ -754,6 +754,7 @@ impl EmbyMigrationService {
         let state_fields = state_fields_for_migration(&scope);
         let requested_state_fields =
             requested_fields_for_state_filters(scope.selected_item_state_filters());
+        let requested_user_fields = user_fields_for_migration(&scope);
         let testing_started = Instant::now();
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "TESTING", None)
@@ -794,10 +795,17 @@ impl EmbyMigrationService {
         let selected_user_ids_for_source = connection
             .supports_filtered_reads
             .then_some(selected_user_ids.as_slice());
+        let requested_user_fields_for_source = connection
+            .supports_filtered_reads
+            .then_some(requested_user_fields.as_slice());
         source_rpc_calls += 1;
         let user_page = match self
             .plugin
-            .list_users_filtered(&source, selected_user_ids_for_source)
+            .list_users_filtered_with_fields(
+                &source,
+                selected_user_ids_for_source,
+                requested_user_fields_for_source,
+            )
             .await
         {
             Ok(page) => page,
@@ -2795,6 +2803,22 @@ fn state_fields_for_migration(scope: &MigrationScope) -> EmbyMigrationUserItemSt
     fields
 }
 
+fn user_fields_for_migration(scope: &MigrationScope) -> Vec<&'static str> {
+    let mut fields = vec!["id", "name"];
+    if scope.user_profile {
+        fields.extend([
+            "hasPassword",
+            "isDisabled",
+            "enableRemoteAccess",
+            "enableContentDownloading",
+        ]);
+    }
+    if scope.library_access || scope.item_state {
+        fields.extend(["enableAllFolders", "enabledFolders", "libraryFolders"]);
+    }
+    fields
+}
+
 fn migration_merge_policy(value: &str) -> MigrationMergePolicy {
     match value {
         "OVERWRITE" => MigrationMergePolicy::Overwrite,
@@ -3226,6 +3250,48 @@ mod tests {
     }
 
     #[test]
+    fn migration_user_fields_follow_selected_scope() {
+        let profile_only = MigrationScope {
+            user_profile: true,
+            library_access: false,
+            item_state: false,
+            item_state_filters: None,
+            person_favorites: false,
+            target_library_ids: None,
+        };
+        assert_eq!(
+            user_fields_for_migration(&profile_only),
+            vec![
+                "id",
+                "name",
+                "hasPassword",
+                "isDisabled",
+                "enableRemoteAccess",
+                "enableContentDownloading"
+            ]
+        );
+
+        let media_only = MigrationScope {
+            user_profile: false,
+            library_access: false,
+            item_state: true,
+            item_state_filters: Some(vec![MigrationUserStateFilter::Favorite]),
+            person_favorites: false,
+            target_library_ids: Some(vec!["library-1".to_owned()]),
+        };
+        assert_eq!(
+            user_fields_for_migration(&media_only),
+            vec![
+                "id",
+                "name",
+                "enableAllFolders",
+                "enabledFolders",
+                "libraryFolders"
+            ]
+        );
+    }
+
+    #[test]
     fn favorite_only_state_hash_ignores_unselected_playback_values() {
         let fields = EmbyMigrationUserItemStateFields {
             position_ticks: false,
@@ -3568,6 +3634,9 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(user_calls.len(), 1);
         assert!(user_calls[0].contains("\"userIds\":[\"emby-user\"]"));
+        assert!(user_calls[0].contains(
+            "\"userFields\":[\"id\",\"name\",\"enableAllFolders\",\"enabledFolders\",\"libraryFolders\"]"
+        ));
         assert_eq!(state_calls.len(), 1);
         assert!(state_calls[0].contains("\"stateFilter\":\"FAVORITE\""));
         assert!(state_calls[0].contains("\"stateFields\":[\"isFavorite\"]"));

@@ -199,10 +199,15 @@ pub struct MigrationConnectionInfo {
 pub struct MigrationUser {
     pub id: String,
     pub name: String,
+    #[serde(default)]
     pub has_password: bool,
+    #[serde(default)]
     pub is_disabled: bool,
+    #[serde(default)]
     pub is_administrator: bool,
+    #[serde(default)]
     pub enable_all_folders: bool,
+    #[serde(default)]
     pub enabled_folders: Vec<String>,
     #[serde(default)]
     pub enable_remote_access: bool,
@@ -318,8 +323,9 @@ impl MigrationSourceFilter<'_> {
 #[cfg(test)]
 mod user_data_tests {
     use super::{
-        EmbyMigrationSource, MigrationScope, MigrationSourceFilter, MigrationUserData,
-        MigrationUserStateFilter, migration_list_users_params, migration_user_state_params,
+        EmbyMigrationSource, MigrationScope, MigrationSourceFilter, MigrationUser,
+        MigrationUserData, MigrationUserStateFilter, migration_list_users_params,
+        migration_list_users_params_with, migration_user_state_params,
         requested_fields_for_state_filters,
     };
     use serde_json::json;
@@ -455,6 +461,51 @@ mod user_data_tests {
     }
 
     #[test]
+    fn filtered_user_list_request_projects_selected_users_and_fields() {
+        let source = EmbyMigrationSource {
+            base_url: "http://emby.example/".to_owned(),
+            api_key: "redacted-test-key".to_owned(),
+            allow_private_network: false,
+        };
+        let user_ids = ["user-1".to_owned(), "user-2".to_owned()];
+        let fields = ["id", "name", "hasPassword", "isDisabled"];
+        let params = migration_list_users_params_with(
+            &source,
+            Some(0),
+            Some(500),
+            None,
+            Some(&user_ids),
+            Some(&fields),
+        )
+        .expect("valid filtered user request");
+
+        assert_eq!(params["userIds"], json!(["user-1", "user-2"]));
+        assert_eq!(
+            params["userFields"],
+            json!(["id", "name", "hasPassword", "isDisabled"])
+        );
+    }
+
+    #[test]
+    fn projected_source_user_response_defaults_unrequested_fields() {
+        let user: MigrationUser = serde_json::from_value(json!({
+            "id": "user-1",
+            "name": "Alice"
+        }))
+        .expect("minimal projected user should deserialize");
+
+        assert_eq!(user.id, "user-1");
+        assert_eq!(user.name, "Alice");
+        assert!(!user.has_password);
+        assert!(!user.is_disabled);
+        assert!(!user.enable_all_folders);
+        assert!(user.enabled_folders.is_empty());
+        assert!(!user.enable_remote_access);
+        assert!(!user.enable_content_downloading);
+        assert!(user.primary_image_tag.is_none());
+    }
+
+    #[test]
     fn partial_source_user_data_defaults_unrequested_fields() {
         let data: MigrationUserData = serde_json::from_value(json!({
             "isFavorite": true
@@ -579,10 +630,24 @@ impl EmbyMigrationPluginClient {
         source: &EmbyMigrationSource,
         selected_user_ids: Option<&[String]>,
     ) -> Result<MigrationUserPage, PluginServiceError> {
-        let mut params = serde_json::json!({"source": source});
-        if let Some(selected_user_ids) = selected_user_ids {
-            params["userIds"] = serde_json::json!(selected_user_ids);
-        }
+        self.list_users_filtered_with_fields(source, selected_user_ids, None)
+            .await
+    }
+
+    pub(crate) async fn list_users_filtered_with_fields(
+        &self,
+        source: &EmbyMigrationSource,
+        selected_user_ids: Option<&[String]>,
+        user_fields: Option<&[&'static str]>,
+    ) -> Result<MigrationUserPage, PluginServiceError> {
+        let params = migration_list_users_params_with(
+            source,
+            None,
+            None,
+            None,
+            selected_user_ids,
+            user_fields,
+        )?;
         self.call_with(MIGRATION_LIST_USERS_METHOD, params)
             .await
             .map(normalize_migration_user_page)
@@ -775,23 +840,46 @@ fn migration_list_users_params(
     limit: i64,
     search: Option<&str>,
 ) -> Result<Value, PluginServiceError> {
+    migration_list_users_params_with(source, Some(start_index), Some(limit), search, None, None)
+}
+
+fn migration_list_users_params_with(
+    source: &EmbyMigrationSource,
+    start_index: Option<i64>,
+    limit: Option<i64>,
+    search: Option<&str>,
+    selected_user_ids: Option<&[String]>,
+    user_fields: Option<&[&'static str]>,
+) -> Result<Value, PluginServiceError> {
     source
         .validate()
         .map_err(|_| PluginServiceError::InvalidConfig)?;
-    if start_index < 0 {
-        return Err(PluginServiceError::InvalidConfig);
-    }
     let search = search.unwrap_or_default().trim();
     if search.chars().count() > MAX_TEXT_LENGTH {
         return Err(PluginServiceError::InvalidConfig);
     }
-    let mut params = serde_json::json!({
-        "source": source,
-        "startIndex": start_index,
-        "limit": limit.clamp(1, MAX_PAGE_SIZE),
-    });
+    let mut params = serde_json::json!({"source": source});
+    if let Some(start_index) = start_index {
+        if start_index < 0 {
+            return Err(PluginServiceError::InvalidConfig);
+        }
+        params["startIndex"] = serde_json::json!(start_index);
+    }
+    if let Some(limit) = limit {
+        params["limit"] = serde_json::json!(limit.clamp(1, MAX_PAGE_SIZE));
+    }
     if !search.is_empty() {
         params["search"] = Value::String(search.to_owned());
+    }
+    if let Some(selected_user_ids) = selected_user_ids {
+        let selected_user_ids = selected_user_ids
+            .iter()
+            .map(|user_id| validate_id(user_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        params["userIds"] = serde_json::json!(selected_user_ids);
+    }
+    if let Some(user_fields) = user_fields.filter(|fields| !fields.is_empty()) {
+        params["userFields"] = serde_json::json!(user_fields);
     }
     Ok(params)
 }

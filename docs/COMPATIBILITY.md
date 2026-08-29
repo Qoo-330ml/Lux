@@ -308,7 +308,8 @@ Lux 匹配；重叠结果按 Emby 条目 ID 去重。该优化不改变 `ITEM_ST
 `migration.list_users` 支持可选 `startIndex`、`limit`、`search` 及分页元数据；旧插件返回完整列表时宿主本地切页并
 保留兼容行为。宿主转发已选用户 ID，在 `migration.user_state` 转发 `stateFilter`、`stateFields` 和
 `sourceLibraryIds`。多个状态筛选同时启用时，`stateFields` 是已选字段并集，跨筛选按 Emby 条目 ID 去重仍能完整
-保留已选状态；未选字段不会发送或写入。旧插件缺少该可选能力时不会收到新字段，可能仍读取较大范围，但宿主仍严格
+保留已选状态；未选字段不会发送或写入。执行阶段还会在 `migration.list_users` 转发按范围计算的 `userFields`，只
+读取用户资料或库权限所需字段；配置页用户预览仍使用完整摘要。旧插件缺少该可选能力时不会收到新字段，可能仍读取较大范围，但宿主仍严格
 禁止未选目标库的状态、导入记录和 ACL 写入。按页 Provider 候选查询使用 schema 107 的 `media_item_provider_ids` 索引，
 不再加载全量媒体身份；异常页恢复最多 32 次来源 RPC，超出范围会记录 `sourceRangeLimit` 并推进游标。
 
