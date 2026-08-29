@@ -18,6 +18,7 @@ const MAX_SECRET_LENGTH: usize = 1024;
 const MAX_TEXT_LENGTH: usize = 1024;
 const MAX_ID_LENGTH: usize = 256;
 const MAX_PAGE_SIZE: i64 = 500;
+const SOURCE_USER_PREVIEW_FIELDS: [&str; 4] = ["id", "name", "isDisabled", "isAdministrator"];
 
 #[derive(Debug, Eq, PartialEq)]
 pub enum MigrationInputError {
@@ -444,6 +445,10 @@ mod user_data_tests {
         assert_eq!(params["startIndex"], json!(200));
         assert_eq!(params["limit"], json!(100));
         assert_eq!(params["search"], json!("Alice"));
+        assert_eq!(
+            params["userFields"],
+            json!(["id", "name", "isDisabled", "isAdministrator"])
+        );
     }
 
     #[test]
@@ -840,7 +845,14 @@ fn migration_list_users_params(
     limit: i64,
     search: Option<&str>,
 ) -> Result<Value, PluginServiceError> {
-    migration_list_users_params_with(source, Some(start_index), Some(limit), search, None, None)
+    migration_list_users_params_with(
+        source,
+        Some(start_index),
+        Some(limit),
+        search,
+        None,
+        Some(&SOURCE_USER_PREVIEW_FIELDS),
+    )
 }
 
 fn migration_list_users_params_with(
