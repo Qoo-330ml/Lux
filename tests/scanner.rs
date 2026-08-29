@@ -401,6 +401,44 @@ async fn scanner_can_process_one_directory_without_marking_other_entries_missing
 }
 
 #[tokio::test]
+async fn targeted_movie_scan_batches_files_across_directory_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let batch_dir = root.join("Batch");
+    tokio::fs::create_dir_all(&batch_dir).await?;
+    for index in 0..501 {
+        tokio::fs::write(
+            batch_dir.join(format!("Batch.Movie.Title{index:03}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let report = LibraryScanner::new(database)
+        .scan_movie_directory(library.id, &batch_dir)
+        .await?;
+    assert_eq!(report.discovered_files, 501);
+    assert_eq!(report.created_items, 501);
+    assert_eq!(report.created_sources, 501);
+    assert_eq!(report.skipped_files, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;

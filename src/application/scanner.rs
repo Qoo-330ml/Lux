@@ -308,11 +308,21 @@ impl LibraryScanner {
                     .await?;
                 let mut seen_entry_ids = Vec::with_capacity(files.len());
                 let mut new_paths = Vec::new();
-                for path in files {
-                    if let Some((entry_id, quick_report)) = self
-                        .scan_episode_file_if_unchanged(&root, &root_path, &path, &existing_entries)
-                        .await?
-                    {
+                let quick_results = self
+                    .scan_episode_files_if_unchanged(&root, &root_path, &files, &existing_entries)
+                    .await?;
+                for (path, quick_result) in files.into_iter().zip(quick_results) {
+                    if let Some((entry_id, quick_report, provider_update)) = quick_result {
+                        if let Some((series_identity, provider_ids_json)) = provider_update
+                            && refreshed_series.insert(series_identity.clone())
+                        {
+                            self.database
+                                .update_local_provider_ids_for_identity_if_empty(
+                                    &series_identity,
+                                    &provider_ids_json,
+                                )
+                                .await?;
+                        }
                         seen_entry_ids.push(entry_id);
                         report.merge(quick_report);
                         continue;
@@ -1323,19 +1333,102 @@ impl LibraryScanner {
         let mut report = ScanReport::default();
         let mut walker = FileBatchWalker::new(&canonical_directory);
         while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
-            for path in files {
-                report.merge(
-                    self.scan_movie_file(
-                        &library_id_text,
-                        &root,
-                        Path::new(&root.canonical_path),
-                        &path,
-                        &generation,
-                    )
+            report.merge(
+                self.scan_movie_file_batch(
+                    &library_id_text,
+                    &root,
+                    Path::new(&root.canonical_path),
+                    &files,
+                    &generation,
+                )
+                .await?,
+            );
+        }
+        Ok(report)
+    }
+
+    async fn scan_movie_file_batch(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        files: &[PathBuf],
+        generation: &str,
+    ) -> Result<ScanReport, ScannerError> {
+        if files.is_empty() {
+            return Ok(ScanReport::default());
+        }
+        let relative_paths = files
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root_path)
+                    .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or(ScannerError::NonUtf8Path)
+            })
+            .collect::<Result<Vec<_>, ScannerError>>()?;
+        let existing_entries = self
+            .database
+            .list_filesystem_entries_for_paths(&root.id, &relative_paths)
+            .await?;
+        let quick_results = self
+            .scan_movie_files_if_unchanged(&root.id, root_path, files, &existing_entries)
+            .await?;
+        let mut report = ScanReport::default();
+        let mut seen_entry_ids = Vec::with_capacity(files.len());
+        let mut new_paths = Vec::new();
+        for (path, quick_result) in files.iter().zip(quick_results) {
+            if let Some((entry_id, quick_report)) = quick_result {
+                seen_entry_ids.push(entry_id);
+                report.merge(quick_report);
+                continue;
+            }
+            let relative_path = path
+                .strip_prefix(root_path)
+                .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                .to_str()
+                .ok_or(ScannerError::NonUtf8Path)?;
+            if !existing_entries.contains_key(relative_path) {
+                new_paths.push(path.clone());
+                continue;
+            }
+            report.merge(
+                self.scan_movie_file(library_id_text, root, root_path, path, generation)
                     .await?,
-                );
+            );
+        }
+
+        let mut pending_new_files = Vec::with_capacity(new_paths.len());
+        for file in self
+            .prepare_new_movie_files(root_path, &new_paths)
+            .await?
+            .into_iter()
+            .flatten()
+        {
+            pending_new_files.push(file);
+            if pending_new_files.len() == FILE_BATCH_SIZE {
+                self.flush_new_movie_files(
+                    library_id_text,
+                    root,
+                    generation,
+                    &mut pending_new_files,
+                    &mut report,
+                )
+                .await?;
             }
         }
+        self.flush_new_movie_files(
+            library_id_text,
+            root,
+            generation,
+            &mut pending_new_files,
+            &mut report,
+        )
+        .await?;
+        self.database
+            .mark_filesystem_entries_seen_batch(&seen_entry_ids, generation)
+            .await?;
         Ok(report)
     }
 
@@ -1470,9 +1563,9 @@ impl LibraryScanner {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
         };
-        let Some(parsed) = parse_episode_filename(file_name) else {
+        if parse_episode_filename(file_name).is_none() {
             return Ok(None);
-        };
+        }
         if is_strm_file(path) {
             return Ok(None);
         }
@@ -1480,7 +1573,47 @@ impl LibraryScanner {
         let Some(existing_entry) = existing_entries.get(&relative_path) else {
             return Ok(None);
         };
-        if existing_entry.fingerprint.as_deref() != Some(fingerprint.as_slice()) {
+        let Some((entry_id, report, provider_update)) = self
+            .scan_episode_file_if_unchanged_entry(
+                root,
+                path,
+                &relative_path,
+                &fingerprint,
+                existing_entry,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Some((series_identity, provider_ids_json)) = provider_update {
+            self.database
+                .update_local_provider_ids_for_identity_if_empty(
+                    &series_identity,
+                    &provider_ids_json,
+                )
+                .await?;
+        }
+        Ok(Some((entry_id, report)))
+    }
+
+    async fn scan_episode_file_if_unchanged_entry(
+        &self,
+        root: &StoredLibraryRoot,
+        path: &Path,
+        relative_path: &str,
+        fingerprint: &[u8],
+        existing_entry: &StoredFilesystemEntry,
+    ) -> Result<Option<(String, ScanReport, Option<(String, String)>)>, ScannerError> {
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            return Ok(None);
+        };
+        let Some(parsed) = parse_episode_filename(file_name) else {
+            return Ok(None);
+        };
+        if is_strm_file(path) {
+            return Ok(None);
+        }
+        if existing_entry.fingerprint.as_deref() != Some(fingerprint) {
             return Ok(None);
         }
         if existing_entry.item_id.is_none() {
@@ -1496,17 +1629,11 @@ impl LibraryScanner {
             .series_provider_ids_json
             .as_deref()
             .is_none_or(|value| value.is_empty() || value == "{}");
-        if !hierarchy.provider_ids.is_empty() && series_provider_ids_missing {
-            let provider_ids_json = provider_ids_json(&hierarchy.provider_ids);
-            if let Some(provider_ids_json) = provider_ids_json.as_deref() {
-                self.database
-                    .update_local_provider_ids_for_identity_if_empty(
-                        &series_identity,
-                        provider_ids_json,
-                    )
-                    .await?;
-            }
-        }
+        let provider_update = if !hierarchy.provider_ids.is_empty() && series_provider_ids_missing {
+            provider_ids_json(&hierarchy.provider_ids).map(|json| (series_identity, json))
+        } else {
+            None
+        };
         Ok(Some((
             existing_entry.id.clone(),
             ScanReport {
@@ -1514,7 +1641,61 @@ impl LibraryScanner {
                 skipped_files: 1,
                 ..ScanReport::default()
             },
+            provider_update,
         )))
+    }
+
+    async fn scan_episode_files_if_unchanged(
+        &self,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        paths: &[PathBuf],
+        existing_entries: &HashMap<String, StoredFilesystemEntry>,
+    ) -> Result<Vec<Option<(String, ScanReport, Option<(String, String)>)>>, ScannerError> {
+        let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
+        let mut tasks: JoinSet<EpisodeFingerprintTask> = JoinSet::new();
+        for (index, path) in paths.iter().enumerate() {
+            let relative_path = path
+                .strip_prefix(root_path)
+                .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                .to_str()
+                .ok_or(ScannerError::NonUtf8Path)?;
+            let Some(existing_entry) = existing_entries.get(relative_path).cloned() else {
+                continue;
+            };
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_none_or(|name| parse_episode_filename(name).is_none() || is_strm_file(path))
+            {
+                continue;
+            }
+            while tasks.len() >= FINGERPRINT_CHECK_CONCURRENCY {
+                collect_episode_fingerprint_task(&mut tasks, &mut results).await?;
+            }
+            let scanner = self.clone();
+            let root = root.clone();
+            let root_path = root_path.to_owned();
+            let path = path.clone();
+            let relative_path = relative_path.to_owned();
+            tasks.spawn(async move {
+                let (_, fingerprint) = current_file_fingerprint(&root_path, &path).await?;
+                let result = scanner
+                    .scan_episode_file_if_unchanged_entry(
+                        &root,
+                        &path,
+                        &relative_path,
+                        &fingerprint,
+                        &existing_entry,
+                    )
+                    .await?;
+                Ok((index, result))
+            });
+        }
+        while !tasks.is_empty() {
+            collect_episode_fingerprint_task(&mut tasks, &mut results).await?;
+        }
+        Ok(results)
     }
 
     async fn file_has_moved_entry(
@@ -5168,6 +5349,13 @@ type MoviePreparationOutput = (
 );
 type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
 type MovieFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
+type EpisodeFingerprintTask = Result<
+    (
+        usize,
+        Option<(String, ScanReport, Option<(String, String)>)>,
+    ),
+    ScannerError,
+>;
 type ReconciliationFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
 type ReconciliationRegularTask = Result<(usize, ScanReport), ScannerError>;
 
@@ -5187,6 +5375,31 @@ async fn collect_movie_fingerprint_task(
             return Err(ScannerError::Io {
                 path: PathBuf::from("<movie-fingerprint-task>"),
                 source: std::io::Error::other("movie fingerprint task set is empty"),
+            });
+        }
+    };
+    if let Some(slot) = results.get_mut(index) {
+        *slot = result;
+    }
+    Ok(())
+}
+
+async fn collect_episode_fingerprint_task(
+    tasks: &mut JoinSet<EpisodeFingerprintTask>,
+    results: &mut [Option<(String, ScanReport, Option<(String, String)>)>],
+) -> Result<(), ScannerError> {
+    let (index, result) = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-fingerprint-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<episode-fingerprint-task>"),
+                source: std::io::Error::other("episode fingerprint task set is empty"),
             });
         }
     };
