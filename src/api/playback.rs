@@ -350,6 +350,11 @@ pub(super) async fn handle_emby_playback_event(
         ),
     );
     let remote_ip = request_client_ip(&headers, &state.remote_access);
+    let activity_remote_ip = remote_ip.as_deref().or_else(|| {
+        previous_session
+            .as_ref()
+            .and_then(|session| session.remote_ip.as_deref())
+    });
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -391,6 +396,7 @@ pub(super) async fn handle_emby_playback_event(
                         "deviceName": device_name,
                         "deviceType": device_type,
                         "state": state_name,
+                        "remoteIp": activity_remote_ip,
                     }),
                 )
                 .await;
@@ -1280,6 +1286,11 @@ pub(super) async fn lux_post_progress(
         ),
     );
     let remote_ip = request_client_ip(&headers, &state.remote_access);
+    let activity_remote_ip = remote_ip.as_deref().or_else(|| {
+        previous_session
+            .as_ref()
+            .and_then(|session| session.remote_ip.as_deref())
+    });
     match database
         .record_playback_event(NewPlaybackEvent {
             user_id: &user_id,
@@ -1323,6 +1334,7 @@ pub(super) async fn lux_post_progress(
                         "deviceType": "Web",
                         "deviceName": "Web",
                         "state": playback_state.as_str(),
+                        "remoteIp": activity_remote_ip,
                     }),
                 )
                 .await;

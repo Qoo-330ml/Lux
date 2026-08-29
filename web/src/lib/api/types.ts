@@ -637,6 +637,8 @@ export type AdminActivityEvent = {
   targetId?: string | null;
   targetTitle?: string | null;
   metadata?: Record<string, unknown>;
+  remoteIp?: string | null;
+  remoteIpLocation?: AdminIpLocation | null;
   createdAt: number;
 };
 

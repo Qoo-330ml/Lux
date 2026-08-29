@@ -88,6 +88,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             "Authorization",
             r#"Emby Client="DashboardTest", Device="Mac", DeviceId="dashboard-device", Version="1""#,
         )
+        .header("X-Forwarded-For", "203.0.113.10")
         .json(&json!({ "Username": "admin", "Pw": "correct password" }))
         .send()
         .await?;
@@ -182,11 +183,21 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             .iter()
             .any(|event| event["eventType"] == "AUTH_LOGIN")
     );
+    assert!(events.iter().any(|event| {
+        event["eventType"] == "AUTH_LOGIN" && event["remoteIp"] == "203.0.113.10"
+    }));
     assert!(
         events
             .iter()
             .any(|event| event["eventType"] == "PLAYBACK_STARTED")
     );
+    let playback_activity = events
+        .iter()
+        .find(|event| event["eventType"] == "PLAYBACK_STARTED")
+        .ok_or("missing playback activity")?;
+    assert_eq!(playback_activity["remoteIp"], "203.0.113.10");
+    assert_eq!(playback_activity["metadata"]["remoteIp"], "203.0.113.10");
+    assert!(playback_activity["remoteIpLocation"].is_null());
     assert!(events.len() <= 24);
 
     sqlx::query(
@@ -238,6 +249,15 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             .iter()
             .any(|event| event["eventType"] == "PLAYBACK_STOPPED")
     }));
+    let stopped_activity = after_stop["activity"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["eventType"] == "PLAYBACK_STOPPED")
+        })
+        .ok_or("missing stopped activity")?;
+    assert_eq!(stopped_activity["remoteIp"], "203.0.113.10");
 
     server.abort();
     Ok(())

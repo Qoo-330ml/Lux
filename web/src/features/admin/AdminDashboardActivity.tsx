@@ -11,12 +11,19 @@ export function AdminDashboardActivity({ events }: { events: AdminActivityEvent[
 
 function ActivityRow({ event }: { event: AdminActivityEvent }) {
   const detail = activityDetail(event.metadata);
+  const remoteIp = event.remoteIp || metadataText(event.metadata, "remoteIp");
+  const location = locationDetail(event.remoteIpLocation);
   return (
     <li className="lux-admin-activity-row">
       <span className={`lux-admin-activity-icon is-${activityTone(event.eventType)}`} aria-hidden="true">{activityIcon(event.eventType)}</span>
       <div className="lux-admin-activity-copy">
         <p><strong>{event.userName || "未知账户"}</strong><span>{activityLabel(event.eventType)}</span>{event.targetTitle ? <em>{event.targetTitle}</em> : null}</p>
-        <div><time dateTime={new Date(event.createdAt * 1000).toISOString()}>{formatActivityTime(event.createdAt)}</time>{detail ? <span>· {String(detail)}</span> : null}</div>
+        <div>
+          <time dateTime={new Date(event.createdAt * 1000).toISOString()}>{formatActivityTime(event.createdAt)}</time>
+          {detail ? <span>· {detail}</span> : null}
+          {remoteIp ? <span className="lux-admin-activity-network-detail" aria-label="IP 地址">· {remoteIp}</span> : null}
+          {location ? <span className="lux-admin-activity-network-detail" aria-label="IP 归属地">· {location}</span> : null}
+        </div>
       </div>
     </li>
   );
@@ -24,11 +31,23 @@ function ActivityRow({ event }: { event: AdminActivityEvent }) {
 
 function activityDetail(metadata?: Record<string, unknown>) {
   if (!metadata) return undefined;
-  const device = typeof metadata.deviceName === "string" ? metadata.deviceName : undefined;
-  const client = typeof metadata.client === "string" ? metadata.client : undefined;
-  const version = typeof metadata.clientVersion === "string" ? metadata.clientVersion : undefined;
+  const device = metadataText(metadata, "deviceName");
+  const client = metadataText(metadata, "client");
+  const version = metadataText(metadata, "clientVersion");
   const clientLabel = client && version ? `${client} v${version}` : client;
   return [device, clientLabel].filter(Boolean).join(" · ") || undefined;
+}
+
+function metadataText(metadata: Record<string, unknown> | undefined, key: string) {
+  const value = metadata?.[key];
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function locationDetail(location: AdminActivityEvent["remoteIpLocation"]) {
+  if (!location) return undefined;
+  return [location.location, location.district, location.street, location.isp]
+    .filter((value): value is string => Boolean(value?.trim()))
+    .join(" · ") || undefined;
 }
 
 function activityIcon(eventType: string) {

@@ -1080,8 +1080,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-activity-copy p { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0 7px; margin: 0; color: var(--lux-muted); font-size: .78rem; }
 .lux-admin-activity-copy p strong { color: #fff; font-weight: 600; }
 .lux-admin-activity-copy p em { overflow: hidden; max-width: 38ch; color: var(--lux-muted); font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
-.lux-admin-activity-copy > div { display: flex; gap: 7px; margin-top: 5px; color: var(--lux-subtle); font-size: .66rem; }
+.lux-admin-activity-copy > div { display: flex; flex-wrap: wrap; gap: 4px 7px; min-width: 0; margin-top: 5px; color: var(--lux-subtle); font-size: .66rem; }
 .lux-admin-activity-copy time { font-variant-numeric: tabular-nums; }
+.lux-admin-activity-network-detail { min-width: 0; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-create-panel { margin-bottom: 18px; }
 .lux-admin-create-form { display: grid; grid-template-columns: minmax(180px, 1.3fr) minmax(130px, .75fr) auto auto; align-items: end; gap: 13px; }
 .lux-admin-form label, .lux-admin-schedule-field { display: grid; gap: 7px; color: var(--lux-muted); font-size: .74rem; }

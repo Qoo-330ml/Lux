@@ -302,6 +302,7 @@ pub(super) async fn emby_authenticate(
                     "clientVersion": result.device.version,
                     "deviceName": result.device.device,
                     "deviceType": result.device.device,
+                    "remoteIp": request_client_ip(&headers, &state.remote_access),
                 }),
             )
             .await;

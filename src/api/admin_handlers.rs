@@ -4661,7 +4661,7 @@ pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppS
     {
         Ok(events) => events
             .iter()
-            .map(dashboard_activity_json)
+            .map(|event| dashboard_activity_json(event, state.ip_location.as_ref()))
             .collect::<Vec<_>>(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
@@ -4829,7 +4829,16 @@ pub(crate) fn dashboard_source_json(source: &CatalogSource) -> Value {
     })
 }
 
-pub(crate) fn dashboard_activity_json(event: &crate::storage::StoredActivityEvent) -> Value {
+pub(crate) fn dashboard_activity_json(
+    event: &crate::storage::StoredActivityEvent,
+    ip_location: Option<&IpLocationService>,
+) -> Value {
+    let metadata =
+        serde_json::from_str::<Value>(&event.metadata_json).unwrap_or_else(|_| json!({}));
+    let remote_ip = metadata.get("remoteIp").and_then(Value::as_str);
+    let remote_ip_location = remote_ip.and_then(|remote_ip| {
+        ip_location.and_then(|service| service.cached_or_schedule(remote_ip))
+    });
     json!({
         "id": event.id,
         "userId": event.actor_user_id,
@@ -4838,8 +4847,11 @@ pub(crate) fn dashboard_activity_json(event: &crate::storage::StoredActivityEven
         "targetType": event.target_type,
         "targetId": event.target_id,
         "targetTitle": event.target_title,
-        "metadata": serde_json::from_str::<Value>(&event.metadata_json)
-            .unwrap_or_else(|_| json!({})),
+        "metadata": metadata,
+        "remoteIp": remote_ip,
+        "remoteIpLocation": remote_ip_location
+            .as_ref()
+            .map(|location| dashboard_ip_location_json(location)),
         "createdAt": event.created_at,
     })
 }

@@ -599,7 +599,9 @@ pub(super) async fn auth_login(
         &user_id,
         "AUTH_LOGIN",
         None,
-        json!({}),
+        json!({
+            "remoteIp": request_client_ip(&headers, &state.remote_access),
+        }),
     )
     .await;
 
