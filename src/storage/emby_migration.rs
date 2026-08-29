@@ -377,7 +377,11 @@ impl Database {
         &self,
         binding: &StoredEmbyMigrationUserBinding,
     ) -> Result<(), StorageError> {
-        self.query(
+        let secret_ref_changed = sql_is_distinct(
+            "emby_migration_user_bindings.secret_ref",
+            "excluded.secret_ref",
+        );
+        self.query(sqlx::AssertSqlSafe(format!(
             "INSERT INTO emby_migration_user_bindings (
                  lux_user_id, source_base_url, secret_ref, emby_user_id,
                  emby_username, password_pending
@@ -388,8 +392,13 @@ impl Database {
                  emby_user_id = excluded.emby_user_id,
                  emby_username = excluded.emby_username,
                  password_pending = excluded.password_pending,
-                 updated_at = unixepoch()",
-        )
+                 updated_at = unixepoch()
+             WHERE emby_migration_user_bindings.source_base_url <> excluded.source_base_url
+                OR {secret_ref_changed}
+                OR emby_migration_user_bindings.emby_user_id <> excluded.emby_user_id
+                OR emby_migration_user_bindings.emby_username <> excluded.emby_username
+                OR emby_migration_user_bindings.password_pending <> excluded.password_pending",
+        )))
         .bind(&binding.lux_user_id)
         .bind(&binding.source_base_url)
         .bind(&binding.secret_ref)
@@ -2059,6 +2068,46 @@ mod tests {
         })
         .await?;
         Ok((temp_dir, database))
+    }
+
+    #[tokio::test]
+    async fn unchanged_user_binding_does_not_refresh_its_timestamp()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let binding = StoredEmbyMigrationUserBinding {
+            lux_user_id: "lux-user".to_owned(),
+            source_base_url: "https://emby.example.test/".to_owned(),
+            secret_ref: Some("emby-migration/test.json".to_owned()),
+            emby_user_id: "emby-user".to_owned(),
+            emby_username: "Alice".to_owned(),
+            password_pending: true,
+        };
+        database
+            .insert_initial_user("lux-user", "migration-user", "Migration User", "hash")
+            .await?;
+        database
+            .upsert_emby_migration_user_binding(&binding)
+            .await?;
+        sqlx::query(
+            "UPDATE emby_migration_user_bindings
+             SET updated_at = 123 WHERE lux_user_id = ?",
+        )
+        .bind(&binding.lux_user_id)
+        .execute(database.pool())
+        .await?;
+
+        database
+            .upsert_emby_migration_user_binding(&binding)
+            .await?;
+
+        let updated_at: i64 = sqlx::query_scalar(
+            "SELECT updated_at FROM emby_migration_user_bindings WHERE lux_user_id = ?",
+        )
+        .bind(&binding.lux_user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(updated_at, 123);
+        Ok(())
     }
 
     async fn insert_test_user_and_item(
