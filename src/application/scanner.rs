@@ -4019,6 +4019,9 @@ impl ScanJobService {
         job_id: &str,
         error: &ScanJobError,
     ) -> Result<(), ScanJobError> {
+        if matches!(error, ScanJobError::AlreadyActive(_)) {
+            return Ok(());
+        }
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             return Ok(());
         };
