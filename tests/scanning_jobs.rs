@@ -1125,6 +1125,55 @@ async fn reconciliation_job_discovers_once_and_processes_a_persisted_snapshot()
 }
 
 #[tokio::test]
+async fn reconciliation_streams_large_directory_discovery_in_bounded_chunks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for index in 0..1_025 {
+        tokio::fs::write(
+            root.join(format!("Movie {index:04}.Movie.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let discovery = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(discovery.processed, 0);
+    let pending_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = ? AND entry_type = 'FILE'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(pending_files, 1_025);
+    let directory_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = ? AND entry_type = 'DIRECTORY'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(directory_entries, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconciliation_hides_items_after_their_last_file_is_deleted()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
