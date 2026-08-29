@@ -1603,7 +1603,7 @@ impl LibraryScanner {
         relative_path: &str,
         fingerprint: &[u8],
         existing_entry: &StoredFilesystemEntry,
-    ) -> Result<Option<(String, ScanReport, Option<(String, String)>)>, ScannerError> {
+    ) -> Result<EpisodeQuickResult, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
         };
@@ -1619,7 +1619,7 @@ impl LibraryScanner {
         if existing_entry.item_id.is_none() {
             return Ok(None);
         }
-        let hierarchy = episode_hierarchy(&relative_path, &parsed);
+        let hierarchy = episode_hierarchy(relative_path, &parsed);
         let series_identity = format!("series:{}:{}", root.id, hierarchy.series_path);
         let episode_identity = Self::episode_identity_key(root, &hierarchy, &parsed);
         if existing_entry.item_identity_key.as_deref() != Some(episode_identity.as_str()) {
@@ -1651,7 +1651,7 @@ impl LibraryScanner {
         root_path: &Path,
         paths: &[PathBuf],
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
-    ) -> Result<Vec<Option<(String, ScanReport, Option<(String, String)>)>>, ScannerError> {
+    ) -> Result<Vec<EpisodeQuickResult>, ScannerError> {
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         let mut tasks: JoinSet<EpisodeFingerprintTask> = JoinSet::new();
         for (index, path) in paths.iter().enumerate() {
@@ -5349,13 +5349,8 @@ type MoviePreparationOutput = (
 );
 type MoviePreparationTask = Result<MoviePreparationOutput, ScannerError>;
 type MovieFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
-type EpisodeFingerprintTask = Result<
-    (
-        usize,
-        Option<(String, ScanReport, Option<(String, String)>)>,
-    ),
-    ScannerError,
->;
+type EpisodeQuickResult = Option<(String, ScanReport, Option<(String, String)>)>;
+type EpisodeFingerprintTask = Result<(usize, EpisodeQuickResult), ScannerError>;
 type ReconciliationFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
 type ReconciliationRegularTask = Result<(usize, ScanReport), ScannerError>;
 
@@ -5386,7 +5381,7 @@ async fn collect_movie_fingerprint_task(
 
 async fn collect_episode_fingerprint_task(
     tasks: &mut JoinSet<EpisodeFingerprintTask>,
-    results: &mut [Option<(String, ScanReport, Option<(String, String)>)>],
+    results: &mut [EpisodeQuickResult],
 ) -> Result<(), ScannerError> {
     let (index, result) = match tasks.join_next().await {
         Some(Ok(result)) => result?,
