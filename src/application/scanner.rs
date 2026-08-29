@@ -2734,6 +2734,7 @@ impl ScanJobService {
         job_id: &str,
         root: &StoredLibraryRoot,
         relative_directory: &str,
+        discovered_count_base: i64,
         cancellation: &AtomicBool,
     ) -> Result<Option<usize>, ScannerError> {
         let relative = Path::new(relative_directory);
@@ -2808,6 +2809,14 @@ impl ScanJobService {
                         &media_files,
                     )
                     .await?;
+                self.database
+                    .update_scan_job_discovery_progress(
+                        job_id,
+                        discovered_count_base.saturating_add(
+                            i64::try_from(discovered_media_files).unwrap_or(i64::MAX),
+                        ),
+                    )
+                    .await?;
                 directories.clear();
                 media_files.clear();
             }
@@ -2816,6 +2825,13 @@ impl ScanJobService {
         media_files.sort_unstable();
         self.database
             .append_reconciliation_directory_entries(job_id, &root.id, &directories, &media_files)
+            .await?;
+        self.database
+            .update_scan_job_discovery_progress(
+                job_id,
+                discovered_count_base
+                    .saturating_add(i64::try_from(discovered_media_files).unwrap_or(i64::MAX)),
+            )
             .await?;
         Ok(Some(discovered_media_files))
     }
@@ -2863,6 +2879,7 @@ impl ScanJobService {
                     &job.id,
                     &root,
                     &directory.relative_path,
+                    discovered_count,
                     cancellation,
                 )
                 .await
