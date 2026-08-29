@@ -52,6 +52,16 @@ cargo test --locked --lib migration_page_batch_benchmark_records_scale -- --igno
 
 ## 本轮新增的低风险优化（2026-08-30）
 
+### 来源插件过滤与有界用户读取
+
+`Lux-plugins` 中的 `org.lux.emby-migration` 0.1.3 已实现 `supportsFilteredReads`：宿主传入的用户 ID、用户字段、状态字段
+和来源虚拟库 ID 会在插件发起 Emby 请求前转换为查询投影；响应还会再次按投影裁剪，兼容忽略投影参数的旧 Emby 版本。
+空的来源库范围直接返回空页，不连接 Emby。插件对多个已选用户使用最多 8 路并发读取，保持输入顺序；单个请求失败会取消
+剩余未完成读取，避免继续消耗来源资源。相关行为由本地 HTTP fixture 覆盖，16 个用户请求的峰值并发断言为 2–8。
+
+本地 fixture 只能证明请求边界和并发上限，不能证明每个 Emby 版本都会执行 `Fields`、`ParentId` 或 `AncestorIds` 投影；连接真实
+Emby 前不把该结果外推为 NAS/x86 或特定 Emby 版本的零读取保证。
+
 - 恢复任务在读取 `emby_migration_handled_items` 后，先从当前页移除已经成功提交的条目，再构造 Provider/标题候选查询；重试不会为已处理条目重复读取 Lux 身份。
 - 同一来源页内具有相同类型、标题、年份、季集键和 Provider ID 的匹配键只保留一份，减少 SQL OR 条件、绑定参数和重复候选行；条目 ID 级别的去重仍由宿主保留，因此不会改变报告和状态语义。
 - 标题仅含标点且没有 Provider ID 的条目不再触发 `LIKE '%'` 全库回退；目标白名单内已经确认冲突的候选也不再重复读取白名单外身份，只保留不可安全匹配的条目做诊断回退。
