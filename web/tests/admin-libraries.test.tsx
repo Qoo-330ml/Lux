@@ -220,6 +220,7 @@ describe("AdminLibrariesPage library cards", () => {
 
     const dialog = container.querySelector('[role="dialog"]');
     expect(dialog?.textContent).toContain("文件夹");
+    expect(dialog?.textContent).not.toContain("开启后，实时索引完成会为受影响的新资源提交元数据和图片补全任务。");
     expect(
       dialog?.querySelector<HTMLInputElement>("[aria-label='新媒体库实时新增资源自动刮削']")?.checked,
     ).toBe(true);
@@ -490,6 +491,7 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("增量扫描");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("全量校验");
     expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("元数据任务");
+    expect(container.querySelector('[role="dialog"]')?.textContent).not.toContain("实时索引完成后，仅为本次受影响的媒体条目提交元数据和图片补全任务。");
   });
 
   it("allows a mixed library to choose an intro and outro source", async () => {
