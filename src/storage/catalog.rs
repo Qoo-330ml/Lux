@@ -1908,7 +1908,7 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_local_danmaku_source_for_item(
+    pub(crate) async fn find_danmaku_source_for_item(
         &self,
         item_id: &str,
         source_id: Option<&str>,
@@ -1917,7 +1917,8 @@ impl Database {
             Some(source_id) => {
                 self.query(
                     "SELECT ms.id AS source_id, ms.item_id,
-                            mi.item_type, mi.title, mi.original_title,
+                            mi.item_type, mi.season_number, mi.episode_number,
+                            mi.title, mi.original_title,
                             series.title AS series_title,
                             series.original_title AS series_original_title,
                             lr.canonical_path AS root_path, fe.relative_path
@@ -1926,7 +1927,8 @@ impl Database {
                      LEFT JOIN media_items series ON series.id = mi.series_id
                      JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                      JOIN library_roots lr ON lr.id = fe.library_root_id
-                     WHERE mi.id = ? AND ms.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                     WHERE mi.id = ? AND ms.id = ?
+                       AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                        AND fe.is_missing = 0
                      LIMIT 1",
                 )
@@ -1938,7 +1940,8 @@ impl Database {
             None => {
                 self.query(
                     "SELECT ms.id AS source_id, ms.item_id,
-                            mi.item_type, mi.title, mi.original_title,
+                            mi.item_type, mi.season_number, mi.episode_number,
+                            mi.title, mi.original_title,
                             series.title AS series_title,
                             series.original_title AS series_original_title,
                             lr.canonical_path AS root_path, fe.relative_path
@@ -1947,7 +1950,7 @@ impl Database {
                      LEFT JOIN media_items series ON series.id = mi.series_id
                      JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                      JOIN library_roots lr ON lr.id = fe.library_root_id
-                     WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                     WHERE mi.id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                        AND fe.is_missing = 0
                      ORDER BY ms.is_default DESC, fe.relative_path
                      LIMIT 1",
@@ -1966,6 +1969,8 @@ impl Database {
             root_path: row.get("root_path"),
             relative_path: row.get("relative_path"),
             item_type: row.get("item_type"),
+            season_number: row.get("season_number"),
+            episode_number: row.get("episode_number"),
             title: row.get("title"),
             original_title: row.get("original_title"),
             series_title: row.get("series_title"),
@@ -1973,7 +1978,7 @@ impl Database {
         }))
     }
 
-    pub(crate) async fn find_registered_local_danmaku_source_for_item(
+    pub(crate) async fn find_registered_danmaku_source_for_item(
         &self,
         item_id: &str,
         source_id: Option<&str>,
@@ -1982,7 +1987,8 @@ impl Database {
             Some(source_id) => {
                 self.query(
                     "SELECT ms.id AS source_id, ms.item_id,
-                            mi.item_type, mi.title, mi.original_title,
+                            mi.item_type, mi.season_number, mi.episode_number,
+                            mi.title, mi.original_title,
                             series.title AS series_title,
                             series.original_title AS series_original_title,
                             lr.canonical_path AS root_path, fe.relative_path
@@ -1992,7 +1998,8 @@ impl Database {
                      LEFT JOIN media_items series ON series.id = mi.series_id
                      JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                      JOIN library_roots lr ON lr.id = fe.library_root_id
-                     WHERE mi.id = ? AND ms.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                     WHERE mi.id = ? AND ms.id = ?
+                       AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                        AND fe.is_missing = 0 AND dt.status = 'READY'
                      LIMIT 1",
                 )
@@ -2004,7 +2011,8 @@ impl Database {
             None => {
                 self.query(
                     "SELECT ms.id AS source_id, ms.item_id,
-                            mi.item_type, mi.title, mi.original_title,
+                            mi.item_type, mi.season_number, mi.episode_number,
+                            mi.title, mi.original_title,
                             series.title AS series_title,
                             series.original_title AS series_original_title,
                             lr.canonical_path AS root_path, fe.relative_path
@@ -2014,7 +2022,7 @@ impl Database {
                      LEFT JOIN media_items series ON series.id = mi.series_id
                      JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                      JOIN library_roots lr ON lr.id = fe.library_root_id
-                     WHERE mi.id = ? AND ms.source_kind = 'LOCAL_FILE'
+                     WHERE mi.id = ? AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                        AND fe.is_missing = 0 AND dt.status = 'READY'
                      ORDER BY ms.is_default DESC, fe.relative_path
                      LIMIT 1",
@@ -2033,6 +2041,8 @@ impl Database {
             root_path: row.get("root_path"),
             relative_path: row.get("relative_path"),
             item_type: row.get("item_type"),
+            season_number: row.get("season_number"),
+            episode_number: row.get("episode_number"),
             title: row.get("title"),
             original_title: row.get("original_title"),
             series_title: row.get("series_title"),
@@ -2116,7 +2126,8 @@ impl Database {
                  FROM media_sources ms
                  JOIN media_items mi ON mi.id = ms.item_id
                  JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-                 WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
+                 WHERE mi.library_id = ?
+                   AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                    AND fe.is_missing = 0",
             )
             .bind(job.id)
@@ -2313,13 +2324,15 @@ impl Database {
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
         self.query(
             "SELECT ji.id, ji.media_source_id,
-                    mi.item_type, mi.title, mi.original_title,
+                    mi.item_type, mi.season_number, mi.episode_number,
+                    mi.title, mi.original_title,
                     series.title AS series_title,
                     series.original_title AS series_original_title,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM danmaku_match_job_items ji
              LEFT JOIN media_sources ms
-               ON ms.id = ji.media_source_id AND ms.source_kind = 'LOCAL_FILE'
+               ON ms.id = ji.media_source_id
+              AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
              LEFT JOIN media_items mi ON mi.id = ms.item_id
              LEFT JOIN media_items series ON series.id = mi.series_id
              LEFT JOIN filesystem_entries fe
@@ -2341,6 +2354,8 @@ impl Database {
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     item_type: row.get("item_type"),
+                    season_number: row.get("season_number"),
+                    episode_number: row.get("episode_number"),
                     title: row.get("title"),
                     original_title: row.get("original_title"),
                     series_title: row.get("series_title"),

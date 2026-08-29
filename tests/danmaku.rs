@@ -121,13 +121,18 @@ async fn danmaku_service_rejects_unsafe_concurrency() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn danmaku_service_matches_local_video_and_writes_sidecar()
+async fn danmaku_service_matches_local_and_strm_sources_and_writes_sidecars()
 -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempfile::tempdir()?;
     let config_dir = directory.path().join("config");
     let media_root = directory.path().join("Movies");
     tokio::fs::create_dir_all(&media_root).await?;
     tokio::fs::write(media_root.join("Demo.Movie.2024.mkv"), b"video").await?;
+    tokio::fs::write(
+        media_root.join("Remote.Movie.2024.strm"),
+        "https://media.example.test/Remote.Movie.2024.mkv\n",
+    )
+    .await?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: config_dir.clone(),
@@ -150,7 +155,10 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
         .route(
             "/api/v2/match",
             post(|Json(body): Json<serde_json::Value>| async move {
-                assert_eq!(body["fileName"], "Demo.Movie.2024.mkv");
+                assert!(matches!(
+                    body["fileName"].as_str(),
+                    Some("Demo.Movie.2024.mkv") | Some("Remote.Movie.2024.strm")
+                ));
                 Json(serde_json::json!({
                     "matches": [{"animeId": 12, "episodeId": 34}]
                 }))
@@ -261,11 +269,28 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
     .await
     .map_err(|_| std::io::Error::other("timed out waiting for scheduled danmaku job"))??;
     assert_eq!(completed.status, "COMPLETED");
-    assert_eq!(completed.success_count, 1);
+    assert_eq!(completed.success_count, 2);
     assert_eq!(
         tokio::fs::read(media_root.join("Demo.Movie.2024.xml")).await?,
         b"<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>"
     );
+    assert_eq!(
+        tokio::fs::read(media_root.join("Remote.Movie.2024.xml")).await?,
+        b"<i><d p=\"1,1,25,16777215,0,0,0,0\">hello</d></i>"
+    );
+    let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote.Movie.2024.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let strm_danmaku = service
+        .read_registered_sidecar_for_source(&strm_item_id, Some(&strm_source_id))
+        .await?;
+    assert!(strm_danmaku.is_some());
     let track_status: String = sqlx::query_scalar("SELECT status FROM danmaku_tracks LIMIT 1")
         .fetch_one(database.pool())
         .await?;
@@ -336,7 +361,7 @@ async fn danmaku_service_matches_local_video_and_writes_sidecar()
     )
     .await
     .map_err(|_| "danmaku job creation materialized every source")??;
-    assert_eq!(large_job.total_count, 10001);
+    assert_eq!(large_job.total_count, 10002);
 
     server.abort();
     Ok(())

@@ -483,7 +483,7 @@ impl DanmakuService {
     ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
         let Some(source) = self
             .database
-            .find_local_danmaku_source_for_item(item_id, source_id)
+            .find_danmaku_source_for_item(item_id, source_id)
             .await?
         else {
             return Ok(None);
@@ -513,7 +513,7 @@ impl DanmakuService {
     ) -> Result<Option<Vec<u8>>, DanmakuServiceError> {
         let Some(source) = self
             .database
-            .find_registered_local_danmaku_source_for_item(item_id, source_id)
+            .find_registered_danmaku_source_for_item(item_id, source_id)
             .await?
         else {
             return Ok(None);
@@ -642,6 +642,8 @@ impl DanmakuService {
                         root_path,
                         relative_path,
                         item_type: item.item_type.clone(),
+                        season_number: item.season_number,
+                        episode_number: item.episode_number,
                         title: item.title.clone(),
                         original_title: item.original_title.clone(),
                         series_title: item.series_title.clone(),
@@ -1060,7 +1062,7 @@ fn match_file_name_candidates(
     };
     if settings.match_simplified_traditional_titles {
         if let Some(title) = title {
-            candidates.push(title_with_episode_suffix(title, file_name));
+            candidates.push(title_with_episode_suffix(title, file_name, source));
         }
     }
     if settings.match_english_title {
@@ -1073,7 +1075,7 @@ fn match_file_name_candidates(
             source.original_title.as_deref()
         };
         if let Some(title) = title {
-            candidates.push(title_with_episode_suffix(title, file_name));
+            candidates.push(title_with_episode_suffix(title, file_name, source));
         }
     }
     candidates.retain(|candidate| !candidate.trim().is_empty());
@@ -1081,15 +1083,23 @@ fn match_file_name_candidates(
     candidates
 }
 
-fn title_with_episode_suffix(title: &str, file_name: &str) -> String {
-    let Some(parsed) = parse_media_name(file_name, MediaKind::Episode) else {
-        return title.trim().to_owned();
-    };
+fn title_with_episode_suffix(title: &str, file_name: &str, source: &StoredDanmakuSource) -> String {
+    let season = source
+        .season_number
+        .and_then(|value| u32::try_from(value).ok());
+    let episode = source
+        .episode_number
+        .and_then(|value| u32::try_from(value).ok());
+    let parsed = (season.is_none() || episode.is_none())
+        .then(|| parse_media_name(file_name, MediaKind::Episode))
+        .flatten();
+    let season = season.or_else(|| parsed.as_ref().and_then(|value| value.season));
+    let episode = episode.or_else(|| parsed.as_ref().and_then(|value| value.episode));
     let mut result = title.trim().to_owned();
-    if let Some(season) = parsed.season {
+    if let Some(season) = season {
         result.push_str(&format!(" S{season:02}"));
     }
-    if let Some(episode) = parsed.episode {
+    if let Some(episode) = episode {
         result.push_str(&format!("E{episode:02}"));
     }
     result
@@ -1182,6 +1192,8 @@ mod tests {
             root_path: "/media".to_owned(),
             relative_path: "Show/Episode 01.mkv".to_owned(),
             item_type: Some("EPISODE".to_owned()),
+            season_number: None,
+            episode_number: None,
             title: Some("第 1 集".to_owned()),
             original_title: Some("Episode 1".to_owned()),
             series_title: Some("简体剧名".to_owned()),
@@ -1202,6 +1214,34 @@ mod tests {
                 "简体剧名 S01E01",
                 "English Show S01E01"
             ]
+        );
+    }
+
+    #[test]
+    fn structured_episode_numbers_take_precedence_over_filename_numbers() {
+        let source = StoredDanmakuSource {
+            source_id: "source-1".to_owned(),
+            root_path: "/media".to_owned(),
+            relative_path: "Show/Episode 01.mkv".to_owned(),
+            item_type: Some("EPISODE".to_owned()),
+            season_number: Some(2),
+            episode_number: Some(3),
+            title: Some("第 3 集".to_owned()),
+            original_title: Some("Episode 3".to_owned()),
+            series_title: Some("简体剧名".to_owned()),
+            series_original_title: Some("English Show".to_owned()),
+        };
+        let settings = DanmakuSettings {
+            library_ids: vec!["library-1".to_owned()],
+            match_original_filename: false,
+            match_simplified_traditional_titles: true,
+            match_english_title: true,
+            schedule: DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned(),
+        };
+
+        assert_eq!(
+            match_file_name_candidates("Original.S01E01.mkv", &source, &settings),
+            vec!["简体剧名 S02E03", "English Show S02E03"]
         );
     }
 }
