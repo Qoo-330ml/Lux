@@ -212,6 +212,144 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
 }
 
 #[tokio::test]
+async fn series_reconciliation_batches_hierarchy_and_versions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season = root.join("Example Show (2024)").join("Season 01");
+    tokio::fs::create_dir_all(&season).await?;
+    for name in [
+        "Example.Show.S01E01.1080p.mkv",
+        "Example.Show.S01E01.2160p.mkv",
+        "Example.Show.S01E02.mkv",
+    ] {
+        tokio::fs::write(season.join(name), b"episode").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let hierarchy_counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT item_type, COUNT(*) FROM media_items
+         WHERE library_id = ? GROUP BY item_type ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        hierarchy_counts,
+        vec![
+            ("EPISODE".to_owned(), 2),
+            ("SEASON".to_owned(), 1),
+            ("SERIES".to_owned(), 1),
+        ]
+    );
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources ms
+         JOIN media_items mi ON mi.id = ms.item_id
+         WHERE mi.library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source_count, 3);
+    let batch_details: String = sqlx::query_scalar(
+        "SELECT details_json FROM scan_job_events
+         WHERE job_id = ? AND event_code = 'BATCH_COMPLETED'
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(batch_details.contains("\"concurrency\":"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn mixed_reconciliation_batches_known_media_and_keeps_unresolved()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Mixed", LibraryKind::Mixed, false)
+        .await?;
+    let root = temp_dir.path().join("Mixed");
+    let movie_dir = root.join("Known Movie (2020)");
+    let episode_dir = root.join("Known Show").join("Season 01");
+    let unresolved_dir = root.join("Unclear");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::create_dir_all(&episode_dir).await?;
+    tokio::fs::create_dir_all(&unresolved_dir).await?;
+    tokio::fs::write(movie_dir.join("Known.Movie.2020.mkv"), b"movie").await?;
+    tokio::fs::write(episode_dir.join("Known.Show.S01E01.mkv"), b"episode").await?;
+    tokio::fs::write(unresolved_dir.join("Mystery File.mkv"), b"unknown").await?;
+    tokio::fs::write(root.join("Known Show").join("tvshow.nfo"), "<tvshow />").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let counts: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT item_type, COUNT(*) FROM media_items
+         WHERE library_id = ? GROUP BY item_type ORDER BY item_type",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        counts,
+        vec![
+            ("EPISODE".to_owned(), 1),
+            ("FOLDER".to_owned(), 2),
+            ("MOVIE".to_owned(), 1),
+            ("SEASON".to_owned(), 1),
+            ("SERIES".to_owned(), 1),
+            ("UNRESOLVED".to_owned(), 1),
+        ]
+    );
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources ms
+         JOIN media_items mi ON mi.id = ms.item_id
+         WHERE mi.library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source_count, 3);
+    let batch_details: String = sqlx::query_scalar(
+        "SELECT details_json FROM scan_job_events
+         WHERE job_id = ? AND event_code = 'BATCH_COMPLETED'
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(batch_details.contains("\"concurrency\":"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelling_after_indexing_completion_does_not_cancel_scan()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -1871,14 +1871,31 @@ impl LibraryScanner {
         root_path: &Path,
         paths: &[PathBuf],
     ) -> Result<Vec<Option<NewEpisodeFile>>, ScannerError> {
+        self.prepare_new_episode_files_with_concurrency(
+            root,
+            root_path,
+            paths,
+            FILE_PREPARATION_CONCURRENCY,
+        )
+        .await
+    }
+
+    async fn prepare_new_episode_files_with_concurrency(
+        &self,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        paths: &[PathBuf],
+        configured_concurrency: usize,
+    ) -> Result<Vec<Option<NewEpisodeFile>>, ScannerError> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
+        let concurrency = configured_concurrency.max(1);
         let mut tasks: JoinSet<Result<(usize, Option<NewEpisodeFile>), ScannerError>> =
             JoinSet::new();
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         for (index, path) in paths.iter().cloned().enumerate() {
-            if tasks.len() >= FILE_PREPARATION_CONCURRENCY {
+            if tasks.len() >= concurrency {
                 collect_episode_preparation_task(&mut tasks, &mut results).await?;
             }
             let scanner = self.clone();
@@ -1902,9 +1919,24 @@ impl LibraryScanner {
         root_path: &Path,
         paths: &[PathBuf],
     ) -> Result<Vec<Option<NewMovieFile>>, ScannerError> {
+        self.prepare_new_movie_files_with_concurrency(
+            root_path,
+            paths,
+            FILE_PREPARATION_CONCURRENCY,
+        )
+        .await
+    }
+
+    async fn prepare_new_movie_files_with_concurrency(
+        &self,
+        root_path: &Path,
+        paths: &[PathBuf],
+        configured_concurrency: usize,
+    ) -> Result<Vec<Option<NewMovieFile>>, ScannerError> {
         if paths.is_empty() {
             return Ok(Vec::new());
         }
+        let concurrency = configured_concurrency.max(1);
         let mut folder_provider_ids = HashMap::<PathBuf, BTreeMap<String, String>>::new();
         for path in paths {
             let directory = path.parent().unwrap_or(root_path).to_owned();
@@ -1917,7 +1949,7 @@ impl LibraryScanner {
             JoinSet::new();
         let mut results = Vec::with_capacity(paths.len());
         for (index, path) in paths.iter().cloned().enumerate() {
-            if tasks.len() >= FILE_PREPARATION_CONCURRENCY {
+            if tasks.len() >= concurrency {
                 collect_movie_preparation_task(&mut tasks, &mut results).await?;
             }
             let scanner = self.clone();
@@ -2959,7 +2991,10 @@ impl ScanJobService {
         let mut changed_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut new_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut changed_sidecar_paths_by_root = HashMap::<String, Vec<String>>::new();
+        let mut new_works_by_root = HashMap::<String, Vec<ReconciliationScanWork>>::new();
+        let mut root_has_existing_index = HashMap::<String, bool>::new();
         let mut quick_seen_entry_ids = Vec::<String>::new();
+        let mut refreshed_series = HashSet::new();
         for entry in &batch {
             batch_paths_by_root
                 .entry(entry.library_root_id.clone())
@@ -3078,6 +3113,65 @@ impl ScanJobService {
                 completed_entries.push(entry.clone());
                 continue;
             }
+            let classification = match library_kind {
+                "SERIES" => MixedClassification::Episode,
+                "MIXED" => classify_mixed_file(Path::new(&root.canonical_path), &path).await,
+                _ => return Err(ScanJobError::LibraryNotFound),
+            };
+            let is_new = !existing_entries.contains_key(&entry.relative_path);
+            let batchable = is_new
+                && matches!(
+                    classification,
+                    MixedClassification::Movie | MixedClassification::Episode
+                );
+            let root_has_index = if batchable {
+                if let Some(has_index) = root_has_existing_index.get(&root.id) {
+                    *has_index
+                } else {
+                    let has_index = self
+                        .database
+                        .has_filesystem_entries_for_root(&root.id)
+                        .await?;
+                    root_has_existing_index.insert(root.id.clone(), has_index);
+                    has_index
+                }
+            } else {
+                false
+            };
+            let requires_compatibility_scan = batchable
+                && root_has_index
+                && (self
+                    .scanner
+                    .file_has_moved_entry(
+                        &job.library_id,
+                        root,
+                        Path::new(&root.canonical_path),
+                        &path,
+                    )
+                    .await?
+                    || (matches!(classification, MixedClassification::Episode)
+                        && self
+                            .scanner
+                            .episode_path_has_legacy_identity(
+                                root,
+                                Path::new(&root.canonical_path),
+                                &path,
+                            )
+                            .await?));
+            if batchable && !requires_compatibility_scan {
+                new_paths_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry.relative_path.clone());
+                new_works_by_root.entry(root.id.clone()).or_default().push(
+                    ReconciliationScanWork {
+                        entry: entry.clone(),
+                        path,
+                        classification,
+                    },
+                );
+                continue;
+            }
             let target_paths = if existing_entries.contains_key(&entry.relative_path) {
                 &mut changed_paths_by_root
             } else {
@@ -3102,52 +3196,52 @@ impl ScanJobService {
                 }
                 "SERIES" => {
                     self.scanner
-                        .scan_episode_file(
+                        .scan_episode_file_with_provider_cache(
                             &job.library_id,
                             root,
                             Path::new(&root.canonical_path),
                             &path,
                             &job.generation,
+                            Some(&mut refreshed_series),
                         )
                         .await
                 }
-                "MIXED" => {
-                    match classify_mixed_file(Path::new(&root.canonical_path), &path).await {
-                        MixedClassification::Movie => {
-                            self.scanner
-                                .scan_movie_file(
-                                    &job.library_id,
-                                    root,
-                                    Path::new(&root.canonical_path),
-                                    &path,
-                                    &job.generation,
-                                )
-                                .await
-                        }
-                        MixedClassification::Episode => {
-                            self.scanner
-                                .scan_episode_file(
-                                    &job.library_id,
-                                    root,
-                                    Path::new(&root.canonical_path),
-                                    &path,
-                                    &job.generation,
-                                )
-                                .await
-                        }
-                        MixedClassification::Unresolved => {
-                            self.scanner
-                                .scan_unresolved_file(
-                                    &job.library_id,
-                                    root,
-                                    Path::new(&root.canonical_path),
-                                    &path,
-                                    &job.generation,
-                                )
-                                .await
-                        }
+                "MIXED" => match classification {
+                    MixedClassification::Movie => {
+                        self.scanner
+                            .scan_movie_file(
+                                &job.library_id,
+                                root,
+                                Path::new(&root.canonical_path),
+                                &path,
+                                &job.generation,
+                            )
+                            .await
                     }
-                }
+                    MixedClassification::Episode => {
+                        self.scanner
+                            .scan_episode_file_with_provider_cache(
+                                &job.library_id,
+                                root,
+                                Path::new(&root.canonical_path),
+                                &path,
+                                &job.generation,
+                                Some(&mut refreshed_series),
+                            )
+                            .await
+                    }
+                    MixedClassification::Unresolved => {
+                        self.scanner
+                            .scan_unresolved_file(
+                                &job.library_id,
+                                root,
+                                Path::new(&root.canonical_path),
+                                &path,
+                                &job.generation,
+                            )
+                            .await
+                    }
+                },
                 _ => Err(ScannerError::LibraryNotFound),
             };
             let report = match result {
@@ -3162,6 +3256,117 @@ impl ScanJobService {
             next_count = next_count.saturating_add(1);
             processed = processed.saturating_add(1);
             completed_entries.push(entry.clone());
+        }
+        let concurrency = self.effective_scan_concurrency(scan_concurrency).await;
+        let mut prepared_movie_files = HashMap::<String, Vec<NewMovieFile>>::new();
+        let mut prepared_episode_files = HashMap::<String, Vec<NewEpisodeFile>>::new();
+        for (root_id, works) in new_works_by_root {
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(&job.id).await;
+            }
+            let mut movie_works = Vec::new();
+            let mut episode_works = Vec::new();
+            for work in works {
+                match work.classification {
+                    MixedClassification::Movie => movie_works.push(work),
+                    MixedClassification::Episode => episode_works.push(work),
+                    MixedClassification::Unresolved => {}
+                }
+            }
+            let Some(root) = roots.iter().find(|root| root.id == root_id) else {
+                continue;
+            };
+            if !movie_works.is_empty() {
+                let paths = movie_works
+                    .iter()
+                    .map(|work| work.path.clone())
+                    .collect::<Vec<_>>();
+                let prepared = match self
+                    .scanner
+                    .prepare_new_movie_files_with_concurrency(
+                        Path::new(&root.canonical_path),
+                        &paths,
+                        concurrency,
+                    )
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        return self
+                            .fail_reconciliation_job(job, error, &completed_entries, next_count)
+                            .await;
+                    }
+                };
+                for (work, prepared) in movie_works.into_iter().zip(prepared) {
+                    if let Some(file) = prepared {
+                        prepared_movie_files
+                            .entry(root_id.clone())
+                            .or_default()
+                            .push(file);
+                    }
+                    next_count = next_count.saturating_add(1);
+                    processed = processed.saturating_add(1);
+                    completed_entries.push(work.entry);
+                }
+            }
+            if !episode_works.is_empty() {
+                let paths = episode_works
+                    .iter()
+                    .map(|work| work.path.clone())
+                    .collect::<Vec<_>>();
+                let prepared = match self
+                    .scanner
+                    .prepare_new_episode_files_with_concurrency(
+                        root,
+                        Path::new(&root.canonical_path),
+                        &paths,
+                        concurrency,
+                    )
+                    .await
+                {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        return self
+                            .fail_reconciliation_job(job, error, &completed_entries, next_count)
+                            .await;
+                    }
+                };
+                for (work, prepared) in episode_works.into_iter().zip(prepared) {
+                    if let Some(file) = prepared {
+                        prepared_episode_files
+                            .entry(root_id.clone())
+                            .or_default()
+                            .push(file);
+                    }
+                    next_count = next_count.saturating_add(1);
+                    processed = processed.saturating_add(1);
+                    completed_entries.push(work.entry);
+                }
+            }
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return self.cancel_running_job(&job.id).await;
+        }
+        for root in roots {
+            if let Some(files) = prepared_movie_files.get(&root.id) {
+                created_items = created_items.saturating_add(
+                    self.database
+                        .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
+                        .await?,
+                );
+            }
+            if let Some(files) = prepared_episode_files.get(&root.id) {
+                created_items = created_items.saturating_add(
+                    self.database
+                        .insert_episode_files_batch(
+                            &job.library_id,
+                            &root.id,
+                            &job.generation,
+                            files,
+                        )
+                        .await?,
+                );
+            }
         }
         self.database
             .mark_filesystem_entries_seen_batch(&quick_seen_entry_ids, &job.generation)
@@ -3187,7 +3392,7 @@ impl ScanJobService {
             processed,
             created_items,
             next_count,
-            None,
+            Some(concurrency),
         )
         .await
     }
@@ -4995,6 +5200,12 @@ enum MixedClassification {
     Movie,
     Episode,
     Unresolved,
+}
+
+struct ReconciliationScanWork {
+    entry: StoredReconciliationScanEntry,
+    path: PathBuf,
+    classification: MixedClassification,
 }
 
 async fn classify_mixed_file(root: &Path, path: &Path) -> MixedClassification {

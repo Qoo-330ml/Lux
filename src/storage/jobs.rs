@@ -3293,6 +3293,25 @@ impl Database {
         Ok(entries)
     }
 
+    pub(crate) async fn has_filesystem_entries_for_root(
+        &self,
+        library_root_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar::<i64>(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM filesystem_entries WHERE library_root_id = ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(library_root_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_filesystem_entry_by_inode(
         &self,
         library_id: &str,
