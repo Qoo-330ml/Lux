@@ -55,6 +55,30 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    let fixed_caption_tracks = [
+        (2_i64, "subrip", "zho", "中文", 1_i64),
+        (3, "ass", "eng", "English", 0),
+        (4, "ssa", "jpn", "SSA", 0),
+        (5, "hdmv_pgs_subtitle", "zho", "PGS 图形字幕", 0),
+        (6, "sup", "zho", "SUP 图形字幕", 0),
+    ];
+    for (stream_index, codec, language, title, is_default) in fixed_caption_tracks {
+        sqlx::query(
+            "INSERT INTO media_streams
+             (id, media_source_id, stream_index, stream_type, codec, language, title,
+              is_external, is_default, is_forced)
+             VALUES (?, ?, ?, 'SUBTITLE', ?, ?, ?, 0, ?, 0)",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&source_id)
+        .bind(stream_index)
+        .bind(codec)
+        .bind(language)
+        .bind(title)
+        .bind(is_default)
+        .execute(database.pool())
+        .await?;
+    }
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -80,6 +104,33 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let session_cookie = cookie_value(login.headers(), "lux_session").ok_or("missing session")?;
     let csrf_cookie = cookie_value(login.headers(), "lux_csrf").ok_or("missing csrf")?;
     let cookies = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
+
+    let item_details = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(item_details.status(), reqwest::StatusCode::OK);
+    let item_details = item_details.json::<Value>().await?;
+    let source_details = item_details["mediaSources"]
+        .as_array()
+        .and_then(|sources| sources.iter().find(|source| source["id"] == source_id))
+        .ok_or("missing fixed local source")?;
+    let caption_streams = source_details["streams"]
+        .as_array()
+        .ok_or("missing fixed caption streams")?
+        .iter()
+        .filter(|stream| stream["type"] == "SUBTITLE")
+        .collect::<Vec<_>>();
+    assert_eq!(caption_streams.len(), 5);
+    assert_eq!(caption_streams[0]["index"], 2);
+    assert_eq!(caption_streams[0]["codec"], "subrip");
+    assert_eq!(caption_streams[0]["isExternal"], false);
+    assert_eq!(caption_streams[0]["isDefault"], true);
+    assert_eq!(caption_streams[1]["codec"], "ass");
+    assert_eq!(caption_streams[2]["codec"], "ssa");
+    assert_eq!(caption_streams[3]["codec"], "hdmv_pgs_subtitle");
+    assert_eq!(caption_streams[4]["codec"], "sup");
 
     let create = client
         .post(format!("{base_url}/api/v1/playback/sessions"))
@@ -207,6 +258,44 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(strm_session_count, 0);
+
+    let strm_direct_create = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": strm_item_id,
+            "sourceId": strm_source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "videoCopyToFmp4": true,
+                "audioCopyToFmp4": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(strm_direct_create.status(), reqwest::StatusCode::OK);
+    let strm_direct_body = strm_direct_create.json::<Value>().await?;
+    assert_eq!(strm_direct_body["plan"]["type"], "DIRECT");
+    assert!(strm_direct_body["plan"]["proxyUrl"].is_null());
+    assert!(strm_direct_body["sessionId"].is_string());
+    let strm_direct_session_id = strm_direct_body["sessionId"]
+        .as_str()
+        .ok_or("missing direct STRM session id")?;
+    let strm_direct_stopped = client
+        .delete(format!(
+            "{base_url}/api/v1/playback/sessions/{strm_direct_session_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .send()
+        .await?;
+    assert_eq!(
+        strm_direct_stopped.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
 
     tokio::fs::write(
         root.join("Proxy Path Movie 2027.strm"),

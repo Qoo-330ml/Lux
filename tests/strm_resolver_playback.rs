@@ -152,6 +152,7 @@ fi
         stream.headers()[reqwest::header::LOCATION],
         "https://media.example.test/resolved.mkv"
     );
+    assert!(stream.bytes().await?.is_empty());
 
     server.abort();
     Ok(())
