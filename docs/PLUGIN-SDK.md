@@ -229,15 +229,22 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 - `chapters.detect`：接收同一季度至少两个分集的有界 Chromaprint 指纹序列。每个分集只包含请求内临时 `key`、固定 `sampleRate: 11025`、`fingerprintPointDurationTicks: 1238095`、指纹 Base64、窗口起点和窗口时长；宿主对每个文件固定取第一个音频流并让 FFmpeg chromaprint muxer 输出 raw `uint32` 点序列，按 little-endian 编码，不能把 Base64 字节索引当作时间。插件不得接收路径、URL、媒体源 ID 或任务对象。结果只能返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`，时间必须落在对应窗口内，置信度为 0-1。
 - `chapters.lookup`：接收请求内临时 `key`、TMDb/TVDb/IMDb ID、季号、集号和可选时长；插件不得接收路径、URL、媒体源 ID、音频指纹或任务对象。插件只能访问 manifest 声明的固定网络主机，返回 `IntroStart`、`IntroEnd` 和 `CreditsStart`；无数据时返回空标记，宿主不会因空响应删除已有标记。
 - `migration.test`：接收管理员提交的 Emby 基础地址、API key 和明确的局域网访问许可，返回脱敏服务器信息及
-  `historyCapability`。基础地址不得含凭据、查询参数或片段；API key 不得出现在结果、日志或错误消息中。
+  `historyCapability`。较新的插件可以额外返回可选布尔值 `supportsFilteredReads: true`，表示插件能够在发起
+  Emby 请求前执行宿主传入的用户、来源库和字段投影；缺省或 `false` 表示不支持。基础地址不得含凭据、查询参数或片段；
+  API key 不得出现在结果、日志或错误消息中。
 - `migration.list_users`：分页边界由宿主提供，插件调用 Emby 用户接口并返回用户名、显示名、启用状态、管理员标记、
   远程访问/内容下载策略、媒体库文件夹策略和头像标签；同时返回 Emby 虚拟媒体库文件夹的稳定 ID、名称和位置，
-  用于将受限用户的库权限映射到 Lux；不返回 Emby token、密码或完整原始响应。
+  用于将受限用户的库权限映射到 Lux；不返回 Emby token、密码或完整原始响应。支持过滤的插件可接收可选 `userIds`
+  数组，只读取这些用户；未提供时保持列出全部用户的兼容行为。
 - `migration.list_items`：接收一个 Emby 用户 ID 和有界分页参数，返回 Movie、Series、Season、Episode 的稳定 ID、
   ProviderIds、层级字段和可选的用户状态；未知条目类型不得被伪造成支持类型。
 - `migration.user_state`：接收一个 Emby 用户 ID、有界分页参数和必填的 `stateFilter`；筛选值为
-  `PLAYED`、`FAVORITE` 或 `RESUMABLE`，分别只返回已看、收藏或存在可继续播放位置的媒体，并返回播放位置、播放次数、最近播放时间和收藏。
-  宿主应分别请求三种筛选并按 Emby 条目 ID 去重。当前 `historyCapability: "ITEM_STATE"` 只表示条目聚合状态，不得生成假的历史事件。
+  `PLAYED`、`FAVORITE` 或 `RESUMABLE`，分别只返回已看、收藏或存在可继续播放位置的媒体。支持过滤的插件还会收到可选
+  `stateFields`（分别为 `played`/`playCount`/`lastPlayedDate`、`isFavorite` 或 `playbackPositionTicks`）以及
+  `sourceLibraryIds`，插件必须在 Emby 请求前应用这些投影和来源虚拟库限制。若一次迁移选择多个筛选项，宿主会在每个
+  筛选请求中发送所选字段的并集，以便按 Emby 条目 ID 去重时不丢失其他已选字段；未选择的字段仍不会发送或写入。
+  宿主应分别请求三种筛选并按 Emby 条目 ID 去重；
+  空的已确认来源库范围表示无需发起该用户的状态请求。当前 `historyCapability: "ITEM_STATE"` 只表示条目聚合状态，不得生成假的历史事件。
 - `migration.authenticate_user`：仅在 Lux 用户首次登录迁移账户时接收一次用户名和密码，向 Emby 验证后只返回成功及
   脱敏用户身份；插件不得返回或持久化 Emby access token、密码或完整认证响应。
 - 迁移插件必须声明 `type: "data_migration"`、`category: "MIGRATION"` 和 `capabilities: ["migration.emby"]`。

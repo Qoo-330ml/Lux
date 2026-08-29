@@ -26,6 +26,9 @@ pub enum MigrationInputError {
     InvalidSecret,
     InvalidIdentifier,
     NoSelectedUsers,
+    NoSelectedMigrationScope,
+    NoSelectedItemStateFilters,
+    NoSelectedTargetLibraries,
 }
 
 impl fmt::Display for MigrationInputError {
@@ -38,6 +41,15 @@ impl fmt::Display for MigrationInputError {
             Self::InvalidSecret => formatter.write_str("invalid Emby API key"),
             Self::InvalidIdentifier => formatter.write_str("invalid migration identifier"),
             Self::NoSelectedUsers => formatter.write_str("at least one Emby user must be selected"),
+            Self::NoSelectedMigrationScope => {
+                formatter.write_str("at least one migration category must be selected")
+            }
+            Self::NoSelectedItemStateFilters => {
+                formatter.write_str("at least one media state field must be selected")
+            }
+            Self::NoSelectedTargetLibraries => {
+                formatter.write_str("at least one target Lux library must be selected")
+            }
         }
     }
 }
@@ -117,8 +129,15 @@ pub struct MigrationScope {
     pub library_access: bool,
     #[serde(default = "default_scope_enabled")]
     pub item_state: bool,
+    /// New requests may narrow media-state migration to a subset of source
+    /// queries.  `None` preserves the all-state behavior used by jobs created
+    /// before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_state_filters: Option<Vec<MigrationUserStateFilter>>,
     #[serde(default = "default_scope_enabled")]
     pub person_favorites: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_library_ids: Option<Vec<String>>,
 }
 
 impl Default for MigrationScope {
@@ -127,8 +146,29 @@ impl Default for MigrationScope {
             user_profile: true,
             library_access: true,
             item_state: true,
+            item_state_filters: None,
             person_favorites: true,
+            target_library_ids: None,
         }
+    }
+}
+
+impl MigrationScope {
+    pub fn has_selected_category(&self) -> bool {
+        self.user_profile || self.library_access || self.item_state || self.person_favorites
+    }
+
+    pub fn requires_target_libraries(&self) -> bool {
+        self.library_access || self.item_state
+    }
+
+    pub fn selected_item_state_filters(&self) -> &[MigrationUserStateFilter] {
+        if !self.item_state {
+            return &[];
+        }
+        self.item_state_filters
+            .as_deref()
+            .unwrap_or(&MigrationUserStateFilter::ALL)
     }
 }
 
@@ -147,6 +187,11 @@ pub struct MigrationConnectionInfo {
     pub version: Option<String>,
     pub server_id: Option<String>,
     pub history_capability: HistoryCapability,
+    /// Newer migration plugins can enforce the selected source-library and
+    /// user-data field projection before issuing Emby requests.  Older
+    /// plugins omit this field and retain the legacy read behaviour.
+    #[serde(default)]
+    pub supports_filtered_reads: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -203,10 +248,15 @@ pub struct MigrationItem {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct MigrationUserData {
+    #[serde(default)]
     pub playback_position_ticks: i64,
+    #[serde(default)]
     pub played: bool,
+    #[serde(default)]
     pub is_favorite: bool,
+    #[serde(default)]
     pub play_count: i64,
+    #[serde(default)]
     pub last_played_date: Option<String>,
 }
 
@@ -230,11 +280,40 @@ pub enum MigrationUserStateFilter {
 
 impl MigrationUserStateFilter {
     pub const ALL: [Self; 3] = [Self::Played, Self::Favorite, Self::Resumable];
+
+    pub const fn requested_fields(self) -> &'static [&'static str] {
+        match self {
+            Self::Played => &["played", "playCount", "lastPlayedDate"],
+            Self::Favorite => &["isFavorite"],
+            Self::Resumable => &["playbackPositionTicks"],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct MigrationSourceFilter<'a> {
+    pub(crate) library_ids: Option<&'a [String]>,
+    pub(crate) enabled: bool,
+    pub(crate) state_fields: Option<&'a [&'static str]>,
+}
+
+impl MigrationSourceFilter<'_> {
+    pub(crate) const fn disabled() -> Self {
+        Self {
+            library_ids: None,
+            enabled: false,
+            state_fields: None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod user_data_tests {
-    use super::{MigrationScope, MigrationUserData};
+    use super::{
+        EmbyMigrationSource, MigrationScope, MigrationSourceFilter, MigrationUserData,
+        MigrationUserStateFilter, migration_user_state_params, requested_fields_for_state_filters,
+    };
+    use serde_json::json;
 
     #[test]
     fn migration_scope_defaults_to_all_categories() {
@@ -253,6 +332,102 @@ mod user_data_tests {
         assert!(scope.library_access);
         assert!(!scope.item_state);
         assert!(scope.person_favorites);
+    }
+
+    #[test]
+    fn migration_scope_uses_only_explicitly_selected_item_state_filters() {
+        let scope: MigrationScope =
+            serde_json::from_str(r#"{"itemState":true,"itemStateFilters":["FAVORITE"]}"#)
+                .expect("selected item-state filters should deserialize");
+
+        assert_eq!(
+            scope.selected_item_state_filters(),
+            &[MigrationUserStateFilter::Favorite]
+        );
+    }
+
+    #[test]
+    fn legacy_item_state_scope_keeps_all_state_filters() {
+        let scope: MigrationScope = serde_json::from_str(r#"{"itemState":true}"#)
+            .expect("legacy item-state scope should deserialize");
+
+        assert_eq!(
+            scope.selected_item_state_filters(),
+            &MigrationUserStateFilter::ALL
+        );
+    }
+
+    #[test]
+    fn filtered_user_state_request_contains_only_selected_source_scope() {
+        let source = EmbyMigrationSource {
+            base_url: "http://emby.example/".to_owned(),
+            api_key: "redacted-test-key".to_owned(),
+            allow_private_network: false,
+        };
+        let source_library_ids = ["source-library-1".to_owned()];
+        let params = migration_user_state_params(
+            &source,
+            "user-1",
+            0,
+            500,
+            MigrationUserStateFilter::Favorite,
+            MigrationSourceFilter {
+                library_ids: Some(&source_library_ids),
+                enabled: true,
+                state_fields: None,
+            },
+        )
+        .expect("valid filtered request");
+
+        assert_eq!(params["stateFilter"], json!("FAVORITE"));
+        assert_eq!(params["stateFields"], json!(["isFavorite"]));
+        assert_eq!(params["sourceLibraryIds"], json!(["source-library-1"]));
+        assert!(params.get("includeItemTypes").is_none());
+    }
+
+    #[test]
+    fn filtered_user_state_request_projects_the_union_of_selected_fields() {
+        let source = EmbyMigrationSource {
+            base_url: "http://emby.example/".to_owned(),
+            api_key: "redacted-test-key".to_owned(),
+            allow_private_network: false,
+        };
+        let fields = requested_fields_for_state_filters(&[
+            MigrationUserStateFilter::Played,
+            MigrationUserStateFilter::Favorite,
+        ]);
+        let params = migration_user_state_params(
+            &source,
+            "user-1",
+            0,
+            500,
+            MigrationUserStateFilter::Favorite,
+            MigrationSourceFilter {
+                library_ids: None,
+                enabled: true,
+                state_fields: Some(&fields),
+            },
+        )
+        .expect("valid union field projection");
+
+        assert_eq!(
+            params["stateFields"],
+            json!(["played", "playCount", "lastPlayedDate", "isFavorite"])
+        );
+    }
+
+    #[test]
+    fn partial_source_user_data_defaults_unrequested_fields() {
+        let data: MigrationUserData = serde_json::from_value(json!({
+            "isFavorite": true
+        }))
+        .expect("partial state projection should deserialize");
+
+        assert!(data.is_favorite);
+        assert_eq!(data.playback_position_ticks, 0);
+        assert!(!data.played);
+        assert_eq!(data.play_count, 0);
+        assert!(data.last_played_date.is_none());
     }
 
     #[test]
@@ -358,7 +533,19 @@ impl EmbyMigrationPluginClient {
         &self,
         source: &EmbyMigrationSource,
     ) -> Result<MigrationUserPage, PluginServiceError> {
-        self.call(MIGRATION_LIST_USERS_METHOD, source)
+        self.list_users_filtered(source, None).await
+    }
+
+    pub(crate) async fn list_users_filtered(
+        &self,
+        source: &EmbyMigrationSource,
+        selected_user_ids: Option<&[String]>,
+    ) -> Result<MigrationUserPage, PluginServiceError> {
+        let mut params = serde_json::json!({"source": source});
+        if let Some(selected_user_ids) = selected_user_ids {
+            params["userIds"] = serde_json::json!(selected_user_ids);
+        }
+        self.call_with(MIGRATION_LIST_USERS_METHOD, params)
             .await
             .map(normalize_migration_user_page)
     }
@@ -392,18 +579,35 @@ impl EmbyMigrationPluginClient {
         limit: u32,
         state_filter: MigrationUserStateFilter,
     ) -> Result<MigrationItemPage, PluginServiceError> {
-        let page = self
-            .call_with(
-                MIGRATION_USER_STATE_METHOD,
-                serde_json::json!({
-                    "source": source,
-                    "userId": validate_id(user_id)?,
-                    "startIndex": start_index,
-                    "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
-                    "stateFilter": state_filter,
-                }),
-            )
-            .await?;
+        self.user_state_filtered(
+            source,
+            user_id,
+            start_index,
+            limit,
+            state_filter,
+            MigrationSourceFilter::disabled(),
+        )
+        .await
+    }
+
+    pub(crate) async fn user_state_filtered(
+        &self,
+        source: &EmbyMigrationSource,
+        user_id: &str,
+        start_index: u32,
+        limit: u32,
+        state_filter: MigrationUserStateFilter,
+        source_filter: MigrationSourceFilter<'_>,
+    ) -> Result<MigrationItemPage, PluginServiceError> {
+        let params = migration_user_state_params(
+            source,
+            user_id,
+            start_index,
+            limit,
+            state_filter,
+            source_filter,
+        )?;
+        let page = self.call_with(MIGRATION_USER_STATE_METHOD, params).await?;
         Ok(normalize_migration_item_page(page))
     }
 
@@ -479,6 +683,50 @@ fn normalize_migration_user_page(mut page: MigrationUserPage) -> MigrationUserPa
         user.name = normalize_migration_text(&user.name);
     }
     page
+}
+
+fn migration_user_state_params(
+    source: &EmbyMigrationSource,
+    user_id: &str,
+    start_index: u32,
+    limit: u32,
+    state_filter: MigrationUserStateFilter,
+    source_filter: MigrationSourceFilter<'_>,
+) -> Result<Value, PluginServiceError> {
+    let mut params = serde_json::json!({
+        "source": source,
+        "userId": validate_id(user_id)?,
+        "startIndex": start_index,
+        "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
+        "stateFilter": state_filter,
+    });
+    if source_filter.enabled {
+        params["stateFields"] = serde_json::json!(
+            source_filter
+                .state_fields
+                .unwrap_or_else(|| state_filter.requested_fields())
+        );
+    }
+    if source_filter.enabled {
+        if let Some(source_library_ids) = source_filter.library_ids {
+            params["sourceLibraryIds"] = serde_json::json!(source_library_ids);
+        }
+    }
+    Ok(params)
+}
+
+pub(crate) fn requested_fields_for_state_filters(
+    filters: &[MigrationUserStateFilter],
+) -> Vec<&'static str> {
+    let mut fields = Vec::new();
+    for filter in filters {
+        for field in filter.requested_fields() {
+            if !fields.contains(field) {
+                fields.push(*field);
+            }
+        }
+    }
+    fields
 }
 
 fn normalize_migration_item_page(mut page: MigrationItemPage) -> MigrationItemPage {
