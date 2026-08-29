@@ -236,6 +236,36 @@ LUX-215 的固定夹具和记录；本次只增加阶段 18的播放器交互断
 外推为飞牛 NAS/x86_64 性能。当前没有新增 ArtPlayer 运行时、依赖、代码复制或衍生 notice；ArtPlayer 仍仅按
 `docs/THIRD-PARTY-NOTICES.md` 固定 commit 台账作为交互和生命周期参考。
 
+## LUX-229 本地与远程 `.strm` 字幕兼容性阶段门（2026-08-29）
+
+本阶段使用当前 Lux 工作树中的固定、无个人数据元数据夹具和 Rust/Web 回归；代码夹具提交为 `24730578`，宿主机
+`uname -m=arm64`，本机 Chrome 为 `151.0.7922.175`。哈希是对应测试对象经稳定 JSON 序列化后的 SHA-256，不是远程媒体
+内容哈希；夹具不包含真实网盘地址、凭据、Cookie 或媒体字节。
+
+| 固定夹具 | SHA-256 | 内容边界 |
+|---|---|---|
+| 本地 `LOCAL_FILE` MKV 字幕轨记录 | `f35df8cb0d5254e4756430d50f7b4653039c46df0da7289b7d78f65998c2decf` | 视频轨 `h264`；内嵌 `subrip`、`ass`、`ssa`、`hdmv_pgs_subtitle`、`sup` 五轨；SRT 默认；所有字幕轨 `isExternal=false` |
+| URL 型 `.strm` 字幕轨记录 | `d3db0f84d9ed407c9405108f1f58235006867908343fc3c2620644823873ea42` | 远程文本轨元数据仅用于验证 native-track 映射；URL 目标为合成地址，未由测试访问 |
+| Path 型 `.strm` 字幕轨记录 | `d2478122ca885f9ca87fdbe86dc28ef48a4aad249947f1f350df11fc47ac5110` | 与 URL 型相同的文本/PGS 元数据，目标为合成路径；未由 Lux 读取 |
+
+| 路径/能力 | 结果 | 请求边界与证据 |
+|---|---|---|
+| 本地内嵌 SRT/ASS/SSA | 通过 | `playerCaptionOptions` 将三种文本轨标为可选；只有选择后才请求 source-scoped 字幕端点，交给现有 Worker/overlay；seek、source 切换、fallback 和离开页面清理旧 cue/Worker/AbortController |
+| 本地 PGS/SUP | 明确不支持 | 两种轨道显示“当前不支持此字幕格式”，不生成字幕请求；视频播放路径不受影响，不实现烧录或图形字幕解析 |
+| URL/Path `.strm` 无 native track | 通过 | 两种 `.strm` 均不创建 Lux 字幕 URL，不调用字幕 `fetch`；视频继续走既有 Direct Play/外部代理路径 |
+| URL/Path `.strm` 有 native track | 通过 | 只有当前 `video.textTracks` 实际暴露的轨道可选；只切换 track mode，不改媒体 URL、播放会话、tier、进度或心跳 |
+| 单次媒体读取实验关闭/失败 | 通过 | 默认关闭；失败回归只消费调用方提供的同一 `ReadableStream`，不在实验内 `fetch`、不重试第二条连接、不切换 HLS/媒体代理；视频保持原 Direct Play |
+| Rust 播放边界 | 通过 | `cargo test --locked --test web_playback` 验证固定本地字幕轨从 Web item 合同读回；`tests/strm_resolver_playback.rs` 验证远程解析响应为 307 且响应体为空，未携带媒体字节 |
+
+Web 定向证据为 LUX-229、字幕实验和字幕选择共 18 个 Vitest 测试通过；Rust 定向播放测试 1 个通过。现有 Chrome 151
+播放器阶段门已验证 Direct/HLS/fallback 的控制台和请求清洁度，但本次没有真实一次性 UA/令牌网盘资源可供安全复测，因此
+没有把合成夹具升级为真实远程 `.strm` 兼容声明。Chrome/Playwright 真实浏览器的通用播放、字幕 overlay 生命周期和请求观察
+结果继续以 LUX-215/LUX-222 记录为准；真实 Safari、Firefox、移动端浏览器，以及远程资源是否暴露 native Matroska 文本轨，
+仍未验证。
+
+本阶段没有新增字幕专用 302/Redia 接口、远程媒体代理、ffmpeg/ffprobe 读取、PGS/SUP 支持或 ArtPlayer 运行时依赖。Rust
+测试和本机 `arm64` 结果不外推为 NAS/x86_64 性能；发布前仍需项目所有者确认后关闭阶段。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。
