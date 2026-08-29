@@ -85,6 +85,7 @@ describe("AdminLibrariesPage library cards", () => {
 
   beforeEach(() => {
     vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [library] });
+    vi.spyOn(api, "libraryOrder").mockResolvedValue({ libraryOrder: [library.id] });
     vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [configuredScraper] });
     vi.spyOn(api, "adminChapterSources").mockResolvedValue({ sources: [] });
     vi.spyOn(api, "adminSettings").mockResolvedValue({
@@ -295,6 +296,17 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("01每日更新");
     expect(container.textContent).toContain("混合内容");
     expect(container.textContent).toContain("/media/strm/video/每日更新");
+  });
+
+  it("renders library cards in the current account's saved order", async () => {
+    const seriesLibrary = { ...library, id: "library-2", name: "剧集库", kind: "SERIES" };
+    vi.mocked(api.adminLibraries).mockResolvedValueOnce({ libraries: [library, seriesLibrary] });
+    vi.mocked(api.libraryOrder).mockResolvedValueOnce({ libraryOrder: [seriesLibrary.id, library.id] });
+
+    await renderPage();
+
+    expect([...container.querySelectorAll(".lux-admin-library-copy strong")].map((name) => name.textContent))
+      .toEqual(["剧集库", "01每日更新"]);
   });
 
   it("summarizes multiple library roots on the card", async () => {

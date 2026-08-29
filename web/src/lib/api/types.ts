@@ -656,7 +656,7 @@ export type AdminJob = {
   startedAt?: string | number | null;
   finishedAt?: string | number | null;
   currentItem?: string | null;
-  scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "IDLE" | string;
+  scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "POSTPROCESSING" | "IDLE" | string;
 };
 
 export type AdminTaskActivity = {
@@ -669,7 +669,7 @@ export type AdminTaskActivity = {
   totalCount?: number | null;
   cancelRequested?: boolean;
   currentItem?: string | null;
-  scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "IDLE" | string;
+  scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "POSTPROCESSING" | "IDLE" | string;
   createdAt?: string | number;
 };
 

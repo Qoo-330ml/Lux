@@ -1185,11 +1185,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 html[data-lux-theme="light"] .lux-admin-job-error { color: #9f3047; background: rgba(190,47,76,.07); }
 html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,.035); }
 .lux-admin-job-finished-at { display: block; margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
+.lux-admin-job-current-item { display: block; margin-top: 5px; overflow: hidden; color: var(--lux-muted); font-size: .7rem; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-job-duration { display: block; margin-top: 2px; color: var(--lux-subtle); font-size: .68rem; }
 .lux-admin-job-attention { display: inline-flex; margin-top: 8px; color: #f3c788; font-size: .7rem; text-decoration: none; }
 .lux-admin-job-attention:hover { color: #fff; text-decoration: underline; text-underline-offset: 3px; }
 .lux-job-status { padding: 4px 7px; border-radius: 999px; font-size: .62rem; white-space: nowrap; }
 .status-running, .status-pending { color: #b8a4ec; background: rgba(154,126,232,.12); }
+.status-postprocessing { color: #b8a4ec; background: rgba(154,126,232,.12); }
 .status-completed { color: #9bdcb3; background: rgba(96,194,132,.1); }
 .status-completed-with-issues { color: #f3c788; background: rgba(226,163,75,.12); }
 .status-deferred { color: #c8b6f2; background: rgba(154,126,232,.12); }

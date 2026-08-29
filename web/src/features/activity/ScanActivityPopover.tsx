@@ -23,6 +23,7 @@ const PHASE_LABELS: Record<string, string> = {
   DISCOVERY: "发现目录",
   INDEXING: "处理文件",
   FINALIZING: "收尾同步",
+  POSTPROCESSING: "索引已完成，后处理进行中",
   IDLE: "等待调度",
 };
 
@@ -46,7 +47,7 @@ export function ScanActivityPopover() {
   });
   const jobs = useMemo(() => {
     const active = (activity.data?.activities ?? []).filter((job) =>
-      job.status === "RUNNING" || job.status === "PENDING" || job.status === "QUEUED",
+      isActiveActivityJob(job),
     );
     return active.sort(compareJobs);
   }, [activity.data?.activities]);
@@ -88,9 +89,9 @@ export function ScanActivityPopover() {
                   </div>
                   <div className="lux-scan-activity-actions">
                     <Link to="/admin/jobs" onClick={() => setOpen(false)}>任务与日志</Link>
-                    {job.kind === "cover" ? null : <button type="button" aria-label={`取消${activityLabel(job)}`} disabled={cancel.isPending || job.cancelRequested} onClick={() => cancel.mutate(job)}>
+                    {!isPostprocessingActivityJob(job) && job.kind !== "cover" ? <button type="button" aria-label={`取消${activityLabel(job)}`} disabled={cancel.isPending || job.cancelRequested} onClick={() => cancel.mutate(job)}>
                       <StopCircle size={14} /> {job.cancelRequested ? "停止中" : "取消"}
-                    </button>}
+                    </button> : null}
                   </div>
                 </article>
               ))}
@@ -118,18 +119,31 @@ function phaseLabel(job: AdminTaskActivity) {
 }
 
 function progressValue(job: AdminTaskActivity) {
+  if (isPostprocessingActivityJob(job)) return null;
   if (!job.totalCount || job.totalCount <= 0) return null;
   return Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100));
 }
 
 function progressLabel(job: AdminTaskActivity) {
+  if (isPostprocessingActivityJob(job)) return "索引完成，后处理进行中";
   const total = job.totalCount ?? 0;
   return total > 0 ? `${job.processedCount ?? 0}/${total}` : "发现中";
 }
 
 function compareJobs(left: AdminTaskActivity, right: AdminTaskActivity) {
-  const status = Number(right.status === "RUNNING") - Number(left.status === "RUNNING");
+  const status = Number(isActiveActivityJob(right)) - Number(isActiveActivityJob(left));
   return status || String(right.createdAt ?? "").localeCompare(String(left.createdAt ?? ""));
+}
+
+function isPostprocessingActivityJob(job: AdminTaskActivity) {
+  return job.kind === "scan" && job.scanPhase === "POSTPROCESSING";
+}
+
+function isActiveActivityJob(job: AdminTaskActivity) {
+  return job.status === "RUNNING"
+    || job.status === "PENDING"
+    || job.status === "QUEUED"
+    || isPostprocessingActivityJob(job);
 }
 
 function cancelTask(job: AdminTaskActivity) {

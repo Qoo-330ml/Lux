@@ -1,5 +1,22 @@
 use super::*;
 
+struct BatchHierarchyRow {
+    id: String,
+    library_id: String,
+    item_type: &'static str,
+    parent_id: Option<String>,
+    series_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    absolute_number: Option<i64>,
+    title: String,
+    sort_title: String,
+    original_title: Option<String>,
+    production_year: Option<i64>,
+    provider_ids_json: Option<String>,
+    identity_key: String,
+}
+
 impl Database {
     pub(crate) async fn media_source_belongs_to_item(
         &self,
@@ -999,6 +1016,456 @@ impl Database {
                 source,
             })?;
         Ok(new_items.len())
+    }
+
+    pub(crate) async fn insert_episode_files_batch(
+        &self,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewEpisodeFile],
+    ) -> Result<usize, StorageError> {
+        if files.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO filesystem_entries (
+                    id, library_root_id, relative_path, entry_kind, size,
+                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for file in chunk {
+                statement = statement
+                    .bind(&file.filesystem_entry_id)
+                    .bind(library_root_id)
+                    .bind(&file.relative_path)
+                    .bind(file.size)
+                    .bind(file.modified_at)
+                    .bind(file.inode)
+                    .bind(&file.fingerprint)
+                    .bind(generation);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let mut series_rows = BTreeMap::<String, BatchHierarchyRow>::new();
+        for file in files {
+            series_rows
+                .entry(file.series_identity.clone())
+                .or_insert_with(|| BatchHierarchyRow {
+                    id: Uuid::now_v7().to_string(),
+                    library_id: library_id.to_owned(),
+                    item_type: "SERIES",
+                    parent_id: None,
+                    series_id: None,
+                    season_number: None,
+                    episode_number: None,
+                    absolute_number: None,
+                    title: file.series_title.clone(),
+                    sort_title: file.series_sort_title.clone(),
+                    original_title: Some(file.series_title.clone()),
+                    production_year: file.series_production_year,
+                    provider_ids_json: file.series_provider_ids_json.clone(),
+                    identity_key: file.series_identity.clone(),
+                });
+        }
+        let series_keys = series_rows.keys().cloned().collect::<Vec<_>>();
+        let (mut series_ids, series_removed_ids) = self
+            .list_hierarchy_ids_in_transaction(&mut transaction, &series_keys)
+            .await?;
+        let missing_series = series_rows
+            .values()
+            .filter(|row| !series_ids.contains_key(&row.identity_key))
+            .collect::<Vec<_>>();
+        self.insert_hierarchy_rows_in_transaction(&mut transaction, missing_series.iter().copied())
+            .await?;
+        self.revive_hierarchy_rows_in_transaction(
+            &mut transaction,
+            series_rows.values(),
+            &series_ids,
+            &series_removed_ids,
+        )
+        .await?;
+        series_ids = self
+            .list_hierarchy_ids_in_transaction(&mut transaction, &series_keys)
+            .await?
+            .0;
+
+        let mut season_rows = BTreeMap::<String, BatchHierarchyRow>::new();
+        for file in files {
+            let series_id = series_ids
+                .get(&file.series_identity)
+                .ok_or_else(|| StorageError::Conflict("批量扫描未找到剧集层级".to_owned()))?;
+            season_rows
+                .entry(file.season_identity.clone())
+                .or_insert_with(|| BatchHierarchyRow {
+                    id: Uuid::now_v7().to_string(),
+                    library_id: library_id.to_owned(),
+                    item_type: "SEASON",
+                    parent_id: Some(series_id.clone()),
+                    series_id: Some(series_id.clone()),
+                    season_number: Some(file.season_number),
+                    episode_number: None,
+                    absolute_number: None,
+                    title: if file.season_number == 0 {
+                        "Specials".to_owned()
+                    } else {
+                        format!("Season {:02}", file.season_number)
+                    },
+                    sort_title: if file.season_number == 0 {
+                        "specials".to_owned()
+                    } else {
+                        format!("season {:02}", file.season_number)
+                    },
+                    original_title: Some(if file.season_number == 0 {
+                        "Specials".to_owned()
+                    } else {
+                        format!("Season {:02}", file.season_number)
+                    }),
+                    production_year: None,
+                    provider_ids_json: None,
+                    identity_key: file.season_identity.clone(),
+                });
+        }
+        let season_keys = season_rows.keys().cloned().collect::<Vec<_>>();
+        let (mut season_ids, season_removed_ids) = self
+            .list_hierarchy_ids_in_transaction(&mut transaction, &season_keys)
+            .await?;
+        let missing_seasons = season_rows
+            .values()
+            .filter(|row| !season_ids.contains_key(&row.identity_key))
+            .collect::<Vec<_>>();
+        self.insert_hierarchy_rows_in_transaction(
+            &mut transaction,
+            missing_seasons.iter().copied(),
+        )
+        .await?;
+        self.revive_hierarchy_rows_in_transaction(
+            &mut transaction,
+            season_rows.values(),
+            &season_ids,
+            &season_removed_ids,
+        )
+        .await?;
+        season_ids = self
+            .list_hierarchy_ids_in_transaction(&mut transaction, &season_keys)
+            .await?
+            .0;
+
+        let mut episode_rows = BTreeMap::<String, BatchHierarchyRow>::new();
+        for file in files {
+            let season_id = season_ids
+                .get(&file.season_identity)
+                .ok_or_else(|| StorageError::Conflict("批量扫描未找到季度层级".to_owned()))?;
+            let series_id = series_ids
+                .get(&file.series_identity)
+                .ok_or_else(|| StorageError::Conflict("批量扫描未找到剧集层级".to_owned()))?;
+            episode_rows
+                .entry(file.episode_identity.clone())
+                .or_insert_with(|| BatchHierarchyRow {
+                    id: Uuid::now_v7().to_string(),
+                    library_id: library_id.to_owned(),
+                    item_type: "EPISODE",
+                    parent_id: Some(season_id.clone()),
+                    series_id: Some(series_id.clone()),
+                    season_number: Some(file.season_number),
+                    episode_number: Some(file.episode_number),
+                    absolute_number: file.episode_absolute_number,
+                    title: file.episode_title.clone(),
+                    sort_title: file.episode_sort_title.clone(),
+                    original_title: Some(file.episode_title.clone()),
+                    production_year: None,
+                    provider_ids_json: None,
+                    identity_key: file.episode_identity.clone(),
+                });
+        }
+        let episode_keys = episode_rows.keys().cloned().collect::<Vec<_>>();
+        let (episode_ids, episode_removed_ids) = self
+            .list_hierarchy_ids_in_transaction(&mut transaction, &episode_keys)
+            .await?;
+        let missing_episodes = episode_rows
+            .values()
+            .filter(|row| !episode_ids.contains_key(&row.identity_key))
+            .collect::<Vec<_>>();
+        let new_episode_identities = missing_episodes
+            .iter()
+            .map(|row| row.identity_key.clone())
+            .collect::<HashSet<_>>();
+        self.insert_hierarchy_rows_in_transaction(
+            &mut transaction,
+            missing_episodes.iter().copied(),
+        )
+        .await?;
+        self.revive_hierarchy_rows_in_transaction(
+            &mut transaction,
+            episode_rows.values(),
+            &episode_ids,
+            &episode_removed_ids,
+        )
+        .await?;
+        let episode_ids = self
+            .list_hierarchy_ids_in_transaction(&mut transaction, &episode_keys)
+            .await?
+            .0;
+
+        let mut defaulted_episode_identities = HashSet::new();
+        for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let values =
+                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            let query = format!(
+                "INSERT INTO media_sources (
+                    id, item_id, source_kind, filesystem_entry_id,
+                    edition_name, quality_label, container, size,
+                    external_url, strm_target_kind, is_default, probe_status
+                ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for file in chunk {
+                let item_id = episode_ids
+                    .get(&file.episode_identity)
+                    .ok_or_else(|| StorageError::Conflict("批量扫描未找到分集层级".to_owned()))?;
+                let is_default = new_episode_identities.contains(&file.episode_identity)
+                    && defaulted_episode_identities.insert(file.episode_identity.clone());
+                statement = statement
+                    .bind(&file.source_id)
+                    .bind(item_id)
+                    .bind(&file.source_kind)
+                    .bind(&file.filesystem_entry_id)
+                    .bind(file.edition_name.as_deref())
+                    .bind(file.quality_label.as_deref())
+                    .bind(&file.container)
+                    .bind(file.size)
+                    .bind(file.external_url.as_deref())
+                    .bind(file.strm_target_kind.as_deref())
+                    .bind(database_flag(is_default));
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let strm_item_ids = files
+            .iter()
+            .filter(|file| file.source_kind == "STRM_URL")
+            .filter_map(|file| episode_ids.get(&file.episode_identity))
+            .cloned()
+            .collect::<HashSet<_>>();
+        if !strm_item_ids.is_empty() {
+            let placeholders = std::iter::repeat_n("?", strm_item_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "UPDATE media_items
+                 SET poster_fallback_required = 1
+                 WHERE id IN ({placeholders})
+                   AND NOT EXISTS (
+                       SELECT 1 FROM item_images
+                       WHERE item_id = media_items.id
+                         AND image_type IN ('POSTER', 'THUMB')
+                         AND image_index = 0
+                   )"
+            )));
+            for item_id in &strm_item_ids {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(missing_series.len() + missing_seasons.len() + missing_episodes.len())
+    }
+
+    async fn list_hierarchy_ids_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        identity_keys: &[String],
+    ) -> Result<(HashMap<String, String>, HashSet<String>), StorageError> {
+        let mut ids = HashMap::new();
+        let mut removed_ids = HashSet::new();
+        for chunk in identity_keys.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT id, identity_key, removed_at
+                 FROM media_items WHERE identity_key IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for identity_key in chunk {
+                statement = statement.bind(identity_key);
+            }
+            let rows = statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                let identity_key = row.try_get::<String, _>("identity_key").map_err(|source| {
+                    StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    }
+                })?;
+                let id = row
+                    .try_get::<String, _>("id")
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                if row
+                    .try_get::<Option<i64>, _>("removed_at")
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .is_some()
+                {
+                    removed_ids.insert(identity_key.clone());
+                }
+                ids.insert(identity_key, id);
+            }
+        }
+        Ok((ids, removed_ids))
+    }
+
+    async fn insert_hierarchy_rows_in_transaction<'a, I>(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        rows: I,
+    ) -> Result<(), StorageError>
+    where
+        I: IntoIterator<Item = &'a BatchHierarchyRow>,
+    {
+        let rows = rows.into_iter().collect::<Vec<_>>();
+        for chunk in rows.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values =
+                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+            let query = format!(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, parent_id, series_id,
+                    season_number, episode_number, absolute_number,
+                    title, sort_title, original_title, production_year,
+                    provider_ids_json, identification_status, identity_key
+                ) VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for row in chunk {
+                statement = statement
+                    .bind(&row.id)
+                    .bind(&row.library_id)
+                    .bind(row.item_type)
+                    .bind(row.parent_id.as_deref())
+                    .bind(row.series_id.as_deref())
+                    .bind(row.season_number)
+                    .bind(row.episode_number)
+                    .bind(row.absolute_number)
+                    .bind(&row.title)
+                    .bind(&row.sort_title)
+                    .bind(row.original_title.as_deref())
+                    .bind(row.production_year)
+                    .bind(row.provider_ids_json.as_deref())
+                    .bind("PENDING")
+                    .bind(&row.identity_key);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn revive_hierarchy_rows_in_transaction<'a, I>(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        rows: I,
+        ids: &HashMap<String, String>,
+        removed_identities: &HashSet<String>,
+    ) -> Result<(), StorageError>
+    where
+        I: IntoIterator<Item = &'a BatchHierarchyRow>,
+    {
+        for row in rows {
+            if !removed_identities.contains(&row.identity_key) {
+                continue;
+            }
+            let Some(item_id) = ids.get(&row.identity_key) else {
+                continue;
+            };
+            self.query(
+                "UPDATE media_items
+                 SET library_id = ?, item_type = ?, parent_id = ?, series_id = ?,
+                     season_number = ?, episode_number = ?, absolute_number = ?,
+                     removed_at = NULL
+                 WHERE id = ?",
+            )
+            .bind(&row.library_id)
+            .bind(row.item_type)
+            .bind(row.parent_id.as_deref())
+            .bind(row.series_id.as_deref())
+            .bind(row.season_number)
+            .bind(row.episode_number)
+            .bind(row.absolute_number)
+            .bind(item_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn find_media_item(

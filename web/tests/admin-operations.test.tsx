@@ -269,6 +269,39 @@ describe("AdminOperationsPage", () => {
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="正在取消任务"]')?.disabled).toBe(true);
   });
 
+  it("does not present scan postprocessing as finally completed", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
+      id: "scan-job-postprocessing",
+      libraryId: "library-1",
+      jobType: "RECONCILE_LIBRARY",
+      status: "COMPLETED",
+      processedCount: 1_000_000,
+      totalCount: 1_000_000,
+      discoveryCompleted: true,
+      currentItem: "媒体探测",
+      scanPhase: "POSTPROCESSING",
+      createdAt: 1_700_000_001,
+      startedAt: 1_700_000_001,
+      finishedAt: 1_700_000_061,
+    }] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [{ id: "library-1", name: "电影库" }] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+
+    expect(container.textContent).toContain("索引已完成，后处理进行中");
+    expect(container.textContent).toContain("当前：媒体探测");
+    expect(container.textContent).toContain("未完成");
+    expect(container.querySelector<HTMLElement>(".lux-job-status")?.textContent).toBe("后处理进行中");
+    expect(container.querySelector<HTMLElement>(".lux-job-progress.is-indeterminate")).not.toBeNull();
+  });
+
   it("shows STRM probe progress and can cancel the active job", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
