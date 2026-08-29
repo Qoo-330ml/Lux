@@ -8,6 +8,16 @@ import { LuxShell } from "../components/layout/LuxShell";
 import { LoginPage } from "../features/auth/LoginPage";
 import { SetupPage } from "../features/auth/SetupPage";
 import { HomePage } from "../features/home/HomePage";
+import {
+  loadAdminChangelogPage,
+  loadAdminDashboardPage,
+  loadAdminLibrariesPage,
+  loadAdminNotificationsPage,
+  loadAdminOperationsPage,
+  loadAdminPluginsPage,
+  loadAdminSettingsPage,
+  loadAdminUsersPage,
+} from "../features/admin/admin-navigation";
 
 const LibrariesPage = lazy(() => import("../features/library/LibrariesPage").then(({ LibrariesPage }) => ({ default: LibrariesPage })));
 const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({ LibraryPage }) => ({ default: LibraryPage })));
@@ -18,14 +28,14 @@ const PersonDetailPage = lazy(() => import("../features/detail/PersonDetailPage"
 const PlayerPage = lazy(() => import("../features/player/PlayerPage").then(({ PlayerPage }) => ({ default: PlayerPage })));
 const AccountPage = lazy(() => import("../features/account/AccountPage").then(({ AccountPage }) => ({ default: AccountPage })));
 const AdminLayout = lazy(() => import("../features/admin/AdminLayout").then(({ AdminLayout }) => ({ default: AdminLayout })));
-const AdminDashboardPage = lazy(() => import("../features/admin/AdminDashboardPage").then(({ AdminDashboardPage }) => ({ default: AdminDashboardPage })));
-const AdminLibrariesPage = lazy(() => import("../features/admin/AdminLibrariesPage").then(({ AdminLibrariesPage }) => ({ default: AdminLibrariesPage })));
-const AdminPluginsPage = lazy(() => import("../features/admin/AdminPluginsPage").then(({ AdminPluginsPage }) => ({ default: AdminPluginsPage })));
-const AdminNotificationsPage = lazy(() => import("../features/admin/AdminNotificationsPage").then(({ AdminNotificationsPage }) => ({ default: AdminNotificationsPage })));
-const AdminUsersPage = lazy(() => import("../features/admin/AdminUsersPage").then(({ AdminUsersPage }) => ({ default: AdminUsersPage })));
-const AdminOperationsPage = lazy(() => import("../features/admin/AdminOperationsPage").then(({ AdminOperationsPage }) => ({ default: AdminOperationsPage })));
-const AdminSettingsPage = lazy(() => import("../features/admin/AdminSettingsPage").then(({ AdminSettingsPage }) => ({ default: AdminSettingsPage })));
-const AdminChangelogPage = lazy(() => import("../features/admin/AdminChangelogPage").then(({ AdminChangelogPage }) => ({ default: AdminChangelogPage })));
+const AdminDashboardPage = lazy(loadAdminDashboardPage);
+const AdminLibrariesPage = lazy(loadAdminLibrariesPage);
+const AdminPluginsPage = lazy(loadAdminPluginsPage);
+const AdminNotificationsPage = lazy(loadAdminNotificationsPage);
+const AdminUsersPage = lazy(loadAdminUsersPage);
+const AdminOperationsPage = lazy(loadAdminOperationsPage);
+const AdminSettingsPage = lazy(loadAdminSettingsPage);
+const AdminChangelogPage = lazy(loadAdminChangelogPage);
 
 export function App() {
   const setup = useQuery({

@@ -136,4 +136,28 @@ describe("admin SSE events", () => {
       { queryKey: ["admin", "logs"] },
     ]);
   });
+
+  it("prefetches a target page when its navigation link is activated", () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const prefetch = vi.spyOn(queryClient, "prefetchQuery").mockResolvedValue(undefined);
+
+    act(() => {
+      root = createRoot(container);
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminLayout />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    const pluginsLink = [...container.querySelectorAll<HTMLAnchorElement>("a")]
+      .find((link) => link.getAttribute("href") === "/admin/plugins");
+    expect(pluginsLink).toBeTruthy();
+
+    act(() => pluginsLink?.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+
+    expect(prefetch).toHaveBeenCalledWith(expect.objectContaining({ queryKey: ["admin", "plugins"] }));
+  });
 });

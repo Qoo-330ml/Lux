@@ -1,5 +1,7 @@
 import { Activity, BellRing, BookOpen, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { NavLink, Outlet } from "react-router-dom";
+import { prefetchAdminPage } from "./admin-navigation";
 import { useAdminEvents } from "./useAdminEvents";
 
 export const adminNav = [
@@ -14,7 +16,12 @@ export const adminNav = [
 ];
 
 export function AdminLayout() {
+  const queryClient = useQueryClient();
   useAdminEvents();
+
+  const preload = (to: string) => {
+    prefetchAdminPage(queryClient, to);
+  };
 
   return (
     <section className="lux-admin-layout">
@@ -25,7 +32,15 @@ export function AdminLayout() {
         </div>
         <nav className="lux-admin-nav">
           {adminNav.map(({ to, label, icon: Icon, end }) => (
-            <NavLink key={to} to={to} end={end} className={adminNavClass}>
+            <NavLink
+              key={to}
+              to={to}
+              end={end}
+              className={adminNavClass}
+              onPointerEnter={() => preload(to)}
+              onFocus={() => preload(to)}
+              onPointerDown={() => preload(to)}
+            >
               <Icon size={17} strokeWidth={1.8} /><span>{label}</span>
             </NavLink>
           ))}
