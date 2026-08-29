@@ -145,6 +145,50 @@ describe("AdminLibrariesPage library cards", () => {
     });
   }
 
+  it("shows library cards before auxiliary admin data finishes loading", async () => {
+    vi.mocked(api.adminPlugins).mockReturnValueOnce(new Promise(() => {}));
+    vi.mocked(api.adminChapterSources).mockReturnValueOnce(new Promise(() => {}));
+    vi.mocked(api.adminSettings).mockReturnValueOnce(new Promise(() => {}));
+
+    await renderPage();
+
+    expect(container.querySelector(".lux-admin-library-grid")).toBeTruthy();
+    expect(container.querySelector(".lux-admin-page-state")).toBeNull();
+    expect(container.textContent).toContain("01每日更新");
+  });
+
+  it("waits for the saved library order before rendering cards", async () => {
+    const seriesLibrary = { ...library, id: "library-2", name: "剧集库", kind: "SERIES" };
+    let resolveOrder: ((value: { libraryOrder: string[] }) => void) | undefined;
+    const pendingOrder = new Promise<{ libraryOrder: string[] }>((resolve) => {
+      resolveOrder = resolve;
+    });
+    vi.mocked(api.adminLibraries).mockResolvedValueOnce({ libraries: [library, seriesLibrary] });
+    vi.mocked(api.libraryOrder).mockReturnValueOnce(pendingOrder);
+
+    await renderPage();
+
+    expect(container.querySelector(".lux-admin-library-grid")).toBeNull();
+    expect(container.textContent).toContain("正在读取已保存的媒体库顺序");
+
+    await act(async () => {
+      resolveOrder?.({ libraryOrder: [seriesLibrary.id, library.id] });
+      await pendingOrder;
+      await vi.waitFor(() => expect(
+        [...container.querySelectorAll(".lux-admin-library-copy strong")].map((name) => name.textContent),
+      ).toEqual(["剧集库", "01每日更新"]));
+    });
+  });
+
+  it("surfaces a saved library order loading failure instead of using the API order", async () => {
+    vi.mocked(api.libraryOrder).mockRejectedValueOnce(new Error("个人媒体库顺序加载失败"));
+
+    await renderPage();
+
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("个人媒体库顺序加载失败");
+    expect(container.querySelector(".lux-admin-library-grid")).toBeNull();
+  });
+
   it("creates a library with multiple folders selected from the same dialog", async () => {
     const createdLibrary = { ...library, id: "library-2", name: "电影库", roots: [] };
     const createLibrary = vi.spyOn(api, "createAdminLibrary").mockResolvedValue({ library: createdLibrary });

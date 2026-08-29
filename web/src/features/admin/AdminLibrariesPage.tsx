@@ -145,11 +145,21 @@ export function AdminLibrariesPage() {
     setCreateOpen(true);
   }
 
-  if (libraries.isPending || plugins.isPending || chapterSources.isPending || settings.isPending) return <AdminLibraryState label="正在读取媒体库、插件与全局策略…" />;
-  if (libraries.error || plugins.error || chapterSources.error || settings.error) return <AdminLibraryState label={libraries.error?.message || plugins.error?.message || chapterSources.error?.message || settings.error?.message || "管理数据加载失败"} error />;
+  if ((libraries.error && !libraries.data) || (libraryOrder.error && !libraryOrder.data)) {
+    return <AdminLibraryState label={libraries.error?.message || libraryOrder.error?.message || "媒体库数据加载失败"} error />;
+  }
+  if (libraries.isPending || libraryOrder.isPending) {
+    const label = libraries.isPending
+      ? libraryOrder.isPending ? "正在读取媒体库及已保存的媒体库顺序…" : "正在读取媒体库…"
+      : "正在读取已保存的媒体库顺序…";
+    return <AdminLibraryState label={label} />;
+  }
 
   const items = orderLibraries(libraries.data.libraries ?? [], libraryOrder.data?.libraryOrder ?? []);
-  const pluginItems = plugins.data.plugins ?? [];
+  const pluginItems = plugins.data?.plugins ?? [];
+  const chapterSourceItems = chapterSources.data?.sources ?? [];
+  const auxiliaryLoading = plugins.isPending || chapterSources.isPending || settings.isPending;
+  const auxiliaryError = plugins.error || chapterSources.error || settings.error;
   function submit(event: FormEvent) {
     event.preventDefault();
     if (!name.trim()) {
@@ -182,6 +192,8 @@ export function AdminLibrariesPage() {
 
       {activeView === "libraries" ? (
         <>
+          {auxiliaryLoading ? <p className="lux-admin-muted" role="status">媒体库已加载，正在读取插件、章节源和全局策略…</p> : null}
+          {auxiliaryError ? <p className="lux-error-copy" role="alert">部分编辑配置加载失败：{auxiliaryError.message}</p> : null}
           <div className="lux-library-management-toolbar">
             <span>共 {items.length} 个媒体库</span>
             <div>
@@ -190,10 +202,10 @@ export function AdminLibrariesPage() {
             </div>
           </div>
           {createNotice ? <p className="lux-error-copy" role="status">{createNotice}</p> : null}
-          {items.length === 0 ? <div className="lux-admin-empty"><Database size={24} /><h2>还没有媒体库</h2><p>创建第一个媒体库后，Lux 才能开始索引内容。</p></div> : <div className="lux-admin-library-grid">{items.map((library) => <LibraryAdminCard key={library.id} library={library} plugins={pluginItems} chapterSources={chapterSources.data.sources ?? []} globalStrategy={strategy ?? undefined} />)}</div>}
+          {items.length === 0 ? <div className="lux-admin-empty"><Database size={24} /><h2>还没有媒体库</h2><p>创建第一个媒体库后，Lux 才能开始索引内容。</p></div> : <div className="lux-admin-library-grid">{items.map((library) => <LibraryAdminCard key={library.id} library={library} plugins={pluginItems} chapterSources={chapterSourceItems} globalStrategy={strategy ?? undefined} />)}</div>}
         </>
       ) : (
-        strategy ? <GlobalStrategyPanel strategy={strategy} plugins={pluginItems} saved={strategySaved} saving={saveStrategy.isPending} refreshing={refreshAll.isPending} error={saveStrategy.error?.message || refreshAll.error?.message} onChange={(next) => { setStrategySaved(false); setStrategy(next); }} onSave={(next) => saveStrategy.mutate(next)} onRefresh={(mode) => refreshAll.mutate(mode)} onBack={() => setActiveView("libraries")} /> : null
+        settings.isPending ? <AdminLibraryState title="正在加载高级配置" label="正在读取全局策略…" /> : settings.error ? <AdminLibraryState title="高级配置加载失败" label={settings.error.message} error /> : strategy ? <GlobalStrategyPanel strategy={strategy} plugins={pluginItems} saved={strategySaved} saving={saveStrategy.isPending} refreshing={refreshAll.isPending} error={saveStrategy.error?.message || refreshAll.error?.message} onChange={(next) => { setStrategySaved(false); setStrategy(next); }} onSave={(next) => saveStrategy.mutate(next)} onRefresh={(mode) => refreshAll.mutate(mode)} onBack={() => setActiveView("libraries")} /> : <AdminLibraryState title="高级配置不可用" label="全局策略为空，请稍后重试。" error />
       )}
 
       {createOpen ? <div className="lux-library-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setCreateOpen(false); }}>
@@ -203,7 +215,7 @@ export function AdminLibrariesPage() {
             <label htmlFor="new-library-name">名称<input id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
             <label htmlFor="new-library-kind">类型<LuxSelect id="new-library-kind" value={kind} options={[{ value: "MOVIE", label: "电影" }, { value: "SERIES", label: "剧集" }, { value: "MIXED", label: "混合" }]} onChange={setKind} aria-label="媒体库类型" /></label>
             <ScraperListEditor value={scrapers} plugins={pluginItems} onChange={setScrapers} />
-            <ChapterSourceSelect id="new-library-chapter-source" kind={kind} value={chapterSourceId} sources={chapterSources.data.sources ?? []} onChange={setChapterSourceId} />
+            <ChapterSourceSelect id="new-library-chapter-source" kind={kind} value={chapterSourceId} sources={chapterSourceItems} onChange={setChapterSourceId} />
             <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库实时新增资源自动刮削" checked={createRealtimeMetadataAutoMatch} onChange={(event) => setCreateRealtimeMetadataAutoMatch(event.target.checked)} /><span>实时新增资源自动刮削</span></label>
             <p className="lux-library-create-root-help">开启后，实时索引完成会为受影响的新资源提交元数据和图片补全任务。</p>
             <section className="lux-library-dialog-section lux-library-create-root-section">
@@ -648,6 +660,6 @@ function libraryKindLabel(kind: string) {
   return "混合内容";
 }
 
-function AdminLibraryState({ label, error = false }: { label: string; error?: boolean }) {
-  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "媒体库加载失败" : "正在加载媒体库"}</h1><p>{label}</p></section>;
+function AdminLibraryState({ title, label, error = false }: { title?: string; label: string; error?: boolean }) {
+  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{title ?? (error ? "媒体库加载失败" : "正在加载媒体库")}</h1><p>{label}</p></section>;
 }
