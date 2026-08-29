@@ -21,7 +21,7 @@ describe("EmbyMigrationPluginConfig", () => {
     vi.restoreAllMocks();
   });
 
-  it("keeps the full migration workspace inside the plugin configuration", async () => {
+  it("guides an admin through the migration in three explicit steps", async () => {
     const testSource = vi.spyOn(api, "testAdminEmbyMigration").mockResolvedValue({
       serverName: "家庭 Emby",
       productName: "Emby Server",
@@ -133,31 +133,61 @@ describe("EmbyMigrationPluginConfig", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("连接 Emby"));
     });
+    const initialPanel = container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]');
+    expect(initialPanel?.dataset.step).toBe("1");
+    expect(initialPanel?.textContent).toContain("连接 Emby");
+    expect(initialPanel?.querySelector("#emby-migration-users-heading")).toBeNull();
     expect(container.textContent).toContain("第 1 步");
     expect(container.textContent).toContain("第 2 步");
-    expect(container.textContent).not.toContain("迁移设置");
-    expect(container.querySelector("details")?.open).toBe(false);
+    expect(container.textContent).toContain("第 3 步");
+    expect(container.querySelector("details.lux-emby-advanced-options")).toBeNull();
     expect(container.querySelector("#emby-plugin-base-url")).not.toBeNull();
     expect(container.querySelector("#emby-plugin-api-key")).not.toBeNull();
     expect(container.querySelector("#emby-migration-base-url")).toBeNull();
     act(() => {
-      container.querySelector<HTMLButtonElement>('button[aria-label="测试 Emby 连接"]')?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="保存并测试 Emby 连接"]')?.click();
     });
     await act(async () => {
+      await vi.waitFor(() => expect(api.updateAdminPluginConfig).toHaveBeenCalledWith("org.lux.emby-migration", {
+        baseUrl: "http://emby.local:8096",
+        allowPrivateNetwork: false,
+      }));
       await vi.waitFor(() => expect(testSource).toHaveBeenCalledWith());
     });
     expect(container.textContent).toContain("家庭 Emby");
-    expect(container.textContent).toContain("完整历史播放时间线不可用");
+    expect(container.textContent).toContain("仅迁移条目状态，历史时间线不可用");
+    expect(container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]')?.dataset.step).toBe("2");
     await act(async () => {
       await vi.waitFor(() => expect(sourceUsers).toHaveBeenCalledWith(1));
     });
     expect(api.adminEmbyMigrations).not.toHaveBeenCalled();
     expect(container.textContent).toContain("Alice");
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="下一步：确认迁移"]')?.disabled).toBe(true);
     act(() => {
       container.querySelector<HTMLInputElement>('input[aria-label="选择 Emby 用户 Alice"]')?.click();
     });
+    expect(container.querySelector<HTMLButtonElement>('button[aria-label="下一步：确认迁移"]')?.disabled).toBe(false);
 
-    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="迁移选中用户"]')?.click());
+    act(() => {
+      Array.from(container.querySelectorAll<HTMLButtonElement>("button")).find((button) => button.textContent?.trim() === "上一步")?.click();
+    });
+    expect(container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]')?.dataset.step).toBe("1");
+    act(() => {
+      container.querySelector<HTMLButtonElement>('button[aria-label="保存并测试 Emby 连接"]')?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(testSource).toHaveBeenCalledTimes(2));
+      await vi.waitFor(() => expect(container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]')?.dataset.step).toBe("2"));
+    });
+    expect(container.querySelector<HTMLInputElement>('input[aria-label="选择 Emby 用户 Alice"]')?.checked).toBe(true);
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="下一步：确认迁移"]')?.click());
+    expect(container.querySelector<HTMLElement>('[data-testid="emby-migration-step-panel"]')?.dataset.step).toBe("3");
+    expect(container.textContent).toContain("确认并开始");
+    expect(container.textContent).toContain("合并");
+    expect(container.textContent).toContain("覆盖");
+    expect(container.textContent).toContain("跳过");
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="开始 Emby 迁移"]')?.click());
     await act(async () => {
       await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({ dryRun: false, mergePolicy: "MERGE", embyUserIds: ["user-1"] }));
     });
