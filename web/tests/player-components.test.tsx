@@ -198,6 +198,8 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('value="-1.2"');
     expect(markup).toContain('aria-valuetext="-1.2s"');
     expect(markup).toContain("正值延后，负值提前");
+    expect(markup).not.toContain("快捷键提示");
+    expect(markup).not.toContain("空格 / K");
     expect(markup).toContain('aria-label="关闭播放设置"');
   });
 

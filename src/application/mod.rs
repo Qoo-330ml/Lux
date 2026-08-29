@@ -10,6 +10,7 @@ pub mod database_setup;
 pub mod deletion;
 pub mod directory_browser;
 pub mod downloads;
+pub mod embedded_subtitle;
 pub mod emby_migration;
 pub mod emby_migration_service;
 pub mod home;

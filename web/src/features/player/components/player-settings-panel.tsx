@@ -225,16 +225,6 @@ export function PlayerSettingsPanel({
         />
         <p className="lux-player-caption-status">正值延后，负值提前；仅影响当前选中的字幕。</p>
       </div>
-      <div className="lux-player-settings-section">
-        <span className="lux-player-settings-label" id="lux-player-shortcuts-label">快捷键提示</span>
-        <div className="lux-player-shortcuts-list" aria-labelledby="lux-player-shortcuts-label">
-          <div><span>空格 / K</span><span>播放 / 暂停</span></div>
-          <div><span>← / →</span><span>快退 / 快进 10 秒</span></div>
-          <div><span>↑ / ↓</span><span>音量调节</span></div>
-          <div><span>F</span><span>全屏切换</span></div>
-          <div><span>M</span><span>静音切换</span></div>
-        </div>
-      </div>
     </div>
   );
 }

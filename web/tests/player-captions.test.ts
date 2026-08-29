@@ -3,6 +3,7 @@ import type { MediaSource } from "../src/lib/api/types";
 import {
   defaultCaptionSelection,
   nativeCaptionTrack,
+  overlayCaptionSource,
   playerCaptionOptions,
 } from "../src/features/player/components/player-captions";
 
@@ -52,6 +53,71 @@ describe("LuxPlayer caption selection", () => {
     expect(options).toEqual([
       expect.objectContaining({ format: "ass", renderMode: "overlay", available: true }),
       expect.objectContaining({ format: "vtt", renderMode: "native", available: true }),
+    ]);
+  });
+
+  it("uses local embedded text fallback but requires an actual native track for remote STRM", () => {
+    const localOptions = playerCaptionOptions({
+      id: "local-mkv",
+      sourceKind: "LOCAL_FILE",
+      streams: [
+        { index: 2, type: "SUBTITLE", codec: "subrip", title: "本地文本", isExternal: false },
+        { index: 3, type: "SUBTITLE", codec: "hdmv_pgs_subtitle", title: "图形字幕", isExternal: false },
+      ],
+    }, true);
+    expect(localOptions).toEqual([
+      expect.objectContaining({ streamIndex: 2, format: "srt", renderMode: "overlay", available: true }),
+      expect.objectContaining({ streamIndex: 3, available: false }),
+    ]);
+
+    const remoteOptions = playerCaptionOptions({
+      id: "remote-strm",
+      sourceKind: "STRM_URL",
+      streams: [{ index: 2, type: "SUBTITLE", codec: "subrip", title: "远程文本", isExternal: false }],
+    }, true);
+    expect(remoteOptions[0]).toEqual(expect.objectContaining({ available: false }));
+  });
+
+  it("marks a matching browser-exposed in-band track as native without building a subtitle URL", () => {
+    const options = playerCaptionOptions({
+      id: "remote-strm",
+      sourceKind: "STRM_URL",
+      streams: [{ index: 2, type: "SUBTITLE", codec: "subrip", title: "远程文本", isExternal: false }],
+    }, true, [{
+      id: "inband-caption-0",
+      label: "远程文本",
+      language: "zho",
+      kind: "subtitles",
+      ordinal: 0,
+    }]);
+
+    expect(options[0]).toEqual(expect.objectContaining({
+      available: true,
+      renderMode: "native-inband",
+      runtimeTrackId: "inband-caption-0",
+    }));
+    expect(nativeCaptionTrack("item", "remote-strm", options[0])).toBeNull();
+    expect(overlayCaptionSource("item", "remote-strm", options[0])).toBeNull();
+  });
+
+  it("maps runtime tracks only across supported embedded text streams", () => {
+    const options = playerCaptionOptions({
+      id: "local-mkv",
+      sourceKind: "LOCAL_FILE",
+      streams: [
+        { index: 1, type: "SUBTITLE", codec: "srt", title: "中文", isExternal: false, isDefault: true },
+        { index: 2, type: "SUBTITLE", codec: "hdmv_pgs_subtitle", title: "图形字幕", isExternal: false },
+        { index: 3, type: "SUBTITLE", codec: "ass", title: "English", isExternal: false },
+      ],
+    }, true, [
+      { id: "inband-caption-0", label: "中文", kind: "subtitles", ordinal: 0 },
+      { id: "inband-caption-1", label: "English", kind: "subtitles", ordinal: 1 },
+    ]);
+
+    expect(options).toEqual([
+      expect.objectContaining({ streamIndex: 1, renderMode: "native-inband", runtimeTrackId: "inband-caption-0" }),
+      expect.objectContaining({ streamIndex: 2, available: false }),
+      expect.objectContaining({ streamIndex: 3, renderMode: "native-inband", runtimeTrackId: "inband-caption-1" }),
     ]);
   });
 });

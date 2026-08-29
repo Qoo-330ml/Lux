@@ -1325,6 +1325,93 @@ async fn media_source_library_page_respects_limit_and_offset() {
 }
 
 #[tokio::test]
+async fn subtitle_stream_query_is_source_scoped_and_paginated() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    tokio::fs::write(root_path.join("Subtitle.Movie.2024.mkv"), b"fixture")
+        .await
+        .expect("movie");
+    libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("scan");
+
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("item");
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("source");
+    for (stream_index, codec, title) in [(2_i64, "srt", "English"), (3, "ass", "中文")] {
+        sqlx::query(
+            "INSERT INTO media_streams
+             (id, media_source_id, stream_index, stream_type, codec, language, title,
+              details_json, is_external, is_default, is_forced)
+             VALUES (?, ?, ?, 'SUBTITLE', ?, ?, ?, ?, 0, ?, 0)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&source_id)
+        .bind(stream_index)
+        .bind(codec)
+        .bind(if stream_index == 2 { "eng" } else { "zho" })
+        .bind(title)
+        .bind(r#"{"disposition":{"default":true}}"#)
+        .bind(if stream_index == 2 { 1_i64 } else { 0 })
+        .execute(database.pool())
+        .await
+        .expect("subtitle stream");
+    }
+
+    let page = database
+        .list_subtitle_streams(&item_id, Some(&source_id), 1, 1)
+        .await
+        .expect("source-scoped page");
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].media_source_id, source_id);
+    assert_eq!(page[0].item_id, item_id);
+    assert_eq!(page[0].stream_index, 3);
+    assert_eq!(page[0].codec.as_deref(), Some("ass"));
+    assert_eq!(page[0].source_kind, "LOCAL_FILE");
+    assert_eq!(page[0].relative_path, "Subtitle.Movie.2024.mkv");
+    assert!(page[0].external_path.is_none());
+
+    let default_page = database
+        .list_subtitle_streams(&page[0].item_id, None, 0, 10)
+        .await
+        .expect("default source page");
+    assert_eq!(default_page.len(), 2);
+    assert!(
+        database
+            .list_subtitle_streams(&item_id, Some("not-this-source"), 0, 10)
+            .await
+            .expect("other source page")
+            .is_empty()
+    );
+    database.close().await;
+}
+
+#[tokio::test]
 async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

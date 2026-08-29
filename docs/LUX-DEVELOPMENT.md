@@ -1317,7 +1317,12 @@ locked local value
 - 扫描同目录外挂字幕并识别语言、forced、default 等文件名标记。
 - API 列出内嵌和外挂字幕。
 - 外挂字幕可由受鉴权端点直接读取。
-- 内嵌字幕由客户端从媒体容器读取；若某目标客户端强制请求提取端点，再以兼容性探针决定是否用 ffmpeg 做无转换抽取。
+- Web 播放器首先尝试浏览器实际暴露的 in-band `TextTrack`；该路径不产生额外字幕请求，也不改变媒体 URL。
+- 本地媒体的内嵌 SRT、ASS、SSA 在浏览器未暴露轨道时，可由 source-scoped 字幕端点按需做无转码抽取，再交给已有的
+  Worker 文本解析器；不写回媒体、不烧录、不生成永久缓存。
+- 远程 `.strm` 不由 Lux 拉取或抽取内嵌字幕，不新增 302/Redia 字幕接口；只尝试浏览器原生轨道，或在明确满足 CORS、Range
+  和 MSE 条件时进行单次媒体读取实验。条件不满足时保留视频直放并显示字幕不可用。
+- PGS/SUP 图形字幕不属于本阶段承诺；完整 ASS/SSA 样式、字幕烧录和 HLS 字幕组另行处理。
 
 ### 14.5 弹幕兼容
 
@@ -1333,6 +1338,7 @@ locked local value
 - 档位 0 使用原生 Range 直放或现有客户端 fallback；档位 1～4 使用服务端 fMP4/CMAF HLS。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用 Web HLS 播放器。
 - 创建会话时固定媒体源、音频/字幕选择、起播位置和服务端计划；seek 必要时切换会话生成代次，不把客户端任意路径或外部 URL 交给服务端执行。
 - `.strm` 只能返回档位 0；URL 型直连、路径型外部代理接管或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
+- 内嵌文本字幕是独立于媒体计划的能力：浏览器原生轨道或客户端单次读取只能复用当前媒体资源，不能改变 `.strm` 的 Direct 规则。
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
 - 不实现 DRM、服务器字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。LUX-212 的浏览器文本 cue
@@ -1901,6 +1907,23 @@ services:
 - 版本：协议 v1 的 metadata 方法保持不变；TMDb 与豆瓣插件分别在解耦发布中增加一个 patch 版本。
 - 原因：避免新增 provider 时修改核心依赖、数据库模型和应用服务，也避免插件读取无关凭据。
 
+### ADR-032：内嵌文本字幕的浏览器优先与远程 STRM 隔离
+
+- 状态：已接受；由 LUX-224 实施。
+- 决定：Web 播放器先使用浏览器暴露的 in-band `TextTrack`。浏览器未暴露轨道时，本地媒体允许通过现有
+  source-scoped 字幕端点按需抽取原始 SRT/ASS/SSA，复用 Lux 的 Worker 文本解析器；远程 `.strm` 不由 Lux
+  拉取媒体或提供字幕代理接口。
+- 远程 `.strm` 只有在浏览器本身支持内嵌字幕，或实验性的单次 `fetch`/MSE/Worker 媒体管线满足 CORS、Range、
+  鉴权和生命周期条件时才尝试显示。实验失败必须回到原有 Direct Play，不得为了字幕切换到 Lux HLS、服务端
+  代理或额外的远程媒体连接。
+- PGS/SUP、服务器字幕烧录、HLS 字幕组、完整 ASS/SSA 样式和字幕写回不属于本决定。内嵌字幕选择不进入 Web
+  播放会话创建请求，不影响 tier、媒体 URL、进度、心跳或停止接口。
+- 原因：浏览器内部媒体管线可能拥有页面不可见的字幕数据；把远程 `.strm` 拉回 Lux 会破坏直连、User-Agent
+  绑定和单连接语义，并扩大隐私、SSRF 和资源风险。浏览器能力必须以真实运行时暴露结果为准，不能从 ffprobe
+  的轨道枚举推断浏览器一定可渲染。
+- 后果：本地文本字幕可以安全提供可控的 Lux fallback；远程 `.strm` 字幕是能力型支持，不承诺所有浏览器，
+  且不依赖 302/Redia 的字幕专用合同。兼容性记录必须分别记录视频请求和字幕数据来源。
+
 ---
 
 ## 24. 全局完成标准
@@ -2007,6 +2030,12 @@ services:
 | LUX-221 | web/src/features/player/、web/tests/、docs/THIRD-PARTY-NOTICES.md；章节时间轴与片头跳过体验 |
 | LUX-222 | scripts/player-danmaku-smoke.mjs、web/tests/、docs/COMPATIBILITY.md；阶段 18 真实浏览器和全量质量门 |
 | LUX-223 | src/api/、src/storage/、src/application/people/、docs/；内部领域模块化重构，不改变公共协议或数据库模型 |
+| LUX-224 | docs/LUX-DEVELOPMENT.md、docs/decisions/032-embedded-text-subtitles.md；内嵌文本字幕合同与远程 .strm 边界 |
+| LUX-225 | src/storage/repository.rs、src/storage/jobs.rs、src/storage/mod.rs、tests/subtitles.rs；source-scoped 字幕流查询 |
+| LUX-226 | src/application/embedded_subtitle.rs、src/application/mod.rs、src/api/media.rs、tests/subtitles.rs；本地内嵌文本字幕按需抽取 |
+| LUX-227 | web/src/features/player/components/player-captions.ts、web/src/features/player/components/player-video-surface.tsx、web/src/features/player/PlayerPage.tsx、web/tests/player-captions.test.ts、web/tests/player-caption-surface.test.tsx；浏览器原生 in-band TextTrack 探测 |
+| LUX-228 | web/src/features/player/、web/tests/；单次媒体读取的文本字幕解析实验，默认不改变 Direct Play |
+| LUX-229 | tests/strm_resolver_playback.rs、tests/web_playback.rs、web/tests/、docs/COMPATIBILITY.md；本地与远程 .strm 字幕兼容性阶段门 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5200,6 +5229,126 @@ repository 方法或 People 用例。此任务不引入新依赖、不新增端�
 均通过。最终 `cargo test --locked --all-targets` 通过（库测试 285 passed、1 ignored，所有集成目标通过）；此前
 一次全量运行和一次隔离重复运行曾收到用户管理测试 503，但最终全量复跑通过，说明该测试仍存在启动/后台任务
 时序不稳定风险，未在本任务范围内修改测试行为。此 ARM64 结果不外推 NAS/x86_64 性能。
+
+### 阶段 20：内嵌文本字幕与远程 STRM 能力边界
+
+本阶段只处理文本字幕（SRT、ASS、SSA）的发现、按需抽取和浏览器侧显示，不处理 PGS/SUP 图形字幕。字幕是附着于
+当前媒体源的独立展示能力：切换字幕不能重新创建播放会话，不能改变 Direct/HLS/fallback 计划、媒体 URL、ACL、进度、
+心跳或停止语义。远程 `.strm` 继续只允许 Direct Play，Lux 不拉取远程媒体字节、不运行 ffmpeg、不提供 302/Redia 字幕
+代理接口。
+
+浏览器优先级固定为：首先使用实际运行时暴露的 `HTMLVideoElement.textTracks`；本地媒体未暴露内嵌轨时，再从 Lux 已授权的
+source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原生轨道，实验性单次读取管线默认关闭且失败必须回到原有
+视频直放。ffprobe 的轨道列表只用于索引和能力提示，不能作为浏览器一定能读取内嵌轨的证明。
+
+#### LUX-224：内嵌文本字幕规格与 ADR-032
+
+范围：记录本阶段字幕合同、媒体源隔离、远程 `.strm` 边界、ArtPlayer 官方实现核验结论和任务依赖。只改规格和 ADR，
+不改运行时行为、不新增路由、不新增依赖、不改数据库。
+
+验收：
+
+- [ ] 明确支持本地内嵌 SRT/ASS/SSA 的按需文本抽取；首版不支持 PGS/SUP、服务器烧录、HLS 字幕组和完整 ASS 样式。
+- [ ] 明确浏览器原生 `TextTrack` 优先，以及远程 `.strm` 不拉取、不代理、不启动 ffmpeg、默认不启用实验管线。
+- [ ] 明确字幕选择不影响播放会话、媒体 URL、tier、HLS、进度、心跳、停止和 ACL；source-scoped 合同不泄露路径或外部 URL。
+- [ ] ADR 记录 ArtPlayer 核心字幕模块只加载外部 `subtitle.url`；JASSUB/Mediabunny 属于额外浏览器管线，不能推导普通
+      `<video>` 能解封装远程 MKV 内嵌字幕。
+
+验证：`git diff --check`，人工审阅规格和 ADR。
+
+依赖：LUX-223 阶段门确认后进入。
+
+#### LUX-225：source-scoped 字幕流查询合同
+
+范围：为当前媒体源查询内嵌字幕流提供稳定的 Lux application/storage 合同。复用已有媒体流信息和 item ACL，不做数据库
+迁移，不读取远程 `.strm` 目标，不在 HTTP handler 中执行 SQL 或媒体扫描。
+
+验收：
+
+- [ ] 查询只返回属于 `{itemId, sourceId}` 的字幕流，并区分 `embedded`、`external`、格式、语言、标题、default、forced
+      和当前可用性；省略 `sourceId` 时保持既有默认源回退。
+- [ ] 字幕流列表分页并有服务端上限；跨条目/跨源 ID、无权限和不存在资源使用既有安全错误边界，不暴露本地路径、原始
+      `.strm` 文本、令牌或完整外部 URL。
+- [ ] 对远程 `.strm` 不触发 HTTP/SMB/FTP 读取、ffprobe、ffmpeg、代理或字幕专用重定向；播放合同和既有外挂字幕端点不回归。
+
+验证：`cargo test --locked --test subtitles`，相关 API/ACL 测试，`cargo fmt --all -- --check`。
+
+依赖：LUX-224。
+
+#### LUX-226：本地内嵌文本字幕按需抽取
+
+范围：为本地、已授权、可读取的媒体提供 SRT/ASS/SSA 内嵌轨的按需无转码读取。抽取在 application/service 边界完成，
+使用有界阻塞 worker，结果通过 source-scoped 字幕端点返回给 Web Worker；不写回媒体、不生成永久缓存、不处理 PGS/SUP。
+
+验收：
+
+- [ ] 只接受已索引且属于当前 item/source 的文本字幕流；路径 canonicalize 后仍必须位于已配置媒体根或既有允许的本地 `.strm`
+      目标边界内，目录、另一个 `.strm`、远程 URL 和未知协议拒绝。
+- [ ] 抽取有文件大小、读取时长、输出字节和并发上限；SRT/ASS/SSA 原始文本保持可解析，格式无效、超限、取消和读取失败
+      返回可诊断但不泄露路径的错误。
+- [ ] 读取只发生在用户请求的选定字幕轨，未选择字幕不触发抽取；本地视频 Direct/HLS/fallback 和外挂字幕行为不改变。
+
+验证：`cargo test --locked --test subtitles`，`cargo build --locked`，相关取消/上限测试。
+
+依赖：LUX-225。
+
+#### LUX-227：浏览器原生 in-band TextTrack 探测
+
+范围：在 LuxPlayer 当前视频 surface 中探测当前 video 实例真实暴露的 `textTracks`，把可用内嵌文本轨并入已有字幕选择器。
+探测只读浏览器运行时状态，不猜测、不下载媒体、不创建额外字幕请求；track 随 source、engine、页面和 destroy 生命周期释放。
+
+验收：
+
+- [ ] 只接受当前 video 的实际 `TextTrack`，区分 native in-band 与 Lux 外挂 track，标签、语言、default、forced 和 mode 显示正确。
+- [ ] 选择 native track 只切换 `mode`/当前显示状态，不调用播放会话 API，不改变媒体 URL、请求头、tier、进度或心跳。
+- [ ] native 轨道不存在、浏览器不暴露、轨道格式无法渲染或 track 事件异常时，视频继续播放并显示字幕不可用原因；不影响
+      SRT/ASS/SSA overlay fallback。
+
+验证：`pnpm --dir web test`、`pnpm --dir web build`，组件生命周期测试和真实浏览器 console/network 检查。
+
+依赖：LUX-225、LUX-226。
+
+#### LUX-228：单次媒体读取字幕解析实验（默认关闭）
+
+范围：建立隔离的浏览器实验接口，只在明确的能力开关和运行时条件同时满足时尝试一次媒体读取与文本字幕解析。实验只能
+复用当前播放资源及其鉴权上下文，不能偷偷创建第二条远程连接；不把实验结果作为普通 Direct Play 的承诺。
+
+验收：
+
+- [ ] 默认关闭；开启前必须满足 CORS、Range、媒体类型、读取上限、生命周期取消和可用解析器条件，任何条件不满足立即跳过。
+- [ ] 解析失败、网络中断、资源一次性 UA/令牌绑定或浏览器不支持时，视频保持原有 Direct Play；不回退到 Lux HLS、媒体代理
+      或 302/Redia 字幕接口，不重试第二条远程媒体连接。
+- [ ] 实验结果与视频请求、字幕来源、字节上限和失败原因可诊断但不记录完整 URL、令牌、Cookie 或媒体内容；实验不处理 PGS/SUP。
+
+验证：Web 单测覆盖开关、能力门、取消、失败回退和单连接约束；`pnpm --dir web test`、`pnpm --dir web build`。
+
+依赖：LUX-227。
+
+#### LUX-229：本地/远程 `.strm` 字幕兼容性阶段门
+
+范围：使用固定、无个人数据的媒体夹具，分别验证本地媒体、URL 型远程 `.strm`、路径型远程 `.strm`、浏览器原生轨道、按需
+本地抽取和实验关闭/失败路径。只记录已验证能力，不扩大 `.strm` 播放合同。
+
+验收：
+
+- [ ] 本地内嵌文本字幕可按轨选择并与 Direct/HLS/fallback 生命周期一致；PGS/SUP 明确显示不支持且视频仍可播放。
+- [ ] 远程 URL/path `.strm` 的视频请求仍由播放器/外部代理按既有规则直连；Lux 没有媒体字节、ffmpeg、ffprobe 或字幕专用代理
+      请求，native track 仅在浏览器实际暴露时可用。
+- [ ] source 切换、seek、停止、页面离开和失败回退不残留字幕；兼容性记录包含浏览器、平台、夹具哈希和请求边界。
+- [ ] 阶段 Rust/Web 全量质量门通过，并记录 `uname -m`；本机 ARM64 结果不外推 NAS/x86_64 性能，项目所有者确认后关闭阶段。
+
+验证：`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、`pnpm --dir web build`、`cargo build --locked`、
+`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+真实浏览器 console/network 检查，并更新 `docs/COMPATIBILITY.md`。
+
+依赖：LUX-226、LUX-227、LUX-228。
+
+阶段门：
+
+- [ ] 本地文本字幕与浏览器 native track 均不改变播放会话和 `.strm` Direct Play 边界。
+- [ ] 远程 `.strm` 没有 Lux 媒体字节流量、服务端字幕抽取、ffmpeg 或 302/Redia 字幕专用合同。
+- [ ] PGS/SUP、服务器烧录、HLS 字幕组和完整 ASS 样式未被隐式加入，所有未验证浏览器能力均已记录。
+- [ ] Rust/Web 全量质量门、兼容性记录、本机架构记录和项目所有者确认均完成。
 
 ## 26. 风险与缓解
 

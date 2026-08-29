@@ -36,6 +36,7 @@ use crate::{
     application::database_setup::{DatabaseSetupError, DatabaseSetupService},
     application::deletion::{MediaDeleteError, MediaDeleteService},
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
+    application::embedded_subtitle::EmbeddedSubtitleService,
     application::home::{HomeError, HomeService},
     application::playback::decision::{PlaybackCapabilities, PlaybackSourceKind},
     application::playback::session::{
@@ -176,6 +177,7 @@ pub struct AppState {
     metadata_reidentify: Option<MetadataReidentifyService>,
     deletion: Option<MediaDeleteService>,
     probe: Option<MediaProbeService>,
+    embedded_subtitle: Option<EmbeddedSubtitleService>,
     thumbnails: Option<ThumbnailService>,
     scan_jobs: Option<ScanJobService>,
     strm_probe: Option<StrmProbeService>,
@@ -313,6 +315,7 @@ impl AppState {
             MediaProbeService::new(database.clone(), FfprobeRunner::default())
                 .with_resource_metrics(resources.clone()),
         );
+        let embedded_subtitle = Some(EmbeddedSubtitleService::new());
         let thumbnails = Some(ThumbnailService::new(database.clone()));
         let scan_jobs = {
             let service = ScanJobService::new(database.clone())
@@ -393,6 +396,7 @@ impl AppState {
                 None => MediaDeleteService::new(database.clone()),
             }),
             probe,
+            embedded_subtitle,
             thumbnails,
             scan_jobs: Some(scan_jobs),
             strm_probe: Some(strm_probe),
@@ -421,6 +425,12 @@ impl AppState {
     #[doc(hidden)]
     pub fn with_strm_playback_resolver(mut self, resolver: StrmPlaybackResolver) -> Self {
         self.strm_playback = Some(resolver);
+        self
+    }
+
+    #[doc(hidden)]
+    pub fn with_embedded_subtitle_executable(mut self, executable: PathBuf) -> Self {
+        self.embedded_subtitle = Some(EmbeddedSubtitleService::with_executable(executable));
         self
     }
 

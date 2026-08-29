@@ -94,15 +94,26 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"10","bit_rate":"100
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    sqlx::query(
+        "INSERT INTO media_streams
+         (id, media_source_id, stream_index, stream_type, codec, language, title,
+          is_external, is_default, is_forced)
+         VALUES (?, ?, 4, 'SUBTITLE', 'subrip', 'eng', '内嵌英文', 0, 0, 0)",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+    let fake_ffmpeg = executable_script(
+        temp_dir.path(),
+        "printf '1\\n00:00:00,000 --> 00:00:01,000\\nEmbedded Hello\\n'",
+    )?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(
-        config,
-        database.clone(),
-        setup,
-        auth,
-        emby_auth,
-    ));
+    let app = app_with_state(
+        AppState::ready(config, database.clone(), setup, auth, emby_auth)
+            .with_embedded_subtitle_executable(fake_ffmpeg),
+    );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -146,6 +157,19 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"10","bit_rate":"100
         "text/plain; charset=utf-8"
     );
     assert!(String::from_utf8(subtitle.bytes().await?.to_vec())?.contains("Hello"));
+    let embedded = client
+        .get(format!(
+            "{base_url}/Videos/{item_id}/{source_id}/Subtitles/4/Stream"
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(embedded.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        embedded.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    assert!(String::from_utf8(embedded.bytes().await?.to_vec())?.contains("Embedded Hello"));
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))

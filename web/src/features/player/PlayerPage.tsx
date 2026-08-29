@@ -57,6 +57,7 @@ import {
   nativeCaptionTrack,
   overlayCaptionSource,
   playerCaptionOptions,
+  type PlayerRuntimeCaptionTrack,
 } from "./components/player-captions";
 
 const TICKS_PER_SECOND = 10_000_000;
@@ -191,6 +192,7 @@ export function PlayerPage() {
   const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
   const [captionStatus, setCaptionStatus] = useState<string | null>(null);
   const [captionOffset, setCaptionOffset] = useState(0);
+  const [nativeCaptionTracks, setNativeCaptionTracks] = useState<PlayerRuntimeCaptionTrack[]>([]);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
 
   const requestedSourceId = searchParams.get("sourceId");
@@ -213,12 +215,15 @@ export function PlayerPage() {
     media?.mediaSources?.find((entry) => entry.isDefault) ??
     media?.mediaSources?.[0];
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
-  const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported);
+  const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, nativeCaptionTracks);
   const selectedCaptionOption = captionSourceId === source?.id
     ? captionOptions.find((caption) => caption.streamIndex === selectedCaptionStreamIndex && caption.available) ?? null
     : null;
   const captionTrack = nativeCaptionTrack(itemId, source?.id ?? "", selectedCaptionOption);
   const captionOverlaySource = overlayCaptionSource(itemId, source?.id ?? "", selectedCaptionOption);
+  const nativeCaptionTrackId = selectedCaptionOption?.renderMode === "native-inband"
+    ? selectedCaptionOption.runtimeTrackId ?? null
+    : null;
   const playbackKey = `${itemId}:${source?.id ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(playbackKey);
   const sessionStartedRef = useRef(false);
@@ -266,6 +271,7 @@ export function PlayerPage() {
   const fallbackRequestedRef = useRef(false);
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
+  const captionSelectionTouchedRef = useRef(false);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
@@ -279,6 +285,7 @@ export function PlayerPage() {
       }
       engineRef.current = null;
       videoRef.current = null;
+      setNativeCaptionTracks([]);
       setAirPlayVideo(null);
       return;
     }
@@ -396,13 +403,29 @@ export function PlayerPage() {
   }, [itemId, requestedSourceId]);
 
   useEffect(() => {
+    captionSelectionTouchedRef.current = false;
+    setNativeCaptionTracks([]);
     const initialCaption = defaultCaptionSelection(
-      playerCaptionOptions(source, nativeCaptionTracksSupported),
+      playerCaptionOptions(source, nativeCaptionTracksSupported, []),
     );
     setCaptionSourceId(source?.id ?? null);
     setSelectedCaptionStreamIndex(initialCaption?.streamIndex ?? null);
     setCaptionStatus(null);
   }, [nativeCaptionTracksSupported, source?.id]);
+
+  const defaultCaptionStreamIndex = defaultCaptionSelection(captionOptions)?.streamIndex ?? null;
+  useEffect(() => {
+    if (
+      captionSelectionTouchedRef.current
+      || !source?.id
+      || captionSourceId !== source.id
+    ) {
+      return;
+    }
+    setSelectedCaptionStreamIndex((previous) => (
+      previous === defaultCaptionStreamIndex ? previous : defaultCaptionStreamIndex
+    ));
+  }, [captionSourceId, defaultCaptionStreamIndex, source?.id]);
 
   useEffect(() => {
     if (sessionGateKey === playbackKey) return;
@@ -784,6 +807,7 @@ export function PlayerPage() {
   }, []);
 
   const selectCaption = useCallback((streamIndex: number | null) => {
+    captionSelectionTouchedRef.current = true;
     if (streamIndex === null) {
       setCaptionSourceId(source?.id ?? null);
       setSelectedCaptionStreamIndex(null);
@@ -795,7 +819,7 @@ export function PlayerPage() {
     if (!option?.available) return;
     setCaptionSourceId(source?.id ?? null);
     setSelectedCaptionStreamIndex(option.streamIndex);
-    setCaptionStatus("字幕加载中…");
+    setCaptionStatus(option.renderMode === "native-inband" ? null : "字幕加载中…");
     resetControlsTimeout();
   }, [captionOptions, resetControlsTimeout, source?.id]);
 
@@ -1110,6 +1134,8 @@ export function PlayerPage() {
         fallbackLoading={fallbackLoading}
         fallbackSpeedX={fallbackSpeedX}
         captionTrack={captionTrack}
+        nativeCaptionTrackId={nativeCaptionTrackId}
+        onNativeCaptionTracksChange={setNativeCaptionTracks}
         captionOffset={captionOffset}
         captionDuration={duration}
         captionLifecycleKey={playbackKey}
