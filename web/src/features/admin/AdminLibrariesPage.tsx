@@ -24,11 +24,13 @@ import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminLibraryScraper, AdminPlugin, ChapterSource, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
+import { orderLibraries } from "../account/account-settings";
 import { DirectoryPicker } from "./DirectoryPicker";
 
 export function AdminLibrariesPage() {
   const queryClient = useQueryClient();
   const libraries = useQuery({ queryKey: queryKeys.adminLibraries, queryFn: () => api.adminLibraries() });
+  const libraryOrder = useQuery({ queryKey: queryKeys.libraryOrder, queryFn: () => api.libraryOrder() });
   const plugins = useQuery({ queryKey: queryKeys.adminPlugins, queryFn: () => api.adminPlugins() });
   const chapterSources = useQuery({ queryKey: queryKeys.adminChapterSources, queryFn: () => api.adminChapterSources() });
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
@@ -146,7 +148,7 @@ export function AdminLibrariesPage() {
   if (libraries.isPending || plugins.isPending || chapterSources.isPending || settings.isPending) return <AdminLibraryState label="正在读取媒体库、插件与全局策略…" />;
   if (libraries.error || plugins.error || chapterSources.error || settings.error) return <AdminLibraryState label={libraries.error?.message || plugins.error?.message || chapterSources.error?.message || settings.error?.message || "管理数据加载失败"} error />;
 
-  const items = libraries.data.libraries ?? [];
+  const items = orderLibraries(libraries.data.libraries ?? [], libraryOrder.data?.libraryOrder ?? []);
   const pluginItems = plugins.data.plugins ?? [];
   function submit(event: FormEvent) {
     event.preventDefault();
