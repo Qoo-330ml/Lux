@@ -90,6 +90,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_test_emby_migration),
         )
         .route(
+            "/api/v1/admin/emby-migration/source-users",
+            get(admin_list_emby_migration_source_users),
+        )
+        .route(
             "/api/v1/admin/emby-migration",
             get(admin_list_emby_migrations).post(admin_create_emby_migration),
         )

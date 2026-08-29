@@ -428,6 +428,20 @@ export type AdminEmbyMigrationConnection = {
   historyCapability: "ITEM_STATE" | "EVENT_HISTORY" | string;
 };
 
+export type AdminEmbyMigrationSourceUser = {
+  id: string;
+  name: string;
+  isDisabled: boolean;
+  isAdministrator: boolean;
+};
+
+export type AdminEmbyMigrationSourceUserPage = {
+  users?: AdminEmbyMigrationSourceUser[];
+  total?: number;
+  page?: number;
+  pageSize?: number;
+};
+
 export type AdminEmbyMigrationJob = {
   id: string;
   sourceLabel: string;

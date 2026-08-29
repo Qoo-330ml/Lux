@@ -35,4 +35,18 @@ describe("LuxApiClient Emby migration methods", () => {
     expect(calls[2]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/users?page=2&pageSize=50");
     expect(calls[3]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/person-favorites?page=3&pageSize=50");
   });
+
+  it("loads a paginated source-user list for targeted migration", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ users: [{ id: "user-1", name: "Alice", isDisabled: false, isAdministrator: false }] }), { status: 200 }),
+    );
+    const client = new LuxApiClient();
+
+    await expect(client.adminEmbyMigrationSourceUsers(2)).resolves.toMatchObject({
+      users: [{ id: "user-1", name: "Alice" }],
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/emby-migration/source-users?page=2&pageSize=100",
+    );
+  });
 });

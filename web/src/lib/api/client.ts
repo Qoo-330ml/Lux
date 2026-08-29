@@ -18,6 +18,7 @@ import type {
   AdminSettings,
   AdminSettingsPatch,
   AdminEmbyMigrationConnection,
+  AdminEmbyMigrationSourceUserPage,
   AdminEmbyMigrationImport,
   AdminEmbyMigrationJob,
   AdminEmbyMigrationMatch,
@@ -543,6 +544,12 @@ export class LuxApiClient {
       method: "POST",
       body: JSON.stringify({}),
     });
+  }
+
+  adminEmbyMigrationSourceUsers(page = 1) {
+    return this.request<AdminEmbyMigrationSourceUserPage>(
+      `/api/v1/admin/emby-migration/source-users?page=${page}&pageSize=100`,
+    );
   }
 
   createAdminEmbyMigration(input: {

@@ -78,6 +78,33 @@ pub struct MigrationUserLinkView {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationSourceUserView {
+    pub id: String,
+    pub name: String,
+    pub is_disabled: bool,
+    pub is_administrator: bool,
+}
+
+impl From<MigrationUser> for MigrationSourceUserView {
+    fn from(user: MigrationUser) -> Self {
+        Self {
+            id: user.id,
+            name: user.name,
+            is_disabled: user.is_disabled,
+            is_administrator: user.is_administrator,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationSourceUserPageView {
+    pub users: Vec<MigrationSourceUserView>,
+    pub total: i64,
+}
+
 impl From<StoredEmbyMigrationUserLink> for MigrationUserLinkView {
     fn from(link: StoredEmbyMigrationUserLink) -> Self {
         Self {
@@ -513,6 +540,23 @@ impl EmbyMigrationService {
     ) -> Result<MigrationConnectionInfo, EmbyMigrationServiceError> {
         let source = self.plugin.configured_source().await?;
         Ok(self.plugin.test_connection(&source).await?)
+    }
+
+    pub async fn list_source_users(
+        &self,
+        offset: i64,
+        limit: i64,
+    ) -> Result<MigrationSourceUserPageView, EmbyMigrationServiceError> {
+        let source = self.plugin.configured_source().await?;
+        let users = self.plugin.list_users(&source).await?.items;
+        let total = users.len() as i64;
+        let users = users
+            .into_iter()
+            .skip(offset.max(0) as usize)
+            .take(limit.clamp(1, MAX_JOB_PAGE_SIZE) as usize)
+            .map(MigrationSourceUserView::from)
+            .collect();
+        Ok(MigrationSourceUserPageView { users, total })
     }
 
     pub async fn authenticate_pending_user(

@@ -6610,6 +6610,41 @@ pub(crate) async fn admin_test_emby_migration(
     }
 }
 
+pub(crate) async fn admin_list_emby_migration_source_users(
+    headers: HeaderMap,
+    Query(query): Query<AdminJobsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let Some(service) = state.emby_migration.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.list_source_users(offset, limit).await {
+        Ok(page) => Json(json!({
+            "users": page.users,
+            "total": page.total,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(error) => emby_migration_error(&headers, error),
+    }
+}
+
 pub(crate) async fn admin_create_emby_migration(
     headers: HeaderMap,
     State(state): State<AppState>,
