@@ -373,6 +373,7 @@ impl Database {
         .map_err(storage_error)
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn upsert_emby_migration_user_binding(
         &self,
         binding: &StoredEmbyMigrationUserBinding,
