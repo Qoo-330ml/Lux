@@ -63,4 +63,47 @@ describe("ScanActivityPopover", () => {
       await vi.waitFor(() => expect(cancel).toHaveBeenCalledWith("metadata-job-1"));
     });
   });
+
+  it("keeps completed-index postprocessing visible as active work", async () => {
+    vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
+      activities: [{
+        id: "scan-job-postprocessing",
+        kind: "scan",
+        taskType: "RECONCILE_LIBRARY",
+        libraryId: "library-1",
+        status: "COMPLETED",
+        processedCount: 1_000_000,
+        totalCount: 1_000_000,
+        currentItem: "媒体探测",
+        scanPhase: "POSTPROCESSING",
+      }],
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影库" }],
+    });
+    const cancel = vi.spyOn(api, "cancelAdminJob").mockResolvedValue(undefined);
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ScanActivityPopover />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector("button[aria-label*='后台任务活动']")).not.toBeNull());
+    });
+    act(() => container.querySelector<HTMLButtonElement>("button[aria-label*='后台任务活动']")?.click());
+    expect(container.textContent).toContain("索引已完成，后处理进行中");
+    expect(container.textContent).toContain("媒体探测");
+    expect(container.textContent).not.toContain("100%");
+    expect(container.querySelector<HTMLButtonElement>("button[aria-label='取消全量校验']")).toBeNull();
+    expect(cancel).not.toHaveBeenCalled();
+  });
 });

@@ -1414,6 +1414,71 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
 
 #[cfg(unix)]
 #[tokio::test]
+async fn scan_postprocessing_persists_the_current_stage_while_ffprobe_runs()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Slow.Movie.2024.mp4"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+sleep 1
+printf '%s' '{"format":{"format_name":"mp4"},"streams":[]}'
+"#,
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let worker = tokio::spawn({
+        let jobs = jobs.clone();
+        let job_id = job.id.clone();
+        async move { jobs.run_to_completion(&job_id, 100, Some(probe)).await }
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let activity: (String, Option<String>) =
+                sqlx::query_as("SELECT scan_phase, current_item FROM scan_jobs WHERE id = ?")
+                    .bind(&job.id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if activity.0 == "POSTPROCESSING" && activity.1.as_deref() == Some("媒体探测") {
+                break Ok::<(), sqlx::Error>(());
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await??;
+    worker.await??;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn failed_postprocessing_targets_leave_scan_completed_and_retryable()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};

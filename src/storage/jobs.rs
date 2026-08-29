@@ -2496,6 +2496,31 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_scan_jobs_for_activity(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StoredScanJob>, StorageError> {
+        self.query(
+            "SELECT id, library_id, job_type, status, generation, cursor,
+                    processed_count, total_count, cancel_requested, error,
+                    created_at, started_at, finished_at,
+                    discovery_completed, auto_metadata_match,
+                    current_item, scan_phase
+             FROM scan_jobs
+             WHERE status IN ('PENDING', 'RUNNING')
+                OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING')
+             ORDER BY created_at DESC, id DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_scan_job).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_scan_job_ids_needing_resume(
         &self,
     ) -> Result<Vec<String>, StorageError> {
@@ -2670,7 +2695,8 @@ impl Database {
         self.query(
             "UPDATE scan_jobs
              SET current_item = ?, scan_phase = ?, updated_at = unixepoch()
-             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
+             WHERE id = ? AND (status IN ('PENDING', 'RUNNING')
+                OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))",
         )
         .bind(current_item)
         .bind(scan_phase)

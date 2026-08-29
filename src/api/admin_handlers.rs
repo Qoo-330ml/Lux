@@ -2382,26 +2382,25 @@ pub(crate) async fn admin_list_task_activity(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let mut activities = Vec::new();
+    let scan_jobs = match database.list_scan_jobs_for_activity(100).await {
+        Ok(jobs) => jobs,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    activities.extend(scan_jobs.iter().map(|job| {
+        json!({
+            "id": job.id,
+            "kind": "scan",
+            "taskType": job.job_type,
+            "libraryId": job.library_id,
+            "status": job.status,
+            "processedCount": job.processed_count,
+            "totalCount": job.total_count,
+            "cancelRequested": job.cancel_requested,
+            "currentItem": job.current_item,
+            "scanPhase": job.scan_phase,
+        })
+    }));
     for status in ["PENDING", "RUNNING"] {
-        let scan_jobs = match database.list_scan_jobs(Some(status), 0, 100).await {
-            Ok(jobs) => jobs,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        activities.extend(scan_jobs.iter().map(|job| {
-            json!({
-                "id": job.id,
-                "kind": "scan",
-                "taskType": job.job_type,
-                "libraryId": job.library_id,
-                "status": job.status,
-                "processedCount": job.processed_count,
-                "totalCount": job.total_count,
-                "cancelRequested": job.cancel_requested,
-                "currentItem": job.current_item,
-                "scanPhase": job.scan_phase,
-            })
-        }));
-
         let metadata_status = if status == "PENDING" {
             "QUEUED"
         } else {

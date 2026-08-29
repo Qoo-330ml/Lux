@@ -3618,9 +3618,17 @@ impl ScanJobService {
                     return Ok(());
                 }
                 self.database.retry_failed_scan_job_targets(job_id).await?;
+                self.update_activity(job_id, Some("媒体探测"), "POSTPROCESSING")
+                    .await?;
                 self.run_probe_after_scan(job_id, probe).await?;
+                self.update_activity(job_id, Some("本地元数据"), "POSTPROCESSING")
+                    .await?;
                 self.run_metadata_after_scan(job_id).await?;
+                self.update_activity(job_id, Some("媒体库封面"), "POSTPROCESSING")
+                    .await?;
                 self.run_auto_library_cover_after_scan(job_id).await?;
+                self.update_activity(job_id, Some("视频缩略图"), "POSTPROCESSING")
+                    .await?;
                 self.run_thumbnails_after_scan(job_id, thumbnails).await?;
                 self.database
                     .clear_completed_scan_job_targets(job_id)

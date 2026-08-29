@@ -2,9 +2,12 @@ use std::time::Duration;
 
 use luxd::{
     api::{AppState, app_with_state},
+    application::libraries::LibraryService,
+    application::scanner::ScanJobService,
     application::setup::SetupService,
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
+    library::LibraryKind,
     storage::Database,
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
@@ -1037,6 +1040,68 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(orphaned_tasks, 0);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_task_activity_includes_scan_postprocessing() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, _csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let job_id = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?
+        .id;
+
+    sqlx::query(
+        "UPDATE scan_jobs
+         SET status = 'COMPLETED', scan_phase = 'POSTPROCESSING', current_item = '媒体探测'
+         WHERE id = ?",
+    )
+    .bind(&job_id)
+    .execute(database.pool())
+    .await?;
+
+    let activity = client
+        .get(format!("{base_url}/api/v1/admin/task-activity"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(activity.status(), reqwest::StatusCode::OK);
+    let activities = activity.json::<Value>().await?["activities"]
+        .as_array()
+        .cloned()
+        .ok_or("missing activities")?;
+    let scan = activities
+        .iter()
+        .find(|activity| activity["id"] == job_id)
+        .ok_or("postprocessing scan missing from activity")?;
+    assert_eq!(scan["status"], "COMPLETED");
+    assert_eq!(scan["scanPhase"], "POSTPROCESSING");
+    assert_eq!(scan["currentItem"], "媒体探测");
 
     server.abort();
     Ok(())

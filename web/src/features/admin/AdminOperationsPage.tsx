@@ -265,7 +265,7 @@ export function AdminOperationsPage() {
     return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
   }
 
-  const runningCount = jobItems.filter((job) => isActiveJob(job.status)).length;
+  const runningCount = jobItems.filter(isActiveJob).length;
   const failedCount = jobItems.filter((job) => job.status === "FAILED").length;
   const enabledCount = registeredTasks.filter((task) => task.isEnabled && Boolean(task.schedule)).length;
   const libraryNames = new Map((libraries.data?.libraries ?? []).map((library) => [library.id, library.name]));
@@ -556,8 +556,10 @@ function Pagination({ page, pageSize, total, onPageChange }: { page: number; pag
 function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: OperationsJob; libraryNames: ReadonlyMap<string, string>; onCancel: () => void; onRetry: () => void; busy: boolean }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const progress = job.totalCount && job.totalCount > 0 ? Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100)) : null;
-  const active = isActiveJob(job.status);
-  const cancelling = active && job.kind !== "cover" && Boolean(job.cancelRequested);
+  const active = isActiveJob(job);
+  const postprocessing = isPostprocessingJob(job);
+  const cancellable = isActiveStatus(job.status);
+  const cancelling = cancellable && job.kind !== "cover" && Boolean(job.cancelRequested);
   const discovering = active && job.kind === "scan" && job.discoveryCompleted === false;
   const jobContext = job.kind === "strm"
     ? "STRM 媒体信息任务"
@@ -573,6 +575,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   const libraryLabel = job.libraryId ? libraryNames.get(job.libraryId) ?? job.libraryId : "";
   const pendingCount = job.kind === "metadata" ? job.pendingCount ?? 0 : 0;
   const pendingHref = job.libraryId ? `/libraries/${encodeURIComponent(job.libraryId)}?metadataStatus=pending` : undefined;
+  const currentItem = job.kind === "scan" ? job.currentItem : null;
   const details = useQuery({
     queryKey: ["admin", "metadata-job", job.id, "details"],
     queryFn: () => api.adminMetadataReidentifyJob(job.id),
@@ -582,24 +585,25 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
   const jobLabel = formatJobType(job.jobType);
   const duration = formatJobDuration(job);
   return <article className="lux-admin-job-row">
-    <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" || job.status === "COMPLETED_WITH_ISSUES" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
+    <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" || job.status === "COMPLETED_WITH_ISSUES" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" && !postprocessing ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
     <div className="lux-admin-job-main">
-      <div className="lux-admin-job-heading"><strong>{jobLabel}</strong><span className={`lux-job-status status-${job.status.toLowerCase().replaceAll("_", "-")}`}>{formatJobStatus(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}</span></div>
+      <div className="lux-admin-job-heading"><strong>{jobLabel}</strong><span className={`lux-job-status ${postprocessing ? "status-postprocessing" : `status-${job.status.toLowerCase().replaceAll("_", "-")}`}`}>{postprocessing ? "后处理进行中" : formatJobStatus(job.status)}</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : postprocessing ? "索引已完成，后处理进行中" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}</span></div>
+      {currentItem ? <span className="lux-admin-job-current-item">当前：{currentItem}</span> : null}
       {error ? <div className="lux-admin-job-error" role="alert"><strong>失败原因</strong><span>{error}</span></div> : null}
       {detailsOpen && job.kind === "metadata" ? <div className="lux-admin-job-details">
         {details.isPending ? <p role="status">正在读取失败详情…</p> : null}
         {details.error ? <p role="alert">详情读取失败，请稍后重试。</p> : null}
         {details.data ? <><strong>问题条目 {failedItems.length} 个</strong>{failedItems.length ? <ul>{failedItems.map((item) => <li key={item.itemId}><code>{item.itemId}</code><span>{formatJobError(item.error) || "未记录具体原因"}</span></li>)}</ul> : <p>任务未记录逐条问题信息。</p>}</> : null}
       </div> : null}
-      <time className="lux-admin-job-finished-at">完成时间：{job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>
+      <time className="lux-admin-job-finished-at">完成时间：{active || job.finishedAt == null ? "未完成" : formatAdminDate(job.finishedAt)}</time>
       {duration ? <span className="lux-admin-job-duration">{duration}</span> : null}
-      {active && (progress !== null || discovering) ? <div className={`lux-job-progress${discovering && progress === null ? " is-indeterminate" : ""}`}><span style={progress === null ? undefined : { width: `${progress}%` }} /></div> : null}
+      {active && (postprocessing || progress !== null || discovering) ? <div className={`lux-job-progress${postprocessing || (discovering && progress === null) ? " is-indeterminate" : ""}`}><span style={postprocessing || progress === null ? undefined : { width: `${progress}%` }} /></div> : null}
       {pendingCount > 0 ? pendingHref ? <Link className="lux-admin-job-attention" to={pendingHref}>低匹配 {pendingCount} 项 · 去处理</Link> : <span className="lux-admin-job-attention">低匹配 {pendingCount} 项</span> : null}
     </div>
     <div className="lux-admin-job-actions">
       {error && job.kind === "metadata" ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}${jobLabel}问题详情`} onClick={() => setDetailsOpen((open) => !open)}>详情<ChevronDown size={14} /></button> : null}
-      {active && job.kind !== "cover" ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}
+      {cancellable && job.kind !== "cover" ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}
       {retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={onRetry} disabled={busy}><RotateCcw size={15} /></button> : null}
     </div>
   </article>;
@@ -657,7 +661,7 @@ function formatJobError(error?: string | null) {
 }
 
 function formatJobDuration(job: OperationsJob) {
-  if (isActiveJob(job.status)) return "";
+  if (isActiveJob(job)) return "";
   const startedAt = adminTimestamp(job.startedAt);
   const finishedAt = adminTimestamp(job.finishedAt);
   if (!Number.isFinite(startedAt) || !Number.isFinite(finishedAt) || finishedAt < startedAt) return "";
@@ -695,8 +699,16 @@ function auditLevel(log: AdminAuditEvent) {
   return "INFO";
 }
 
-function isActiveJob(status: string) {
+function isActiveStatus(status: string) {
   return status === "PENDING" || status === "QUEUED" || status === "RUNNING";
+}
+
+function isPostprocessingJob(job: { kind?: string; scanPhase?: string }) {
+  return job.kind === "scan" && job.scanPhase === "POSTPROCESSING";
+}
+
+function isActiveJob(job: { status: string; kind?: string; scanPhase?: string }) {
+  return isActiveStatus(job.status) || isPostprocessingJob(job);
 }
 
 function compareOperationsJobs(left: OperationsJob, right: OperationsJob) {
