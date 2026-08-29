@@ -891,8 +891,15 @@ impl EmbyMigrationService {
             ids.sort_unstable();
             ids
         });
-        let source_filtering_enabled =
-            connection.supports_filtered_reads && scope.item_state && target_library_ids.is_some();
+        // New jobs normally carry an explicit target whitelist.  Legacy jobs
+        // may omit it; for those, a restricted source user can still be
+        // safely narrowed to the Lux libraries that their source folders map
+        // to.  Users with access to all source folders keep the legacy
+        // unfiltered request when no explicit whitelist exists, because an
+        // incomplete folder mapping must not hide a valid item.
+        let source_filtering_enabled = connection.supports_filtered_reads
+            && scope.item_state
+            && (target_library_ids.is_some() || users.iter().any(|user| !user.enable_all_folders));
         let lux_library_identities = if (scope.library_access || scope.item_state)
             && library_folders.is_some()
             && (users.iter().any(|user| !user.enable_all_folders) || source_filtering_enabled)
@@ -915,6 +922,9 @@ impl EmbyMigrationService {
         } else {
             None
         };
+        let enabled_library_id_set = enabled_library_ids
+            .as_ref()
+            .map(|ids| ids.iter().cloned().collect::<HashSet<_>>());
         let mut processed = job.processed_count;
         let mut matched = job.matched_count;
         let mut skipped = job.skipped_count;
@@ -982,15 +992,20 @@ impl EmbyMigrationService {
             };
             let library_access_plan =
                 restrict_library_access_plan(library_access_plan, target_library_ids.as_ref());
-            let source_library_ids = if source_filtering_enabled {
-                target_library_ids.as_ref().and_then(|target_library_ids| {
-                    source_library_ids_for_user(
-                        &user,
-                        library_folders.as_deref(),
-                        lux_library_identities.as_deref().unwrap_or_default(),
-                        target_library_ids,
-                    )
-                })
+            let source_library_ids = if source_filtering_enabled
+                && (target_library_ids.is_some() || !user.enable_all_folders)
+            {
+                target_library_ids
+                    .as_ref()
+                    .or(enabled_library_id_set.as_ref())
+                    .and_then(|selected_library_ids| {
+                        source_library_ids_for_user(
+                            &user,
+                            library_folders.as_deref(),
+                            lux_library_identities.as_deref().unwrap_or_default(),
+                            selected_library_ids,
+                        )
+                    })
             } else {
                 None
             };
@@ -3694,6 +3709,16 @@ mod tests {
         )
         .expect("source folder mapping should be available");
         assert_eq!(source_ids, vec!["source-b"]);
+
+        let all_enabled_library_ids = HashSet::from(["lux-movies".to_owned(), "lux-tv".to_owned()]);
+        let source_ids = source_library_ids_for_user(
+            &user,
+            Some(&source_folders),
+            &lux_libraries,
+            &all_enabled_library_ids,
+        )
+        .expect("legacy source folder mapping should be available");
+        assert_eq!(source_ids, vec!["source-a", "source-b"]);
     }
 
     #[test]
@@ -3904,7 +3929,10 @@ mod tests {
                         item_state: true,
                         item_state_filters: Some(vec![MigrationUserStateFilter::Favorite]),
                         person_favorites: false,
-                        target_library_ids: Some(vec![library_id.to_owned()]),
+                        // Omit the target whitelist to exercise the legacy
+                        // compatibility path: a restricted user should
+                        // still push its safely mapped source library.
+                        target_library_ids: None,
                     },
                 },
             )
