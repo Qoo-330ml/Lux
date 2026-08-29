@@ -2106,7 +2106,7 @@ html[data-lux-theme="light"] .lux-emby-job-summary.is-selected { background: rgb
 @media (max-width: 560px) {
   .lux-emby-migration-intro, .lux-emby-migration-action, .lux-emby-detail-heading { align-items: flex-start; flex-direction: column; }
   .lux-emby-stepper-copy { margin-right: 5px; margin-left: 6px; }
-  .lux-emby-stepper-copy strong { font-size: .66rem; }
+  .lux-emby-stepper-copy strong { overflow: visible; font-size: .66rem; line-height: 1.25; text-overflow: clip; white-space: normal; }
   .lux-emby-user-selection-toolbar { align-items: flex-start; flex-direction: column; }
   .lux-emby-migration-action > .lux-button { width: 100%; }
   .lux-emby-migration-action-buttons { width: 100%; flex-direction: column-reverse; }
