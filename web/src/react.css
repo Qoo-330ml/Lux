@@ -577,7 +577,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-episode-card strong { overflow: hidden; color: inherit; font-size: .78rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-player-page { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; min-height: 100vh; min-height: 100dvh; padding: 0; background: #000; overflow: hidden; z-index: 100; user-select: none; display: flex; flex-direction: column; justify-content: space-between; }
 .lux-player-page.controls-hidden { cursor: none; }
-.lux-player-page-loading, .lux-player-page-error { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: grid; place-items: center; align-content: center; background: #000; z-index: 100; color: var(--lux-muted); text-align: center; }
+.lux-player-page-loading, .lux-player-page-error { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #000; z-index: 100; color: var(--lux-muted); text-align: center; }
 .lux-player-page-loading p { margin-top: 16px; font-size: .95rem; color: #fff; }
 
 .lux-player-frame { position: absolute; top: env(safe-area-inset-top); right: env(safe-area-inset-right); bottom: env(safe-area-inset-bottom); left: env(safe-area-inset-left); display: flex; align-items: center; justify-content: center; background: #000; overflow: hidden; z-index: 1; }

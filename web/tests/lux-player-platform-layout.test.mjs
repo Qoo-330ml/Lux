@@ -23,3 +23,12 @@ test("LuxPlayer mini progress stays at the edge without taking pointer focus", (
   assert.match(styles, /\.lux-player-mini-progress \{[^}]*bottom: calc\(4px \+ env\(safe-area-inset-bottom\)\)/);
   assert.match(styles, /\.lux-player-mini-progress \{[^}]*pointer-events: none/);
 });
+
+test("LuxPlayer loading and error states center their content across the full viewport", () => {
+  const stateRule = styles.match(/\.lux-player-page-loading, \.lux-player-page-error \{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(stateRule, /display:\s*flex/);
+  assert.match(stateRule, /flex-direction:\s*column/);
+  assert.match(stateRule, /align-items:\s*center/);
+  assert.match(stateRule, /justify-content:\s*center/);
+});
