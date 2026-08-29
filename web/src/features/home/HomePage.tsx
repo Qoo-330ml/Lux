@@ -6,9 +6,10 @@ import { useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
-import type { HomeResponse, Library, LuxUser, MediaItem, PageResponse } from "../../lib/api/types";
+import type { HomeResponse, LuxUser, MediaItem } from "../../lib/api/types";
 import { HERO_CAROUSEL_INTERVAL_MS, heroSlides, heroTitleScale } from "./carousel";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
+import { prefetchLibraryPage } from "../library/prefetchLibrary";
 
 const HOME_CACHE_VERSION = 1;
 const HOME_CACHE_TTL_MS = 5 * 60_000;
@@ -41,28 +42,6 @@ export function HomePage({ user }: { user: LuxUser }) {
   const data = home.data ?? {};
   const libraries = data.libraries ?? [];
   const slides = heroSlides(data);
-  const prefetchLibrary = (library: Library) => {
-    const itemTypes = library.kind === "SERIES"
-      ? "SERIES"
-      : library.kind === "MOVIE"
-        ? "MOVIE"
-        : library.kind === "MIXED"
-          ? "MOVIE,SERIES"
-          : undefined;
-    const sortBy = "Name" as const;
-    const sortOrder = "Ascending" as const;
-    void queryClient.prefetchInfiniteQuery({
-      queryKey: queryKeys.library(library.id, 1, itemTypes, sortBy, sortOrder, "all"),
-      queryFn: ({ pageParam }) => api.libraryItems(library.id, pageParam, itemTypes, { sortBy, sortOrder }),
-      initialPageParam: 1,
-      getNextPageParam: (lastPage: PageResponse<MediaItem>) => {
-        const page = lastPage.page ?? 1;
-        const pageSize = lastPage.pageSize ?? 24;
-        const total = lastPage.total ?? 0;
-        return page * pageSize < total ? page + 1 : undefined;
-      },
-    });
-  };
   return (
     <div className="lux-home">
       <HeroCarousel items={slides} continueWatching={data.continueWatching ?? []} />
@@ -71,7 +50,7 @@ export function HomePage({ user }: { user: LuxUser }) {
           <div className="lux-section-heading"><h2>我的媒体库</h2><span>{libraries.length} 个库</span></div>
           <HorizontalScrollRail className="lux-home-rail" ariaLabel="我的媒体库">
             <div className="lux-library-rail">
-              {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} onPrefetch={() => prefetchLibrary(library)} />) : <EmptyLibraries />}
+              {libraries.length ? libraries.map((library) => <LibraryCard key={library.id} library={library} onPrefetch={() => void prefetchLibraryPage(queryClient, library)} />) : <EmptyLibraries />}
             </div>
           </HorizontalScrollRail>
         </section>
