@@ -91,7 +91,7 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
             "degraded"
         }
     );
-    assert_eq!(body["schemaVersion"], 103);
+    assert_eq!(body["schemaVersion"], 107);
     assert_eq!(body["database"]["status"], "ok");
     assert_eq!(body["database"]["backend"], "SQLITE");
     assert_eq!(body["database"]["writable"], true);

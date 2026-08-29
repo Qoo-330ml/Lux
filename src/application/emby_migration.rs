@@ -227,6 +227,14 @@ pub struct MigrationUserPage {
     pub history_capability: HistoryCapability,
     #[serde(default)]
     pub library_folders: Option<Vec<MigrationLibraryFolder>>,
+    /// Optional pagination metadata returned by newer migration plugins.
+    /// Legacy plugins omit these fields and continue to return a complete list.
+    #[serde(default)]
+    pub start_index: Option<i64>,
+    #[serde(default)]
+    pub total_record_count: Option<i64>,
+    #[serde(default)]
+    pub next_start_index: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
@@ -311,7 +319,8 @@ impl MigrationSourceFilter<'_> {
 mod user_data_tests {
     use super::{
         EmbyMigrationSource, MigrationScope, MigrationSourceFilter, MigrationUserData,
-        MigrationUserStateFilter, migration_user_state_params, requested_fields_for_state_filters,
+        MigrationUserStateFilter, migration_list_users_params, migration_user_state_params,
+        requested_fields_for_state_filters,
     };
     use serde_json::json;
 
@@ -414,6 +423,35 @@ mod user_data_tests {
             params["stateFields"],
             json!(["played", "playCount", "lastPlayedDate", "isFavorite"])
         );
+    }
+
+    #[test]
+    fn paged_user_list_request_contains_optional_bounds_and_search() {
+        let source = EmbyMigrationSource {
+            base_url: "http://emby.example/".to_owned(),
+            api_key: "redacted-test-key".to_owned(),
+            allow_private_network: false,
+        };
+        let params = migration_list_users_params(&source, 200, 100, Some(" Alice "))
+            .expect("valid paged user request");
+
+        assert_eq!(params["startIndex"], json!(200));
+        assert_eq!(params["limit"], json!(100));
+        assert_eq!(params["search"], json!("Alice"));
+    }
+
+    #[test]
+    fn paged_user_list_request_omits_blank_search_and_clamps_limit() {
+        let source = EmbyMigrationSource {
+            base_url: "http://emby.example/".to_owned(),
+            api_key: "redacted-test-key".to_owned(),
+            allow_private_network: false,
+        };
+        let params = migration_list_users_params(&source, 0, 0, Some("  "))
+            .expect("valid empty-search request");
+
+        assert_eq!(params["limit"], json!(1));
+        assert!(params.get("search").is_none());
     }
 
     #[test]
@@ -545,6 +583,22 @@ impl EmbyMigrationPluginClient {
         if let Some(selected_user_ids) = selected_user_ids {
             params["userIds"] = serde_json::json!(selected_user_ids);
         }
+        self.call_with(MIGRATION_LIST_USERS_METHOD, params)
+            .await
+            .map(normalize_migration_user_page)
+    }
+
+    /// Read one bounded source-user page.  Pagination and search are optional
+    /// protocol fields so older plugins can ignore them and return their
+    /// complete user list; the host applies the legacy slice in that case.
+    pub(crate) async fn list_users_page(
+        &self,
+        source: &EmbyMigrationSource,
+        start_index: i64,
+        limit: i64,
+        search: Option<&str>,
+    ) -> Result<MigrationUserPage, PluginServiceError> {
+        let params = migration_list_users_params(source, start_index, limit, search)?;
         self.call_with(MIGRATION_LIST_USERS_METHOD, params)
             .await
             .map(normalize_migration_user_page)
@@ -711,6 +765,33 @@ fn migration_user_state_params(
         if let Some(source_library_ids) = source_filter.library_ids {
             params["sourceLibraryIds"] = serde_json::json!(source_library_ids);
         }
+    }
+    Ok(params)
+}
+
+fn migration_list_users_params(
+    source: &EmbyMigrationSource,
+    start_index: i64,
+    limit: i64,
+    search: Option<&str>,
+) -> Result<Value, PluginServiceError> {
+    source
+        .validate()
+        .map_err(|_| PluginServiceError::InvalidConfig)?;
+    if start_index < 0 {
+        return Err(PluginServiceError::InvalidConfig);
+    }
+    let search = search.unwrap_or_default().trim();
+    if search.chars().count() > MAX_TEXT_LENGTH {
+        return Err(PluginServiceError::InvalidConfig);
+    }
+    let mut params = serde_json::json!({
+        "source": source,
+        "startIndex": start_index,
+        "limit": limit.clamp(1, MAX_PAGE_SIZE),
+    });
+    if !search.is_empty() {
+        params["search"] = Value::String(search.to_owned());
     }
     Ok(params)
 }

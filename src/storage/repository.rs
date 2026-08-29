@@ -41,11 +41,14 @@ mod sessions;
 mod users;
 
 pub(crate) use emby_migration::{
-    EmbyMigrationJobProgress, NewEmbyMigrationImportRecord, NewEmbyMigrationItemMatch,
-    NewEmbyMigrationJob, NewEmbyMigrationPersonFavorite, NewImportedUserItemState,
-    StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob,
-    StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding,
-    StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity, StoredPlaybackHistoryEvent,
+    EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
+    EmbyMigrationItemPageBatch, EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
+    EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
+    EmbyMigrationUserItemStateFields, MigrationMediaIdentityLookup, MigrationPersonIdentityLookup,
+    NewEmbyMigrationJob, StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch,
+    StoredEmbyMigrationJob, StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource,
+    StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
+    StoredMigrationPersonIdentity, StoredPlaybackHistoryEvent,
 };
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};

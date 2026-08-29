@@ -118,6 +118,44 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_users_by_normalized_usernames(
+        &self,
+        usernames: &[String],
+    ) -> Result<Vec<StoredUser>, StorageError> {
+        if usernames.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut users = Vec::new();
+        for chunk in usernames.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT id, username_normalized, display_name, password_hash,
+                        is_disabled, is_admin, can_manage_server,
+                        can_remote_access, can_download
+                 FROM users WHERE username_normalized IN ({placeholders})
+                 ORDER BY username_normalized"
+            );
+            let mut query = self.query(sqlx::AssertSqlSafe(query));
+            for username in chunk {
+                query = query.bind(username);
+            }
+            users.extend(
+                query
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .into_iter()
+                    .map(stored_user),
+            );
+        }
+        Ok(users)
+    }
+
     pub(crate) async fn user_exists(&self, user_id: &str) -> Result<bool, StorageError> {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(SELECT 1 FROM users WHERE id = ?) THEN 1 ELSE 0 END",
@@ -457,6 +495,53 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn set_user_library_access_batch(
+        &self,
+        user_id: &str,
+        updates: &[(String, bool)],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        for chunk in updates.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            // The dynamic fragment is derived only from the bounded chunk length. Library IDs
+            // and permissions remain bound values, so no external data can become SQL text.
+            let placeholders = (0..chunk.len())
+                .map(|_| "(?, ?, ?)")
+                .collect::<Vec<_>>()
+                .join(", ");
+            let statement = sqlx::AssertSqlSafe(format!(
+                "INSERT INTO user_library_access (user_id, library_id, can_view)
+                 VALUES {placeholders}
+                 ON CONFLICT(user_id, library_id) DO UPDATE SET
+                     can_view = excluded.can_view, updated_at = unixepoch()
+                 WHERE user_library_access.can_view <> excluded.can_view"
+            ));
+            let mut statement = self.query(statement);
+            for (library_id, can_view) in chunk {
+                statement = statement
+                    .bind(user_id)
+                    .bind(library_id)
+                    .bind(database_flag(*can_view));
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn has_user_library_access(
@@ -1053,5 +1138,134 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+    use uuid::Uuid;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        Ok((temp_dir, database))
+    }
+
+    #[tokio::test]
+    async fn set_user_library_access_batch_upserts_multiple_libraries_in_one_statement()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let user_id = Uuid::now_v7().to_string();
+        let first_library_id = Uuid::now_v7().to_string();
+        let second_library_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&user_id, "migration-admin", "Migration Admin", "hash")
+            .await?;
+        for library_id in [&first_library_id, &second_library_id] {
+            sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+                .bind(library_id)
+                .bind(library_id)
+                .execute(database.pool())
+                .await?;
+        }
+
+        database.reset_query_count();
+        database
+            .set_user_library_access_batch(
+                &user_id,
+                &[
+                    (first_library_id.clone(), true),
+                    (second_library_id.clone(), false),
+                ],
+            )
+            .await?;
+        assert_eq!(database.query_count(), 1);
+        assert!(
+            database
+                .has_user_library_access(&user_id, &first_library_id)
+                .await?
+        );
+        assert!(
+            !database
+                .has_user_library_access(&user_id, &second_library_id)
+                .await?
+        );
+
+        sqlx::query("CREATE TABLE library_access_update_counts (count INTEGER NOT NULL)")
+            .execute(database.pool())
+            .await?;
+        sqlx::query("INSERT INTO library_access_update_counts (count) VALUES (0)")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "CREATE TRIGGER count_repeated_library_access_updates
+             AFTER UPDATE ON user_library_access
+             BEGIN
+                 UPDATE library_access_update_counts SET count = count + 1;
+             END",
+        )
+        .execute(database.pool())
+        .await?;
+        database
+            .set_user_library_access_batch(
+                &user_id,
+                &[
+                    (first_library_id.clone(), true),
+                    (second_library_id.clone(), false),
+                ],
+            )
+            .await?;
+        let repeated_updates: i64 =
+            sqlx::query_scalar("SELECT count FROM library_access_update_counts")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(repeated_updates, 0);
+
+        database
+            .set_user_library_access_batch(&user_id, &[(second_library_id.clone(), true)])
+            .await?;
+        assert!(
+            database
+                .has_user_library_access(&user_id, &second_library_id)
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_users_by_normalized_usernames_fetches_only_requested_users()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let first_user_id = Uuid::now_v7().to_string();
+        let second_user_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&first_user_id, "alice", "Alice", "hash")
+            .await?;
+        database
+            .insert_user(&second_user_id, "bob", "Bob", "hash", false)
+            .await?;
+        sqlx::query("UPDATE users SET is_disabled = 1 WHERE username_normalized = 'bob'")
+            .execute(database.pool())
+            .await?;
+
+        database.reset_query_count();
+        let users = database
+            .list_users_by_normalized_usernames(&[String::from("alice"), String::from("bob")])
+            .await?;
+
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(users.len(), 2);
+        let bob = users
+            .iter()
+            .find(|user| user.id == second_user_id)
+            .expect("batched lookup should include Bob");
+        assert!(bob.is_disabled);
+        Ok(())
     }
 }

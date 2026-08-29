@@ -97,6 +97,18 @@ impl UserStore {
             .transpose()
     }
 
+    pub(crate) async fn list_by_normalized_usernames(
+        &self,
+        usernames: &[String],
+    ) -> Result<Vec<UserRecord>, UserStoreError> {
+        self.database
+            .list_users_by_normalized_usernames(usernames)
+            .await?
+            .into_iter()
+            .map(user_record)
+            .collect()
+    }
+
     pub async fn update_user(
         &self,
         user_id: &str,

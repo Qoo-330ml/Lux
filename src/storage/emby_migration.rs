@@ -309,6 +309,15 @@ pub(crate) struct MigrationMediaIdentityLookup {
     pub provider_ids: Vec<(String, String)>,
 }
 
+/// Exact person keys extracted from one bounded Emby favorites page. Provider
+/// IDs and normalized names are resolved in batches so the migration runner
+/// never needs to materialize the complete people identity table.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MigrationPersonIdentityLookup {
+    pub normalized_name: String,
+    pub provider_ids: Vec<(String, String)>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredMigrationPersonIdentity {
     pub id: String,
@@ -612,6 +621,7 @@ impl Database {
             .map_err(storage_error)
     }
 
+    #[allow(dead_code)]
     pub(crate) async fn upsert_emby_migration_user_link(
         &self,
         link: &StoredEmbyMigrationUserLink,
@@ -637,6 +647,63 @@ impl Database {
         .await
         .map(|_| ())
         .map_err(storage_error)
+    }
+
+    /// Upsert a bounded batch of user-link reports in one transaction per
+    /// 100 rows. User creation and profile synchronization remain outside this
+    /// method because they have per-user password and administrator invariants.
+    pub(crate) async fn upsert_emby_migration_user_links_batch(
+        &self,
+        links: &[StoredEmbyMigrationUserLink],
+    ) -> Result<(), StorageError> {
+        for links in links.chunks(EMBY_MIGRATION_WRITE_BATCH_SIZE) {
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            let mut sql = String::from(
+                "INSERT INTO emby_migration_user_links (
+                 job_id, emby_user_id, emby_username, lux_user_id, status, error
+             ) VALUES ",
+            );
+            for index in 0..links.len() {
+                if index > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(" (?, ?, ?, ?, ?, ?)");
+            }
+            let lux_user_id_changed = sql_is_distinct(
+                "emby_migration_user_links.lux_user_id",
+                "excluded.lux_user_id",
+            );
+            let error_changed =
+                sql_is_distinct("emby_migration_user_links.error", "excluded.error");
+            sql.push_str(&format!(
+                " ON CONFLICT(job_id, emby_user_id) DO UPDATE SET
+                     emby_username = excluded.emby_username,
+                     lux_user_id = excluded.lux_user_id,
+                     status = excluded.status,
+                     error = excluded.error,
+                     updated_at = unixepoch()
+                 WHERE emby_migration_user_links.emby_username <> excluded.emby_username
+                    OR {lux_user_id_changed}
+                    OR emby_migration_user_links.status <> excluded.status
+                    OR {error_changed}"
+            ));
+            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            for link in links {
+                query = query
+                    .bind(&link.job_id)
+                    .bind(&link.emby_user_id)
+                    .bind(&link.emby_username)
+                    .bind(&link.lux_user_id)
+                    .bind(&link.status)
+                    .bind(&link.error);
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(storage_error)?;
+            transaction.commit().await.map_err(storage_error)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn list_emby_migration_user_links(
@@ -781,6 +848,13 @@ impl Database {
         let title_lookups = lookups
             .iter()
             .filter(|lookup| {
+                // A punctuation-only title normalizes to an empty key and its
+                // generated pattern is "%". Never issue that unbounded
+                // fallback query; the application can only report it as
+                // unmatched when no Provider ID resolved.
+                if !lookup.title.chars().any(char::is_alphanumeric) {
+                    return false;
+                }
                 let provider_candidates = lookup
                     .provider_ids
                     .iter()
@@ -877,6 +951,106 @@ impl Database {
                 .collect()
         })
         .map_err(storage_error)
+    }
+
+    /// Resolve only the people referenced by the current source favorites
+    /// page. Provider and normalized-name predicates are batched separately so
+    /// both existing indexes (`person_identities` primary key and
+    /// `idx_people_name`) remain usable.
+    pub(crate) async fn list_migration_person_identity_candidates(
+        &self,
+        lookups: &[MigrationPersonIdentityLookup],
+    ) -> Result<Vec<StoredMigrationPersonIdentity>, StorageError> {
+        if lookups.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut identities = Vec::new();
+        let mut seen = HashSet::<(String, Option<String>, Option<String>)>::new();
+        let mut provider_keys = lookups
+            .iter()
+            .flat_map(|lookup| lookup.provider_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        provider_keys.sort_unstable();
+        provider_keys.dedup();
+        for chunk in provider_keys.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicates =
+                std::iter::repeat_n("(pi.provider = ? AND pi.provider_id = ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+            let sql = format!(
+                "SELECT p.id, p.display_name, pi.provider, pi.provider_id
+                 FROM people p
+                 JOIN person_identities pi ON pi.person_id = p.id
+                 WHERE p.status = 'ACTIVE' AND ({predicates})"
+            );
+            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            for (provider, provider_id) in chunk {
+                query = query.bind(provider).bind(provider_id);
+            }
+            for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
+                let identity = StoredMigrationPersonIdentity {
+                    id: row.get("id"),
+                    display_name: row.get("display_name"),
+                    provider: row.try_get("provider").ok(),
+                    provider_id: row.try_get("provider_id").ok(),
+                };
+                let key = (
+                    identity.id.clone(),
+                    identity.provider.clone(),
+                    identity.provider_id.clone(),
+                );
+                if seen.insert(key) {
+                    identities.push(identity);
+                }
+            }
+        }
+
+        let mut names = lookups
+            .iter()
+            .map(|lookup| lookup.normalized_name.as_str())
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names.dedup();
+        for chunk in names.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicates = std::iter::repeat_n("p.normalized_name = ?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let sql = format!(
+                "SELECT p.id, p.display_name
+                 FROM people p
+                 WHERE p.status = 'ACTIVE' AND ({predicates})"
+            );
+            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            for name in chunk {
+                query = query.bind(name);
+            }
+            for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
+                let identity = StoredMigrationPersonIdentity {
+                    id: row.get("id"),
+                    display_name: row.get("display_name"),
+                    provider: None,
+                    provider_id: None,
+                };
+                let key = (identity.id.clone(), None, None);
+                if seen.insert(key) {
+                    identities.push(identity);
+                }
+            }
+        }
+        identities.sort_unstable_by(|left, right| {
+            left.id
+                .cmp(&right.id)
+                .then_with(|| left.provider.cmp(&right.provider))
+                .then_with(|| left.provider_id.cmp(&right.provider_id))
+        });
+        Ok(identities)
     }
 
     pub(crate) async fn list_emby_migration_item_matches(
@@ -1989,6 +2163,128 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_provider_lookup_with_empty_title_skips_wildcard_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database.reset_query_count();
+
+        let identities = database
+            .list_migration_media_identity_candidates(&[MigrationMediaIdentityLookup {
+                item_type: "MOVIE".to_owned(),
+                title: "!!!".to_owned(),
+                title_pattern: "%".to_owned(),
+                production_year: None,
+                season_number: None,
+                episode_number: None,
+                provider_ids: vec![("tmdb".to_owned(), "missing".to_owned())],
+            }])
+            .await?;
+
+        assert!(identities.is_empty());
+        assert_eq!(database.query_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_user_links_are_upserted_in_bounded_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, _item_id) = insert_test_user_and_item(&database).await?;
+        let job_id = Uuid::now_v7().to_string();
+        database
+            .insert_emby_migration_job(&NewEmbyMigrationJob {
+                id: &job_id,
+                created_by_user_id: &user_id,
+                source_label: "Test Emby",
+                source_base_url: "https://emby.example.test/",
+                secret_ref: "emby-migration/test",
+                dry_run: false,
+                merge_policy: "MERGE",
+                scope_json: r#"{}"#,
+                emby_user_ids_json: r#"["emby-user"]"#,
+            })
+            .await?;
+        let links = (0..205)
+            .map(|index| StoredEmbyMigrationUserLink {
+                job_id: job_id.clone(),
+                emby_user_id: format!("emby-{index}"),
+                emby_username: format!("User {index}"),
+                lux_user_id: Some(user_id.clone()),
+                status: "LINKED".to_owned(),
+                error: None,
+            })
+            .collect::<Vec<_>>();
+
+        database.reset_query_count();
+        database
+            .upsert_emby_migration_user_links_batch(&links)
+            .await?;
+
+        assert_eq!(database.query_count(), 3);
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM emby_migration_user_links WHERE job_id = ?")
+                .bind(&job_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(count, 205);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_person_candidates_are_scoped_to_page_keys()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let provider_person = Uuid::now_v7().to_string();
+        let name_person = Uuid::now_v7().to_string();
+        for (id, name) in [(&provider_person, "Actor A"), (&name_person, "Actor B")] {
+            sqlx::query(
+                "INSERT INTO people (
+                    id, display_name, directory_name, normalized_name, status, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, 'ACTIVE', unixepoch(), unixepoch())",
+            )
+            .bind(id)
+            .bind(name)
+            .bind(name)
+            .bind(name.to_lowercase().replace(' ', ""))
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO person_identities (
+                person_id, provider, provider_id, match_method, confidence, evidence_json,
+                created_at, updated_at
+             ) VALUES (?, 'tmdb', '42', 'TEST', 100, '{}', unixepoch(), unixepoch())",
+        )
+        .bind(&provider_person)
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        let identities = database
+            .list_migration_person_identity_candidates(&[
+                MigrationPersonIdentityLookup {
+                    normalized_name: "actora".to_owned(),
+                    provider_ids: vec![("tmdb".to_owned(), "42".to_owned())],
+                },
+                MigrationPersonIdentityLookup {
+                    normalized_name: "actorb".to_owned(),
+                    provider_ids: Vec::new(),
+                },
+            ])
+            .await?;
+
+        assert!(database.query_count() <= 3);
+        assert_eq!(identities.len(), 3);
+        assert!(
+            identities
+                .iter()
+                .any(|identity| identity.id == provider_person)
+        );
+        assert!(identities.iter().any(|identity| identity.id == name_person));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn migration_provider_candidates_respect_selected_library_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, database) = test_database().await?;
@@ -2948,6 +3244,123 @@ mod tests {
         });
         assert_eq!(database.query_count(), 17);
         println!("{report}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "run manually to record 500/5000/50000 item migration benchmarks"]
+    async fn migration_page_batch_benchmark_records_scale() -> Result<(), Box<dyn std::error::Error>>
+    {
+        const PAGE_SIZE: usize = 500;
+
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, item_id) = insert_test_user_and_item(&database).await?;
+        for total_items in [500_usize, 5_000, 50_000] {
+            let job_id = Uuid::now_v7().to_string();
+            database
+                .insert_emby_migration_job(&NewEmbyMigrationJob {
+                    id: &job_id,
+                    created_by_user_id: &user_id,
+                    source_label: "Benchmark Emby",
+                    source_base_url: "https://emby.example.test/",
+                    secret_ref: "emby-migration/benchmark-scale",
+                    dry_run: false,
+                    merge_policy: "MERGE",
+                    scope_json: r#"{"userProfile":false,"libraryAccess":false,"itemState":true,"personFavorites":false}"#,
+                    emby_user_ids_json: r#"["emby-user"]"#,
+                })
+                .await?;
+            database
+                .update_emby_migration_job_status(&job_id, "RUNNING", "ITEMS", None)
+                .await?;
+
+            database.reset_query_count();
+            let started = std::time::Instant::now();
+            let page_count = total_items.div_ceil(PAGE_SIZE);
+            for page_index in 0..page_count {
+                let page_start = page_index * PAGE_SIZE;
+                let page_len = (total_items - page_start).min(PAGE_SIZE);
+                let item_matches = (0..page_len)
+                    .map(|index| {
+                        let item_index = page_start + index;
+                        EmbyMigrationItemMatchBatch {
+                            emby_item_id: format!("emby-item-{total_items}-{item_index}"),
+                            emby_item_type: "Movie".to_owned(),
+                            lux_item_id: Some(item_id.clone()),
+                            match_method: "TMDB_ID".to_owned(),
+                            confidence: Some(100),
+                            status: "MATCHED".to_owned(),
+                            detail_json: "{}".to_owned(),
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let import_records = item_matches
+                    .iter()
+                    .map(|item_match| EmbyMigrationImportRecordBatch {
+                        emby_user_id: "emby-user".to_owned(),
+                        emby_item_id: item_match.emby_item_id.clone(),
+                        lux_user_id: user_id.clone(),
+                        lux_item_id: item_id.clone(),
+                        state_hash: item_match.emby_item_id.clone(),
+                        status: "IMPORTED".to_owned(),
+                        error: None,
+                    })
+                    .collect::<Vec<_>>();
+                let handled_items = item_matches
+                    .iter()
+                    .map(|item_match| EmbyMigrationHandledItemBatch {
+                        emby_user_id: "emby-user".to_owned(),
+                        emby_item_id: item_match.emby_item_id.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                let states = if page_index == 0 {
+                    vec![EmbyMigrationUserItemStateBatch {
+                        user_id: user_id.clone(),
+                        item_id: item_id.clone(),
+                        position_ticks: 120,
+                        is_played: true,
+                        is_favorite: true,
+                        play_count: 1,
+                        last_played_at: Some(200),
+                    }]
+                } else {
+                    Vec::new()
+                };
+                database
+                    .commit_emby_migration_item_page(EmbyMigrationItemPageBatch {
+                        job_id: &job_id,
+                        merge_policy: "MERGE",
+                        state_fields: EmbyMigrationUserItemStateFields::all(),
+                        item_matches: &item_matches,
+                        states: &states,
+                        import_records: &import_records,
+                        handled_items: &handled_items,
+                        progress: EmbyMigrationJobProgress {
+                            id: &job_id,
+                            cursor_json: "{}",
+                            processed_count: (page_start + page_len) as i64,
+                            total_count: total_items as i64,
+                            matched_count: (page_start + page_len) as i64,
+                            skipped_count: 0,
+                            failed_count: 0,
+                        },
+                    })
+                    .await?;
+            }
+            let elapsed = started.elapsed();
+            let report = serde_json::json!({
+                "benchmark": "emby_migration_page_batch_scale",
+                "os": std::env::consts::OS,
+                "architecture": std::env::consts::ARCH,
+                "effectiveItems": total_items,
+                "databaseStatements": database.query_count(),
+                "databaseTransactions": page_count,
+                "elapsedMs": elapsed.as_millis(),
+                "itemsPerSecond": total_items as f64 / elapsed.as_secs_f64().max(0.001),
+                "peakRssBytes": process_peak_rss_bytes(),
+            });
+            println!("{report}");
+        }
         Ok(())
     }
 

@@ -58,6 +58,8 @@ pub(super) async fn remove_sqlite_title_year_unique(
             "DROP TRIGGER IF EXISTS media_items_search_ai",
             "DROP TRIGGER IF EXISTS media_items_search_au",
             "DROP TRIGGER IF EXISTS media_items_search_ad",
+            "DROP TRIGGER IF EXISTS media_item_provider_ids_ai",
+            "DROP TRIGGER IF EXISTS media_item_provider_ids_au",
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_insert",
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_update",
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_delete",
@@ -147,6 +149,35 @@ pub(super) async fn remove_sqlite_title_year_unique(
             "CREATE TRIGGER media_items_search_ad AFTER DELETE ON media_items BEGIN
                 DELETE FROM media_search WHERE item_id = OLD.id;
             END",
+            "CREATE TRIGGER media_item_provider_ids_ai
+             AFTER INSERT ON media_items
+             BEGIN
+                 INSERT OR IGNORE INTO media_item_provider_ids
+                     (media_item_id, item_type, provider, provider_id)
+                 SELECT NEW.id, NEW.item_type, lower(json_each.key), json_each.value
+                 FROM json_each(
+                     CASE
+                         WHEN json_valid(NEW.provider_ids_json) THEN NEW.provider_ids_json
+                         ELSE '{}'
+                     END
+                 ) AS json_each
+                 WHERE json_each.type = 'text';
+             END",
+            "CREATE TRIGGER media_item_provider_ids_au
+             AFTER UPDATE OF item_type, provider_ids_json ON media_items
+             BEGIN
+                 DELETE FROM media_item_provider_ids WHERE media_item_id = NEW.id;
+                 INSERT OR IGNORE INTO media_item_provider_ids
+                     (media_item_id, item_type, provider, provider_id)
+                 SELECT NEW.id, NEW.item_type, lower(json_each.key), json_each.value
+                 FROM json_each(
+                     CASE
+                         WHEN json_valid(NEW.provider_ids_json) THEN NEW.provider_ids_json
+                         ELSE '{}'
+                     END
+                 ) AS json_each
+                 WHERE json_each.type = 'text';
+             END",
             "CREATE TRIGGER trg_media_sources_availability_insert
              AFTER INSERT ON media_sources
              BEGIN

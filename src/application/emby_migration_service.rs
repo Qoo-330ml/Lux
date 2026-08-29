@@ -18,7 +18,7 @@ use crate::{
         EmbyMigrationPluginClient, EmbyMigrationSource, HistoryCapability, MigrationConnectionInfo,
         MigrationInputError, MigrationItem, MigrationItemPage, MigrationLibraryFolder,
         MigrationMergePolicy, MigrationScope, MigrationSourceFilter, MigrationUser,
-        MigrationUserData, MigrationUserStateFilter, StoredItemState,
+        MigrationUserData, MigrationUserPage, MigrationUserStateFilter, StoredItemState,
         requested_fields_for_state_filters,
     },
     application::plugin_runtime::PluginRuntimeError,
@@ -29,9 +29,9 @@ use crate::{
         EmbyMigrationItemMatchBatch, EmbyMigrationItemPageBatch, EmbyMigrationJobProgress,
         EmbyMigrationPersonFavoriteBatch, EmbyMigrationPersonFavoriteStateBatch,
         EmbyMigrationUserItemStateBatch, EmbyMigrationUserItemStateFields,
-        MigrationMediaIdentityLookup, NewEmbyMigrationJob, StorageError,
-        StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob,
-        StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource,
+        MigrationMediaIdentityLookup, MigrationPersonIdentityLookup, NewEmbyMigrationJob,
+        StorageError, StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch,
+        StoredEmbyMigrationJob, StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource,
         StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredMigrationMediaIdentity,
         StoredMigrationPersonIdentity, StoredPlaybackHistoryEvent,
     },
@@ -611,16 +611,23 @@ impl EmbyMigrationService {
         offset: i64,
         limit: i64,
     ) -> Result<MigrationSourceUserPageView, EmbyMigrationServiceError> {
+        self.list_source_users_filtered(offset, limit, None).await
+    }
+
+    pub async fn list_source_users_filtered(
+        &self,
+        offset: i64,
+        limit: i64,
+        search: Option<&str>,
+    ) -> Result<MigrationSourceUserPageView, EmbyMigrationServiceError> {
         let source = self.plugin.configured_source().await?;
-        let users = self.plugin.list_users(&source).await?.items;
-        let total = users.len() as i64;
-        let users = users
-            .into_iter()
-            .skip(offset.max(0) as usize)
-            .take(limit.clamp(1, MAX_JOB_PAGE_SIZE) as usize)
-            .map(MigrationSourceUserView::from)
-            .collect();
-        Ok(MigrationSourceUserPageView { users, total })
+        let offset = offset.max(0);
+        let limit = limit.clamp(1, MAX_JOB_PAGE_SIZE);
+        let page = self
+            .plugin
+            .list_users_page(&source, offset, limit, search)
+            .await?;
+        Ok(project_source_user_page(page, offset, limit, search))
     }
 
     pub async fn authenticate_pending_user(
@@ -734,6 +741,8 @@ impl EmbyMigrationService {
         let mut source_rpc_calls = 0_u64;
         let mut database_transactions = 0_u64;
         let mut peak_source_page_records = 0_usize;
+        let mut candidate_query_ms = 0_u128;
+        let mut database_write_ms = 0_u128;
         let Some(job) = self.database.find_emby_migration_job(job_id).await? else {
             return Err(EmbyMigrationServiceError::NotFound);
         };
@@ -745,6 +754,7 @@ impl EmbyMigrationService {
         let state_fields = state_fields_for_migration(&scope);
         let requested_state_fields =
             requested_fields_for_state_filters(scope.selected_item_state_filters());
+        let testing_started = Instant::now();
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "TESTING", None)
             .await?;
@@ -771,10 +781,12 @@ impl EmbyMigrationService {
                 history_capability_name(connection.history_capability),
             )
             .await?;
+        let testing_ms = testing_started.elapsed().as_millis();
         if self.is_cancelled(job_id).await? {
             return self.cancelled(job_id, "TESTING").await;
         }
 
+        let users_started = Instant::now();
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "USERS", None)
             .await?;
@@ -828,10 +840,12 @@ impl EmbyMigrationService {
                 .collect::<HashMap<_, _>>()
         };
         let mut user_links = Vec::with_capacity(users.len());
+        let mut user_links_reports = Vec::with_capacity(users.len());
         for user in &users {
             if self.is_cancelled(job_id).await? {
                 return self.cancelled(job_id, "USERS").await;
             }
+            let write_started = Instant::now();
             let link = self
                 .prepare_user(
                     &user_store,
@@ -841,10 +855,18 @@ impl EmbyMigrationService {
                     scope.user_profile,
                 )
                 .await?;
-            self.database.upsert_emby_migration_user_link(&link).await?;
+            database_write_ms += write_started.elapsed().as_millis();
             user_links.push((user.clone(), link.lux_user_id.clone()));
+            user_links_reports.push(link);
         }
+        let write_started = Instant::now();
+        self.database
+            .upsert_emby_migration_user_links_batch(&user_links_reports)
+            .await?;
+        database_write_ms += write_started.elapsed().as_millis();
+        let users_ms = users_started.elapsed().as_millis();
 
+        let items_started = Instant::now();
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "ITEMS", None)
             .await?;
@@ -859,11 +881,6 @@ impl EmbyMigrationService {
         });
         let source_filtering_enabled =
             connection.supports_filtered_reads && scope.item_state && target_library_ids.is_some();
-        // Defer the complete people index until the source actually returns a
-        // favorite person.  A user can have the person-favorites scope selected
-        // while having no such data; loading the index up front would be a
-        // needless read on every empty migration.
-        let mut person_identity_index = None;
         let lux_library_identities = if (scope.library_access || scope.item_state)
             && library_folders.is_some()
             && (users.iter().any(|user| !user.enable_all_folders) || source_filtering_enabled)
@@ -1074,13 +1091,16 @@ impl EmbyMigrationService {
                         state_items =
                             retain_unhandled_state_items(state_items, &already_handled_item_ids);
                         let identity_index = if !state_items.is_empty() {
-                            Some(
+                            let candidate_started = Instant::now();
+                            let identity_index = Some(
                                 self.load_media_identity_index(
                                     &state_items,
                                     target_library_filter.as_deref(),
                                 )
                                 .await?,
-                            )
+                            );
+                            candidate_query_ms += candidate_started.elapsed().as_millis();
+                            identity_index
                         } else {
                             None
                         };
@@ -1188,6 +1208,7 @@ impl EmbyMigrationService {
                             &scope,
                         );
                         let cursor_json = migration_cursor_json(next_cursor);
+                        let write_started = Instant::now();
                         self.database
                             .commit_emby_migration_item_page(EmbyMigrationItemPageBatch {
                                 job_id,
@@ -1208,6 +1229,7 @@ impl EmbyMigrationService {
                                 },
                             })
                             .await?;
+                        database_write_ms += write_started.elapsed().as_millis();
                         database_transactions += 1;
                         let Some(next_start_index) = page.next_start_index else {
                             break;
@@ -1237,9 +1259,11 @@ impl EmbyMigrationService {
                                     (library_id.clone(), allowed_library_ids.contains(library_id))
                                 })
                                 .collect::<Vec<_>>();
+                            let write_started = Instant::now();
                             self.database
                                 .set_user_library_access_batch(lux_user_id, &library_updates)
                                 .await?;
+                            database_write_ms += write_started.elapsed().as_millis();
                         }
                         LibraryAccessPlan::Derived => {
                             let imported_library_ids = self
@@ -1256,9 +1280,11 @@ impl EmbyMigrationService {
                                 })
                                 .map(|library_id| (library_id, true))
                                 .collect::<Vec<_>>();
+                            let write_started = Instant::now();
                             self.database
                                 .set_user_library_access_batch(lux_user_id, &library_updates)
                                 .await?;
+                            database_write_ms += write_started.elapsed().as_millis();
                         }
                         LibraryAccessPlan::Disabled | LibraryAccessPlan::Unavailable => {}
                     }
@@ -1323,10 +1349,24 @@ impl EmbyMigrationService {
                             .iter()
                             .map(invalid_person_favorite_report),
                     );
-                    for person in page.items {
-                        if !is_migratable_person_favorite(&person) {
-                            continue;
-                        }
+                    let people = page
+                        .items
+                        .into_iter()
+                        .filter(is_migratable_person_favorite)
+                        .collect::<Vec<_>>();
+                    let person_identity_index = if people.is_empty() {
+                        MigrationPersonIdentityIndex::new(Vec::new())
+                    } else {
+                        let lookups = migration_person_identity_lookups(&people);
+                        let candidate_started = Instant::now();
+                        let identities = self
+                            .database
+                            .list_migration_person_identity_candidates(&lookups)
+                            .await?;
+                        candidate_query_ms += candidate_started.elapsed().as_millis();
+                        MigrationPersonIdentityIndex::new(identities)
+                    };
+                    for person in people {
                         let user_data = person.user_data.clone().unwrap_or(MigrationUserData {
                             playback_position_ticks: 0,
                             played: false,
@@ -1335,13 +1375,7 @@ impl EmbyMigrationService {
                             last_played_date: None,
                         });
                         processed += 1;
-                        if person_identity_index.is_none() {
-                            person_identity_index = Some(self.load_person_identity_index().await?);
-                        }
-                        let Some(person_identity_index) = person_identity_index.as_ref() else {
-                            return Err(EmbyMigrationServiceError::InvalidState);
-                        };
-                        let outcome = self.match_person(&person, person_identity_index);
+                        let outcome = self.match_person(&person, &person_identity_index);
                         let provider_ids_json = serde_json::to_string(&person.provider_ids)
                             .unwrap_or_else(|_| "{}".to_owned());
                         let detail_json = serde_json::to_string(&json!({
@@ -1407,6 +1441,7 @@ impl EmbyMigrationService {
                         &scope,
                     );
                     let cursor_json = migration_cursor_json(next_cursor);
+                    let write_started = Instant::now();
                     self.database
                         .commit_emby_migration_person_page(
                             job_id,
@@ -1423,6 +1458,7 @@ impl EmbyMigrationService {
                             },
                         )
                         .await?;
+                    database_write_ms += write_started.elapsed().as_millis();
                     database_transactions += 1;
                     let Some(next_start_index) = page.next_start_index else {
                         break;
@@ -1434,6 +1470,8 @@ impl EmbyMigrationService {
                 }
             }
         }
+        let items_ms = items_started.elapsed().as_millis();
+        let finalizing_started = Instant::now();
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "FINALIZING", None)
             .await?;
@@ -1451,11 +1489,18 @@ impl EmbyMigrationService {
         self.database
             .update_emby_migration_job_status(job_id, "COMPLETED", "FINALIZING", None)
             .await?;
+        let finalizing_ms = finalizing_started.elapsed().as_millis();
         tracing::info!(
             job_id = %job_id,
             source_rpc_calls,
             database_transactions,
             peak_source_page_records,
+            testing_ms,
+            users_ms,
+            items_ms,
+            finalizing_ms,
+            candidate_query_ms,
+            database_write_ms,
             processed,
             matched,
             skipped,
@@ -1619,7 +1664,7 @@ impl EmbyMigrationService {
             let selected_index = MigrationMediaIdentityIndex::new(identities.clone());
             let fallback_items = items
                 .iter()
-                .filter(|item| match_item(item, &selected_index).lux_item_id.is_none())
+                .filter(|item| needs_unfiltered_library_fallback(item, &selected_index))
                 .cloned()
                 .collect::<Vec<_>>();
             if !fallback_items.is_empty() {
@@ -1642,6 +1687,7 @@ impl EmbyMigrationService {
         Ok(MigrationMediaIdentityIndex::new(identities))
     }
 
+    #[allow(dead_code)]
     async fn load_person_identity_index(
         &self,
     ) -> Result<MigrationPersonIdentityIndex, EmbyMigrationServiceError> {
@@ -1826,6 +1872,16 @@ impl EmbyMigrationService {
             .await?;
         Ok(())
     }
+}
+
+fn needs_unfiltered_library_fallback(
+    item: &MigrationItem,
+    selected_index: &MigrationMediaIdentityIndex,
+) -> bool {
+    // A conflict is already a definitive result. Re-reading excluded
+    // libraries cannot make it safe to guess a single target and only adds
+    // another full candidate query for the same lookup.
+    match_item(item, selected_index).status == "UNMATCHED"
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2426,6 +2482,41 @@ fn migration_media_identity_lookups(items: &[MigrationItem]) -> Vec<MigrationMed
     lookups
 }
 
+fn migration_person_identity_lookups(
+    items: &[MigrationItem],
+) -> Vec<MigrationPersonIdentityLookup> {
+    let mut lookups = items
+        .iter()
+        .filter_map(|item| {
+            let normalized_name = normalize_person_name(&item.name);
+            let mut provider_ids = item
+                .provider_ids
+                .iter()
+                .map(|(provider, provider_id)| {
+                    (normalize_person_provider(provider), provider_id.clone())
+                })
+                .collect::<Vec<_>>();
+            provider_ids.sort_unstable();
+            provider_ids.dedup();
+            if normalized_name.is_empty() && provider_ids.is_empty() {
+                None
+            } else {
+                Some(MigrationPersonIdentityLookup {
+                    normalized_name,
+                    provider_ids,
+                })
+            }
+        })
+        .collect::<Vec<_>>();
+    lookups.sort_unstable_by(|left, right| {
+        left.normalized_name
+            .cmp(&right.normalized_name)
+            .then_with(|| left.provider_ids.cmp(&right.provider_ids))
+    });
+    lookups.dedup();
+    lookups
+}
+
 struct MigrationPersonIdentityIndex {
     by_provider: HashMap<(String, String), Vec<String>>,
     by_name: HashMap<String, Vec<String>>,
@@ -2716,6 +2807,53 @@ fn migration_scope_from_json(value: &str) -> MigrationScope {
     serde_json::from_str(value).unwrap_or_default()
 }
 
+fn project_source_user_page(
+    page: MigrationUserPage,
+    offset: i64,
+    limit: i64,
+    search: Option<&str>,
+) -> MigrationSourceUserPageView {
+    let has_pagination = page.start_index.is_some()
+        || page.total_record_count.is_some()
+        || page.next_start_index.is_some();
+    let (users, total) = if has_pagination {
+        let total = page
+            .total_record_count
+            .unwrap_or_else(|| offset.saturating_add(page.items.len() as i64));
+        (page.items, total)
+    } else {
+        // Legacy plugins ignore optional list bounds and return the complete
+        // user list. Apply search and slicing locally for compatibility.
+        let search_lower = search
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_lowercase);
+        let filtered = page
+            .items
+            .into_iter()
+            .filter(|user| {
+                search_lower
+                    .as_deref()
+                    .is_none_or(|search| user.name.to_lowercase().contains(search))
+            })
+            .collect::<Vec<_>>();
+        let total = filtered.len() as i64;
+        let users = filtered
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect::<Vec<_>>();
+        (users, total)
+    };
+    MigrationSourceUserPageView {
+        users: users
+            .into_iter()
+            .map(MigrationSourceUserView::from)
+            .collect(),
+        total,
+    }
+}
+
 fn normalize_migration_scope(
     mut scope: MigrationScope,
 ) -> Result<MigrationScope, MigrationInputError> {
@@ -2936,6 +3074,56 @@ mod tests {
             serde_json::from_str(r#"{"dryRun":false,"embyUserIds":["user-1"]}"#)
                 .expect("legacy migration request should remain valid");
         assert_eq!(request.scope, MigrationScope::default());
+    }
+
+    fn test_migration_user(id: &str, name: &str) -> MigrationUser {
+        MigrationUser {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            has_password: false,
+            is_disabled: false,
+            is_administrator: false,
+            enable_all_folders: true,
+            enabled_folders: Vec::new(),
+            enable_remote_access: false,
+            enable_content_downloading: false,
+            primary_image_tag: None,
+        }
+    }
+
+    #[test]
+    fn legacy_source_user_pages_are_searched_and_sliced_locally() {
+        let page = MigrationUserPage {
+            items: vec![
+                test_migration_user("1", "Alice"),
+                test_migration_user("2", "Bob"),
+            ],
+            history_capability: HistoryCapability::ItemState,
+            library_folders: None,
+            start_index: None,
+            total_record_count: None,
+            next_start_index: None,
+        };
+
+        let projected = project_source_user_page(page, 0, 1, Some("ali"));
+        assert_eq!(projected.total, 1);
+        assert_eq!(projected.users[0].name, "Alice");
+    }
+
+    #[test]
+    fn paged_source_user_metadata_is_kept_without_reslicing() {
+        let page = MigrationUserPage {
+            items: vec![test_migration_user("101", "User 101")],
+            history_capability: HistoryCapability::ItemState,
+            library_folders: None,
+            start_index: Some(100),
+            total_record_count: Some(250),
+            next_start_index: Some(101),
+        };
+
+        let projected = project_source_user_page(page, 100, 100, None);
+        assert_eq!(projected.total, 250);
+        assert_eq!(projected.users[0].id, "101");
     }
 
     #[test]
@@ -4024,6 +4212,30 @@ done
     }
 
     #[test]
+    fn selected_library_conflicts_do_not_trigger_unfiltered_fallback() {
+        let item = MigrationItem {
+            id: "emby-1".to_owned(),
+            name: "The Film".to_owned(),
+            item_type: "Movie".to_owned(),
+            production_year: Some(2024),
+            provider_ids: BTreeMap::from([(String::from("Tmdb"), String::from("42"))]),
+            parent_id: None,
+            series_id: None,
+            season_id: None,
+            index_number: None,
+            parent_index_number: None,
+            user_data: None,
+        };
+        let index = MigrationMediaIdentityIndex::new(vec![
+            identity("lux-1", r#"{"tmdb":"42"}"#),
+            identity("lux-2", r#"{"tmdb":"42"}"#),
+        ]);
+
+        assert_eq!(match_item(&item, &index).status, "CONFLICT");
+        assert!(!needs_unfiltered_library_fallback(&item, &index));
+    }
+
+    #[test]
     fn migration_match_detail_includes_lux_series_context() {
         let item = MigrationItem {
             id: "emby-episode-1".to_owned(),
@@ -4107,6 +4319,33 @@ done
         assert_eq!(
             index.by_name.get("演员甲"),
             Some(&vec![String::from("person-1")])
+        );
+    }
+
+    #[test]
+    fn person_identity_lookups_are_deduplicated_and_normalized() {
+        let mut first = MigrationItem {
+            id: "person-1".to_owned(),
+            name: "Actor A".to_owned(),
+            item_type: "Person".to_owned(),
+            production_year: None,
+            provider_ids: BTreeMap::from([("TMDB".to_owned(), "42".to_owned())]),
+            parent_id: None,
+            series_id: None,
+            season_id: None,
+            index_number: None,
+            parent_index_number: None,
+            user_data: None,
+        };
+        let second = first.clone();
+        first.name = " actor a ".to_owned();
+
+        let lookups = migration_person_identity_lookups(&[first, second]);
+        assert_eq!(lookups.len(), 1);
+        assert_eq!(lookups[0].normalized_name, "actora");
+        assert_eq!(
+            lookups[0].provider_ids,
+            vec![("tmdb".to_owned(), "42".to_owned())]
         );
     }
 

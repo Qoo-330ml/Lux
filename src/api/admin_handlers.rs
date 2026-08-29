@@ -2232,6 +2232,7 @@ pub(crate) struct AdminJobsQuery {
     pub(crate) page: Option<i64>,
     pub(crate) page_size: Option<i64>,
     pub(crate) status: Option<String>,
+    pub(crate) search: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -4851,7 +4852,7 @@ pub(crate) fn dashboard_activity_json(
         "remoteIp": remote_ip,
         "remoteIpLocation": remote_ip_location
             .as_ref()
-            .map(|location| dashboard_ip_location_json(location)),
+            .map(dashboard_ip_location_json),
         "createdAt": event.created_at,
     })
 }
@@ -6644,7 +6645,10 @@ pub(crate) async fn admin_list_emby_migration_source_users(
     let Some(service) = state.emby_migration.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match service.list_source_users(offset, limit).await {
+    match service
+        .list_source_users_filtered(offset, limit, query.search.as_deref())
+        .await
+    {
         Ok(page) => Json(json!({
             "users": page.users,
             "total": page.total,
@@ -6813,6 +6817,9 @@ pub(crate) fn emby_migration_error(
         EmbyMigrationServiceError::NotFound => (StatusCode::NOT_FOUND, "迁移任务不存在"),
         EmbyMigrationServiceError::InvalidState => {
             (StatusCode::CONFLICT, "迁移任务状态不允许此操作")
+        }
+        EmbyMigrationServiceError::AlreadyActive => {
+            (StatusCode::CONFLICT, "已有 Emby 迁移正在执行或等待执行")
         }
         EmbyMigrationServiceError::Plugin(
             crate::application::plugins::PluginServiceError::InvalidConfig,
