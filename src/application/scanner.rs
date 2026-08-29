@@ -323,12 +323,7 @@ impl LibraryScanner {
                         .ok_or(ScannerError::NonUtf8Path)?;
                     if !existing_entries.contains_key(relative_path) {
                         let requires_regular_scan = self
-                            .episode_file_has_moved_entry(
-                                &library_id_text,
-                                &root,
-                                &root_path,
-                                &path,
-                            )
+                            .file_has_moved_entry(&library_id_text, &root, &root_path, &path)
                             .await?
                             || self
                                 .episode_path_has_legacy_identity(&root, &root_path, &path)
@@ -448,6 +443,8 @@ impl LibraryScanner {
                     .list_filesystem_entries_for_paths(&root.id, &relative_paths)
                     .await?;
                 let mut seen_entry_ids = Vec::with_capacity(files.len());
+                let mut new_movie_paths = Vec::new();
+                let mut new_episode_paths = Vec::new();
                 for path in files {
                     let classification = classify_mixed_file(&root_path, &path).await;
                     let quick_report = match classification {
@@ -496,6 +493,53 @@ impl LibraryScanner {
                         report.merge(quick_report);
                         continue;
                     }
+                    let relative_path = path
+                        .strip_prefix(&root_path)
+                        .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                        .to_str()
+                        .ok_or(ScannerError::NonUtf8Path)?;
+                    if !existing_entries.contains_key(relative_path) {
+                        let requires_regular_scan = match classification {
+                            MixedClassification::Movie => {
+                                self.file_has_moved_entry(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                )
+                                .await?
+                            }
+                            MixedClassification::Episode => {
+                                self.file_has_moved_entry(
+                                    &library_id_text,
+                                    &root,
+                                    &root_path,
+                                    &path,
+                                )
+                                .await?
+                                    || self
+                                        .episode_path_has_legacy_identity(&root, &root_path, &path)
+                                        .await?
+                            }
+                            MixedClassification::Unresolved => true,
+                        };
+                        if !requires_regular_scan {
+                            let batched = match classification {
+                                MixedClassification::Movie => {
+                                    new_movie_paths.push(path.clone());
+                                    true
+                                }
+                                MixedClassification::Episode => {
+                                    new_episode_paths.push(path.clone());
+                                    true
+                                }
+                                MixedClassification::Unresolved => false,
+                            };
+                            if batched {
+                                continue;
+                            }
+                        }
+                    }
                     let result = match classification {
                         MixedClassification::Movie => {
                             self.scan_movie_file(
@@ -530,6 +574,46 @@ impl LibraryScanner {
                         }
                     };
                     report.merge(result);
+                }
+                let new_movie_files = self
+                    .prepare_new_movie_files(&root_path, &new_movie_paths)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if !new_movie_files.is_empty() {
+                    let file_count = new_movie_files.len();
+                    report.created_items += self
+                        .database
+                        .insert_movie_files_batch(
+                            &library_id_text,
+                            &root.id,
+                            &generation,
+                            &new_movie_files,
+                        )
+                        .await?;
+                    report.discovered_files += file_count;
+                    report.created_sources += file_count;
+                }
+                let new_episode_files = self
+                    .prepare_new_episode_files(&root, &root_path, &new_episode_paths)
+                    .await?
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                if !new_episode_files.is_empty() {
+                    let file_count = new_episode_files.len();
+                    report.created_items += self
+                        .database
+                        .insert_episode_files_batch(
+                            &library_id_text,
+                            &root.id,
+                            &generation,
+                            &new_episode_files,
+                        )
+                        .await?;
+                    report.discovered_files += file_count;
+                    report.created_sources += file_count;
                 }
                 self.database
                     .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
@@ -1433,7 +1517,7 @@ impl LibraryScanner {
         )))
     }
 
-    async fn episode_file_has_moved_entry(
+    async fn file_has_moved_entry(
         &self,
         library_id_text: &str,
         root: &StoredLibraryRoot,
