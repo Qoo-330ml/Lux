@@ -35,6 +35,7 @@ use crate::{
 const SECRET_DIRECTORY: &str = "plugin-secrets/emby-migration";
 const MAX_LABEL_LENGTH: usize = 128;
 const MAX_JOB_PAGE_SIZE: i64 = 100;
+const MAX_SELECTED_USER_COUNT: usize = 1_000;
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -43,6 +44,7 @@ pub struct CreateMigrationRequest {
     pub dry_run: bool,
     #[serde(default)]
     pub merge_policy: MigrationMergePolicy,
+    pub emby_user_ids: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -318,6 +320,9 @@ impl EmbyMigrationService {
         created_by_user_id: &str,
         request: CreateMigrationRequest,
     ) -> Result<MigrationJobView, EmbyMigrationServiceError> {
+        let emby_user_ids = normalize_selected_user_ids(&request.emby_user_ids)?;
+        let emby_user_ids_json = serde_json::to_string(&emby_user_ids)
+            .map_err(|_| EmbyMigrationServiceError::InvalidState)?;
         let source = self.plugin.configured_source().await?;
         let source_url = source.validate()?;
         let source_base_url = source_url.to_string();
@@ -351,6 +356,7 @@ impl EmbyMigrationService {
                 secret_ref: &secret_ref,
                 dry_run: request.dry_run,
                 merge_policy: merge_policy_name(request.merge_policy),
+                emby_user_ids_json: &emby_user_ids_json,
             })
             .await
         {
@@ -656,7 +662,18 @@ impl EmbyMigrationService {
             }
         };
         let library_folders = user_page.library_folders;
-        let users = user_page.items;
+        let users = match select_migration_users(user_page.items, &job.emby_user_ids_json) {
+            Ok(users) => users,
+            Err(error) => {
+                self.fail_job(
+                    job_id,
+                    "USERS",
+                    "selected Emby users are no longer available",
+                )
+                .await?;
+                return Err(error);
+            }
+        };
         let user_store = UserStore::new(self.database.clone()).map_err(UserStoreError::from)?;
         let mut user_links = Vec::with_capacity(users.len());
         for user in &users {
@@ -1770,6 +1787,56 @@ fn migration_merge_policy(value: &str) -> MigrationMergePolicy {
     }
 }
 
+fn normalize_selected_user_ids(values: &[String]) -> Result<Vec<String>, MigrationInputError> {
+    let mut selected = Vec::with_capacity(values.len().min(MAX_SELECTED_USER_COUNT));
+    let mut seen = HashSet::with_capacity(values.len());
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if value.len() > 256
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(MigrationInputError::InvalidIdentifier);
+        }
+        if seen.insert(value.to_owned()) {
+            selected.push(value.to_owned());
+        }
+        if selected.len() > MAX_SELECTED_USER_COUNT {
+            return Err(MigrationInputError::InvalidIdentifier);
+        }
+    }
+    if selected.is_empty() {
+        return Err(MigrationInputError::NoSelectedUsers);
+    }
+    Ok(selected)
+}
+
+fn select_migration_users(
+    users: Vec<MigrationUser>,
+    selected_user_ids_json: &str,
+) -> Result<Vec<MigrationUser>, EmbyMigrationServiceError> {
+    let selected_user_ids = serde_json::from_str::<Vec<String>>(selected_user_ids_json)
+        .map_err(|_| EmbyMigrationServiceError::InvalidState)
+        .and_then(|ids| normalize_selected_user_ids(&ids).map_err(Into::into))?;
+    let users_by_id = users
+        .into_iter()
+        .map(|user| (user.id.clone(), user))
+        .collect::<HashMap<_, _>>();
+    selected_user_ids
+        .iter()
+        .map(|user_id| {
+            users_by_id
+                .get(user_id)
+                .cloned()
+                .ok_or(EmbyMigrationServiceError::InvalidState)
+        })
+        .collect()
+}
+
 fn hex_sha256(value: &MigrationUserData) -> Result<String, EmbyMigrationServiceError> {
     let bytes = serde_json::to_vec(value).map_err(|_| EmbyMigrationServiceError::InvalidState)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -1797,6 +1864,64 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn selected_user_ids_are_required_and_deduplicated() {
+        assert_eq!(
+            normalize_selected_user_ids(&[
+                " user-1 ".to_owned(),
+                "user-1".to_owned(),
+                "user-2".to_owned(),
+            ])
+            .expect("valid selected user IDs"),
+            vec!["user-1", "user-2"]
+        );
+        assert!(matches!(
+            normalize_selected_user_ids(&[]),
+            Err(MigrationInputError::NoSelectedUsers)
+        ));
+    }
+
+    #[test]
+    fn selected_user_ids_reject_empty_or_unsafe_identifiers() {
+        assert!(matches!(
+            normalize_selected_user_ids(&["  ".to_owned()]),
+            Err(MigrationInputError::NoSelectedUsers)
+        ));
+        assert!(matches!(
+            normalize_selected_user_ids(&["user/1".to_owned()]),
+            Err(MigrationInputError::InvalidIdentifier)
+        ));
+    }
+
+    #[test]
+    fn migration_user_selection_excludes_unselected_users() {
+        let users = vec![
+            migration_test_user("user-1", "Alice"),
+            migration_test_user("user-2", "Bob"),
+        ];
+
+        let selected = select_migration_users(users, r#"["user-2"]"#)
+            .expect("selected user should be present");
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].id, "user-2");
+    }
+
+    fn migration_test_user(id: &str, name: &str) -> MigrationUser {
+        MigrationUser {
+            id: id.to_owned(),
+            name: name.to_owned(),
+            has_password: false,
+            is_disabled: false,
+            is_administrator: false,
+            enable_all_folders: true,
+            enabled_folders: Vec::new(),
+            enable_remote_access: false,
+            enable_content_downloading: false,
+            primary_image_tag: None,
+        }
+    }
 
     #[test]
     fn plugin_invalid_response_is_recoverable_when_returned_by_rpc() {

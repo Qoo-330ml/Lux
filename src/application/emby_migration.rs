@@ -25,6 +25,7 @@ pub enum MigrationInputError {
     PrivateNetworkNotAllowed,
     InvalidSecret,
     InvalidIdentifier,
+    NoSelectedUsers,
 }
 
 impl fmt::Display for MigrationInputError {
@@ -36,6 +37,7 @@ impl fmt::Display for MigrationInputError {
             }
             Self::InvalidSecret => formatter.write_str("invalid Emby API key"),
             Self::InvalidIdentifier => formatter.write_str("invalid migration identifier"),
+            Self::NoSelectedUsers => formatter.write_str("at least one Emby user must be selected"),
         }
     }
 }

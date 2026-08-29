@@ -15,6 +15,7 @@ pub(crate) struct StoredEmbyMigrationJob {
     pub phase: String,
     pub dry_run: bool,
     pub merge_policy: String,
+    pub emby_user_ids_json: String,
     pub history_capability: String,
     pub cursor_json: String,
     pub processed_count: i64,
@@ -34,6 +35,7 @@ pub(crate) struct NewEmbyMigrationJob<'a> {
     pub secret_ref: &'a str,
     pub dry_run: bool,
     pub merge_policy: &'a str,
+    pub emby_user_ids_json: &'a str,
 }
 
 pub(crate) struct EmbyMigrationJobProgress<'a> {
@@ -318,8 +320,8 @@ impl Database {
         self.query(
             "INSERT INTO emby_migration_jobs (
                  id, plugin_id, created_by_user_id, source_label, source_base_url,
-                 secret_ref, status, phase, dry_run, merge_policy
-             ) VALUES (?, 'org.lux.emby-migration', ?, ?, ?, ?, 'PENDING', 'TESTING', ?, ?)",
+                 secret_ref, status, phase, dry_run, merge_policy, emby_user_ids_json
+             ) VALUES (?, 'org.lux.emby-migration', ?, ?, ?, ?, 'PENDING', 'TESTING', ?, ?, ?)",
         )
         .bind(job.id)
         .bind(job.created_by_user_id)
@@ -328,6 +330,7 @@ impl Database {
         .bind(job.secret_ref)
         .bind(if job.dry_run { 1_i64 } else { 0_i64 })
         .bind(job.merge_policy)
+        .bind(job.emby_user_ids_json)
         .execute(self.pool())
         .await
         .map(|_| ())
@@ -341,6 +344,7 @@ impl Database {
         self.query(
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
                     secret_ref, status, phase, dry_run, merge_policy, cursor_json,
+                    emby_user_ids_json,
                     processed_count, total_count, matched_count, skipped_count, failed_count,
                     cancel_requested, error, history_capability
              FROM emby_migration_jobs WHERE id = ?",
@@ -360,6 +364,7 @@ impl Database {
         self.query(
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
                     secret_ref, status, phase, dry_run, merge_policy, cursor_json,
+                    emby_user_ids_json,
                     processed_count, total_count, matched_count, skipped_count, failed_count,
                     cancel_requested, error, history_capability
              FROM emby_migration_jobs
@@ -917,6 +922,7 @@ fn stored_migration_job(row: sqlx::any::AnyRow) -> StoredEmbyMigrationJob {
         phase: row.get("phase"),
         dry_run: row.get::<i64, _>("dry_run") != 0,
         merge_policy: row.get("merge_policy"),
+        emby_user_ids_json: row.get("emby_user_ids_json"),
         history_capability: row.get("history_capability"),
         cursor_json: row.get("cursor_json"),
         processed_count: row.get("processed_count"),
@@ -1042,6 +1048,7 @@ mod tests {
                 secret_ref: "emby-migration/test",
                 dry_run: true,
                 merge_policy: "MERGE",
+                emby_user_ids_json: r#"["emby-user"]"#,
             })
             .await?;
 
@@ -1088,6 +1095,7 @@ mod tests {
                 secret_ref: "emby-migration/test",
                 dry_run: true,
                 merge_policy: "MERGE",
+                emby_user_ids_json: r#"["emby-user"]"#,
             })
             .await?;
         assert!(
@@ -1122,6 +1130,7 @@ mod tests {
         assert_eq!(job.status, "RUNNING");
         assert_eq!(job.phase, "ITEMS");
         assert_eq!(job.history_capability, "EVENT_HISTORY");
+        assert_eq!(job.emby_user_ids_json, r#"["emby-user"]"#);
         assert_eq!(job.processed_count, 5);
         assert_eq!(job.total_count, 10);
         assert_eq!(job.matched_count, 4);
