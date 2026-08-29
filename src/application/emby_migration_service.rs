@@ -1832,7 +1832,7 @@ fn normalize_selected_user_ids(values: &[String]) -> Result<Vec<String>, Migrati
     for value in values {
         let value = value.trim();
         if value.is_empty() {
-            continue;
+            return Err(MigrationInputError::InvalidIdentifier);
         }
         if value.len() > 256
             || !value
@@ -1925,12 +1925,17 @@ mod tests {
     fn selected_user_ids_reject_empty_or_unsafe_identifiers() {
         assert!(matches!(
             normalize_selected_user_ids(&["  ".to_owned()]),
-            Err(MigrationInputError::NoSelectedUsers)
+            Err(MigrationInputError::InvalidIdentifier)
         ));
         assert!(matches!(
             normalize_selected_user_ids(&["user/1".to_owned()]),
             Err(MigrationInputError::InvalidIdentifier)
         ));
+    }
+
+    #[test]
+    fn create_request_requires_user_ids() {
+        assert!(serde_json::from_str::<CreateMigrationRequest>(r#"{"dryRun":false}"#).is_err());
     }
 
     #[test]
