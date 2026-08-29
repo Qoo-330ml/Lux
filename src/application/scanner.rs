@@ -6,7 +6,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use quick_xml::{events::Event, reader::Reader};
@@ -4461,15 +4461,20 @@ impl ScanJobService {
                 .await?;
             return Ok(());
         };
+        let started = Instant::now();
         match thumbnails.generate_scan_job(job_id).await {
             Ok(report) if report.failed == 0 => {
+                let items = report.considered.saturating_add(report.skipped_strm);
+                let elapsed_ms = started.elapsed().as_millis();
                 let details = format!(
-                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
                     report.considered,
                     report.generated,
                     report.reused,
                     report.failed,
                     report.skipped_strm,
+                    elapsed_ms,
+                    throughput_per_second(items, elapsed_ms),
                 );
                 self.record_event(
                     job_id,
@@ -4481,13 +4486,17 @@ impl ScanJobService {
                 .await;
             }
             Ok(report) => {
+                let items = report.considered.saturating_add(report.skipped_strm);
+                let elapsed_ms = started.elapsed().as_millis();
                 let details = format!(
-                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
                     report.considered,
                     report.generated,
                     report.reused,
                     report.failed,
                     report.skipped_strm,
+                    elapsed_ms,
+                    throughput_per_second(items, elapsed_ms),
                 );
                 self.record_event(
                     job_id,
@@ -4505,7 +4514,10 @@ impl ScanJobService {
                     "ERROR",
                     "THUMBNAIL_FAILED",
                     "视频缩略图任务失败",
-                    "{}",
+                    &format!(
+                        r#"{{"elapsedMs":{},"itemsPerSecond":0}}"#,
+                        started.elapsed().as_millis()
+                    ),
                 )
                 .await;
             }
@@ -4730,12 +4742,23 @@ impl ScanJobService {
             Some(local_nfo) => enricher.with_nfo_store(local_nfo),
             None => enricher,
         };
+        let started = Instant::now();
         let result = enricher.enrich_scan_job(job_id).await;
         match result {
             Ok(report) => {
+                let items = report
+                    .nfo_loaded
+                    .saturating_add(report.nfo_failed)
+                    .saturating_add(report.nfo_skipped);
+                let elapsed_ms = started.elapsed().as_millis();
                 let details = format!(
-                    r#"{{"nfoLoaded":{},"nfoFailed":{},"nfoSkipped":{},"imagesFound":{}}}"#,
-                    report.nfo_loaded, report.nfo_failed, report.nfo_skipped, report.images_found,
+                    r#"{{"nfoLoaded":{},"nfoFailed":{},"nfoSkipped":{},"imagesFound":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
+                    report.nfo_loaded,
+                    report.nfo_failed,
+                    report.nfo_skipped,
+                    report.images_found,
+                    elapsed_ms,
+                    throughput_per_second(items, elapsed_ms),
                 );
                 self.record_event(
                     job_id,
@@ -4756,7 +4779,10 @@ impl ScanJobService {
                     "ERROR",
                     "METADATA_FAILED",
                     "本地元数据处理失败",
-                    "{}",
+                    &format!(
+                        r#"{{"elapsedMs":{},"itemsPerSecond":0}}"#,
+                        started.elapsed().as_millis()
+                    ),
                 )
                 .await;
             }
@@ -4893,19 +4919,37 @@ impl ScanJobService {
             .find_scan_job(job_id)
             .await?
             .ok_or(ScanJobError::JobNotFound)?;
+        let started = Instant::now();
         match probe.probe_scan_job(job_id, &job.library_id).await {
             Ok(report) => {
+                let items = report.attempted.saturating_add(report.skipped);
+                let elapsed_ms = started.elapsed().as_millis();
                 let details = format!(
-                    r#"{{"attempted":{},"ready":{},"failed":{},"timedOut":{},"skipped":{}}}"#,
-                    report.attempted, report.ready, report.failed, report.timed_out, report.skipped,
+                    r#"{{"attempted":{},"ready":{},"failed":{},"timedOut":{},"skipped":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
+                    report.attempted,
+                    report.ready,
+                    report.failed,
+                    report.timed_out,
+                    report.skipped,
+                    elapsed_ms,
+                    throughput_per_second(items, elapsed_ms),
                 );
                 self.record_event(job_id, "INFO", "PROBE_COMPLETED", "媒体探测完成", &details)
                     .await;
             }
             Err(error) => {
                 tracing::warn!(job_id, %error, "scan completed but media probe failed");
-                self.record_event(job_id, "ERROR", "PROBE_FAILED", "媒体探测任务失败", "{}")
-                    .await;
+                self.record_event(
+                    job_id,
+                    "ERROR",
+                    "PROBE_FAILED",
+                    "媒体探测任务失败",
+                    &format!(
+                        r#"{{"elapsedMs":{},"itemsPerSecond":0}}"#,
+                        started.elapsed().as_millis()
+                    ),
+                )
+                .await;
             }
         }
         Ok(())
@@ -5909,6 +5953,15 @@ impl From<StorageError> for ScannerError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
     }
+}
+
+fn throughput_per_second(items: usize, elapsed_ms: u128) -> u64 {
+    if items == 0 {
+        return 0;
+    }
+    let numerator = (items as u128).saturating_mul(1_000);
+    let rate = numerator.checked_div(elapsed_ms).unwrap_or(numerator);
+    u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]

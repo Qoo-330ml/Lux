@@ -1641,6 +1641,16 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
     .fetch_all(database.pool())
     .await?;
     assert!(event_codes.iter().any(|code| code == "PROBE_COMPLETED"));
+    let probe_details: String = sqlx::query_scalar(
+        "SELECT details_json FROM scan_job_events
+         WHERE job_id = ? AND event_code = 'PROBE_COMPLETED'
+         ORDER BY created_at, id LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(probe_details.contains("\"elapsedMs\":"));
+    assert!(probe_details.contains("\"itemsPerSecond\":"));
     Ok(())
 }
 
