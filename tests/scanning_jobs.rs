@@ -1367,6 +1367,97 @@ async fn reconciliation_does_not_mark_files_missing_when_root_disappears_after_d
 }
 
 #[tokio::test]
+async fn failed_reconciliation_keeps_checkpoint_for_retry() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let valid_relative_path = "Valid.Movie.2024.mkv";
+    tokio::fs::write(root.join(valid_relative_path), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let discovery = jobs.run_batch(&job.id, 100).await?;
+    assert!(!discovery.completed);
+    let invalid_absolute_path = temp_dir.path().join("Outside.Movie.2025.mkv");
+    tokio::fs::write(&invalid_absolute_path, b"fixture").await?;
+    let invalid_absolute_path = invalid_absolute_path
+        .to_str()
+        .ok_or("non-utf8 invalid path")?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             last_seen_generation
+         ) VALUES (?, (SELECT id FROM library_roots WHERE library_id = ?), ?, 'FILE', 0, 0, ?)",
+    )
+    .bind("invalid-checkpoint-entry")
+    .bind(library.id.to_string())
+    .bind(invalid_absolute_path)
+    .bind("old-generation")
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE reconciliation_scan_entries
+         SET relative_path = ?
+         WHERE job_id = ? AND entry_type = 'FILE'",
+    )
+    .bind(invalid_absolute_path)
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+
+    let error = jobs
+        .run_batch(&job.id, 100)
+        .await
+        .expect_err("invalid persisted work must fail the scan job");
+    assert!(matches!(error, ScanJobError::Scanner(_)));
+    let failed_status: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(failed_status.0, "FAILED");
+    assert!(failed_status.1.is_some());
+    let remaining_work: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_work, 1);
+
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.status, "PENDING");
+    sqlx::query(
+        "UPDATE reconciliation_scan_entries
+         SET relative_path = ?
+         WHERE job_id = ? AND entry_type = 'FILE'",
+    )
+    .bind(valid_relative_path)
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let completed_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(completed_status, "COMPLETED");
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconciliation_skips_prefetched_sibling_directories_after_one_directory_fails()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

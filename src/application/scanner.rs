@@ -2647,7 +2647,9 @@ impl ScanJobService {
             return Err(ScanJobError::InvalidBatchSize);
         }
         let _scan_permit = self.acquire_scan_lock().await?;
-        let report = self.run_batch_unlocked(job_id, batch_size).await?;
+        let report = self
+            .run_batch_with_failure_handling(job_id, batch_size)
+            .await?;
         if report.processed > 0
             && let Some(home) = &self.home
         {
@@ -2655,6 +2657,20 @@ impl ScanJobService {
             self.user_events.publish(UserEventScope::Home);
         }
         Ok(report)
+    }
+
+    async fn run_batch_with_failure_handling(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        match self.run_batch_unlocked(job_id, batch_size).await {
+            Ok(report) => Ok(report),
+            Err(error) => {
+                self.fail_unhandled_scan_job(job_id, &error).await?;
+                Err(error)
+            }
+        }
     }
 
     async fn run_batch_unlocked(
@@ -3324,9 +3340,14 @@ impl ScanJobService {
                 return self.cancel_running_job(&job.id).await;
             }
             while regular_tasks.len() >= concurrency {
-                collect_reconciliation_regular_task(&mut regular_tasks, &mut regular_results)
-                    .await
-                    .map_err(ScanJobError::from)?;
+                if let Err(error) =
+                    collect_reconciliation_regular_task(&mut regular_tasks, &mut regular_results)
+                        .await
+                {
+                    return self
+                        .fail_reconciliation_job(job, error, &completed_entries, next_count)
+                        .await;
+                }
             }
             let scanner = self.scanner.clone();
             let library_id = job.library_id.clone();
@@ -3374,9 +3395,13 @@ impl ScanJobService {
             });
         }
         while !regular_tasks.is_empty() {
-            collect_reconciliation_regular_task(&mut regular_tasks, &mut regular_results)
-                .await
-                .map_err(ScanJobError::from)?;
+            if let Err(error) =
+                collect_reconciliation_regular_task(&mut regular_tasks, &mut regular_results).await
+            {
+                return self
+                    .fail_reconciliation_job(job, error, &completed_entries, next_count)
+                    .await;
+            }
         }
         if cancellation.load(Ordering::Acquire) {
             return self.cancel_running_job(&job.id).await;
@@ -3481,23 +3506,44 @@ impl ScanJobService {
         }
         for root in roots {
             if let Some(files) = prepared_movie_files.get(&root.id) {
-                created_items = created_items.saturating_add(
-                    self.database
-                        .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
-                        .await?,
-                );
+                let inserted = match self
+                    .database
+                    .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
+                    .await
+                {
+                    Ok(inserted) => inserted,
+                    Err(error) => {
+                        return self
+                            .fail_reconciliation_job(
+                                job,
+                                error.into(),
+                                &completed_entries,
+                                next_count,
+                            )
+                            .await;
+                    }
+                };
+                created_items = created_items.saturating_add(inserted);
             }
             if let Some(files) = prepared_episode_files.get(&root.id) {
-                created_items = created_items.saturating_add(
-                    self.database
-                        .insert_episode_files_batch(
-                            &job.library_id,
-                            &root.id,
-                            &job.generation,
-                            files,
-                        )
-                        .await?,
-                );
+                let inserted = match self
+                    .database
+                    .insert_episode_files_batch(&job.library_id, &root.id, &job.generation, files)
+                    .await
+                {
+                    Ok(inserted) => inserted,
+                    Err(error) => {
+                        return self
+                            .fail_reconciliation_job(
+                                job,
+                                error.into(),
+                                &completed_entries,
+                                next_count,
+                            )
+                            .await;
+                    }
+                };
+                created_items = created_items.saturating_add(inserted);
             }
         }
         self.database
@@ -3968,6 +4014,29 @@ impl ScanJobService {
         Err(error.into())
     }
 
+    async fn fail_unhandled_scan_job(
+        &self,
+        job_id: &str,
+        error: &ScanJobError,
+    ) -> Result<(), ScanJobError> {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
+            return Ok(());
+        };
+        if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
+            return Ok(());
+        }
+        let error_code = error.code();
+        self.database
+            .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
+            .await?;
+        self.record_event(job_id, "ERROR", error_code, "扫描任务失败", "{}")
+            .await;
+        self.publish_webhook_event(&job, WebhookEventType::ScanFailed, Some(error_code))
+            .await;
+        self.clear_cancellation_flag(job_id);
+        Ok(())
+    }
+
     async fn run_incremental_batch(
         &self,
         job_id: &str,
@@ -4301,7 +4370,9 @@ impl ScanJobService {
         let _scan_permit = self.acquire_scan_lock().await?;
         let mut created_items = 0_usize;
         loop {
-            let report = self.run_batch_unlocked(job_id, batch_size).await?;
+            let report = self
+                .run_batch_with_failure_handling(job_id, batch_size)
+                .await?;
             if report.processed > 0
                 && let Some(home) = &self.home
             {
@@ -5296,6 +5367,22 @@ pub enum ScanJobError {
     ScanLockClosed,
     Scanner(ScannerError),
     Storage(StorageError),
+}
+
+impl ScanJobError {
+    fn code(&self) -> &'static str {
+        match self {
+            Self::LibraryNotFound => "LIBRARY_NOT_FOUND",
+            Self::ItemNotFound => "ITEM_NOT_FOUND",
+            Self::JobNotFound => "JOB_NOT_FOUND",
+            Self::NoChanges => "NO_CHANGES",
+            Self::AlreadyActive(_) => "ALREADY_ACTIVE",
+            Self::InvalidBatchSize => "INVALID_BATCH_SIZE",
+            Self::ScanLockClosed => "SCAN_LOCK_CLOSED",
+            Self::Scanner(error) => error.code(),
+            Self::Storage(_) => "STORAGE_ERROR",
+        }
+    }
 }
 
 impl std::fmt::Display for ScanJobError {
