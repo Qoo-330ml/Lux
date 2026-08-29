@@ -21,6 +21,26 @@ describe("AdminOperationsPage", () => {
     vi.restoreAllMocks();
   });
 
+  it("shows registered tasks before runtime records, logs, and library names finish loading", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminLibraries").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, "adminJobs").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, "adminStrmProbeJobs").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, "adminChapterDetectionJobs").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, "adminDanmakuMatchJobs").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, "adminLibraryCoverJobs").mockReturnValue(new Promise(() => {}));
+    vi.spyOn(api, "adminLogs").mockReturnValue(new Promise(() => {}));
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+
+    expect(container.querySelector(".lux-admin-page-state")).toBeNull();
+    expect(container.textContent).toContain("还没有注册任务");
+  });
+
   it("separates registered tasks, runtime records, and redacted audit logs", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-1",

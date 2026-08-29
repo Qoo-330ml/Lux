@@ -19,6 +19,22 @@ describe("AdminUsersPage deletion", () => {
     vi.restoreAllMocks();
   });
 
+  it("shows the user list before library access options finish loading", async () => {
+    vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: false,
+      isAdmin: false, canManageServer: false, canRemoteAccess: false, canDownload: false,
+    }] });
+    vi.spyOn(api, "adminLibraries").mockReturnValue(new Promise(() => {}));
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("观众"));
+    });
+
+    expect(container.querySelector(".lux-admin-page-state")).toBeNull();
+    expect(container.querySelector(".lux-admin-user-row")).toBeTruthy();
+  });
+
   it("confirms before disabling and refreshes the list", async () => {
     const list = vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
       id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: false,

@@ -13,15 +13,17 @@ export function AdminUsersPage() {
   const [formError, setFormError] = useState("");
   const create = useMutation({ mutationFn: () => api.createAdminUser(form), onSuccess: () => { setForm({ username: "", displayName: "", password: "", isAdmin: false }); setFormError(""); void queryClient.invalidateQueries({ queryKey: queryKeys.adminUsers }); }, onError: (error) => setFormError(error.message) });
 
-  if (users.isPending || libraries.isPending) return <AdminUserState label="正在读取用户与权限…" />;
-  if (users.error || libraries.error) return <AdminUserState label={users.error?.message || libraries.error?.message || "用户数据加载失败"} error />;
-  const items = users.data.users ?? [];
-  const availableLibraries = libraries.data.libraries ?? [];
+  if (users.error && !users.data) return <AdminUserState label={users.error.message || "用户数据加载失败"} error />;
+  if (users.isPending) return <AdminUserState label="正在读取用户列表…" />;
+  const items = users.data?.users ?? [];
+  const availableLibraries = libraries.data?.libraries ?? [];
   function submit(event: FormEvent) { event.preventDefault(); if (!form.username.trim() || !form.password) { setFormError("用户名和密码不能为空"); return; } create.mutate(); }
 
   return (
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading"><div><h1>用户与权限</h1><p>管理账户状态、远程访问、下载和媒体库访问范围。</p></div></header>
+      {libraries.isPending ? <p className="lux-admin-muted" role="status">用户列表已加载，正在读取媒体库权限选项…</p> : null}
+      {libraries.error ? <p className="lux-error-copy" role="alert">媒体库权限选项加载失败：{libraries.error.message}</p> : null}
       <section className="lux-admin-panel lux-admin-create-panel"><div className="lux-admin-panel-heading"><div><h2>创建用户</h2></div><Plus size={20} className="lux-admin-panel-icon" /></div><form className="lux-admin-form lux-admin-user-create-form" onSubmit={submit}><label>用户名<input value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} autoComplete="off" /></label><label>显示名称<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></label><label>初始密码<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} autoComplete="new-password" /></label><label className="lux-admin-toggle"><input type="checkbox" checked={form.isAdmin} onChange={(event) => setForm({ ...form, isAdmin: event.target.checked })} /><span>服务器管理员</span></label><button className="lux-button lux-button-primary" type="submit" disabled={create.isPending}><Plus size={16} /> {create.isPending ? "创建中…" : "创建用户"}</button></form>{formError ? <p className="lux-error-copy">{formError}</p> : null}</section>
       <section className="lux-admin-panel"><div className="lux-admin-panel-heading"><div><h2>账户列表</h2></div><span className="lux-status-pill">{items.length} 个账户</span></div><div className="lux-admin-user-list">{items.map((user) => <UserAdminRow key={user.id} user={user} libraryIds={availableLibraries.map((library) => library.id)} libraryNames={new Map(availableLibraries.map((library) => [library.id, library.name]))} />)}</div></section>
     </div>

@@ -258,17 +258,16 @@ export function AdminOperationsPage() {
     });
   }, [logLevel, logSearch, logs.data?.events]);
 
-  if (tasks.isLoading || libraries.isLoading || jobs.isLoading || metadataJobs.isLoading || strmJobs.isLoading || chapterJobs.isLoading || danmakuJobs.isLoading || libraryCoverJobs.isLoading || logs.isLoading) {
-    return <AdminOperationsState label="正在读取注册任务、运行记录与日志…" />;
-  }
-  if (tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error || logs.error) {
-    return <AdminOperationsState label={(tasks.error || libraries.error || jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error || logs.error)?.message || "任务数据加载失败"} error />;
-  }
+  if (tasks.error && !tasks.data) return <AdminOperationsState label={tasks.error.message || "注册任务加载失败"} error />;
+  if (tasks.isLoading) return <AdminOperationsState label="正在读取注册任务…" />;
 
   const runningCount = jobItems.filter(isActiveJob).length;
   const failedCount = jobItems.filter((job) => job.status === "FAILED").length;
   const enabledCount = registeredTasks.filter((task) => task.isEnabled && Boolean(task.schedule)).length;
   const libraryNames = new Map((libraries.data?.libraries ?? []).map((library) => [library.id, library.name]));
+  const runtimeLoading = jobs.isLoading || metadataJobs.isLoading || strmJobs.isLoading || chapterJobs.isLoading || danmakuJobs.isLoading || libraryCoverJobs.isLoading;
+  const runtimeError = jobs.error || metadataJobs.error || strmJobs.error || chapterJobs.error || danmakuJobs.error || libraryCoverJobs.error;
+  const logsLoading = logs.isLoading;
   async function exportLogs() {
     setLogExportError("");
     setLogExportSuccess(false);
@@ -301,6 +300,10 @@ export function AdminOperationsPage() {
       <header className="lux-admin-page-heading lux-operations-heading">
         <div><span className="lux-eyebrow">任务总览</span><h1>任务与日志</h1><p>所有后台工作都从系统或插件注册开始。</p></div>
       </header>
+      {libraries.isLoading ? <p className="lux-admin-muted" role="status">注册任务已加载，正在读取媒体库名称…</p> : null}
+      {libraries.error ? <p className="lux-error-copy" role="alert">媒体库名称加载失败：{libraries.error.message}</p> : null}
+      {runtimeError ? <p className="lux-error-copy" role="alert">部分运行记录加载失败：{runtimeError.message}</p> : null}
+      {logs.error ? <p className="lux-error-copy" role="alert">系统日志加载失败：{logs.error.message}</p> : null}
 
       <section className="lux-operations-summary" aria-label="任务概览">
         <OperationsStat label="已注册任务" value={tasks.data?.total ?? registeredTasks.length} detail="系统与插件提供" icon={<ClipboardList size={18} />} />
@@ -326,7 +329,7 @@ export function AdminOperationsPage() {
         />
       ) : null}
       {tab === "runs" ? (
-        <RunsSection
+        runtimeLoading ? <AdminOperationsState label="正在读取运行记录…" /> : <RunsSection
           jobs={jobItems}
           libraryNames={libraryNames}
           status={status}
@@ -337,7 +340,7 @@ export function AdminOperationsPage() {
         />
       ) : null}
       {tab === "logs" ? (
-        <LogsSection
+        logsLoading ? <AdminOperationsState label="正在读取系统日志…" /> : <LogsSection
           logs={logItems}
           level={logLevel}
           search={logSearch}

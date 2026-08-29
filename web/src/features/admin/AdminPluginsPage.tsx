@@ -82,10 +82,13 @@ export function AdminPluginsPage() {
     return () => document.removeEventListener("keydown", closeOnEscape);
   }, [closeStoreDialog, storeDialogOpen]);
 
-  if (plugins.isPending || installedPlugins.isPending || store.isPending) return <AdminPluginsState label="正在读取插件库…" />;
-  if (plugins.error || installedPlugins.error || store.error) return <AdminPluginsState label={plugins.error?.message || installedPlugins.error?.message || store.error?.message || "插件库加载失败"} error />;
+  const activePlugins = mode === "store" ? plugins : installedPlugins;
+  if (activePlugins.error && !activePlugins.data) return <AdminPluginsState label={activePlugins.error.message || "插件列表加载失败"} error />;
+  if (activePlugins.isPending) return <AdminPluginsState label={mode === "store" ? "正在读取插件商店…" : "正在读取已安装插件…"} />;
 
-  const items = (mode === "store" ? plugins.data.plugins : installedPlugins.data.plugins) ?? [];
+  const items = activePlugins.data?.plugins ?? [];
+  const auxiliaryLoading = (mode === "store" ? installedPlugins.isPending : plugins.isPending) || store.isPending;
+  const auxiliaryError = (mode === "store" ? installedPlugins.error : plugins.error) || store.error;
   return (
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
@@ -95,6 +98,8 @@ export function AdminPluginsPage() {
           <button className="lux-button lux-button-compact lux-button-secondary lux-admin-plugin-store-trigger" type="button" aria-label="设置插件商店来源" aria-haspopup="dialog" aria-expanded={storeDialogOpen} onClick={() => setStoreDialogOpen(true)}><Globe2 size={15} /> 插件商店来源</button>
         </div>
       </header>
+      {auxiliaryLoading ? <p className="lux-admin-muted" role="status">当前列表已加载，正在读取其他插件数据…</p> : null}
+      {auxiliaryError ? <p className="lux-error-copy" role="alert">部分插件数据加载失败：{auxiliaryError.message}</p> : null}
       {storeDialogOpen ? (
         <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeStoreDialog(); }}>
           <section className="lux-admin-plugin-dialog lux-admin-plugin-store-dialog" role="dialog" aria-modal="true" aria-labelledby="plugin-store-source-dialog-title">
@@ -103,6 +108,8 @@ export function AdminPluginsPage() {
               <button ref={storeDialogCloseRef} className="lux-icon-button lux-admin-plugin-dialog-close" type="button" aria-label="关闭插件商店来源设置" onClick={closeStoreDialog}><X size={17} /></button>
             </div>
             <form className="lux-admin-plugin-dialog-form" onSubmit={(event) => { event.preventDefault(); updateStore.mutate(); }}>
+              {store.isPending ? <p className="lux-admin-muted" role="status">正在读取插件商店来源…</p> : null}
+              {store.error ? <p className="lux-error-copy" role="alert">插件商店来源加载失败：{store.error.message}</p> : null}
               <label htmlFor="lux-plugin-store-url">目录地址<input id="lux-plugin-store-url" type="url" value={storeUrl} onChange={(event) => setStoreUrl(event.target.value)} placeholder={store.data?.defaultUrl} required /></label>
               <div className="lux-admin-plugin-dialog-actions">
                 <button className="lux-button lux-button-secondary" type="button" onClick={closeStoreDialog}>取消</button>
@@ -114,8 +121,8 @@ export function AdminPluginsPage() {
         </div>
       ) : null}
       <nav className="lux-admin-plugin-tabs" aria-label="插件库视图">
-        <button className={mode === "store" ? "is-active" : ""} type="button" aria-pressed={mode === "store"} onClick={() => setMode("store")}>插件商店<span>{plugins.data.total ?? plugins.data.plugins?.length ?? 0}</span></button>
-        <button className={mode === "installed" ? "is-active" : ""} type="button" aria-pressed={mode === "installed"} onClick={() => setMode("installed")}>已安装管理<span>{installedPlugins.data.total ?? installedPlugins.data.plugins?.length ?? 0}</span></button>
+        <button className={mode === "store" ? "is-active" : ""} type="button" aria-pressed={mode === "store"} onClick={() => setMode("store")}>插件商店<span>{plugins.data?.total ?? plugins.data?.plugins?.length ?? 0}</span></button>
+        <button className={mode === "installed" ? "is-active" : ""} type="button" aria-pressed={mode === "installed"} onClick={() => setMode("installed")}>已安装管理<span>{installedPlugins.data?.total ?? installedPlugins.data?.plugins?.length ?? 0}</span></button>
       </nav>
       <section className="lux-admin-plugin-grid" aria-label="可用插件">
         {items.length === 0 ? <div className="lux-admin-empty"><PackageOpen size={24} /><h2>{mode === "store" ? "暂无可用插件" : "还没有已安装插件"}</h2><p>{mode === "store" ? "插件目录为空，请稍后重试。" : "从插件商店安装插件后，会在这里统一配置和管理。"}</p></div> : items.map((plugin) => <PluginCard key={plugin.id} plugin={plugin} installing={install.isPending && install.variables === plugin.id} installedManagement={mode === "installed"} toggling={toggleEnabled.isPending && toggleEnabled.variables?.pluginId === plugin.id} uninstalling={uninstall.isPending && uninstall.variables === plugin.id} updating={update.isPending && update.variables === plugin.id} onInstall={() => install.mutate(plugin.id)} onToggleEnabled={(enabled) => toggleEnabled.mutate({ pluginId: plugin.id, enabled })} onUninstall={() => uninstall.mutate(plugin.id)} onUpdate={() => update.mutate(plugin.id)} />)}

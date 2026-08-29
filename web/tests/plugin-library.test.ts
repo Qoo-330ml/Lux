@@ -98,6 +98,17 @@ describe("AdminPluginsPage plugin cards", () => {
     });
   }
 
+  it("shows plugin cards before the store source and installed list finish loading", async () => {
+    vi.mocked(api.adminInstalledPlugins).mockReturnValueOnce(new Promise(() => {}));
+    vi.mocked(api.adminPluginStore).mockReturnValueOnce(new Promise(() => {}));
+
+    await renderPage();
+
+    expect(container.querySelector(".lux-admin-plugin-card")).toBeTruthy();
+    expect(container.querySelector(".lux-admin-page-state")).toBeNull();
+    expect(container.textContent).toContain("TMDb 元数据插件");
+  });
+
   it("keeps plugin cards compact and exposes version, category, and install state", async () => {
     await renderPage();
 

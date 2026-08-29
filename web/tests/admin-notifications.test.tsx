@@ -131,6 +131,25 @@ describe("AdminNotificationsPage", () => {
     vi.restoreAllMocks();
   });
 
+  it("shows configured destinations before provider and delivery data finish loading", async () => {
+    vi.mocked(api.adminNotificationProviders).mockReturnValueOnce(new Promise(() => {}));
+    vi.mocked(api.adminWebhookDeliveries).mockReturnValueOnce(new Promise(() => {}));
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("本地接收器"));
+    });
+
+    expect(container.querySelector(".lux-admin-page-state")).toBeNull();
+    expect(container.querySelector(".lux-notification-destination")).toBeTruthy();
+  });
+
   it("shows destinations, event choices, delivery failures, and retry action", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
