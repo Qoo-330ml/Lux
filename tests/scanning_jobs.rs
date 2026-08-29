@@ -2164,6 +2164,116 @@ async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn s
 }
 
 #[cfg(unix)]
+#[tokio::test]
+async fn postprocessing_does_not_hold_the_shared_scan_lock()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("First Movies", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Second Movies", LibraryKind::Movie, false)
+        .await?;
+    let first_root = temp_dir.path().join("first");
+    let second_root = temp_dir.path().join("second");
+    tokio::fs::create_dir_all(&first_root).await?;
+    tokio::fs::create_dir_all(&second_root).await?;
+    tokio::fs::write(first_root.join("First.Movie.2024.mkv"), b"fixture").await?;
+    tokio::fs::write(second_root.join("Second.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(
+            first_library.id,
+            first_root.to_str().ok_or("non-utf8 first root")?,
+        )
+        .await?;
+    libraries
+        .add_root(
+            second_library.id,
+            second_root.to_str().ok_or("non-utf8 second root")?,
+        )
+        .await?;
+
+    let fake_ffprobe = temp_dir.path().join("slow-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+sleep 1
+printf '%s' '{"format":{"format_name":"mp4"},"streams":[]}'
+"#,
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let scan_lock = Arc::new(Semaphore::new(1));
+    let first_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
+    let second_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock);
+    let first_job = first_jobs.create_movie_scan_job(first_library.id).await?;
+    let second_job = second_jobs.create_movie_scan_job(second_library.id).await?;
+    let first_job_id = first_job.id.clone();
+    let first_probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    let first_worker = tokio::spawn(async move {
+        first_jobs
+            .run_to_completion(&first_job_id, 100, Some(first_probe))
+            .await
+    });
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let phase: String = sqlx::query_scalar("SELECT scan_phase FROM scan_jobs WHERE id = ?")
+                .bind(&first_job.id)
+                .fetch_one(database.pool())
+                .await?;
+            if phase == "POSTPROCESSING" {
+                break Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+
+    let second_job_id = second_job.id.clone();
+    let second_worker = tokio::spawn(async move {
+        second_jobs
+            .run_to_completion(&second_job_id, 100, None)
+            .await
+    });
+    tokio::time::timeout(Duration::from_millis(500), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+                .bind(&second_job.id)
+                .fetch_one(database.pool())
+                .await?;
+            if status != "PENDING" {
+                break Ok::<(), sqlx::Error>(());
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await??;
+
+    second_worker.await??;
+    first_worker.await??;
+    let first_phase: String = sqlx::query_scalar("SELECT scan_phase FROM scan_jobs WHERE id = ?")
+        .bind(&first_job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(first_phase, "IDLE");
+    Ok(())
+}
+
+#[cfg(unix)]
 async fn finish_scan(
     jobs: &ScanJobService,
     job_id: &str,
