@@ -160,7 +160,7 @@ Lux 提供一个服务器级共享管理员 API Key，行为与 Emby API Key 兼
 Lux 电影查询要求有效 Web session：
 
 - `GET /api/v1/libraries`：返回已启用媒体库的基本信息，不暴露服务器路径。
-- `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`metadataStatus=PENDING`、`sortBy=Name|DateCreated|PremiereDate|CommunityRating` 和 `sortOrder=Ascending|Descending`（同时兼容下划线参数名），筛选、排序和分页在 SQLite 查询中完成；评分排序将无评分条目稳定放在有评分条目之后。`metadataStatus=PENDING` 返回仍有待确认候选的条目。
+- `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`metadataStatus=PENDING`、`sortBy=Name|DateCreated|PremiereDate|CommunityRating` 和 `sortOrder=Ascending|Descending`（同时兼容下划线参数名），筛选、排序和分页在 SQLite 查询中完成；发行日期排序优先使用完整 `premiere_date`，缺少发行日期时回退到 `production_year`，两者都缺少的条目稳定排在最后；评分排序将无评分条目稳定放在有评分条目之后。`metadataStatus=PENDING` 返回仍有待确认候选的条目。
 - `GET /api/v1/favorites?page=1&pageSize=50`：返回当前用户跨可见媒体库的收藏条目，按最近添加倒序分页；服务端执行用户状态和媒体库 ACL。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
 - `GET /api/v1/home`：返回当前用户继续观看、推荐和可见媒体库入口；每个媒体库入口包含最多 12 条该库最新资源，按 `media_items.added_at` 倒序。所有内容均执行媒体库 ACL；响应中的 `recentlyAdded` 字段保留用于旧客户端兼容，Lux Web 首页按媒体库分别展示最新资源。

@@ -1087,12 +1087,14 @@ impl Database {
             (CatalogSort::DateCreated, true) => "mi.added_at DESC, LOWER(mi.title) ASC, mi.id ASC",
             (CatalogSort::DateCreated, false) => "mi.added_at ASC, LOWER(mi.title) ASC, mi.id ASC",
             (CatalogSort::PremiereDate, true) => {
-                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.premiere_date DESC, LOWER(mi.title) ASC, mi.id ASC"
+                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
+                 COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') DESC,
+                 LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::PremiereDate, false) => {
-                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL THEN 1 ELSE 0 END ASC,
-                 mi.premiere_date ASC, LOWER(mi.title) ASC, mi.id ASC"
+                "CASE WHEN NULLIF(mi.premiere_date, '') IS NULL AND mi.production_year IS NULL THEN 1 ELSE 0 END ASC,
+                 COALESCE(NULLIF(mi.premiere_date, ''), CAST(mi.production_year AS TEXT) || '-01-01') ASC,
+                 LOWER(mi.title) ASC, mi.id ASC"
             }
             (CatalogSort::Rating, true) => {
                 "CASE WHEN mi.rating IS NULL THEN 1 ELSE 0 END ASC,

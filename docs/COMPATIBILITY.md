@@ -326,6 +326,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - 2026-08-23 Infuse 8.5.5726（macOS arm64）连接探针发现：登录成功后请求 `/DisplayPreferences/usersettings?userId=:userId&client=:client`，此前因路由缺失落入 Web 首页 HTML，导致 JSON 解码失败；现已补齐带认证的 `GET /DisplayPreferences/{displayPreferencesId}`，根路径和 `/emby` 前缀均有自动协议回归。完整 Infuse 媒体库、播放和状态流程仍待部署后复测。
 - LUX-024：已完成 Users/Public、AuthenticateByName、Sessions/Logout 的本地协议 shape 和 token 脱敏测试；VidHub 真实登录通过；SenPlayer 认证响应解析失败的历史缺口已补充更完整的 `User`/`SessionInfo` shape，并补齐认证后 `GET /Users/:userId` 用户详情路由；P0 真实 UI 复测已通过。
 - Emby `GET /Items/Counts` 现已支持根路径和 `/emby` 前缀，执行 Emby token/API key 鉴权、用户媒体库 ACL，并支持 `UserId` 与 `IsFavorite` 过滤；`tests/emby_counts.rs` 覆盖协议响应。尚未以 Filmly 或 CapyPlayer 真实 UI 复测，不据此宣称客户端兼容。
+- Emby 与 Lux 媒体库列表的 `SortBy=PremiereDate`/`sortBy=PremiereDate` 在条目没有完整发行日期时回退到 `ProductionYear`，并将两者都缺少的条目稳定放在最后；发行日期新旧两个方向均有服务端回归覆盖。
 - 2026-08-23 AfuseKt `2.9.8.6-fix`（Android）HAR 显示其媒体库首页请求会发送空值 `IsFavorite=`；此前 `/Users/{userId}/Items` 和 `/Items/Latest` 因此返回 400，导致库条目与最新资源不显示。Emby 查询现在将空的可选布尔值按未提供处理，`tests/catalog.rs` 已加入 Items/Latest 回归；修复后的真实客户端复测待部署后进行。该客户端请求的 `/Genres` 仍属于规范明确未实现的端点。
 - 2026-08-11 服务器名称兼容修复：第三方客户端添加服务器时可从 `GET /System/Info/Public` 的 `ServerName` 读取名称；认证后的 `GET /System/Info`、`Users/Public`、`AuthenticateByName` 返回的 `User.ServerName` 也统一读取管理员设置的 `serverName`。官方 Emby 文档将 `ServerName` 定义为服务器名称字段；本次加入 `tests/emby_system.rs` 协议回归，尚未在当前环境重新进行 VidHub UI 点选复测。
 - SenPlayer 列表兼容修复：当请求的 `Fields` 未包含 `MediaSources` 或 `MediaStreams` 时，Emby 列表响应不再携带这些字段；详情和 `PlaybackInfo` 仍返回完整媒体源。自动化回归已覆盖，真实客户端需要清理缓存或重新进入库后复测。

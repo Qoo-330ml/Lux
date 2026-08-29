@@ -1207,6 +1207,69 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
 }
 
 #[tokio::test]
+async fn catalog_premiere_date_sort_falls_back_to_production_year() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, production_year,
+                identification_status, added_at, has_available_source
+             ) VALUES
+                ('item-newer', ?, 'MOVIE', 'A Newer Movie', 'a newer movie', 2025, 'LOCAL_CONFIRMED', 100, 1),
+                ('item-older', ?, 'MOVIE', 'B Older Movie', 'b older movie', 2010, 'LOCAL_CONFIRMED', 100, 1)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media items");
+
+    let library_ids = vec![library_id];
+    let item_types = vec!["MOVIE".to_owned()];
+    let empty = Vec::new();
+    let empty_years = Vec::<i64>::new();
+    for (descending, expected) in [
+        (false, vec!["B Older Movie", "A Newer Movie"]),
+        (true, vec!["A Newer Movie", "B Older Movie"]),
+    ] {
+        let filter = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: "test-user",
+            item_types: &item_types,
+            excluded_item_types: &empty,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            years: &empty_years,
+            is_played: None,
+            is_favorite: None,
+            metadata_pending: false,
+            sort_by: CatalogSort::PremiereDate,
+            descending,
+            offset: 0,
+            limit: 10,
+        };
+        let (rows, total) = database
+            .list_filtered_catalog_rows(&filter)
+            .await
+            .expect("catalog rows");
+        let titles = rows.into_iter().map(|row| row.title).collect::<Vec<_>>();
+        assert_eq!(total, 2);
+        assert_eq!(titles, expected, "descending={descending}");
+    }
+}
+
+#[tokio::test]
 async fn media_source_library_page_respects_limit_and_offset() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

@@ -1071,6 +1071,21 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let release_page_body: Value = release_page.json().await?;
     assert_eq!(release_page_body["items"][0]["title"], "Alpha Movie");
 
+    let release_page_ascending = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=PremiereDate&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(release_page_ascending.status(), reqwest::StatusCode::OK);
+    let release_page_ascending_body: Value = release_page_ascending.json().await?;
+    assert_eq!(
+        release_page_ascending_body["items"][0]["title"],
+        "Beta Movie"
+    );
+
     let rating_page = client
         .get(format!(
             "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=CommunityRating&sort_order=Descending",
