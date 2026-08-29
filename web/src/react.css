@@ -820,6 +820,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-emby-connection-result strong { color: #fff; font-size: .76rem; }
 .lux-emby-connection-result span { color: var(--lux-subtle); font-size: .67rem; overflow-wrap: anywhere; }
 .lux-emby-connection-result small { color: currentColor; font-size: .67rem; text-align: right; }
+.lux-emby-user-selection-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 10px; color: var(--lux-muted); font-size: .7rem; }
+.lux-emby-user-selection-toolbar > div { display: flex; flex-wrap: wrap; gap: 7px; }
+.lux-emby-user-selection { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px; }
+.lux-emby-user-option { display: flex; align-items: center; gap: 10px; min-width: 0; padding: 10px 11px; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: var(--lux-muted); background: rgba(255,255,255,.025); cursor: pointer; }
+.lux-emby-user-option:has(input:checked) { border-color: color-mix(in srgb, var(--lux-accent) 55%, var(--lux-line-soft)); background: color-mix(in srgb, var(--lux-accent) 8%, transparent); }
+.lux-emby-user-option input { flex: 0 0 auto; width: 16px; height: 16px; accent-color: var(--lux-accent); }
+.lux-emby-user-option span { display: grid; gap: 3px; min-width: 0; }
+.lux-emby-user-option strong { overflow: hidden; color: #fff; font-size: .74rem; text-overflow: ellipsis; white-space: nowrap; }
+.lux-emby-user-option small { color: var(--lux-subtle); font-size: .65rem; }
 .lux-emby-migration-action { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 12px; border: 1px solid var(--lux-line-soft); border-radius: 9px; background: rgba(255,255,255,.025); }
 .lux-emby-migration-action div { display: grid; gap: 4px; min-width: 0; }
 .lux-emby-migration-action strong { color: #fff; font-size: .76rem; }
@@ -831,6 +840,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-emby-advanced-options[open] > summary::after, .lux-emby-reports[open] > summary::after { content: "－"; }
 .lux-emby-advanced-options > summary span, .lux-emby-reports > summary span { margin-left: auto; color: var(--lux-subtle); font-size: .66rem; }
 .lux-emby-advanced-options > label { max-width: 360px; margin-top: 12px; }
+.lux-emby-advanced-options > .lux-button { margin-top: 12px; }
+.lux-emby-history > summary { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; cursor: pointer; list-style: none; }
+.lux-emby-history > summary::-webkit-details-marker { display: none; }
+.lux-emby-history > summary::after { content: "＋"; color: var(--lux-subtle); font-size: .9rem; }
+.lux-emby-history[open] > summary::after { content: "－"; }
+.lux-emby-history > summary h3 { margin: 0; color: #fff; font-size: .86rem; font-weight: 650; }
+.lux-emby-history > summary > span:last-of-type { color: var(--lux-subtle); font-size: .66rem; }
 .lux-emby-migration-success, .lux-emby-inline-status { display: flex; align-items: center; gap: 7px; margin: 13px 0 0; color: #9bdcb3; font-size: .72rem; }
 .lux-emby-inline-error { display: flex; align-items: center; gap: 7px; margin: 12px 0 0; font-size: .72rem; }
 .lux-emby-job-list { display: grid; gap: 6px; }
@@ -2029,6 +2045,7 @@ html[data-lux-theme="light"] .lux-emby-job-summary strong,
 html[data-lux-theme="light"] .lux-emby-job-progress strong,
 html[data-lux-theme="light"] .lux-emby-job-stats strong,
 html[data-lux-theme="light"] .lux-emby-step-heading h3,
+html[data-lux-theme="light"] .lux-emby-history > summary h3,
 html[data-lux-theme="light"] .lux-emby-migration-action strong,
 html[data-lux-theme="light"] .lux-emby-detail-heading h3,
 html[data-lux-theme="light"] .lux-emby-report-row strong { color: var(--lux-text); }
@@ -2044,6 +2061,7 @@ html[data-lux-theme="light"] .lux-emby-job-summary.is-selected { background: rgb
 
 @media (max-width: 560px) {
   .lux-emby-migration-intro, .lux-emby-migration-action, .lux-emby-detail-heading { align-items: flex-start; flex-direction: column; }
+  .lux-emby-user-selection-toolbar { align-items: flex-start; flex-direction: column; }
   .lux-emby-migration-action > .lux-button { width: 100%; }
   .lux-emby-plugin-settings-actions > .lux-button { flex: 1 1 0; }
   .lux-emby-job-summary { align-items: flex-start; }

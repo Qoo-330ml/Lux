@@ -22,7 +22,7 @@ describe("LuxApiClient Emby migration methods", () => {
 
     const client = new LuxApiClient();
     await expect(client.testAdminEmbyMigration()).resolves.toMatchObject({ serverName: "Home Emby" });
-    await expect(client.createAdminEmbyMigration({ dryRun: true, mergePolicy: "MERGE" })).resolves.toMatchObject({ job: { id: "job-1" } });
+    await expect(client.createAdminEmbyMigration({ dryRun: true, mergePolicy: "MERGE", embyUserIds: ["user-1"] })).resolves.toMatchObject({ job: { id: "job-1" } });
     await client.adminEmbyMigrationUsers("job-1", 2);
     await client.adminEmbyMigrationPersonFavorites("job-1", 3);
 
@@ -31,7 +31,7 @@ describe("LuxApiClient Emby migration methods", () => {
     expect(JSON.parse(String(calls[0]?.[1]?.body))).toEqual({});
     expect(calls[1]?.[0]).toBe("/api/v1/admin/emby-migration");
     expect((calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
-    expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({ dryRun: true, mergePolicy: "MERGE" });
+    expect(JSON.parse(String(calls[1]?.[1]?.body))).toEqual({ dryRun: true, mergePolicy: "MERGE", embyUserIds: ["user-1"] });
     expect(calls[2]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/users?page=2&pageSize=50");
     expect(calls[3]?.[0]).toBe("/api/v1/admin/emby-migration/job-1/person-favorites?page=3&pageSize=50");
   });

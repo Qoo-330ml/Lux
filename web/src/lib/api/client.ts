@@ -555,6 +555,7 @@ export class LuxApiClient {
   createAdminEmbyMigration(input: {
     dryRun: boolean;
     mergePolicy: "MERGE" | "OVERWRITE" | "SKIP";
+    embyUserIds: string[];
   }) {
     return this.request<{ job: AdminEmbyMigrationJob }>("/api/v1/admin/emby-migration", {
       method: "POST",

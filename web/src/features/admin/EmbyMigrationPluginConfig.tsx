@@ -3,7 +3,7 @@ import { AlertTriangle, CheckCircle2, CloudDownload, LoaderCircle, RefreshCw, Sa
 import { useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminPlugin, AdminEmbyMigrationJob } from "../../lib/api/types";
+import type { AdminPlugin, AdminEmbyMigrationJob, AdminEmbyMigrationSourceUser } from "../../lib/api/types";
 import { EmbyMigrationReports, type ReportTab, useMigrationReport } from "./EmbyMigrationReports";
 
 type MergePolicy = "MERGE" | "OVERWRITE" | "SKIP";
@@ -63,7 +63,7 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
       <div className="lux-emby-migration-intro">
         <div>
           <span className="lux-admin-eyebrow">Emby → Lux</span>
-          <p>保存并测试连接，先预览匹配结果，再执行导入。</p>
+          <p>保存并测试连接，只迁移你选中的 Emby 用户。</p>
         </div>
         <span className="lux-emby-flow-label">3 步完成</span>
       </div>
@@ -104,14 +104,31 @@ function TestConnectionButton({ onStart, onSuccess, onError, disabled }: { onSta
 function MigrationWorkspace({ connection }: { connection: ConnectionInfo | null }) {
   const queryClient = useQueryClient();
   const [mergePolicy, setMergePolicy] = useState<MergePolicy>("MERGE");
+  const [selectedUserIds, setSelectedUserIds] = useState<string[]>([]);
+  const [sourceUserPage, setSourceUserPage] = useState(1);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [tab, setTab] = useState<ReportTab>("users");
   const [reportPage, setReportPage] = useState<Record<ReportTab, number>>(() => initialReportPages());
+  const [historyOpen, setHistoryOpen] = useState(false);
+
+  const sourceUsers = useQuery({
+    queryKey: queryKeys.adminEmbyMigrationSourceUsers(sourceUserPage),
+    queryFn: () => api.adminEmbyMigrationSourceUsers(sourceUserPage),
+    enabled: Boolean(connection),
+    staleTime: 5 * 60_000,
+    retry: false,
+  });
+  const users = sourceUsers.data?.users ?? [];
+  const sourceUserPageSize = sourceUsers.data?.pageSize ?? 100;
+  const sourceUserTotal = sourceUsers.data?.total ?? 0;
+  const sourceUserPages = Math.max(1, Math.ceil(sourceUserTotal / sourceUserPageSize));
+  const allVisibleUsersSelected = users.length > 0 && users.every((user) => selectedUserIds.includes(user.id));
 
   const jobs = useQuery({
     queryKey: queryKeys.adminEmbyMigrations(),
     queryFn: () => api.adminEmbyMigrations(),
-    refetchInterval: 5_000,
+    enabled: historyOpen && Boolean(connection),
+    refetchInterval: historyOpen ? 5_000 : false,
   });
   const selectedFromList = jobs.data?.jobs?.find((job) => job.id === selectedJobId) ?? null;
   const detail = useQuery({
@@ -121,16 +138,21 @@ function MigrationWorkspace({ connection }: { connection: ConnectionInfo | null 
     refetchInterval: (query) => isActiveJob(query.state.data?.job) ? 5_000 : false,
   });
   const job = detail.data?.job ?? selectedFromList;
-  const previewReady = job?.dryRun === true && job.status === "COMPLETED";
   const active = isActiveJob(job);
-  const canCreate = Boolean(connection && !active);
+  const canCreate = Boolean(connection && selectedUserIds.length > 0 && !active);
 
   useEffect(() => {
-    if (!selectedJobId && jobs.data?.jobs?.[0]) selectJob(jobs.data.jobs[0].id);
-  }, [jobs.data?.jobs, selectedJobId]);
+    setSelectedUserIds([]);
+    setSourceUserPage(1);
+    setSelectedJobId(null);
+  }, [connection]);
 
   const createJob = useMutation({
-    mutationFn: (dryRun: boolean) => api.createAdminEmbyMigration({ dryRun, mergePolicy }),
+    mutationFn: (dryRun: boolean) => api.createAdminEmbyMigration({
+      dryRun,
+      mergePolicy,
+      embyUserIds: selectedUserIds,
+    }),
     onSuccess: ({ job: created }) => {
       selectJob(created.id);
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminEmbyMigrations() });
@@ -156,34 +178,57 @@ function MigrationWorkspace({ connection }: { connection: ConnectionInfo | null 
     setReportPage(initialReportPages());
   }
 
-  const actionIsPreview = !previewReady;
   const actionDisabled = !canCreate || createJob.isPending;
-  const actionLabel = createJob.isPending
-    ? "创建中…"
-    : active
-      ? "迁移进行中"
-      : previewReady
-        ? "执行迁移"
-        : connection
-          ? "生成预览"
-          : "先测试连接";
+  const actionLabel = createJob.isPending ? "创建中…" : active ? "迁移进行中" : "迁移选中用户";
+  const toggleUser = (user: AdminEmbyMigrationSourceUser) => {
+    setSelectedUserIds((current) => current.includes(user.id)
+      ? current.filter((id) => id !== user.id)
+      : [...current, user.id]);
+  };
 
   return (
     <>
+      <section className="lux-emby-migration-section" aria-labelledby="emby-migration-users-heading">
+        <StepHeading number="2" headingId="emby-migration-users-heading" title="选择用户" description="只会读取和迁移勾选用户的播放状态、收藏和权限。" icon={<ShieldCheck size={18} />} />
+        {!connection ? <EmptyState label="先测试连接" detail="连接成功后才能选择要迁移的 Emby 用户。" /> : sourceUsers.isPending ? <LoadingState label="正在读取 Emby 用户…" /> : sourceUsers.error ? <InlineError message={sourceUsers.error.message} /> : (
+          <>
+            <div className="lux-emby-user-selection-toolbar">
+              <span>已选 {selectedUserIds.length} / {sourceUserTotal} 位用户</span>
+              <div>
+                <button className="lux-button lux-button-secondary" type="button" disabled={users.length === 0 || allVisibleUsersSelected} onClick={() => setSelectedUserIds((current) => Array.from(new Set([...current, ...users.map((user) => user.id)])))}>全选当前页</button>
+                <button className="lux-button lux-button-secondary" type="button" disabled={selectedUserIds.length === 0} onClick={() => setSelectedUserIds([])}>清空</button>
+              </div>
+            </div>
+            <div className="lux-emby-user-selection" role="group" aria-labelledby="emby-migration-users-heading">
+              {users.map((user) => <label key={user.id} className="lux-emby-user-option">
+                <input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => toggleUser(user)} aria-label={`选择 Emby 用户 ${user.name}`} />
+                <span><strong>{user.name}</strong><small>{user.isDisabled ? "已禁用" : "可用"}{user.isAdministrator ? " · 管理员" : ""}</small></span>
+              </label>)}
+              {users.length === 0 ? <EmptyState label="没有可迁移的用户" detail="Emby 没有返回用户列表。" /> : null}
+            </div>
+            {sourceUserPages > 1 ? <div className="lux-emby-pagination" aria-label="Emby 用户分页">
+              <button className="lux-button lux-button-secondary" type="button" disabled={sourceUserPage <= 1} onClick={() => setSourceUserPage((page) => page - 1)}>上一页</button>
+              <span>第 {sourceUserPage} / {sourceUserPages} 页</span>
+              <button className="lux-button lux-button-secondary" type="button" disabled={sourceUserPage >= sourceUserPages} onClick={() => setSourceUserPage((page) => page + 1)}>下一页</button>
+            </div> : null}
+          </>
+        )}
+      </section>
+
       <section className="lux-emby-migration-section" aria-labelledby="emby-migration-action-heading">
-        <StepHeading number="2" headingId="emby-migration-action-heading" title="迁移数据" description={previewReady ? "预览已完成，确认匹配结果后执行导入。" : "默认先生成预览，不会创建用户或修改播放状态。"} icon={<CloudDownload size={18} />} />
+        <StepHeading number="3" headingId="emby-migration-action-heading" title="开始迁移" description="迁移范围固定为上面勾选的用户。默认合并已有状态。" icon={<CloudDownload size={18} />} />
         <div className="lux-emby-migration-action">
           <div>
-            <strong>{previewReady ? "预览已完成" : "先从预览开始"}</strong>
-            <span>{previewReady ? "确认报告无误后，可以执行正式迁移。" : "默认合并已有播放状态。"}</span>
+            <strong>{selectedUserIds.length > 0 ? `准备迁移 ${selectedUserIds.length} 位用户` : "请先选择用户"}</strong>
+            <span>不会默认迁移其他 Emby 用户。</span>
           </div>
-          <button className="lux-button lux-button-primary" type="button" aria-label={previewReady ? "执行 Emby 迁移" : "开始 Emby 迁移"} disabled={actionDisabled} onClick={() => createJob.mutate(actionIsPreview)}>
-            {previewReady ? <CloudDownload size={15} /> : <RefreshCw size={15} />}
+          <button className="lux-button lux-button-primary" type="button" aria-label="迁移选中用户" disabled={actionDisabled} onClick={() => createJob.mutate(false)}>
+            <CloudDownload size={15} />
             {actionLabel}
           </button>
         </div>
         <details className="lux-emby-advanced-options">
-          <summary>高级选项 <span>默认：合并</span></summary>
+          <summary>高级选项 <span>预览和合并策略</span></summary>
           <label>
             <span>已有播放状态</span>
             <select value={mergePolicy} onChange={(event) => setMergePolicy(event.target.value as MergePolicy)}>
@@ -192,19 +237,20 @@ function MigrationWorkspace({ connection }: { connection: ConnectionInfo | null 
               <option value="SKIP">跳过：不修改已有状态</option>
             </select>
           </label>
+          <button className="lux-button lux-button-secondary" type="button" disabled={actionDisabled} onClick={() => createJob.mutate(true)}><RefreshCw size={15} /> 生成预览</button>
         </details>
         {createJob.error ? <InlineError message={createJob.error.message} /> : null}
-        {createJob.data ? <p className="lux-emby-migration-success" role="status"><CheckCircle2 size={15} /> {createJob.data.job.dryRun ? "预览任务已创建" : "正式迁移任务已创建"}</p> : null}
+        {createJob.data ? <p className="lux-emby-migration-success" role="status"><CheckCircle2 size={15} /> {createJob.data.job.dryRun ? "预览任务已创建" : "迁移任务已创建"}</p> : null}
       </section>
 
-      <section className="lux-emby-migration-section" aria-labelledby="emby-migration-jobs-heading">
-        <StepHeading number="3" headingId="emby-migration-jobs-heading" title="任务与结果" description="任务会自动保存，运行中每 5 秒更新一次。" icon={<RefreshCw size={18} />} />
+      <details className="lux-emby-migration-section lux-emby-history" open={historyOpen} onToggle={(event) => setHistoryOpen(event.currentTarget.open)}>
+        <summary aria-labelledby="emby-migration-jobs-heading"><span className="lux-admin-eyebrow">可选</span><h3 id="emby-migration-jobs-heading">历史任务</h3><span>需要时查看旧任务和详细报告</span></summary>
         {jobs.isPending ? <LoadingState label="正在读取任务…" /> : jobs.error ? <InlineError message={jobs.error.message} /> : jobs.data?.jobs?.length ? (
           <div className="lux-emby-job-list">
             {jobs.data.jobs.map((candidate) => <JobSummary key={candidate.id} job={candidate} selected={candidate.id === selectedJobId} onSelect={() => selectJob(candidate.id)} />)}
           </div>
-        ) : <EmptyState label="还没有任务" detail="测试连接后，点击“生成预览”开始。" />}
-      </section>
+        ) : <EmptyState label="还没有任务" detail="选中用户后开始一次迁移。" />}
+      </details>
 
       {job ? <MigrationDetails key={job.id} job={job} tab={tab} page={reportPage[tab]} onTabChange={(nextTab) => { setTab(nextTab); setReportPage((current) => ({ ...current, [nextTab]: 1 })); }} onPageChange={(page) => setReportPage((current) => ({ ...current, [tab]: page }))} onCancel={() => cancelJob.mutate(job.id)} onRetry={() => retryJob.mutate(job.id)} actionPending={cancelJob.isPending || retryJob.isPending} /> : null}
     </>

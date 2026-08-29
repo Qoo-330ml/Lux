@@ -29,13 +29,22 @@ describe("EmbyMigrationPluginConfig", () => {
       serverId: "server-1",
       historyCapability: "ITEM_STATE",
     });
+    const sourceUsers = vi.spyOn(api, "adminEmbyMigrationSourceUsers").mockResolvedValue({
+      users: [
+        { id: "user-1", name: "Alice", isDisabled: false, isAdministrator: false },
+        { id: "user-2", name: "Bob", isDisabled: true, isAdministrator: false },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 100,
+    });
     const migrationJob = {
         id: "job-1",
         sourceLabel: "emby.local",
         sourceBaseUrl: "http://emby.local:8096/",
         status: "PENDING",
         phase: "TESTING",
-        dryRun: true,
+        dryRun: false,
         mergePolicy: "MERGE",
         historyCapability: "ITEM_STATE",
         processedCount: 0,
@@ -139,13 +148,20 @@ describe("EmbyMigrationPluginConfig", () => {
     });
     expect(container.textContent).toContain("家庭 Emby");
     expect(container.textContent).toContain("完整历史播放时间线不可用");
-
-    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="开始 Emby 迁移"]')?.click());
     await act(async () => {
-      await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({ dryRun: true, mergePolicy: "MERGE" }));
+      await vi.waitFor(() => expect(sourceUsers).toHaveBeenCalledWith(1));
     });
-    expect(container.textContent).toContain("预览任务已创建");
-    expect(container.textContent).not.toContain("执行迁移");
+    expect(api.adminEmbyMigrations).not.toHaveBeenCalled();
+    expect(container.textContent).toContain("Alice");
+    act(() => {
+      container.querySelector<HTMLInputElement>('input[aria-label="选择 Emby 用户 Alice"]')?.click();
+    });
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="迁移选中用户"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(createJob).toHaveBeenCalledWith({ dryRun: false, mergePolicy: "MERGE", embyUserIds: ["user-1"] }));
+    });
+    expect(container.textContent).toContain("迁移任务已创建");
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("当前任务"));
     });
