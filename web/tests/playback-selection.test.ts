@@ -33,6 +33,15 @@ describe("playback selection", () => {
     expect(await shouldUseClientMkv(mkv, video)).toBe(true);
   });
 
+  it("recognizes ffprobe's matroska,webm container label as an MKV fallback candidate", () => {
+    const matroska = { ...source, container: "matroska,webm", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "AAC" },
+    ] };
+
+    expect(hasClientMkvCandidate(matroska)).toBe(true);
+  });
+
   it("accepts an MKV when a supported AAC track follows DTS and E-AC-3 tracks", () => {
     const mkv = { ...source, container: "mkv", streams: [
       { index: 0, type: "VIDEO", codec: "HEVC" },

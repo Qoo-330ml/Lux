@@ -2,7 +2,6 @@ import type { MediaSource } from "../../lib/api/types";
 import { isHevcCodec } from "./media-codec";
 
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
-const CLIENT_MKV_CONTAINERS = new Set(["mkv"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
 const HEVC_MSE_CODECS = ["hvc1.2.4.L153.B0", "hvc1.1.6.L120.B0"] as const;
 const PASSTHROUGH_AUDIO_CODECS = new Set(["ac3", "ac-3", "eac3", "ec-3"]);
@@ -21,11 +20,18 @@ export function hasClientHevcCandidate(source: MediaSource | undefined) {
 }
 
 export function hasClientMkvCandidate(source: MediaSource | undefined) {
-  if (!source || (source.sourceKind === "STRM_URL" && !source.externalUrl) || !CLIENT_MKV_CONTAINERS.has((source.container ?? "").toLowerCase())) return false;
+  if (!source || (source.sourceKind === "STRM_URL" && !source.externalUrl) || !isMatroskaContainer(source.container)) return false;
   const video = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
   if (!isHevcCodec(video?.codec)) return false;
   const audio = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
   return audio.length === 0 || audio.some((stream) => /^aac$|^mp4a\./i.test(stream.codec ?? "") || PASSTHROUGH_AUDIO_CODECS.has((stream.codec ?? "").toLowerCase()));
+}
+
+function isMatroskaContainer(container: string | null | undefined) {
+  return (container ?? "")
+    .toLowerCase()
+    .split(",")
+    .some((part) => ["mkv", "matroska"].includes(part.trim()));
 }
 
 export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {
