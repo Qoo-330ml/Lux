@@ -753,6 +753,7 @@ impl EmbyMigrationService {
         let mut peak_source_page_records = 0_usize;
         let mut candidate_query_ms = 0_u128;
         let mut database_write_ms = 0_u128;
+        let mut prefetched_source_pages = 0_u64;
         let Some(job) = self.database.find_emby_migration_job(job_id).await? else {
             return Err(EmbyMigrationServiceError::NotFound);
         };
@@ -1067,12 +1068,16 @@ impl EmbyMigrationService {
                         })
                         .map(|cursor| cursor.start_index)
                         .unwrap_or_default();
+                    let mut prefetched_page: Option<MigrationPagePrefetch> = None;
                     loop {
                         if self.is_cancelled(job_id).await? {
+                            drop(prefetched_page.take());
                             return self.cancelled(job_id, "ITEMS").await;
                         }
-                        let recovered_page = self
-                            .recover_migration_page(
+                        let recovered_page = if let Some(prefetched_page) = prefetched_page.take() {
+                            prefetched_page.join().await?
+                        } else {
+                            self.recover_migration_page(
                                 &source,
                                 &user.id,
                                 start_index,
@@ -1084,7 +1089,8 @@ impl EmbyMigrationService {
                                     state_fields: Some(requested_state_fields.as_slice()),
                                 },
                             )
-                            .await?;
+                            .await?
+                        };
                         source_rpc_calls += recovered_page.source_rpc_calls;
                         if !recovered_page.invalid_items.is_empty() {
                             let invalid_item_count = recovered_page
@@ -1103,6 +1109,23 @@ impl EmbyMigrationService {
                             );
                         }
                         let page = recovered_page.page;
+                        let next_prefetched_page = page
+                            .next_start_index
+                            .filter(|next_start_index| *next_start_index > start_index)
+                            .map(|next_start_index| {
+                                self.prefetch_migration_page(
+                                    &source,
+                                    &user.id,
+                                    next_start_index,
+                                    MigrationPageKind::UserState(state_filter),
+                                    MigrationSourceFilter {
+                                        library_ids: source_library_ids.as_deref(),
+                                        enabled: source_filtering_enabled,
+                                        state_fields: Some(requested_state_fields.as_slice()),
+                                    },
+                                )
+                            });
+                        prefetched_source_pages += u64::from(next_prefetched_page.is_some());
                         peak_source_page_records = peak_source_page_records.max(page.items.len());
                         // Deduplicate before querying Lux.  The same source item commonly
                         // appears in more than one state-filter page; querying identities first
@@ -1295,6 +1318,7 @@ impl EmbyMigrationService {
                             break;
                         }
                         start_index = next_start_index;
+                        prefetched_page = next_prefetched_page;
                     }
                 }
             }
@@ -1359,12 +1383,16 @@ impl EmbyMigrationService {
                     })
                     .map(|cursor| cursor.start_index)
                     .unwrap_or_default();
+                let mut prefetched_page: Option<MigrationPagePrefetch> = None;
                 loop {
                     if self.is_cancelled(job_id).await? {
+                        drop(prefetched_page.take());
                         return self.cancelled(job_id, "ITEMS").await;
                     }
-                    let recovered_page = self
-                        .recover_migration_page(
+                    let recovered_page = if let Some(prefetched_page) = prefetched_page.take() {
+                        prefetched_page.join().await?
+                    } else {
+                        self.recover_migration_page(
                             &source,
                             &user.id,
                             start_index,
@@ -1372,7 +1400,8 @@ impl EmbyMigrationService {
                             MigrationPageKind::PersonFavorites,
                             MigrationSourceFilter::disabled(),
                         )
-                        .await?;
+                        .await?
+                    };
                     source_rpc_calls += recovered_page.source_rpc_calls;
                     if !recovered_page.invalid_items.is_empty() {
                         let invalid_item_count = recovered_page
@@ -1391,6 +1420,19 @@ impl EmbyMigrationService {
                         );
                     }
                     let page = recovered_page.page;
+                    let next_prefetched_page = page
+                        .next_start_index
+                        .filter(|next_start_index| *next_start_index > start_index)
+                        .map(|next_start_index| {
+                            self.prefetch_migration_page(
+                                &source,
+                                &user.id,
+                                next_start_index,
+                                MigrationPageKind::PersonFavorites,
+                                MigrationSourceFilter::disabled(),
+                            )
+                        });
+                    prefetched_source_pages += u64::from(next_prefetched_page.is_some());
                     peak_source_page_records = peak_source_page_records.max(page.items.len());
                     if !person_total_recorded {
                         if let Some(page_total) = page.total_record_count {
@@ -1532,6 +1574,7 @@ impl EmbyMigrationService {
                         break;
                     }
                     start_index = next_start_index;
+                    prefetched_page = next_prefetched_page;
                 }
             }
         }
@@ -1568,6 +1611,7 @@ impl EmbyMigrationService {
             media_identity_cache_hits,
             person_identity_cache_hits,
             database_write_ms,
+            prefetched_source_pages,
             processed,
             matched,
             skipped,
@@ -1802,6 +1846,38 @@ impl EmbyMigrationService {
         Ok(MigrationPersonIdentityIndex::new(
             self.database.list_migration_person_identities().await?,
         ))
+    }
+
+    fn prefetch_migration_page(
+        &self,
+        source: &EmbyMigrationSource,
+        user_id: &str,
+        start_index: u32,
+        kind: MigrationPageKind,
+        source_filter: MigrationSourceFilter<'_>,
+    ) -> MigrationPagePrefetch {
+        let service = self.clone();
+        let source = source.clone();
+        let user_id = user_id.to_owned();
+        let library_ids = source_filter.library_ids.map(ToOwned::to_owned);
+        let state_fields = source_filter.state_fields.map(ToOwned::to_owned);
+        let enabled = source_filter.enabled;
+        MigrationPagePrefetch::new(tokio::spawn(async move {
+            service
+                .recover_migration_page(
+                    &source,
+                    &user_id,
+                    start_index,
+                    500,
+                    kind,
+                    MigrationSourceFilter {
+                        library_ids: library_ids.as_deref(),
+                        enabled,
+                        state_fields: state_fields.as_deref(),
+                    },
+                )
+                .await
+        }))
     }
 
     async fn recover_migration_page(
@@ -2140,6 +2216,42 @@ struct RecoveredMigrationPage {
     page: MigrationItemPage,
     invalid_items: Vec<InvalidMigrationItem>,
     source_rpc_calls: u64,
+}
+
+/// Owns one read-ahead page and cancels it if the current page cannot be
+/// committed.  Dropping a Tokio join handle normally detaches its task; that
+/// would let a cancelled migration keep consuming source pages, so this
+/// wrapper aborts an unconsumed read explicitly.
+struct MigrationPagePrefetch {
+    handle:
+        Option<tokio::task::JoinHandle<Result<RecoveredMigrationPage, EmbyMigrationServiceError>>>,
+}
+
+impl MigrationPagePrefetch {
+    fn new(
+        handle: tokio::task::JoinHandle<Result<RecoveredMigrationPage, EmbyMigrationServiceError>>,
+    ) -> Self {
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn join(mut self) -> Result<RecoveredMigrationPage, EmbyMigrationServiceError> {
+        let Some(handle) = self.handle.take() else {
+            return Err(EmbyMigrationServiceError::InvalidState);
+        };
+        handle
+            .await
+            .map_err(|_| EmbyMigrationServiceError::InvalidState)?
+    }
+}
+
+impl Drop for MigrationPagePrefetch {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.abort();
+        }
+    }
 }
 
 fn assemble_recovered_migration_page(
@@ -3296,6 +3408,25 @@ mod tests {
 
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    #[tokio::test]
+    async fn dropping_migration_page_prefetch_aborts_source_read() {
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = Arc::clone(&completed);
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            task_completed.store(true, Ordering::SeqCst);
+            Err::<RecoveredMigrationPage, _>(EmbyMigrationServiceError::InvalidState)
+        });
+        let prefetch = MigrationPagePrefetch::new(handle);
+        drop(prefetch);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!completed.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn selected_user_ids_are_required_and_deduplicated() {
