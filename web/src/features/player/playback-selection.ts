@@ -6,16 +6,6 @@ const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
 const HEVC_MSE_CODECS = ["hvc1.2.4.L153.B0", "hvc1.1.6.L120.B0"] as const;
 const PASSTHROUGH_AUDIO_CODECS = new Set(["ac3", "ac-3", "eac3", "ec-3"]);
 
-export function isRemoteHttpStrmSource(source: MediaSource | undefined) {
-  if (source?.sourceKind !== "STRM_URL" || !source.externalUrl) return false;
-  try {
-    const url = new URL(source.externalUrl);
-    return url.protocol === "http:" || url.protocol === "https:";
-  } catch {
-    return false;
-  }
-}
-
 export function h264CodecForDimensions(width: number, height: number) {
   const pixels = Math.max(1, width) * Math.max(1, height);
   if (pixels > 2_073_600) return "avc1.640033";

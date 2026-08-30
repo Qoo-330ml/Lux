@@ -27,7 +27,7 @@ import {
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
 import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
-import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -241,9 +241,7 @@ export function PlayerPage() {
   const playbackPlan = webPlaybackSession.data?.plan;
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
   const streamUrl = playbackPlan?.type === "DIRECT"
-    ? isRemoteHttpStrmSource(source)
-      ? source?.externalUrl ?? ""
-      : (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
+    ? (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
@@ -603,15 +601,9 @@ export function PlayerPage() {
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          // A remote HTTP(S) STRM must stay on the native element so the
-          // browser itself follows the upstream 302 and owns the media bytes.
-          const useMkvFallback = isRemoteHttpStrmSource(source)
-            ? false
-            : await shouldUseClientMkv(source, initialEngine.element);
+          const useMkvFallback = await shouldUseClientMkv(source, initialEngine.element);
           const useHevcFallback =
-            !useMkvFallback
-            && !isRemoteHttpStrmSource(source)
-            && (await shouldUseClientHevc(source, initialEngine.element));
+            !useMkvFallback && (await shouldUseClientHevc(source, initialEngine.element));
           if (useMkvFallback || useHevcFallback) {
             setFallbackLoading(true);
             if (cancelled) return;

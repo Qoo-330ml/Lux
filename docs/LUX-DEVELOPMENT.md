@@ -1337,10 +1337,10 @@ locked local value
 ### 14.6 Web 播放
 
 - Web 播放通过独立的 `/api/v1/playback/sessions` 会话接口创建一次播放计划；Web API 与 Emby 播放接口、DTO 和领域类型分离。
-- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；本地媒体和路径型 `.strm` 的 Direct Play 使用短期签名 URL 或标准 `/Videos/...` `proxyUrl`，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie。远程 HTTP(S) `.strm` 的 Lux Web Direct Play 直接把 `.strm` 原始 URL 交给原生 `<video>`，由浏览器携带自身请求上下文跟随 302；该路径不使用 Lux 签名媒体入口、不由 Lux 解析或代理媒体字节。Emby/第三方客户端仍按各自兼容入口由 Lux 做受保护鉴权和有限 307 重定向。
+- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；普通 Direct Play 和 HLS 地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie；路径型 `.strm` 的 `DIRECT` 计划额外返回标准 `/Videos/...` `proxyUrl`，Web 播放器优先使用它并在代理鉴权/映射失败时回退到签名 `url`，该代理地址依赖 Emby token 或代理注入的 API Key。
 - 档位 0 使用原生 Range 直放或现有客户端 fallback；档位 1～4 使用服务端 fMP4/CMAF HLS。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用 Web HLS 播放器。
 - 创建会话时固定媒体源、音频/字幕选择、起播位置和服务端计划；seek 必要时切换会话生成代次，不把客户端任意路径或外部 URL 交给服务端执行。
-- `.strm` 只能返回档位 0；Lux Web 的 URL 型 HTTP(S) `.strm` 使用浏览器原始 URL 直连，路径型外部代理接管或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。远程 URL 型 `.strm` 不进入客户端 MKV/HEVC `fetch` fallback，避免把直连媒体变成需要 CORS 的脚本读取。
+- `.strm` 只能返回档位 0；URL 型直连、路径型外部代理接管或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
 - 内嵌文本字幕是独立于媒体计划的能力：浏览器原生轨道或客户端单次读取只能复用当前媒体资源，不能改变 `.strm` 的 Direct 规则。
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。

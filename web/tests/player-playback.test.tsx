@@ -286,7 +286,7 @@ describe("PlayerPage playback synchronization", () => {
       .toBe("/api/v1/playback/sessions/web-source-proxy/direct?expires=1900000000&signature=test");
   });
 
-  it("uses the original HTTP(S) STRM URL so the browser follows its 302 directly", async () => {
+  it("uses the Lux direct endpoint for a remote HTTP(S) STRM URL", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-remote-strm",
       title: "远程直连测试",
@@ -328,7 +328,8 @@ describe("PlayerPage playback synchronization", () => {
     });
 
     const video = container.querySelector<HTMLVideoElement>("video");
-    expect(video?.getAttribute("src")).toBe("https://media.example.test/302?pickcode=fixture");
+    expect(video?.getAttribute("src"))
+      .toBe("/api/v1/playback/sessions/web-source-remote-strm/direct?expires=1900000000&signature=test");
     expect(video?.getAttribute("crossorigin")).toBeNull();
   });
 
