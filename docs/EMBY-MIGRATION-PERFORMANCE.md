@@ -50,6 +50,8 @@ cargo test --locked --lib migration_page_batch_benchmark_records_scale -- --igno
 
 来源插件返回 `PLUGIN_RATE_LIMITED` 时，宿主对单次来源调用执行最多 3 次、250/500/1000 ms 的有界退避；分页恢复预算仍按实际 RPC 尝试次数计算，不会因重试突破 32 次上限。完成日志记录 `source_rate_limited_rpc_calls`，失败调用也会记录尝试数，便于在真实 Emby/NAS 上判断是否需要调整并发或退避策略。
 
+如果当前页发生过限流，宿主会暂时关闭下一页读前置，让重试退避与后续读取不叠加；未触发限流的页面仍保持最多一页读前置。这样稳定来源保留流水线吞吐，受限来源减少无效并发请求。
+
 坏页恢复预算为每个逻辑页最多 32 次来源 RPC。预算耗尽后，未恢复范围作为 `PLUGIN_INVALID_RESPONSE_RECOVERY_BUDGET` 诊断记录写入并推进游标；这用有限失败成本换取后续页面继续迁移，避免异常插件造成指数级拆分。
 
 ## 本轮新增的低风险优化（2026-08-30）
