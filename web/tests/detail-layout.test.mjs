@@ -22,6 +22,29 @@ test("detail actions leave space below the overview", () => {
   assert.match(actionRule, /margin-top:\s*24px/);
 });
 
+test("mobile detail hero keeps the immersive poster compact", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const posterRule = mobileStyles.match(/\.lux-detail-poster\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(posterRule, /height:\s*clamp\(384px,\s*120vw,\s*520px\)/);
+  assert.match(posterRule, /aspect-ratio:\s*auto/);
+  assert.match(posterRule, /border:\s*0/);
+  assert.match(posterRule, /border-radius:\s*0/);
+});
+
+test("mobile detail poster fades broadly into the content surface", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const posterFadeRule = mobileStyles.match(/\.lux-detail-poster::after\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(posterFadeRule, /transparent\s+40%/);
+  assert.match(posterFadeRule, /rgba\(5,5,6,\.04\)\s+54%/);
+  assert.match(posterFadeRule, /rgba\(5,5,6,\.32\)\s+70%/);
+  assert.match(posterFadeRule, /rgba\(5,5,6,\.72\)\s+86%/);
+  assert.match(posterFadeRule, /#050506\s+100%/);
+});
+
 test("detail grid fills the container so left and right outer spacing match", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const detailGridRule = stylesheet.match(/\.lux-detail-grid\s*\{([^}]*)\}/)?.[1] ?? "";
