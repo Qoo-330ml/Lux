@@ -599,51 +599,57 @@ pub(super) async fn lux_get_item(
     match catalog.find_item(principal, &item_id).await {
         Ok(Some(item)) => {
             let user_id = user.id.to_string();
-            let (metadata_pending_result, user_state_result, actors_result, nfo_result) = tokio::join!(
-                database.list_pending_metadata_item_ids(std::slice::from_ref(&item_id)),
-                database.find_user_item_state(&user_id, &item.id),
+            let (metadata_pending, user_state, actors, nfo) = match tokio::try_join!(
                 async {
-                    match state.people.as_ref() {
-                        Some(people) => people.list_item_actors(&item.id).await,
-                        None => Ok(Vec::new()),
-                    }
+                    database
+                        .list_pending_metadata_item_ids(std::slice::from_ref(&item_id))
+                        .await
+                        .map(|item_ids| item_ids.contains(&item_id))
+                        .map_err(|_| ())
                 },
                 async {
-                    match state.local_nfo.as_ref() {
-                        Some(local_nfo) => local_nfo.read_item(&item.id).await,
-                        None => Ok(None),
-                    }
+                    database
+                        .find_user_item_state(&user_id, &item.id)
+                        .await
+                        .map_err(|_| ())
                 },
-            );
-            let metadata_pending = match metadata_pending_result {
-                Ok(item_ids) => item_ids.contains(&item_id),
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            let user_state = match user_state_result {
-                Ok(user_state) => user_state,
-                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            let actors = match actors_result {
-                Ok(actors) => actors,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id = %item.id,
-                        %error,
-                        "derived actor relation is unavailable; returning an empty cast"
-                    );
-                    Vec::new()
-                }
-            };
-            let nfo = match nfo_result {
-                Ok(nfo) => nfo,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id = %item.id,
-                        %error,
-                        "derived local NFO cache is unavailable; returning partial item detail"
-                    );
-                    None
-                }
+                async {
+                    let actors = match state.people.as_ref() {
+                        Some(people) => match people.list_item_actors(&item.id).await {
+                            Ok(actors) => actors,
+                            Err(error) => {
+                                tracing::warn!(
+                                    item_id = %item.id,
+                                    %error,
+                                    "derived actor relation is unavailable; returning an empty cast"
+                                );
+                                Vec::new()
+                            }
+                        },
+                        None => Vec::new(),
+                    };
+                    Ok::<_, ()>(actors)
+                },
+                async {
+                    let nfo = match state.local_nfo.as_ref() {
+                        Some(local_nfo) => match local_nfo.read_item(&item.id).await {
+                            Ok(nfo) => nfo,
+                            Err(error) => {
+                                tracing::warn!(
+                                    item_id = %item.id,
+                                    %error,
+                                    "derived local NFO cache is unavailable; returning partial item detail"
+                                );
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    Ok::<_, ()>(nfo)
+                },
+            ) {
+                Ok(details) => details,
+                Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
             let mut body = lux_catalog_item_json_with_user_state(&item, user_state.as_ref());
             if let Value::Object(object) = &mut body {
