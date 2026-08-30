@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -608,6 +608,7 @@ impl MetadataEnricher {
             .database
             .list_series_metadata_sources_for_incremental_scan(scan_job_id)
             .await?;
+        let mut directory_cache = DirectoryPathCache::default();
         let mut last_series_id = String::new();
         let mut last_season_id = String::new();
         let mut last_episode_id = String::new();
@@ -617,6 +618,7 @@ impl MetadataEnricher {
             Some(&mut last_series_id),
             Some(&mut last_season_id),
             Some(&mut last_episode_id),
+            &mut directory_cache,
         )
         .await?;
         Ok(report)
@@ -674,6 +676,7 @@ impl MetadataEnricher {
         let mut last_series_id = None;
         let mut last_season_id = None;
         let mut last_episode_id = None;
+        let mut directory_cache = DirectoryPathCache::default();
         loop {
             let sources = self
                 .database
@@ -698,6 +701,7 @@ impl MetadataEnricher {
                     last_series_id.as_mut(),
                     last_season_id.as_mut(),
                     last_episode_id.as_mut(),
+                    &mut directory_cache,
                 )
                 .await
             {
@@ -904,6 +908,7 @@ impl MetadataEnricher {
         let mut last_series_id = None;
         let mut last_season_id = None;
         let mut last_episode_id = None;
+        let mut directory_cache = DirectoryPathCache::default();
         loop {
             let sources = self
                 .database
@@ -920,6 +925,7 @@ impl MetadataEnricher {
                 last_series_id.as_mut(),
                 last_season_id.as_mut(),
                 last_episode_id.as_mut(),
+                &mut directory_cache,
             )
             .await?;
             if last_page {
@@ -937,6 +943,7 @@ impl MetadataEnricher {
         last_series_id: Option<&mut String>,
         last_season_id: Option<&mut String>,
         last_episode_id: Option<&mut String>,
+        directory_cache: &mut DirectoryPathCache,
     ) -> Result<(), MetadataError> {
         let mut last_series_id = last_series_id;
         let mut last_season_id = last_season_id;
@@ -947,7 +954,7 @@ impl MetadataEnricher {
             let Some(series_dir) = series_directory(&root, &source.relative_path) else {
                 continue;
             };
-            let series_paths = read_directory_paths(&series_dir).await?;
+            let series_paths = directory_cache.get(&series_dir).await?;
             let new_series = last_series_id
                 .as_deref()
                 .is_none_or(|id| id != source.series_id.as_str());
@@ -975,15 +982,15 @@ impl MetadataEnricher {
             let new_season = last_season_id
                 .as_deref()
                 .is_none_or(|id| id != source.season_id.as_str());
-            let mut season_paths = series_paths;
+            let mut season_paths = series_paths.as_ref().clone();
             if season_dir != series_dir {
-                let mut directory_paths = read_directory_paths(season_dir).await?;
+                let directory_paths = directory_cache.get(season_dir).await?;
                 season_paths = season_paths
                     .iter()
                     .filter(|path| is_prefixed_season_image(path, season_number))
                     .cloned()
                     .collect();
-                season_paths.append(&mut directory_paths);
+                season_paths.extend(directory_paths.iter().cloned());
             }
             if new_season {
                 if let Some(nfo_path) =
@@ -1461,6 +1468,29 @@ pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Err
     ))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn directory_path_cache_reuses_a_directory_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let directory = temp_dir.path().join("series");
+        tokio::fs::create_dir(&directory).await?;
+        tokio::fs::write(directory.join("episode-1.mkv"), b"episode").await?;
+
+        let mut cache = DirectoryPathCache::default();
+        let initial = cache.get(&directory).await?.to_vec();
+        tokio::fs::write(directory.join("episode-2.mkv"), b"episode").await?;
+        let cached = cache.get(&directory).await?.to_vec();
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cached, initial);
+        Ok(())
+    }
+}
+
 pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
     let directory = media_path.parent()?;
     let movie_nfo = directory.join("movie.nfo");
@@ -1519,6 +1549,28 @@ async fn read_directory_paths(directory: &Path) -> Result<Vec<PathBuf>, Metadata
     }
     paths.sort();
     Ok(paths)
+}
+
+#[derive(Default)]
+struct DirectoryPathCache {
+    entries: HashMap<PathBuf, Arc<Vec<PathBuf>>>,
+}
+
+impl DirectoryPathCache {
+    async fn get(&mut self, directory: &Path) -> Result<Arc<Vec<PathBuf>>, MetadataError> {
+        if let Some(paths) = self.entries.get(directory) {
+            return Ok(Arc::clone(paths));
+        }
+        let paths = Arc::new(read_directory_paths(directory).await?);
+        self.entries
+            .insert(directory.to_owned(), Arc::clone(&paths));
+        Ok(paths)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 pub(crate) fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {
