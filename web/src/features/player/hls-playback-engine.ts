@@ -13,9 +13,14 @@ export class HlsVideoEngine implements PlaybackEngine {
   constructor(readonly element: HTMLVideoElement) {}
 
   async setSource(source: string, poster?: string | null) {
-    const { default: Hls } = await import("hls.js");
     this.error = null;
     this.element.poster = poster ?? "";
+    if (this.element.canPlayType(HLS_MIME) !== "") {
+      this.element.src = source;
+      this.element.load();
+      return;
+    }
+    const { default: Hls } = await import("hls.js");
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
@@ -48,11 +53,7 @@ export class HlsVideoEngine implements PlaybackEngine {
       });
       return;
     }
-    if (this.element.canPlayType(HLS_MIME) === "") {
-      throw new Error("当前浏览器不支持 HLS");
-    }
-    this.element.src = source;
-    this.element.load();
+    throw new Error("当前浏览器不支持 HLS");
   }
 
   play() {
