@@ -144,7 +144,7 @@ test("mobile detail pages use a full-bleed portrait poster and logo-first identi
   const contentRule = mobileStyles.match(/\.lux-detail-content\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(source, /className="lux-detail-mobile-header"/);
-  assert.match(source, /className="lux-detail-title-row" data-has-logo=\{logo \? "true" : undefined\}/);
+  assert.match(source, /className="lux-detail-title-row" data-has-logo=\{logoUrl \? "true" : undefined\}/);
   assert.match(contentRule, /width:\s*100%/);
   assert.match(posterColumnRule, /width:\s*100%/);
   assert.match(posterRule, /border:\s*0/);
@@ -161,9 +161,10 @@ test("mobile episode details switch their landscape hero to a portrait poster wh
 
   assert.match(source, /className="lux-detail-poster-landscape"/);
   assert.match(source, /className="lux-detail-poster-portrait"/);
+  assert.match(source, /isEpisode && poster \? " has-portrait" : ""/);
   assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape\s*\{[^}]*aspect-ratio:\s*2\s*\/\s*3/);
-  assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape \.lux-detail-poster-landscape\s*\{[^}]*display:\s*none/);
-  assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape \.lux-detail-poster-portrait\s*\{[^}]*display:\s*block/);
+  assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape\.has-portrait \.lux-detail-poster-landscape\s*\{[^}]*display:\s*none/);
+  assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape\.has-portrait \.lux-detail-poster-portrait\s*\{[^}]*display:\s*block/);
 });
 
 test("mobile detail sections put hierarchy before cast and metadata", () => {
@@ -174,4 +175,6 @@ test("mobile detail sections put hierarchy before cast and metadata", () => {
   assert.match(mobileStyles, /\.lux-detail-hierarchy\s*\{[^}]*order:\s*1/);
   assert.match(mobileStyles, /\.lux-detail-cast\s*\{[^}]*order:\s*2/);
   assert.match(mobileStyles, /\.lux-detail-nfo\s*\{[^}]*order:\s*3/);
+  assert.match(mobileStyles, /\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*>\s*\.lux-media-actions\s*\{[^}]*display:\s*none/);
+  assert.match(stylesheet, /@media \(max-width: 560px\) \{\s*html\[data-lux-theme="light"\] \.lux-detail-poster\s*\{[^}]*border:\s*0[^}]*box-shadow:\s*none/);
 });

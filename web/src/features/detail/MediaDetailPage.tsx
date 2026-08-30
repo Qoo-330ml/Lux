@@ -118,6 +118,7 @@ export function MediaDetailPage() {
 
   const media = item.data;
   const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
+  const logoUrl = logo?.url ?? imageUrl(media, "logo");
   const backdrop = imageUrl(media, "fanart") ?? imageUrl(media);
   const poster = imageUrl(media);
   const detailKind = isSeries ? "series" : isSeason ? "season" : isEpisode ? "episode" : "movie";
@@ -249,7 +250,7 @@ export function MediaDetailPage() {
       <div className="lux-detail-content">
         <div className="lux-detail-grid">
           <div className="lux-detail-poster-column">
-            <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}`}>
+            <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}${isEpisode && poster ? " has-portrait" : ""}`}>
               {isEpisode && backdrop
                 ? <>
                   <img className="lux-detail-poster-landscape" src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
@@ -261,8 +262,8 @@ export function MediaDetailPage() {
             </div>
           </div>
           <div className="lux-detail-copy">
-            <div className="lux-detail-title-row" data-has-logo={logo ? "true" : undefined}>
-              {logo ? <img className="lux-detail-logo" src={logo.url} alt={`${mediaTitle(media)} 徽标`} /> : null}
+            <div className="lux-detail-title-row" data-has-logo={logoUrl ? "true" : undefined}>
+              {logoUrl ? <img className="lux-detail-logo" src={logoUrl} alt={`${mediaTitle(media)} 徽标`} /> : null}
               <h1>{detailTitle}</h1>
               {detailOriginalTitle && detailOriginalTitle !== detailTitle
                 ? <p className="lux-detail-original-title">{detailOriginalTitle}</p>

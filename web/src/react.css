@@ -1504,8 +1504,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-poster.is-landscape { aspect-ratio: 2 / 3; }
   .lux-detail-poster::after { position: absolute; z-index: 1; inset: 0; pointer-events: none; background: linear-gradient(180deg, transparent 60%, rgba(5,5,6,.1) 72%, #050506 100%); content: ""; }
   .lux-detail-poster img { position: relative; z-index: 0; }
-  .lux-detail-poster.is-landscape .lux-detail-poster-landscape { display: none; }
-  .lux-detail-poster.is-landscape .lux-detail-poster-portrait { display: block; }
+  .lux-detail-poster.is-landscape.has-portrait .lux-detail-poster-landscape { display: none; }
+  .lux-detail-poster.is-landscape.has-portrait .lux-detail-poster-portrait { display: block; }
   .lux-detail-copy { width: 92%; margin: 0 auto; }
   .lux-detail-title-row { align-items: center; margin-top: -24px; text-align: center; }
   .lux-detail-title-row[data-has-logo="true"] h1 { display: none; }
@@ -2101,6 +2101,11 @@ html[data-lux-theme="light"] .lux-season-card-art,
 html[data-lux-theme="light"] .lux-episode-card-art { border-color: var(--lux-line-soft); background: rgba(255,255,255,.72); }
 html[data-lux-theme="light"] .lux-season-episode-copy strong,
 html[data-lux-theme="light"] .lux-episode-card strong { color: var(--lux-text); }
+
+@media (max-width: 560px) {
+  html[data-lux-theme="light"] .lux-detail-poster { border: 0; border-radius: 0; box-shadow: none; background: transparent; }
+  html[data-lux-theme="light"] .lux-detail-poster::after { background: linear-gradient(180deg, transparent 60%, rgba(244,243,241,.08) 72%, var(--lux-bg) 100%); }
+}
 
 /* Light content surfaces keep the media hero dark, while the page below it stays readable. */
 html[data-lux-theme="light"] .lux-home-content { margin-top: 0; background: var(--lux-bg); }

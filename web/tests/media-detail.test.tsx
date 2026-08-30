@@ -542,6 +542,7 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/api/v1/items/episode-3/images/fanart?tag=episode-fanart-3");
     expect(container.querySelector(".lux-detail-poster-portrait")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-3/images/poster?tag=episode-poster-3");
+    expect(container.querySelector(".lux-detail-poster.has-portrait")).not.toBeNull();
     expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("示例剧集");
     expect(container.querySelector(".lux-detail-subtitle")?.textContent).toContain("S03E03 · 第三集标题");
     expect(container.querySelector(".lux-episode-rail")?.textContent).toContain("更多来自第 3 季");
