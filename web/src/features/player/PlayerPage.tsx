@@ -26,8 +26,8 @@ import {
   type PlaybackPerformance,
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
-import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
-import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { canUseHls } from "./hls-capabilities";
+import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -46,6 +46,7 @@ import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
 import { usePlayerAirPlay } from "./components/player-airplay";
 import { PlayerMiniProgressBar } from "./components/player-mini-progress";
 import { normalizePlayerChapters } from "./player-chapters";
+import { createPlaybackTimelineScheduler } from "./player-timeline-scheduler";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -194,22 +195,40 @@ export function PlayerPage() {
   const [captionOffset, setCaptionOffset] = useState(0);
   const [nativeCaptionTracks, setNativeCaptionTracks] = useState<PlayerRuntimeCaptionTrack[]>([]);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
+  const currentTimeRef = useRef(0);
+  const durationRef = useRef(0);
+  const bufferedEndRef = useRef(0);
 
   const requestedSourceId = searchParams.get("sourceId");
+  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${playbackAttempt}`;
+  const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
+  const bootstrapCapabilities = webPlaybackCapabilities(undefined, playbackAttempt);
+  const playbackBootstrap = useQuery({
+    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt),
+    queryFn: () => api.createWebPlaybackBootstrap(itemId, requestedSourceId ?? undefined, bootstrapCapabilities),
+    enabled: Boolean(itemId) && playbackAttempt === 0 && sessionGateKey === bootstrapKey,
+    retry: false,
+    staleTime: Number.POSITIVE_INFINITY,
+    placeholderData: (previous) => previous,
+  });
+  const useLegacyPlaybackQueries = playbackAttempt !== 0 || playbackBootstrap.isError;
   const item = useQuery({
     queryKey: queryKeys.item(itemId),
     queryFn: () => api.item(itemId),
-    enabled: Boolean(itemId),
+    enabled: Boolean(itemId) && useLegacyPlaybackQueries,
   });
   const playback = useQuery({
     queryKey: queryKeys.playback(itemId),
     queryFn: () => api.playback(itemId),
-    enabled: Boolean(itemId),
+    enabled: Boolean(itemId) && useLegacyPlaybackQueries,
   });
-  const playbackDataRef = useRef(playback.data);
-  playbackDataRef.current = playback.data;
+  const playbackData = playbackBootstrap.isPlaceholderData
+    ? playback.data
+    : playbackBootstrap.data?.playback ?? playback.data;
+  const playbackDataRef = useRef(playbackData);
+  playbackDataRef.current = playbackData;
 
-  const media = item.data;
+  const media = playbackBootstrap.data?.item ?? item.data;
   const source =
     media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
     media?.mediaSources?.find((entry) => entry.isDefault) ??
@@ -224,21 +243,30 @@ export function PlayerPage() {
   const nativeCaptionTrackId = selectedCaptionOption?.renderMode === "native-inband"
     ? selectedCaptionOption.runtimeTrackId ?? null
     : null;
-  const playbackKey = `${itemId}:${source?.id ?? ""}:${playbackAttempt}`;
-  const [sessionGateKey, setSessionGateKey] = useState(playbackKey);
+  // For the first bootstrap request, keep the key tied to the URL selection
+  // (or the default slot) rather than changing it when the response resolves
+  // its default source. This prevents the newly-created bootstrap session from
+  // being mistaken for an old session during the initial render.
+  const playbackKeySourceId = playbackAttempt === 0 && !requestedSourceId
+    ? ""
+    : source?.id ?? requestedSourceId ?? "";
+  const playbackKey = `${itemId}:${playbackKeySourceId}:${playbackAttempt}`;
   const sessionStartedRef = useRef(false);
   const playbackSessionIdRef = useRef<string | null>(null);
   const capabilities = webPlaybackCapabilities(source, playbackAttempt);
   const webPlaybackSession = useQuery({
     queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt),
     queryFn: () => api.createWebPlaybackSession(itemId, source?.id ?? "", capabilities),
-    enabled: Boolean(itemId && source?.id)
+    enabled: Boolean(itemId && source?.id) && useLegacyPlaybackQueries
       && (sessionGateKey === playbackKey
         || (!sessionStartedRef.current && playbackSessionIdRef.current === null)),
     retry: false,
     staleTime: Number.POSITIVE_INFINITY,
   });
-  const playbackPlan = webPlaybackSession.data?.plan;
+  const playbackSession = playbackBootstrap.isPlaceholderData
+    ? webPlaybackSession.data
+    : playbackBootstrap.data?.session ?? webPlaybackSession.data;
+  const playbackPlan = playbackSession?.plan;
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
   const streamUrl = playbackPlan?.type === "DIRECT"
     ? (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
@@ -397,6 +425,9 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFallbackLoading(false);
     setFallbackSpeedX(null);
+    currentTimeRef.current = 0;
+    durationRef.current = 0;
+    bufferedEndRef.current = 0;
     setCurrentTime(0);
     setDuration(0);
     setBufferedEnd(0);
@@ -446,19 +477,19 @@ export function PlayerPage() {
 
   useEffect(() => {
     if (sessionGateKey !== playbackKey) return;
-    if (webPlaybackSession.data?.sessionId) sessionStartedRef.current = true;
-    playbackSessionIdRef.current = webPlaybackSession.data?.sessionId ?? null;
+    if (playbackSession?.sessionId) sessionStartedRef.current = true;
+    playbackSessionIdRef.current = playbackSession?.sessionId ?? null;
     playbackSequenceRef.current = 0;
-  }, [playbackKey, sessionGateKey, webPlaybackSession.data?.sessionId]);
+  }, [playbackKey, playbackSession?.sessionId, sessionGateKey]);
 
   useEffect(() => {
-    const sessionId = webPlaybackSession.data?.sessionId;
+    const sessionId = playbackSession?.sessionId;
     if (!sessionId) return;
     const heartbeat = window.setInterval(() => {
       void api.webPlaybackHeartbeat(sessionId).catch(() => undefined);
     }, 60_000);
     return () => window.clearInterval(heartbeat);
-  }, [webPlaybackSession.data?.sessionId]);
+  }, [playbackSession?.sessionId]);
 
   useEffect(() => {
     const handlePageHide = () => {
@@ -506,22 +537,33 @@ export function PlayerPage() {
     let activeEngine: PlaybackEngine = initialEngine;
     let performanceElement: HTMLVideoElement | null = null;
     let cancelled = false;
+    const timelineScheduler = createPlaybackTimelineScheduler((snapshot) => {
+      if (!isDraggingScrubberRef.current) setCurrentTime(snapshot.currentTime);
+      setDuration(snapshot.duration);
+      setBufferedEnd(snapshot.bufferedEnd);
+    });
     const syncSnapshot = (snapshot: {
       currentTime: number;
       duration: number | null;
       bufferedEnd?: number;
-    }) => {
-      if (!isDraggingScrubberRef.current) setCurrentTime(snapshot.currentTime);
-      setDuration(snapshot.duration ?? 0);
+    }, immediate = false) => {
       const ranges = activeEngine.element.buffered;
-      setBufferedEnd(snapshot.bufferedEnd
-        ?? (ranges.length > 0 ? ranges.end(ranges.length - 1) : snapshot.currentTime));
+      const next = {
+        currentTime: snapshot.currentTime,
+        duration: snapshot.duration ?? 0,
+        bufferedEnd: snapshot.bufferedEnd
+          ?? (ranges.length > 0 ? ranges.end(ranges.length - 1) : snapshot.currentTime),
+      };
+      currentTimeRef.current = next.currentTime;
+      durationRef.current = next.duration;
+      bufferedEndRef.current = next.bufferedEnd;
+      timelineScheduler.schedule(next, immediate);
     };
     const removeRuntimeSubscription = runtime.subscribeEvents((event) => {
       if (cancelled) return;
       switch (event.type) {
         case "SOURCE_READY":
-          syncSnapshot(event.snapshot);
+          syncSnapshot(event.snapshot, true);
           restorePlaybackPosition();
           break;
         case "PLAYING":
@@ -532,7 +574,7 @@ export function PlayerPage() {
           void reportPlayback("PLAYING", true, false, initialEngine.element);
           break;
         case "PAUSED":
-          if (event.snapshot) syncSnapshot(event.snapshot);
+          if (event.snapshot) syncSnapshot(event.snapshot, true);
           setPlaying(false);
           setControlsVisible(true);
           if (!event.snapshot?.ended) {
@@ -543,19 +585,21 @@ export function PlayerPage() {
           setControlsVisible(true);
           break;
         case "SEEK_START":
+          currentTimeRef.current = event.position;
           setCurrentTime(event.position);
           break;
         case "SEEKED":
-          syncSnapshot(event.snapshot);
+          syncSnapshot(event.snapshot, true);
           break;
         case "TIME_UPDATE":
           syncSnapshot(event.snapshot);
           void reportPlayback("PLAYING", false, false, initialEngine.element);
           break;
         case "ENDED": {
-          syncSnapshot(event.snapshot);
+          syncSnapshot(event.snapshot, true);
           if (initialEngine.element.loop) {
             runtime.seek(0);
+            currentTimeRef.current = 0;
             setCurrentTime(0);
             void runtime.play().catch((cause) => {
               if (!cancelled) {
@@ -581,7 +625,7 @@ export function PlayerPage() {
           }
           break;
         case "CAN_PLAY":
-          syncSnapshot(activeEngine.snapshot());
+          syncSnapshot(activeEngine.snapshot(), true);
           break;
       }
     });
@@ -591,19 +635,30 @@ export function PlayerPage() {
       setFallbackSpeedX(performance && !performance.realtime ? performance.speedX : null);
     };
     const handleDurationChange = () => {
-      if (!cancelled) syncSnapshot(activeEngine.snapshot());
+      if (!cancelled) syncSnapshot(activeEngine.snapshot(), true);
     };
     initialEngine.element.addEventListener("durationchange", handleDurationChange);
     const load = async () => {
       try {
         if (playbackPlan?.type === "SERVER_HLS") {
           initialEngine.destroy();
+          const { HlsVideoEngine } = await import("./hls-playback-engine");
+          if (cancelled) return;
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          const useMkvFallback = await shouldUseClientMkv(source, initialEngine.element);
+          // A remote HTTP(S) STRM must remain on the native element. The
+          // signed Lux endpoint follows the upstream redirect, but a client
+          // fallback would fetch that redirect with CORS and cannot safely
+          // consume the remote response when the upstream omits CORS headers.
+          const remoteHttpStrm = isRemoteHttpStrmSource(source);
+          const useMkvFallback = remoteHttpStrm
+            ? false
+            : await shouldUseClientMkv(source, initialEngine.element);
           const useHevcFallback =
-            !useMkvFallback && (await shouldUseClientHevc(source, initialEngine.element));
+            !useMkvFallback
+            && !remoteHttpStrm
+            && (await shouldUseClientHevc(source, initialEngine.element));
           if (useMkvFallback || useHevcFallback) {
             setFallbackLoading(true);
             if (cancelled) return;
@@ -657,6 +712,7 @@ export function PlayerPage() {
     void load();
     return () => {
       cancelled = true;
+      timelineScheduler.dispose();
       initialEngine.element.removeEventListener("durationchange", handleDurationChange);
       performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
       removeRuntimeSubscription();
@@ -1046,11 +1102,11 @@ export function PlayerPage() {
     }
   };
 
-  if (item.isPending) {
+  if (playbackBootstrap.isPending || (useLegacyPlaybackQueries && item.isPending)) {
     return <PlayerLoadingState message="正在准备播放器…" />;
   }
 
-  if (item.error) {
+  if (useLegacyPlaybackQueries && item.error) {
     return (
       <PlayerErrorState
         title="播放器加载失败"
@@ -1066,11 +1122,11 @@ export function PlayerPage() {
     );
   }
 
-  if (webPlaybackSession.isPending) {
+  if (useLegacyPlaybackQueries && webPlaybackSession.isPending) {
     return <PlayerLoadingState message="正在创建播放会话…" />;
   }
 
-  if (webPlaybackSession.error) {
+  if (useLegacyPlaybackQueries && webPlaybackSession.error) {
     const sessionFailure = webPlaybackSession.error instanceof ApiError
       && [401, 403, 410].includes(webPlaybackSession.error.status)
       ? classifyPlayerEngineFailure(webPlaybackSession.error, webPlaybackSession.error.status)

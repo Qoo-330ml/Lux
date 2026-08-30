@@ -8,6 +8,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 const fallbackState = vi.hoisted(() => ({
   assets: [] as Array<{ workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string }>,
@@ -15,6 +16,8 @@ const fallbackState = vi.hoisted(() => ({
 }));
 
 vi.mock("../src/features/player/playback-selection", () => ({
+  isRemoteHttpStrmSource: (source: { sourceKind?: string; externalUrl?: string }) =>
+    source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? ""),
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
 }));
@@ -56,6 +59,7 @@ describe("PlayerPage client fallback status", () => {
   let root: Root | undefined;
 
   beforeEach(() => {
+    mockPlaybackBootstrap();
     fallbackState.assets.length = 0;
     fallbackState.snapshotDuration = 8;
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
@@ -127,6 +131,62 @@ describe("PlayerPage client fallback status", () => {
     expect(fallbackState.assets[0]).toMatchObject({
       wasmUrl: "/hevc/hevc-decode.js",
     });
+  });
+
+  it("keeps remote HTTP STRM on native direct playback instead of client fallback", async () => {
+    vi.mocked(api.item).mockResolvedValue({
+      id: "remote-hevc-strm",
+      title: "远程 HEVC",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "remote-hevc-source",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/video.mp4",
+        container: "mp4",
+        streams: [{ index: 0, type: "VIDEO", codec: "HEVC" }],
+      }],
+    });
+    vi.mocked(api.createWebPlaybackSession).mockResolvedValue({
+      sessionId: "web-remote-hevc",
+      playSessionId: "lux-web:web-remote-hevc",
+      sourceId: "remote-hevc-source",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-remote-hevc/direct?expires=1900000000&signature=test",
+      },
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/remote-hevc-strm"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    expect(fallbackState.assets).toHaveLength(0);
+    expect(shouldUseClientHevc).not.toHaveBeenCalled();
+    expect(shouldUseClientMkv).not.toHaveBeenCalled();
+    expect(api.createWebPlaybackSession).toHaveBeenCalledWith(
+      "remote-hevc-strm",
+      "remote-hevc-source",
+      expect.objectContaining({ directPlay: true }),
+    );
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {
