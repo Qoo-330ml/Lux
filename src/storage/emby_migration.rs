@@ -194,7 +194,7 @@ pub(crate) struct EmbyMigrationItemMatchBatch {
     pub detail_json: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct EmbyMigrationUserItemStateBatch {
     pub user_id: String,
     pub item_id: String,
@@ -1420,6 +1420,8 @@ impl Database {
             }
         }
 
+        let states =
+            deduplicate_emby_migration_user_item_states(states, merge_policy, state_fields);
         if !states.is_empty() {
             for states in states.chunks(EMBY_MIGRATION_WRITE_BATCH_SIZE) {
                 let (mut position_ticks, mut is_played, mut is_favorite, mut play_count, mut last_played_at) =
@@ -1773,6 +1775,7 @@ impl Database {
                     .map_err(storage_error)?;
             }
         }
+        let states = deduplicate_emby_migration_person_favorite_states(states);
         if !states.is_empty() {
             for states in states.chunks(EMBY_MIGRATION_WRITE_BATCH_SIZE) {
                 let mut sql = String::from(
@@ -2139,6 +2142,86 @@ impl Database {
 }
 
 const MIGRATION_LIBRARY_FILTER_CHUNK_SIZE: usize = 200;
+
+/// PostgreSQL rejects a multi-row `ON CONFLICT DO UPDATE` when two source
+/// records resolve to the same Lux state key. Collapse only the target state
+/// writes; source-specific reports and import records stay distinct.
+fn deduplicate_emby_migration_user_item_states(
+    states: &[EmbyMigrationUserItemStateBatch],
+    merge_policy: &str,
+    state_fields: EmbyMigrationUserItemStateFields,
+) -> Vec<EmbyMigrationUserItemStateBatch> {
+    let mut deduplicated = Vec::with_capacity(states.len());
+    let mut indexes = HashMap::with_capacity(states.len());
+    for state in states {
+        let key = (state.user_id.clone(), state.item_id.clone());
+        let Some(index) = indexes.get(&key).copied() else {
+            indexes.insert(key, deduplicated.len());
+            deduplicated.push(state.clone());
+            continue;
+        };
+
+        match merge_policy {
+            "OVERWRITE" => deduplicated[index] = state.clone(),
+            "SKIP" => {}
+            _ => merge_duplicate_user_item_state(&mut deduplicated[index], state, state_fields),
+        }
+    }
+    deduplicated
+}
+
+fn merge_duplicate_user_item_state(
+    target: &mut EmbyMigrationUserItemStateBatch,
+    incoming: &EmbyMigrationUserItemStateBatch,
+    state_fields: EmbyMigrationUserItemStateFields,
+) {
+    if state_fields.position_ticks {
+        target.position_ticks = if state_fields.last_played_at {
+            match (target.last_played_at, incoming.last_played_at) {
+                (None, Some(_)) => incoming.position_ticks,
+                (Some(target_at), Some(incoming_at)) if incoming_at > target_at => {
+                    incoming.position_ticks
+                }
+                (Some(target_at), Some(incoming_at)) if incoming_at == target_at => {
+                    target.position_ticks.max(incoming.position_ticks)
+                }
+                (None, None) => target.position_ticks.max(incoming.position_ticks),
+                (Some(_), None) | (Some(_), Some(_)) => target.position_ticks,
+            }
+        } else {
+            target.position_ticks.max(incoming.position_ticks)
+        };
+    }
+    if state_fields.is_played {
+        target.is_played |= incoming.is_played;
+    }
+    if state_fields.is_favorite {
+        target.is_favorite |= incoming.is_favorite;
+    }
+    if state_fields.play_count {
+        target.play_count = target.play_count.max(incoming.play_count);
+    }
+    if state_fields.last_played_at {
+        target.last_played_at = match (target.last_played_at, incoming.last_played_at) {
+            (None, incoming) => incoming,
+            (target, None) => target,
+            (Some(target_at), Some(incoming_at)) => Some(target_at.max(incoming_at)),
+        };
+    }
+}
+
+fn deduplicate_emby_migration_person_favorite_states(
+    states: &[EmbyMigrationPersonFavoriteStateBatch],
+) -> Vec<EmbyMigrationPersonFavoriteStateBatch> {
+    let mut deduplicated = Vec::with_capacity(states.len());
+    let mut seen = HashSet::with_capacity(states.len());
+    for state in states {
+        if seen.insert((state.user_id.clone(), state.person_id.clone())) {
+            deduplicated.push(state.clone());
+        }
+    }
+    deduplicated
+}
 
 fn migration_library_id_chunks(selected_library_ids: Option<&[String]>) -> Vec<Option<&[String]>> {
     selected_library_ids
@@ -3573,6 +3656,227 @@ mod tests {
         .await?;
         assert_eq!(favorite, 1);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_item_page_merges_duplicate_target_states()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, item_id) = insert_test_user_and_item(&database).await?;
+        let job_id = Uuid::now_v7().to_string();
+        database
+            .insert_emby_migration_job(&NewEmbyMigrationJob {
+                id: &job_id,
+                created_by_user_id: &user_id,
+                source_label: "Test Emby",
+                source_base_url: "https://emby.example.test/",
+                secret_ref: "emby-migration/test",
+                dry_run: false,
+                merge_policy: "MERGE",
+                scope_json: r#"{"userProfile":false,"libraryAccess":false,"itemState":true,"personFavorites":false}"#,
+                emby_user_ids_json: r#"["emby-user"]"#,
+            })
+            .await?;
+        database
+            .update_emby_migration_job_status(&job_id, "RUNNING", "ITEMS", None)
+            .await?;
+
+        sqlx::query("CREATE TABLE migration_state_update_counts (count INTEGER NOT NULL)")
+            .execute(database.pool())
+            .await?;
+        sqlx::query("INSERT INTO migration_state_update_counts (count) VALUES (0)")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "CREATE TRIGGER count_duplicate_target_state_updates
+             AFTER UPDATE ON user_item_state
+             BEGIN
+                 UPDATE migration_state_update_counts SET count = count + 1;
+             END",
+        )
+        .execute(database.pool())
+        .await?;
+
+        database
+            .commit_emby_migration_item_page(EmbyMigrationItemPageBatch {
+                job_id: &job_id,
+                merge_policy: "MERGE",
+                state_fields: EmbyMigrationUserItemStateFields::all(),
+                item_matches: &[],
+                states: &[
+                    EmbyMigrationUserItemStateBatch {
+                        user_id: user_id.clone(),
+                        item_id: item_id.clone(),
+                        position_ticks: 100,
+                        is_played: false,
+                        is_favorite: true,
+                        play_count: 2,
+                        last_played_at: Some(100),
+                    },
+                    EmbyMigrationUserItemStateBatch {
+                        user_id: user_id.clone(),
+                        item_id: item_id.clone(),
+                        position_ticks: 200,
+                        is_played: true,
+                        is_favorite: false,
+                        play_count: 5,
+                        last_played_at: Some(200),
+                    },
+                ],
+                import_records: &[],
+                handled_items: &[],
+                progress: EmbyMigrationJobProgress {
+                    id: &job_id,
+                    cursor_json: "{}",
+                    processed_count: 2,
+                    total_count: 2,
+                    matched_count: 2,
+                    skipped_count: 0,
+                    failed_count: 0,
+                },
+            })
+            .await?;
+
+        let state = database
+            .find_user_item_state_for_migration(&user_id, &item_id)
+            .await?
+            .expect("merged duplicate state should be stored");
+        assert_eq!(state.position_ticks, 200);
+        assert!(state.is_played);
+        assert!(state.is_favorite);
+        assert_eq!(state.play_count, 5);
+        assert_eq!(state.last_played_at, Some(200));
+        let update_count: i64 =
+            sqlx::query_scalar("SELECT count FROM migration_state_update_counts")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(update_count, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_person_page_deduplicates_duplicate_target_states()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, _item_id) = insert_test_user_and_item(&database).await?;
+        let person_id = Uuid::now_v7().to_string();
+        let job_id = Uuid::now_v7().to_string();
+        database
+            .insert_emby_migration_job(&NewEmbyMigrationJob {
+                id: &job_id,
+                created_by_user_id: &user_id,
+                source_label: "Test Emby",
+                source_base_url: "https://emby.example.test/",
+                secret_ref: "emby-migration/test",
+                dry_run: false,
+                merge_policy: "MERGE",
+                scope_json: r#"{"userProfile":false,"libraryAccess":false,"itemState":false,"personFavorites":true}"#,
+                emby_user_ids_json: r#"["emby-user"]"#,
+            })
+            .await?;
+        database
+            .update_emby_migration_job_status(&job_id, "RUNNING", "ITEMS", None)
+            .await?;
+
+        let state = EmbyMigrationPersonFavoriteStateBatch {
+            user_id: user_id.clone(),
+            person_id: person_id.clone(),
+        };
+        database
+            .commit_emby_migration_person_page(
+                &job_id,
+                &[],
+                &[state.clone(), state],
+                &EmbyMigrationJobProgress {
+                    id: &job_id,
+                    cursor_json: "{}",
+                    processed_count: 2,
+                    total_count: 2,
+                    matched_count: 2,
+                    skipped_count: 0,
+                    failed_count: 0,
+                },
+            )
+            .await?;
+
+        let favorite: i64 = sqlx::query_scalar(
+            "SELECT is_favorite FROM user_person_state WHERE user_id = ? AND person_id = ?",
+        )
+        .bind(&user_id)
+        .bind(&person_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(favorite, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_item_states_follow_the_selected_merge_policy() {
+        let states = vec![
+            EmbyMigrationUserItemStateBatch {
+                user_id: "user".to_owned(),
+                item_id: "item".to_owned(),
+                position_ticks: 100,
+                is_played: false,
+                is_favorite: true,
+                play_count: 2,
+                last_played_at: Some(100),
+            },
+            EmbyMigrationUserItemStateBatch {
+                user_id: "user".to_owned(),
+                item_id: "item".to_owned(),
+                position_ticks: 200,
+                is_played: true,
+                is_favorite: false,
+                play_count: 5,
+                last_played_at: Some(200),
+            },
+        ];
+
+        let merged = deduplicate_emby_migration_user_item_states(
+            &states,
+            "MERGE",
+            EmbyMigrationUserItemStateFields::all(),
+        );
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].position_ticks, 200);
+        assert!(merged[0].is_played);
+        assert!(merged[0].is_favorite);
+        assert_eq!(merged[0].play_count, 5);
+        assert_eq!(merged[0].last_played_at, Some(200));
+
+        let overwritten = deduplicate_emby_migration_user_item_states(
+            &states,
+            "OVERWRITE",
+            EmbyMigrationUserItemStateFields::all(),
+        );
+        assert_eq!(overwritten, vec![states[1].clone()]);
+
+        let skipped = deduplicate_emby_migration_user_item_states(
+            &states,
+            "SKIP",
+            EmbyMigrationUserItemStateFields::all(),
+        );
+        assert_eq!(skipped, vec![states[0].clone()]);
+    }
+
+    #[test]
+    fn duplicate_person_favorite_states_are_kept_once() {
+        let states = vec![
+            EmbyMigrationPersonFavoriteStateBatch {
+                user_id: "user".to_owned(),
+                person_id: "person".to_owned(),
+            },
+            EmbyMigrationPersonFavoriteStateBatch {
+                user_id: "user".to_owned(),
+                person_id: "person".to_owned(),
+            },
+        ];
+
+        let deduplicated = deduplicate_emby_migration_person_favorite_states(&states);
+        assert_eq!(deduplicated.len(), 1);
+        assert_eq!(deduplicated[0].user_id, "user");
+        assert_eq!(deduplicated[0].person_id, "person");
     }
 
     #[tokio::test]

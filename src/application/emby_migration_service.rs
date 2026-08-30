@@ -781,10 +781,31 @@ impl EmbyMigrationService {
             let _runner_guard = self.execution.runner.lock().await;
             let result = self.run(&job_id).await;
             drop(_runner_guard);
-            self.execution.release(&job_id).await;
             if let Err(error) = result {
+                let error_message = error.to_string();
+                let phase = match self.database.find_emby_migration_job(&job_id).await {
+                    Ok(Some(job)) => job.phase,
+                    Ok(None) => "UNKNOWN".to_owned(),
+                    Err(status_error) => {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %status_error,
+                            "could not read Emby migration phase after job failure"
+                        );
+                        "UNKNOWN".to_owned()
+                    }
+                };
+                if let Err(status_error) = self.fail_job(&job_id, &phase, &error_message).await {
+                    tracing::error!(
+                        job_id = %job_id,
+                        phase = %phase,
+                        error = %status_error,
+                        "could not mark failed Emby migration job"
+                    );
+                }
                 tracing::error!(job_id = %job_id, %error, "Emby migration job stopped");
             }
+            self.execution.release(&job_id).await;
         });
     }
 
@@ -4336,6 +4357,85 @@ mod tests {
         assert!(!gate.claim("job-1").await);
         gate.release("job-1").await;
         assert!(gate.claim("job-1").await);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawned_migration_marks_unexpected_errors_as_failed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path().join("config");
+        write_fake_emby_migration_plugin(&config_dir)?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        })
+        .await?;
+        let user_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&user_id, "alice", "Alice", "hash")
+            .await?;
+
+        let plugins = PluginService::new(database.clone(), config_dir.clone());
+        plugins.install(EMBY_MIGRATION_PLUGIN_ID).await?;
+        plugins
+            .update_dynamic_config(
+                EMBY_MIGRATION_PLUGIN_ID,
+                serde_json::Map::from_iter([
+                    ("baseUrl".to_owned(), json!("http://emby.local:8096")),
+                    ("apiKey".to_owned(), json!("fixture")),
+                    ("allowPrivateNetwork".to_owned(), json!(true)),
+                ]),
+            )
+            .await?;
+        let service = Arc::new(EmbyMigrationService::new(
+            database.clone(),
+            plugins,
+            config_dir.clone(),
+        ));
+        let job = service
+            .create_job(
+                &user_id,
+                CreateMigrationRequest {
+                    dry_run: false,
+                    merge_policy: MigrationMergePolicy::Merge,
+                    emby_user_ids: vec!["emby-user".to_owned()],
+                    scope: MigrationScope::default(),
+                },
+            )
+            .await?;
+        let stored_job = database
+            .find_emby_migration_job(&job.id)
+            .await?
+            .expect("created migration job should be stored");
+        database
+            .update_emby_migration_job_status(&job.id, "RUNNING", "ITEMS", None)
+            .await?;
+        tokio::fs::remove_file(
+            config_dir
+                .join("plugin-secrets")
+                .join(stored_job.secret_ref),
+        )
+        .await?;
+
+        service.clone().spawn(job.id.clone());
+        let mut failed_job = None;
+        for _ in 0..100 {
+            let current = database
+                .find_emby_migration_job(&job.id)
+                .await?
+                .expect("migration job should remain stored");
+            if current.status == "FAILED" {
+                failed_job = Some(current);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let failed_job = failed_job.ok_or("migration job did not reach FAILED")?;
+
+        assert_eq!(failed_job.phase, "ITEMS");
+        assert!(failed_job.error.is_some());
+        Ok(())
     }
 
     #[cfg(unix)]
