@@ -7,7 +7,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
-import { shouldUseClientHevc } from "../src/features/player/playback-selection";
+import {
+  isRemoteHttpStrmSource,
+  shouldUseClientHevc,
+  shouldUseClientMkv,
+} from "../src/features/player/playback-selection";
 
 const fallbackState = vi.hoisted(() => ({
   assets: [] as Array<{ workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string }>,
@@ -15,6 +19,7 @@ const fallbackState = vi.hoisted(() => ({
 }));
 
 vi.mock("../src/features/player/playback-selection", () => ({
+  isRemoteHttpStrmSource: vi.fn().mockReturnValue(false),
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
 }));
@@ -58,7 +63,9 @@ describe("PlayerPage client fallback status", () => {
   beforeEach(() => {
     fallbackState.assets.length = 0;
     fallbackState.snapshotDuration = 8;
+    vi.mocked(isRemoteHttpStrmSource).mockReturnValue(false);
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
+    vi.mocked(shouldUseClientMkv).mockResolvedValue(false);
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-fallback",
       title: "4K fallback",
@@ -126,6 +133,59 @@ describe("PlayerPage client fallback status", () => {
     expect(fallbackState.assets[0]).toMatchObject({
       wasmUrl: "/hevc/hevc-decode.js",
     });
+  });
+
+  it("keeps remote HTTP STRM on native playback instead of the CORS fallback", async () => {
+    vi.mocked(isRemoteHttpStrmSource).mockReturnValue(true);
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-remote-fallback",
+      title: "远程直连测试",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "source-remote-fallback",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/302?pickcode=fixture",
+        container: "mkv",
+        streams: [{ index: 0, type: "VIDEO", codec: "HEVC" }],
+      }],
+    });
+    vi.mocked(api.createWebPlaybackSession).mockResolvedValueOnce({
+      sessionId: "web-remote-fallback",
+      playSessionId: "lux-web:web-remote-fallback",
+      sourceId: "source-remote-fallback",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-remote-fallback/direct?expires=1900000000&signature=test",
+      },
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-remote-fallback"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    expect(video?.getAttribute("src")).toBe("https://media.example.test/302?pickcode=fixture");
+    expect(shouldUseClientMkv).not.toHaveBeenCalled();
+    expect(shouldUseClientHevc).not.toHaveBeenCalled();
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {

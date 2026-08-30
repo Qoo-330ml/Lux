@@ -1007,7 +1007,7 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector<HTMLVideoElement>("video")?.getAttribute("src"))
-      .toBe("/api/v1/playback/sessions/web-source-strm/direct?expires=1900000000&signature=test");
+      .toBe("https://example.invalid/video.mkv");
   });
 
   it("shows classified Lux guidance when the browser cannot play the source", async () => {

@@ -286,6 +286,52 @@ describe("PlayerPage playback synchronization", () => {
       .toBe("/api/v1/playback/sessions/web-source-proxy/direct?expires=1900000000&signature=test");
   });
 
+  it("uses the original HTTP(S) STRM URL so the browser follows its 302 directly", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-remote-strm",
+      title: "远程直连测试",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "source-remote-strm",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/302?pickcode=fixture",
+        container: "mp4",
+        streams: [{ index: 0, type: "VIDEO", codec: "h264" }],
+      }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({
+      positionTicks: 0,
+      isPlayed: false,
+      state: null,
+      isPaused: false,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/movie-remote-strm"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    expect(video?.getAttribute("src")).toBe("https://media.example.test/302?pickcode=fixture");
+    expect(video?.getAttribute("crossorigin")).toBeNull();
+  });
+
   it("stops the old session before creating a selected replacement source", async () => {
     const lifecycle: string[] = [];
     vi.mocked(api.createWebPlaybackSession).mockImplementation(async (_itemId, sourceId) => {
