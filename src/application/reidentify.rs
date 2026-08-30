@@ -37,7 +37,6 @@ const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
 const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
-const AUTO_MATCH_MIN_MARGIN: f64 = 5.0;
 
 static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -1332,29 +1331,23 @@ impl From<StorageError> for MetadataReidentifyError {
 
 fn best_automatic_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
     let candidate = best_pending_candidate(page)?;
-    if candidate.score < AUTO_MATCH_MIN_SCORE {
-        return None;
-    }
-    let second_score = page
-        .items
-        .iter()
-        .filter(|item| item.status == "PENDING" && item.id != candidate.id)
-        .filter(|item| {
-            item.provider != candidate.provider || item.provider_id != candidate.provider_id
-        })
-        .map(|item| item.score)
-        .max_by(f64::total_cmp);
-    if second_score.is_some_and(|score| candidate.score - score < AUTO_MATCH_MIN_MARGIN) {
-        return None;
-    }
-    Some(candidate)
+    (candidate.score >= AUTO_MATCH_MIN_SCORE).then_some(candidate)
 }
 
 fn best_pending_candidate(page: &MetadataCandidatePage) -> Option<&MetadataCandidateView> {
-    page.items
+    let mut best = None;
+    for candidate in page
+        .items
         .iter()
         .filter(|candidate| candidate.status == "PENDING")
-        .max_by(|left, right| left.score.total_cmp(&right.score))
+    {
+        if best.is_none_or(|current: &MetadataCandidateView| {
+            candidate.score.total_cmp(&current.score).is_gt()
+        }) {
+            best = Some(candidate);
+        }
+    }
+    best
 }
 
 fn recoverable_scraper_attempt(error: &MetadataReidentifyError) -> bool {
@@ -1447,10 +1440,10 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        AUTO_MATCH_MIN_MARGIN, AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT,
-        MetadataCandidatePage, MetadataCandidateView, MetadataRequestPlan,
-        best_automatic_candidate, metadata_global_permits, metadata_request_plan_is_complete,
-        metadata_worker_concurrency, metadata_worker_default_concurrency,
+        AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage,
+        MetadataCandidateView, MetadataRequestPlan, best_automatic_candidate,
+        metadata_global_permits, metadata_request_plan_is_complete, metadata_worker_concurrency,
+        metadata_worker_default_concurrency,
     };
     use crate::{
         application::{
@@ -2072,7 +2065,7 @@ mod tests {
     }
 
     #[test]
-    fn automatic_matching_sends_close_candidates_to_review() {
+    fn automatic_matching_accepts_equal_high_confidence_candidates_in_search_order() {
         let page = MetadataCandidatePage {
             items: vec![candidate("first", 90.0), candidate("second", 90.0)],
             total: 2,
@@ -2080,11 +2073,14 @@ mod tests {
             limit: 50,
         };
 
-        assert!(best_automatic_candidate(&page).is_none());
+        assert_eq!(
+            best_automatic_candidate(&page).map(|item| item.id.as_str()),
+            Some("first")
+        );
     }
 
     #[test]
-    fn automatic_matching_ignores_duplicate_candidates_for_margin() {
+    fn automatic_matching_accepts_duplicate_provider_candidates() {
         let mut duplicate = candidate("duplicate-1", 95.0);
         duplicate.provider_id = "same-provider-id".to_owned();
         let mut repeated = candidate("duplicate-2", 95.0);
@@ -2100,18 +2096,18 @@ mod tests {
     }
 
     #[test]
-    fn automatic_matching_sends_candidates_with_a_small_margin_to_review() {
+    fn automatic_matching_accepts_qualifying_candidates_with_a_small_margin() {
         let page = MetadataCandidatePage {
-            items: vec![
-                candidate("first", 90.0),
-                candidate("second", 90.0 - AUTO_MATCH_MIN_MARGIN + 0.1),
-            ],
+            items: vec![candidate("first", 90.0), candidate("second", 85.1)],
             total: 2,
             offset: 0,
             limit: 50,
         };
 
-        assert!(best_automatic_candidate(&page).is_none());
+        assert_eq!(
+            best_automatic_candidate(&page).map(|item| item.id.as_str()),
+            Some("first")
+        );
     }
 
     #[test]
