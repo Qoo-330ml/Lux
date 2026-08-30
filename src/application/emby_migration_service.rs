@@ -1229,22 +1229,27 @@ impl EmbyMigrationService {
                             );
                         }
                         let page = recovered_page.page;
-                        let next_prefetched_page = page
-                            .next_start_index
-                            .filter(|next_start_index| *next_start_index > start_index)
-                            .map(|next_start_index| {
-                                self.prefetch_migration_page(
-                                    &source,
-                                    &user.id,
-                                    next_start_index,
-                                    MigrationPageKind::UserState(state_filter),
-                                    MigrationSourceFilter {
-                                        library_ids: source_library_ids.as_deref(),
-                                        enabled: source_filtering_enabled,
-                                        state_fields: Some(requested_state_fields.as_slice()),
-                                    },
-                                )
-                            });
+                        let next_prefetched_page = should_prefetch_source_page(
+                            recovered_page.source_rate_limited_rpc_calls,
+                        )
+                        .then(|| {
+                            page.next_start_index
+                                .filter(|next_start_index| *next_start_index > start_index)
+                                .map(|next_start_index| {
+                                    self.prefetch_migration_page(
+                                        &source,
+                                        &user.id,
+                                        next_start_index,
+                                        MigrationPageKind::UserState(state_filter),
+                                        MigrationSourceFilter {
+                                            library_ids: source_library_ids.as_deref(),
+                                            enabled: source_filtering_enabled,
+                                            state_fields: Some(requested_state_fields.as_slice()),
+                                        },
+                                    )
+                                })
+                        })
+                        .flatten();
                         prefetched_source_pages += u64::from(next_prefetched_page.is_some());
                         peak_source_page_records = peak_source_page_records.max(page.items.len());
                         // Deduplicate before querying Lux.  The same source item commonly
@@ -1552,22 +1557,26 @@ impl EmbyMigrationService {
                         );
                     }
                     let page = recovered_page.page;
-                    let next_prefetched_page = page
-                        .next_start_index
-                        .filter(|next_start_index| *next_start_index > start_index)
-                        .map(|next_start_index| {
-                            self.prefetch_migration_page(
-                                &source,
-                                &user.id,
-                                next_start_index,
-                                MigrationPageKind::PersonFavorites,
-                                MigrationSourceFilter {
-                                    library_ids: source_library_ids.as_deref(),
-                                    enabled: source_filtering_enabled,
-                                    state_fields: None,
-                                },
-                            )
-                        });
+                    let next_prefetched_page =
+                        should_prefetch_source_page(recovered_page.source_rate_limited_rpc_calls)
+                            .then(|| {
+                                page.next_start_index
+                                    .filter(|next_start_index| *next_start_index > start_index)
+                                    .map(|next_start_index| {
+                                        self.prefetch_migration_page(
+                                            &source,
+                                            &user.id,
+                                            next_start_index,
+                                            MigrationPageKind::PersonFavorites,
+                                            MigrationSourceFilter {
+                                                library_ids: source_library_ids.as_deref(),
+                                                enabled: source_filtering_enabled,
+                                                state_fields: None,
+                                            },
+                                        )
+                                    })
+                            })
+                            .flatten();
                     prefetched_source_pages += u64::from(next_prefetched_page.is_some());
                     peak_source_page_records = peak_source_page_records.max(page.items.len());
                     if !person_total_recorded {
@@ -2741,6 +2750,10 @@ fn source_filter_has_candidates(
     source_library_ids: Option<&[String]>,
 ) -> bool {
     !filtered_reads || source_library_ids.is_none_or(|library_ids| !library_ids.is_empty())
+}
+
+fn should_prefetch_source_page(rate_limited_rpc_calls: u64) -> bool {
+    rate_limited_rpc_calls == 0
 }
 
 #[cfg(test)]
@@ -4227,6 +4240,12 @@ mod tests {
         assert!(!source_filter_has_candidates(true, Some(&[])));
         assert!(source_filter_has_candidates(true, None));
         assert!(source_filter_has_candidates(false, Some(&[])));
+    }
+
+    #[test]
+    fn rate_limited_page_disables_the_next_read_ahead() {
+        assert!(!should_prefetch_source_page(1));
+        assert!(should_prefetch_source_page(0));
     }
 
     #[test]
