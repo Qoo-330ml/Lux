@@ -441,7 +441,7 @@ impl StrmProbeService {
             self.finish_probe_outcome(&job, outcome, &mut failed, &mut processed, &mut progress)
                 .await?;
         }
-        if progress.latest_cursor.is_some() {
+        if progress.has_pending_progress() {
             self.flush_probe_progress(&job, processed, &mut progress)
                 .await?;
         }
@@ -811,6 +811,10 @@ impl ProbeProgress {
         self.completions_since_progress = 0;
         self.last_progress_update = now;
     }
+
+    fn has_pending_progress(&self) -> bool {
+        self.completions_since_progress > 0
+    }
 }
 
 fn is_valid_jpeg(bytes: &[u8]) -> bool {
@@ -996,10 +1000,12 @@ mod tests {
         assert!(progress.should_flush_progress(start));
         progress.mark_progress_updated(start);
         assert!(!progress.should_flush_progress(start));
+        assert!(!progress.has_pending_progress());
 
         let later = start + PROGRESS_UPDATE_INTERVAL;
         progress.record_completion("source-timed".to_owned());
         assert!(progress.should_flush_progress(later));
+        assert!(progress.has_pending_progress());
 
         for _ in 0..(CANCEL_CHECK_EVERY - 1) {
             progress.note_source_started();
