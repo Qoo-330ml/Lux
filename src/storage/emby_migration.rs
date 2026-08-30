@@ -2442,6 +2442,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn migration_title_lookup_prefers_exact_title_over_punctuation_variant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library_id = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'SERIES')")
+            .bind(&library_id)
+            .bind("Migration punctuation conflict")
+            .execute(database.pool())
+            .await?;
+        let exact_item_id = Uuid::now_v7().to_string();
+        for (index, title) in ["Pilot Episode", "Pilot-Episode"].into_iter().enumerate() {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    season_number, episode_number, identification_status
+                 ) VALUES (?, ?, 'EPISODE', ?, ?, 1, 1, 'LOCAL_CONFIRMED')",
+            )
+            .bind(if index == 0 {
+                exact_item_id.clone()
+            } else {
+                Uuid::now_v7().to_string()
+            })
+            .bind(&library_id)
+            .bind(title)
+            .bind(title.to_lowercase())
+            .execute(database.pool())
+            .await?;
+        }
+
+        let identities = database
+            .list_migration_media_identity_candidates(&[MigrationMediaIdentityLookup {
+                item_type: "EPISODE".to_owned(),
+                title: "Pilot Episode".to_owned(),
+                title_pattern: "%pilot%episode%".to_owned(),
+                production_year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+                provider_ids: Vec::new(),
+            }])
+            .await?;
+
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].id, exact_item_id);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn migration_title_index_is_created_for_existing_databases()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, database) = test_database().await?;
