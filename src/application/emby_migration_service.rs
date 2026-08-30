@@ -4038,6 +4038,95 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn item_state_pages_use_bounded_read_ahead_and_preserve_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config_dir = temp_dir.path().join("config");
+        write_paged_emby_migration_plugin(&config_dir)?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.clone(),
+        })
+        .await?;
+        let lux_user_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&lux_user_id, "alice", "Alice", "hash")
+            .await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind("movies-library")
+            .bind("Movies")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, production_year,
+                 provider_ids_json, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind("lux-movie")
+        .bind("movies-library")
+        .bind("Selected film")
+        .bind("selected film")
+        .bind(2024_i64)
+        .bind(r#"{"tmdb":"42"}"#)
+        .execute(database.pool())
+        .await?;
+
+        let plugins = PluginService::new(database.clone(), config_dir.clone());
+        plugins.install(EMBY_MIGRATION_PLUGIN_ID).await?;
+        plugins
+            .update_dynamic_config(
+                EMBY_MIGRATION_PLUGIN_ID,
+                serde_json::Map::from_iter([
+                    ("baseUrl".to_owned(), json!("http://emby.local:8096")),
+                    ("apiKey".to_owned(), json!("test-api-key")),
+                    ("allowPrivateNetwork".to_owned(), json!(true)),
+                ]),
+            )
+            .await?;
+        let service = EmbyMigrationService::new(database.clone(), plugins, config_dir.clone());
+        let job = service
+            .create_job(
+                &lux_user_id,
+                CreateMigrationRequest {
+                    dry_run: false,
+                    merge_policy: MigrationMergePolicy::Merge,
+                    emby_user_ids: vec!["emby-user".to_owned()],
+                    scope: MigrationScope {
+                        user_profile: false,
+                        library_access: false,
+                        item_state: true,
+                        item_state_filters: Some(vec![MigrationUserStateFilter::Played]),
+                        person_favorites: false,
+                        target_library_ids: Some(vec!["movies-library".to_owned()]),
+                    },
+                },
+            )
+            .await?;
+
+        service.run(&job.id).await?;
+        let matches = service.list_item_matches(&job.id, 0, 10).await?;
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].status, "MATCHED");
+        let calls = tokio::fs::read_to_string(
+            config_dir
+                .join("plugins")
+                .join(EMBY_MIGRATION_PLUGIN_ID)
+                .join("migration-calls.jsonl"),
+        )
+        .await?;
+        let state_calls = calls
+            .lines()
+            .filter(|line| line.contains("migration.user_state"))
+            .collect::<Vec<_>>();
+        assert_eq!(state_calls.len(), 2);
+        assert!(state_calls[0].contains("\"startIndex\":0"));
+        assert!(state_calls[1].contains("\"startIndex\":500"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn favorite_only_migration_forwards_only_selected_source_filter()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
@@ -4204,6 +4293,50 @@ done
                 "files": []
             }))?,
         )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn write_paged_emby_migration_plugin(
+        config_dir: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::{fs, os::unix::fs::PermissionsExt};
+
+        write_fake_emby_migration_plugin(config_dir)?;
+        let entrypoint = config_dir.join(format!(
+            "plugins/{EMBY_MIGRATION_PLUGIN_ID}/binaries/plugin"
+        ));
+        fs::write(
+            &entrypoint,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  start_index=$(printf '%s' "$line" | sed -n 's/.*"startIndex":\([0-9]*\).*/\1/p')
+  printf '%s\n' "$line" >> migration-calls.jsonl
+  case "$method" in
+    migration.test)
+      result='{"serverName":"Paged Fixture Emby","historyCapability":"ITEM_STATE","supportsFilteredReads":true}'
+      ;;
+    migration.list_users)
+      result='{"items":[{"id":"emby-user","name":"Alice","hasPassword":false,"isDisabled":false,"isAdministrator":false,"enableAllFolders":true,"enabledFolders":[],"enableRemoteAccess":false,"enableContentDownloading":false,"primaryImageTag":null}],"historyCapability":"ITEM_STATE"}'
+      ;;
+    migration.user_state)
+      if [ "$start_index" = "0" ]; then
+          result='{"items":[{"id":"emby-item","name":"Selected film","itemType":"Movie","productionYear":2024,"providerIds":{"tmdb":"42"},"parentId":null,"seriesId":null,"seasonId":null,"indexNumber":null,"parentIndexNumber":null,"userData":{"playbackPositionTicks":1,"played":true,"isFavorite":false,"playCount":1,"lastPlayedDate":null}}],"startIndex":0,"totalRecordCount":1000,"nextStartIndex":500,"historyCapability":"ITEM_STATE"}'
+      else
+          result='{"items":[],"startIndex":500,"totalRecordCount":1000,"nextStartIndex":null,"historyCapability":"ITEM_STATE"}'
+      fi
+      ;;
+    *)
+      result='{"items":[],"startIndex":0,"totalRecordCount":0,"nextStartIndex":null,"historyCapability":"ITEM_STATE"}'
+      ;;
+  esac
+  printf '{"id":"%s","result":%s}\n' "$id" "$result"
+done
+"#,
+        )?;
+        fs::set_permissions(&entrypoint, fs::Permissions::from_mode(0o700))?;
         Ok(())
     }
 
