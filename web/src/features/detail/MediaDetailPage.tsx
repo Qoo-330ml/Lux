@@ -1,5 +1,5 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
+import { ArrowLeft, Check, Heart, Play, Radio, Sparkles, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { LuxSelect } from "../../components/LuxSelect";
@@ -15,6 +15,7 @@ import { MediaIdentifier } from "../media/MediaIdentifier";
 import { MediaMetadataEditor } from "../media/MediaMetadataEditor";
 import { MediaSubtitleEditor } from "../media/MediaSubtitleEditor";
 import { MediaDeleteDialog } from "../media/MediaDeleteDialog";
+import { LuxLogo } from "../../components/LuxLogo";
 
 export function MediaDetailPage() {
   const { itemId = "" } = useParams();
@@ -233,6 +234,16 @@ export function MediaDetailPage() {
 
   return (
     <article className={`lux-detail-page lux-detail-page-${detailKind}`}>
+      <div className="lux-detail-mobile-header">
+        <button className="lux-detail-mobile-back" type="button" aria-label="返回上一页" onClick={() => navigate(-1)}>
+          <ArrowLeft size={21} />
+        </button>
+        <Link className="lux-detail-mobile-brand" to="/" aria-label="Lux 首页">
+          <LuxLogo className="lux-detail-mobile-brand-logo" />
+          <span>Lux</span>
+        </Link>
+        <MediaActionMenu item={media} className="lux-detail-mobile-menu" sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+      </div>
       {backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null}
       <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
@@ -247,7 +258,7 @@ export function MediaDetailPage() {
             </div>
           </div>
           <div className="lux-detail-copy">
-            <div className="lux-detail-title-row">
+            <div className="lux-detail-title-row" data-has-logo={logo ? "true" : undefined}>
               {logo ? <img className="lux-detail-logo" src={logo.url} alt={`${mediaTitle(media)} 徽标`} /> : null}
               <h1>{detailTitle}</h1>
               {detailOriginalTitle && detailOriginalTitle !== detailTitle
@@ -292,8 +303,9 @@ export function MediaDetailPage() {
                   <Play size={17} fill="currentColor" /> 播放
                 </button>
               )}
-              <button className="lux-button lux-button-large lux-button-glass" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
-                <Heart size={17} fill={playback.data?.isFavorite ? "currentColor" : "none"} /> {playback.data?.isFavorite ? "已收藏" : "收藏"}
+              <button className="lux-button lux-button-large lux-button-glass lux-detail-action-control" type="button" data-action="toggle-favorite" aria-pressed={Boolean(playback.data?.isFavorite)} disabled={pendingPlaybackAction !== undefined} onClick={() => void updatePlaybackFlag("favorite")}>
+                <span className="lux-detail-action-icon"><Heart size={17} fill={playback.data?.isFavorite ? "currentColor" : "none"} /></span>
+                <span className="lux-detail-action-label">{playback.data?.isFavorite ? "已收藏" : "收藏"}</span>
               </button>
               {media.metadataPending || pendingReview ? (
                 <button className="lux-button lux-button-large lux-button-glass" type="button" data-action="confirm-metadata" disabled={confirmingMetadata} onClick={() => void confirmMetadata()}>
@@ -310,7 +322,8 @@ export function MediaDetailPage() {
                 disabled={pendingPlaybackAction !== undefined}
                 onClick={() => void updatePlaybackFlag("played")}
               >
-                <Check size={20} strokeWidth={2.4} />
+                <span className="lux-detail-action-icon"><Check size={20} strokeWidth={2.4} /></span>
+                <span className="lux-detail-action-label">已看</span>
               </button>
               <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               {pendingReview && nextPendingItem ? <Link className="lux-button lux-button-large lux-button-glass lux-detail-next-pending" data-action="next-pending" to={`/items/${nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
@@ -327,24 +340,32 @@ export function MediaDetailPage() {
             ) : null}
           </div>
         </div>
-        <MediaCast actors={media.actors ?? []} />
-        <MediaNfoPanel
-          details={localNfo}
-          mediaInfo={source ? {
-            source,
-            itemType: media.itemType,
-            lastAirDate: media.lastAirDate,
-            status,
-            originalLanguage,
-          } : undefined}
-        />
-        {isSeries ? (
-          <SeriesChildren
-            seasons={seasons.data?.items ?? []}
-          />
-        ) : null}
-        {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
-        {isEpisode ? <EpisodeRail episodes={episodes.data?.items ?? []} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
+        <div className="lux-detail-sections">
+          <div className="lux-detail-hierarchy">
+            {isSeries ? (
+              <SeriesChildren
+                seasons={seasons.data?.items ?? []}
+              />
+            ) : null}
+            {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
+            {isEpisode ? <EpisodeRail episodes={episodes.data?.items ?? []} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
+          </div>
+          <div className="lux-detail-cast">
+            <MediaCast actors={media.actors ?? []} />
+          </div>
+          <div className="lux-detail-nfo">
+            <MediaNfoPanel
+              details={localNfo}
+              mediaInfo={source ? {
+                source,
+                itemType: media.itemType,
+                lastAirDate: media.lastAirDate,
+                status,
+                originalLanguage,
+              } : undefined}
+            />
+          </div>
+        </div>
       </div>
       {editor === "metadata" ? <MediaMetadataEditor item={media} onClose={() => setEditor(undefined)} /> : null}
       {editor === "images" ? <MediaImageEditor item={media} onClose={() => {

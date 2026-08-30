@@ -926,8 +926,10 @@ describe("MediaDetailPage series hierarchy", () => {
     const titleRow = container.querySelector(".lux-detail-title-row");
     expect(titleRow?.querySelector<HTMLImageElement>(".lux-detail-logo")?.getAttribute("src"))
       .toBe("/api/v1/items/movie-1/images/logo");
+    expect(titleRow?.getAttribute("data-has-logo")).toBe("true");
     expect(titleRow?.children[0]?.className).toBe("lux-detail-logo");
     expect(titleRow?.children[1]?.tagName).toBe("H1");
+    expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
     expect(posterColumn?.querySelector(".lux-detail-logo")).toBeNull();
     expect(titleRow?.querySelector("h1")?.textContent).toBe("示例电影");
   });

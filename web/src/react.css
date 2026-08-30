@@ -386,9 +386,14 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-account-list small { color: var(--lux-subtle); }
 
 .lux-detail-page { position: relative; min-height: 100vh; overflow: hidden; isolation: isolate; background: #08080a; }
+.lux-detail-mobile-header { display: none; }
 .lux-detail-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .58; filter: saturate(.78) brightness(.72) blur(1px); transform: scale(1.02); }
 .lux-detail-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95), rgba(5,5,6,.7) 45%, rgba(5,5,6,.42)), linear-gradient(0deg, #050506 4%, transparent 58%); }
 .lux-detail-content { width: 92%; min-height: 100vh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
+.lux-detail-sections { display: flex; flex-direction: column; }
+.lux-detail-cast { order: 1; }
+.lux-detail-nfo { order: 2; }
+.lux-detail-hierarchy { order: 3; }
 .lux-hero-actions > .lux-media-actions { position: relative; top: auto; right: auto; align-self: center; }
 .lux-hero-actions > .lux-media-actions .lux-media-actions-trigger { width: 48px; height: 48px; }
 .lux-hero-actions > .lux-media-actions .lux-media-action-menu { top: 54px; right: 0; }
@@ -1481,13 +1486,49 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-search-panel input { flex-basis: calc(100% - 40px); min-height: 32px; }
   .lux-search-panel .lux-button { flex: 1; }
   .lux-auth-card { padding: 30px 24px; }
-  .lux-detail-content { width: 92%; }
+  .lux-app:has(.lux-detail-page) > .lux-header { display: none; }
+  .lux-detail-page { overflow-x: clip; }
+  .lux-detail-mobile-header { position: absolute; z-index: 8; top: calc(14px + env(safe-area-inset-top)); right: 15px; left: 15px; display: flex; align-items: center; gap: 10px; pointer-events: none; }
+  .lux-detail-mobile-back { display: grid; place-items: center; width: 46px; height: 46px; padding: 0; border: 1px solid var(--lux-line); border-radius: 50%; color: #fff; background: rgba(5,5,6,.3); box-shadow: 0 6px 22px rgba(0,0,0,.18); pointer-events: auto; backdrop-filter: blur(12px); }
+  .lux-detail-mobile-back:hover { border-color: rgba(255,255,255,.36); background: rgba(255,255,255,.1); }
+  .lux-detail-mobile-brand { display: inline-flex; align-items: center; gap: 8px; min-height: 46px; color: #fff; font-size: 1rem; font-weight: 650; letter-spacing: -.04em; text-shadow: 0 4px 16px rgba(0,0,0,.4); pointer-events: auto; }
+  .lux-detail-mobile-brand-logo { display: block; width: 31px; height: 31px; filter: drop-shadow(0 5px 12px rgba(0,0,0,.28)); }
+  .lux-detail-backdrop { display: none; }
+  .lux-detail-overlay { display: none; }
+  .lux-detail-content { width: 100%; padding-top: 0; }
   .lux-detail-grid { grid-template-columns: 1fr; gap: 28px; }
-  .lux-detail-poster-column { width: min(220px, 62vw); }
+  .lux-detail-poster-column { width: 100%; }
   .lux-detail-page-episode .lux-detail-poster-column { width: min(100%, 420px); }
-  .lux-detail-poster { width: 100%; }
+  .lux-detail-page-episode .lux-detail-poster-column { width: 100%; }
+  .lux-detail-poster { width: 100%; border: 0; border-radius: 0; box-shadow: none; background: transparent; }
+  .lux-detail-poster:not(.is-landscape)::after { position: absolute; z-index: 1; inset: 0; pointer-events: none; background: linear-gradient(180deg, transparent 60%, rgba(5,5,6,.1) 72%, #050506 100%); content: ""; }
+  .lux-detail-poster img { position: relative; z-index: 0; }
+  .lux-detail-copy { width: 92%; margin: 0 auto; }
+  .lux-detail-title-row { align-items: center; margin-top: -24px; text-align: center; }
+  .lux-detail-title-row[data-has-logo="true"] h1 { display: none; }
+  .lux-detail-logo { max-width: min(78vw, 360px); max-height: 84px; }
+  .lux-detail-original-title, .lux-detail-subtitle { text-align: center; }
+  .lux-detail-meta { justify-content: center; text-align: center; }
+  .lux-detail-copy > .lux-hero-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 16px 10px; margin-top: 20px; }
+  .lux-detail-copy > .lux-hero-actions > .lux-button-primary { grid-column: 1 / -1; width: 100%; }
+  .lux-detail-action-control { display: flex; align-items: center; flex-direction: column; justify-content: flex-start; gap: 8px; min-width: 0; min-height: 76px; padding: 0; border: 0; border-radius: 0; color: var(--lux-muted); background: transparent; box-shadow: none; font-size: .72rem; font-weight: 550; backdrop-filter: none; }
+  .lux-detail-action-control:hover { color: #fff; background: transparent; box-shadow: none; transform: none; }
+  .lux-detail-action-icon { display: grid; place-items: center; flex: 0 0 auto; width: 48px; height: 48px; border: 1px solid var(--lux-line); border-radius: 50%; color: currentColor; background: rgba(0,0,0,.28); }
+  .lux-detail-action-label { display: block; min-height: 1em; color: currentColor; font-size: .72rem; line-height: 1; }
+  .lux-detail-copy > .lux-hero-actions > .lux-media-actions { display: none; }
+  .lux-detail-watched-status { display: flex; align-items: center; flex-direction: column; justify-content: flex-start; gap: 8px; width: 100%; height: auto; min-height: 76px; padding: 0; border: 0; border-radius: 0; color: var(--lux-muted); background: transparent; box-shadow: none; }
+  .lux-detail-watched-status:hover { color: #fff; }
+  .lux-detail-watched-status.is-played { border: 0; color: #a4e4ba; background: transparent; box-shadow: none; }
+  .lux-detail-watched-status.is-played .lux-detail-action-icon { border-color: rgba(155,226,183,.58); background: rgba(96,194,132,.16); box-shadow: inset 0 0 0 1px rgba(155,226,183,.12), 0 8px 22px rgba(96,194,132,.16); }
+  .lux-detail-mobile-menu { position: static; z-index: auto; flex: 0 0 auto; margin-left: auto; pointer-events: auto; }
+  .lux-detail-mobile-menu .lux-media-actions-trigger { width: 46px; height: 46px; }
+  .lux-detail-copy > .lux-hero-actions > [data-action="confirm-metadata"], .lux-detail-copy > .lux-hero-actions > .lux-detail-next-pending { grid-column: 1 / -1; width: 100%; }
+  .lux-detail-source { grid-column: 1 / -1; justify-content: center; width: 100%; }
   .lux-detail-copy h1 { font-size: 28px; }
   .lux-detail-source { width: 100%; }
+  .lux-detail-hierarchy { order: 1; }
+  .lux-detail-cast { order: 2; }
+  .lux-detail-nfo { order: 3; }
   .lux-season-episode-row { grid-template-columns: minmax(120px, 36vw) minmax(0, 1fr); gap: 12px; }
   .lux-season-episode-arrow { display: none; }
   .lux-media-info { margin-top: 52px; }

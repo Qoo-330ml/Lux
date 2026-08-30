@@ -134,3 +134,22 @@ test("detail lower sections use the full content width", () => {
   assert.match(seriesChildrenRule, /max-width:\s*none/);
   assert.match(hierarchyRule, /max-width:\s*none/);
 });
+
+test("mobile detail pages use a full-bleed portrait poster and logo-first identity", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const posterRule = mobileStyles.match(/\.lux-detail-poster\s*\{([^}]*)\}/)?.[1] ?? "";
+  const posterColumnRule = mobileStyles.match(/\.lux-detail-poster-column\s*\{([^}]*)\}/)?.[1] ?? "";
+  const contentRule = mobileStyles.match(/\.lux-detail-content\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(source, /className="lux-detail-mobile-header"/);
+  assert.match(source, /className="lux-detail-title-row" data-has-logo=\{logo \? "true" : undefined\}/);
+  assert.match(contentRule, /width:\s*100%/);
+  assert.match(posterColumnRule, /width:\s*100%/);
+  assert.match(posterRule, /border:\s*0/);
+  assert.match(posterRule, /border-radius:\s*0/);
+  assert.match(posterRule, /box-shadow:\s*none/);
+  assert.match(mobileStyles, /\.lux-detail-backdrop\s*\{[^}]*display:\s*none/);
+  assert.match(mobileStyles, /\.lux-detail-title-row\[data-has-logo="true"\]\s+h1\s*\{[^}]*display:\s*none/);
+});
