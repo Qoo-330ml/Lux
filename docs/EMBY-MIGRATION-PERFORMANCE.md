@@ -54,7 +54,7 @@ cargo test --locked --lib migration_page_batch_benchmark_records_scale -- --igno
 
 ### 来源插件过滤与有界用户读取
 
-`Lux-plugins` 中的 `org.lux.emby-migration` 0.1.4 已实现 `supportsFilteredReads`：宿主传入的用户 ID、用户字段、状态字段
+`Lux-plugins` 中的 `org.lux.emby-migration` 0.1.5 已实现 `supportsFilteredReads`：宿主传入的用户 ID、用户字段、状态字段
 和来源虚拟库 ID 会在插件发起 Emby 请求前转换为查询投影；响应还会再次按投影裁剪，兼容忽略投影参数的旧 Emby 版本。
 空的来源库范围直接返回空页，不连接 Emby。插件对多个已选用户使用最多 8 路并发读取，保持输入顺序；单个请求失败会取消
 剩余未完成读取，避免继续消耗来源资源。相关行为由本地 HTTP fixture 覆盖，16 个用户请求的峰值并发断言为 2–8。
