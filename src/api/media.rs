@@ -596,60 +596,66 @@ pub(super) async fn lux_get_item(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let metadata_pending = match database
-        .list_pending_metadata_item_ids(std::slice::from_ref(&item_id))
-        .await
-    {
-        Ok(item_ids) => item_ids.contains(&item_id),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     match catalog.find_item(principal, &item_id).await {
-        Ok(Some(item)) => match database
-            .find_user_item_state(&user.id.to_string(), &item.id)
-            .await
-        {
-            Ok(user_state) => {
-                let actors = match state.people.as_ref() {
-                    Some(people) => match people.list_item_actors(&item.id).await {
-                        Ok(actors) => actors,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %item.id,
-                                %error,
-                                "derived actor relation is unavailable; returning an empty cast"
-                            );
-                            Vec::new()
-                        }
-                    },
-                    None => Vec::new(),
-                };
-                let nfo = match state.local_nfo.as_ref() {
-                    Some(local_nfo) => match local_nfo.read_item(&item.id).await {
-                        Ok(nfo) => nfo,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %item.id,
-                                %error,
-                                "derived local NFO cache is unavailable; returning partial item detail"
-                            );
-                            None
-                        }
-                    },
-                    None => None,
-                };
-                let mut body = lux_catalog_item_json_with_user_state(&item, user_state.as_ref());
-                if let Value::Object(object) = &mut body {
-                    object.insert("actors".to_owned(), json!(actors));
-                    object.insert("nfo".to_owned(), json!(nfo));
-                    object.insert("metadataPending".to_owned(), json!(metadata_pending));
-                    if let Some(nfo) = nfo.as_ref() {
-                        apply_local_nfo_details(object, nfo);
+        Ok(Some(item)) => {
+            let user_id = user.id.to_string();
+            let (metadata_pending_result, user_state_result, actors_result, nfo_result) = tokio::join!(
+                database.list_pending_metadata_item_ids(std::slice::from_ref(&item_id)),
+                database.find_user_item_state(&user_id, &item.id),
+                async {
+                    match state.people.as_ref() {
+                        Some(people) => people.list_item_actors(&item.id).await,
+                        None => Ok(Vec::new()),
                     }
+                },
+                async {
+                    match state.local_nfo.as_ref() {
+                        Some(local_nfo) => local_nfo.read_item(&item.id).await,
+                        None => Ok(None),
+                    }
+                },
+            );
+            let metadata_pending = match metadata_pending_result {
+                Ok(item_ids) => item_ids.contains(&item_id),
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let user_state = match user_state_result {
+                Ok(user_state) => user_state,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            let actors = match actors_result {
+                Ok(actors) => actors,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %item.id,
+                        %error,
+                        "derived actor relation is unavailable; returning an empty cast"
+                    );
+                    Vec::new()
                 }
-                Json(body).into_response()
+            };
+            let nfo = match nfo_result {
+                Ok(nfo) => nfo,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %item.id,
+                        %error,
+                        "derived local NFO cache is unavailable; returning partial item detail"
+                    );
+                    None
+                }
+            };
+            let mut body = lux_catalog_item_json_with_user_state(&item, user_state.as_ref());
+            if let Value::Object(object) = &mut body {
+                object.insert("actors".to_owned(), json!(actors));
+                object.insert("nfo".to_owned(), json!(nfo));
+                object.insert("metadataPending".to_owned(), json!(metadata_pending));
+                if let Some(nfo) = nfo.as_ref() {
+                    apply_local_nfo_details(object, nfo);
+                }
             }
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        },
+            Json(body).into_response()
+        }
         Ok(None) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
