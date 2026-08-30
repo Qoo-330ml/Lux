@@ -1025,16 +1025,17 @@ impl EmbyMigrationService {
         // unfiltered request when no explicit whitelist exists, because an
         // incomplete folder mapping must not hide a valid item.
         let source_filtering_enabled = connection.supports_filtered_reads
-            && scope.item_state
+            && (scope.item_state || scope.person_favorites)
             && (target_library_ids.is_some() || users.iter().any(|user| !user.enable_all_folders));
-        let lux_library_identities = if (scope.library_access || scope.item_state)
-            && library_folders.is_some()
-            && (users.iter().any(|user| !user.enable_all_folders) || source_filtering_enabled)
-        {
-            Some(self.load_library_identities().await?)
-        } else {
-            None
-        };
+        let lux_library_identities =
+            if (scope.library_access || scope.item_state || scope.person_favorites)
+                && library_folders.is_some()
+                && (users.iter().any(|user| !user.enable_all_folders) || source_filtering_enabled)
+            {
+                Some(self.load_library_identities().await?)
+            } else {
+                None
+            };
         // The library identity load already reads enabled library rows. Reuse
         // those IDs instead of issuing a second identical query.
         let enabled_library_ids = if let Some(libraries) = lux_library_identities.as_deref() {
@@ -1491,7 +1492,12 @@ impl EmbyMigrationService {
                 }
             }
 
-            if scope.person_favorites {
+            if scope.person_favorites
+                && source_filter_has_candidates(
+                    source_filtering_enabled,
+                    source_library_ids.as_deref(),
+                )
+            {
                 let person_filter_base = processed;
                 let mut person_total_recorded = false;
                 let mut start_index = resume_cursor
@@ -1518,7 +1524,11 @@ impl EmbyMigrationService {
                             start_index,
                             500,
                             MigrationPageKind::PersonFavorites,
-                            MigrationSourceFilter::disabled(),
+                            MigrationSourceFilter {
+                                library_ids: source_library_ids.as_deref(),
+                                enabled: source_filtering_enabled,
+                                state_fields: None,
+                            },
                         )
                         .await?
                     };
@@ -1551,7 +1561,11 @@ impl EmbyMigrationService {
                                 &user.id,
                                 next_start_index,
                                 MigrationPageKind::PersonFavorites,
-                                MigrationSourceFilter::disabled(),
+                                MigrationSourceFilter {
+                                    library_ids: source_library_ids.as_deref(),
+                                    enabled: source_filtering_enabled,
+                                    state_fields: None,
+                                },
                             )
                         });
                     prefetched_source_pages += u64::from(next_prefetched_page.is_some());
@@ -2060,7 +2074,13 @@ impl EmbyMigrationService {
                     }
                     MigrationPageKind::PersonFavorites => {
                         self.plugin
-                            .person_favorites(source, user_id, range_start, range_limit)
+                            .person_favorites_filtered(
+                                source,
+                                user_id,
+                                range_start,
+                                range_limit,
+                                source_filter,
+                            )
                             .await
                     }
                 }
@@ -4533,7 +4553,7 @@ mod tests {
                         library_access: false,
                         item_state: true,
                         item_state_filters: Some(vec![MigrationUserStateFilter::Favorite]),
-                        person_favorites: false,
+                        person_favorites: true,
                         // Omit the target whitelist to exercise the legacy
                         // compatibility path: a restricted user should
                         // still push its safely mapped source library.
@@ -4568,6 +4588,12 @@ mod tests {
         assert!(state_calls[0].contains("\"stateFilter\":\"FAVORITE\""));
         assert!(state_calls[0].contains("\"stateFields\":[\"isFavorite\"]"));
         assert!(state_calls[0].contains("\"sourceLibraryIds\":[\"source-movies\"]"));
+        let person_calls = calls
+            .lines()
+            .filter(|line| line.contains("migration.person_favorites"))
+            .collect::<Vec<_>>();
+        assert_eq!(person_calls.len(), 1);
+        assert!(person_calls[0].contains("\"sourceLibraryIds\":[\"source-movies\"]"));
         assert!(!calls.contains("\"stateFilter\":\"PLAYED\""));
         assert!(!calls.contains("\"stateFilter\":\"RESUMABLE\""));
         Ok(())

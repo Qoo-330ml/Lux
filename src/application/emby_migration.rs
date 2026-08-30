@@ -742,16 +742,37 @@ impl EmbyMigrationPluginClient {
         start_index: u32,
         limit: u32,
     ) -> Result<MigrationItemPage, PluginServiceError> {
+        self.person_favorites_filtered(
+            source,
+            user_id,
+            start_index,
+            limit,
+            MigrationSourceFilter::disabled(),
+        )
+        .await
+    }
+
+    pub(crate) async fn person_favorites_filtered(
+        &self,
+        source: &EmbyMigrationSource,
+        user_id: &str,
+        start_index: u32,
+        limit: u32,
+        source_filter: MigrationSourceFilter<'_>,
+    ) -> Result<MigrationItemPage, PluginServiceError> {
+        let mut params = serde_json::json!({
+            "source": source,
+            "userId": validate_id(user_id)?,
+            "startIndex": start_index,
+            "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
+        });
+        if source_filter.enabled {
+            if let Some(source_library_ids) = source_filter.library_ids {
+                params["sourceLibraryIds"] = serde_json::json!(source_library_ids);
+            }
+        }
         let page = self
-            .call_with(
-                MIGRATION_PERSON_FAVORITES_METHOD,
-                serde_json::json!({
-                    "source": source,
-                    "userId": validate_id(user_id)?,
-                    "startIndex": start_index,
-                    "limit": limit.min(MAX_PAGE_SIZE as u32).max(1),
-                }),
-            )
+            .call_with(MIGRATION_PERSON_FAVORITES_METHOD, params)
             .await?;
         Ok(normalize_migration_item_page(page))
     }
