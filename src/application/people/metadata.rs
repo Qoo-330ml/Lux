@@ -1,4 +1,112 @@
+use std::{
+    collections::{HashMap, HashSet},
+    future::Future,
+    hash::Hash,
+    sync::Arc,
+};
+
+use tokio::{sync::Semaphore, task::JoinSet};
+
 use super::*;
+
+const PERSON_VIEW_IO_CONCURRENCY: usize = 8;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PersonImageLookup {
+    provider: Option<String>,
+    person_id: String,
+}
+
+struct ActorViewPrefetchPlan {
+    relation_item_ids: Vec<String>,
+    canonical_person_ids: Vec<String>,
+}
+
+fn actor_view_prefetch_plan(credits: &[StoredPersonCredit]) -> ActorViewPrefetchPlan {
+    let relation_item_ids = credits
+        .iter()
+        .map(|credit| credit.item_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let canonical_person_ids = credits
+        .iter()
+        .filter_map(|credit| credit.lux_person_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    ActorViewPrefetchPlan {
+        relation_item_ids,
+        canonical_person_ids,
+    }
+}
+
+fn actor_view_fallback_profile_keys(
+    credits: &[StoredPersonCredit],
+    canonical_profiles: &HashSet<String>,
+) -> HashSet<PersonImageLookup> {
+    credits
+        .iter()
+        .filter(|credit| {
+            credit
+                .lux_person_id
+                .as_ref()
+                .is_none_or(|person_id| !canonical_profiles.contains(person_id))
+        })
+        .map(|credit| PersonImageLookup {
+            provider: (!credit.provider.is_empty()).then(|| credit.provider.clone()),
+            person_id: credit.person_id.clone(),
+        })
+        .collect()
+}
+
+fn person_metadata_from_relation(
+    relation: &StoredPeopleRelation,
+    person_id: &str,
+) -> Option<PersonMetadata> {
+    relation
+        .actors
+        .iter()
+        .find(|actor| actor_id_from_stored_actor(actor) == person_id)
+        .and_then(|actor| actor.person.clone())
+}
+
+async fn prefetch_values<K, V, Keys, F, Fut>(keys: Keys, loader: F) -> HashMap<K, V>
+where
+    K: Clone + Eq + Hash + Send + 'static,
+    V: Send + 'static,
+    Keys: IntoIterator<Item = K>,
+    F: Fn(K) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = V> + Send + 'static,
+{
+    let permits = Arc::new(Semaphore::new(PERSON_VIEW_IO_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+    for key in keys {
+        let permit = match Arc::clone(&permits).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let loader = loader.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let value = loader(key.clone()).await;
+            (key, value)
+        });
+    }
+
+    let mut values = HashMap::new();
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((key, value)) => {
+                values.insert(key, value);
+            }
+            Err(error) => {
+                tracing::error!(%error, "people actor view prefetch task failed");
+            }
+        }
+    }
+    values
+}
 
 impl PeopleService {
     pub async fn list_libraries_actors(
@@ -328,10 +436,70 @@ impl PeopleService {
         )
     }
 
+    async fn prefetch_actor_view_files(
+        &self,
+        credits: &[StoredPersonCredit],
+    ) -> (
+        HashMap<String, StoredPeopleRelation>,
+        HashSet<String>,
+        HashMap<PersonImageLookup, Option<String>>,
+    ) {
+        let plan = actor_view_prefetch_plan(credits);
+        let service = self.clone();
+        let relations_by_item = prefetch_values(plan.relation_item_ids, move |item_id| {
+            let service = service.clone();
+            async move { service.read_actor_view_relation(&item_id).await }
+        })
+        .await
+        .into_iter()
+        .filter_map(|(item_id, relation)| relation.map(|relation| (item_id, relation)))
+        .collect();
+
+        let service = self.clone();
+        let canonical_profiles = prefetch_values(plan.canonical_person_ids, move |person_id| {
+            let service = service.clone();
+            async move { matches!(service.profile_image(&person_id).await, Ok(Some(_))) }
+        })
+        .await
+        .into_iter()
+        .filter_map(|(person_id, available)| available.then_some(person_id))
+        .collect::<HashSet<_>>();
+
+        let fallback_keys = actor_view_fallback_profile_keys(credits, &canonical_profiles);
+        let service = self.clone();
+        let fallback_profile_urls = prefetch_values(fallback_keys, move |lookup| {
+            let service = service.clone();
+            async move {
+                service
+                    .person_image_url(lookup.provider.as_deref(), &lookup.person_id)
+                    .await
+            }
+        })
+        .await;
+
+        (relations_by_item, canonical_profiles, fallback_profile_urls)
+    }
+
+    async fn read_actor_view_relation(&self, item_id: &str) -> Option<StoredPeopleRelation> {
+        let path = library_item_directory(&self.config_dir, item_id)
+            .ok()?
+            .join("people.json");
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        match read_relation(&path).await.ok()? {
+            Some(relation) => Some(relation),
+            None => read_relation(&legacy_path).await.ok()?,
+        }
+    }
+
     pub(super) async fn actor_views_from_credits(
         &self,
         credits: Vec<StoredPersonCredit>,
     ) -> Vec<ActorView> {
+        let (relations_by_item, canonical_profiles, fallback_profile_urls) =
+            self.prefetch_actor_view_files(&credits).await;
         let mut views = Vec::with_capacity(credits.len());
         for credit in credits {
             let lookup_id = credit
@@ -339,16 +507,24 @@ impl PeopleService {
                 .clone()
                 .unwrap_or_else(|| credit.person_id.clone());
             let provider = (!credit.provider.is_empty()).then(|| credit.provider.clone());
-            let image_url = if let Some(lux_person_id) = credit.lux_person_id.as_deref()
-                && matches!(self.profile_image(lux_person_id).await, Ok(Some(_)))
-            {
+            let canonical_profile_found = credit
+                .lux_person_id
+                .as_ref()
+                .is_some_and(|person_id| canonical_profiles.contains(person_id));
+            let fallback_profile_key = PersonImageLookup {
+                provider: provider.clone(),
+                person_id: credit.person_id.clone(),
+            };
+            let image_url = if canonical_profile_found {
                 provider
                     .as_deref()
                     .and_then(|provider| actor_image_url(provider, &credit.person_id))
                     .or_else(|| Some(format!("/api/v1/people/{}/image", credit.person_id)))
             } else {
-                self.person_image_url(provider.as_deref(), &credit.person_id)
-                    .await
+                fallback_profile_urls
+                    .get(&fallback_profile_key)
+                    .cloned()
+                    .flatten()
             };
             let stored_metadata = PersonMetadata {
                 biography: credit.biography.clone(),
@@ -366,9 +542,9 @@ impl PeopleService {
                     .and_then(|year| i32::try_from(year).ok()),
                 taglines: credit.taglines.clone(),
             };
-            let metadata = self
-                .person_metadata_from_relation(&credit.item_id, &credit.person_id)
-                .await
+            let metadata = relations_by_item
+                .get(&credit.item_id)
+                .and_then(|relation| person_metadata_from_relation(relation, &credit.person_id))
                 .map(|relation_metadata| {
                     stored_metadata
                         .clone()
@@ -401,29 +577,6 @@ impl PeopleService {
         views
     }
 
-    pub(super) async fn person_metadata_from_relation(
-        &self,
-        item_id: &str,
-        person_id: &str,
-    ) -> Option<PersonMetadata> {
-        let path = library_item_directory(&self.config_dir, item_id)
-            .ok()?
-            .join("people.json");
-        let legacy_path = self
-            .legacy_people_dir()
-            .join(LEGACY_ITEMS_DIR)
-            .join(format!("{item_id}.json"));
-        let relation = match read_relation(&path).await.ok()? {
-            Some(relation) => relation,
-            None => read_relation(&legacy_path).await.ok()??,
-        };
-        relation
-            .actors
-            .iter()
-            .find(|actor| actor_id_from_stored_actor(actor) == person_id)
-            .and_then(|actor| actor.person.clone())
-    }
-
     pub(super) async fn person_image_url(
         &self,
         provider: Option<&str>,
@@ -442,5 +595,65 @@ impl PeopleService {
         provider
             .and_then(|provider| actor_image_url(provider, person_id))
             .or_else(|| Some(format!("/api/v1/people/{person_id}/image")))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stored_credit(
+        item_id: &str,
+        person_id: &str,
+        lux_person_id: Option<&str>,
+        provider: &str,
+    ) -> StoredPersonCredit {
+        StoredPersonCredit {
+            item_id: item_id.to_owned(),
+            person_id: person_id.to_owned(),
+            lux_person_id: lux_person_id.map(str::to_owned),
+            provider: provider.to_owned(),
+            person_name: person_id.to_owned(),
+            role: String::new(),
+            date_created: 0,
+            biography: None,
+            birthday: None,
+            deathday: None,
+            known_for_department: None,
+            place_of_birth: None,
+            provider_ids: BTreeMap::new(),
+            genres: Vec::new(),
+            tags: Vec::new(),
+            production_locations: Vec::new(),
+            premiere_date: None,
+            production_year: None,
+            taglines: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn actor_view_prefetch_deduplicates_relation_and_profile_lookups() {
+        let credits = vec![
+            stored_credit("item-1", "person-1", Some("lux-1"), "tmdb"),
+            stored_credit("item-1", "person-1", Some("lux-1"), "tmdb"),
+            stored_credit("item-1", "person-2", Some("lux-2"), "tmdb"),
+            stored_credit("item-2", "person-3", None, "imdb"),
+        ];
+
+        let plan = actor_view_prefetch_plan(&credits);
+        assert_eq!(plan.relation_item_ids.len(), 2);
+        assert_eq!(plan.canonical_person_ids.len(), 2);
+
+        let canonical_profiles = HashSet::from(["lux-1".to_owned()]);
+        let fallback_profiles = actor_view_fallback_profile_keys(&credits, &canonical_profiles);
+        assert_eq!(fallback_profiles.len(), 2);
+        assert!(fallback_profiles.contains(&PersonImageLookup {
+            provider: Some("tmdb".to_owned()),
+            person_id: "person-2".to_owned(),
+        }));
+        assert!(fallback_profiles.contains(&PersonImageLookup {
+            provider: Some("imdb".to_owned()),
+            person_id: "person-3".to_owned(),
+        }));
     }
 }
