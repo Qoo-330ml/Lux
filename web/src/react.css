@@ -1535,13 +1535,14 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-hierarchy { order: 1; }
   .lux-detail-hierarchy > .lux-series-children, .lux-detail-hierarchy > .lux-season-episodes, .lux-detail-hierarchy > .lux-episode-rail { margin-top: 0; padding-top: 0; }
   .lux-detail-cast { order: 2; }
+  .lux-media-cast { margin-top: 32px; padding-top: 12px; }
   .lux-detail-nfo { order: 3; }
   .lux-season-episode-row { grid-template-columns: minmax(120px, 36vw) minmax(0, 1fr); gap: 12px; }
   .lux-season-episode-arrow { display: none; }
   .lux-media-info { margin-top: 52px; }
   .lux-media-info-summary { grid-template-columns: 1fr; }
   .lux-media-info-address { align-items: flex-start; flex-direction: column; gap: 5px; }
-  .lux-media-nfo { margin-top: 52px; }
+  .lux-media-nfo { margin-top: 32px; padding-top: 12px; }
   .lux-media-nfo-summary { grid-template-columns: 1fr; }
   .lux-player-topbar { top: calc(14px + env(safe-area-inset-top)); }
   .lux-player-controls-wrap { right: calc(10px + env(safe-area-inset-right)); bottom: calc(6px + env(safe-area-inset-bottom)); left: calc(10px + env(safe-area-inset-left)); }

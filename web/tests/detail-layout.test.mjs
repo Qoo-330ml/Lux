@@ -256,3 +256,15 @@ test("mobile detail actions share one row and sit directly above the hierarchy",
   assert.match(hierarchyRule, /margin-top:\s*0/);
   assert.match(hierarchyRule, /padding-top:\s*0/);
 });
+
+test("mobile detail lower sections use tighter vertical spacing", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const castRule = mobileStyles.match(/\.lux-media-cast\s*\{([^}]*)\}/)?.[1] ?? "";
+  const nfoRule = mobileStyles.match(/\.lux-media-nfo\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(castRule, /margin-top:\s*32px/);
+  assert.match(castRule, /padding-top:\s*12px/);
+  assert.match(nfoRule, /margin-top:\s*32px/);
+  assert.match(nfoRule, /padding-top:\s*12px/);
+});
