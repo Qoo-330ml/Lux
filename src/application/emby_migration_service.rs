@@ -754,6 +754,8 @@ impl EmbyMigrationService {
         let mut candidate_query_ms = 0_u128;
         let mut database_write_ms = 0_u128;
         let mut prefetched_source_pages = 0_u64;
+        let mut consumed_prefetched_source_pages = 0_u64;
+        let mut source_read_ms = 0_u128;
         let Some(job) = self.database.find_emby_migration_job(job_id).await? else {
             return Err(EmbyMigrationServiceError::NotFound);
         };
@@ -944,6 +946,15 @@ impl EmbyMigrationService {
         let enabled_library_id_set = enabled_library_ids
             .as_ref()
             .map(|ids| ids.iter().cloned().collect::<HashSet<_>>());
+        // Resolve each source virtual folder once per migration.  The old
+        // per-user path normalized every folder and Lux root repeatedly when
+        // calculating both the ACL plan and the source-side filter.
+        let source_library_mappings = library_folders.as_deref().map(|source_folders| {
+            precompute_source_library_mappings(
+                source_folders,
+                lux_library_identities.as_deref().unwrap_or_default(),
+            )
+        });
         let mut processed = job.processed_count;
         let mut matched = job.matched_count;
         let mut skipped = job.skipped_count;
@@ -994,11 +1005,10 @@ impl EmbyMigrationService {
                             .cloned()
                             .collect(),
                     )
-                } else if let Some(source_folders) = library_folders.as_deref() {
-                    match map_enabled_library_ids_checked(
+                } else if let Some(source_library_mappings) = source_library_mappings.as_deref() {
+                    match map_enabled_library_ids_checked_with_mappings(
                         &user,
-                        Some(source_folders),
-                        lux_library_identities.as_deref().unwrap_or_default(),
+                        source_library_mappings,
                     ) {
                         Some(ids) => LibraryAccessPlan::Exact(ids),
                         None => LibraryAccessPlan::Unavailable,
@@ -1018,12 +1028,11 @@ impl EmbyMigrationService {
                     .as_ref()
                     .or(enabled_library_id_set.as_ref())
                     .and_then(|selected_library_ids| {
-                        source_library_ids_for_user(
+                        Some(source_library_ids_for_user_with_mappings(
                             &user,
-                            library_folders.as_deref(),
-                            lux_library_identities.as_deref().unwrap_or_default(),
+                            source_library_mappings.as_deref()?,
                             selected_library_ids,
-                        )
+                        ))
                     })
             } else {
                 None
@@ -1075,6 +1084,7 @@ impl EmbyMigrationService {
                             return self.cancelled(job_id, "ITEMS").await;
                         }
                         let recovered_page = if let Some(prefetched_page) = prefetched_page.take() {
+                            consumed_prefetched_source_pages += 1;
                             prefetched_page.join().await?
                         } else {
                             self.recover_migration_page(
@@ -1092,6 +1102,7 @@ impl EmbyMigrationService {
                             .await?
                         };
                         source_rpc_calls += recovered_page.source_rpc_calls;
+                        source_read_ms += recovered_page.source_read_ms;
                         if !recovered_page.invalid_items.is_empty() {
                             let invalid_item_count = recovered_page
                                 .invalid_items
@@ -1390,6 +1401,7 @@ impl EmbyMigrationService {
                         return self.cancelled(job_id, "ITEMS").await;
                     }
                     let recovered_page = if let Some(prefetched_page) = prefetched_page.take() {
+                        consumed_prefetched_source_pages += 1;
                         prefetched_page.join().await?
                     } else {
                         self.recover_migration_page(
@@ -1403,6 +1415,7 @@ impl EmbyMigrationService {
                         .await?
                     };
                     source_rpc_calls += recovered_page.source_rpc_calls;
+                    source_read_ms += recovered_page.source_read_ms;
                     if !recovered_page.invalid_items.is_empty() {
                         let invalid_item_count = recovered_page
                             .invalid_items
@@ -1612,6 +1625,8 @@ impl EmbyMigrationService {
             person_identity_cache_hits,
             database_write_ms,
             prefetched_source_pages,
+            consumed_prefetched_source_pages,
+            source_read_ms,
             processed,
             matched,
             skipped,
@@ -1889,6 +1904,7 @@ impl EmbyMigrationService {
         kind: MigrationPageKind,
         source_filter: MigrationSourceFilter<'_>,
     ) -> Result<RecoveredMigrationPage, EmbyMigrationServiceError> {
+        let read_started = Instant::now();
         let mut pending_ranges = vec![(start_index, limit)];
         let mut pages = Vec::new();
         let mut invalid_items = Vec::new();
@@ -1958,6 +1974,7 @@ impl EmbyMigrationService {
         let mut recovered =
             assemble_recovered_migration_page(start_index, limit, pages, invalid_items);
         recovered.source_rpc_calls = source_rpc_calls;
+        recovered.source_read_ms = read_started.elapsed().as_millis();
         Ok(recovered)
     }
 
@@ -2216,6 +2233,7 @@ struct RecoveredMigrationPage {
     page: MigrationItemPage,
     invalid_items: Vec<InvalidMigrationItem>,
     source_rpc_calls: u64,
+    source_read_ms: u128,
 }
 
 /// Owns one read-ahead page and cancels it if the current page cannot be
@@ -2287,6 +2305,7 @@ fn assemble_recovered_migration_page(
         },
         invalid_items,
         source_rpc_calls: 0,
+        source_read_ms: 0,
     }
 }
 
@@ -2404,6 +2423,25 @@ struct MigrationLuxLibraryIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct MigrationSourceLibraryMapping {
+    source_id: String,
+    lux_library_id: Option<String>,
+}
+
+fn precompute_source_library_mappings(
+    source_folders: &[MigrationLibraryFolder],
+    lux_libraries: &[MigrationLuxLibraryIdentity],
+) -> Vec<MigrationSourceLibraryMapping> {
+    source_folders
+        .iter()
+        .map(|folder| MigrationSourceLibraryMapping {
+            source_id: folder.id.clone(),
+            lux_library_id: match_lux_library(folder, lux_libraries),
+        })
+        .collect()
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum LibraryAccessPlan {
     Disabled,
     Exact(HashSet<String>),
@@ -2468,21 +2506,39 @@ fn source_library_ids_for_user(
     selected_library_ids: &HashSet<String>,
 ) -> Option<Vec<String>> {
     let source_folders = source_folders?;
-    let mut source_ids = source_folders
+    let mappings = precompute_source_library_mappings(source_folders, lux_libraries);
+    Some(source_library_ids_for_user_with_mappings(
+        user,
+        &mappings,
+        selected_library_ids,
+    ))
+}
+
+fn source_library_ids_for_user_with_mappings(
+    user: &MigrationUser,
+    source_library_mappings: &[MigrationSourceLibraryMapping],
+    selected_library_ids: &HashSet<String>,
+) -> Vec<String> {
+    let mut source_ids = source_library_mappings
         .iter()
-        .filter(|folder| {
-            user.enable_all_folders || user.enabled_folders.iter().any(|id| id == &folder.id)
+        .filter(|mapping| {
+            user.enable_all_folders
+                || user
+                    .enabled_folders
+                    .iter()
+                    .any(|id| id == &mapping.source_id)
         })
-        .filter_map(|folder| {
-            let lux_library_id = match_lux_library(folder, lux_libraries)?;
-            selected_library_ids
-                .contains(&lux_library_id)
-                .then(|| folder.id.clone())
+        .filter_map(|mapping| {
+            mapping
+                .lux_library_id
+                .as_ref()
+                .filter(|lux_library_id| selected_library_ids.contains(*lux_library_id))
+                .map(|_| mapping.source_id.clone())
         })
         .collect::<Vec<_>>();
     source_ids.sort_unstable();
     source_ids.dedup();
-    Some(source_ids)
+    source_ids
 }
 
 fn source_filter_has_candidates(
@@ -2514,13 +2570,22 @@ fn map_enabled_library_ids_checked(
     lux_libraries: &[MigrationLuxLibraryIdentity],
 ) -> Option<HashSet<String>> {
     let source_folders = source_folders?;
-    let selected = source_folders
-        .iter()
-        .filter(|folder| user.enabled_folders.iter().any(|id| id == &folder.id))
-        .collect::<Vec<_>>();
-    let mut mapped = HashSet::with_capacity(selected.len());
-    for folder in selected {
-        mapped.insert(match_lux_library(folder, lux_libraries)?);
+    let mappings = precompute_source_library_mappings(source_folders, lux_libraries);
+    map_enabled_library_ids_checked_with_mappings(user, &mappings)
+}
+
+fn map_enabled_library_ids_checked_with_mappings(
+    user: &MigrationUser,
+    source_library_mappings: &[MigrationSourceLibraryMapping],
+) -> Option<HashSet<String>> {
+    let selected = source_library_mappings.iter().filter(|mapping| {
+        user.enabled_folders
+            .iter()
+            .any(|id| id == &mapping.source_id)
+    });
+    let mut mapped = HashSet::new();
+    for mapping in selected {
+        mapped.insert(mapping.lux_library_id.clone()?);
     }
     Some(mapped)
 }
@@ -3899,6 +3964,66 @@ mod tests {
         )
         .expect("legacy source folder mapping should be available");
         assert_eq!(source_ids, vec!["source-a", "source-b"]);
+    }
+
+    #[test]
+    fn precomputed_source_folder_mapping_reuses_resolved_lux_ids() {
+        let user = MigrationUser {
+            id: "emby-user".to_owned(),
+            name: "Alice".to_owned(),
+            has_password: false,
+            is_disabled: false,
+            is_administrator: false,
+            enable_all_folders: false,
+            enabled_folders: vec!["source-a".to_owned(), "source-b".to_owned()],
+            enable_remote_access: false,
+            enable_content_downloading: false,
+            primary_image_tag: None,
+        };
+        let source_folders = vec![
+            MigrationLibraryFolder {
+                id: "source-a".to_owned(),
+                name: "Movies".to_owned(),
+                locations: vec!["/media/movies".to_owned()],
+            },
+            MigrationLibraryFolder {
+                id: "source-b".to_owned(),
+                name: "TV".to_owned(),
+                locations: vec!["/media/tv".to_owned()],
+            },
+        ];
+        let lux_libraries = vec![
+            MigrationLuxLibraryIdentity {
+                id: "lux-movies".to_owned(),
+                name: "Movies".to_owned(),
+                root_paths: vec!["/media/movies".to_owned()],
+            },
+            MigrationLuxLibraryIdentity {
+                id: "lux-tv".to_owned(),
+                name: "TV".to_owned(),
+                root_paths: vec!["/media/tv".to_owned()],
+            },
+        ];
+        let mappings = precompute_source_library_mappings(&source_folders, &lux_libraries);
+
+        assert_eq!(mappings.len(), 2);
+        assert_eq!(mappings[0].lux_library_id.as_deref(), Some("lux-movies"));
+        assert_eq!(mappings[1].lux_library_id.as_deref(), Some("lux-tv"));
+        assert_eq!(
+            map_enabled_library_ids_checked_with_mappings(&user, &mappings),
+            Some(HashSet::from([
+                "lux-movies".to_owned(),
+                "lux-tv".to_owned(),
+            ]))
+        );
+        assert_eq!(
+            source_library_ids_for_user_with_mappings(
+                &user,
+                &mappings,
+                &HashSet::from(["lux-tv".to_owned()]),
+            ),
+            vec!["source-b"]
+        );
     }
 
     #[test]
