@@ -94,6 +94,27 @@ Emby 前不把该结果外推为 NAS/x86 或特定 Emby 版本的零读取保证
 
 当 Emby 用户拥有全部虚拟媒体库、且来源文件夹映射不完整时，宿主不会把来源库过滤成空集；该场景退回由目标 Lux 媒体库白名单过滤，避免路径或名称差异造成漏迁移。只有映射足够完整时才下推来源库过滤，因此不会为了少读来源数据牺牲已选内容的完整性。
 
+无 Provider ID 的媒体条目现在先按 `item_type + sort_title + production_year` 使用
+`idx_media_items_migration_title` 精确查询；精确标题没有候选时才执行原有的标题模糊回退。
+SQLite 和 PostgreSQL 都包含该索引，旧 SQLite 表重建路径也会补建索引。模糊回退仍按原有
+规范化标题、年份和季集号规则筛选，因此标点或空格差异不会丢失匹配。
+
+标题索引合成基准命令：
+
+```bash
+cargo test --locked --lib migration_title_lookup_benchmark_records_index_effect -- --ignored --nocapture
+```
+
+运行环境：macOS，`aarch64`（本机 ARM64），SQLite 临时数据库，50,000 个电影条目。
+
+| 标题输入 | 候选数 | 数据库查询 | 耗时 |
+| --- | ---: | ---: | ---: |
+| `Benchmark 25000`（精确命中） | 1 | 1 | 0 ms |
+| `Benchmark-25000`（标点差异，模糊回退） | 1 | 2 | 24 ms |
+
+该结果只用于确认索引路径和查询次数；耗时受本机缓存、SQLite 临时库和合成数据影响，
+不可外推为 NAS/x86 或真实 Emby 网络耗时。
+
 ## 后续优化候选（已完成项保留记录）
 
 按预期收益和风险排序：
