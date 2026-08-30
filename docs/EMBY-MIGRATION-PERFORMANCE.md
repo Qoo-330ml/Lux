@@ -48,6 +48,8 @@ cargo test --locked --lib migration_page_batch_benchmark_records_scale -- --igno
 
 分页循环的取消轮询只读取 `cancel_requested` 标量，不再重复加载迁移任务的完整列集合；任务不存在时仍按未请求取消处理，保持原有恢复语义。
 
+来源插件返回 `PLUGIN_RATE_LIMITED` 时，宿主对单次来源调用执行最多 3 次、250/500/1000 ms 的有界退避；分页恢复预算仍按实际 RPC 尝试次数计算，不会因重试突破 32 次上限。完成日志记录 `source_rate_limited_rpc_calls`，失败调用也会记录尝试数，便于在真实 Emby/NAS 上判断是否需要调整并发或退避策略。
+
 坏页恢复预算为每个逻辑页最多 32 次来源 RPC。预算耗尽后，未恢复范围作为 `PLUGIN_INVALID_RESPONSE_RECOVERY_BUDGET` 诊断记录写入并推进游标；这用有限失败成本换取后续页面继续迁移，避免异常插件造成指数级拆分。
 
 ## 本轮新增的低风险优化（2026-08-30）
