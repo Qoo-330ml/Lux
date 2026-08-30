@@ -1514,8 +1514,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-logo { max-width: min(78vw, 360px); max-height: 84px; }
   .lux-detail-original-title, .lux-detail-subtitle { text-align: center; }
   .lux-detail-meta { justify-content: center; text-align: center; }
-  .lux-detail-copy > .lux-hero-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 16px 10px; margin-top: 20px; }
-  .lux-detail-copy > .lux-hero-actions > .lux-button-primary { grid-column: 1 / -1; width: 100%; }
+  .lux-detail-copy > .lux-hero-actions { display: grid; grid-template-columns: minmax(0, 1fr) repeat(2, 72px); align-items: start; column-gap: 10px; row-gap: 0; margin-top: 20px; }
+  .lux-detail-copy > .lux-hero-actions > .lux-button-primary { grid-column: auto; width: auto; }
   .lux-detail-action-control { display: flex; align-items: center; flex-direction: column; justify-content: flex-start; gap: 8px; min-width: 0; min-height: 76px; padding: 0; border: 0; border-radius: 0; color: var(--lux-muted); background: transparent; box-shadow: none; font-size: .72rem; font-weight: 550; backdrop-filter: none; }
   .lux-detail-action-control:hover { color: #fff; background: transparent; box-shadow: none; transform: none; }
   .lux-detail-action-icon { display: grid; place-items: center; flex: 0 0 auto; width: 48px; height: 48px; border: 1px solid var(--lux-line); border-radius: 50%; color: currentColor; background: rgba(0,0,0,.28); }
@@ -1533,6 +1533,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-source { width: 100%; }
   .lux-detail-sections { display: flex; flex-direction: column; }
   .lux-detail-hierarchy { order: 1; }
+  .lux-detail-hierarchy > .lux-series-children, .lux-detail-hierarchy > .lux-season-episodes, .lux-detail-hierarchy > .lux-episode-rail { margin-top: 0; padding-top: 0; }
   .lux-detail-cast { order: 2; }
   .lux-detail-nfo { order: 3; }
   .lux-season-episode-row { grid-template-columns: minmax(120px, 36vw) minmax(0, 1fr); gap: 12px; }
