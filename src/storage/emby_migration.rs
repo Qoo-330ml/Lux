@@ -982,6 +982,8 @@ impl Database {
                     let row_item_type: String = row.get("item_type");
                     let row_sort_title: String = row.get("sort_title");
                     let row_production_year: Option<i64> = row.get("production_year");
+                    let row_season_number: Option<i64> = row.get("season_number");
+                    let row_episode_number: Option<i64> = row.get("episode_number");
                     for (lookup, sort_title) in chunk {
                         let same_year = lookup.production_year.is_none()
                             || row_production_year.is_none()
@@ -990,9 +992,17 @@ impl Database {
                                     (i128::from(lookup_year) - i128::from(row_year)).abs() <= 1
                                 },
                             );
+                        let same_episode = lookup.item_type != "EPISODE"
+                            || (lookup
+                                .season_number
+                                .is_none_or(|number| row_season_number == Some(number))
+                                && lookup
+                                    .episode_number
+                                    .is_none_or(|number| row_episode_number == Some(number)));
                         if lookup.item_type == row_item_type
                             && *sort_title == row_sort_title
                             && same_year
+                            && same_episode
                         {
                             exact_title_lookups.insert((*lookup).clone());
                         }
@@ -2382,6 +2392,52 @@ mod tests {
         assert_eq!(identities.len(), 1);
         assert_eq!(identities[0].id, item_id);
         assert_eq!(database.query_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_title_fallback_keeps_episode_candidates_with_exact_variant()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library_id = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'SERIES')")
+            .bind(&library_id)
+            .bind("Migration episode test")
+            .execute(database.pool())
+            .await?;
+        for (title, season_number, episode_number) in [
+            ("Pilot Episode", 2_i64, 1_i64),
+            ("Pilot-Episode", 1_i64, 1_i64),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    season_number, episode_number, identification_status
+                 ) VALUES (?, ?, 'EPISODE', ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&library_id)
+            .bind(title)
+            .bind(title.to_lowercase())
+            .bind(season_number)
+            .bind(episode_number)
+            .execute(database.pool())
+            .await?;
+        }
+
+        let identities = database
+            .list_migration_media_identity_candidates(&[MigrationMediaIdentityLookup {
+                item_type: "EPISODE".to_owned(),
+                title: "Pilot Episode".to_owned(),
+                title_pattern: "%pilot%episode%".to_owned(),
+                production_year: None,
+                season_number: Some(1),
+                episode_number: Some(1),
+                provider_ids: Vec::new(),
+            }])
+            .await?;
+
+        assert_eq!(identities.len(), 2);
         Ok(())
     }
 
