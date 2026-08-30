@@ -50,7 +50,7 @@ test("mobile detail identity pulls above the poster edge", () => {
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
   const titleRowRule = mobileStyles.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(titleRowRule, /margin-top:\s*-48px/);
+  assert.match(titleRowRule, /margin-top:\s*-168px/);
 });
 
 test("detail grid fills the container so left and right outer spacing match", () => {
