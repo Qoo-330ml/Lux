@@ -1105,6 +1105,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
+        corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
         title={mediaTitle(media)}
         videoRef={setVideoRef}

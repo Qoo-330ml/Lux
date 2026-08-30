@@ -23,6 +23,7 @@ import {
 
 type PlayerVideoSurfaceProps = {
   streamUrl: string;
+  corsEnabled?: boolean;
   poster?: string | null;
   title: string;
   videoRef: RefCallback<HTMLVideoElement>;
@@ -68,6 +69,7 @@ type PlayerVideoSurfaceProps = {
 
 export function PlayerVideoSurface({
   streamUrl,
+  corsEnabled = true,
   poster,
   title,
   videoRef,
@@ -256,7 +258,7 @@ export function PlayerVideoSurface({
         <video
           ref={setVideoElementRef}
           className="lux-video"
-          crossOrigin="anonymous"
+          crossOrigin={corsEnabled ? "anonymous" : undefined}
           src={streamUrl}
           poster={poster ?? undefined}
           preload="metadata"

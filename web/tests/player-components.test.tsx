@@ -78,6 +78,28 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain("客户端解码失败");
   });
 
+  it("omits anonymous CORS mode for remote STRM playback", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerVideoSurface
+        streamUrl="/api/v1/playback/sessions/session-1/direct"
+        corsEnabled={false}
+        title="远程 STRM"
+        videoRef={() => undefined}
+        onClick={() => undefined}
+        onDoubleClick={() => undefined}
+        centerSplash={null}
+        fallbackLoading={false}
+        fallbackSpeedX={null}
+        errorMessage={null}
+        showError={false}
+        onRetry={() => undefined}
+        onBack={() => undefined}
+      />,
+    );
+
+    expect(markup).not.toContain('crossorigin="anonymous"');
+  });
+
   it("applies loop, aspect ratio, and flip to the current video presentation", () => {
     expect(playerVideoPresentationStyle("default", "normal")).toBeUndefined();
     expect(playerVideoPresentationStyle("4:3", "horizontal")).toMatchObject({

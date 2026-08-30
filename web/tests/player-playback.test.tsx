@@ -280,6 +280,7 @@ describe("PlayerPage playback synchronization", () => {
 
     const video = container.querySelector<HTMLVideoElement>("video");
     expect(video?.getAttribute("src")).toBe("/Videos/movie-proxy/stream?MediaSourceId=source-proxy");
+    expect(video?.getAttribute("crossorigin")).toBeNull();
     await act(async () => video?.dispatchEvent(new Event("error")));
     expect(video?.getAttribute("src"))
       .toBe("/api/v1/playback/sessions/web-source-proxy/direct?expires=1900000000&signature=test");
