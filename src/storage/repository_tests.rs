@@ -647,6 +647,65 @@ async fn person_credits_migration_creates_the_index_table() {
 }
 
 #[tokio::test]
+async fn person_credit_replacement_batches_large_credit_sets() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('item-large-credits', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    let credits = (0..41)
+        .map(|index| NewPersonCredit {
+            person_id: format!("person-{index}"),
+            lux_person_id: None,
+            person_type: "Actor".to_owned(),
+            person_name: format!("演员{index}"),
+            provider: "tmdb".to_owned(),
+            role: format!("角色{index}"),
+            sort_order: index,
+            biography: None,
+            birthday: None,
+            deathday: None,
+            known_for_department: None,
+            place_of_birth: None,
+            provider_ids: BTreeMap::new(),
+            genres: Vec::new(),
+            tags: Vec::new(),
+            production_locations: Vec::new(),
+            premiere_date: None,
+            production_year: None,
+            taglines: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    database
+        .replace_person_credits("item-large-credits", &credits)
+        .await
+        .expect("large credit replacement");
+    assert_eq!(database.query_count(), 4);
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-large-credits'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored credit count");
+    assert_eq!(stored_count, 41);
+}
+
+#[tokio::test]
 async fn person_credit_list_uses_one_consistent_representative_row() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

@@ -334,6 +334,7 @@ impl Database {
             })?;
         let mut seen_keys = HashSet::with_capacity(credits.len());
         let mut duplicates_skipped = 0;
+        let mut prepared = Vec::with_capacity(credits.len());
         for credit in credits {
             let key = (
                 credit.person_id.as_str(),
@@ -355,14 +356,31 @@ impl Database {
                 .map_err(|source| StorageError::Serialization(source.to_string()))?;
             let taglines_json = serde_json::to_string(&credit.taglines)
                 .map_err(|source| StorageError::Serialization(source.to_string()))?;
-            self.query(
+            prepared.push((
+                credit,
+                provider_ids_json,
+                genres_json,
+                tags_json,
+                production_locations_json,
+                taglines_json,
+            ));
+        }
+        const PERSON_CREDIT_INSERT_CHUNK_SIZE: usize = 40;
+        for chunk in prepared.chunks(PERSON_CREDIT_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n(
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO person_credits (
                     item_id, person_id, person_type, person_name, provider, role,
                     sort_order, biography, birthday, deathday, known_for_department,
                     place_of_birth, provider_ids_json, genres_json, tags_json,
-                    production_locations_json, premiere_date, production_year, taglines_json
-                    , lux_person_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    production_locations_json, premiere_date, production_year, taglines_json,
+                    lux_person_id
+                ) VALUES {placeholders}
                 ON CONFLICT (item_id, person_type, provider, person_id, role) DO UPDATE SET
                     person_name = excluded.person_name,
                     sort_order = excluded.sort_order,
@@ -378,34 +396,46 @@ impl Database {
                     premiere_date = excluded.premiere_date,
                     production_year = excluded.production_year,
                     taglines_json = excluded.taglines_json,
-                    lux_person_id = excluded.lux_person_id",
-            )
-            .bind(item_id)
-            .bind(&credit.person_id)
-            .bind(&credit.person_type)
-            .bind(&credit.person_name)
-            .bind(&credit.provider)
-            .bind(&credit.role)
-            .bind(credit.sort_order)
-            .bind(&credit.biography)
-            .bind(&credit.birthday)
-            .bind(&credit.deathday)
-            .bind(&credit.known_for_department)
-            .bind(&credit.place_of_birth)
-            .bind(provider_ids_json)
-            .bind(genres_json)
-            .bind(tags_json)
-            .bind(production_locations_json)
-            .bind(&credit.premiere_date)
-            .bind(credit.production_year)
-            .bind(taglines_json)
-            .bind(&credit.lux_person_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                    lux_person_id = excluded.lux_person_id"
+            )));
+            for (
+                credit,
+                provider_ids_json,
+                genres_json,
+                tags_json,
+                production_locations_json,
+                taglines_json,
+            ) in chunk
+            {
+                statement = statement
+                    .bind(item_id)
+                    .bind(&credit.person_id)
+                    .bind(&credit.person_type)
+                    .bind(&credit.person_name)
+                    .bind(&credit.provider)
+                    .bind(&credit.role)
+                    .bind(credit.sort_order)
+                    .bind(&credit.biography)
+                    .bind(&credit.birthday)
+                    .bind(&credit.deathday)
+                    .bind(&credit.known_for_department)
+                    .bind(&credit.place_of_birth)
+                    .bind(provider_ids_json)
+                    .bind(genres_json)
+                    .bind(tags_json)
+                    .bind(production_locations_json)
+                    .bind(&credit.premiere_date)
+                    .bind(credit.production_year)
+                    .bind(taglines_json)
+                    .bind(&credit.lux_person_id);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         if duplicates_skipped > 0 {
             tracing::debug!(
