@@ -1,6 +1,9 @@
 use super::*;
 use crate::{
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        candidates::MetadataCandidateService, libraries::LibraryService, scanner::LibraryScanner,
+        setup::SetupService,
+    },
     config::{Config, DatabaseBackend, PostgresConnection},
     library::LibraryKind,
 };
@@ -190,6 +193,128 @@ async fn recent_catalog_rows_use_one_query_for_multiple_libraries() {
         std::collections::HashSet::from(["recent-first-new", "recent-second-new"])
     );
     assert_eq!(database.query_count(), 1);
+}
+
+#[tokio::test]
+async fn pending_metadata_candidates_load_current_items_in_one_batch() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Metadata candidates", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    for (index, title) in [(1, "First"), (2, "Second")] {
+        let item_id = format!("candidate-item-{index}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'PENDING')",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .bind(title)
+        .bind(title.to_ascii_lowercase())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                    id, item_id, provider, provider_id, candidate_json, score, status
+                 ) VALUES (?, ?, 'TMDB', ?, ?, 80, 'PENDING')",
+        )
+        .bind(format!("candidate-{index}"))
+        .bind(&item_id)
+        .bind(index.to_string())
+        .bind(serde_json::json!({"title": title}).to_string())
+        .execute(database.pool())
+        .await
+        .expect("metadata candidate");
+    }
+
+    database.reset_query_count();
+    let page = MetadataCandidateService::new(database.clone())
+        .list_pending(0, 50)
+        .await
+        .expect("pending candidates");
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.items[0].field_diffs.len(), 0);
+    assert_eq!(page.items[1].field_diffs.len(), 0);
+    assert_eq!(database.query_count(), 3);
+}
+
+#[tokio::test]
+async fn collection_refresh_uses_provider_index_and_batch_insert() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Collections", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    for index in 1..=3 {
+        let item_id = format!("collection-movie-{index}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, provider_ids_json,
+                    identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'ONLINE_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .bind(format!("Movie {index}"))
+        .bind(format!("movie {index}"))
+        .bind(serde_json::json!({"tmdb": index.to_string()}).to_string())
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let member_provider_ids = (1..=3)
+        .map(|index| ("TMDB".to_owned(), index.to_string(), index))
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    let result = database
+        .upsert_collection(NewCollection {
+            library_id: &library_id,
+            provider: "tmdb",
+            provider_id: "collection-1",
+            title: "Collection",
+            overview: None,
+            poster_path: None,
+            backdrop_path: None,
+            member_provider_ids: &member_provider_ids,
+        })
+        .await
+        .expect("collection refresh");
+
+    assert_eq!(result.member_count, 3);
+    assert_eq!(database.query_count(), 8);
+    let member_ids = sqlx::query_scalar::<_, String>(
+        "SELECT item_id FROM collection_items
+         WHERE collection_id = (SELECT id FROM collections WHERE provider_id = 'collection-1')
+         ORDER BY sort_order",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("collection members");
+    assert_eq!(
+        member_ids,
+        vec![
+            "collection-movie-1".to_owned(),
+            "collection-movie-2".to_owned(),
+            "collection-movie-3".to_owned(),
+        ]
+    );
 }
 
 #[tokio::test]

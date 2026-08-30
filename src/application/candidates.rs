@@ -143,10 +143,20 @@ impl MetadataCandidateService {
             .database
             .list_pending_metadata_candidates(offset, limit)
             .await?;
+        let item_ids = rows
+            .iter()
+            .map(|row| row.item_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let current_by_item = self
+            .database
+            .list_media_item_metadata_by_ids(&item_ids)
+            .await?;
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
-            let current = self.database.find_media_item_metadata(&row.item_id).await?;
-            items.push(candidate_view(row, current.as_ref())?);
+            let current = current_by_item.get(&row.item_id);
+            items.push(candidate_view(row, current)?);
         }
         Ok(MetadataCandidatePage {
             items,

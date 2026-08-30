@@ -17,6 +17,44 @@ struct BatchHierarchyRow {
     identity_key: String,
 }
 
+fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
+    let scraper_id = row.get::<Option<String>, _>("scraper_id");
+    let series_scraper_id = row
+        .get::<Option<String>, _>("series_metadata_scraper_id")
+        .or_else(|| scraper_id.clone());
+    let series_provider = first_provider_id(
+        row.get("series_provider_ids_json"),
+        None,
+        series_scraper_id.as_deref(),
+    );
+    StoredMediaMetadata {
+        item_type: row.get("item_type"),
+        title: row.get("title"),
+        original_title: row.get("original_title"),
+        overview: row.get("overview"),
+        production_year: row.get("production_year"),
+        premiere_date: row.get("premiere_date"),
+        last_air_date: row.get("last_air_date"),
+        status: row.get("status"),
+        original_language: row.get("original_language"),
+        rating: row.get("rating"),
+        provider_ids_json: row.get("provider_ids_json"),
+        metadata_scraper_id: row.get("metadata_scraper_id"),
+        identification_status: row.get("identification_status"),
+        scraper_id,
+        provenance_json: row.get("metadata_provenance_json"),
+        locked_fields_json: row.get("locked_fields_json"),
+        nfo_metadata_json: row.get("nfo_metadata_json"),
+        series_item_id: row.get("series_id"),
+        series_title: row.get("series_title"),
+        series_production_year: row.get("series_production_year"),
+        series_provider_name: series_provider.as_ref().map(|(name, _)| name.clone()),
+        series_provider_id: series_provider.map(|(_, id)| id),
+        season_number: row.get("season_number"),
+        episode_number: row.get("episode_number"),
+    }
+}
+
 impl Database {
     pub(crate) async fn media_source_belongs_to_item(
         &self,
@@ -1720,69 +1758,59 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaMetadata>, StorageError> {
-        self.query(
-            "SELECT mi.item_type, mi.title, mi.original_title, mi.overview, mi.production_year,
-                    mi.premiere_date, mi.last_air_date, mi.status, mi.original_language, mi.rating,
-                    mi.provider_ids_json, mi.metadata_scraper_id, mi.identification_status,
-                    mi.metadata_provenance_json, mi.locked_fields_json,
-                    mi.nfo_metadata_json,
-                    mi.series_id, mi.season_number, mi.episode_number,
-                    series.title AS series_title,
-                    series.production_year AS series_production_year,
-                    series.provider_ids_json AS series_provider_ids_json,
-                    series.metadata_scraper_id AS series_metadata_scraper_id,
-                    libraries.scraper_id AS scraper_id
-             FROM media_items mi
-             LEFT JOIN media_items series ON series.id = mi.series_id
-             LEFT JOIN libraries ON libraries.id = mi.library_id
-             WHERE mi.id = ?",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| {
-            row.map(|row| {
-                let scraper_id = row.get::<Option<String>, _>("scraper_id");
-                let series_scraper_id = row
-                    .get::<Option<String>, _>("series_metadata_scraper_id")
-                    .or_else(|| scraper_id.clone());
-                let series_provider = first_provider_id(
-                    row.get("series_provider_ids_json"),
-                    None,
-                    series_scraper_id.as_deref(),
-                );
-                StoredMediaMetadata {
-                    item_type: row.get("item_type"),
-                    title: row.get("title"),
-                    original_title: row.get("original_title"),
-                    overview: row.get("overview"),
-                    production_year: row.get("production_year"),
-                    premiere_date: row.get("premiere_date"),
-                    last_air_date: row.get("last_air_date"),
-                    status: row.get("status"),
-                    original_language: row.get("original_language"),
-                    rating: row.get("rating"),
-                    provider_ids_json: row.get("provider_ids_json"),
-                    metadata_scraper_id: row.get("metadata_scraper_id"),
-                    identification_status: row.get("identification_status"),
-                    scraper_id,
-                    provenance_json: row.get("metadata_provenance_json"),
-                    locked_fields_json: row.get("locked_fields_json"),
-                    nfo_metadata_json: row.get("nfo_metadata_json"),
-                    series_item_id: row.get("series_id"),
-                    series_title: row.get("series_title"),
-                    series_production_year: row.get("series_production_year"),
-                    series_provider_name: series_provider.as_ref().map(|(name, _)| name.clone()),
-                    series_provider_id: series_provider.map(|(_, id)| id),
-                    season_number: row.get("season_number"),
-                    episode_number: row.get("episode_number"),
-                }
-            })
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        let mut metadata = self
+            .list_media_item_metadata_by_ids(&[item_id.to_owned()])
+            .await?;
+        Ok(metadata.remove(item_id))
+    }
+
+    pub(crate) async fn list_media_item_metadata_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, StoredMediaMetadata>, StorageError> {
+        let mut metadata = HashMap::with_capacity(item_ids.len());
+        for chunk in item_ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT mi.id AS item_id, mi.item_type, mi.title, mi.original_title, mi.overview,
+                        mi.production_year, mi.premiere_date, mi.last_air_date, mi.status,
+                        mi.original_language, mi.rating, mi.provider_ids_json,
+                        mi.metadata_scraper_id, mi.identification_status,
+                        mi.metadata_provenance_json, mi.locked_fields_json,
+                        mi.nfo_metadata_json, mi.series_id, mi.season_number, mi.episode_number,
+                        series.title AS series_title,
+                        series.production_year AS series_production_year,
+                        series.provider_ids_json AS series_provider_ids_json,
+                        series.metadata_scraper_id AS series_metadata_scraper_id,
+                        libraries.scraper_id AS scraper_id
+                 FROM media_items mi
+                 LEFT JOIN media_items series ON series.id = mi.series_id
+                 LEFT JOIN libraries ON libraries.id = mi.library_id
+                 WHERE mi.id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                let item_id = row.get::<String, _>("item_id");
+                metadata.insert(item_id, stored_media_metadata(row));
+            }
+        }
+        Ok(metadata)
     }
 
     pub(crate) async fn list_metadata_refresh_item_ids(
@@ -2040,48 +2068,87 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let mut member_count = 0_usize;
-        for (member_provider, member_provider_id, sort_order) in member_provider_ids {
-            let Some(member_item_id) = self
-                .query_scalar::<String>(
-                    "SELECT mi.id
-                 FROM media_items mi
-                 JOIN json_each(
-                    CASE WHEN json_valid(mi.provider_ids_json)
-                         THEN mi.provider_ids_json ELSE '{}' END
-                 ) provider_id ON 1 = 1
-                 WHERE mi.library_id = ? AND mi.item_type = 'MOVIE'
-                   AND mi.removed_at IS NULL
-                   AND lower(provider_id.key) = lower(?)
-                   AND provider_id.value = ?
-                 LIMIT 1",
-                )
+        let mut matched_members = Vec::with_capacity(member_provider_ids.len());
+        for (chunk_index, chunk) in member_provider_ids
+            .chunks(BATCH_INSERT_CHUNK_SIZE)
+            .enumerate()
+        {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested(provider, provider_id, sort_order, ordinal) AS (VALUES {values})
+                 SELECT requested.ordinal, requested.sort_order, provider.media_item_id
+                 FROM requested
+                 JOIN media_item_provider_ids provider
+                   ON provider.item_type = 'MOVIE'
+                  AND provider.provider = lower(requested.provider)
+                  AND provider.provider_id = requested.provider_id
+                 JOIN media_items mi ON mi.id = provider.media_item_id
+                 WHERE mi.library_id = ? AND mi.removed_at IS NULL
+                 ORDER BY requested.ordinal, provider.media_item_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (offset, (member_provider, member_provider_id, sort_order)) in
+                chunk.iter().enumerate()
+            {
+                statement = statement
+                    .bind(member_provider.to_ascii_lowercase())
+                    .bind(member_provider_id)
+                    .bind(*sort_order)
+                    .bind((chunk_index * BATCH_INSERT_CHUNK_SIZE + offset) as i64);
+            }
+            let rows = statement
                 .bind(library_id)
-                .bind(member_provider)
-                .bind(member_provider_id)
-                .fetch_optional(&mut *transaction)
+                .fetch_all(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
-                })?
-            else {
+                })?;
+            let mut seen_ordinals = HashSet::new();
+            for row in rows {
+                let ordinal = row.get::<i64, _>("ordinal");
+                if !seen_ordinals.insert(ordinal) {
+                    continue;
+                }
+                matched_members.push((
+                    row.get::<String, _>("media_item_id"),
+                    row.get::<i64, _>("sort_order"),
+                ));
+            }
+        }
+        let mut member_count = 0_usize;
+        for chunk in matched_members.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
                 continue;
-            };
-            self.query(
+            }
+            let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO collection_items (collection_id, item_id, sort_order)
-                 VALUES (?, ?, ?)",
-            )
-            .bind(&collection_id)
-            .bind(member_item_id)
-            .bind(*sort_order)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            member_count += 1;
+                 VALUES {values}
+                 ON CONFLICT (collection_id, item_id) DO NOTHING"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (member_item_id, sort_order) in chunk {
+                statement = statement
+                    .bind(&collection_id)
+                    .bind(member_item_id)
+                    .bind(*sort_order);
+            }
+            let result = statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            member_count += result.rows_affected() as usize;
         }
         transaction
             .commit()

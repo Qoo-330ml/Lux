@@ -1,4 +1,7 @@
 use super::*;
+use tokio::{sync::Semaphore, task::JoinSet};
+
+const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
 
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyItemsQuery {
@@ -1231,13 +1234,18 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    let include_nfo = emby_nfo_fields_requested(fields);
+    let include_people = fields.is_some_and(|fields| emby_fields_include(Some(fields), "People"));
+    let extras = load_emby_item_extras(
+        state.local_nfo.clone(),
+        state.people.clone(),
+        &catalog_items,
+        include_nfo,
+        include_people,
+    )
+    .await;
     let mut items = Vec::with_capacity(catalog_items.len());
-    for item in &catalog_items {
-        let nfo = if emby_nfo_fields_requested(fields) {
-            read_local_nfo_details(state, &item.id).await
-        } else {
-            None
-        };
+    for (item, (nfo, actors)) in catalog_items.iter().zip(extras) {
         let mut value = emby_catalog_item_json_with_state(
             item,
             &state.server_id,
@@ -1255,21 +1263,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
             let source = sources.remove(index);
             sources.insert(0, source);
         }
-        if fields.is_some_and(|fields| emby_fields_include(Some(fields), "People")) {
-            let actors = match state.people.as_ref() {
-                Some(people) => match people.list_item_actors(&item.id).await {
-                    Ok(actors) => actors,
-                    Err(error) => {
-                        tracing::warn!(
-                            item_id = %item.id,
-                            %error,
-                            "derived actor relation is unavailable for Emby list response"
-                        );
-                        Vec::new()
-                    }
-                },
-                None => Vec::new(),
-            };
+        if include_people {
             if let Value::Object(object) = &mut value {
                 let mut people = actors
                     .into_iter()
@@ -1284,6 +1278,85 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
         items.push(value);
     }
     Ok(items)
+}
+
+async fn load_emby_item_extras(
+    local_nfo: Option<LocalNfoMetadataStore>,
+    people: Option<PeopleService>,
+    items: &[CatalogItem],
+    include_nfo: bool,
+    include_people: bool,
+) -> Vec<(
+    Option<LocalNfoDetails>,
+    Vec<crate::application::people::ActorView>,
+)> {
+    let mut extras = vec![(None, Vec::new()); items.len()];
+    if items.is_empty() || (!include_nfo && !include_people) {
+        return extras;
+    }
+    let semaphore = Arc::new(Semaphore::new(EMBY_ITEM_EXTRA_CONCURRENCY));
+    let mut tasks = JoinSet::new();
+    for (index, item) in items.iter().enumerate() {
+        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+            Ok(permit) => permit,
+            Err(_) => break,
+        };
+        let item_id = item.id.clone();
+        let local_nfo = local_nfo.clone();
+        let people = people.clone();
+        tasks.spawn(async move {
+            let _permit = permit;
+            let nfo = if include_nfo {
+                match local_nfo {
+                    Some(store) => match store.read_item(&item_id).await {
+                        Ok(details) => details,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %item_id,
+                                %error,
+                                "derived local NFO cache is unavailable for Emby list response"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            } else {
+                None
+            };
+            let actors = if include_people {
+                match people {
+                    Some(people) => match people.list_item_actors(&item_id).await {
+                        Ok(actors) => actors,
+                        Err(error) => {
+                            tracing::warn!(
+                                item_id = %item_id,
+                                %error,
+                                "derived actor relation is unavailable for Emby list response"
+                            );
+                            Vec::new()
+                        }
+                    },
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
+            (index, nfo, actors)
+        });
+    }
+    while let Some(result) = tasks.join_next().await {
+        match result {
+            Ok((index, nfo, actors)) if index < extras.len() => {
+                extras[index] = (nfo, actors);
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "Emby item extras task failed");
+            }
+        }
+    }
+    extras
 }
 
 pub(super) async fn emby_user_items(
