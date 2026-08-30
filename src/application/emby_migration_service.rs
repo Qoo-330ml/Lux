@@ -2499,6 +2499,7 @@ fn restrict_library_access_plan(
 /// Lux libraries for a user.  `None` means the source did not provide enough
 /// folder identity data to prove a safe source-side restriction; callers must
 /// then retain the legacy target-side filtering behaviour.
+#[cfg(test)]
 fn source_library_ids_for_user(
     user: &MigrationUser,
     source_folders: Option<&[MigrationLibraryFolder]>,
@@ -2564,6 +2565,7 @@ fn map_enabled_library_ids(
         .collect()
 }
 
+#[cfg(test)]
 fn map_enabled_library_ids_checked(
     user: &MigrationUser,
     source_folders: Option<&[MigrationLibraryFolder]>,
