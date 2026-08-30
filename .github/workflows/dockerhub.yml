@@ -13,6 +13,11 @@ env:
   # namespace for metadata while keeping publishing disabled.
   IMAGE_NAMESPACE: ${{ secrets.DOCKERHUB_USERNAME || 'local' }}
   IMAGE_NAME: lux
+  # The runtime image is immutable by convention. Bump this tag only when the
+  # Debian/FFmpeg runtime dependencies change; application builds reuse the
+  # existing per-architecture image and pin it by digest.
+  RUNTIME_IMAGE_NAME: lux-runtime
+  RUNTIME_IMAGE_TAG: trixie-jellyfin-ffmpeg7-v1
 
 jobs:
   build:
@@ -58,6 +63,58 @@ jobs:
             type=ref,event=pr
             type=raw,value=test,enable={{is_default_branch}}
 
+      - name: Resolve immutable runtime image
+        id: runtime
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          APP_ARCH: ${{ matrix.arch }}
+          APP_PLATFORM: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            {
+              echo 'image=lux-runtime'
+              echo 'context=target:runtime'
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          runtime_image="docker.io/${IMAGE_NAMESPACE}/${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}-${APP_ARCH}"
+          runtime_inspect="$(mktemp)"
+          if ! docker buildx imagetools inspect "$runtime_image" >"$runtime_inspect" 2>&1; then
+            if ! grep -Eqi 'manifest unknown|not found|name unknown' "$runtime_inspect"; then
+              cat "$runtime_inspect" >&2
+              exit 1
+            fi
+            echo "Runtime image $runtime_image is missing; building it once for this runtime version."
+            docker buildx build \
+              --platform "$APP_PLATFORM" \
+              --file ./runtime/Dockerfile \
+              --tag "$runtime_image" \
+              --build-arg "LUX_RUNTIME_VERSION=$RUNTIME_IMAGE_TAG" \
+              --cache-from "type=gha,scope=lux-runtime-$APP_ARCH" \
+              --cache-to "type=gha,mode=max,scope=lux-runtime-$APP_ARCH" \
+              --provenance=mode=max \
+              --sbom=true \
+              --push \
+              .
+          fi
+
+          runtime_digest="$(docker buildx imagetools inspect "$runtime_image" \
+            | awk '$1 == "Digest:" { print $2; exit }')"
+          if [[ ! "$runtime_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "Could not resolve an immutable digest for $runtime_image" >&2
+            exit 1
+          fi
+
+          runtime_ref="$runtime_image@$runtime_digest"
+          {
+            echo "image=$runtime_ref"
+            echo "context=docker-image://$runtime_ref"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Build and publish architecture image
         shell: bash
         env:
@@ -67,6 +124,8 @@ jobs:
           APP_PLATFORM: ${{ matrix.platform }}
           APP_ARCH: ${{ matrix.arch }}
           EVENT_NAME: ${{ github.event_name }}
+          RUNTIME_IMAGE: ${{ steps.runtime.outputs.image }}
+          RUNTIME_CONTEXT: ${{ steps.runtime.outputs.context }}
         run: |
           set -euo pipefail
 
@@ -84,12 +143,18 @@ jobs:
             --set "app.tags=$app_tags"
             --set "app.args.LUX_VERSION=$APP_VERSION"
             --set "app.args.LUX_REVISION=$APP_REVISION"
-            --set "runtime.cache-from=type=gha,scope=lux-runtime-$APP_ARCH"
-            --set "runtime.cache-to=type=gha,mode=max,scope=lux-runtime-$APP_ARCH"
+            --set "app.args.LUX_RUNTIME_IMAGE=$RUNTIME_IMAGE"
+            --set "app.contexts.lux-runtime=$RUNTIME_CONTEXT"
             --set "app.cache-from=type=gha,scope=lux-$APP_ARCH"
             --set "app.cache-to=type=gha,mode=max,scope=lux-$APP_ARCH"
             --set "$app_output"
           )
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            bake_args+=(
+              --set "runtime.cache-from=type=gha,scope=lux-runtime-$APP_ARCH"
+              --set "runtime.cache-to=type=gha,mode=max,scope=lux-runtime-$APP_ARCH"
+            )
+          fi
           if [[ "$EVENT_NAME" != "pull_request" ]]; then
             bake_args+=(
               --set "app.attest=type=provenance,mode=max"
@@ -138,3 +203,11 @@ jobs:
               "${tag}-amd64" \
               "${tag}-arm64"
           done <<< "${{ steps.meta.outputs.tags }}"
+
+          runtime_image="docker.io/${IMAGE_NAMESPACE}/${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}"
+          if ! docker buildx imagetools inspect "$runtime_image" >/dev/null 2>&1; then
+            docker buildx imagetools create \
+              --tag "$runtime_image" \
+              "${runtime_image}-amd64" \
+              "${runtime_image}-arm64"
+          fi

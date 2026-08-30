@@ -2,6 +2,8 @@
 # rebuild the operating-system dependency layer.
 FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
 
+# Keep this value aligned with RUNTIME_IMAGE_TAG in the Docker Hub workflow;
+# bump both when the runtime dependency set changes.
 ARG LUX_RUNTIME_VERSION=trixie-jellyfin-ffmpeg7-v1
 ARG JELLYFIN_FFMPEG_VERSION=7.1.4-3
 ARG TARGETARCH

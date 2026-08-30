@@ -38,9 +38,9 @@ COPY --from=web-builder /src/web/dist ./web/dist
 
 RUN cargo build --release --locked --bin luxd
 
-# The CI bake target supplies the local `lux-runtime` build context here. It
-# remains part of the application image, so registry pulls can reuse its layer
-# digest without publishing a separate runtime repository.
+# Local builds use the `lux-runtime` bake target here. Published builds replace
+# this argument with the per-architecture runtime image pinned by digest, so
+# application releases reuse the same dependency layers.
 FROM ${LUX_RUNTIME_IMAGE}
 
 ARG LUX_VERSION=dev
