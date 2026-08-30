@@ -132,6 +132,20 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
     assert_eq!(allowed_cover.status(), reqwest::StatusCode::OK);
     assert_eq!(allowed_cover.headers()["content-type"], "image/png");
     assert_eq!(allowed_cover.bytes().await?.as_ref(), PNG_1X1);
+    let allowed_source: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+            .bind(&first_item)
+            .fetch_one(database.pool())
+            .await?;
+    let allowed_stream = client
+        .get(format!(
+            "{base_url}/api/v1/items/{first_item}/stream?sourceId={allowed_source}"
+        ))
+        .header(COOKIE, &viewer_cookie)
+        .send()
+        .await?;
+    assert_eq!(allowed_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(allowed_stream.bytes().await?.as_ref(), b"movie");
     let denied_cover = client
         .get(format!("{base_url}/api/v1/libraries/{}/cover", second.id))
         .header(COOKIE, &viewer_cookie)

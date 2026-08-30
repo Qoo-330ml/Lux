@@ -2046,7 +2046,9 @@ pub(crate) struct StoredItemScanPath {
 }
 
 pub(crate) struct StoredPlaybackSource {
+    pub(crate) source_id: String,
     pub(crate) source_kind: String,
+    pub(crate) container: Option<String>,
     pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,

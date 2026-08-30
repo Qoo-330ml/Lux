@@ -1876,19 +1876,25 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        for item_id in item_ids {
-            self.query(
+        for chunk in item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, 'PENDING')", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
-                 VALUES (?, ?, 'PENDING')",
-            )
-            .bind(job_id)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                 VALUES {values}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(job_id).bind(item_id);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         self.query(
             "UPDATE metadata_reidentify_jobs
@@ -1925,64 +1931,83 @@ impl Database {
         &self,
         job_id: &str,
         library_id: &str,
-        item_ids: &[String],
         mode: &str,
-    ) -> Result<(), StorageError> {
+    ) -> Result<i64, StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "INSERT INTO metadata_reidentify_jobs (
                 id, status, total_count, mode, library_id, job_scope
-             ) VALUES (?, 'CANCELLED', ?, ?, ?, 'LIBRARY')",
+             )
+             SELECT ?, 'CANCELLED', COUNT(*), ?, ?, 'LIBRARY'
+             FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
         )
         .bind(job_id)
-        .bind(i64::try_from(item_ids.len()).unwrap_or(i64::MAX))
         .bind(mode)
         .bind(library_id)
-        .execute(&self.pool)
+        .bind(library_id)
+        .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-
-        for chunk in item_ids.chunks(500) {
-            let mut transaction = self.begin_metadata_write_transaction().await?;
-            for item_id in chunk {
-                self.query(
-                    "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
-                     VALUES (?, ?, 'PENDING')",
-                )
-                .bind(job_id)
-                .bind(item_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            }
+        let total_count: i64 = self
+            .query_scalar("SELECT total_count FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if total_count == 0 {
             transaction
-                .commit()
+                .rollback()
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
+            return Ok(0);
         }
-
+        self.query(
+            "INSERT INTO metadata_reidentify_job_items (job_id, item_id, status)
+             SELECT ?, id, 'PENDING'
+             FROM media_items
+             WHERE library_id = ? AND removed_at IS NULL
+               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
+        )
+        .bind(job_id)
+        .bind(library_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         self.query(
             "UPDATE metadata_reidentify_jobs
              SET status = 'QUEUED', updated_at = unixepoch()
              WHERE id = ? AND status = 'CANCELLED'",
         )
         .bind(job_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        Ok(())
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(total_count)
     }
 
     pub(crate) async fn find_metadata_reidentify_job(

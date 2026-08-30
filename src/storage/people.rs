@@ -2241,35 +2241,6 @@ impl Database {
         Ok(rows)
     }
 
-    pub(crate) async fn list_media_item_ids_for_library(
-        &self,
-        library_id: &str,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query_scalar(
-            "SELECT id FROM media_items
-             WHERE library_id = ? AND removed_at IS NULL
-               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
-             ORDER BY CASE item_type
-                          WHEN 'SERIES' THEN 0
-                          WHEN 'SEASON' THEN 1
-                          WHEN 'EPISODE' THEN 2
-                          ELSE 3
-                      END, id
-             LIMIT ? OFFSET ?",
-        )
-        .bind(library_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn list_person_index_item_ids(
         &self,
         library_id: &str,

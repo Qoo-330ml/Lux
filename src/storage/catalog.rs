@@ -2970,42 +2970,59 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_playback_source(
+    pub(crate) async fn find_authorized_playback_source(
         &self,
         item_id: &str,
         source_id: Option<&str>,
+        user_id: &str,
+        is_admin: bool,
     ) -> Result<Option<StoredPlaybackSource>, StorageError> {
-        self.query(
-            "SELECT ms.source_kind, ms.external_url,
+        let access_join = if is_admin {
+            ""
+        } else {
+            "JOIN user_library_access ula
+               ON ula.user_id = ?
+              AND ula.library_id = mi.library_id
+              AND ula.can_view = 1"
+        };
+        let query = format!(
+            "SELECT ms.id AS source_id, ms.source_kind, ms.container, ms.external_url,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             {access_join}
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE mi.id = ?
+             WHERE mi.id = ? AND mi.removed_at IS NULL
                AND (? IS NULL OR ms.id = ?)
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id
-             LIMIT 1",
-        )
-        .bind(item_id)
-        .bind(source_id)
-        .bind(source_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| {
-            row.map(|row| StoredPlaybackSource {
-                source_kind: row.get("source_kind"),
-                external_url: row.get("external_url"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
+             LIMIT 1"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        if !is_admin {
+            statement = statement.bind(user_id);
+        }
+        statement = statement.bind(item_id).bind(source_id).bind(source_id);
+        statement
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| {
+                row.map(|row| StoredPlaybackSource {
+                    source_id: row.get("source_id"),
+                    source_kind: row.get("source_kind"),
+                    container: row.get("container"),
+                    external_url: row.get("external_url"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
             })
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn find_download_source_by_id(

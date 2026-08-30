@@ -1358,24 +1358,25 @@ pub(super) async fn lux_download(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match access
-        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+    let source = match access
+        .authorized_playback_source(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &item_id,
+            query.source_id.as_deref(),
+        )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    };
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(downloads) = state.downloads.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let artifact = match downloads
-        .prepare(&item_id, query.source_id.as_deref())
-        .await
-    {
+    let artifact = match downloads.prepare_authorized_source(&source).await {
         Ok(artifact) => artifact,
         Err(error) => return download_error_response(error),
     };
@@ -2002,24 +2003,25 @@ pub(super) async fn emby_download(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match access
-        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+    let source = match access
+        .authorized_playback_source(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &item_id,
+            query.media_source_id.as_deref(),
+        )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    };
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(downloads) = state.downloads.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let artifact = match downloads
-        .prepare(&item_id, query.media_source_id.as_deref())
-        .await
-    {
+    let artifact = match downloads.prepare_authorized_source(&source).await {
         Ok(artifact) => artifact,
         Err(error) => return download_error_response(error),
     };
@@ -2084,18 +2086,10 @@ pub(super) async fn serve_media_file(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match access.can_view_item(principal, item_id).await {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let source = database
-        .find_playback_source(item_id, media_source_id)
-        .await;
-    let source = match source {
+    let source = match access
+        .authorized_playback_source(principal, item_id, media_source_id)
+        .await
+    {
         Ok(Some(source)) => source,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),

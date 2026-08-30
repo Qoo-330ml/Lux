@@ -3539,18 +3539,25 @@ pub(super) fn emby_media_source_stream_url(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
 ) -> String {
-    let stream_suffix = source
-        .container
-        .as_deref()
-        .filter(|container| {
-            !(source.source_kind == "STRM_URL" && container.eq_ignore_ascii_case("strm"))
-        })
+    emby_media_source_stream_url_parts(
+        item_id,
+        &source.id,
+        &source.source_kind,
+        source.container.as_deref(),
+    )
+}
+
+pub(super) fn emby_media_source_stream_url_parts(
+    item_id: &str,
+    source_id: &str,
+    source_kind: &str,
+    container: Option<&str>,
+) -> String {
+    let stream_suffix = container
+        .filter(|container| !(source_kind == "STRM_URL" && container.eq_ignore_ascii_case("strm")))
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
-    format!(
-        "/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={}",
-        source.id
-    )
+    format!("/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={source_id}")
 }
 
 pub(super) fn emby_signed_direct_stream_url(

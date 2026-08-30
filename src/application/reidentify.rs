@@ -409,30 +409,14 @@ impl MetadataReidentifyService {
         {
             return Err(MetadataReidentifyError::LibraryJobAlreadyActive(job_id));
         }
-        let mut item_ids = Vec::new();
-        let mut offset = 0_i64;
-        loop {
-            let page = self
-                .database
-                .list_media_item_ids_for_library(library_id, offset, 500)
-                .await?;
-            if page.is_empty() {
-                break;
-            }
-            let page_len = i64::try_from(page.len()).unwrap_or(500);
-            item_ids.extend(page);
-            offset = offset.saturating_add(page_len);
-            if page_len < 500 {
-                break;
-            }
-        }
-        if item_ids.is_empty() {
+        let job_id = Uuid::now_v7().to_string();
+        let total_count = self
+            .database
+            .create_metadata_reidentify_library_job(&job_id, library_id, mode.as_str())
+            .await?;
+        if total_count == 0 {
             return Err(MetadataReidentifyError::InvalidItemCount);
         }
-        let job_id = Uuid::now_v7().to_string();
-        self.database
-            .create_metadata_reidentify_library_job(&job_id, library_id, &item_ids, mode.as_str())
-            .await?;
         self.admin_events.publish(AdminEventScope::Jobs);
         self.get_job(&job_id).await
     }

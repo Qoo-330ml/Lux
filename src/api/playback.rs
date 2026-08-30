@@ -807,21 +807,17 @@ pub(super) async fn lux_create_web_playback_session(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let item = match catalog.find_item(principal, &request.item_id).await {
-        Ok(Some(item)) => item,
+    let source = match access
+        .authorized_playback_source(principal, &request.item_id, Some(&request.source_id))
+        .await
+    {
+        Ok(Some(source)) => source,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
-    let Some(source) = item
-        .media_sources
-        .iter()
-        .find(|source| source.id == request.source_id)
-    else {
-        return StatusCode::NOT_FOUND.into_response();
     };
     let source_kind = match source.source_kind.as_str() {
         "LOCAL_FILE" => PlaybackSourceKind::LocalFile,
@@ -846,26 +842,11 @@ pub(super) async fn lux_create_web_playback_session(
         Err(error) => return web_playback_error(&headers, error),
     };
     if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
-        let Some(database) = state.database.as_ref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
-        let source_record = match database
-            .find_playback_source(&request.item_id, Some(&request.source_id))
-            .await
-        {
-            Ok(Some(source_record)) => source_record,
-            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        if source_record.source_kind != "LOCAL_FILE" {
+        if source.source_kind != "LOCAL_FILE" {
             let _ = service.stop(&created.id, &user.id.to_string()).await;
             return StatusCode::NOT_IMPLEMENTED.into_response();
         }
-        let input = match canonical_local_media_path(
-            &source_record.root_path,
-            &source_record.relative_path,
-        )
-        .await
+        let input = match canonical_local_media_path(&source.root_path, &source.relative_path).await
         {
             Ok(path) => path,
             Err(LocalPathError::Missing) => {
@@ -888,7 +869,12 @@ pub(super) async fn lux_create_web_playback_session(
                 && source.external_url.as_deref().is_some_and(|target| {
                     matches!(classify_strm_target(target).kind, StrmTargetKind::Path)
                 }) {
-                Some(emby_media_source_stream_url(&request.item_id, source))
+                Some(super::emby_catalog::emby_media_source_stream_url_parts(
+                    &request.item_id,
+                    &source.source_id,
+                    &source.source_kind,
+                    source.container.as_deref(),
+                ))
             } else {
                 None
             };
