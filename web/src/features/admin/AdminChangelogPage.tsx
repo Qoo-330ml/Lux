@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.3",
+    date: "2026-08-30",
+    sections: [
+      { kind: "added", items: [
+        "优化移动端媒体详情页：增加返回、Lux 首页和操作菜单顶部栏，采用全宽沉浸式海报，并改善标题、操作和详情区域的布局。",
+        "剧集详情在移动端增加可用的竖版海报展示，同时保留桌面端横向剧照布局。",
+      ] },
+      { kind: "fixed", items: [
+        "修复媒体详情缺少徽标或竖版海报时的回退逻辑，避免标题被错误隐藏或移动端误切换到空的竖版展示。",
+      ] },
+      { kind: "changed", items: [
+        "调整移动端详情内容顺序为剧集层级、演职员和媒体信息，并收紧收藏、已看等操作控件在窄屏下的显示方式。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.2",
     date: "2026-08-30",
     sections: [
