@@ -8,7 +8,7 @@ pub(crate) use repository::{
     EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
     EmbyMigrationItemPageBatch, EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
-    EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
+    EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove, ItemImageInsert,
     ItemImageMetadata, LibrarySettingsUpdate, MediaMetadataUpdate, MediaProbeUpdate,
     MediaStreamUpdate, MetadataCapabilityResult, MetadataImageAttemptUpdate,
     MigrationMediaIdentityLookup, MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent,

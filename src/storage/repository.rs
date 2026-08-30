@@ -1628,6 +1628,18 @@ pub(crate) struct ItemImageMetadata<'a> {
     pub(crate) source_url: Option<&'a str>,
 }
 
+pub(crate) struct ItemImageInsert {
+    pub(crate) image_type: String,
+    pub(crate) image_index: i64,
+    pub(crate) local_path: String,
+    pub(crate) file_size: i64,
+    pub(crate) width: Option<i32>,
+    pub(crate) height: Option<i32>,
+    pub(crate) content_tag: String,
+    pub(crate) source: String,
+    pub(crate) source_url: Option<String>,
+}
+
 pub(crate) struct MetadataImageAttemptUpdate<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) image_type: &'a str,

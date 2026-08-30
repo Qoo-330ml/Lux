@@ -90,6 +90,23 @@ pub(crate) async fn read_image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i3
     .flatten()
 }
 
+pub(crate) async fn image_content_tag_and_dimensions_from_bytes(
+    bytes: Vec<u8>,
+) -> Result<(String, Option<(i32, i32)>), std::io::Error> {
+    tokio::task::spawn_blocking(move || {
+        let content_tag = format!("{:x}", Sha256::digest(&bytes));
+        let dimensions = image::load_from_memory(&bytes).ok().and_then(|image| {
+            Some((
+                i32::try_from(image.width()).ok()?,
+                i32::try_from(image.height()).ok()?,
+            ))
+        });
+        Ok((content_tag, dimensions))
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("image metadata worker failed: {error}")))?
+}
+
 #[derive(Clone, Debug)]
 pub struct ImageDownloadConfig {
     pub timeout: Duration,
@@ -2210,8 +2227,9 @@ mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
         canonical_image_stems, global_image_download_permits, global_image_write_permits,
-        image_attempt_failure, image_download_retry_delay, image_lookup_stems,
-        is_allowed_scraper_image_url, retryable_image_status,
+        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
+        image_download_retry_delay, image_lookup_stems, is_allowed_scraper_image_url,
+        retryable_image_status,
     };
 
     #[test]
@@ -2250,6 +2268,23 @@ mod tests {
         let write = global_image_write_permits();
         assert!(!std::sync::Arc::ptr_eq(&first, &write));
         assert_eq!(write.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn combined_local_image_metadata_reads_bytes_once() {
+        let image = image::RgbImage::from_pixel(3, 2, image::Rgb([12, 34, 56]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("png encoding");
+        let (content_tag, dimensions) = image_content_tag_and_dimensions_from_bytes(bytes)
+            .await
+            .expect("metadata worker");
+        assert_eq!(content_tag.len(), 64);
+        assert_eq!(dimensions, Some((3, 2)));
     }
 
     #[test]

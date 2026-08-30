@@ -4573,57 +4573,69 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn insert_item_image_at_index(
+    pub(crate) async fn insert_item_images_at_indices(
         &self,
         item_id: &str,
-        image_type: &str,
-        image_index: i64,
-        local_path: &std::path::Path,
-        metadata: ItemImageMetadata<'_>,
-    ) -> Result<bool, StorageError> {
-        let id = Uuid::now_v7().to_string();
+        images: &[ItemImageInsert],
+    ) -> Result<usize, StorageError> {
+        if images.is_empty() {
+            return Ok(0);
+        }
+
+        const MAX_ROWS_PER_BATCH: usize = 64;
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        let result = self
-            .query(
+        let mut inserted_count = 0_usize;
+        for batch in images.chunks(MAX_ROWS_PER_BATCH) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO item_images (
-                id, item_id, image_type, image_index, local_path, width, height,
-                file_size, content_tag, source, source_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
-                id = excluded.id,
-                local_path = excluded.local_path,
-                width = excluded.width,
-                height = excluded.height,
-                file_size = excluded.file_size,
-                content_tag = excluded.content_tag,
-                source = excluded.source,
-                source_url = excluded.source_url,
-                updated_at = unixepoch()
-            WHERE item_images.local_path <> excluded.local_path
-               OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
-               OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
-               OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
-               OR item_images.source <> excluded.source
-               OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')",
-            )
-            .bind(id)
-            .bind(item_id)
-            .bind(image_type)
-            .bind(image_index)
-            .bind(local_path.to_string_lossy().as_ref())
-            .bind(metadata.width)
-            .bind(metadata.height)
-            .bind(metadata.file_size)
-            .bind(metadata.content_tag)
-            .bind(metadata.source)
-            .bind(metadata.source_url)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                    id, item_id, image_type, image_index, local_path, width, height,
+                    file_size, content_tag, source, source_url
+                ) VALUES {values}
+                ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
+                    id = excluded.id,
+                    local_path = excluded.local_path,
+                    width = excluded.width,
+                    height = excluded.height,
+                    file_size = excluded.file_size,
+                    content_tag = excluded.content_tag,
+                    source = excluded.source,
+                    source_url = excluded.source_url,
+                    updated_at = unixepoch()
+                WHERE item_images.local_path <> excluded.local_path
+                   OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
+                   OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
+                   OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
+                   OR item_images.source <> excluded.source
+                   OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for image in batch {
+                statement = statement
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(item_id)
+                    .bind(&image.image_type)
+                    .bind(image.image_index)
+                    .bind(&image.local_path)
+                    .bind(image.width)
+                    .bind(image.height)
+                    .bind(image.file_size)
+                    .bind(&image.content_tag)
+                    .bind(&image.source)
+                    .bind(image.source_url.as_deref());
+            }
+            let result = statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            inserted_count = inserted_count.saturating_add(result.rows_affected() as usize);
+        }
         transaction
             .commit()
             .await
@@ -4631,7 +4643,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(result.rows_affected() == 1)
+        Ok(inserted_count)
     }
 
     pub(crate) async fn set_poster_fallback_required(
