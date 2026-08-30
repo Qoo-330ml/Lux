@@ -121,34 +121,50 @@ export function PlayerControls({
     <div className="lux-player-controls-wrap">
       <PlayerIntroSkip currentTime={currentTime} introSkip={introSkip} onSkip={onSkipIntro} />
       <PlayerChapterTimeline segments={chapters} duration={duration} onSeek={onChapterSeek} />
-      <div
-        ref={progressBarRef}
-        className="lux-player-timeline"
-        role="slider"
-        tabIndex={0}
-        aria-label="播放进度"
-        aria-valuemin={0}
-        aria-valuemax={Math.max(0, Math.round(duration))}
-        aria-valuenow={Math.max(0, Math.round(currentTime))}
-        aria-valuetext={`${formatTime(currentTime)} / ${formatTime(duration)}`}
-        onPointerDown={onTimelinePointerDown}
-        onPointerMove={onTimelinePointerMove}
-        onPointerUp={onTimelinePointerUp}
-        onPointerCancel={onTimelinePointerCancel}
-        onMouseMove={onTimelineMouseMove}
-        onMouseLeave={onTimelineMouseLeave}
-        onKeyDown={onTimelineKeyDown}
-      >
-        {hoverTime !== null && hoverPercent !== null ? (
-          <div className="lux-player-tooltip" style={{ left: `${hoverPercent}%` }} aria-hidden="true">
-            {formatTime(hoverTime)}
-          </div>
-        ) : null}
+      <div className="lux-player-timeline-row">
+        <button
+          type="button"
+          className="lux-player-time"
+          onClick={onToggleRemainingTime}
+          title="点击切换显示剩余时间"
+          aria-label="切换剩余时间显示"
+        >
+          <span className="lux-player-time-current">{formatTime(currentTime)}</span>
+          <span className="lux-player-time-divider" aria-hidden="true">/</span>
+          <span className="lux-player-time-total">
+            {remainingTime ? `-${formatTime(Math.max(0, duration - currentTime))}` : formatTime(duration)}
+          </span>
+        </button>
 
-        <div className="lux-player-timeline-rail" aria-hidden="true">
-          <div className="lux-player-timeline-buffered" style={{ width: `${bufferedPercent}%` }} />
-          <div className="lux-player-timeline-played" style={{ width: `${progressPercent}%` }}>
-            <div className="lux-player-timeline-handle" />
+        <div
+          ref={progressBarRef}
+          className="lux-player-timeline"
+          role="slider"
+          tabIndex={0}
+          aria-label="播放进度"
+          aria-valuemin={0}
+          aria-valuemax={Math.max(0, Math.round(duration))}
+          aria-valuenow={Math.max(0, Math.round(currentTime))}
+          aria-valuetext={`${formatTime(currentTime)} / ${formatTime(duration)}`}
+          onPointerDown={onTimelinePointerDown}
+          onPointerMove={onTimelinePointerMove}
+          onPointerUp={onTimelinePointerUp}
+          onPointerCancel={onTimelinePointerCancel}
+          onMouseMove={onTimelineMouseMove}
+          onMouseLeave={onTimelineMouseLeave}
+          onKeyDown={onTimelineKeyDown}
+        >
+          {hoverTime !== null && hoverPercent !== null ? (
+            <div className="lux-player-tooltip" style={{ left: `${hoverPercent}%` }} aria-hidden="true">
+              {formatTime(hoverTime)}
+            </div>
+          ) : null}
+
+          <div className="lux-player-timeline-rail" aria-hidden="true">
+            <div className="lux-player-timeline-buffered" style={{ width: `${bufferedPercent}%` }} />
+            <div className="lux-player-timeline-played" style={{ width: `${progressPercent}%` }}>
+              <div className="lux-player-timeline-handle" />
+            </div>
           </div>
         </div>
       </div>
@@ -190,19 +206,6 @@ export function PlayerControls({
             </div>
           </div>
 
-          <button
-            type="button"
-            className="lux-player-time"
-            onClick={onToggleRemainingTime}
-            title="点击切换显示剩余时间"
-            aria-label="切换剩余时间显示"
-          >
-            <span className="lux-player-time-current">{formatTime(currentTime)}</span>
-            <span className="lux-player-time-divider" aria-hidden="true">/</span>
-            <span className="lux-player-time-total">
-              {remainingTime ? `-${formatTime(Math.max(0, duration - currentTime))}` : formatTime(duration)}
-            </span>
-          </button>
         </div>
 
         <div className="lux-player-controls-middle" />

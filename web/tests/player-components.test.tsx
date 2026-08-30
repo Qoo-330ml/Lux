@@ -254,6 +254,14 @@ describe("LuxPlayer state components", () => {
     expect(markup).toContain('tabindex="0"');
     expect(markup).toContain('aria-valuenow="10"');
     expect(markup).toContain('aria-valuemax="100"');
+    const timelineRowStart = markup.indexOf('<div class="lux-player-timeline-row">');
+    const controlsStart = markup.indexOf('<div class="lux-player-controls">');
+    const timeDisplayIndex = markup.indexOf('class="lux-player-time"');
+    expect(timelineRowStart).toBeGreaterThanOrEqual(0);
+    expect(timeDisplayIndex).toBeGreaterThan(timelineRowStart);
+    expect(timeDisplayIndex).toBeLessThan(controlsStart);
+    expect(markup).toMatch(/<div class="lux-player-timeline-row"><button type="button" class="lux-player-time"/);
+    expect(markup).not.toMatch(/<div class="lux-player-controls-left">[\s\S]*lux-player-time/);
     expect(markup).toContain('aria-label="播放"');
     expect(markup).toContain('aria-label="音量调节"');
     expect(markup).toContain('style="--lux-volume-percent:100%"');
