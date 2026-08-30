@@ -406,6 +406,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-detail-poster.is-landscape { aspect-ratio: 16 / 9; }
 .lux-detail-poster > .lux-rating { display: inline-flex; height: auto; padding: 5px 8px; }
 .lux-detail-poster img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-detail-poster-portrait { display: none; }
 .lux-detail-poster span { display: grid; place-items: center; align-content: center; gap: 14px; height: 100%; padding: 25px; color: var(--lux-muted); text-align: center; }
 .lux-detail-title-row { display: flex; flex-direction: column; align-items: flex-start; gap: 12px; margin-bottom: 14px; }
 .lux-detail-logo { display: block; flex: 0 1 auto; max-width: min(360px, 100%); max-height: 96px; width: auto; height: auto; object-fit: contain; filter: drop-shadow(0 4px 12px rgba(0,0,0,.28)); }
@@ -1498,11 +1499,13 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-content { width: 100%; padding-top: 0; }
   .lux-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-detail-poster-column { width: 100%; }
-  .lux-detail-page-episode .lux-detail-poster-column { width: min(100%, 420px); }
   .lux-detail-page-episode .lux-detail-poster-column { width: 100%; }
   .lux-detail-poster { width: 100%; border: 0; border-radius: 0; box-shadow: none; background: transparent; }
-  .lux-detail-poster:not(.is-landscape)::after { position: absolute; z-index: 1; inset: 0; pointer-events: none; background: linear-gradient(180deg, transparent 60%, rgba(5,5,6,.1) 72%, #050506 100%); content: ""; }
+  .lux-detail-poster.is-landscape { aspect-ratio: 2 / 3; }
+  .lux-detail-poster::after { position: absolute; z-index: 1; inset: 0; pointer-events: none; background: linear-gradient(180deg, transparent 60%, rgba(5,5,6,.1) 72%, #050506 100%); content: ""; }
   .lux-detail-poster img { position: relative; z-index: 0; }
+  .lux-detail-poster.is-landscape .lux-detail-poster-landscape { display: none; }
+  .lux-detail-poster.is-landscape .lux-detail-poster-portrait { display: block; }
   .lux-detail-copy { width: 92%; margin: 0 auto; }
   .lux-detail-title-row { align-items: center; margin-top: -24px; text-align: center; }
   .lux-detail-title-row[data-has-logo="true"] h1 { display: none; }
@@ -1526,6 +1529,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-source { grid-column: 1 / -1; justify-content: center; width: 100%; }
   .lux-detail-copy h1 { font-size: 28px; }
   .lux-detail-source { width: 100%; }
+  .lux-detail-sections { display: flex; flex-direction: column; }
   .lux-detail-hierarchy { order: 1; }
   .lux-detail-cast { order: 2; }
   .lux-detail-nfo { order: 3; }

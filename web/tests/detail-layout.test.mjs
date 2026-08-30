@@ -153,3 +153,25 @@ test("mobile detail pages use a full-bleed portrait poster and logo-first identi
   assert.match(mobileStyles, /\.lux-detail-backdrop\s*\{[^}]*display:\s*none/);
   assert.match(mobileStyles, /\.lux-detail-title-row\[data-has-logo="true"\]\s+h1\s*\{[^}]*display:\s*none/);
 });
+
+test("mobile episode details switch their landscape hero to a portrait poster when available", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+
+  assert.match(source, /className="lux-detail-poster-landscape"/);
+  assert.match(source, /className="lux-detail-poster-portrait"/);
+  assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape\s*\{[^}]*aspect-ratio:\s*2\s*\/\s*3/);
+  assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape \.lux-detail-poster-landscape\s*\{[^}]*display:\s*none/);
+  assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape \.lux-detail-poster-portrait\s*\{[^}]*display:\s*block/);
+});
+
+test("mobile detail sections put hierarchy before cast and metadata", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+
+  assert.match(mobileStyles, /\.lux-detail-sections\s*\{[^}]*display:\s*flex/);
+  assert.match(mobileStyles, /\.lux-detail-hierarchy\s*\{[^}]*order:\s*1/);
+  assert.match(mobileStyles, /\.lux-detail-cast\s*\{[^}]*order:\s*2/);
+  assert.match(mobileStyles, /\.lux-detail-nfo\s*\{[^}]*order:\s*3/);
+});

@@ -251,7 +251,10 @@ export function MediaDetailPage() {
           <div className="lux-detail-poster-column">
             <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}`}>
               {isEpisode && backdrop
-                ? <img src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
+                ? <>
+                  <img className="lux-detail-poster-landscape" src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
+                  {poster ? <img className="lux-detail-poster-portrait" src={poster} alt={`${mediaTitle(media)} 海报`} /> : null}
+                </>
                 : poster
                   ? <img src={poster} alt={`${mediaTitle(media)} 海报`} />
                   : <span><Sparkles size={32} />{mediaTitle(media)}</span>}

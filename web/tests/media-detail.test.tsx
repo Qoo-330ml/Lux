@@ -485,7 +485,7 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/api/v1/items/episode-1/images/fanart?tag=episode-fanart");
   });
 
-  it("shows a landscape episode hero and more episodes from its season", async () => {
+  it("provides a portrait poster for episode detail while keeping the desktop hero", async () => {
     vi.spyOn(api, "item").mockImplementation(async (itemId) => {
       if (itemId === "episode-3") {
         return {
@@ -496,7 +496,7 @@ describe("MediaDetailPage series hierarchy", () => {
           seriesId: "series-1",
           parentIndexNumber: 3,
           indexNumber: 3,
-          imageTags: { fanart: "episode-fanart-3" },
+          imageTags: { fanart: "episode-fanart-3", poster: "episode-poster-3" },
           mediaSources: [],
         };
       }
@@ -540,6 +540,8 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-poster.is-landscape")).not.toBeNull();
     expect(container.querySelector(".lux-detail-poster.is-landscape img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-3/images/fanart?tag=episode-fanart-3");
+    expect(container.querySelector(".lux-detail-poster-portrait")?.getAttribute("src"))
+      .toBe("/api/v1/items/episode-3/images/poster?tag=episode-poster-3");
     expect(container.querySelector(".lux-detail-title-row h1")?.textContent).toBe("示例剧集");
     expect(container.querySelector(".lux-detail-subtitle")?.textContent).toContain("S03E03 · 第三集标题");
     expect(container.querySelector(".lux-episode-rail")?.textContent).toContain("更多来自第 3 季");
@@ -585,9 +587,8 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(watched?.getAttribute("aria-label")).toBe("已看");
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
 
-    const actionItems = [...(container.querySelector(".lux-hero-actions")?.children ?? [])];
-    expect(actionItems[3]?.classList.contains("lux-media-actions")).toBe(true);
-    expect(actionItems[3]?.querySelector(".lux-media-actions-trigger")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-mobile-header .lux-media-actions-trigger")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-copy > .lux-hero-actions .lux-media-actions-trigger")).not.toBeNull();
   });
 
   it("writes favorite and played state and refreshes dependent shelves", async () => {
