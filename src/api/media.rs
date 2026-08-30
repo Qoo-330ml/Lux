@@ -111,16 +111,6 @@ pub(super) async fn lux_home(headers: HeaderMap, State(state): State<AppState>) 
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let ordered_views = match libraries
-        .list_libraries_for_user(&user_id, &accessible_library_ids)
-        .await
-    {
-        Ok(views) => views,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
     let latest_groups = snapshot
         .latest_groups
@@ -159,7 +149,7 @@ pub(super) async fn lux_home(headers: HeaderMap, State(state): State<AppState>) 
             .push(value);
     }
     let mut visible = Vec::new();
-    for view in &ordered_views {
+    for view in &snapshot.views {
         let library_id = view.library.id.to_string();
         if !accessible_library_ids.contains(&library_id) {
             continue;
@@ -2851,8 +2841,10 @@ pub(super) async fn lux_catalog_item_values_by_id(
             item_ids.push(item.id.clone());
         }
     }
-    let states = database.list_user_item_states(user_id, &item_ids).await?;
-    let pending_item_ids = database.list_pending_metadata_item_ids(&item_ids).await?;
+    let (states, pending_item_ids) = tokio::try_join!(
+        database.list_user_item_states(user_id, &item_ids),
+        database.list_pending_metadata_item_ids(&item_ids),
+    )?;
     Ok(items
         .iter()
         .map(|item| {

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -1920,13 +1920,30 @@ impl ImageService {
         }
 
         let metadata_root = fs::canonicalize(metadata_root(&self.config_dir)).await.ok();
+        let mut canonical_roots = HashMap::<PathBuf, Option<PathBuf>>::new();
+        let mut canonical_paths = HashMap::<PathBuf, Option<PathBuf>>::new();
+        let mut metadata_by_path = HashMap::<PathBuf, std::fs::Metadata>::new();
         let mut saw_outside_root = false;
         for candidate in candidates {
             let path = PathBuf::from(&candidate.local_path);
-            let Ok(canonical_path) = fs::canonicalize(&path).await else {
+            let canonical_path = if let Some(canonical_path) = canonical_paths.get(&path) {
+                canonical_path.clone()
+            } else {
+                let canonical_path = fs::canonicalize(&path).await.ok();
+                canonical_paths.insert(path, canonical_path.clone());
+                canonical_path
+            };
+            let Some(canonical_path) = canonical_path else {
                 continue;
             };
-            let canonical_root = fs::canonicalize(&candidate.root_path).await.ok();
+            let root_path = PathBuf::from(&candidate.root_path);
+            let canonical_root = if let Some(canonical_root) = canonical_roots.get(&root_path) {
+                canonical_root.clone()
+            } else {
+                let canonical_root = fs::canonicalize(&root_path).await.ok();
+                canonical_roots.insert(root_path, canonical_root.clone());
+                canonical_root
+            };
             let in_media_root = canonical_root
                 .as_ref()
                 .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root);
@@ -1937,13 +1954,19 @@ impl ImageService {
                 saw_outside_root = true;
                 continue;
             }
-            let metadata =
-                fs::metadata(&canonical_path)
-                    .await
-                    .map_err(|source| ImageError::Io {
-                        path: canonical_path.clone(),
-                        source,
-                    })?;
+            let metadata = if let Some(metadata) = metadata_by_path.get(&canonical_path) {
+                metadata.clone()
+            } else {
+                let metadata =
+                    fs::metadata(&canonical_path)
+                        .await
+                        .map_err(|source| ImageError::Io {
+                            path: canonical_path.clone(),
+                            source,
+                        })?;
+                metadata_by_path.insert(canonical_path.clone(), metadata.clone());
+                metadata
+            };
             if !metadata.is_file() {
                 return Ok(None);
             }

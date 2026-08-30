@@ -230,7 +230,17 @@ impl LibraryService {
         user_id: &str,
         accessible_library_ids: &[String],
     ) -> Result<Vec<LibraryView>, LibraryServiceError> {
-        let mut views = self.list_libraries().await?;
+        let views = self.list_libraries().await?;
+        self.order_views_for_user(user_id, accessible_library_ids, views)
+            .await
+    }
+
+    pub(crate) async fn order_views_for_user(
+        &self,
+        user_id: &str,
+        accessible_library_ids: &[String],
+        mut views: Vec<LibraryView>,
+    ) -> Result<Vec<LibraryView>, LibraryServiceError> {
         let order = self.database.user_library_order(user_id).await?;
         order_library_views(&mut views, &order);
         let accessible = accessible_library_ids.iter().collect::<HashSet<_>>();

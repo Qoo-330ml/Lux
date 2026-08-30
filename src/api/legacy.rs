@@ -241,7 +241,7 @@ impl AppState {
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
         let catalog = CatalogService::new(database.clone(), access.clone());
-        let home = HomeService::new(catalog.clone(), libraries.clone(), access.clone());
+        let home = HomeService::new(catalog.clone(), libraries.clone());
         let image_writes = ImageWriteService::new_with_proxy_and_config_dir(
             database.clone(),
             config.config_dir.clone(),
