@@ -45,6 +45,14 @@ test("mobile detail poster fades broadly into the content surface", () => {
   assert.match(posterFadeRule, /#050506\s+100%/);
 });
 
+test("mobile detail identity pulls above the poster edge", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const titleRowRule = mobileStyles.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(titleRowRule, /margin-top:\s*-48px/);
+});
+
 test("detail grid fills the container so left and right outer spacing match", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const detailGridRule = stylesheet.match(/\.lux-detail-grid\s*\{([^}]*)\}/)?.[1] ?? "";

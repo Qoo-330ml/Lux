@@ -1507,7 +1507,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-poster.is-landscape.has-portrait .lux-detail-poster-landscape { display: none; }
   .lux-detail-poster.is-landscape.has-portrait .lux-detail-poster-portrait { display: block; }
   .lux-detail-copy { width: 92%; margin: 0 auto; }
-  .lux-detail-title-row { align-items: center; margin-top: -24px; text-align: center; }
+  .lux-detail-title-row { align-items: center; margin-top: -48px; text-align: center; }
   .lux-detail-title-row[data-has-logo="true"] h1 { display: none; }
   .lux-detail-logo { max-width: min(78vw, 360px); max-height: 84px; }
   .lux-detail-original-title, .lux-detail-subtitle { text-align: center; }
