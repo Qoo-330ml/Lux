@@ -830,6 +830,57 @@ async fn canonical_people_reuse_one_lux_id_across_provider_identities() {
 }
 
 #[tokio::test]
+async fn canonical_people_batch_identity_lookup_returns_all_matches_in_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let first = database
+        .resolve_or_create_canonical_person(
+            "华晨宇",
+            "tmdb",
+            "57975",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("first canonical person");
+    let second = database
+        .resolve_or_create_canonical_person(
+            "另一位演员",
+            "tmdb",
+            "57976",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("second canonical person");
+
+    database.reset_query_count();
+    let matches = database
+        .find_canonical_people_by_identities(&[
+            ("tmdb".to_owned(), "57975".to_owned()),
+            ("tmdb".to_owned(), "57976".to_owned()),
+            ("tmdb".to_owned(), "missing".to_owned()),
+        ])
+        .await
+        .expect("batch identity lookup");
+
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        matches,
+        vec![
+            ("tmdb".to_owned(), "57975".to_owned(), first.id),
+            ("tmdb".to_owned(), "57976".to_owned(), second.id),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn restoring_a_manifest_rejects_a_provider_identity_owned_by_another_person() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

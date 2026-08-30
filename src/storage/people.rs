@@ -638,6 +638,50 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_canonical_people_by_identities(
+        &self,
+        identities: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, StorageError> {
+        const MAX_IDENTITIES_PER_QUERY: usize = 400;
+        let mut matches = Vec::new();
+        for chunk in identities.chunks(MAX_IDENTITIES_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let conditions =
+                std::iter::repeat_n("(pi.provider = ? AND pi.provider_id = ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+            let query = format!(
+                "SELECT pi.provider, pi.provider_id, p.id
+                 FROM person_identities pi
+                 JOIN people p ON p.id = pi.person_id
+                 WHERE {conditions}
+                 ORDER BY pi.provider, pi.provider_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (provider, provider_id) in chunk {
+                statement = statement.bind(provider).bind(provider_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            matches.extend(rows.into_iter().map(|row| {
+                (
+                    row.get::<String, _>("provider"),
+                    row.get::<String, _>("provider_id"),
+                    row.get::<String, _>("id"),
+                )
+            }));
+        }
+        Ok(matches)
+    }
+
     pub(crate) async fn find_canonical_person_display_name(
         &self,
         person_id: &str,

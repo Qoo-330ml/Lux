@@ -489,19 +489,82 @@ impl PeopleService {
             if item_ids.is_empty() {
                 break;
             }
+            let mut pending = Vec::new();
+            let mut identities = BTreeSet::new();
             for item_id in &item_ids {
-                match self
-                    .rebuild_item_person_credit_index(item_id, force_rebuild)
-                    .await
-                {
-                    Ok(()) => processed_count += 1,
+                let relation = match self.read_person_relation(item_id).await {
+                    Ok(relation) => relation,
                     Err(PeopleError::Serialization(message)) => {
                         tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
                         processed_count += 1;
+                        cursor_id = Some(item_id.clone());
+                        continue;
                     }
                     Err(error) => return Err(error),
+                };
+                let Some(relation) = relation else {
+                    let cleared = database
+                        .clear_person_credits(item_id)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    if cleared > 0 {
+                        tracing::debug!(
+                            item_id,
+                            cleared,
+                            "cleared person credits because relation snapshot is missing"
+                        );
+                    }
+                    processed_count += 1;
+                    cursor_id = Some(item_id.clone());
+                    continue;
+                };
+                if !force_rebuild
+                    && database
+                        .person_index_item_state_is_current(
+                            item_id,
+                            relation.source_fingerprint.as_deref(),
+                        )
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?
+                {
+                    processed_count += 1;
+                    cursor_id = Some(item_id.clone());
+                    continue;
                 }
+                for actor in relation.actors.iter().take(MAX_ACTORS) {
+                    if actor.name.trim().is_empty() {
+                        continue;
+                    }
+                    identities.extend(
+                        actor
+                            .identities
+                            .iter()
+                            .map(|identity| (identity.provider.clone(), identity.id.clone())),
+                    );
+                }
+                pending.push((item_id.clone(), relation));
+                processed_count += 1;
                 cursor_id = Some(item_id.clone());
+            }
+
+            let identity_lookup = database
+                .find_canonical_people_by_identities(&identities.into_iter().collect::<Vec<_>>())
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?
+                .into_iter()
+                .map(|(provider, provider_id, person_id)| ((provider, provider_id), person_id))
+                .collect::<BTreeMap<_, _>>();
+            for (item_id, relation) in pending {
+                let credits =
+                    self.person_credits_from_relation_with_lookup(&relation, &identity_lookup);
+                database
+                    .replace_person_credits_with_fingerprint(
+                        &item_id,
+                        &credits,
+                        relation.source_fingerprint.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
             }
             if let Some(cursor_id) = cursor_id.as_deref()
                 && database
@@ -981,67 +1044,40 @@ impl PeopleService {
         Ok(true)
     }
 
-    pub(super) async fn rebuild_item_person_credit_index(
-        &self,
-        item_id: &str,
-        force_rebuild: bool,
-    ) -> Result<(), PeopleError> {
-        let new_path = library_item_directory(&self.config_dir, item_id)
-            .map_err(PeopleError::from)?
-            .join("people.json");
-        let legacy_path = self
-            .legacy_people_dir()
-            .join(LEGACY_ITEMS_DIR)
-            .join(format!("{item_id}.json"));
-        let relation = match read_relation(&new_path).await? {
-            Some(relation) => Some(relation),
-            None => read_relation(&legacy_path).await?,
-        };
-        let Some(database) = &self.database else {
-            return Err(PeopleError::Storage(
-                "people database index is unavailable".to_owned(),
-            ));
-        };
-        let Some(relation) = relation else {
-            let cleared = database
-                .clear_person_credits(item_id)
-                .await
-                .map_err(|error| PeopleError::Storage(error.to_string()))?;
-            if cleared > 0 {
-                tracing::debug!(
-                    item_id,
-                    cleared,
-                    "cleared person credits because relation snapshot is missing"
-                );
-            }
-            return Ok(());
-        };
-        if !force_rebuild
-            && database
-                .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
-                .await
-                .map_err(|error| PeopleError::Storage(error.to_string()))?
-        {
-            return Ok(());
-        }
-        let credits = self
-            .person_credits_from_relation(database, &relation)
-            .await?;
-        database
-            .replace_person_credits_with_fingerprint(
-                item_id,
-                &credits,
-                relation.source_fingerprint.as_deref(),
-            )
-            .await
-            .map_err(|error| PeopleError::Storage(error.to_string()))
-    }
-
     pub(super) async fn person_credits_from_relation(
         &self,
         database: &Database,
         relation: &StoredPeopleRelation,
     ) -> Result<Vec<NewPersonCredit>, PeopleError> {
+        let identities = relation
+            .actors
+            .iter()
+            .take(MAX_ACTORS)
+            .filter(|actor| !actor.name.trim().is_empty())
+            .flat_map(|actor| {
+                actor
+                    .identities
+                    .iter()
+                    .map(|identity| (identity.provider.clone(), identity.id.clone()))
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let lookup = database
+            .find_canonical_people_by_identities(&identities)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?
+            .into_iter()
+            .map(|(provider, provider_id, person_id)| ((provider, provider_id), person_id))
+            .collect::<BTreeMap<_, _>>();
+        Ok(self.person_credits_from_relation_with_lookup(relation, &lookup))
+    }
+
+    fn person_credits_from_relation_with_lookup(
+        &self,
+        relation: &StoredPeopleRelation,
+        lookup: &BTreeMap<(String, String), String>,
+    ) -> Vec<NewPersonCredit> {
         let mut credits = Vec::new();
         for actor in relation.actors.iter().take(MAX_ACTORS) {
             if actor.name.trim().is_empty() {
@@ -1052,26 +1088,42 @@ impl PeopleService {
                 let mut mapped_person_id = None;
                 let mut conflicting = false;
                 for identity in &actor.identities {
-                    let mapped = database
-                        .find_canonical_person_by_identity(&identity.provider, &identity.id)
-                        .await
-                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
-                    if let Some(mapped) = mapped {
-                        if mapped_person_id
-                            .as_ref()
-                            .is_some_and(|person_id| person_id != &mapped.id)
-                        {
-                            conflicting = true;
-                            break;
-                        }
-                        mapped_person_id = Some(mapped.id);
+                    let Some(mapped) =
+                        lookup.get(&(identity.provider.clone(), identity.id.clone()))
+                    else {
+                        continue;
+                    };
+                    if mapped_person_id
+                        .as_ref()
+                        .is_some_and(|person_id| person_id != mapped)
+                    {
+                        conflicting = true;
+                        break;
                     }
+                    mapped_person_id = Some(mapped.clone());
                 }
                 actor.person_key = (!conflicting).then_some(mapped_person_id.clone()).flatten();
                 actor.lux_person_id = actor.person_key.clone();
             }
             credits.push(person_credit_from_stored_actor(&actor));
         }
-        Ok(credits)
+        credits
+    }
+
+    async fn read_person_relation(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredPeopleRelation>, PeopleError> {
+        let new_path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        match read_relation(&new_path).await? {
+            Some(relation) => Ok(Some(relation)),
+            None => read_relation(&legacy_path).await,
+        }
     }
 }
