@@ -590,6 +590,8 @@ describe("MediaDetailPage series hierarchy", () => {
 
     expect(container.querySelector(".lux-detail-mobile-header .lux-media-actions-trigger")).not.toBeNull();
     expect(container.querySelector(".lux-detail-copy > .lux-hero-actions .lux-media-actions-trigger")).not.toBeNull();
+    expect(container.querySelector(".lux-detail-inline-menu .lux-media-actions-trigger")?.getAttribute("aria-label")).toBe("更多");
+    expect(container.querySelector(".lux-detail-inline-menu .lux-media-actions-trigger-label")?.textContent).toBe("更多");
   });
 
   it("writes favorite and played state and refreshes dependent shelves", async () => {

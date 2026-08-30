@@ -16,6 +16,7 @@ type MediaActionMenuProps = {
   onScanFolder?: () => void;
   className?: string;
   sourceId?: string;
+  showLabel?: boolean;
 };
 
 type MediaActionRect = Pick<DOMRect, "top" | "bottom" | "left" | "right">;
@@ -55,7 +56,7 @@ function canDeleteMediaSource(item: MediaItem) {
   return !NON_MEDIA_ITEM_TYPES.has(item.itemType ?? "");
 }
 
-export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanFolder, className = "", sourceId }: MediaActionMenuProps) {
+export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubtitles, onDelete, onIdentify, onLockMetadata, onUnlockMetadata, onRefreshMetadata, onScanFolder, className = "", sourceId, showLabel = false }: MediaActionMenuProps) {
   const [open, setOpen] = useState(false);
   const [menuPosition, setMenuPosition] = useState({ left: 16, top: 16 });
   const rootRef = useRef<HTMLDivElement>(null);
@@ -113,7 +114,7 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
         ref={triggerRef}
         className="lux-media-actions-trigger"
         type="button"
-        aria-label={`打开 ${title} 操作菜单`}
+        aria-label={showLabel ? "更多" : `打开 ${title} 操作菜单`}
         aria-haspopup="menu"
         aria-expanded={open}
         onClick={(event) => {
@@ -122,7 +123,8 @@ export function MediaActionMenu({ item, onEditMetadata, onEditImages, onEditSubt
           setOpen((value) => !value);
         }}
       >
-        {open ? <X size={18} /> : <Ellipsis size={19} />}
+        <span className="lux-media-actions-trigger-icon" aria-hidden="true">{open ? <X size={18} /> : <Ellipsis size={19} />}</span>
+        {showLabel ? <span className="lux-media-actions-trigger-label">更多</span> : null}
       </button>
       {open ? createPortal(
         <div ref={menuRef} className="lux-media-action-menu" role="menu" aria-label={`${title} 操作`} style={{ left: menuPosition.left, top: menuPosition.top, position: "fixed" }}>

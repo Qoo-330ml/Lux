@@ -329,7 +329,7 @@ export function MediaDetailPage() {
                 <span className="lux-detail-action-icon"><Check size={20} strokeWidth={2.4} /></span>
                 <span className="lux-detail-action-label">已看</span>
               </button>
-              <MediaActionMenu item={media} sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
+              <MediaActionMenu item={media} className="lux-detail-inline-menu" showLabel sourceId={source?.id} onEditMetadata={() => setEditor("metadata")} onEditImages={() => setEditor("images")} onEditSubtitles={() => setEditor("subtitles")} onDelete={() => setDeleteOpen(true)} onIdentify={() => setEditor("identify")} onRefreshMetadata={() => void refreshMetadata()} onScanFolder={() => void scanLibrary()} onLockMetadata={() => void setMetadataLock(true)} onUnlockMetadata={() => void setMetadataLock(false)} />
               {pendingReview && nextPendingItem ? <Link className="lux-button lux-button-large lux-button-glass lux-detail-next-pending" data-action="next-pending" to={`/items/${nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
               {source ? <span className="lux-detail-source"><Radio size={16} /> {source.container || "DIRECT PLAY"}</span> : null}
             </div>

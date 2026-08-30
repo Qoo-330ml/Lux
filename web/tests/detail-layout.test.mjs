@@ -238,7 +238,7 @@ test("mobile detail sections put hierarchy before cast and metadata", () => {
   assert.match(mobileStyles, /\.lux-detail-hierarchy\s*\{[^}]*order:\s*1/);
   assert.match(mobileStyles, /\.lux-detail-cast\s*\{[^}]*order:\s*2/);
   assert.match(mobileStyles, /\.lux-detail-nfo\s*\{[^}]*order:\s*3/);
-  assert.match(mobileStyles, /\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*>\s*\.lux-media-actions\s*\{[^}]*display:\s*none/);
+  assert.match(mobileStyles, /\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*>\s*\.lux-media-actions:not\(\.lux-detail-inline-menu\)\s*\{[^}]*display:\s*none/);
   assert.match(stylesheet, /@media \(max-width: 560px\) \{\s*html\[data-lux-theme="light"\] \.lux-detail-poster\s*\{[^}]*border:\s*0[^}]*box-shadow:\s*none/);
 });
 
@@ -249,12 +249,27 @@ test("mobile detail actions share one row and sit directly above the hierarchy",
   const primaryRule = mobileStyles.match(/\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*>\s*\.lux-button-primary\s*\{([^}]*)\}/)?.[1] ?? "";
   const hierarchyRule = mobileStyles.match(/\.lux-detail-hierarchy\s*>\s*\.lux-series-children,\s*\.lux-detail-hierarchy\s*>\s*\.lux-season-episodes,\s*\.lux-detail-hierarchy\s*>\s*\.lux-episode-rail\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(actionRule, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+repeat\(2,\s*72px\)/);
+  assert.match(actionRule, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+repeat\(3,\s*56px\)/);
+  assert.match(actionRule, /column-gap:\s*4px/);
   assert.match(actionRule, /row-gap:\s*0/);
   assert.match(primaryRule, /grid-column:\s*auto/);
   assert.match(primaryRule, /width:\s*auto/);
   assert.match(hierarchyRule, /margin-top:\s*0/);
   assert.match(hierarchyRule, /padding-top:\s*0/);
+});
+
+test("mobile detail actions fit a compact more action beside favorite and watched", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const actionRule = mobileStyles.match(/\.lux-detail-copy\s*>\s*\.lux-hero-actions\s*\{([^}]*)\}/)?.[1] ?? "";
+  const inlineMenuRule = mobileStyles.match(/\.lux-detail-inline-menu\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(source, /className="lux-detail-inline-menu"/);
+  assert.match(source, /showLabel/);
+  assert.match(actionRule, /grid-template-columns:\s*minmax\(0,\s*1fr\)\s+repeat\(3,\s*56px\)/);
+  assert.match(actionRule, /column-gap:\s*4px/);
+  assert.match(inlineMenuRule, /display:\s*flex/);
 });
 
 test("mobile detail lower sections use tighter vertical spacing", () => {
