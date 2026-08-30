@@ -881,6 +881,83 @@ async fn canonical_people_batch_identity_lookup_returns_all_matches_in_one_query
 }
 
 #[tokio::test]
+async fn canonical_people_batch_identity_attach_is_atomic() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let owner = database
+        .resolve_or_create_canonical_person(
+            "人物甲",
+            "tmdb",
+            "57975",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("owner");
+    database.reset_query_count();
+    database
+        .attach_canonical_person_identities(
+            &owner.id,
+            &[
+                ("douban".to_owned(), "1313123".to_owned()),
+                ("imdb".to_owned(), "nm0000001".to_owned()),
+            ],
+            "SAME_SOURCE_ID_SET",
+            Some(0.99),
+            r#"{"method":"test"}"#,
+        )
+        .await
+        .expect("batch attach");
+    assert_eq!(database.query_count(), 3);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_identities WHERE person_id = ?")
+            .bind(&owner.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("identity count");
+    assert_eq!(identity_count, 3);
+
+    let other = database
+        .resolve_or_create_canonical_person(
+            "人物乙",
+            "tmdb",
+            "57976",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("other owner");
+    let result = database
+        .attach_canonical_person_identities(
+            &owner.id,
+            &[
+                ("douban".to_owned(), "new-id".to_owned()),
+                ("tmdb".to_owned(), "57976".to_owned()),
+            ],
+            "SAME_SOURCE_ID_SET",
+            Some(0.99),
+            r#"{"method":"conflict"}"#,
+        )
+        .await;
+    assert!(result.is_err());
+    let new_identity_owner: Option<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities
+         WHERE provider = 'douban' AND provider_id = 'new-id'",
+    )
+    .fetch_optional(database.pool())
+    .await
+    .expect("new identity lookup");
+    assert!(new_identity_owner.is_none());
+    assert_eq!(other.id, "lux-000002");
+}
+
+#[tokio::test]
 async fn restoring_a_manifest_rejects_a_provider_identity_owned_by_another_person() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

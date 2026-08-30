@@ -1759,6 +1759,125 @@ impl Database {
         Ok(stored_canonical_person(person))
     }
 
+    pub(crate) async fn attach_canonical_person_identities(
+        &self,
+        person_id: &str,
+        identities: &[(String, String)],
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        const IDENTITY_INSERT_CHUNK_SIZE: usize = 100;
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let person = self
+            .query("SELECT id FROM people WHERE id = ?")
+            .bind(person_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .ok_or_else(|| {
+                StorageError::Conflict(format!("canonical person '{person_id}' does not exist"))
+            })?;
+
+        for chunk in identities.chunks(IDENTITY_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO person_identities (
+                    person_id, provider, provider_id, match_method, confidence,
+                    evidence_json, created_at, updated_at
+                 ) VALUES {placeholders}
+                 ON CONFLICT(provider, provider_id) DO NOTHING"
+            )));
+            for (provider, provider_id) in chunk {
+                statement = statement
+                    .bind(person_id)
+                    .bind(provider)
+                    .bind(provider_id)
+                    .bind(match_method)
+                    .bind(confidence)
+                    .bind(evidence_json)
+                    .bind(now)
+                    .bind(now);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let mut owners = HashMap::new();
+        for chunk in identities.chunks(IDENTITY_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let conditions = std::iter::repeat_n("(provider = ? AND provider_id = ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT provider, provider_id, person_id
+                 FROM person_identities
+                 WHERE {conditions}"
+            )));
+            for (provider, provider_id) in chunk {
+                statement = statement.bind(provider).bind(provider_id);
+            }
+            let rows = statement
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            owners.extend(rows.into_iter().map(|row| {
+                (
+                    (
+                        row.get::<String, _>("provider"),
+                        row.get::<String, _>("provider_id"),
+                    ),
+                    row.get::<String, _>("person_id"),
+                )
+            }));
+        }
+        for (provider, provider_id) in identities {
+            if owners
+                .get(&(provider.clone(), provider_id.clone()))
+                .is_none_or(|owner| owner != person_id)
+            {
+                return Err(StorageError::Conflict(format!(
+                    "provider identity '{provider}:{provider_id}' belongs to another person"
+                )));
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(stored_canonical_person(person))
+    }
+
     pub(crate) async fn list_person_credit_item_ids(
         &self,
         library_ids: &[String],

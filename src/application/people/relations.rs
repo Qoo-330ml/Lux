@@ -14,18 +14,19 @@ impl PeopleService {
             return Ok(person_key_for_identities(identities));
         };
 
-        let mut mapped_person: Option<StoredCanonicalPerson> = None;
-        for identity in identities {
-            let candidate = database
-                .find_canonical_person_by_identity(&identity.provider, &identity.id)
-                .await
-                .map_err(|error| PeopleError::Storage(error.to_string()))?;
-            let Some(candidate) = candidate else {
-                continue;
-            };
+        let identity_pairs = identities
+            .iter()
+            .map(|identity| (identity.provider.clone(), identity.id.clone()))
+            .collect::<Vec<_>>();
+        let mapped_identities = database
+            .find_canonical_people_by_identities(&identity_pairs)
+            .await
+            .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        let mut mapped_person: Option<String> = None;
+        for (_, _, candidate_id) in &mapped_identities {
             if mapped_person
                 .as_ref()
-                .is_some_and(|person| person.id != candidate.id)
+                .is_some_and(|person_id| person_id != candidate_id)
             {
                 tracing::warn!(
                     actor = %actor.name,
@@ -33,28 +34,26 @@ impl PeopleService {
                 );
                 return Ok(None);
             }
-            mapped_person = Some(candidate);
+            mapped_person = Some(candidate_id.clone());
         }
+        let mapped_identity_keys = mapped_identities
+            .iter()
+            .map(|(provider, provider_id, _)| (provider.clone(), provider_id.clone()))
+            .collect::<BTreeSet<_>>();
 
         if mapped_person.is_none()
             && let Some(bridge_person_key) = bridge_person_key
         {
-            if identities.is_empty() {
-                return Ok(Some(bridge_person_key.to_owned()));
-            }
-            for identity in identities {
-                database
-                    .attach_canonical_person_identity(
-                        bridge_person_key,
-                        &identity.provider,
-                        &identity.id,
-                        "SAME_MEDIA_BRIDGE",
-                        Some(0.97),
-                        r#"{"method":"same-media-bridge"}"#,
-                    )
-                    .await
-                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
-            }
+            database
+                .attach_canonical_person_identities(
+                    bridge_person_key,
+                    &identity_pairs,
+                    "SAME_MEDIA_BRIDGE",
+                    Some(0.97),
+                    r#"{"method":"same-media-bridge"}"#,
+                )
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
             return Ok(Some(bridge_person_key.to_owned()));
         }
 
@@ -81,56 +80,52 @@ impl PeopleService {
                 .collect::<Vec<_>>();
             if compatible.len() == 1 {
                 let person_id = &compatible[0].id;
-                for identity in identities {
-                    database
-                        .attach_canonical_person_identity(
-                            person_id,
-                            &identity.provider,
-                            &identity.id,
-                            "NAME_BIRTHDAY_UNIQUE",
-                            Some(0.96),
-                            &serde_json::json!({
-                                "method": "unique-name-birthday",
-                                "normalizedName": normalize_person_match_text(&actor.name),
-                                "birthday": incoming_birthday,
-                            })
-                            .to_string(),
-                        )
-                        .await
-                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
-                }
+                database
+                    .attach_canonical_person_identities(
+                        person_id,
+                        &identity_pairs,
+                        "NAME_BIRTHDAY_UNIQUE",
+                        Some(0.96),
+                        &serde_json::json!({
+                            "method": "unique-name-birthday",
+                            "normalizedName": normalize_person_match_text(&actor.name),
+                            "birthday": incoming_birthday,
+                        })
+                        .to_string(),
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
                 return Ok(Some(person_id.to_owned()));
             }
         }
 
-        let person = match mapped_person {
-            Some(person) => person,
-            None => database
-                .resolve_or_create_canonical_person(
-                    &actor.name,
-                    &identities[0].provider,
-                    &identities[0].id,
-                    "PROVIDER_ID",
-                    Some(1.0),
-                    r#"{"method":"provider-id"}"#,
-                )
-                .await
-                .map_err(|error| PeopleError::Storage(error.to_string()))?,
-        };
-        for identity in identities {
-            if database
-                .find_canonical_person_by_identity(&identity.provider, &identity.id)
-                .await
-                .map_err(|error| PeopleError::Storage(error.to_string()))?
-                .is_some()
-            {
-                continue;
+        let person_id = match mapped_person {
+            Some(person_id) => person_id,
+            None => {
+                database
+                    .resolve_or_create_canonical_person(
+                        &actor.name,
+                        &identity_pairs[0].0,
+                        &identity_pairs[0].1,
+                        "PROVIDER_ID",
+                        Some(1.0),
+                        r#"{"method":"provider-id"}"#,
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?
+                    .id
             }
+        };
+        let identities_to_attach = identity_pairs
+            .iter()
+            .filter(|identity| !mapped_identity_keys.contains(*identity))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !identities_to_attach.is_empty() {
             database
-                .attach_canonical_person_identity(
-                    &person.id,
-                    &identity.provider,
-                    &identity.id,
+                .attach_canonical_person_identities(
+                    &person_id,
+                    &identities_to_attach,
                     "SAME_SOURCE_ID_SET",
                     Some(0.99),
                     r#"{"method":"same-source-id-set"}"#,
@@ -138,7 +133,7 @@ impl PeopleService {
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
         }
-        Ok(Some(person.id))
+        Ok(Some(person_id))
     }
 
     pub async fn persist_item_actors(

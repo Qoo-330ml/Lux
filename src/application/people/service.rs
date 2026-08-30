@@ -33,9 +33,8 @@ use crate::application::metadata_paths::{
 };
 use crate::application::remote_body::{LimitedBodyError, read_response_body_limited};
 use crate::storage::{
-    Database, NewPersonCredit, PersonListOptions, PersonMatchCandidateRestore,
-    StoredCanonicalPerson, StoredPersonCredit, StoredPersonIndexRebuildJob,
-    StoredPersonMatchCandidate,
+    Database, NewPersonCredit, PersonListOptions, PersonMatchCandidateRestore, StoredPersonCredit,
+    StoredPersonIndexRebuildJob, StoredPersonMatchCandidate,
 };
 
 #[path = "helpers.rs"]
