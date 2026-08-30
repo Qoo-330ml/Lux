@@ -1501,6 +1501,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-overlay { display: none; }
   .lux-detail-content { width: 100%; padding-top: 0; }
   .lux-detail-grid { grid-template-columns: 1fr; gap: 28px; }
+  .lux-detail-page-episode .lux-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-detail-poster-column { width: 100%; }
   .lux-detail-page-episode .lux-detail-poster-column { width: 100%; }
   .lux-detail-poster { width: 100%; height: clamp(384px, 120vw, 520px); aspect-ratio: auto; border: 0; border-radius: 0; box-shadow: none; background: transparent; }

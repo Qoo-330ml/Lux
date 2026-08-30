@@ -230,6 +230,14 @@ test("mobile episode details switch their landscape hero to a portrait poster wh
   assert.match(mobileStyles, /\.lux-detail-poster\.is-landscape\.has-portrait \.lux-detail-poster-portrait\s*\{[^}]*display:\s*block/);
 });
 
+test("mobile episode detail uses a single-column hero grid", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const episodeGridRule = mobileStyles.match(/\.lux-detail-page-episode\s+\.lux-detail-grid\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(episodeGridRule, /grid-template-columns:\s*1fr/);
+});
+
 test("mobile detail sections put hierarchy before cast and metadata", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
