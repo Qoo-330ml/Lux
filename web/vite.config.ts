@@ -80,7 +80,9 @@ export default defineConfig({
           if (id.includes("@tanstack/react-query")) return "react-query";
           if (id.includes("framer-motion")) return "motion";
           if (id.includes("lucide-react")) return "icons";
-          if (/[\\/]react(?:-dom|-router-dom)?[\\/]/.test(id)) return "react";
+          if (id.includes("react-router")) return "router";
+          if (id.includes("react-dom")) return "react-dom";
+          if (/[\\/]react[\\/]/.test(id)) return "react";
           return undefined;
         },
       },
