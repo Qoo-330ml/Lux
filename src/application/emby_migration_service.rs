@@ -1024,9 +1024,12 @@ impl EmbyMigrationService {
         // to.  Users with access to all source folders keep the legacy
         // unfiltered request when no explicit whitelist exists, because an
         // incomplete folder mapping must not hide a valid item.
-        let source_filtering_enabled = connection.supports_filtered_reads
-            && (scope.item_state || scope.person_favorites)
-            && (target_library_ids.is_some() || users.iter().any(|user| !user.enable_all_folders));
+        let source_filtering_enabled = migration_source_filtering_enabled(
+            connection.supports_filtered_reads,
+            &scope,
+            target_library_ids.as_ref(),
+            &users,
+        );
         let lux_library_identities =
             if (scope.library_access || scope.item_state || scope.person_favorites)
                 && library_folders.is_some()
@@ -2752,6 +2755,17 @@ fn source_filter_has_candidates(
     !filtered_reads || source_library_ids.is_none_or(|library_ids| !library_ids.is_empty())
 }
 
+fn migration_source_filtering_enabled(
+    supports_filtered_reads: bool,
+    scope: &MigrationScope,
+    target_library_ids: Option<&HashSet<String>>,
+    users: &[MigrationUser],
+) -> bool {
+    supports_filtered_reads
+        && (scope.item_state || scope.person_favorites)
+        && (target_library_ids.is_some() || users.iter().any(|user| !user.enable_all_folders))
+}
+
 fn should_prefetch_source_page(rate_limited_rpc_calls: u64) -> bool {
     rate_limited_rpc_calls == 0
 }
@@ -4246,6 +4260,37 @@ mod tests {
     fn rate_limited_page_disables_the_next_read_ahead() {
         assert!(!should_prefetch_source_page(1));
         assert!(should_prefetch_source_page(0));
+    }
+
+    #[test]
+    fn person_favorites_only_scope_enables_source_library_filtering() {
+        let scope = MigrationScope {
+            user_profile: false,
+            library_access: false,
+            item_state: false,
+            item_state_filters: None,
+            person_favorites: true,
+            target_library_ids: None,
+        };
+        let user = MigrationUser {
+            id: "emby-user".to_owned(),
+            name: "Alice".to_owned(),
+            has_password: false,
+            is_disabled: false,
+            is_administrator: false,
+            enable_all_folders: false,
+            enabled_folders: vec!["source-movies".to_owned()],
+            enable_remote_access: false,
+            enable_content_downloading: false,
+            primary_image_tag: None,
+        };
+
+        assert!(migration_source_filtering_enabled(
+            true,
+            &scope,
+            None,
+            &[user]
+        ));
     }
 
     #[test]
