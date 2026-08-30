@@ -1028,11 +1028,11 @@ impl EmbyMigrationService {
                     .as_ref()
                     .or(enabled_library_id_set.as_ref())
                     .and_then(|selected_library_ids| {
-                        Some(source_library_ids_for_user_with_mappings(
+                        source_library_filter_for_user(
                             &user,
                             source_library_mappings.as_deref()?,
                             selected_library_ids,
-                        ))
+                        )
                     })
             } else {
                 None
@@ -2542,6 +2542,33 @@ fn source_library_ids_for_user_with_mappings(
     source_ids
 }
 
+/// Return a source-side library filter only when the mapping is complete
+/// enough to prove that it cannot hide an item that belongs to a selected
+/// target library.  A user with `EnableAllFolders` can read every Emby
+/// virtual folder, so an unknown mapping must not be interpreted as an empty
+/// source scope: the item may still belong to a selected Lux library whose
+/// path/name could not be matched.  Restricted users retain the existing
+/// empty-filter behavior because an unmapped enabled folder is already denied
+/// by the exact library-access plan.
+fn source_library_filter_for_user(
+    user: &MigrationUser,
+    source_library_mappings: &[MigrationSourceLibraryMapping],
+    selected_library_ids: &HashSet<String>,
+) -> Option<Vec<String>> {
+    if user.enable_all_folders
+        && source_library_mappings
+            .iter()
+            .any(|mapping| mapping.lux_library_id.is_none())
+    {
+        return None;
+    }
+    Some(source_library_ids_for_user_with_mappings(
+        user,
+        source_library_mappings,
+        selected_library_ids,
+    ))
+}
+
 fn source_filter_has_candidates(
     filtered_reads: bool,
     source_library_ids: Option<&[String]>,
@@ -4033,6 +4060,41 @@ mod tests {
         assert!(!source_filter_has_candidates(true, Some(&[])));
         assert!(source_filter_has_candidates(true, None));
         assert!(source_filter_has_candidates(false, Some(&[])));
+    }
+
+    #[test]
+    fn all_folder_users_fall_back_to_target_filter_when_source_mapping_is_incomplete() {
+        let user = MigrationUser {
+            id: "emby-user".to_owned(),
+            name: "Alice".to_owned(),
+            has_password: false,
+            is_disabled: false,
+            is_administrator: false,
+            enable_all_folders: true,
+            enabled_folders: Vec::new(),
+            enable_remote_access: false,
+            enable_content_downloading: false,
+            primary_image_tag: None,
+        };
+        let mappings = vec![
+            MigrationSourceLibraryMapping {
+                source_id: "source-movies".to_owned(),
+                lux_library_id: Some("lux-movies".to_owned()),
+            },
+            MigrationSourceLibraryMapping {
+                source_id: "source-unknown".to_owned(),
+                lux_library_id: None,
+            },
+        ];
+
+        assert_eq!(
+            source_library_filter_for_user(
+                &user,
+                &mappings,
+                &HashSet::from(["lux-movies".to_owned()]),
+            ),
+            None,
+        );
     }
 
     #[tokio::test]
