@@ -598,69 +598,10 @@ pub(super) async fn lux_get_item(
     };
     match catalog.find_item(principal, &item_id).await {
         Ok(Some(item)) => {
-            let user_id = user.id.to_string();
-            let (metadata_pending, user_state, actors, nfo) = match tokio::try_join!(
-                async {
-                    database
-                        .list_pending_metadata_item_ids(std::slice::from_ref(&item_id))
-                        .await
-                        .map(|item_ids| item_ids.contains(&item_id))
-                        .map_err(|_| ())
-                },
-                async {
-                    database
-                        .find_user_item_state(&user_id, &item.id)
-                        .await
-                        .map_err(|_| ())
-                },
-                async {
-                    let actors = match state.people.as_ref() {
-                        Some(people) => match people.list_item_actors(&item.id).await {
-                            Ok(actors) => actors,
-                            Err(error) => {
-                                tracing::warn!(
-                                    item_id = %item.id,
-                                    %error,
-                                    "derived actor relation is unavailable; returning an empty cast"
-                                );
-                                Vec::new()
-                            }
-                        },
-                        None => Vec::new(),
-                    };
-                    Ok::<_, ()>(actors)
-                },
-                async {
-                    let nfo = match state.local_nfo.as_ref() {
-                        Some(local_nfo) => match local_nfo.read_item(&item.id).await {
-                            Ok(nfo) => nfo,
-                            Err(error) => {
-                                tracing::warn!(
-                                    item_id = %item.id,
-                                    %error,
-                                    "derived local NFO cache is unavailable; returning partial item detail"
-                                );
-                                None
-                            }
-                        },
-                        None => None,
-                    };
-                    Ok::<_, ()>(nfo)
-                },
-            ) {
-                Ok(details) => details,
-                Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            };
-            let mut body = lux_catalog_item_json_with_user_state(&item, user_state.as_ref());
-            if let Value::Object(object) = &mut body {
-                object.insert("actors".to_owned(), json!(actors));
-                object.insert("nfo".to_owned(), json!(nfo));
-                object.insert("metadataPending".to_owned(), json!(metadata_pending));
-                if let Some(nfo) = nfo.as_ref() {
-                    apply_local_nfo_details(object, nfo);
-                }
+            match load_lux_item_detail(&state, database, &item, &user.id.to_string()).await {
+                Ok(detail) => Json(detail.body).into_response(),
+                Err(()) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
-            Json(body).into_response()
         }
         Ok(None) => api_error(
             &headers,
@@ -680,6 +621,79 @@ pub(super) async fn lux_get_item(
             unreachable!("inaccessible item is returned as not found")
         }
     }
+}
+
+pub(super) struct LuxItemDetail {
+    pub(super) body: Value,
+    pub(super) user_state: Option<crate::storage::StoredUserItemState>,
+}
+
+pub(super) async fn load_lux_item_detail(
+    state: &AppState,
+    database: &Database,
+    item: &CatalogItem,
+    user_id: &str,
+) -> Result<LuxItemDetail, ()> {
+    let (metadata_pending, user_state, actors, nfo) = tokio::try_join!(
+        async {
+            database
+                .list_pending_metadata_item_ids(std::slice::from_ref(&item.id))
+                .await
+                .map(|item_ids| item_ids.contains(&item.id))
+                .map_err(|_| ())
+        },
+        async {
+            database
+                .find_user_item_state(user_id, &item.id)
+                .await
+                .map_err(|_| ())
+        },
+        async {
+            let actors = match state.people.as_ref() {
+                Some(people) => match people.list_item_actors(&item.id).await {
+                    Ok(actors) => actors,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            %error,
+                            "derived actor relation is unavailable; returning an empty cast"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            Ok::<_, ()>(actors)
+        },
+        async {
+            let nfo = match state.local_nfo.as_ref() {
+                Some(local_nfo) => match local_nfo.read_item(&item.id).await {
+                    Ok(nfo) => nfo,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            %error,
+                            "derived local NFO cache is unavailable; returning partial item detail"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            Ok::<_, ()>(nfo)
+        },
+    )
+    .map_err(|_| ())?;
+    let mut body = lux_catalog_item_json_with_user_state(item, user_state.as_ref());
+    if let Value::Object(object) = &mut body {
+        object.insert("actors".to_owned(), json!(actors));
+        object.insert("nfo".to_owned(), json!(nfo));
+        object.insert("metadataPending".to_owned(), json!(metadata_pending));
+        if let Some(nfo) = nfo.as_ref() {
+            apply_local_nfo_details(object, nfo);
+        }
+    }
+    Ok(LuxItemDetail { body, user_state })
 }
 
 pub(super) async fn lux_get_metadata(

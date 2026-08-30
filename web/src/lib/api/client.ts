@@ -56,6 +56,7 @@ import type {
   PlaybackEventState,
   WebPlaybackCapabilities,
   WebPlaybackSession,
+  WebPlaybackBootstrap,
   WebDanmakuInfo,
   SetupStatus,
   SetupDatabaseBackend,
@@ -464,6 +465,17 @@ export class LuxApiClient {
     capabilities: WebPlaybackCapabilities,
   ) {
     return this.request<WebPlaybackSession>("/api/v1/playback/sessions", {
+      method: "POST",
+      body: JSON.stringify({ itemId, sourceId, capabilities }),
+    });
+  }
+
+  createWebPlaybackBootstrap(
+    itemId: string,
+    sourceId: string | undefined,
+    capabilities: WebPlaybackCapabilities,
+  ) {
+    return this.request<WebPlaybackBootstrap>("/api/v1/playback/bootstrap", {
       method: "POST",
       body: JSON.stringify({ itemId, sourceId, capabilities }),
     });

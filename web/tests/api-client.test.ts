@@ -967,6 +967,56 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
+  it("uses the playback bootstrap contract for item, state, and session data", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("/api/v1/playback/bootstrap");
+      expect(init?.method).toBe("POST");
+      expect(JSON.parse(String(init?.body))).toEqual({
+        itemId: "item-1",
+        sourceId: "source-1",
+        capabilities: {
+          directPlay: true,
+          hls: true,
+          videoCopyToFmp4: true,
+          audioCopyToFmp4: true,
+          hardwareTranscode: false,
+          softwareTranscode: true,
+        },
+      });
+      return new Response(JSON.stringify({
+        item: { id: "item-1", mediaSources: [{ id: "source-1", isDefault: true }] },
+        playback: { itemId: "item-1", positionTicks: 42, isPlayed: false },
+        session: {
+          sessionId: "session-1",
+          playSessionId: "lux-web:session-1",
+          sourceId: "source-1",
+          tier: 0,
+          expiresAt: 1_900_000_000,
+          plan: { type: "DIRECT", url: "/api/v1/playback/sessions/session-1/direct" },
+        },
+      }), { status: 200 });
+    });
+
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    await expect(new LuxApiClient().createWebPlaybackBootstrap("item-1", "source-1", {
+      directPlay: true,
+      hls: true,
+      videoCopyToFmp4: true,
+      audioCopyToFmp4: true,
+      hardwareTranscode: false,
+      softwareTranscode: true,
+    })).resolves.toMatchObject({
+      item: { id: "item-1" },
+      playback: { positionTicks: 42 },
+      session: { sessionId: "session-1" },
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("reads Lux Web danmaku metadata without using the Emby compatibility route", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

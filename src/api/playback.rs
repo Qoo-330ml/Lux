@@ -795,72 +795,53 @@ pub(super) fn web_playback_hls_url(
     ))
 }
 
-pub(super) async fn lux_create_web_playback_session(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-    Json(request): Json<WebPlaybackSessionRequest>,
-) -> Response {
-    let user = match require_web_user(&headers, &state).await {
-        Ok(user) => user,
-        Err(response) => return response,
-    };
-    if let Err(response) = require_web_csrf(&headers, &state).await {
-        return response;
-    }
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let source = match access
-        .authorized_playback_source(principal, &request.item_id, Some(&request.source_id))
-        .await
-    {
-        Ok(Some(source)) => source,
-        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+async fn create_web_playback_session_json(
+    headers: &HeaderMap,
+    state: &AppState,
+    user: &UserRecord,
+    item_id: &str,
+    source: &crate::storage::StoredPlaybackSource,
+    capabilities: PlaybackCapabilities,
+) -> Result<Value, Response> {
     let source_kind = match source.source_kind.as_str() {
         "LOCAL_FILE" => PlaybackSourceKind::LocalFile,
         "STRM_URL" => PlaybackSourceKind::Strm,
-        _ => return StatusCode::NOT_IMPLEMENTED.into_response(),
+        _ => return Err(StatusCode::NOT_IMPLEMENTED.into_response()),
     };
     let Some(service) = state.web_playback.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
-    let created = match service
+    let created = service
         .create(CreateWebPlaybackSession {
             user_id: &user.id.to_string(),
             is_admin: user.is_admin,
-            item_id: &request.item_id,
-            media_source_id: &request.source_id,
+            item_id,
+            media_source_id: &source.source_id,
             source_kind,
-            capabilities: request.capabilities.into(),
+            capabilities,
         })
         .await
-    {
-        Ok(created) => created,
-        Err(error) => return web_playback_error(&headers, error),
-    };
+        .map_err(|error| web_playback_error(headers, error))?;
     if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
         if source.source_kind != "LOCAL_FILE" {
             let _ = service.stop(&created.id, &user.id.to_string()).await;
-            return StatusCode::NOT_IMPLEMENTED.into_response();
+            return Err(StatusCode::NOT_IMPLEMENTED.into_response());
         }
         let input = match canonical_local_media_path(&source.root_path, &source.relative_path).await
         {
             Ok(path) => path,
             Err(LocalPathError::Missing) => {
                 let _ = service.stop(&created.id, &user.id.to_string()).await;
-                return StatusCode::NOT_FOUND.into_response();
+                return Err(StatusCode::NOT_FOUND.into_response());
             }
             Err(LocalPathError::Forbidden) => {
                 let _ = service.stop(&created.id, &user.id.to_string()).await;
-                return StatusCode::FORBIDDEN.into_response();
+                return Err(StatusCode::FORBIDDEN.into_response());
             }
         };
         if let Err(error) = service.start_hls(&created.id, *tier, &input).await {
             let _ = service.stop(&created.id, &user.id.to_string()).await;
-            return web_playback_error(&headers, error);
+            return Err(web_playback_error(headers, error));
         }
     }
     let plan = match &created.plan {
@@ -870,7 +851,7 @@ pub(super) async fn lux_create_web_playback_session(
                     matches!(classify_strm_target(target).kind, StrmTargetKind::Path)
                 }) {
                 Some(super::emby_catalog::emby_media_source_stream_url_parts(
-                    &request.item_id,
+                    item_id,
                     &source.source_id,
                     &source.source_kind,
                     source.container.as_deref(),
@@ -899,13 +880,147 @@ pub(super) async fn lux_create_web_playback_session(
             "reason": reason.to_string(),
         }),
     };
-    Json(json!({
+    Ok(json!({
         "sessionId": (!created.id.is_empty()).then_some(created.id),
         "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),
         "tier": created.plan.tier().number(),
         "expiresAt": created.expires_at,
         "plan": plan,
         "sourceId": created.media_source_id,
+    }))
+}
+
+pub(super) async fn lux_create_web_playback_session(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<WebPlaybackSessionRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let source = match access
+        .authorized_playback_source(principal, &request.item_id, Some(&request.source_id))
+        .await
+    {
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match create_web_playback_session_json(
+        &headers,
+        &state,
+        &user,
+        &request.item_id,
+        &source,
+        request.capabilities.into(),
+    )
+    .await
+    {
+        Ok(session) => Json(session).into_response(),
+        Err(response) => response,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WebPlaybackBootstrapRequest {
+    item_id: String,
+    source_id: Option<String>,
+    #[serde(default)]
+    capabilities: WebPlaybackCapabilitiesRequest,
+}
+
+pub(super) async fn lux_create_web_playback_bootstrap(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<WebPlaybackBootstrapRequest>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let source_id = request
+        .source_id
+        .as_deref()
+        .filter(|value| !value.is_empty());
+    let (item_result, source_result) = tokio::join!(
+        catalog.find_item(principal, &request.item_id),
+        access.authorized_playback_source(principal, &request.item_id, source_id),
+    );
+    let item = match item_result {
+        Ok(Some(item)) => item,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(CatalogError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
+    let source = match source_result {
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let user_id = user.id.to_string();
+    let (detail_result, active_session_result) = tokio::join!(
+        load_lux_item_detail(&state, database, &item, &user_id),
+        database.find_active_playback_session(&user_id, &request.item_id),
+    );
+    let detail = match detail_result {
+        Ok(detail) => detail,
+        Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let active_session = match active_session_result {
+        Ok(session) => session,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let session = match create_web_playback_session_json(
+        &headers,
+        &state,
+        &user,
+        &request.item_id,
+        &source,
+        request.capabilities.into(),
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let playback = json!({
+        "itemId": request.item_id,
+        "positionTicks": detail.user_state.as_ref().map(|value| value.position_ticks).unwrap_or_default(),
+        "isPlayed": detail.user_state.as_ref().map(|value| value.is_played).unwrap_or(false),
+        "isFavorite": detail.user_state.as_ref().map(|value| value.is_favorite).unwrap_or(false),
+        "playCount": detail.user_state.as_ref().map(|value| value.play_count).unwrap_or_default(),
+        "state": active_session.as_ref().map(|value| value.state.as_str()),
+        "isPaused": active_session.as_ref().map(|value| value.is_paused).unwrap_or(false),
+        "lastEventAt": active_session.as_ref().map(|value| value.last_event_at),
+    });
+    Json(json!({
+        "item": detail.body,
+        "playback": playback,
+        "session": session,
     }))
     .into_response()
 }
