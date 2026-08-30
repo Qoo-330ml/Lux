@@ -46,4 +46,36 @@ describe("createPlaybackTimelineScheduler", () => {
     expect(callbacks).toHaveLength(1);
     scheduler.dispose();
   });
+
+  it("throttles non-critical timeline updates while keeping the latest snapshot", () => {
+    const callbacks: Array<() => void> = [];
+    const updates: PlaybackTimelineSnapshot[] = [];
+    let now = 0;
+    const scheduler = createPlaybackTimelineScheduler(
+      (snapshot) => updates.push(snapshot),
+      (callback) => {
+        callbacks.push(callback);
+        return callbacks.length;
+      },
+      () => undefined,
+      { minIntervalMs: 100, now: () => now },
+    );
+
+    scheduler.schedule({ currentTime: 1, duration: 100, bufferedEnd: 4 });
+    callbacks[0]();
+    now = 50;
+    scheduler.schedule({ currentTime: 2, duration: 100, bufferedEnd: 5 });
+    expect(callbacks).toHaveLength(1);
+
+    now = 100;
+    scheduler.schedule({ currentTime: 3, duration: 100, bufferedEnd: 6 });
+    expect(callbacks).toHaveLength(2);
+    callbacks[1]();
+
+    expect(updates).toEqual([
+      { currentTime: 1, duration: 100, bufferedEnd: 4 },
+      { currentTime: 3, duration: 100, bufferedEnd: 6 },
+    ]);
+    scheduler.dispose();
+  });
 });

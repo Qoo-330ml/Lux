@@ -63,6 +63,7 @@ import {
 
 const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
+const TIMELINE_UI_UPDATE_INTERVAL_MS = 100;
 const AUTO_HIDE_DELAY_MS = 3_000;
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
@@ -205,7 +206,12 @@ export function PlayerPage() {
   const bootstrapCapabilities = webPlaybackCapabilities(undefined, playbackAttempt);
   const playbackBootstrap = useQuery({
     queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt),
-    queryFn: () => api.createWebPlaybackBootstrap(itemId, requestedSourceId ?? undefined, bootstrapCapabilities),
+    queryFn: ({ signal }) => api.createWebPlaybackBootstrap(
+      itemId,
+      requestedSourceId ?? undefined,
+      bootstrapCapabilities,
+      signal,
+    ),
     enabled: Boolean(itemId) && playbackAttempt === 0 && sessionGateKey === bootstrapKey,
     retry: false,
     staleTime: Number.POSITIVE_INFINITY,
@@ -256,7 +262,12 @@ export function PlayerPage() {
   const capabilities = webPlaybackCapabilities(source, playbackAttempt);
   const webPlaybackSession = useQuery({
     queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt),
-    queryFn: () => api.createWebPlaybackSession(itemId, source?.id ?? "", capabilities),
+    queryFn: ({ signal }) => api.createWebPlaybackSession(
+      itemId,
+      source?.id ?? "",
+      capabilities,
+      signal,
+    ),
     enabled: Boolean(itemId && source?.id) && useLegacyPlaybackQueries
       && (sessionGateKey === playbackKey
         || (!sessionStartedRef.current && playbackSessionIdRef.current === null)),
@@ -537,11 +548,16 @@ export function PlayerPage() {
     let activeEngine: PlaybackEngine = initialEngine;
     let performanceElement: HTMLVideoElement | null = null;
     let cancelled = false;
-    const timelineScheduler = createPlaybackTimelineScheduler((snapshot) => {
-      if (!isDraggingScrubberRef.current) setCurrentTime(snapshot.currentTime);
-      setDuration(snapshot.duration);
-      setBufferedEnd(snapshot.bufferedEnd);
-    });
+    const timelineScheduler = createPlaybackTimelineScheduler(
+      (snapshot) => {
+        if (!isDraggingScrubberRef.current) setCurrentTime(snapshot.currentTime);
+        setDuration(snapshot.duration);
+        setBufferedEnd(snapshot.bufferedEnd);
+      },
+      undefined,
+      undefined,
+      { minIntervalMs: TIMELINE_UI_UPDATE_INTERVAL_MS },
+    );
     const syncSnapshot = (snapshot: {
       currentTime: number;
       duration: number | null;

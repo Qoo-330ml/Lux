@@ -1017,6 +1017,28 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("forwards cancellation to playback bootstrap requests", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        item: { id: "item-1", mediaSources: [{ id: "source-1", isDefault: true }] },
+        playback: { itemId: "item-1", positionTicks: 0, isPlayed: false },
+        session: { sessionId: null, sourceId: "source-1", tier: 0, expiresAt: 0, plan: { type: "UNSUPPORTED", reason: "test" } },
+      }), { status: 200 }),
+    );
+    const signal = new AbortController().signal;
+
+    await new LuxApiClient().createWebPlaybackBootstrap("item-1", undefined, {
+      directPlay: true,
+      hls: true,
+      videoCopyToFmp4: false,
+      audioCopyToFmp4: false,
+      hardwareTranscode: false,
+      softwareTranscode: true,
+    }, signal);
+
+    expect(fetchMock.mock.calls[0]?.[1]?.signal).toBe(signal);
+  });
+
   it("reads Lux Web danmaku metadata without using the Emby compatibility route", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

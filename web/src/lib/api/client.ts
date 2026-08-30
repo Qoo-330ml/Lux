@@ -463,9 +463,11 @@ export class LuxApiClient {
     itemId: string,
     sourceId: string,
     capabilities: WebPlaybackCapabilities,
+    signal?: AbortSignal,
   ) {
     return this.request<WebPlaybackSession>("/api/v1/playback/sessions", {
       method: "POST",
+      signal,
       body: JSON.stringify({ itemId, sourceId, capabilities }),
     });
   }
@@ -474,9 +476,11 @@ export class LuxApiClient {
     itemId: string,
     sourceId: string | undefined,
     capabilities: WebPlaybackCapabilities,
+    signal?: AbortSignal,
   ) {
     return this.request<WebPlaybackBootstrap>("/api/v1/playback/bootstrap", {
       method: "POST",
+      signal,
       body: JSON.stringify({ itemId, sourceId, capabilities }),
     });
   }
