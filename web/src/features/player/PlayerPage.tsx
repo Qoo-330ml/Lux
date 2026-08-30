@@ -27,7 +27,7 @@ import {
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
 import { HlsVideoEngine, canUseHls } from "./hls-playback-engine";
-import { shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -601,9 +601,18 @@ export function PlayerPage() {
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          const useMkvFallback = await shouldUseClientMkv(source, initialEngine.element);
+          // A remote HTTP(S) STRM must remain on the native element. The
+          // signed Lux endpoint follows the upstream redirect, but a client
+          // fallback would fetch that redirect with CORS and cannot safely
+          // consume the remote response when the upstream omits CORS headers.
+          const remoteHttpStrm = isRemoteHttpStrmSource(source);
+          const useMkvFallback = remoteHttpStrm
+            ? false
+            : await shouldUseClientMkv(source, initialEngine.element);
           const useHevcFallback =
-            !useMkvFallback && (await shouldUseClientHevc(source, initialEngine.element));
+            !useMkvFallback
+            && !remoteHttpStrm
+            && (await shouldUseClientHevc(source, initialEngine.element));
           if (useMkvFallback || useHevcFallback) {
             setFallbackLoading(true);
             if (cancelled) return;
