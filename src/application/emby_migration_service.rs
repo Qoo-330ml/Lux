@@ -1,9 +1,10 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    future::Future,
     path::PathBuf,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,9 @@ const MAX_JOB_PAGE_SIZE: i64 = 100;
 const MAX_SELECTED_USER_COUNT: usize = 1_000;
 const MAX_SELECTED_LIBRARY_COUNT: usize = 1_000;
 const MAX_MIGRATION_PAGE_RECOVERY_RPCS: u64 = 32;
+const MAX_SOURCE_RATE_LIMIT_RETRIES: u32 = 3;
+const SOURCE_RATE_LIMIT_RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+const SOURCE_RATE_LIMIT_RETRY_MAX_DELAY: Duration = Duration::from_secs(4);
 const MAX_MEDIA_IDENTITY_CACHE_ENTRIES: usize = 64;
 const MAX_MEDIA_IDENTITY_CACHE_IDENTITIES: usize = 8_192;
 const MAX_PERSON_IDENTITY_CACHE_ENTRIES: usize = 64;
@@ -368,6 +372,84 @@ pub struct EmbyMigrationService {
     plugin: EmbyMigrationPluginClient,
     config_dir: PathBuf,
     execution: Arc<MigrationExecutionGate>,
+}
+
+#[derive(Debug)]
+struct RetriedSourceCall<T> {
+    value: T,
+    attempts: u64,
+    rate_limited_responses: u64,
+}
+
+#[derive(Debug)]
+struct RetriedSourceCallError {
+    error: PluginServiceError,
+    attempts: u64,
+    rate_limited_responses: u64,
+}
+
+/// Retry only source responses explicitly classified as transient rate limits
+/// or upstream 5xx failures. The retry budget is deliberately small and the
+/// delay is capped so a degraded source cannot stall a migration indefinitely.
+async fn retry_rate_limited_source_call<T, F, Fut>(
+    mut operation: F,
+) -> Result<RetriedSourceCall<T>, RetriedSourceCallError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, PluginServiceError>>,
+{
+    retry_rate_limited_source_call_with_limit(&mut operation, MAX_SOURCE_RATE_LIMIT_RETRIES).await
+}
+
+async fn retry_rate_limited_source_call_with_limit<T, F, Fut>(
+    operation: &mut F,
+    max_retries: u32,
+) -> Result<RetriedSourceCall<T>, RetriedSourceCallError>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<T, PluginServiceError>>,
+{
+    let mut attempts = 0_u64;
+    let mut rate_limited_responses = 0_u64;
+    loop {
+        attempts += 1;
+        match operation().await {
+            Ok(value) => {
+                return Ok(RetriedSourceCall {
+                    value,
+                    attempts,
+                    rate_limited_responses,
+                });
+            }
+            Err(error) if is_rate_limited_migration_response(&error) => {
+                rate_limited_responses += 1;
+                if rate_limited_responses > u64::from(max_retries) {
+                    return Err(RetriedSourceCallError {
+                        error,
+                        attempts,
+                        rate_limited_responses,
+                    });
+                }
+                tokio::time::sleep(source_rate_limit_retry_delay(rate_limited_responses)).await;
+            }
+            Err(error) => {
+                return Err(RetriedSourceCallError {
+                    error,
+                    attempts,
+                    rate_limited_responses,
+                });
+            }
+        }
+    }
+}
+
+fn source_rate_limit_retry_delay(retry_number: u64) -> Duration {
+    let exponent = retry_number.saturating_sub(1).min(31) as u32;
+    let factor = 1_u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    let delay_millis = 250_u64
+        .saturating_mul(factor)
+        .min(SOURCE_RATE_LIMIT_RETRY_MAX_DELAY.as_millis() as u64);
+    SOURCE_RATE_LIMIT_RETRY_BASE_DELAY.max(Duration::from_millis(delay_millis))
 }
 
 impl EmbyMigrationService {
@@ -749,6 +831,7 @@ impl EmbyMigrationService {
     async fn run(&self, job_id: &str) -> Result<(), EmbyMigrationServiceError> {
         let run_started = Instant::now();
         let mut source_rpc_calls = 0_u64;
+        let mut source_rate_limited_rpc_calls = 0_u64;
         let mut database_transactions = 0_u64;
         let mut peak_source_page_records = 0_usize;
         let mut candidate_query_ms = 0_u128;
@@ -772,14 +855,26 @@ impl EmbyMigrationService {
         self.database
             .update_emby_migration_job_status(job_id, "RUNNING", "TESTING", None)
             .await?;
-        source_rpc_calls += 1;
-        let connection = match self.plugin.test_connection(&source).await {
-            Ok(connection) => connection,
-            Err(error) => {
-                self.fail_job(job_id, "TESTING", &error.to_string()).await?;
-                return Err(error.into());
-            }
-        };
+        let connection =
+            match retry_rate_limited_source_call(|| self.plugin.test_connection(&source)).await {
+                Ok(result) => {
+                    source_rpc_calls += result.attempts;
+                    source_rate_limited_rpc_calls += result.rate_limited_responses;
+                    result.value
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        phase = "TESTING",
+                        source_rpc_attempts = error.attempts,
+                        source_rate_limited_rpc_calls = error.rate_limited_responses,
+                        "Emby migration source call failed after bounded retries"
+                    );
+                    self.fail_job(job_id, "TESTING", &error.error.to_string())
+                        .await?;
+                    return Err(error.error.into());
+                }
+            };
         self.database
             .upsert_emby_migration_source(&StoredEmbyMigrationSource {
                 source_base_url: job.source_base_url.clone(),
@@ -811,20 +906,31 @@ impl EmbyMigrationService {
         let requested_user_fields_for_source = connection
             .supports_filtered_reads
             .then_some(requested_user_fields.as_slice());
-        source_rpc_calls += 1;
-        let user_page = match self
-            .plugin
-            .list_users_filtered_with_fields(
+        let user_page = match retry_rate_limited_source_call(|| {
+            self.plugin.list_users_filtered_with_fields(
                 &source,
                 selected_user_ids_for_source,
                 requested_user_fields_for_source,
             )
-            .await
+        })
+        .await
         {
-            Ok(page) => page,
+            Ok(result) => {
+                source_rpc_calls += result.attempts;
+                source_rate_limited_rpc_calls += result.rate_limited_responses;
+                result.value
+            }
             Err(error) => {
-                self.fail_job(job_id, "USERS", &error.to_string()).await?;
-                return Err(error.into());
+                tracing::warn!(
+                    job_id = %job_id,
+                    phase = "USERS",
+                    source_rpc_attempts = error.attempts,
+                    source_rate_limited_rpc_calls = error.rate_limited_responses,
+                    "Emby migration source call failed after bounded retries"
+                );
+                self.fail_job(job_id, "USERS", &error.error.to_string())
+                    .await?;
+                return Err(error.error.into());
             }
         };
         let library_folders = user_page.library_folders;
@@ -1102,6 +1208,8 @@ impl EmbyMigrationService {
                             .await?
                         };
                         source_rpc_calls += recovered_page.source_rpc_calls;
+                        source_rate_limited_rpc_calls +=
+                            recovered_page.source_rate_limited_rpc_calls;
                         source_read_ms += recovered_page.source_read_ms;
                         if !recovered_page.invalid_items.is_empty() {
                             let invalid_item_count = recovered_page
@@ -1415,6 +1523,7 @@ impl EmbyMigrationService {
                         .await?
                     };
                     source_rpc_calls += recovered_page.source_rpc_calls;
+                    source_rate_limited_rpc_calls += recovered_page.source_rate_limited_rpc_calls;
                     source_read_ms += recovered_page.source_read_ms;
                     if !recovered_page.invalid_items.is_empty() {
                         let invalid_item_count = recovered_page
@@ -1614,6 +1723,7 @@ impl EmbyMigrationService {
         tracing::info!(
             job_id = %job_id,
             source_rpc_calls,
+            source_rate_limited_rpc_calls,
             database_transactions,
             peak_source_page_records,
             testing_ms,
@@ -1909,6 +2019,7 @@ impl EmbyMigrationService {
         let mut pages = Vec::new();
         let mut invalid_items = Vec::new();
         let mut source_rpc_calls = 0_u64;
+        let mut source_rate_limited_rpc_calls = 0_u64;
 
         while let Some((range_start, range_limit)) = pending_ranges.pop() {
             if source_rpc_calls >= MAX_MIGRATION_PAGE_RECOVERY_RPCS {
@@ -1928,29 +2039,43 @@ impl EmbyMigrationService {
                 }));
                 break;
             }
-            source_rpc_calls += 1;
-            let result = match kind {
-                MigrationPageKind::UserState(state_filter) => {
-                    self.plugin
-                        .user_state_filtered(
-                            source,
-                            user_id,
-                            range_start,
-                            range_limit,
-                            state_filter,
-                            source_filter,
-                        )
-                        .await
-                }
-                MigrationPageKind::PersonFavorites => {
-                    self.plugin
-                        .person_favorites(source, user_id, range_start, range_limit)
-                        .await
+            let remaining_rpc_budget = MAX_MIGRATION_PAGE_RECOVERY_RPCS
+                .saturating_sub(source_rpc_calls)
+                .saturating_sub(1);
+            let max_retries =
+                remaining_rpc_budget.min(u64::from(MAX_SOURCE_RATE_LIMIT_RETRIES)) as u32;
+            let mut operation = || async {
+                match kind {
+                    MigrationPageKind::UserState(state_filter) => {
+                        self.plugin
+                            .user_state_filtered(
+                                source,
+                                user_id,
+                                range_start,
+                                range_limit,
+                                state_filter,
+                                source_filter,
+                            )
+                            .await
+                    }
+                    MigrationPageKind::PersonFavorites => {
+                        self.plugin
+                            .person_favorites(source, user_id, range_start, range_limit)
+                            .await
+                    }
                 }
             };
+            let result =
+                retry_rate_limited_source_call_with_limit(&mut operation, max_retries).await;
             match result {
-                Ok(page) => pages.push((range_start, page)),
-                Err(error) if is_invalid_migration_response(&error) && range_limit > 1 => {
+                Ok(result) => {
+                    source_rpc_calls += result.attempts;
+                    source_rate_limited_rpc_calls += result.rate_limited_responses;
+                    pages.push((range_start, result.value));
+                }
+                Err(result) if is_invalid_migration_response(&result.error) && range_limit > 1 => {
+                    source_rpc_calls += result.attempts;
+                    source_rate_limited_rpc_calls += result.rate_limited_responses;
                     if let Some(((left_start, left_limit), (right_start, right_limit))) =
                         split_migration_page_range(range_start, range_limit)
                     {
@@ -1958,7 +2083,9 @@ impl EmbyMigrationService {
                         pending_ranges.push((left_start, left_limit));
                     }
                 }
-                Err(error) if is_invalid_migration_response(&error) => {
+                Err(result) if is_invalid_migration_response(&result.error) => {
+                    source_rpc_calls += result.attempts;
+                    source_rate_limited_rpc_calls += result.rate_limited_responses;
                     invalid_items.push(InvalidMigrationItem {
                         user_id: user_id.to_owned(),
                         start_index: range_start,
@@ -1967,13 +2094,23 @@ impl EmbyMigrationService {
                     });
                     pages.push((range_start, empty_migration_page(range_start)));
                 }
-                Err(error) => return Err(error.into()),
+                Err(result) => {
+                    tracing::warn!(
+                        user_id,
+                        start_index = range_start,
+                        source_rpc_attempts = result.attempts,
+                        source_rate_limited_rpc_calls = result.rate_limited_responses,
+                        "Emby migration page failed after bounded retries"
+                    );
+                    return Err(result.error.into());
+                }
             }
         }
 
         let mut recovered =
             assemble_recovered_migration_page(start_index, limit, pages, invalid_items);
         recovered.source_rpc_calls = source_rpc_calls;
+        recovered.source_rate_limited_rpc_calls = source_rate_limited_rpc_calls;
         recovered.source_read_ms = read_started.elapsed().as_millis();
         Ok(recovered)
     }
@@ -2233,6 +2370,7 @@ struct RecoveredMigrationPage {
     page: MigrationItemPage,
     invalid_items: Vec<InvalidMigrationItem>,
     source_rpc_calls: u64,
+    source_rate_limited_rpc_calls: u64,
     source_read_ms: u128,
 }
 
@@ -2305,6 +2443,7 @@ fn assemble_recovered_migration_page(
         },
         invalid_items,
         source_rpc_calls: 0,
+        source_rate_limited_rpc_calls: 0,
         source_read_ms: 0,
     }
 }
@@ -2317,6 +2456,14 @@ fn is_invalid_migration_response(error: &PluginServiceError) -> bool {
         }
         _ => false,
     }
+}
+
+fn is_rate_limited_migration_response(error: &PluginServiceError) -> bool {
+    matches!(
+        error,
+        PluginServiceError::Runtime(PluginRuntimeError::Plugin { code, .. })
+            if code.eq_ignore_ascii_case("PLUGIN_RATE_LIMITED")
+    )
 }
 
 fn invalid_item_report_id(invalid: &InvalidMigrationItem) -> String {
@@ -3504,7 +3651,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     };
 
     #[tokio::test]
@@ -4758,6 +4905,62 @@ done
                 message: "authentication failed".to_owned(),
             })
         ));
+    }
+
+    #[tokio::test]
+    async fn rate_limited_source_calls_retry_with_a_bounded_attempt_count() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let operation_attempts = Arc::clone(&attempts);
+        let result = retry_rate_limited_source_call(|| {
+            let attempt = operation_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            async move {
+                if attempt < 3 {
+                    Err(PluginServiceError::Runtime(PluginRuntimeError::Plugin {
+                        code: "PLUGIN_RATE_LIMITED".to_owned(),
+                        message: "retry".to_owned(),
+                    }))
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await
+        .expect("a transient source limit should recover");
+
+        assert_eq!(result.value, 3);
+        assert_eq!(result.attempts, 3);
+        assert_eq!(result.rate_limited_responses, 2);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_source_calls_stop_after_the_retry_budget() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let operation_attempts = Arc::clone(&attempts);
+        let result = retry_rate_limited_source_call(|| {
+            operation_attempts.fetch_add(1, Ordering::SeqCst);
+            async {
+                Err::<(), _>(PluginServiceError::Runtime(PluginRuntimeError::Plugin {
+                    code: "PLUGIN_RATE_LIMITED".to_owned(),
+                    message: "retry".to_owned(),
+                }))
+            }
+        })
+        .await
+        .expect_err("a permanently rate-limited source must stop");
+
+        assert_eq!(
+            result.attempts,
+            u64::from(MAX_SOURCE_RATE_LIMIT_RETRIES) + 1
+        );
+        assert_eq!(
+            result.rate_limited_responses,
+            u64::from(MAX_SOURCE_RATE_LIMIT_RETRIES) + 1
+        );
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            usize::try_from(MAX_SOURCE_RATE_LIMIT_RETRIES + 1).expect("small retry budget")
+        );
     }
 
     #[test]
