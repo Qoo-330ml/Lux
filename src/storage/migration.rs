@@ -135,6 +135,9 @@ pub(super) async fn remove_sqlite_title_year_unique(
             "CREATE INDEX idx_media_items_people_visible
              ON media_items(library_id, id)
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_migration_title
+             ON media_items(item_type, sort_title, production_year, library_id, id)
+             WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
                 VALUES (NEW.id, NEW.title, NEW.sort_title, COALESCE(NEW.original_title, ''),

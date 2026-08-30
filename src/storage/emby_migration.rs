@@ -916,7 +916,7 @@ impl Database {
         // Title-only matching is intentionally constrained by item type and a
         // one-year production window. The application applies its stricter
         // Unicode-normalized title and episode-key checks afterwards.
-        let title_lookups = lookups
+        let title_lookups_without_provider = lookups
             .iter()
             .filter(|lookup| {
                 // A punctuation-only title normalizes to an empty key and its
@@ -942,6 +942,81 @@ impl Database {
                     .collect::<HashSet<_>>();
                 provider_candidates.is_empty()
             })
+            .collect::<Vec<_>>();
+        let mut exact_title_lookups = HashSet::new();
+        let title_lookup_keys = title_lookups_without_provider
+            .iter()
+            .map(|lookup| (*lookup, lookup.title.to_lowercase()))
+            .collect::<Vec<_>>();
+        for chunk in title_lookup_keys.chunks(100) {
+            for library_chunk in migration_library_id_chunks(selected_library_ids) {
+                let predicates = std::iter::repeat_n(
+                    "(mi.item_type = ? AND mi.sort_title = ? AND
+                      (? IS NULL OR mi.production_year IS NULL OR abs(mi.production_year - ?) <= 1))",
+                    chunk.len(),
+                )
+                .collect::<Vec<_>>()
+                .join(" OR ");
+                let sql = format!(
+                    "SELECT DISTINCT mi.id, mi.item_type, mi.title, mi.sort_title,
+                            mi.production_year, mi.provider_ids_json, mi.series_id,
+                            mi.season_number, mi.episode_number, mi.library_id
+                     FROM media_items AS mi
+                     WHERE mi.removed_at IS NULL AND ({predicates}){}",
+                    migration_library_filter_sql(library_chunk),
+                );
+                let mut query = self.query(sqlx::AssertSqlSafe(sql));
+                for (lookup, sort_title) in chunk {
+                    query = query
+                        .bind(&lookup.item_type)
+                        .bind(sort_title)
+                        .bind(lookup.production_year)
+                        .bind(lookup.production_year);
+                }
+                if let Some(library_ids) = library_chunk {
+                    for library_id in library_ids {
+                        query = query.bind(library_id);
+                    }
+                }
+                for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
+                    let row_item_type: String = row.get("item_type");
+                    let row_sort_title: String = row.get("sort_title");
+                    let row_production_year: Option<i64> = row.get("production_year");
+                    for (lookup, sort_title) in chunk {
+                        let same_year = lookup.production_year.is_none()
+                            || row_production_year.is_none()
+                            || lookup.production_year.zip(row_production_year).is_some_and(
+                                |(lookup_year, row_year)| {
+                                    (i128::from(lookup_year) - i128::from(row_year)).abs() <= 1
+                                },
+                            );
+                        if lookup.item_type == row_item_type
+                            && *sort_title == row_sort_title
+                            && same_year
+                        {
+                            exact_title_lookups.insert((*lookup).clone());
+                        }
+                    }
+                    let id: String = row.get("id");
+                    if seen_ids.insert(id.clone()) {
+                        identities.push(StoredMigrationMediaIdentity {
+                            id,
+                            library_id: row.get("library_id"),
+                            item_type: row_item_type,
+                            title: row.get("title"),
+                            production_year: row_production_year,
+                            provider_ids_json: row.get("provider_ids_json"),
+                            series_id: row.get("series_id"),
+                            season_number: row.get("season_number"),
+                            episode_number: row.get("episode_number"),
+                        });
+                    }
+                }
+            }
+        }
+        let title_lookups = title_lookups_without_provider
+            .into_iter()
+            .filter(|lookup| !exact_title_lookups.contains(*lookup))
             .collect::<Vec<_>>();
         for chunk in title_lookups.chunks(100) {
             for library_chunk in migration_library_id_chunks(selected_library_ids) {
@@ -2282,6 +2357,131 @@ mod tests {
         assert_eq!(title_only.len(), 1);
         assert_eq!(title_only[0].id, item_id);
         assert_eq!(database.query_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_title_fallback_keeps_punctuation_tolerant_matching()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (_user_id, item_id) = insert_test_user_and_item(&database).await?;
+
+        database.reset_query_count();
+        let identities = database
+            .list_migration_media_identity_candidates(&[MigrationMediaIdentityLookup {
+                item_type: "MOVIE".to_owned(),
+                title: "Migration-Item".to_owned(),
+                title_pattern: "%migration%item%".to_owned(),
+                production_year: None,
+                season_number: None,
+                episode_number: None,
+                provider_ids: Vec::new(),
+            }])
+            .await?;
+
+        assert_eq!(identities.len(), 1);
+        assert_eq!(identities[0].id, item_id);
+        assert_eq!(database.query_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_title_index_is_created_for_existing_databases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let exists: i64 = sqlx::query_scalar(
+            "SELECT EXISTS (
+                 SELECT 1 FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_media_items_migration_title'
+             )",
+        )
+        .fetch_one(database.pool())
+        .await?;
+
+        assert_eq!(exists, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_title_lookup_uses_the_title_index() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp_dir, database) = test_database().await?;
+        let details = sqlx::query(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM media_items
+             WHERE item_type = 'MOVIE'
+               AND sort_title = 'migration item'
+               AND removed_at IS NULL
+               AND (production_year IS NULL OR production_year = 2024)",
+        )
+        .fetch_all(database.pool())
+        .await?
+        .into_iter()
+        .filter_map(|row| row.try_get::<String, _>(3).ok())
+        .collect::<Vec<_>>();
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("idx_media_items_migration_title"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "run manually to compare indexed and fuzzy title candidate lookups"]
+    async fn migration_title_lookup_benchmark_records_index_effect()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const ITEM_COUNT: usize = 50_000;
+        let (_temp_dir, database) = test_database().await?;
+        let library_id = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(&library_id)
+            .bind("Migration benchmark")
+            .execute(database.pool())
+            .await?;
+        let mut transaction = database.pool().begin().await?;
+        for index in 0..ITEM_COUNT {
+            let title = format!("Benchmark {index}");
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, production_year,
+                    identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 2024, 'LOCAL_CONFIRMED')",
+            )
+            .bind(Uuid::now_v7().to_string())
+            .bind(&library_id)
+            .bind(&title)
+            .bind(title.to_lowercase())
+            .execute(&mut *transaction)
+            .await?;
+        }
+        transaction.commit().await?;
+
+        for (title, title_pattern) in [
+            ("Benchmark 25000", "%benchmark%25000%"),
+            ("Benchmark-25000", "%benchmark%25000%"),
+        ] {
+            database.reset_query_count();
+            let started = std::time::Instant::now();
+            let identities = database
+                .list_migration_media_identity_candidates(&[MigrationMediaIdentityLookup {
+                    item_type: "MOVIE".to_owned(),
+                    title: title.to_owned(),
+                    title_pattern: title_pattern.to_owned(),
+                    production_year: Some(2024),
+                    season_number: None,
+                    episode_number: None,
+                    provider_ids: Vec::new(),
+                }])
+                .await?;
+            println!(
+                "{{\"title\":\"{title}\",\"items\":{},\"queries\":{},\"elapsedMs\":{}}}",
+                identities.len(),
+                database.query_count(),
+                started.elapsed().as_millis()
+            );
+        }
         Ok(())
     }
 
