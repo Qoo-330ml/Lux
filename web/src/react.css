@@ -1502,12 +1502,12 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-detail-page-episode .lux-detail-poster-column { width: 100%; }
   .lux-detail-poster { width: 100%; height: clamp(384px, 120vw, 520px); aspect-ratio: auto; border: 0; border-radius: 0; box-shadow: none; background: transparent; }
   .lux-detail-poster.is-landscape { aspect-ratio: 2 / 3; }
-  .lux-detail-poster::after { position: absolute; z-index: 1; inset: 0; pointer-events: none; background: linear-gradient(180deg, transparent 40%, rgba(5,5,6,.04) 54%, rgba(5,5,6,.32) 70%, rgba(5,5,6,.72) 86%, #050506 100%); content: ""; }
+  .lux-detail-poster::after { position: absolute; z-index: 1; inset: 0; pointer-events: none; background: linear-gradient(180deg, transparent 18%, rgba(8,8,10,.06) 48%, rgba(8,8,10,.34) 74%, #08080a 100%); content: ""; }
   .lux-detail-poster img { position: relative; z-index: 0; }
   .lux-detail-poster.is-landscape.has-portrait .lux-detail-poster-landscape { display: none; }
   .lux-detail-poster.is-landscape.has-portrait .lux-detail-poster-portrait { display: block; }
-  .lux-detail-copy { width: 92%; margin: 0 auto; }
-  .lux-detail-title-row { align-items: center; margin-top: -168px; text-align: center; }
+  .lux-detail-copy { position: relative; z-index: 2; width: 92%; margin: 0 auto; }
+  .lux-detail-title-row { position: relative; z-index: 2; align-items: center; margin-top: -168px; text-align: center; }
   .lux-detail-title-row[data-has-logo="true"] h1 { display: none; }
   .lux-detail-logo { max-width: min(78vw, 360px); max-height: 84px; }
   .lux-detail-original-title, .lux-detail-subtitle { text-align: center; }
@@ -2104,7 +2104,7 @@ html[data-lux-theme="light"] .lux-episode-card strong { color: var(--lux-text); 
 
 @media (max-width: 560px) {
   html[data-lux-theme="light"] .lux-detail-poster { border: 0; border-radius: 0; box-shadow: none; background: transparent; }
-  html[data-lux-theme="light"] .lux-detail-poster::after { background: linear-gradient(180deg, transparent 40%, rgba(244,243,241,.04) 54%, rgba(244,243,241,.32) 70%, rgba(244,243,241,.72) 86%, var(--lux-bg) 100%); }
+  html[data-lux-theme="light"] .lux-detail-poster::after { background: linear-gradient(180deg, transparent 18%, rgba(244,243,241,.06) 48%, rgba(244,243,241,.34) 74%, var(--lux-bg) 100%); }
 }
 
 /* Light content surfaces keep the media hero dark, while the page below it stays readable. */

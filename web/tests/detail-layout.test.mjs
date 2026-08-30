@@ -38,11 +38,10 @@ test("mobile detail poster fades broadly into the content surface", () => {
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
   const posterFadeRule = mobileStyles.match(/\.lux-detail-poster::after\s*\{([^}]*)\}/)?.[1] ?? "";
 
-  assert.match(posterFadeRule, /transparent\s+40%/);
-  assert.match(posterFadeRule, /rgba\(5,5,6,\.04\)\s+54%/);
-  assert.match(posterFadeRule, /rgba\(5,5,6,\.32\)\s+70%/);
-  assert.match(posterFadeRule, /rgba\(5,5,6,\.72\)\s+86%/);
-  assert.match(posterFadeRule, /#050506\s+100%/);
+  assert.match(posterFadeRule, /transparent\s+18%/);
+  assert.match(posterFadeRule, /rgba\(8,8,10,\.06\)\s+48%/);
+  assert.match(posterFadeRule, /rgba\(8,8,10,\.34\)\s+74%/);
+  assert.match(posterFadeRule, /#08080a\s+100%/);
 });
 
 test("mobile detail identity pulls above the poster edge", () => {
@@ -51,6 +50,20 @@ test("mobile detail identity pulls above the poster edge", () => {
   const titleRowRule = mobileStyles.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(titleRowRule, /margin-top:\s*-168px/);
+});
+
+test("mobile detail identity stays above the poster fade", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const titleRowRule = mobileStyles.match(/\.lux-detail-title-row\s*\{([^}]*)\}/)?.[1] ?? "";
+  const copyRule = mobileStyles.match(/\.lux-detail-copy\s*\{([^}]*)\}/)?.[1] ?? "";
+  const posterFadeRule = mobileStyles.match(/\.lux-detail-poster::after\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(copyRule, /position:\s*relative/);
+  assert.match(copyRule, /z-index:\s*2/);
+  assert.match(titleRowRule, /position:\s*relative/);
+  assert.match(titleRowRule, /z-index:\s*2/);
+  assert.match(posterFadeRule, /z-index:\s*1/);
 });
 
 test("detail grid fills the container so left and right outer spacing match", () => {
