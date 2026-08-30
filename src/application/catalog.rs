@@ -56,6 +56,8 @@ pub struct CatalogService {
 const LIBRARY_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
 const LIBRARY_PAGE_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const MAX_LIBRARY_PAGE_CACHE_ENTRIES: usize = 256;
+// Cold pages are refreshed on demand; the background worker keeps only hot pages warm.
+const MAX_LIBRARY_PAGE_REFRESH_ENTRIES: usize = 64;
 const MAX_SEARCH_FLIGHTS: usize = 256;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -180,6 +182,7 @@ struct LibraryPageCacheEntry {
     request: LibraryPageRequest,
     value: Mutex<Option<CachedLibraryPage>>,
     compute_lock: Mutex<()>,
+    last_accessed_at: Mutex<Instant>,
 }
 
 struct LibraryPageCache {
@@ -241,6 +244,7 @@ impl LibraryPageCache {
                     request,
                     value: Mutex::new(None),
                     compute_lock: Mutex::new(()),
+                    last_accessed_at: Mutex::new(Instant::now()),
                 })
             })
             .clone()
@@ -274,6 +278,7 @@ impl LibraryPageCache {
             limit: request.limit,
         };
         let entry = self.entry(key, request).await;
+        *entry.last_accessed_at.lock().await = Instant::now();
         let generation = self.generation.load(Ordering::Acquire);
         {
             let cached = entry.value.lock().await;
@@ -318,6 +323,12 @@ impl LibraryPageCache {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut recently_accessed = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let last_accessed_at = *entry.last_accessed_at.lock().await;
+            recently_accessed.push((last_accessed_at, entry));
+        }
+        let entries = take_recent_entries(recently_accessed, MAX_LIBRARY_PAGE_REFRESH_ENTRIES);
         for entry in entries {
             let Ok(_compute_guard) = entry.compute_lock.try_lock() else {
                 continue;
@@ -344,6 +355,15 @@ impl LibraryPageCache {
             }
         }
     }
+}
+
+fn take_recent_entries<T>(mut entries: Vec<(Instant, T)>, limit: usize) -> Vec<T> {
+    entries.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
+    entries
+        .into_iter()
+        .take(limit)
+        .map(|(_, entry)| entry)
+        .collect()
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -390,6 +410,31 @@ impl CatalogService {
             box_set_count: counts.box_set_count,
             item_count: counts.item_count,
         })
+    }
+
+    pub(crate) async fn count_library_root_items(
+        &self,
+        library_ids: &[String],
+    ) -> Result<HashMap<String, CatalogItemCounts>, CatalogError> {
+        let counts = self
+            .database
+            .count_catalog_root_items_by_library(library_ids)
+            .await?;
+        Ok(counts
+            .into_iter()
+            .map(|(library_id, count)| {
+                (
+                    library_id,
+                    CatalogItemCounts {
+                        movie_count: count.movie_count,
+                        series_count: count.series_count,
+                        episode_count: count.episode_count,
+                        box_set_count: count.box_set_count,
+                        item_count: count.item_count,
+                    },
+                )
+            })
+            .collect())
     }
 
     pub async fn list_library_items(
@@ -1502,13 +1547,16 @@ impl From<AccessError> for CatalogError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::{
+        collections::BTreeMap,
+        time::{Duration, Instant},
+    };
 
     use crate::application::recommendations::daily_recommendation_items;
 
     use super::{
-        CatalogItem, SearchFlightHandle, SearchFlightKey, SearchFlightRegistry,
-        reorder_catalog_items,
+        CatalogItem, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle, SearchFlightKey,
+        SearchFlightRegistry, reorder_catalog_items, take_recent_entries,
     };
 
     fn catalog_item(id: &str) -> CatalogItem {
@@ -1579,6 +1627,25 @@ mod tests {
 
         assert_eq!(day_one, same_day);
         assert_ne!(day_one, next_day);
+    }
+
+    #[test]
+    fn library_page_refresh_is_bounded_to_recent_entries() {
+        let now = Instant::now();
+        let entries = (0..(MAX_LIBRARY_PAGE_REFRESH_ENTRIES + 1))
+            .map(|index| {
+                (
+                    now - Duration::from_secs(index as u64),
+                    format!("page-{index}"),
+                )
+            })
+            .collect();
+
+        let selected = take_recent_entries(entries, MAX_LIBRARY_PAGE_REFRESH_ENTRIES);
+
+        assert_eq!(selected.len(), MAX_LIBRARY_PAGE_REFRESH_ENTRIES);
+        assert_eq!(selected.first().map(String::as_str), Some("page-0"));
+        assert!(!selected.iter().any(|page| page == "page-64"));
     }
 
     #[tokio::test]

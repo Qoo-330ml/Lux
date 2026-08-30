@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::application::catalog::CatalogItemCounts;
+
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyItemsQuery {
     #[serde(
@@ -564,11 +566,17 @@ pub(super) async fn emby_visible_library_items(
         .list_libraries_for_user(&principal.user_id.to_string(), &accessible_library_ids)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let child_counts = state
+        .catalog
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?
+        .count_library_root_items(&accessible_library_ids)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut items = Vec::new();
     for view in views {
         let library_id = view.library.id.to_string();
-        let child_count =
-            emby_library_root_count(state, principal, &library_id, view.library.kind).await?;
+        let child_count = library_root_count(child_counts.get(&library_id), view.library.kind);
         items.push(emby_library_view_json(
             &view.library,
             &state.server_id,
@@ -609,6 +617,17 @@ pub(super) async fn emby_library_root_count(
             CatalogError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
             CatalogError::LibraryNotFound | CatalogError::AccessDenied => StatusCode::NOT_FOUND,
         })
+}
+
+fn library_root_count(counts: Option<&CatalogItemCounts>, kind: LibraryKind) -> i64 {
+    let Some(counts) = counts else {
+        return 0;
+    };
+    match kind {
+        LibraryKind::Movie => counts.movie_count,
+        LibraryKind::Series => counts.series_count,
+        LibraryKind::Mixed => counts.movie_count + counts.series_count,
+    }
 }
 
 pub(super) async fn emby_user_resume(

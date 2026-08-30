@@ -32,6 +32,57 @@ impl Database {
             })
     }
 
+    pub(crate) async fn count_catalog_root_items_by_library(
+        &self,
+        library_ids: &[String],
+    ) -> Result<HashMap<String, StoredCatalogItemCounts>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT mi.library_id,
+                    COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
+                    COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
+                    COUNT(*) AS item_count
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.removed_at IS NULL
+               AND mi.library_id IN ({placeholders})
+               AND mi.item_type IN ('MOVIE', 'SERIES')
+               {CATALOG_VISIBLE_PREDICATE}
+             GROUP BY mi.library_id"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            row.get::<String, _>("library_id"),
+                            StoredCatalogItemCounts {
+                                movie_count: row.get("movie_count"),
+                                series_count: row.get("series_count"),
+                                item_count: row.get("item_count"),
+                                ..StoredCatalogItemCounts::default()
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn count_catalog_item_types(
         &self,
         library_ids: &[String],

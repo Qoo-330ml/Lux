@@ -1443,6 +1443,75 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
 }
 
 #[tokio::test]
+async fn catalog_root_counts_are_grouped_by_library_in_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let first = libraries
+        .create_library("First", LibraryKind::Mixed, false)
+        .await
+        .expect("first library");
+    let second = libraries
+        .create_library("Second", LibraryKind::Mixed, false)
+        .await
+        .expect("second library");
+    let first_id = first.id.to_string();
+    let second_id = second.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items
+         (id, library_id, item_type, title, sort_title, identification_status, has_available_source)
+         VALUES
+           ('root-count-movie-1', ?, 'MOVIE', 'Movie 1', 'movie 1', 'LOCAL_CONFIRMED', 1),
+           ('root-count-series-1', ?, 'SERIES', 'Series 1', 'series 1', 'LOCAL_CONFIRMED', 1),
+           ('root-count-movie-2', ?, 'MOVIE', 'Movie 2', 'movie 2', 'LOCAL_CONFIRMED', 1),
+           ('root-count-series-2', ?, 'SERIES', 'Series 2', 'series 2', 'LOCAL_CONFIRMED', 1),
+           ('root-count-folder', ?, 'FOLDER', 'Folder', 'folder', 'LOCAL_CONFIRMED', 1),
+           ('root-count-removed', ?, 'MOVIE', 'Removed', 'removed', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&first_id)
+    .bind(&first_id)
+    .bind(&second_id)
+    .bind(&second_id)
+    .bind(&first_id)
+    .bind(&first_id)
+    .execute(database.pool())
+    .await
+    .expect("media items");
+    sqlx::query("UPDATE media_items SET removed_at = 1 WHERE id = 'root-count-removed'")
+        .execute(database.pool())
+        .await
+        .expect("removed item");
+
+    database.reset_query_count();
+    let counts = database
+        .count_catalog_root_items_by_library(&[first_id.clone(), second_id.clone()])
+        .await
+        .expect("root counts");
+
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        counts.get(&first_id).map(|value| value.movie_count),
+        Some(1)
+    );
+    assert_eq!(
+        counts.get(&first_id).map(|value| value.series_count),
+        Some(1)
+    );
+    assert_eq!(
+        counts.get(&second_id).map(|value| value.movie_count),
+        Some(1)
+    );
+    assert_eq!(
+        counts.get(&second_id).map(|value| value.series_count),
+        Some(1)
+    );
+}
+
+#[tokio::test]
 async fn catalog_premiere_date_sort_falls_back_to_production_year() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
