@@ -66,6 +66,25 @@ test("mobile detail identity stays above the poster fade", () => {
   assert.match(posterFadeRule, /z-index:\s*1/);
 });
 
+test("mobile detail header keeps the desktop shadow and fade above its controls", () => {
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
+  const mobileHeaderRule = mobileStyles.match(/\.lux-detail-mobile-header\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mobileFadeRule = mobileStyles.match(/\.lux-detail-mobile-header::before\s*\{([^}]*)\}/)?.[1] ?? "";
+  const desktopFadeRule = stylesheet.match(/\.lux-header::before\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(mobileHeaderRule, /isolation:\s*isolate/);
+  assert.match(mobileFadeRule, /top:\s*calc\(-14px\s*-\s*env\(safe-area-inset-top\)\)/);
+  assert.match(mobileFadeRule, /background:\s*linear-gradient\(180deg, rgba\(5,5,6,\.88\) 0%/);
+  assert.match(mobileFadeRule, /backdrop-filter:\s*blur\(18px\)/);
+  assert.match(mobileFadeRule, /mask-image:\s*linear-gradient\(180deg, #000 0%/);
+  assert.match(mobileFadeRule, /-webkit-mask-image:\s*linear-gradient\(180deg, #000 0%/);
+  assert.match(mobileFadeRule, /height:\s*calc\(100%\s*\+\s*clamp\(40px,\s*4vw,\s*64px\)\s*\+\s*14px\s*\+\s*env\(safe-area-inset-top\)\)/);
+  assert.match(mobileFadeRule, /z-index:\s*0/);
+  assert.match(stylesheet, /\.lux-detail-mobile-header\s*>\s*\*\s*\{[^}]*z-index:\s*1/);
+  assert.match(desktopFadeRule, /backdrop-filter:\s*blur\(18px\)/);
+});
+
 test("detail grid fills the container so left and right outer spacing match", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const detailGridRule = stylesheet.match(/\.lux-detail-grid\s*\{([^}]*)\}/)?.[1] ?? "";
