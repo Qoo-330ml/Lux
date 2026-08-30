@@ -129,6 +129,14 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(chapter_job_table_count, 2);
+    let scan_job_index_definition: String = sqlx::query_scalar(
+        "SELECT indexdef FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_scan_jobs_one_active'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(scan_job_index_definition.contains("(library_id, job_type)"));
 
     let setup = SetupService::new(database.clone())?;
     setup

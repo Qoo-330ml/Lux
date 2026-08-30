@@ -30,6 +30,61 @@ fn postgres_bootstrap_migration_keeps_its_original_checksum() {
 }
 
 #[tokio::test]
+async fn postgres_scan_job_migration_allows_one_active_job_per_type()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::SqlitePool::connect(":memory:").await?;
+    sqlx::query(
+        "CREATE TABLE scan_jobs (
+            id TEXT PRIMARY KEY,
+            library_id TEXT NOT NULL,
+            job_type TEXT NOT NULL,
+            status TEXT NOT NULL
+        )",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "CREATE UNIQUE INDEX idx_scan_jobs_one_active
+         ON scan_jobs(library_id)
+         WHERE status IN ('PENDING', 'RUNNING')",
+    )
+    .execute(&pool)
+    .await?;
+
+    for statement in include_str!("../migrations-postgres/0109_scan_job_active_by_type.sql")
+        .split(';')
+        .map(str::trim)
+        .filter(|statement| !statement.is_empty())
+    {
+        sqlx::query(statement).execute(&pool).await?;
+    }
+
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status)
+         VALUES ('full', 'library', 'RECONCILE_LIBRARY', 'RUNNING'),
+                ('incremental', 'library', 'INCREMENTAL_SCAN', 'PENDING')",
+    )
+    .execute(&pool)
+    .await?;
+    let active_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_jobs
+         WHERE library_id = 'library' AND status IN ('PENDING', 'RUNNING')",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(active_jobs, 2);
+
+    let duplicate_incremental = sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status)
+         VALUES ('incremental-2', 'library', 'INCREMENTAL_SCAN', 'RUNNING')",
+    )
+    .execute(&pool)
+    .await;
+    assert!(duplicate_incremental.is_err());
+    Ok(())
+}
+
+#[tokio::test]
 async fn metadata_candidate_identity_migration_collapses_pending_duplicates()
 -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;

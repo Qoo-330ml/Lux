@@ -24,7 +24,7 @@ use crate::{
     application::{
         libraries::LibraryChangeNotifier,
         reidentify::MetadataReidentifyService,
-        scanner::{IncrementalScanChange, ScanJobService},
+        scanner::{IncrementalScanChange, ScanJobError, ScanJobService},
     },
     domain::ids::LibraryId,
     storage::{Database, StoredLibraryRoot},
@@ -365,11 +365,17 @@ impl LibraryWatchService {
                     });
                 }
                 Err(error) => {
-                    tracing::warn!(library_id = %library_id, %error, "realtime incremental scan was not queued");
+                    if should_log_realtime_enqueue_error(&error) {
+                        tracing::warn!(library_id = %library_id, %error, "realtime incremental scan was not queued");
+                    }
                 }
             }
         }
     }
+}
+
+fn should_log_realtime_enqueue_error(error: &ScanJobError) -> bool {
+    !matches!(error, ScanJobError::AlreadyActive(_))
 }
 
 fn reconcile_active_roots(
@@ -615,5 +621,12 @@ mod tests {
             Some(WatcherToken(2))
         );
         watcher_tasks.abort_all();
+    }
+
+    #[test]
+    fn active_scan_conflict_is_not_a_realtime_watch_error() {
+        assert!(!should_log_realtime_enqueue_error(
+            &crate::application::scanner::ScanJobError::AlreadyActive("job-1".to_owned())
+        ));
     }
 }
