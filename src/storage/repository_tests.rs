@@ -533,16 +533,32 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
         .expect("rated media item");
     }
 
+    database.reset_query_count();
     let rows = database
-        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 3)
+        .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
         .await
         .expect("recommended catalog rows");
+    let first_query_count = database.query_count();
+    database.reset_query_count();
+    let cached_rows = database
+        .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
+        .await
+        .expect("cached recommended catalog rows");
 
     assert_eq!(
         rows.iter()
             .map(|row| row.item_id.as_str())
-            .collect::<Vec<_>>(),
+        .collect::<Vec<_>>(),
         ["rating-top", "rating-unknown", "rating-low"]
+    );
+    assert_eq!(first_query_count, 2);
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        rows.iter().map(|row| row.item_id.as_str()).collect::<Vec<_>>(),
+        cached_rows
+            .iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
