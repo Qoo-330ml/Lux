@@ -25,6 +25,24 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     } else {
         "id=\"app\""
     }));
+    for path in [
+        "/api/v1/not-implemented",
+        "/emby/not-implemented",
+        "/Sessions/not-implemented",
+    ] {
+        let response = client.get(format!("{base_url}{path}")).send().await?;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next()),
+            Some("application/json"),
+            "{path}"
+        );
+        assert!(response.json::<serde_json::Value>().await?.is_object());
+    }
     let logo = client.get(format!("{base_url}/logo.svg")).send().await?;
     assert_eq!(logo.status(), StatusCode::OK);
     assert_eq!(

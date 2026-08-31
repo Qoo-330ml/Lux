@@ -53,6 +53,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         .layer(middleware::from_fn(trace_emby_playback_info))
         .layer(middleware::from_fn(trace_emby_media_stream_failure))
         .layer(middleware::from_fn(reject_unmatched_emby_video_path))
+        .layer(middleware::from_fn(reject_unmatched_api_path))
         .layer(middleware::from_fn(normalize_empty_api_service_unavailable))
         .layer(middleware::from_fn(
             move |request: Request<Body>, next: Next| {

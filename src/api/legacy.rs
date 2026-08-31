@@ -968,6 +968,60 @@ async fn reject_unmatched_emby_video_path(request: Request<Body>, next: Next) ->
     next.run(request).await
 }
 
+fn is_api_or_emby_namespace_path(path: &str) -> bool {
+    if path == "/api" || path.starts_with("/api/") || path == "/emby" || path.starts_with("/emby/")
+    {
+        return true;
+    }
+    matches!(
+        path.strip_prefix('/')
+            .and_then(|path| path.split('/').next()),
+        Some(
+            "DisplayPreferences"
+                | "Items"
+                | "Library"
+                | "Persons"
+                | "Search"
+                | "Sessions"
+                | "Shows"
+                | "System"
+                | "Users"
+                | "Videos"
+                | "videos"
+        )
+    )
+}
+
+async fn reject_unmatched_api_path(request: Request<Body>, next: Next) -> Response {
+    if !is_api_or_emby_namespace_path(request.uri().path()) {
+        return next.run(request).await;
+    }
+    let request_headers = request.headers().clone();
+    let response = next.run(request).await;
+    let is_html_fallback = response.status().is_success()
+        && response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("text/html"));
+    let is_non_json_not_found = response.status() == StatusCode::NOT_FOUND
+        && !response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with("application/json"));
+    if is_html_fallback || is_non_json_not_found {
+        return api_error(
+            &request_headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "请求的资源不存在",
+        )
+        .into_response();
+    }
+    response
+}
+
 fn web_root() -> PathBuf {
     if let Some(directory) = std::env::var_os("LUX_WEB_DIR") {
         return PathBuf::from(directory);
