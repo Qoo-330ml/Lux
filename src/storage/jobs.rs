@@ -2633,6 +2633,27 @@ impl Database {
             })
     }
 
+    pub(crate) async fn count_scan_jobs_by_status(
+        &self,
+    ) -> Result<StoredScanJobCounts, StorageError> {
+        self.query(
+            "SELECT
+                SUM(CASE WHEN status IN ('PENDING', 'RUNNING') THEN 1 ELSE 0 END) AS running,
+                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed
+             FROM scan_jobs",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map(|row| StoredScanJobCounts {
+            running: row.get::<Option<i64>, _>("running").unwrap_or(0),
+            failed: row.get::<Option<i64>, _>("failed").unwrap_or(0),
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn list_scan_jobs_for_activity(
         &self,
         limit: i64,

@@ -817,6 +817,32 @@ pub(crate) struct StoredScanJobPath {
     pub(crate) change_kind: String,
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct StoredScanJobCounts {
+    pub(crate) running: i64,
+    pub(crate) failed: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChapterDetectionSourceStateUpdate {
+    pub(crate) input_fingerprint: Vec<u8>,
+    pub(crate) status: String,
+    pub(crate) last_checked_at: i64,
+    pub(crate) last_success_at: Option<i64>,
+    pub(crate) next_retry_at: Option<i64>,
+    pub(crate) error: Option<String>,
+    pub(crate) intro_fingerprint: Option<Vec<u8>>,
+    pub(crate) credits_fingerprint: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChapterDetectionOutcomeUpdate {
+    pub(crate) source_id: String,
+    pub(crate) status: String,
+    pub(crate) error: Option<String>,
+    pub(crate) source_state: Option<ChapterDetectionSourceStateUpdate>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredReconciliationScanEntry {
     pub(crate) library_root_id: String,

@@ -3644,62 +3644,148 @@ impl Database {
             })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn upsert_chapter_detection_source_state(
-        &self,
-        source_id: &str,
-        plugin_id: &str,
-        input_fingerprint: &[u8],
-        status: &str,
-        last_checked_at: i64,
-        last_success_at: Option<i64>,
-        next_retry_at: Option<i64>,
-        error: Option<&str>,
-        intro_fingerprint: Option<&[u8]>,
-        credits_fingerprint: Option<&[u8]>,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO chapter_detection_source_states (
-                source_id, plugin_id, input_fingerprint, status, last_checked_at,
-                last_success_at, next_retry_at, error, intro_fingerprint,
-                credits_fingerprint, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-             ON CONFLICT(source_id, plugin_id) DO UPDATE SET
-                input_fingerprint = excluded.input_fingerprint,
-                status = excluded.status,
-                last_checked_at = excluded.last_checked_at,
-                last_success_at = excluded.last_success_at,
-                next_retry_at = excluded.next_retry_at,
-                error = excluded.error,
-                intro_fingerprint = excluded.intro_fingerprint,
-                credits_fingerprint = excluded.credits_fingerprint,
-                updated_at = unixepoch()",
-        )
-        .bind(source_id)
-        .bind(plugin_id)
-        .bind(input_fingerprint)
-        .bind(status)
-        .bind(last_checked_at)
-        .bind(last_success_at)
-        .bind(next_retry_at)
-        .bind(error)
-        .bind(intro_fingerprint)
-        .bind(credits_fingerprint)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn delete_chapter_detection_job(&self, id: &str) -> Result<(), StorageError> {
         self.query("DELETE FROM chapter_detection_jobs WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await
             .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn apply_chapter_detection_outcomes(
+        &self,
+        job_id: &str,
+        plugin_id: &str,
+        updates: &[ChapterDetectionOutcomeUpdate],
+        cursor: Option<&str>,
+        processed_count: i64,
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let status_cases = std::iter::repeat_n("WHEN ? THEN ?", updates.len())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let error_cases = std::iter::repeat_n("WHEN ? THEN ?", updates.len())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source_placeholders = std::iter::repeat_n("?", updates.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let status_query = format!(
+            "UPDATE chapter_detection_job_items
+             SET status = CASE source_id {status_cases} ELSE status END,
+                 error = CASE source_id {error_cases} ELSE error END,
+                 updated_at = unixepoch()
+             WHERE job_id = ? AND source_id IN ({source_placeholders})"
+        );
+        let mut status_statement = self.query(sqlx::AssertSqlSafe(status_query));
+        for update in updates {
+            status_statement = status_statement
+                .bind(&update.source_id)
+                .bind(&update.status);
+        }
+        for update in updates {
+            status_statement = status_statement.bind(&update.source_id).bind(&update.error);
+        }
+        status_statement = status_statement.bind(job_id);
+        for update in updates {
+            status_statement = status_statement.bind(&update.source_id);
+        }
+        status_statement
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let source_updates = updates
+            .iter()
+            .filter(|update| update.source_state.is_some())
+            .collect::<Vec<_>>();
+        if !source_updates.is_empty() {
+            let values = std::iter::repeat_n(
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())",
+                source_updates.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+            let source_query = format!(
+                "INSERT INTO chapter_detection_source_states (
+                    source_id, plugin_id, input_fingerprint, status, last_checked_at,
+                    last_success_at, next_retry_at, error, intro_fingerprint,
+                    credits_fingerprint, updated_at
+                 ) VALUES {values}
+                 ON CONFLICT(source_id, plugin_id) DO UPDATE SET
+                    input_fingerprint = excluded.input_fingerprint,
+                    status = excluded.status,
+                    last_checked_at = excluded.last_checked_at,
+                    last_success_at = excluded.last_success_at,
+                    next_retry_at = excluded.next_retry_at,
+                    error = excluded.error,
+                    intro_fingerprint = excluded.intro_fingerprint,
+                    credits_fingerprint = excluded.credits_fingerprint,
+                    updated_at = unixepoch()"
+            );
+            let mut source_statement = self.query(sqlx::AssertSqlSafe(source_query));
+            for update in source_updates {
+                let Some(source_state) = update.source_state.as_ref() else {
+                    continue;
+                };
+                source_statement = source_statement
+                    .bind(&update.source_id)
+                    .bind(plugin_id)
+                    .bind(source_state.input_fingerprint.as_slice())
+                    .bind(&source_state.status)
+                    .bind(source_state.last_checked_at)
+                    .bind(source_state.last_success_at)
+                    .bind(source_state.next_retry_at)
+                    .bind(&source_state.error)
+                    .bind(source_state.intro_fingerprint.as_deref())
+                    .bind(source_state.credits_fingerprint.as_deref());
+            }
+            source_statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        if cursor.is_some() {
+            self.query(
+                "UPDATE chapter_detection_jobs
+                 SET cursor = ?, processed_count = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(cursor)
+            .bind(processed_count)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
@@ -3938,54 +4024,6 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
-    }
-
-    pub(crate) async fn set_chapter_detection_item_status(
-        &self,
-        job_id: &str,
-        source_id: &str,
-        status: &str,
-        error: Option<&str>,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE chapter_detection_job_items
-             SET status = ?, error = ?, updated_at = unixepoch()
-             WHERE job_id = ? AND source_id = ?",
-        )
-        .bind(status)
-        .bind(error)
-        .bind(job_id)
-        .bind(source_id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn update_chapter_detection_job_progress(
-        &self,
-        id: &str,
-        cursor: Option<&str>,
-        processed_count: i64,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE chapter_detection_jobs
-             SET cursor = ?, processed_count = ?, updated_at = unixepoch()
-             WHERE id = ? AND status = 'RUNNING'",
-        )
-        .bind(cursor)
-        .bind(processed_count)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
     }
 
     pub(crate) async fn chapter_detection_job_cancel_requested(

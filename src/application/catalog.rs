@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     sync::{
         Arc,
@@ -1000,6 +1000,37 @@ impl CatalogService {
         self.populate_chapters(std::slice::from_mut(&mut item))
             .await?;
         Ok(Some(item))
+    }
+
+    pub(crate) async fn find_items(
+        &self,
+        principal: AccessPrincipal,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, CatalogItem>, CatalogError> {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let allowed_libraries = if principal.is_admin {
+            None
+        } else {
+            Some(
+                self.access
+                    .accessible_library_ids(principal)
+                    .await?
+                    .into_iter()
+                    .collect::<HashSet<_>>(),
+            )
+        };
+        let mut items = assemble_items(self.database.list_catalog_rows_by_ids(item_ids).await?);
+        if let Some(allowed_libraries) = allowed_libraries {
+            items.retain(|item| allowed_libraries.contains(&item.library_id));
+        }
+        self.populate_item_details(&mut items).await?;
+        self.populate_chapters(&mut items).await?;
+        Ok(items
+            .into_iter()
+            .map(|item| (item.id.clone(), item))
+            .collect())
     }
 
     pub async fn find_item_by_media_source_id(

@@ -2302,6 +2302,192 @@ async fn chapter_detection_job_creation_is_atomic_per_library() {
 }
 
 #[tokio::test]
+async fn scan_job_status_counts_are_aggregated_in_storage() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Scan jobs", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    for (id, status, job_type) in [
+        ("scan-count-pending", "PENDING", "INCREMENTAL_SCAN"),
+        ("scan-count-running", "RUNNING", "RECONCILE_LIBRARY"),
+        ("scan-count-failed", "FAILED", "INCREMENTAL_SCAN"),
+        ("scan-count-completed", "COMPLETED", "INCREMENTAL_SCAN"),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES (?, ?, ?, ?, 'generation')",
+        )
+        .bind(id)
+        .bind(&library_id)
+        .bind(job_type)
+        .bind(status)
+        .execute(database.pool())
+        .await
+        .expect("scan job");
+    }
+
+    assert_eq!(
+        database
+            .count_scan_jobs_by_status()
+            .await
+            .expect("status counts"),
+        StoredScanJobCounts {
+            running: 2,
+            failed: 1,
+        }
+    );
+}
+
+#[tokio::test]
+async fn chapter_detection_outcomes_commit_status_state_and_progress_as_one_batch() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Chapter jobs", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 root"))
+        .await
+        .expect("library root");
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .expect("root");
+    let item_id = "chapter-item";
+    let source_id = "chapter-source";
+    let entry_id = "chapter-entry";
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+         VALUES (?, ?, 'EPISODE', 'Episode', 'episode', 'LOCAL_CONFIRMED')",
+    )
+    .bind(item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO filesystem_entries
+         (id, library_root_id, relative_path, entry_kind, size, modified_at, last_seen_generation)
+         VALUES (?, ?, 'episode.mkv', 'FILE', 1, 1, 'generation')",
+    )
+    .bind(entry_id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("filesystem entry");
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, duration_ticks)
+         VALUES (?, ?, 'LOCAL_FILE', ?, 10000000)",
+    )
+    .bind(source_id)
+    .bind(item_id)
+    .bind(entry_id)
+    .execute(database.pool())
+    .await
+    .expect("media source");
+    database
+        .create_chapter_detection_job(NewChapterDetectionJob {
+            id: "chapter-job-batch",
+            library_id: &library.id.to_string(),
+            plugin_id: "builtin",
+            concurrency: 1,
+            intro_window_seconds: 15,
+            credits_window_seconds: 15,
+            match_threshold: 0.8,
+            total_count: 1,
+        })
+        .await
+        .expect("chapter job");
+    database
+        .claim_chapter_detection_job("chapter-job-batch")
+        .await
+        .expect("claim chapter job");
+    sqlx::query(
+        "INSERT INTO chapter_detection_job_items
+         (job_id, source_id, item_id, season_id, source_fingerprint, input_fingerprint, is_context, status)
+         VALUES (?, ?, ?, ?, ?, ?, 0, 'PENDING')",
+    )
+    .bind("chapter-job-batch")
+    .bind(source_id)
+    .bind(item_id)
+    .bind(item_id)
+    .bind(vec![1_u8])
+    .bind(vec![2_u8])
+    .execute(database.pool())
+    .await
+    .expect("chapter item");
+
+    database.reset_query_count();
+    database
+        .apply_chapter_detection_outcomes(
+            "chapter-job-batch",
+            "builtin",
+            &[ChapterDetectionOutcomeUpdate {
+                source_id: source_id.to_owned(),
+                status: "COMPLETED".to_owned(),
+                error: None,
+                source_state: Some(ChapterDetectionSourceStateUpdate {
+                    input_fingerprint: vec![2],
+                    status: "NOT_FOUND".to_owned(),
+                    last_checked_at: 10,
+                    last_success_at: None,
+                    next_retry_at: Some(20),
+                    error: None,
+                    intro_fingerprint: None,
+                    credits_fingerprint: None,
+                }),
+            }],
+            Some(source_id),
+            1,
+        )
+        .await
+        .expect("apply chapter batch");
+    assert_eq!(database.query_count(), 3);
+    let item_status: String = sqlx::query_scalar(
+        "SELECT status FROM chapter_detection_job_items WHERE job_id = ? AND source_id = ?",
+    )
+    .bind("chapter-job-batch")
+    .bind(source_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("item status");
+    let source_status: String = sqlx::query_scalar(
+        "SELECT status FROM chapter_detection_source_states WHERE source_id = ? AND plugin_id = ?",
+    )
+    .bind(source_id)
+    .bind("builtin")
+    .fetch_one(database.pool())
+    .await
+    .expect("source state");
+    let progress: (i64, String) =
+        sqlx::query_as("SELECT processed_count, cursor FROM chapter_detection_jobs WHERE id = ?")
+            .bind("chapter-job-batch")
+            .fetch_one(database.pool())
+            .await
+            .expect("job progress");
+    assert_eq!(item_status, "COMPLETED");
+    assert_eq!(source_status, "NOT_FOUND");
+    assert_eq!(progress, (1, source_id.to_owned()));
+}
+
+#[tokio::test]
 async fn person_index_rebuild_tasks_are_token_guarded_and_requeueable() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

@@ -13,7 +13,7 @@ use reqwest::{Client, StatusCode, redirect::Policy};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use tokio::{fs, net::lookup_host, sync::Mutex, time::sleep};
+use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet, time::sleep};
 use url::{Host, Url};
 
 use crate::application::{
@@ -36,6 +36,7 @@ const MAX_RETRY_DELAY_SECONDS: i64 = 7_200;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
 const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
+const DELIVERY_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -593,7 +594,11 @@ impl WebhookService {
 
     pub async fn process_ready_deliveries(&self) -> Result<usize, WebhookError> {
         let deliveries = self.database.list_ready_notification_deliveries(10).await?;
-        let mut processed = 0;
+        if deliveries.is_empty() {
+            return Ok(0);
+        }
+        let secrets = Arc::new(self.read_secrets().await?);
+        let mut claimed = Vec::with_capacity(deliveries.len());
         for delivery in deliveries {
             if !self
                 .database
@@ -602,8 +607,40 @@ impl WebhookService {
             {
                 continue;
             }
-            processed += 1;
-            self.process_delivery(delivery).await?;
+            claimed.push(delivery);
+        }
+        let processed = claimed.len();
+        let mut pending = claimed.into_iter();
+        let mut workers = JoinSet::new();
+        for _ in 0..DELIVERY_CONCURRENCY {
+            let Some(delivery) = pending.next() else {
+                break;
+            };
+            let service = self.clone();
+            let secrets = Arc::clone(&secrets);
+            workers.spawn(async move { service.process_delivery(delivery, secrets).await });
+        }
+        let mut first_error = None;
+        while let Some(result) = workers.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) if first_error.is_none() => first_error = Some(error),
+                Ok(Err(_)) => {}
+                Err(error) if first_error.is_none() => {
+                    first_error = Some(WebhookError::RequestSetup(format!(
+                        "delivery worker stopped: {error}"
+                    )))
+                }
+                Err(_) => {}
+            }
+            if let Some(delivery) = pending.next() {
+                let service = self.clone();
+                let secrets = Arc::clone(&secrets);
+                workers.spawn(async move { service.process_delivery(delivery, secrets).await });
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
         }
         Ok(processed)
     }
@@ -611,29 +648,26 @@ impl WebhookService {
     async fn process_delivery(
         &self,
         delivery: StoredNotificationDelivery,
+        secrets: Arc<BTreeMap<String, String>>,
     ) -> Result<(), WebhookError> {
-        let secret = self
-            .read_secrets()
-            .await?
-            .remove(&delivery.destination_id)
-            .ok_or(WebhookError::SecretUnavailable);
+        let secret = secrets.get(&delivery.destination_id).cloned();
         let result = if delivery.provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
-            match secret {
-                Ok(secret) => {
+            match secret.as_deref() {
+                Some(secret) => {
                     self.send_http(
                         &delivery.destination_url,
                         delivery.allow_private_network,
-                        &secret,
+                        secret,
                         &delivery.event_id,
                         &delivery.event_type,
                         delivery.payload_json.as_bytes(),
                     )
                     .await
                 }
-                Err(error) => Err(error),
+                None => Err(WebhookError::SecretUnavailable),
             }
         } else {
-            self.send_plugin(&delivery, secret.as_ref().ok()).await
+            self.send_plugin(&delivery, secret.as_ref()).await
         };
         match result {
             Ok(status) => {

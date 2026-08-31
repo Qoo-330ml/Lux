@@ -4571,10 +4571,10 @@ pub(crate) async fn admin_health_payload(state: &AppState) -> Result<Value, Stat
         },
         None => Vec::new(),
     };
-    let jobs = match database.list_scan_jobs(None, 0, 10_000).await {
-        Ok(jobs) => json!({
-            "scanRunning": jobs.iter().filter(|job| matches!(job.status.as_str(), "PENDING" | "RUNNING")).count(),
-            "scanFailed": jobs.iter().filter(|job| job.status == "FAILED").count(),
+    let jobs = match database.count_scan_jobs_by_status().await {
+        Ok(counts) => json!({
+            "scanRunning": counts.running,
+            "scanFailed": counts.failed,
         }),
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
@@ -4706,24 +4706,40 @@ pub(crate) async fn dashboard_playback_json(
         .map(|user| (user.id.to_string(), user.display_name.clone()))
         .collect::<BTreeMap<_, _>>();
     let principal = AccessPrincipal::new(crate::domain::ids::UserId::new(), true);
+    let sessions = sessions
+        .iter()
+        .take(DASHBOARD_PLAYBACK_LIMIT)
+        .collect::<Vec<_>>();
+    let item_ids = sessions
+        .iter()
+        .map(|session| session.item_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let items_by_id = catalog
+        .find_items(principal, &item_ids)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let series_ids = items_by_id
+        .values()
+        .filter(|item| item.item_type == "EPISODE")
+        .filter_map(|item| item.series_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let series_by_id = catalog
+        .find_items(principal, &series_ids)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let mut values = Vec::new();
-    for session in sessions.iter().take(DASHBOARD_PLAYBACK_LIMIT) {
-        let item = match catalog.find_item(principal, &session.item_id).await {
-            Ok(Some(item)) => item,
-            Ok(None) => continue,
-            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+    for session in sessions {
+        let Some(item) = items_by_id.get(&session.item_id) else {
+            continue;
         };
-        let series = if item.item_type == "EPISODE" {
-            match item.series_id.as_deref() {
-                Some(series_id) => match catalog.find_item(principal, series_id).await {
-                    Ok(series) => series,
-                    Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
-                },
-                None => None,
-            }
-        } else {
-            None
-        };
+        let series = item
+            .series_id
+            .as_deref()
+            .and_then(|series_id| series_by_id.get(series_id));
         let remote_ip_location = session.remote_ip.as_deref().and_then(|remote_ip| {
             state
                 .ip_location
@@ -4732,8 +4748,8 @@ pub(crate) async fn dashboard_playback_json(
         });
         values.push(dashboard_playback_item_json(
             session,
-            &item,
-            series.as_ref(),
+            item,
+            series,
             user_names
                 .get(&session.user_id)
                 .map(String::as_str)
