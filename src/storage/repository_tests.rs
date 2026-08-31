@@ -196,6 +196,67 @@ async fn recent_catalog_rows_use_one_query_for_multiple_libraries() {
 }
 
 #[tokio::test]
+async fn recommended_catalog_rows_stop_awarding_freshness_after_seven_days() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, added_at, has_available_source
+             ) VALUES
+                ('item-fifteen-days-old', ?, 'MOVIE', 'Fifteen Days Old', 'fifteen days old', 'LOCAL_CONFIRMED', ?, 1),
+                ('item-new', ?, 'MOVIE', 'New Movie', 'new movie', 'LOCAL_CONFIRMED', ?, 1)",
+    )
+    .bind(&library_id)
+    .bind(now - 15 * 86_400)
+    .bind(&library_id)
+    .bind(now)
+    .execute(database.pool())
+    .await
+    .expect("media items");
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id)
+         VALUES (?, 'item-new')",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await
+    .expect("user item state");
+
+    let rows = database
+        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 2)
+        .await
+        .expect("recommended catalog rows");
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["item-fifteen-days-old", "item-new"]
+    );
+}
+
+#[tokio::test]
 async fn pending_metadata_candidates_load_current_items_in_one_batch() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

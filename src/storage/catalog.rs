@@ -612,7 +612,7 @@ impl Database {
                             + CASE WHEN us.item_id IS NOT NULL
                                       AND COALESCE(us.is_played, 0) = 0 THEN 20 ELSE 0 END
                             + CASE WHEN COALESCE(us.is_played, 0) = 1 THEN -35 ELSE 0 END
-                            + {min_function}(30, {max_function}(0, 30 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
+                            + {min_function}(7, {max_function}(0, 7 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
                             + CASE WHEN us.last_played_at IS NULL THEN 0 ELSE
                                 {min_function}(30, {max_function}(0, 30 - CAST((unixepoch() - us.last_played_at) / 86400 AS INTEGER)))
                               END
