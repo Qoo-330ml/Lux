@@ -120,7 +120,6 @@ export function PlayerControls({
   return (
     <div className="lux-player-controls-wrap">
       <PlayerIntroSkip currentTime={currentTime} introSkip={introSkip} onSkip={onSkipIntro} />
-      <PlayerChapterTimeline segments={chapters} duration={duration} onSeek={onChapterSeek} />
       <div className="lux-player-timeline-row">
         <button
           type="button"
@@ -137,22 +136,7 @@ export function PlayerControls({
         </button>
 
         <div
-          ref={progressBarRef}
           className="lux-player-timeline"
-          role="slider"
-          tabIndex={0}
-          aria-label="播放进度"
-          aria-valuemin={0}
-          aria-valuemax={Math.max(0, Math.round(duration))}
-          aria-valuenow={Math.max(0, Math.round(currentTime))}
-          aria-valuetext={`${formatTime(currentTime)} / ${formatTime(duration)}`}
-          onPointerDown={onTimelinePointerDown}
-          onPointerMove={onTimelinePointerMove}
-          onPointerUp={onTimelinePointerUp}
-          onPointerCancel={onTimelinePointerCancel}
-          onMouseMove={onTimelineMouseMove}
-          onMouseLeave={onTimelineMouseLeave}
-          onKeyDown={onTimelineKeyDown}
         >
           {hoverTime !== null && hoverPercent !== null ? (
             <div className="lux-player-tooltip" style={{ left: `${hoverPercent}%` }} aria-hidden="true">
@@ -166,6 +150,25 @@ export function PlayerControls({
               <div className="lux-player-timeline-handle" />
             </div>
           </div>
+          <div
+            ref={progressBarRef}
+            className="lux-player-timeline-interaction"
+            role="slider"
+            tabIndex={0}
+            aria-label="播放进度"
+            aria-valuemin={0}
+            aria-valuemax={Math.max(0, Math.round(duration))}
+            aria-valuenow={Math.max(0, Math.round(currentTime))}
+            aria-valuetext={`${formatTime(currentTime)} / ${formatTime(duration)}`}
+            onPointerDown={onTimelinePointerDown}
+            onPointerMove={onTimelinePointerMove}
+            onPointerUp={onTimelinePointerUp}
+            onPointerCancel={onTimelinePointerCancel}
+            onMouseMove={onTimelineMouseMove}
+            onMouseLeave={onTimelineMouseLeave}
+            onKeyDown={onTimelineKeyDown}
+          />
+          <PlayerChapterTimeline segments={chapters} duration={duration} onSeek={onChapterSeek} />
         </div>
       </div>
 

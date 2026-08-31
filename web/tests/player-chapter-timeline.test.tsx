@@ -40,6 +40,7 @@ describe("LuxPlayer chapter controls", () => {
     const segment = container.querySelector<HTMLButtonElement>("[aria-label='章节：中段']");
     expect(segment).not.toBeNull();
     expect(segment?.getAttribute("title")).toContain("00:25");
+    expect(segment?.style.width).toBe("4px");
     await act(async () => segment?.click());
     expect(onSeek).toHaveBeenCalledWith(25);
   });

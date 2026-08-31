@@ -18,7 +18,7 @@ export function PlayerChapterTimeline({ segments, duration, onSeek }: PlayerChap
           className="lux-player-chapter-segment"
           style={{
             left: `${(segment.start / duration) * 100}%`,
-            width: `${((segment.end - segment.start) / duration) * 100}%`,
+            width: "4px",
           }}
           data-marker-type={segment.markerType}
           data-chapter-start={segment.start}

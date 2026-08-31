@@ -623,8 +623,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-mini-progress-buffered, .lux-player-mini-progress-played { position: absolute; top: 0; bottom: 0; left: 0; border-radius: inherit; pointer-events: none; }
 .lux-player-mini-progress-buffered { background: rgba(255,255,255,.32); }
 .lux-player-mini-progress-played { background: var(--lux-accent); }
-.lux-player-chapter-rail { position: relative; width: 100%; height: 8px; overflow: hidden; border-radius: 9999px; background: rgba(255,255,255,.16); }
-.lux-player-chapter-segment { position: absolute; top: 2px; bottom: 2px; min-width: 3px; padding: 0; border: 0; border-right: 2px solid rgba(0,0,0,.5); border-radius: 2px; background: rgba(255,255,255,.44); cursor: pointer; transition: top .15s ease, bottom .15s ease, background .15s ease; }
+.lux-player-chapter-rail { position: absolute; top: 10px; right: 0; bottom: 5px; left: 0; overflow: hidden; border-radius: 9999px; pointer-events: none; z-index: 2; }
+.lux-player-chapter-segment { position: absolute; top: 0; bottom: 0; min-width: 3px; padding: 0; border: 0; border-right: 2px solid rgba(0,0,0,.5); border-radius: 2px; background: rgba(255,255,255,.22); cursor: pointer; pointer-events: auto; transition: top .15s ease, bottom .15s ease, background .15s ease; }
 .lux-player-chapter-segment:hover, .lux-player-chapter-segment:focus-visible { top: 0; bottom: 0; background: #fff; }
 .lux-player-chapter-segment:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: -2px; }
 .lux-player-skip-intro { position: absolute; right: 0; bottom: calc(73px + env(safe-area-inset-bottom)); z-index: 3; padding: 7px 12px; border: 1px solid rgba(255,255,255,.24); border-radius: 7px; color: #fff; background: rgba(18,18,24,.8); backdrop-filter: blur(12px); font-size: .76rem; font-weight: 600; cursor: pointer; }
@@ -632,13 +632,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-skip-intro:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
 
 .lux-player-timeline-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; }
-.lux-player-timeline { position: relative; flex: 1 1 auto; width: auto; min-width: 0; height: 21px; padding: 10px 0 5px; display: flex; align-items: center; cursor: pointer; touch-action: none; }
+.lux-player-timeline { position: relative; flex: 1 1 auto; width: auto; min-width: 0; height: 21px; padding: 10px 0 5px; display: flex; align-items: center; touch-action: none; }
 .lux-player-timeline-rail { position: relative; width: 100%; height: 4px; background: rgba(255,255,255,.28); border-radius: 9999px; transition: height .15s ease; }
 .lux-player-timeline:hover .lux-player-timeline-rail { height: 6px; }
 .lux-player-timeline-buffered { position: absolute; top: 0; left: 0; height: 100%; background: rgba(255,255,255,.32); border-radius: 9999px; pointer-events: none; transition: width .2s linear; }
 .lux-player-timeline-played { position: absolute; top: 0; left: 0; height: 100%; background: var(--lux-accent); border-radius: 9999px; pointer-events: none; }
 .lux-player-timeline-handle { position: absolute; right: -6px; top: 50%; transform: translateY(-50%) scale(0); width: 13px; height: 13px; border-radius: 50%; background: #fff; box-shadow: 0 0 10px var(--lux-accent); transition: transform .15s ease; pointer-events: none; }
 .lux-player-timeline:hover .lux-player-timeline-handle { transform: translateY(-50%) scale(1); }
+.lux-player-timeline-interaction { position: absolute; inset: 0; z-index: 1; cursor: pointer; outline: none; }
+.lux-player-timeline-interaction:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 3px; border-radius: 3px; }
 .lux-player-tooltip { position: absolute; bottom: 28px; transform: translateX(-50%); padding: 4px 8px; font-size: .75rem; font-weight: 600; color: #fff; background: rgba(15,15,22,.85); border: 1px solid rgba(255,255,255,.18); border-radius: 6px; backdrop-filter: blur(12px); pointer-events: none; white-space: nowrap; }
 
 .lux-player-controls { position: relative; display: flex; align-items: center; width: 100%; min-width: 0; height: 46px; color: #fff; }

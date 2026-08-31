@@ -284,6 +284,11 @@ describe("LuxPlayer state components", () => {
     expect(timeDisplayIndex).toBeLessThan(controlsStart);
     expect(markup).toMatch(/<div class="lux-player-timeline-row"><button type="button" class="lux-player-time"/);
     expect(markup).not.toMatch(/<div class="lux-player-controls-left">[\s\S]*lux-player-time/);
+    const timelineRailIndex = markup.indexOf('class="lux-player-timeline-rail"');
+    const chapterRailIndex = markup.indexOf('class="lux-player-chapter-rail"');
+    expect(timelineRailIndex).toBeGreaterThanOrEqual(0);
+    expect(chapterRailIndex).toBeGreaterThan(timelineRailIndex);
+    expect((markup.match(/class="lux-player-timeline-rail"/g) ?? []).length).toBe(1);
     expect(markup).toContain('aria-label="播放"');
     expect(markup).toContain('aria-label="音量调节"');
     expect(markup).toContain('style="--lux-volume-percent:100%"');

@@ -24,6 +24,11 @@ test("LuxPlayer mini progress stays at the edge without taking pointer focus", (
   assert.match(styles, /\.lux-player-mini-progress \{[^}]*pointer-events: none/);
 });
 
+test("LuxPlayer chapter markers overlay the shared timeline instead of adding a second rail", () => {
+  assert.match(styles, /\.lux-player-chapter-rail \{[^}]*position: absolute/);
+  assert.match(styles, /\.lux-player-chapter-rail \{[^}]*pointer-events: none/);
+});
+
 test("LuxPlayer loading and error states center their content across the full viewport", () => {
   const stateRule = styles.match(/\.lux-player-page-loading, \.lux-player-page-error \{([^}]*)\}/)?.[1] ?? "";
 
