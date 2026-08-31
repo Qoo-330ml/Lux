@@ -115,6 +115,15 @@ function readCookie(name: string): string {
   return value ? decodeURIComponent(value.slice(name.length + 1)) : "";
 }
 
+function writeClientCookie(name: string, value: string, maxAge?: number) {
+  if (typeof document === "undefined") return;
+  const maxAgeAttribute = maxAge === undefined ? "" : ` Max-Age=${maxAge};`;
+  const secureAttribute = typeof window !== "undefined" && window.location.protocol === "https:"
+    ? "; Secure"
+    : "";
+  document.cookie = `${name}=${encodeURIComponent(value)}; Path=/;${maxAgeAttribute} SameSite=Lax${secureAttribute}`;
+}
+
 async function readJson<T>(response: Response): Promise<T | undefined> {
   if (response.status === 204) return undefined;
   return (await response.json().catch(() => undefined)) as T | undefined;
@@ -198,11 +207,18 @@ export class LuxApiClient {
     return this.request<{ user: LuxUser; csrfToken?: string }>("/api/v1/auth/login", {
       method: "POST",
       body: JSON.stringify({ username, password }),
-    }).then((response) => response.user);
+    }).then((response) => {
+      if (typeof response.csrfToken === "string" && response.csrfToken.length > 0) {
+        writeClientCookie(csrfCookie, response.csrfToken);
+      }
+      return response.user;
+    });
   }
 
   logout() {
-    return this.request<void>("/api/v1/auth/logout", { method: "POST" });
+    return this.request<void>("/api/v1/auth/logout", { method: "POST" }).then(() => {
+      writeClientCookie(csrfCookie, "", 0);
+    });
   }
 
   me() {

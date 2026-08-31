@@ -816,6 +816,48 @@ describe("LuxApiClient", () => {
     });
   });
 
+  it("restores the CSRF cookie from the login envelope when a proxy drops Set-Cookie", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ user: { id: "user-1" }, csrfToken: "csrf from json" }), { status: 200 }),
+    );
+    let cookie = "";
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: {
+        get cookie() {
+          return cookie;
+        },
+        set cookie(value: string) {
+          cookie = value;
+        },
+      },
+    });
+
+    await new LuxApiClient().login("user", "password");
+
+    expect(cookie).toBe("lux_csrf=csrf%20from%20json; Path=/; SameSite=Lax");
+  });
+
+  it("clears the client-readable CSRF cookie after logout succeeds", async () => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    let cookie = "lux_csrf=csrf-token";
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: {
+        get cookie() {
+          return cookie;
+        },
+        set cookie(value: string) {
+          cookie = value;
+        },
+      },
+    });
+
+    await new LuxApiClient().logout();
+
+    expect(cookie).toBe("lux_csrf=; Path=/; Max-Age=0; SameSite=Lax");
+  });
+
   it("sends non-sensitive TMDb language and API address settings without requiring an API key", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ plugin: { id: "tmdb" } }), { status: 200 }),
