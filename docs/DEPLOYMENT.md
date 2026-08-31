@@ -82,6 +82,8 @@ LUX_PROXY_URL=http://192.168.1.2:7890
 
 `LUX_PROXY_URL` 可选，用于 Lux 及其外置插件的出站网络请求，例如元数据、图片和人物头像下载。支持 `http://`、`https://`、`socks4://`、`socks4a://`、`socks5://` 和 `socks5h://` 代理地址；代理 URL 可包含用户名认证信息。留空时使用标准系统代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`）；这些变量也可使用小写形式。代理地址不参与入站反向代理，也不改变 `.strm` 直交行为。包含认证信息的代理 URL 应只通过受保护的环境变量或 secrets 注入，不能写入日志。TMDb/豆瓣凭据请在各自插件的专属配置中设置，不再通过 `LUX_TMDB_*` 环境变量注入 Lux 主进程。
 
+本地文件索引默认使用 32 路 worker。Docker 可设置 `LUX_SCAN_CONCURRENCY`（1-1024）作为全局覆盖，例如 `LUX_SCAN_CONCURRENCY=64`；设置后优先于媒体库保存的 `scanConcurrency`。未设置时，新建媒体库默认 32 路，已有媒体库可通过管理 API 的 `scanConcurrency` 单独设置。资源自适应仍可能在 CPU、内存或存储延迟较高时降低实际并发，SQLite 的批量入库保持单写者。
+
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
 反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。

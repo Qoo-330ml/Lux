@@ -14,6 +14,7 @@ use crate::{
         },
         schedule::{DEFAULT_METADATA_SCHEDULE, DEFAULT_RECONCILIATION_SCHEDULE, validate_cron},
     },
+    config::{DEFAULT_SCAN_CONCURRENCY, MAX_SCAN_CONCURRENCY, scan_concurrency_from_env},
     domain::ids::{LibraryId, LibraryRootId},
     library::{
         LibraryKind, LibraryRecord, LibraryRootRecord, LibraryScraper, LibraryScraperRole,
@@ -25,9 +26,7 @@ use crate::{
     },
 };
 
-const DEFAULT_SCAN_CONCURRENCY: i64 = 2;
 const DEFAULT_PROBE_CONCURRENCY: i64 = DEFAULT_PROBE_CONCURRENCY_USIZE as i64;
-const MAX_SCAN_CONCURRENCY: i64 = 64;
 const MAX_PROBE_CONCURRENCY: i64 = MAX_EFFECTIVE_PROBE_CONCURRENCY as i64;
 const MAX_SCHEDULE_LENGTH: usize = 128;
 const MAX_LIBRARY_SCRAPERS: usize = 16;
@@ -64,6 +63,7 @@ impl Default for LibraryChangeNotifier {
 pub struct LibraryService {
     database: Database,
     change_notifier: LibraryChangeNotifier,
+    default_scan_concurrency: i64,
 }
 
 impl LibraryService {
@@ -71,6 +71,8 @@ impl LibraryService {
         Self {
             database,
             change_notifier: LibraryChangeNotifier::new(),
+            default_scan_concurrency: scan_concurrency_from_env()
+                .unwrap_or(DEFAULT_SCAN_CONCURRENCY),
         }
     }
 
@@ -185,7 +187,7 @@ impl LibraryService {
                 realtime_metadata_auto_match_enabled,
                 reconciliation_schedule: Some(DEFAULT_RECONCILIATION_SCHEDULE),
                 metadata_schedule: (!scrapers.is_empty()).then_some(DEFAULT_METADATA_SCHEDULE),
-                scan_concurrency: DEFAULT_SCAN_CONCURRENCY,
+                scan_concurrency: self.default_scan_concurrency,
                 probe_concurrency: DEFAULT_PROBE_CONCURRENCY,
                 chapter_source_id: chapter_source_id.as_deref(),
             })

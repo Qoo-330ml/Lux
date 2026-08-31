@@ -38,6 +38,9 @@ use crate::{
         watch::ChangeKind,
         webhooks::{WebhookEventType, WebhookService},
     },
+    config::{
+        DEFAULT_SCAN_CONCURRENCY, scan_concurrency_from_env, scan_concurrency_override_from_env,
+    },
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     observability::resources::ResourceMetrics,
     storage::{
@@ -2434,6 +2437,8 @@ pub struct ScanJobService {
     home: Option<HomeService>,
     webhooks: Option<WebhookService>,
     resources: ResourceMetrics,
+    default_scan_concurrency: usize,
+    scan_concurrency_override: Option<usize>,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
@@ -2459,6 +2464,14 @@ impl ScanJobService {
             home: None,
             webhooks: None,
             resources: ResourceMetrics::new(),
+            default_scan_concurrency: usize::try_from(
+                scan_concurrency_from_env().unwrap_or(DEFAULT_SCAN_CONCURRENCY),
+            )
+            .unwrap_or(1),
+            scan_concurrency_override: scan_concurrency_override_from_env()
+                .ok()
+                .flatten()
+                .and_then(|value| usize::try_from(value).ok()),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -3175,9 +3188,16 @@ impl ScanJobService {
         let library_kind = library
             .as_ref()
             .map_or("MOVIE", |library| library.kind.as_str());
-        let scan_concurrency = library
-            .as_ref()
-            .map_or(2, |library| library.scan_concurrency);
+        let scan_concurrency = self
+            .scan_concurrency_override
+            .map(|value| value as i64)
+            .unwrap_or_else(|| {
+                library
+                    .as_ref()
+                    .map_or(self.default_scan_concurrency as i64, |library| {
+                        library.scan_concurrency
+                    })
+            });
         let batch = self
             .database
             .list_reconciliation_scan_entries(

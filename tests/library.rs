@@ -94,12 +94,13 @@ async fn new_libraries_enable_realtime_indexing_by_default()
         .await?;
 
     assert!(library.realtime_watch_enabled);
+    assert_eq!(library.scan_concurrency, 32);
     assert_eq!(library.probe_concurrency, 256);
     Ok(())
 }
 
 #[tokio::test]
-async fn library_probe_concurrency_accepts_512_without_raising_scan_limit()
+async fn library_probe_concurrency_accepts_512_and_scan_concurrency_accepts_1024()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -116,20 +117,20 @@ async fn library_probe_concurrency_accepts_512_without_raising_scan_limit()
         .update_settings(
             library.id,
             LibrarySettingsPatch {
-                scan_concurrency: Some(64),
+                scan_concurrency: Some(1024),
                 probe_concurrency: Some(512),
                 ..Default::default()
             },
         )
         .await?;
-    assert_eq!(updated.library.scan_concurrency, 64);
+    assert_eq!(updated.library.scan_concurrency, 1024);
     assert_eq!(updated.library.probe_concurrency, 512);
 
     let error = service
         .update_settings(
             library.id,
             LibrarySettingsPatch {
-                scan_concurrency: Some(65),
+                scan_concurrency: Some(1025),
                 ..Default::default()
             },
         )

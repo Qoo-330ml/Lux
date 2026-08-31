@@ -511,7 +511,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 32 路；Docker 可通过 `LUX_SCAN_CONCURRENCY` 在 1-1024 范围内覆盖新建媒体库的默认值。媒体库的 `scanConcurrency` 可通过管理 API 单独覆盖同一范围；实际后台 worker 数仍会根据 CPU、内存和存储延迟动态降级，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 32 路；Docker 可通过 `LUX_SCAN_CONCURRENCY` 在 1-1024 范围内设置全局覆盖值，设置后优先于媒体库保存的 `scanConcurrency`。未设置环境变量时，新建媒体库默认 32 路，媒体库的 `scanConcurrency` 可通过管理 API 单独覆盖同一范围；实际后台 worker 数仍会根据 CPU、内存和存储延迟动态降级，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 

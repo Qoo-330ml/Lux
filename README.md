@@ -42,6 +42,8 @@ Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、�
 `LUX_DB_MAX_CONNECTIONS` 为当前 Lux 进程覆盖两种后端的连接数，允许范围为 1-100；SQLite
 增加连接不会突破单写者限制，NAS 上应结合前台 p95、写锁和内存观察后再调整。
 
+本地文件索引默认使用 32 路 worker。Docker 可通过 `LUX_SCAN_CONCURRENCY` 设置全局并发（1-1024），设置后优先于媒体库保存的 `scanConcurrency`；未设置时，新建媒体库默认 32 路，已有媒体库仍可在管理 API 中用 `scanConcurrency` 单独覆盖。实际并发仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
+
 ## 快速开始
 
 ### Docker Compose（推荐）
