@@ -652,22 +652,20 @@ impl Database {
                    AND mi.item_type IN ('MOVIE', 'SERIES')
                    AND mi.library_id IN ({catalog_placeholders})
              ),
-             ranked AS (
-                 SELECT scored.*,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY CASE WHEN recent_playback_user_count > 0 THEN 1 ELSE 0 END
-                            ORDER BY recommendation_score DESC, added_at DESC,
-                                     sort_title, id
-                        ) AS playback_rank
+             playback_top AS (
+                 SELECT scored.*
                  FROM scored
-             ),
-             paged AS (
-                 SELECT *
-                 FROM ranked
-                 WHERE recent_playback_user_count = 0 OR playback_rank <= 5
+                 WHERE recent_playback_user_count > 0
                  ORDER BY recommendation_score DESC, added_at DESC,
                           sort_title, id
-                 LIMIT ? OFFSET ?
+                 LIMIT 5
+             ),
+             paged AS (
+                 SELECT * FROM playback_top
+                 UNION ALL
+                 SELECT *
+                 FROM scored
+                 WHERE recent_playback_user_count = 0
              )
              SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -700,7 +698,8 @@ impl Database {
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
              ORDER BY paged.recommendation_score DESC, mi.added_at DESC,
-                      mi.sort_title, mi.id, ms.id, mt.stream_index"
+                      mi.sort_title, mi.id, ms.id, mt.stream_index
+             LIMIT ? OFFSET ?"
         );
         let mut binds = Vec::with_capacity(library_ids.len() * 2 + 4);
         binds.push(CatalogBind::Real(median_rating));
