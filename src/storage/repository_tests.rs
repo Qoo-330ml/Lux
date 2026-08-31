@@ -482,10 +482,23 @@ async fn recommended_catalog_rows_limit_recent_playback_items_and_remove_old_sta
         .complete("Admin", "Admin", "correct password")
         .await
         .expect("setup");
-    let library = LibraryService::new(database.clone())
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
         .await
         .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root");
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .expect("library root id");
     let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
         .fetch_one(database.pool())
         .await
@@ -521,6 +534,32 @@ async fn recommended_catalog_rows_limit_recent_playback_items_and_remove_old_sta
         .expect("media item");
     }
 
+    for (entry_id, source_id, relative_path) in [
+        ("active-1-entry-a", "active-1-source-a", "active-1-a.mkv"),
+        ("active-1-entry-b", "active-1-source-b", "active-1-b.mkv"),
+    ] {
+        sqlx::query(
+            "INSERT INTO filesystem_entries
+             (id, library_root_id, relative_path, entry_kind, size, modified_at, last_seen_generation)
+             VALUES (?, ?, ?, 'FILE', 1, 1, 'generation')",
+        )
+        .bind(entry_id)
+        .bind(&root_id)
+        .bind(relative_path)
+        .execute(database.pool())
+        .await
+        .expect("filesystem entry");
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+             VALUES (?, 'active-1', 'LOCAL_FILE', ?)",
+        )
+        .bind(source_id)
+        .bind(entry_id)
+        .execute(database.pool())
+        .await
+        .expect("media source");
+    }
+
     for item_id in [
         "active-1", "active-2", "active-3", "active-4", "active-5", "active-6",
     ] {
@@ -554,8 +593,8 @@ async fn recommended_catalog_rows_limit_recent_playback_items_and_remove_old_sta
     assert_eq!(
         rows.iter()
             .map(|row| row.item_id.as_str())
-            .collect::<Vec<_>>(),
-        [
+            .collect::<std::collections::HashSet<_>>(),
+        std::collections::HashSet::from([
             "active-1",
             "active-2",
             "active-3",
@@ -563,7 +602,7 @@ async fn recommended_catalog_rows_limit_recent_playback_items_and_remove_old_sta
             "active-5",
             "unplayed-1",
             "unplayed-2",
-        ]
+        ])
     );
 }
 
