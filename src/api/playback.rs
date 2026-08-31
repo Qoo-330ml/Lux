@@ -614,28 +614,51 @@ pub(super) fn emby_session_json(
     catalog_item: Option<&CatalogItem>,
 ) -> Value {
     let runtime_ticks = session_runtime_ticks(session, catalog_item);
+    let mut now_playing_item = json!({
+        "Id": session.item_id,
+        "RunTimeTicks": runtime_ticks,
+    });
+    if let Some(item) = catalog_item
+        && let Value::Object(object) = &mut now_playing_item
+    {
+        object.insert("Name".to_owned(), json!(item.title));
+        object.insert("Type".to_owned(), json!(emby_item_type(&item.item_type)));
+        if let Some(series_name) = item.series_name.as_deref() {
+            object.insert("SeriesName".to_owned(), json!(series_name));
+        }
+        if let Some(season_number) = item.season_number {
+            object.insert("ParentIndexNumber".to_owned(), json!(season_number));
+        }
+        if let Some(episode_number) = item.episode_number {
+            object.insert("IndexNumber".to_owned(), json!(episode_number));
+            // Older Emby clients, including some session-card consumers, use
+            // the legacy Index alias instead of IndexNumber.
+            object.insert("Index".to_owned(), json!(episode_number));
+        }
+    }
+    // Session consumers perform arithmetic and comparisons on these fields.
+    // Never serialize an Option here: null values from a partial playback
+    // callback make otherwise valid sessions unusable to those clients.
     json!({
         "Id": session.id,
         "UserId": session.user_id,
         "ItemId": session.item_id,
-        "MediaSourceId": session.media_source_id,
+        "MediaSourceId": session.media_source_id.as_deref().unwrap_or(""),
         "PlaySessionId": session.play_session_id,
-        "Client": session.client,
+        "Client": session.client.as_deref().unwrap_or("Unknown"),
         "DeviceId": session.device_id,
-        "DeviceName": session.device_name,
-        "DeviceType": session.device_type,
-        "ApplicationVersion": session.client_version,
-        "RemoteEndPoint": session.remote_ip,
+        "DeviceName": session.device_name.as_deref().unwrap_or("Unknown"),
+        "DeviceType": session.device_type.as_deref().unwrap_or("Unknown"),
+        "ApplicationVersion": session.client_version.as_deref().unwrap_or("Unknown"),
+        "RemoteEndPoint": session.remote_ip.as_deref().unwrap_or(""),
         "PlayState": {
-            "PositionTicks": session.position_ticks,
+            "PositionTicks": session.position_ticks.max(0),
             "IsPaused": session.is_paused,
             "CanSeek": true,
             "PlayMethod": "DirectPlay",
+            "VolumeLevel": 100,
         },
-        "NowPlayingItem": {
-            "Id": session.item_id,
-            "RunTimeTicks": runtime_ticks,
-        },
+        "NowPlayingItem": now_playing_item,
         "RunTimeTicks": runtime_ticks,
         "LastActivityDate": session.last_event_at,
     })
