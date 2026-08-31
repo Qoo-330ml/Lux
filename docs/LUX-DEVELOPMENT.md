@@ -511,6 +511,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
+- 本地文件索引并发默认 32 路；Docker 可通过 `LUX_SCAN_CONCURRENCY` 在 1-1024 范围内覆盖新建媒体库的默认值。媒体库的 `scanConcurrency` 可通过管理 API 单独覆盖同一范围；实际后台 worker 数仍会根据 CPU、内存和存储延迟动态降级，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
@@ -1777,6 +1778,7 @@ services:
     environment:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
+      LUX_SCAN_CONCURRENCY: "32"
       RUST_LOG: "lux=info,tower_http=info"
       TZ: "Asia/Shanghai"
     volumes:
@@ -3435,7 +3437,7 @@ STRM 来源的后台探测任务；这条事件驱动路径不替代全局计划
 插件返回结构化匹配状态和受大小限制的 XML；插件不得接收或执行用户直接提供的上游 URL，
 不得访问主进程配置目录以外的凭据。管理员配置 Dandanplay 兼容 API 基地址，或配置
 `huangxd-/danmu_api` 的 API 基地址，配置由插件 manifest 声明并通过插件配置界面保存。
-基地址可以包含部署 token 路径，必须保留路径但在配置响应、日志、审计和错误中脱敏。
+基地址可以包含部署 token 路径，必须保留路径但在配置响应、日志、审计和错误中脱敏。插件配置还提供匹配并发数（0-64，默认 2；0 表示不设插件级限制，但仍受宿主资源上限约束）以及是否覆盖已有同名 XML（默认关闭）；计划任务使用保存的配置值，手动 API 任务可在请求中指定对应选项。
 XML 旁车只登记相对路径，SQLite 保存索引和任务状态，不保存整份 XML。
 
 匹配候选首选媒体源文件名的 basename，以兼容 Dandanplay 的文件名匹配语义；索引中的

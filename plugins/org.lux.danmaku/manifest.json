@@ -3,7 +3,7 @@
   "id": "org.lux.danmaku",
   "name": "弹幕匹配",
   "description": "匹配本地视频并获取 Bilibili 标准弹幕 XML",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "apiVersion": 1,
   "runtime": {
     "kind": "process",
@@ -52,6 +52,22 @@
       "type": "toggle",
       "defaultValue": false,
       "description": "没有匹配结果时，尝试已登记的英文或原始标题。是否支持取决于上游接口。"
+    },
+    {
+      "key": "concurrency",
+      "label": "并发数",
+      "type": "number",
+      "defaultValue": 2,
+      "minimum": 0,
+      "maximum": 64,
+      "description": "限制同时匹配的媒体数量；0 表示不设插件级限制，仍受宿主资源上限约束。"
+    },
+    {
+      "key": "overwrite",
+      "label": "覆盖已有弹幕文件",
+      "type": "toggle",
+      "defaultValue": false,
+      "description": "启用后，每次运行都会覆盖已有的同名弹幕 XML。"
     },
     {
       "key": "schedule",

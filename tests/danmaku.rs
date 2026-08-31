@@ -62,6 +62,9 @@ async fn writes_xml_atomically_and_rejects_existing_file_by_default()
         .await
         .expect_err("overwrite must be explicit");
     assert!(error.to_string().contains("already exists"));
+    let replacement = br#"<i><d p="2,1,25,16777215,0,0,0,0">replacement</d></i>"#;
+    atomic_write_danmaku_xml(&target, replacement, true).await?;
+    assert_eq!(tokio::fs::read(&target).await?, replacement);
     Ok(())
 }
 
@@ -89,7 +92,7 @@ async fn database_migration_creates_danmaku_tables() -> Result<(), Box<dyn std::
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 110);
+    assert_eq!(database.schema_version().await?, 111);
     let active_job_index: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
             SELECT 1 FROM sqlite_master

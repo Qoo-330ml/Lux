@@ -89,6 +89,8 @@ pub struct DanmakuSettings {
     pub match_original_filename: bool,
     pub match_simplified_traditional_titles: bool,
     pub match_english_title: bool,
+    pub concurrency: i64,
+    pub overwrite: bool,
     pub schedule: String,
 }
 
@@ -1012,6 +1014,14 @@ impl PluginService {
                 .unwrap_or(true),
             match_english_title: values
                 .get("matchEnglishTitle")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            concurrency: values
+                .get("concurrency")
+                .and_then(Value::as_i64)
+                .unwrap_or(crate::application::danmaku::DEFAULT_DANMAKU_CONCURRENCY),
+            overwrite: values
+                .get("overwrite")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
             schedule: danmaku_schedule(&values)?,

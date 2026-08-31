@@ -2045,7 +2045,7 @@ pub(crate) struct DanmakuMatchRequest {
 }
 
 const fn default_danmaku_concurrency() -> i64 {
-    2
+    crate::application::danmaku::DEFAULT_DANMAKU_CONCURRENCY
 }
 
 pub(crate) async fn admin_start_danmaku_match(

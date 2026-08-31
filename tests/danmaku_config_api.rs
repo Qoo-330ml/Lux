@@ -36,6 +36,8 @@ async fn danmaku_scheduled_task_api_updates_plugin_schedule()
             "configFields": [
                 {"key": "providerBaseUrl", "label": "弹幕 API 地址", "type": "text", "required": true, "sensitive": true},
                 {"key": "libraryIds", "label": "媒体库", "type": "select", "multiple": true, "optionsSource": "media-libraries", "defaultValue": []},
+                {"key": "concurrency", "label": "并发数", "type": "number", "defaultValue": 2, "minimum": 0, "maximum": 64},
+                {"key": "overwrite", "label": "覆盖已有弹幕文件", "type": "toggle", "defaultValue": false},
                 {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 6 * * *"}
             ],
             "scheduledTasks": [{
@@ -106,6 +108,8 @@ async fn danmaku_scheduled_task_api_updates_plugin_schedule()
         .json(&json!({
             "providerBaseUrl": "https://danmu.example/api",
             "libraryIds": [library.id.to_string()],
+            "concurrency": 0,
+            "overwrite": true,
             "schedule": "0 6 * * *"
         }))
         .send()
@@ -142,6 +146,8 @@ async fn danmaku_scheduled_task_api_updates_plugin_schedule()
         .cloned()
         .ok_or("missing danmaku plugin")?;
     assert_eq!(plugin["configValues"]["schedule"], "0 2 * * *");
+    assert_eq!(plugin["configValues"]["concurrency"], 0);
+    assert_eq!(plugin["configValues"]["overwrite"], true);
 
     let missing_schedule = client
         .put(format!("{base_url}/api/v1/admin/scheduled-tasks"))

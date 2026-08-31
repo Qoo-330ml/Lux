@@ -211,6 +211,8 @@ describe("AdminPluginsPage plugin cards", () => {
         matchOriginalFilename: true,
         matchSimplifiedTraditionalTitles: true,
         matchEnglishTitle: false,
+        concurrency: 3,
+        overwrite: false,
       },
       configFields: [
         {
@@ -234,6 +236,8 @@ describe("AdminPluginsPage plugin cards", () => {
         { key: "matchOriginalFilename", label: "使用原始文件名", type: "toggle", required: false, sensitive: false, defaultValue: true },
         { key: "matchSimplifiedTraditionalTitles", label: "尝试简繁标题", type: "toggle", required: false, sensitive: false, defaultValue: true },
         { key: "matchEnglishTitle", label: "尝试英文标题", type: "toggle", required: false, sensitive: false, defaultValue: false },
+        { key: "concurrency", label: "并发数", type: "number", required: false, sensitive: false, defaultValue: 2, minimum: 0, maximum: 64, description: "0 表示不设插件级并发限制。" },
+        { key: "overwrite", label: "覆盖已有弹幕文件", type: "toggle", required: false, sensitive: false, defaultValue: false, description: "每次运行都覆盖已有的弹幕 XML。" },
       ],
     };
     await renderPage();
@@ -246,7 +250,10 @@ describe("AdminPluginsPage plugin cards", () => {
     expect(dialog?.querySelector<HTMLInputElement>('[id$="-provider-base-url"]')).toBeTruthy();
     expect(dialog?.textContent).toContain("只对选中的媒体库执行弹幕匹配");
     expect(dialog?.textContent).toContain("尝试简繁标题");
-    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
+    expect(dialog?.querySelector<HTMLInputElement>('input[type="number"]')?.value).toBe("3");
+    expect(dialog?.querySelector<HTMLInputElement>('input[type="number"]')?.min).toBe("0");
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(4);
+    expect(dialog?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[3]?.checked).toBe(false);
 
     const providerInput = dialog?.querySelector<HTMLInputElement>('[id$="-provider-base-url"]');
     await act(async () => {
@@ -256,6 +263,7 @@ describe("AdminPluginsPage plugin cards", () => {
         providerInput.dispatchEvent(new Event("change", { bubbles: true }));
       }
       dialog?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[2]?.click();
+      dialog?.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[3]?.click();
       dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
     });
 
@@ -265,6 +273,8 @@ describe("AdminPluginsPage plugin cards", () => {
       matchOriginalFilename: true,
       matchSimplifiedTraditionalTitles: true,
       matchEnglishTitle: true,
+      concurrency: 3,
+      overwrite: true,
     }));
   });
 

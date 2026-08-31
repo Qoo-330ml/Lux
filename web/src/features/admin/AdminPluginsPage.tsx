@@ -152,6 +152,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [matchSimplifiedTraditionalTitles, setMatchSimplifiedTraditionalTitles] = useState(true);
   const [matchEnglishTitle, setMatchEnglishTitle] = useState(false);
   const [concurrency, setConcurrency] = useState(2);
+  const [overwrite, setOverwrite] = useState(false);
   const [introWindowSeconds, setIntroWindowSeconds] = useState(180);
   const [creditsWindowSeconds, setCreditsWindowSeconds] = useState(180);
   const [matchThreshold, setMatchThreshold] = useState(80);
@@ -181,6 +182,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     ?? (apiBaseUrlField?.type === "text" ? apiBaseUrlField : undefined);
   const libraryIdsField = plugin.configFields.find((field) => field.key === "libraryIds");
   const concurrencyField = plugin.configFields.find((field) => field.key === "concurrency");
+  const overwriteField = plugin.configFields.find((field) => field.key === "overwrite");
   const introWindowField = plugin.configFields.find((field) => field.key === "introWindowSeconds");
   const creditsWindowField = plugin.configFields.find((field) => field.key === "creditsWindowSeconds");
   const matchThresholdField = plugin.configFields.find((field) => field.key === "matchThreshold");
@@ -202,6 +204,8 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           matchOriginalFilename,
           matchSimplifiedTraditionalTitles,
           matchEnglishTitle,
+          concurrency,
+          overwrite,
         })
       : isMediaInfo
         ? api.updateAdminPluginConfig(plugin.id, {
@@ -323,6 +327,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setMatchSimplifiedTraditionalTitles(values.matchSimplifiedTraditionalTitles !== false);
     setMatchEnglishTitle(values.matchEnglishTitle === true);
     setConcurrency(typeof values.concurrency === "number" ? values.concurrency : Number(concurrencyField?.defaultValue ?? 2));
+    setOverwrite(values.overwrite === true);
     setIntroWindowSeconds(typeof values.introWindowSeconds === "number" ? values.introWindowSeconds : Number(introWindowField?.defaultValue ?? 180));
     setCreditsWindowSeconds(typeof values.creditsWindowSeconds === "number" ? values.creditsWindowSeconds : Number(creditsWindowField?.defaultValue ?? 180));
     setMatchThreshold(typeof values.matchThreshold === "number" ? values.matchThreshold : Number(matchThresholdField?.defaultValue ?? 80));
@@ -342,7 +347,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setApiKeyDirty(false);
     setDanmakuProviderBaseUrl("");
     setDanmakuProviderBaseUrlDirty(false);
-  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
+  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, overwriteField?.defaultValue, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -388,6 +393,8 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
                 <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={matchOriginalFilename} onChange={(event) => setMatchOriginalFilename(event.target.checked)} /> <span><strong>使用原始文件名</strong><small>优先使用视频文件名请求上游匹配接口。</small></span></label>
                 <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={matchSimplifiedTraditionalTitles} onChange={(event) => setMatchSimplifiedTraditionalTitles(event.target.checked)} /> <span><strong>尝试简繁标题</strong><small>没有匹配结果时，尝试已登记的本地标题候选。</small></span></label>
                 <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={matchEnglishTitle} onChange={(event) => setMatchEnglishTitle(event.target.checked)} /> <span><strong>尝试英文标题</strong><small>没有匹配结果时，尝试已登记的英文或原始标题。</small></span></label>
+                {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 0} max={concurrencyField.maximum ?? 64} step={1} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}
+                {overwriteField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={overwrite} onChange={(event) => setOverwrite(event.target.checked)} /> <span><strong>{overwriteField.label}</strong><small>{overwriteField.description}</small></span></label> : null}
               </> : isMediaInfo ? <>
                 {libraryIdsField ? <label htmlFor={"plugin-config-" + plugin.id + "-library-ids"}>{libraryIdsField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-library-ids"} multiple value={libraryIds} options={libraryIdsField.options ?? []} onChange={setLibraryIds} aria-label={libraryIdsField.label} /><small>{libraryIdsField.description}</small></label> : null}
                 {concurrencyField ? <label htmlFor={"plugin-config-" + plugin.id + "-concurrency"}>{concurrencyField.label}<input id={"plugin-config-" + plugin.id + "-concurrency"} type="number" min={concurrencyField.minimum ?? 1} max={concurrencyField.maximum ?? 64} value={concurrency} onChange={(event) => setConcurrency(Number(event.target.value))} /><small>{concurrencyField.description}</small></label> : null}

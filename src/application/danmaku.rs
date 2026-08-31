@@ -371,7 +371,7 @@ impl DanmakuService {
         concurrency: i64,
         overwrite: bool,
     ) -> Result<DanmakuMatchJob, DanmakuServiceError> {
-        if !(1..=MAX_CONCURRENCY).contains(&concurrency) {
+        if !(0..=MAX_CONCURRENCY).contains(&concurrency) {
             return Err(DanmakuServiceError::InvalidConcurrency);
         }
         let library_id = library_id.to_string();
@@ -425,15 +425,14 @@ impl DanmakuService {
             .danmaku_settings()
             .await
             .map_err(|_| DanmakuServiceError::ProviderNotConfigured)?;
+        let concurrency = settings.concurrency;
+        let overwrite = settings.overwrite;
         let mut jobs = Vec::with_capacity(settings.library_ids.len());
         for library_id in settings.library_ids {
             let library_id = library_id
                 .parse::<LibraryId>()
                 .map_err(|_| DanmakuServiceError::LibraryNotFound)?;
-            match self
-                .create_job(library_id, DEFAULT_DANMAKU_CONCURRENCY, false)
-                .await
-            {
+            match self.create_job(library_id, concurrency, overwrite).await {
                 Ok(job) => jobs.push(job),
                 Err(DanmakuServiceError::AlreadyActive) => {}
                 Err(error) => return Err(error),
@@ -850,6 +849,9 @@ impl From<StorageError> for DanmakuServiceError {
 }
 
 fn effective_danmaku_concurrency(configured: i64) -> usize {
+    if configured == 0 {
+        return MAX_EFFECTIVE_CONCURRENCY;
+    }
     usize::try_from(configured)
         .unwrap_or(1)
         .clamp(1, MAX_EFFECTIVE_CONCURRENCY)
@@ -1180,6 +1182,7 @@ mod tests {
 
     #[test]
     fn worker_concurrency_has_a_memory_safe_ceiling() {
+        assert_eq!(effective_danmaku_concurrency(0), 4);
         assert_eq!(effective_danmaku_concurrency(1), 1);
         assert_eq!(effective_danmaku_concurrency(2), 2);
         assert_eq!(effective_danmaku_concurrency(64), 4);
@@ -1204,6 +1207,8 @@ mod tests {
             match_original_filename: true,
             match_simplified_traditional_titles: true,
             match_english_title: true,
+            concurrency: 2,
+            overwrite: false,
             schedule: DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned(),
         };
 
@@ -1236,6 +1241,8 @@ mod tests {
             match_original_filename: false,
             match_simplified_traditional_titles: true,
             match_english_title: true,
+            concurrency: 2,
+            overwrite: false,
             schedule: DEFAULT_DANMAKU_MATCH_SCHEDULE.to_owned(),
         };
 

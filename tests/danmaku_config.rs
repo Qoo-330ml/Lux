@@ -43,6 +43,8 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
                 {"key": "matchOriginalFilename", "label": "使用原始文件名", "type": "toggle", "defaultValue": true},
                 {"key": "matchSimplifiedTraditionalTitles", "label": "尝试简繁标题", "type": "toggle", "defaultValue": true},
                 {"key": "matchEnglishTitle", "label": "尝试英文标题", "type": "toggle", "defaultValue": false},
+                {"key": "concurrency", "label": "并发数", "type": "number", "defaultValue": 2, "minimum": 0, "maximum": 64},
+                {"key": "overwrite", "label": "覆盖已有弹幕文件", "type": "toggle", "defaultValue": false},
                 {"key": "schedule", "label": "执行计划", "type": "text", "required": true, "defaultValue": "0 6 * * *"}
             ],
             "scheduledTasks": [{
@@ -130,6 +132,8 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
         true
     );
     assert_eq!(plugin.config_values["matchEnglishTitle"], false);
+    assert_eq!(plugin.config_values["concurrency"], 2);
+    assert_eq!(plugin.config_values["overwrite"], false);
     assert!(!plugin.configured);
 
     let values = Map::from_iter([
@@ -141,6 +145,8 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
         ("matchOriginalFilename".to_owned(), json!(true)),
         ("matchSimplifiedTraditionalTitles".to_owned(), json!(false)),
         ("matchEnglishTitle".to_owned(), json!(true)),
+        ("concurrency".to_owned(), json!(3)),
+        ("overwrite".to_owned(), json!(true)),
     ]);
     let updated = plugins.update_dynamic_config(PLUGIN_ID, values).await?;
     assert!(updated.configured);
@@ -153,6 +159,8 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
         false
     );
     assert_eq!(updated.config_values["matchEnglishTitle"], true);
+    assert_eq!(updated.config_values["concurrency"], 3);
+    assert_eq!(updated.config_values["overwrite"], true);
 
     let enabled: (Option<String>, i64) = sqlx::query_as(
         "SELECT cron_or_interval, is_enabled
@@ -183,6 +191,31 @@ async fn danmaku_plugin_config_exposes_library_scope_and_match_preferences()
     assert!(settings.match_original_filename);
     assert!(!settings.match_simplified_traditional_titles);
     assert!(settings.match_english_title);
+    assert_eq!(settings.concurrency, 3);
+    assert!(settings.overwrite);
+
+    let danmaku = DanmakuService::new(database.clone()).with_plugins(plugins.clone());
+    let jobs = danmaku.create_configured_jobs().await?;
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].concurrency, 3);
+    assert!(jobs[0].overwrite);
+    danmaku.run(&jobs[0].id).await?;
+
+    let unlimited = plugins
+        .update_dynamic_config(
+            PLUGIN_ID,
+            Map::from_iter([
+                ("concurrency".to_owned(), json!(0)),
+                ("overwrite".to_owned(), json!(false)),
+            ]),
+        )
+        .await?;
+    assert_eq!(unlimited.config_values["concurrency"], 0);
+    assert_eq!(unlimited.config_values["overwrite"], false);
+    assert_eq!(plugins.danmaku_settings().await?.concurrency, 0);
+    let unlimited_jobs = danmaku.create_configured_jobs().await?;
+    assert_eq!(unlimited_jobs.len(), 1);
+    assert_eq!(unlimited_jobs[0].concurrency, 0);
 
     LibraryService::new(database.clone())
         .delete_library(library.id)
