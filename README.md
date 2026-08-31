@@ -55,6 +55,9 @@ services:
   lux:
     image: pdzhou/lux:latest
     container_name: lux
+    environment:
+      # Optional: set LUX_SCAN_CONCURRENCY in .env to increase scan workers (1-1024).
+      LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY-}
     ports:
       - "8097:8097"
     volumes:
@@ -62,6 +65,14 @@ services:
       - ./media:/media:rw
     restart: unless-stopped
 ```
+
+如需增加扫库线程，可在 Compose 文件同目录的 `.env` 中按需设置：
+
+```dotenv
+LUX_SCAN_CONCURRENCY=1024
+```
+
+支持范围为 `1-1024`；未设置时默认使用 32 路。实际后台 worker 数仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
 
 打开 <http://localhost:8097/>，按引导完成数据库选择和第一个管理员创建。
 
