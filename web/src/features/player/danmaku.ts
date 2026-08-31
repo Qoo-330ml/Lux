@@ -34,6 +34,7 @@ export const DANMAKU_LIMITS = {
 
 const SCROLL_LINE_HEIGHT = 32;
 const FIXED_LINE_HEIGHT = 34;
+const XML_DECLARATION_PATTERN = /^<\?xml\s+version\s*=\s*(?:"1\.[01]"|'1\.[01]')(?:\s+encoding\s*=\s*(?:"[A-Za-z][A-Za-z0-9._-]*"|'[A-Za-z][A-Za-z0-9._-]*'))?(?:\s+standalone\s*=\s*(?:"(?:yes|no)"|'(?:yes|no)'))?\s*\?>$/i;
 
 function laneGeometry(height: number) {
   const fixedLaneCount = Math.max(2, Math.min(4, Math.floor((height * 0.16) / FIXED_LINE_HEIGHT)));
@@ -90,7 +91,8 @@ export function parseBilibiliDanmaku(input: string): LuxDanmakuEntry[] {
     throw invalidXml();
   }
 
-  const root = /^\s*<i\b[^>]*>([\s\S]*)<\/i>\s*$/i.exec(input);
+  const xmlDocument = withoutXmlDeclaration(input);
+  const root = /^\s*<i\b[^>]*>([\s\S]*)<\/i>\s*$/i.exec(xmlDocument);
   if (!root || /<\/i\s*>[\s\S]*<i\b/i.test(input)) {
     throw invalidXml();
   }
@@ -209,6 +211,18 @@ function normalizeMode(value: number): DanmakuMode | null {
   if (value === 5) return "top";
   if ([1, 2, 3, 6].includes(value)) return "scroll";
   return null;
+}
+
+function withoutXmlDeclaration(input: string) {
+  const xmlDocument = input.trimStart();
+  if (!/^<\?xml\b/i.test(xmlDocument)) return xmlDocument;
+  const end = xmlDocument.indexOf("?>");
+  if (end < 0) throw invalidXml();
+  const declaration = xmlDocument.slice(0, end + 2);
+  if (!XML_DECLARATION_PATTERN.test(declaration)) {
+    throw invalidXml();
+  }
+  return xmlDocument.slice(end + 2);
 }
 
 function invalidXml() {

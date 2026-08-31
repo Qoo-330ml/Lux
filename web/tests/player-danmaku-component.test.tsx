@@ -32,7 +32,7 @@ describe("LuxPlayer danmaku overlay", () => {
       rawUrl: "/api/v1/items/item-1/danmaku/raw?sourceId=source-1",
     });
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response('<i><d p="0,1,25,16711680,0,0,0,0">&lt;strong&gt;safe&lt;/strong&gt;</d></i>'),
+      new Response('<?xml version="1.0" encoding="UTF-8"?>\n<i><d p="0,1,25,16711680,0,0,0,0">&lt;strong&gt;safe&lt;/strong&gt;</d></i>'),
     );
 
     await act(async () => {

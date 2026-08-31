@@ -30,11 +30,27 @@ describe("LuxPlayer danmaku parser", () => {
     ]);
   });
 
+  it("accepts downloaded Bilibili XML with a standard declaration", () => {
+    expect(parseBilibiliDanmaku(
+      '<?xml version="1.0" encoding="UTF-8"?>\n<i><chatserver>chat.bilibili.com</chatserver><chatid>1</chatid><d p="1,1,25,16777215,0,0,0,0">下载弹幕</d></i>',
+    )).toEqual([{
+      id: "danmaku-0",
+      start: 1,
+      mode: "scroll",
+      text: "下载弹幕",
+      color: "#ffffff",
+      fontSize: 25,
+    }]);
+  });
+
   it("rejects invalid XML and discards unsafe or unsupported entries", () => {
     expect(() => parseBilibiliDanmaku("<html>not danmaku</html>"))
       .toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
     expect(() => parseBilibiliDanmaku(
       '<i><i><d p="1,1,25,0,0,0,0,0">nested</d></i></i>',
+    )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
+    expect(() => parseBilibiliDanmaku(
+      '<?xml?><i><d p="1,1,25,0,0,0,0,0">bad declaration</d></i>',
     )).toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
     expect(parseBilibiliDanmaku(
       '<i><d p="1,7,25,0,0,0,0,0">高级模式</d><d p="-1,1,25,0,0,0,0,0">负时间</d><d p="1,1,25,0,0,0,0,0">safe\u0000text</d><d p="1,1,25,0,0,0,0,0"></d></i>',

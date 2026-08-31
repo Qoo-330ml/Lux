@@ -159,6 +159,11 @@ Chrome/Chromium `151.0.7922.174`；结论不外推为飞牛 NAS/x86_64 性能、
 | Chrome 151，macOS arm64，390×844 | 关闭/开启弹幕及会话内生命周期 | 通过；`aria-pressed` 在 `true/false` 间切换，关闭时 overlay 被销毁且不创建新请求；开启后只读取 `/api/v1/items/{itemId}/danmaku`、`/danmaku/raw` 和同源 Worker。未请求 Emby `/api/danmu/*`，无外部请求、输入框、发送按钮、热力图或实时推送。 |
 | Web 单测与 Rust 全量测试 | 恶意 XML/有界解析、lane 调度、source 生命周期、ACL/raw 合同 | 通过；Web 343 tests、Rust 273 passed/1 ignored，fmt、clippy、build 均通过。 |
 
+2026-08-31 补充回归：Web 解析器现在接受 Lux 下载链路和 Rust 校验器均支持的标准
+`<?xml version="1.0" encoding="UTF-8"?>` 声明，同时继续拒绝畸形声明、DOCTYPE/ENTITY、嵌套根节点与超限输入。
+Chromium 隔离 smoke 已实际加载声明形式的 XML、启动同源 module Worker 并渲染文本，console 为 0 error / 0 warning；
+Web 104 个静态规则测试和 433 个 Vitest 测试通过，生产构建通过。
+
 ## LuxPlayer LUX-215 字幕/弹幕联合阶段门（2026-08-27）
 
 本次在 Lux `4a7c3193` 上使用隔离 SQLite 配置、固定本地夹具和 Chrome `151.0.7922.174`。宿主为
