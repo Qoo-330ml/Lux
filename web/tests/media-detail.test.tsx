@@ -554,7 +554,7 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/api/v1/items/episode-2/images/fanart?tag=episode-fanart-2");
   });
 
-  it("uses the server playback state for the watched indicator", async () => {
+  it("uses the server playback state for an icon-only watched indicator", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",
       title: "示例电影",
@@ -588,6 +588,7 @@ describe("MediaDetailPage series hierarchy", () => {
     const watched = container.querySelector(".lux-detail-watched-status");
     expect(watched?.classList.contains("is-played")).toBe(true);
     expect(watched?.getAttribute("aria-label")).toBe("已看");
+    expect(watched?.querySelector(".lux-detail-action-label")).toBeNull();
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
 
     expect(container.querySelector(".lux-detail-mobile-header .lux-media-actions-trigger")).not.toBeNull();
