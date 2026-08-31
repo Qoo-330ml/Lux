@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.4",
+    date: "2026-08-31",
+    sections: [
+      { kind: "fixed", items: [
+        "修复 Lux Web 远程 HTTP(S) `.strm` 播放可能进入需要 CORS `fetch` 的客户端 HEVC/MKV fallback 的问题；该类来源保持 Lux 受保护入口后的原生直放和 307 重定向，媒体字节仍由浏览器直连最终地址。",
+      ] },
+      { kind: "changed", items: [
+        "优化 Emby 目录列表：批量预读取本地 NFO 和人物附加数据，并保持原有响应顺序，降低多条目列表的重复 I/O。",
+        "优化待确认元数据与合集刷新：待确认列表批量读取当前条目元数据，合集按 provider ID 索引批量匹配并写入成员，减少数据库往返。",
+        "优化人物演员视图：按页去重并以有界并发预读取人物关系和头像文件，降低演员列表加载的重复文件访问。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.3",
     date: "2026-08-30",
     sections: [
