@@ -28,16 +28,18 @@ describe("heroSlides", () => {
     expect(heroSlides({}).length).toBe(0);
   });
 
-  it("limits the carousel to the first five unique media items", () => {
+  it("limits the carousel to the first seven unique media items", () => {
     expect(heroSlides({
-      continueWatching: [item("continue-1"), item("continue-2"), item("continue-3")],
-      recentlyAdded: [item("recent-1"), item("recent-2"), item("recent-3")],
+      continueWatching: [item("continue-1"), item("continue-2"), item("continue-3"), item("continue-4")],
+      recentlyAdded: [item("recent-1"), item("recent-2"), item("recent-3"), item("recent-4"), item("recent-5")],
     }).map((media) => media.id)).toEqual([
       "continue-1",
       "continue-2",
       "continue-3",
+      "continue-4",
       "recent-1",
       "recent-2",
+      "recent-3",
     ]);
   });
 });

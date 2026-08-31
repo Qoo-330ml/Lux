@@ -1,7 +1,7 @@
 import type { HomeResponse, MediaItem } from "../../lib/api/types";
 
 export const HERO_CAROUSEL_INTERVAL_MS = 8_000;
-export const HERO_CAROUSEL_MAX_SLIDES = 5;
+export const HERO_CAROUSEL_MAX_SLIDES = 7;
 
 export type HeroTitleScale = "default" | "compact" | "small";
 

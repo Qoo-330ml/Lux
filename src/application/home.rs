@@ -338,7 +338,7 @@ impl HomeService {
             async {
                 self.inner
                     .catalog
-                    .list_recommended_for_library_ids(accessible_library_ids, &user_id, 12)
+                    .list_recommended_for_library_ids(accessible_library_ids, &user_id, 7)
                     .await
                     .map_err(HomeError::Catalog)
             },
