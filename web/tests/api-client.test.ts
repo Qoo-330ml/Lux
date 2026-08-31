@@ -1,6 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { ApiError, LuxApiClient } from "../src/lib/api/client";
 
+function installCookieDocument(initialCookie: string) {
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, "document");
+  let cookie = initialCookie;
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      get cookie() {
+        return cookie;
+      },
+      set cookie(value: string) {
+        cookie = value;
+      },
+    },
+  });
+  return {
+    current: () => cookie,
+    restore: () => {
+      if (documentDescriptor) {
+        Object.defineProperty(globalThis, "document", documentDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "document");
+      }
+    },
+  };
+}
+
 describe("LuxApiClient", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -820,42 +846,26 @@ describe("LuxApiClient", () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ user: { id: "user-1" }, csrfToken: "csrf from json" }), { status: 200 }),
     );
-    let cookie = "";
-    Object.defineProperty(globalThis, "document", {
-      configurable: true,
-      value: {
-        get cookie() {
-          return cookie;
-        },
-        set cookie(value: string) {
-          cookie = value;
-        },
-      },
-    });
+    const cookieDocument = installCookieDocument("");
+    try {
+      await new LuxApiClient().login("user", "password");
 
-    await new LuxApiClient().login("user", "password");
-
-    expect(cookie).toBe("lux_csrf=csrf%20from%20json; Path=/; SameSite=Lax");
+      expect(cookieDocument.current()).toBe("lux_csrf=csrf%20from%20json; Path=/; SameSite=Lax");
+    } finally {
+      cookieDocument.restore();
+    }
   });
 
   it("clears the client-readable CSRF cookie after logout succeeds", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
-    let cookie = "lux_csrf=csrf-token";
-    Object.defineProperty(globalThis, "document", {
-      configurable: true,
-      value: {
-        get cookie() {
-          return cookie;
-        },
-        set cookie(value: string) {
-          cookie = value;
-        },
-      },
-    });
+    const cookieDocument = installCookieDocument("lux_csrf=csrf-token");
+    try {
+      await new LuxApiClient().logout();
 
-    await new LuxApiClient().logout();
-
-    expect(cookie).toBe("lux_csrf=; Path=/; Max-Age=0; SameSite=Lax");
+      expect(cookieDocument.current()).toBe("lux_csrf=; Path=/; Max-Age=0; SameSite=Lax");
+    } finally {
+      cookieDocument.restore();
+    }
   });
 
   it("sends non-sensitive TMDb language and API address settings without requiring an API key", async () => {
