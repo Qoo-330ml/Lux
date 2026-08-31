@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.5",
+    date: "2026-08-31",
+    sections: [
+      { kind: "fixed", items: [
+        "修复隐私浏览模式拒绝 Cookie 或 Web Storage 时，登录后的当前页面无法继续执行收藏、已看、播放和退出等写请求的问题；客户端现在以内存保留登录响应中的 CSRF nonce，并在退出时清理。",
+        "修复下载的 Bilibili 弹幕 XML 包含标准 XML 声明时无法解析的问题；现在支持受限的版本、编码和 standalone 声明，同时继续执行 XML 安全与大小校验。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.4",
     date: "2026-08-31",
     sections: [
