@@ -1,5 +1,19 @@
 use super::*;
 
+const SIDECAR_DIRECTORY_TARGET_QUERY: &str = "INSERT INTO scan_job_targets (
+         job_id, target_type, target_id, item_id, change_kind,
+         probe_state, metadata_state, thumbnail_state
+     )
+     SELECT ?, 'ITEM', ms.item_id, ms.item_id, 'SIDECAR',
+            'SKIPPED', 'PENDING', 'PENDING'
+     FROM media_sources ms
+     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+     WHERE fe.library_root_id = ? AND fe.is_missing = 0
+       AND fe.relative_path >= ? || '/'
+       AND fe.relative_path < ? || '0'
+     GROUP BY ms.item_id
+     ON CONFLICT(job_id, target_type, target_id) DO NOTHING";
+
 impl Database {
     pub(crate) async fn find_item_id_by_media_source_id(
         &self,
@@ -1164,18 +1178,19 @@ impl Database {
             .collect::<Vec<_>>();
         directories.sort();
         directories.dedup();
-        for chunk in directories.chunks(BATCH_INSERT_CHUNK_SIZE) {
-            if chunk.is_empty() {
-                continue;
-            }
-            let predicates = chunk
-                .iter()
-                .map(|_| {
-                    "(? = '.' OR fe.relative_path = ? OR substr(fe.relative_path, 1, length(?) + 1) = ? || '/')"
-                })
-                .collect::<Vec<_>>()
-                .join(" OR ");
-            let query = format!(
+        if directories.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if directories.iter().any(|directory| directory == ".") {
+            self.query(
                 "INSERT INTO scan_job_targets (
                      job_id, target_type, target_id, item_id, change_kind,
                      probe_state, metadata_state, thumbnail_state
@@ -1185,30 +1200,45 @@ impl Database {
                  FROM media_sources ms
                  JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                  WHERE fe.library_root_id = ? AND fe.is_missing = 0
-                   AND ({predicates})
                  GROUP BY ms.item_id
-                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
-            );
-            let mut statement = self
-                .query(sqlx::AssertSqlSafe(query))
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(job_id)
+            .bind(library_root_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            return transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+        }
+        for directory in directories {
+            self.query(SIDECAR_DIRECTORY_TARGET_QUERY)
                 .bind(job_id)
-                .bind(library_root_id);
-            for directory in chunk {
-                statement = statement
-                    .bind(directory)
-                    .bind(directory)
-                    .bind(directory)
-                    .bind(directory);
-            }
-            statement
-                .execute(&self.pool)
+                .bind(library_root_id)
+                .bind(&directory)
+                .bind(&directory)
+                .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
         }
-        Ok(())
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn record_scan_job_removed_targets(
@@ -4011,5 +4041,17 @@ impl Database {
                 source,
             })?;
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SIDECAR_DIRECTORY_TARGET_QUERY;
+
+    #[test]
+    fn sidecar_target_query_uses_indexable_directory_ranges() {
+        assert!(SIDECAR_DIRECTORY_TARGET_QUERY.contains("fe.relative_path >= ? || '/'"));
+        assert!(SIDECAR_DIRECTORY_TARGET_QUERY.contains("fe.relative_path < ? || '0'"));
+        assert!(!SIDECAR_DIRECTORY_TARGET_QUERY.contains("substr("));
     }
 }
