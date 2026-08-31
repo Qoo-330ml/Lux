@@ -1,5 +1,7 @@
 use super::*;
 
+const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 6 * 30 * 86_400;
+
 impl Database {
     pub(crate) async fn count_catalog_items(
         &self,
@@ -598,20 +600,59 @@ impl Database {
         }
         let max_function = self.scalar_max_function();
         let min_function = self.scalar_min_function();
-        let placeholders = std::iter::repeat_n("?", library_ids.len())
+        let rating_placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let catalog_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "WITH ranked AS (
+            "WITH rating_values AS (
+                 SELECT mi.rating,
+                        ROW_NUMBER() OVER (ORDER BY mi.rating, mi.id) AS rating_rank,
+                        COUNT(*) OVER () AS rating_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                   AND mi.item_type IN ('MOVIE', 'SERIES')
+                   AND mi.library_id IN ({rating_placeholders})
+                   AND mi.rating IS NOT NULL
+             ),
+             median_rating AS (
+                 SELECT COALESCE(AVG(rating), 0.0) AS value
+                 FROM rating_values
+                 WHERE rating_rank IN ((rating_count + 1) / 2, (rating_count + 2) / 2)
+             ),
+             recent_playback_users AS (
+                 SELECT ps.item_id, ps.user_id
+                 FROM playback_sessions ps
+                 WHERE ps.last_event_at >= unixepoch() - {RECOMMENDATION_PLAYBACK_WINDOW_SECONDS}
+                 UNION
+                 SELECT us.item_id, us.user_id
+                 FROM user_item_state us
+                 WHERE us.last_played_at >= unixepoch() - {RECOMMENDATION_PLAYBACK_WINDOW_SECONDS}
+             ),
+             playback_counts AS (
+                 SELECT item_id, COUNT(*) AS recent_playback_user_count
+                 FROM recent_playback_users
+                 GROUP BY item_id
+             ),
+             favorite_counts AS (
+                 SELECT item_id, COUNT(*) AS favorite_user_count
+                 FROM user_item_state
+                 WHERE is_favorite = 1
+                 GROUP BY item_id
+             ),
+             scored AS (
                  SELECT mi.id,
+                        COALESCE(pc.recent_playback_user_count, 0) AS recent_playback_user_count,
                         (
-                            CASE WHEN COALESCE(us.is_favorite, 0) = 1 THEN 100 ELSE 0 END
-                            + CASE WHEN us.item_id IS NULL THEN 35 ELSE 0 END
-                            + CASE WHEN COALESCE(us.position_ticks, 0) > 0
-                                      AND COALESCE(us.is_played, 0) = 0 THEN 55 ELSE 0 END
-                            + CASE WHEN us.item_id IS NOT NULL
-                                      AND COALESCE(us.is_played, 0) = 0 THEN 20 ELSE 0 END
+                            CASE WHEN us.item_id IS NULL THEN 35 ELSE 0 END
                             + CASE WHEN COALESCE(us.is_played, 0) = 1 THEN -35 ELSE 0 END
+                            + {min_function}(50, 5 * COALESCE(fc.favorite_user_count, 0))
+                            + {min_function}(50.0, {max_function}(0.0,
+                                COALESCE(mi.rating, median_rating.value) * 5.0))
+                            + {min_function}(50, COALESCE(pc.recent_playback_user_count, 0))
                             + {min_function}(7, {max_function}(0, 7 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
                             + CASE WHEN us.last_played_at IS NULL THEN 0 ELSE
                                 {min_function}(30, {max_function}(0, 30 - CAST((unixepoch() - us.last_played_at) / 86400 AS INTEGER)))
@@ -621,13 +662,30 @@ impl Database {
                         mi.sort_title
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 CROSS JOIN median_rating
+                 LEFT JOIN playback_counts pc ON pc.item_id = mi.id
+                 LEFT JOIN favorite_counts fc ON fc.item_id = mi.id
                  LEFT JOIN user_item_state us
                    ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                    AND mi.item_type IN ('MOVIE', 'SERIES')
-                   AND mi.library_id IN ({placeholders})
-                 ORDER BY recommendation_score DESC, mi.added_at DESC,
-                          mi.sort_title, mi.id
+                   AND mi.library_id IN ({catalog_placeholders})
+             ),
+             ranked AS (
+                 SELECT scored.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY CASE WHEN recent_playback_user_count > 0 THEN 1 ELSE 0 END
+                            ORDER BY recommendation_score DESC, added_at DESC,
+                                     sort_title, id
+                        ) AS playback_rank
+                 FROM scored
+             ),
+             paged AS (
+                 SELECT *
+                 FROM ranked
+                 WHERE recent_playback_user_count = 0 OR playback_rank <= 5
+                 ORDER BY recommendation_score DESC, added_at DESC,
+                          sort_title, id
                  LIMIT ? OFFSET ?
              )
              SELECT mi.id AS item_id, mi.library_id, mi.item_type,
@@ -651,8 +709,8 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM ranked
-             JOIN media_items mi ON mi.id = ranked.id
+             FROM paged
+             JOIN media_items mi ON mi.id = paged.id
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
               AND EXISTS (
@@ -660,10 +718,11 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY ranked.recommendation_score DESC, mi.added_at DESC,
+             ORDER BY paged.recommendation_score DESC, mi.added_at DESC,
                       mi.sort_title, mi.id, ms.id, mt.stream_index"
         );
-        let mut binds = Vec::with_capacity(library_ids.len() + 3);
+        let mut binds = Vec::with_capacity(library_ids.len() * 2 + 3);
+        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
         binds.push(CatalogBind::Text(user_id));
         binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
         binds.push(CatalogBind::Integer(limit));

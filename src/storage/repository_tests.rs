@@ -257,6 +257,295 @@ async fn recommended_catalog_rows_stop_awarding_freshness_after_seven_days() {
 }
 
 #[tokio::test]
+async fn recommended_catalog_rows_limit_recent_playback_items_and_remove_old_state_bonuses() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+    let item_ids = [
+        "active-1",
+        "active-2",
+        "active-3",
+        "active-4",
+        "active-5",
+        "active-6",
+        "unplayed-1",
+        "unplayed-2",
+        "favorite-only",
+    ];
+
+    for item_id in item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .bind(now - 15 * 86_400)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+
+    for item_id in [
+        "active-1", "active-2", "active-3", "active-4", "active-5", "active-6",
+    ] {
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                    user_id, item_id, position_ticks, is_favorite, last_played_at
+                 ) VALUES (?, ?, 1, 1, ?)",
+        )
+        .bind(&user_id)
+        .bind(item_id)
+        .bind(now)
+        .execute(database.pool())
+        .await
+        .expect("active user item state");
+    }
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_favorite)
+         VALUES (?, 'favorite-only', 1)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await
+    .expect("favorite user item state");
+
+    let rows = database
+        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 7)
+        .await
+        .expect("recommended catalog rows");
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "active-1",
+            "active-2",
+            "active-3",
+            "active-4",
+            "active-5",
+            "unplayed-1",
+            "unplayed-2",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recommended_catalog_rows_cap_engagement_scores_and_expire_old_playback() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+    let item_ids = [
+        "favorite-11",
+        "favorite-20",
+        "play-51",
+        "play-60",
+        "play-expired",
+        "baseline",
+    ];
+
+    for item_id in item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .bind(now - 15 * 86_400)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+
+    for index in 0..60 {
+        let playback_user_id = format!("recommendation-user-{index}");
+        sqlx::query(
+            "INSERT INTO users (
+                    id, username_normalized, display_name, password_hash
+                 ) VALUES (?, ?, ?, 'test')",
+        )
+        .bind(&playback_user_id)
+        .bind(&playback_user_id)
+        .bind(&playback_user_id)
+        .execute(database.pool())
+        .await
+        .expect("playback user");
+
+        if index < 51 {
+            sqlx::query(
+                "INSERT INTO user_item_state (user_id, item_id, last_played_at)
+                 VALUES (?, 'play-51', ?)",
+            )
+            .bind(&playback_user_id)
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .expect("play-51 state");
+        }
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, last_played_at)
+             VALUES (?, 'play-60', ?)",
+        )
+        .bind(&playback_user_id)
+        .bind(now)
+        .execute(database.pool())
+        .await
+        .expect("play-60 state");
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, last_played_at)
+             VALUES (?, 'play-expired', ?)",
+        )
+        .bind(&playback_user_id)
+        .bind(now - 6 * 30 * 86_400 - 1)
+        .execute(database.pool())
+        .await
+        .expect("expired playback state");
+        if index < 11 {
+            sqlx::query(
+                "INSERT INTO user_item_state (user_id, item_id, is_favorite)
+                 VALUES (?, 'favorite-11', 1)",
+            )
+            .bind(&playback_user_id)
+            .execute(database.pool())
+            .await
+            .expect("favorite-11 state");
+        }
+        if index < 20 {
+            sqlx::query(
+                "INSERT INTO user_item_state (user_id, item_id, is_favorite)
+                 VALUES (?, 'favorite-20', 1)",
+            )
+            .bind(&playback_user_id)
+            .execute(database.pool())
+            .await
+            .expect("favorite-20 state");
+        }
+    }
+
+    let rows = database
+        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 5)
+        .await
+        .expect("recommended catalog rows");
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "favorite-11",
+            "favorite-20",
+            "play-51",
+            "play-60",
+            "baseline",
+        ]
+    );
+}
+
+#[tokio::test]
+async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+
+    for (item_id, rating) in [
+        ("rating-low", Some(0.0_f64)),
+        ("rating-top", Some(10.0_f64)),
+        ("rating-unknown", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at, has_available_source, rating
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, 1, ?)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .bind(now - 15 * 86_400)
+        .bind(rating)
+        .execute(database.pool())
+        .await
+        .expect("rated media item");
+    }
+
+    let rows = database
+        .list_recommended_catalog_rows(&user_id, &[library_id], 0, 3)
+        .await
+        .expect("recommended catalog rows");
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["rating-top", "rating-unknown", "rating-low"]
+    );
+}
+
+#[tokio::test]
 async fn pending_metadata_candidates_load_current_items_in_one_batch() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
