@@ -13,7 +13,8 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
     application::recommendations::{
-        RECOMMENDATION_CANDIDATE_POOL, current_day_bucket, daily_recommendation_items,
+        RECOMMENDATION_CANDIDATE_POOL, current_recommendation_batch_key,
+        daily_recommendation_items, recommendation_library_scope_key,
     },
     storage::{
         CatalogFilterQuery, CatalogSort as StorageCatalogSort, Database, ResumeItemsQuery,
@@ -390,7 +391,6 @@ impl CatalogService {
 
     pub(crate) fn invalidate_library_pages(&self) {
         self.library_page_cache.invalidate();
-        self.database.invalidate_recommendation_rating_cache();
     }
 
     pub async fn count_item_types(
@@ -915,18 +915,69 @@ impl CatalogService {
         user_id: &str,
         limit: i64,
     ) -> Result<Vec<CatalogItem>, CatalogError> {
+        if library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let batch_key = current_recommendation_batch_key();
+        let library_scope_key = recommendation_library_scope_key(library_ids);
+        if let Some(item_ids) = self
+            .database
+            .find_recommendation_daily_batch(user_id, &library_scope_key, batch_key)
+            .await?
+        {
+            let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
+            let mut items = reorder_catalog_items(assemble_items(rows), &item_ids);
+            items.retain(|item| {
+                library_ids
+                    .iter()
+                    .any(|library_id| library_id == &item.library_id)
+            });
+            self.populate_episode_counts(&mut items).await?;
+            items.truncate(usize::try_from(limit).unwrap_or(0));
+            return Ok(items);
+        }
+
+        self.database
+            .refresh_recommendation_stats_if_needed()
+            .await?;
+
         let rows = self
             .database
             .list_recommended_catalog_rows(user_id, library_ids, 0, RECOMMENDATION_CANDIDATE_POOL)
             .await?;
-        let mut items = assemble_items(rows);
-        self.populate_episode_counts(&mut items).await?;
-        Ok(daily_recommendation_items(
-            items,
+        let mut items = daily_recommendation_items(
+            assemble_items(rows),
             user_id,
-            current_day_bucket(),
-            usize::try_from(limit).unwrap_or(0),
-        ))
+            batch_key,
+            RECOMMENDATION_CANDIDATE_POOL as usize,
+        );
+        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let inserted = self
+            .database
+            .save_recommendation_daily_batch(user_id, &library_scope_key, batch_key, &item_ids)
+            .await?;
+        if !inserted {
+            let stable_item_ids = self
+                .database
+                .find_recommendation_daily_batch(user_id, &library_scope_key, batch_key)
+                .await?
+                .unwrap_or(item_ids);
+            let rows = self
+                .database
+                .list_catalog_rows_by_ids(&stable_item_ids)
+                .await?;
+            items = reorder_catalog_items(assemble_items(rows), &stable_item_ids);
+            items.retain(|item| {
+                library_ids
+                    .iter()
+                    .any(|library_id| library_id == &item.library_id)
+            });
+        }
+        self.populate_episode_counts(&mut items).await?;
+        Ok(items
+            .into_iter()
+            .take(usize::try_from(limit).unwrap_or(0))
+            .collect())
     }
 
     async fn populate_episode_counts(&self, items: &mut [CatalogItem]) -> Result<(), CatalogError> {

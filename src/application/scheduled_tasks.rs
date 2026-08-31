@@ -201,6 +201,9 @@ impl ScheduledTaskService {
     }
 
     pub async fn run_once(&self) {
+        if let Err(error) = self.database.refresh_recommendation_stats_if_needed().await {
+            tracing::warn!(%error, "failed to refresh recommendation statistics");
+        }
         let now = OffsetDateTime::now_utc();
         let current_minute = now.unix_timestamp().div_euclid(60);
         let mut offset = 0;

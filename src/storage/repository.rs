@@ -2,10 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -63,6 +60,7 @@ pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
 const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 const BATCH_INSERT_CHUNK_SIZE: usize = 100;
+const RECOMMENDATION_RATING_CACHE_TTL_SECONDS: i64 = 30 * 86_400;
 const DATABASE_POOL_MAX_CONNECTIONS_ENV: &str = "LUX_DB_MAX_CONNECTIONS";
 const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
 const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 20;
@@ -108,6 +106,15 @@ fn current_unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
+fn recommendation_rating_cache_is_fresh(now: i64, calculated_at: i64) -> bool {
+    calculated_at <= now
+        && now.saturating_sub(calculated_at) < RECOMMENDATION_RATING_CACHE_TTL_SECONDS
+}
+
+pub(crate) fn recommendation_batch_key_at(unix_timestamp: i64) -> i64 {
+    (unix_timestamp - 2 * 60 * 60).div_euclid(86_400)
+}
+
 fn normalize_person_name(value: &str) -> String {
     value
         .trim()
@@ -137,16 +144,20 @@ pub struct Database {
     backend: DatabaseBackend,
     person_credits_write_lock: Arc<AsyncMutex<()>>,
     metadata_write_lock: Arc<AsyncMutex<()>>,
+    recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
-    recommendation_rating_median_generation: Arc<AtomicU64>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
 struct RecommendationRatingMedianCache {
-    generation: u64,
-    values: HashMap<Vec<String>, f64>,
+    values: HashMap<Vec<String>, RecommendationRatingMedianEntry>,
+}
+
+struct RecommendationRatingMedianEntry {
+    value: f64,
+    calculated_at: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -260,10 +271,10 @@ impl Database {
             backend,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
+            recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
-            recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -383,11 +394,6 @@ impl Database {
         }
     }
 
-    pub(crate) fn invalidate_recommendation_rating_cache(&self) {
-        self.recommendation_rating_median_generation
-            .fetch_add(1, Ordering::AcqRel);
-    }
-
     pub(crate) async fn recommendation_rating_median(
         &self,
         library_ids: &[String],
@@ -395,16 +401,41 @@ impl Database {
         let mut cache_key = library_ids.to_vec();
         cache_key.sort_unstable();
         cache_key.dedup();
-        let generation = self
-            .recommendation_rating_median_generation
-            .load(Ordering::Acquire);
         let mut cache = self.recommendation_rating_median_cache.lock().await;
-        if cache.generation != generation {
-            cache.values.clear();
-            cache.generation = generation;
+        let now = current_unix_timestamp();
+        if let Some(entry) = cache.values.get(&cache_key)
+            && recommendation_rating_cache_is_fresh(now, entry.calculated_at)
+        {
+            return Ok(entry.value);
         }
-        if let Some(value) = cache.values.get(&cache_key) {
-            return Ok(*value);
+
+        let persistent_key = cache_key.join("\u{001f}");
+        if let Some(row) = self
+            .query(
+                "SELECT median_rating, calculated_at
+                 FROM recommendation_rating_cache
+                 WHERE cache_key = ?",
+            )
+            .bind(&persistent_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        {
+            let calculated_at: i64 = row.get("calculated_at");
+            if recommendation_rating_cache_is_fresh(now, calculated_at) {
+                let median: f64 = row.get("median_rating");
+                cache.values.insert(
+                    cache_key,
+                    RecommendationRatingMedianEntry {
+                        value: median,
+                        calculated_at,
+                    },
+                );
+                return Ok(median);
+            }
         }
 
         let placeholders = std::iter::repeat_n("?", cache_key.len())
@@ -437,7 +468,31 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-        cache.values.insert(cache_key, median);
+        let calculated_at = current_unix_timestamp();
+        self.query(
+            "INSERT INTO recommendation_rating_cache
+                 (cache_key, median_rating, calculated_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(cache_key) DO UPDATE SET
+                 median_rating = excluded.median_rating,
+                 calculated_at = excluded.calculated_at",
+        )
+        .bind(&persistent_key)
+        .bind(median)
+        .bind(calculated_at)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        cache.values.insert(
+            cache_key,
+            RecommendationRatingMedianEntry {
+                value: median,
+                calculated_at,
+            },
+        );
         Ok(median)
     }
 

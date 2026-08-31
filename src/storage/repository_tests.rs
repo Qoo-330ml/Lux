@@ -1,12 +1,224 @@
 use super::*;
 use crate::{
     application::{
-        candidates::MetadataCandidateService, libraries::LibraryService, scanner::LibraryScanner,
-        setup::SetupService,
+        access::MediaAccessService, candidates::MetadataCandidateService, catalog::CatalogService,
+        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
     },
     config::{Config, DatabaseBackend, PostgresConnection},
     library::LibraryKind,
 };
+
+async fn refresh_recommendation_stats(database: &Database) {
+    sqlx::query(
+        "UPDATE recommendation_stats_state
+         SET batch_key = batch_key - 1
+         WHERE id = 1",
+    )
+    .execute(database.pool())
+    .await
+    .expect("invalidate recommendation stats batch");
+    assert!(
+        database
+            .refresh_recommendation_stats_if_needed()
+            .await
+            .expect("refresh recommendation stats")
+    );
+}
+
+#[tokio::test]
+async fn recommendation_stats_are_refreshed_once_per_batch_and_deduplicate_users() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let admin = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Recommendations", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let admin_id = admin.id.to_string();
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO users (
+                id, username_normalized, display_name, password_hash
+             ) VALUES ('recommendation-user-2', 'recommendation-user-2',
+                       'Recommendation User 2', 'test')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("second user");
+    for item_id in ["playback-item", "favorite-item", "expired-item"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, last_played_at)
+         VALUES (?, 'playback-item', ?),
+                ('recommendation-user-2', 'playback-item', ?),
+                (?, 'expired-item', ?),
+                (?, 'favorite-item', 0),
+                ('recommendation-user-2', 'favorite-item', 0)",
+    )
+    .bind(&admin_id)
+    .bind(now)
+    .bind(now)
+    .bind(&admin_id)
+    .bind(now - 180 * 86_400)
+    .bind(&admin_id)
+    .execute(database.pool())
+    .await
+    .expect("user item states");
+    sqlx::query(
+        "UPDATE user_item_state
+         SET is_favorite = 1
+         WHERE item_id = 'favorite-item'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("favorite states");
+    sqlx::query(
+        "INSERT INTO playback_sessions (
+                id, user_id, item_id, play_session_id, device_id, state, last_event_at
+             ) VALUES ('recommendation-session', ?, 'playback-item',
+                       'recommendation-play-session', 'test', 'PLAYING', ?)",
+    )
+    .bind(&admin_id)
+    .bind(now)
+    .execute(database.pool())
+    .await
+    .expect("playback session");
+
+    refresh_recommendation_stats(&database).await;
+    let scores = sqlx::query(
+        "SELECT item_id, recent_playback_score, favorite_score
+         FROM recommendation_item_stats
+         WHERE item_id IN ('playback-item', 'favorite-item', 'expired-item')
+         ORDER BY item_id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("recommendation scores");
+    assert_eq!(scores.len(), 3);
+    assert_eq!(scores[0].get::<String, _>("item_id"), "expired-item");
+    assert_eq!(scores[0].get::<i64, _>("recent_playback_score"), 0);
+    assert_eq!(scores[1].get::<String, _>("item_id"), "favorite-item");
+    assert_eq!(scores[1].get::<i64, _>("favorite_score"), 10);
+    assert_eq!(scores[2].get::<String, _>("item_id"), "playback-item");
+    assert_eq!(scores[2].get::<i64, _>("recent_playback_score"), 2);
+    assert!(
+        !database
+            .refresh_recommendation_stats_if_needed()
+            .await
+            .expect("same-batch stats refresh")
+    );
+}
+
+#[tokio::test]
+async fn recommendation_daily_batch_is_stable_until_the_next_batch() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Recommendations", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, added_at, has_available_source
+             ) VALUES ('daily-item-1', ?, 'MOVIE', 'Daily item 1', 'daily item 1',
+                       'LOCAL_CONFIRMED', ?, 1)",
+    )
+    .bind(&library_id)
+    .bind(now - 15 * 86_400)
+    .execute(database.pool())
+    .await
+    .expect("initial media item");
+    refresh_recommendation_stats(&database).await;
+
+    let service = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let first = service
+        .list_recommended_for_library_ids(std::slice::from_ref(&library_id), &user_id, 7)
+        .await
+        .expect("first daily recommendation");
+    assert_eq!(first.len(), 1);
+    let first_ids = first.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, added_at, has_available_source, rating
+             ) VALUES ('daily-item-2', ?, 'MOVIE', 'Daily item 2', 'daily item 2',
+                       'LOCAL_CONFIRMED', ?, 1, 10.0)",
+    )
+    .bind(&library_id)
+    .bind(now)
+    .execute(database.pool())
+    .await
+    .expect("new media item");
+    let same_batch = service
+        .list_recommended_for_library_ids(std::slice::from_ref(&library_id), &user_id, 7)
+        .await
+        .expect("same daily recommendation");
+    assert_eq!(
+        same_batch
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>(),
+        first_ids
+    );
+
+    sqlx::query(
+        "UPDATE recommendation_daily_batches
+         SET batch_key = batch_key - 1
+         WHERE user_id = ?",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await
+    .expect("advance recommendation batch");
+    let next_batch = service
+        .list_recommended_for_library_ids(&[library_id], &user_id, 7)
+        .await
+        .expect("next daily recommendation");
+    assert_eq!(next_batch.len(), 2);
+    assert!(next_batch.iter().any(|item| item.id == "daily-item-2"));
+}
 
 #[test]
 fn database_pool_max_connections_uses_backend_defaults() {
@@ -242,6 +454,7 @@ async fn recommended_catalog_rows_stop_awarding_freshness_after_seven_days() {
     .execute(database.pool())
     .await
     .expect("user item state");
+    refresh_recommendation_stats(&database).await;
 
     let rows = database
         .list_recommended_catalog_rows(&user_id, &[library_id], 0, 2)
@@ -331,6 +544,7 @@ async fn recommended_catalog_rows_limit_recent_playback_items_and_remove_old_sta
     .execute(database.pool())
     .await
     .expect("favorite user item state");
+    refresh_recommendation_stats(&database).await;
 
     let rows = database
         .list_recommended_catalog_rows(&user_id, &[library_id], 0, 7)
@@ -468,6 +682,8 @@ async fn recommended_catalog_rows_cap_engagement_scores_and_expire_old_playback(
         }
     }
 
+    refresh_recommendation_stats(&database).await;
+
     let rows = database
         .list_recommended_catalog_rows(&user_id, &[library_id], 0, 5)
         .await
@@ -532,6 +748,7 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
         .await
         .expect("rated media item");
     }
+    refresh_recommendation_stats(&database).await;
 
     database.reset_query_count();
     let rows = database
@@ -551,7 +768,7 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             .collect::<Vec<_>>(),
         ["rating-top", "rating-unknown", "rating-low"]
     );
-    assert_eq!(first_query_count, 2);
+    assert_eq!(first_query_count, 4);
     assert_eq!(database.query_count(), 1);
     assert_eq!(
         rows.iter()
@@ -583,13 +800,159 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
         .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
         .await
         .expect("refreshed recommended catalog rows");
-    assert_eq!(database.query_count(), 2);
+    assert_eq!(database.query_count(), 1);
     assert_eq!(
         refreshed_rows
             .iter()
             .map(|row| row.item_id.as_str())
             .collect::<Vec<_>>(),
         ["rating-low", "rating-top", "rating-unknown"]
+    );
+}
+
+#[tokio::test]
+async fn selecting_metadata_candidate_keeps_recommendation_rating_median_until_ttl() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Ratings", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let item_id = "rating-selection-item";
+    let candidate_id = "rating-selection-candidate";
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, has_available_source, rating
+             ) VALUES (?, ?, 'MOVIE', 'Rating selection', 'rating selection',
+                       'LOCAL_CONFIRMED', 1, 1.0)",
+    )
+    .bind(item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO metadata_candidates (
+                id, item_id, provider, provider_id, candidate_json, score, status
+             ) VALUES (?, ?, 'TMDB', 'rating-selection', '{}', 100, 'PENDING')",
+    )
+    .bind(candidate_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await
+    .expect("metadata candidate");
+
+    assert_eq!(
+        database
+            .recommendation_rating_median(&[library.id.to_string()])
+            .await
+            .expect("initial median"),
+        1.0
+    );
+    assert!(
+        database
+            .select_metadata_candidate(SelectedMetadataUpdate {
+                item_id,
+                candidate_id,
+                title: "Rating selection",
+                original_title: None,
+                overview: None,
+                production_year: None,
+                premiere_date: None,
+                last_air_date: None,
+                status: None,
+                original_language: None,
+                rating: Some(9.0),
+                rating_source: Some("TMDB"),
+                provider_ids_json: "{}",
+                metadata_scraper_id: None,
+                metadata_fingerprint: &[],
+                provenance_json: "{}",
+                locked_fields_json: "[]",
+                poster_fallback_required: false,
+                keep_pending: false,
+            })
+            .await
+            .expect("select metadata candidate")
+    );
+    assert_eq!(
+        database
+            .recommendation_rating_median(&[library.id.to_string()])
+            .await
+            .expect("cached median"),
+        1.0
+    );
+}
+
+#[tokio::test]
+async fn recommendation_rating_median_survives_restart_until_thirty_day_ttl() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Ratings", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, has_available_source, rating
+             ) VALUES ('persistent-rating-item', ?, 'MOVIE', 'Persistent rating',
+                       'persistent rating', 'LOCAL_CONFIRMED', 1, 7.0)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    assert_eq!(
+        database
+            .recommendation_rating_median(std::slice::from_ref(&library_id))
+            .await
+            .expect("initial median"),
+        7.0
+    );
+    database.close().await;
+
+    let restarted = Database::connect(&config)
+        .await
+        .expect("restarted database");
+    sqlx::query("UPDATE media_items SET rating = 9.0 WHERE id = 'persistent-rating-item'")
+        .execute(restarted.pool())
+        .await
+        .expect("updated rating");
+    assert_eq!(
+        restarted
+            .recommendation_rating_median(std::slice::from_ref(&library_id))
+            .await
+            .expect("persistent median"),
+        7.0
+    );
+    sqlx::query(
+        "UPDATE recommendation_rating_cache
+         SET calculated_at = unixepoch() - 30 * 86400",
+    )
+    .execute(restarted.pool())
+    .await
+    .expect("expired median cache");
+    restarted.close().await;
+    let expired = Database::connect(&config)
+        .await
+        .expect("expired cache database");
+    assert_eq!(
+        expired
+            .recommendation_rating_median(std::slice::from_ref(&library_id))
+            .await
+            .expect("refreshed median"),
+        9.0
     );
 }
 
@@ -775,6 +1138,68 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
 }
 
 #[tokio::test]
+async fn recommendation_query_uses_materialized_stats_and_image_indexes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Recommendation plan", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let query = format!(
+        "EXPLAIN QUERY PLAN
+         SELECT mi.id
+                , COALESCE(rs.recent_playback_score, 0)
+         FROM media_items mi
+         JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+         LEFT JOIN recommendation_item_stats rs ON rs.item_id = mi.id
+         LEFT JOIN user_item_state us
+           ON us.item_id = mi.id AND us.user_id = ?
+         WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+           AND mi.item_type IN ('MOVIE', 'SERIES')
+           AND mi.library_id IN (?)"
+    );
+    let plan = sqlx::query(sqlx::AssertSqlSafe(query))
+        .bind("plan-user")
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await
+        .expect("recommendation query plan")
+        .into_iter()
+        .map(|row| row.get::<String, _>("detail"))
+        .collect::<Vec<_>>();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("recommendation_item_stats")),
+        "recommendation query did not use materialized stats: {plan:?}"
+    );
+
+    let image_plan = sqlx::query(
+        "EXPLAIN QUERY PLAN
+         SELECT (SELECT id FROM item_images
+                 WHERE item_id = ? AND image_type = 'POSTER'
+                 ORDER BY image_index LIMIT 1)",
+    )
+    .bind("plan-item")
+    .fetch_all(database.pool())
+    .await
+    .expect("image query plan")
+    .into_iter()
+    .map(|row| row.get::<String, _>("detail"))
+    .collect::<Vec<_>>();
+    assert!(
+        image_plan
+            .iter()
+            .any(|detail| detail.contains("idx_item_images_recommendation_lookup")),
+        "recommendation image lookup did not use the covering index: {image_plan:?}"
+    );
+}
+
+#[tokio::test]
 async fn concurrent_metadata_capability_writes_are_serialized() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -935,10 +1360,10 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
-        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -2485,10 +2910,10 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
-        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -2547,10 +2972,10 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
-        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -2641,10 +3066,10 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
-        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -2748,10 +3173,10 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
-        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 

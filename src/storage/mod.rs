@@ -43,5 +43,5 @@ pub(crate) use repository::{
     StoredStrmMediaSource, StoredStrmProbeJob, StoredSubtitleStream, StoredThumbnailSource,
     StoredUser, StoredUserItemState, StoredWebPlaybackSession, StoredWebSession,
     StoredWebSessionSummary, UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
-    movie_parent_folder_identity,
+    movie_parent_folder_identity, recommendation_batch_key_at,
 };

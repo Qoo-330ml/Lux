@@ -3,6 +3,192 @@ use super::*;
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 
 impl Database {
+    pub(crate) async fn refresh_recommendation_stats_if_needed(
+        &self,
+    ) -> Result<bool, StorageError> {
+        let _refresh_guard = self.recommendation_stats_refresh_lock.lock().await;
+        let now = current_unix_timestamp();
+        let batch_key = recommendation_batch_key_at(now);
+        let current_batch = self
+            .query_scalar::<i64>(
+                "SELECT batch_key
+                 FROM recommendation_stats_state
+                 WHERE id = 1",
+            )
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if current_batch == Some(batch_key) {
+            return Ok(false);
+        }
+
+        let min_function = self.scalar_min_function();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let refresh_query = format!(
+            "WITH recent_playback_users AS (
+                 SELECT ps.item_id, ps.user_id
+                 FROM playback_sessions ps
+                 WHERE ps.last_event_at > ?
+                 UNION
+                 SELECT us.item_id, us.user_id
+                 FROM user_item_state us
+                 WHERE us.last_played_at > ?
+             ),
+             playback_counts AS (
+                 SELECT item_id, COUNT(*) AS recent_playback_user_count
+                 FROM recent_playback_users
+                 GROUP BY item_id
+             ),
+             favorite_counts AS (
+                 SELECT item_id, COUNT(*) AS favorite_user_count
+                 FROM user_item_state
+                 WHERE is_favorite = 1
+                 GROUP BY item_id
+             )
+             INSERT INTO recommendation_item_stats (
+                 item_id, recent_playback_score, favorite_score, refreshed_batch_key
+             )
+             SELECT mi.id,
+                    {min_function}(50, COALESCE(pc.recent_playback_user_count, 0)),
+                    {min_function}(50, 5 * COALESCE(fc.favorite_user_count, 0)),
+                    ?
+             FROM media_items mi
+             LEFT JOIN playback_counts pc ON pc.item_id = mi.id
+             LEFT JOIN favorite_counts fc ON fc.item_id = mi.id
+             WHERE mi.removed_at IS NULL
+               AND mi.item_type IN ('MOVIE', 'SERIES')
+             ON CONFLICT(item_id) DO UPDATE SET
+                 recent_playback_score = excluded.recent_playback_score,
+                 favorite_score = excluded.favorite_score,
+                 refreshed_batch_key = excluded.refreshed_batch_key",
+        );
+        self.query(sqlx::AssertSqlSafe(refresh_query))
+            .bind(now - RECOMMENDATION_PLAYBACK_WINDOW_SECONDS)
+            .bind(now - RECOMMENDATION_PLAYBACK_WINDOW_SECONDS)
+            .bind(batch_key)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "DELETE FROM recommendation_item_stats
+             WHERE item_id NOT IN (
+                 SELECT id
+                 FROM media_items
+                 WHERE removed_at IS NULL AND item_type IN ('MOVIE', 'SERIES')
+             )",
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "INSERT INTO recommendation_stats_state (id, batch_key, refreshed_at)
+             VALUES (1, ?, ?)
+             ON CONFLICT(id) DO UPDATE SET
+                 batch_key = excluded.batch_key,
+                 refreshed_at = excluded.refreshed_at",
+        )
+        .bind(batch_key)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "DELETE FROM recommendation_daily_batches
+             WHERE batch_key < ?",
+        )
+        .bind(batch_key)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn find_recommendation_daily_batch(
+        &self,
+        user_id: &str,
+        library_scope_key: &str,
+        batch_key: i64,
+    ) -> Result<Option<Vec<String>>, StorageError> {
+        let Some(item_ids_json) = self
+            .query_scalar::<String>(
+                "SELECT item_ids_json
+                 FROM recommendation_daily_batches
+                 WHERE user_id = ? AND library_scope_key = ? AND batch_key = ?",
+            )
+            .bind(user_id)
+            .bind(library_scope_key)
+            .bind(batch_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        serde_json::from_str(&item_ids_json)
+            .map(Some)
+            .map_err(|error| StorageError::Serialization(error.to_string()))
+    }
+
+    pub(crate) async fn save_recommendation_daily_batch(
+        &self,
+        user_id: &str,
+        library_scope_key: &str,
+        batch_key: i64,
+        item_ids: &[String],
+    ) -> Result<bool, StorageError> {
+        let item_ids_json = serde_json::to_string(item_ids)
+            .map_err(|error| StorageError::Serialization(error.to_string()))?;
+        self.query(
+            "INSERT INTO recommendation_daily_batches (
+                 user_id, library_scope_key, batch_key, item_ids_json
+             ) VALUES (?, ?, ?, ?)
+             ON CONFLICT(user_id, library_scope_key, batch_key) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(library_scope_key)
+        .bind(batch_key)
+        .bind(item_ids_json)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn count_catalog_items(
         &self,
         library_id: Option<&str>,
@@ -605,36 +791,16 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "WITH recent_playback_users AS (
-                 SELECT ps.item_id, ps.user_id
-                 FROM playback_sessions ps
-                 WHERE ps.last_event_at > unixepoch() - {RECOMMENDATION_PLAYBACK_WINDOW_SECONDS}
-                 UNION
-                 SELECT us.item_id, us.user_id
-                 FROM user_item_state us
-                 WHERE us.last_played_at > unixepoch() - {RECOMMENDATION_PLAYBACK_WINDOW_SECONDS}
-             ),
-             playback_counts AS (
-                 SELECT item_id, COUNT(*) AS recent_playback_user_count
-                 FROM recent_playback_users
-                 GROUP BY item_id
-             ),
-             favorite_counts AS (
-                 SELECT item_id, COUNT(*) AS favorite_user_count
-                 FROM user_item_state
-                 WHERE is_favorite = 1
-                 GROUP BY item_id
-             ),
-             scored AS (
+            "WITH scored AS (
                  SELECT mi.id,
-                        COALESCE(pc.recent_playback_user_count, 0) AS recent_playback_user_count,
+                        COALESCE(rs.recent_playback_score, 0) AS recent_playback_score,
                         (
                             CASE WHEN us.item_id IS NULL THEN 35 ELSE 0 END
                             + CASE WHEN COALESCE(us.is_played, 0) = 1 THEN -35 ELSE 0 END
-                            + {min_function}(50, 5 * COALESCE(fc.favorite_user_count, 0))
+                            + COALESCE(rs.favorite_score, 0)
                             + {min_function}(50.0, {max_function}(0.0,
                                 COALESCE(mi.rating, ?) * 5.0))
-                            + {min_function}(50, COALESCE(pc.recent_playback_user_count, 0))
+                            + COALESCE(rs.recent_playback_score, 0)
                             + {min_function}(7, {max_function}(0, 7 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
                             + CASE WHEN us.last_played_at IS NULL THEN 0 ELSE
                                 {min_function}(30, {max_function}(0, 30 - CAST((unixepoch() - us.last_played_at) / 86400 AS INTEGER)))
@@ -644,8 +810,7 @@ impl Database {
                         mi.sort_title
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 LEFT JOIN playback_counts pc ON pc.item_id = mi.id
-                 LEFT JOIN favorite_counts fc ON fc.item_id = mi.id
+                 LEFT JOIN recommendation_item_stats rs ON rs.item_id = mi.id
                  LEFT JOIN user_item_state us
                    ON us.item_id = mi.id AND us.user_id = ?
                  WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
@@ -655,7 +820,7 @@ impl Database {
              playback_top AS (
                  SELECT scored.*
                  FROM scored
-                 WHERE recent_playback_user_count > 0
+                 WHERE recent_playback_score > 0
                  ORDER BY recommendation_score DESC, added_at DESC,
                           sort_title, id
                  LIMIT 5
@@ -665,7 +830,7 @@ impl Database {
                  UNION ALL
                  SELECT *
                  FROM scored
-                 WHERE recent_playback_user_count = 0
+                 WHERE recent_playback_score = 0
              )
              SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -4309,7 +4474,6 @@ impl Database {
         &self,
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
-        let rating_changed = update.rating.is_some();
         let sort_title = update.title.to_lowercase();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
@@ -4346,17 +4510,13 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        let result = transaction
+        transaction
             .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            });
-        if result.is_ok() && rating_changed {
-            self.invalidate_recommendation_rating_cache();
-        }
-        result
+            })
     }
 
     pub(crate) async fn media_item_metadata_fingerprint(
