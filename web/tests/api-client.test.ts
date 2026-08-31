@@ -56,6 +56,48 @@ function installLocalStorage(initialValue: string | null) {
   };
 }
 
+function installBlockedClientState() {
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, "document");
+  const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  Object.defineProperty(globalThis, "document", {
+    configurable: true,
+    value: {
+      get cookie() {
+        return "";
+      },
+      set cookie(_value: string) {
+        throw new Error("client cookies blocked");
+      },
+    },
+  });
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: {
+      getItem() {
+        throw new Error("localStorage blocked");
+      },
+      setItem() {
+        throw new Error("localStorage blocked");
+      },
+      removeItem() {
+        throw new Error("localStorage blocked");
+      },
+    },
+  });
+  return () => {
+    if (documentDescriptor) {
+      Object.defineProperty(globalThis, "document", documentDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "document");
+    }
+    if (storageDescriptor) {
+      Object.defineProperty(globalThis, "localStorage", storageDescriptor);
+    } else {
+      Reflect.deleteProperty(globalThis, "localStorage");
+    }
+  };
+}
+
 describe("LuxApiClient", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -869,6 +911,28 @@ describe("LuxApiClient", () => {
       id: "admin-1",
       canManageServer: true,
     });
+  });
+
+  it("keeps the login CSRF nonce in memory when privacy mode blocks browser storage", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (String(input) === "/api/v1/auth/login") {
+        return new Response(JSON.stringify({ user: { id: "user-1" }, csrfToken: "csrf from login" }), { status: 200 });
+      }
+      expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf from login");
+      return new Response(null, { status: 204 });
+    });
+    const restoreClientState = installBlockedClientState();
+    try {
+      const client = new LuxApiClient();
+      await client.login("user", "password");
+      await client.setFavorite("item-1", true);
+      await client.setPlayed("item-1", true);
+      await client.logout();
+
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    } finally {
+      restoreClientState();
+    }
   });
 
   it("uses the stored CSRF token when a proxy leaves only the session cookie", async () => {

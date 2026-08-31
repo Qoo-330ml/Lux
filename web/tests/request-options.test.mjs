@@ -50,3 +50,47 @@ test("legacy web requests use the stored CSRF token when the cookie is missing",
     }
   }
 });
+
+test("legacy web requests keep the login CSRF nonce in memory when privacy mode blocks storage", () => {
+  const previousDocument = globalThis.document;
+  const previousStorage = globalThis.localStorage;
+  globalThis.document = {
+    get cookie() {
+      return "";
+    },
+    set cookie(_value) {
+      throw new Error("client cookies blocked");
+    },
+  };
+  globalThis.localStorage = {
+    getItem() {
+      throw new Error("localStorage blocked");
+    },
+    setItem() {
+      throw new Error("localStorage blocked");
+    },
+    removeItem() {
+      throw new Error("localStorage blocked");
+    },
+  };
+  try {
+    rememberCsrfToken("csrf-from-login");
+
+    assert.equal(readCsrfToken(), "csrf-from-login");
+    assert.equal(requestOptions({ method: "POST" }).headers["x-csrf-token"], "csrf-from-login");
+
+    clearCsrfToken();
+    assert.equal(readCsrfToken(), "");
+  } finally {
+    if (previousDocument === undefined) {
+      delete globalThis.document;
+    } else {
+      globalThis.document = previousDocument;
+    }
+    if (previousStorage === undefined) {
+      delete globalThis.localStorage;
+    } else {
+      globalThis.localStorage = previousStorage;
+    }
+  }
+});

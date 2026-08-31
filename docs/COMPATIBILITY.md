@@ -272,6 +272,21 @@ TypeScript 检查和生产构建通过；Rust 定向播放测试 1 个通过，R
 本阶段没有新增字幕专用 302/Redia 接口、远程媒体代理、ffmpeg/ffprobe 读取、PGS/SUP 支持或 ArtPlayer 运行时依赖。Rust
 测试和本机 `arm64` 结果不外推为 NAS/x86_64 性能；发布前仍需项目所有者确认后关闭阶段。
 
+## Lux Web Chrome 隐私浏览模式 CSRF 兼容性（2026-08-31）
+
+本次回归针对经 NextEmby 代理访问 Lux、且 Chrome 隐私浏览模式无法读取或写入客户端 Cookie/Web Storage 的场景。
+登录响应中的 CSRF nonce 现在同时保留在当前页面内存中；若浏览器允许，则继续写入同源 Cookie 和 Web Storage。当前页面
+在客户端存储不可用时仍可为收藏、已看、播放会话和退出请求发送 `X-CSRF-Token`，会话认证仍只依赖 HttpOnly 的
+`lux_session` Cookie。
+
+| 场景 | 结果 | 证据与边界 |
+|---|---|---|
+| React Web API 客户端 | 通过 | Vitest 覆盖登录响应保存 nonce、客户端 Cookie/Storage 同时阻断，以及收藏、已看、播放会话和退出请求继续携带 CSRF 请求头 |
+| 旧版静态 Web 入口 | 通过 | Node 测试覆盖 Cookie/Storage 同时阻断时的 nonce 读取、写请求请求头和退出清理 |
+| 真实 Chrome 隐私窗口 | 未在本次本机回归中单独宣称 | 当前证据是浏览器存储阻断模拟；真实 Chrome、扩展和代理组合仍需在部署后的 8098 现场复测 |
+
+该修复不保存会话令牌、不改变服务端 CSRF 校验或 NextEmby 行为；隐私模式关闭页面后，内存 nonce 会随页面销毁，用户需重新登录。
+
 ## 记录格式
 
 每次探针或回归测试至少记录：客户端版本、平台版本、Lux 提交、请求路径序列、脱敏请求参数、状态码、关键响应字段、结果和已知差异。密码、token、Cookie、真实 `.strm` URL 和用户数据不得进入 fixture 或文档。

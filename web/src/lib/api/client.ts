@@ -67,6 +67,7 @@ import type {
 
 const csrfCookie = "lux_csrf";
 const csrfTokenStorageKey = "lux_csrf_token";
+let inMemoryCsrfToken = "";
 
 export type LibrarySortBy = "Name" | "DateCreated" | "PremiereDate" | "CommunityRating";
 export type LibrarySortOrder = "Ascending" | "Descending";
@@ -110,10 +111,14 @@ export class ApiError extends Error {
 
 function readCookie(name: string): string {
   if (typeof document === "undefined") return "";
-  const value = document.cookie
-    .split("; ")
-    .find((part) => part.startsWith(`${name}=`));
-  return value ? decodeURIComponent(value.slice(name.length + 1)) : "";
+  try {
+    const value = document.cookie
+      .split("; ")
+      .find((part) => part.startsWith(`${name}=`));
+    return value ? decodeURIComponent(value.slice(name.length + 1)) : "";
+  } catch {
+    return "";
+  }
 }
 
 function writeClientCookie(name: string, value: string, maxAge?: number) {
@@ -122,7 +127,11 @@ function writeClientCookie(name: string, value: string, maxAge?: number) {
   const secureAttribute = typeof window !== "undefined" && window.location.protocol === "https:"
     ? "; Secure"
     : "";
-  document.cookie = `${name}=${encodeURIComponent(value)}; Path=/;${maxAgeAttribute} SameSite=Lax${secureAttribute}`;
+  try {
+    document.cookie = `${name}=${encodeURIComponent(value)}; Path=/;${maxAgeAttribute} SameSite=Lax${secureAttribute}`;
+  } catch {
+    // Privacy mode may reject client cookie writes; the in-memory nonce remains usable.
+  }
 }
 
 function readStoredCsrfToken(): string {
@@ -135,6 +144,7 @@ function readStoredCsrfToken(): string {
 }
 
 function writeStoredCsrfToken(value: string | null) {
+  inMemoryCsrfToken = value ?? "";
   try {
     if (typeof localStorage === "undefined") return;
     if (value) {
@@ -148,7 +158,7 @@ function writeStoredCsrfToken(value: string | null) {
 }
 
 function readCsrfToken(): string {
-  return readStoredCsrfToken() || readCookie(csrfCookie);
+  return inMemoryCsrfToken || readStoredCsrfToken() || readCookie(csrfCookie);
 }
 
 async function readJson<T>(response: Response): Promise<T | undefined> {
