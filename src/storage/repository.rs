@@ -2450,6 +2450,8 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) original_title: Option<&'a str>,
     pub(crate) overview: Option<&'a str>,
     pub(crate) production_year: Option<i64>,
+    pub(crate) rating: Option<f64>,
+    pub(crate) rating_source: Option<&'a str>,
     pub(crate) metadata_fingerprint: &'a [u8],
     pub(crate) provenance_json: &'a str,
     pub(crate) locked_fields_json: &'a str,

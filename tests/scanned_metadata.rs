@@ -21,7 +21,7 @@ async fn completed_movie_scan_indexes_local_nfo_and_images()
     .await?;
     tokio::fs::write(
         movie_dir.join("Example.Movie.2020.nfo"),
-        "<movie><title>Title From NFO</title><plot>Overview from NFO</plot></movie>",
+        "<movie><title>Title From NFO</title><plot>Overview from NFO</plot><rating>8.4</rating></movie>",
     )
     .await?;
     tokio::fs::write(movie_dir.join("poster.jpg"), b"poster").await?;
@@ -40,13 +40,20 @@ async fn completed_movie_scan_indexes_local_nfo_and_images()
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
 
-    let item: (String, String) =
-        sqlx::query_as("SELECT title, overview FROM media_items WHERE item_type = 'MOVIE'")
-            .fetch_one(database.pool())
-            .await?;
+    let item: (String, String, Option<f64>, Option<String>) = sqlx::query_as(
+        "SELECT title, overview, rating, rating_source
+         FROM media_items WHERE item_type = 'MOVIE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
     assert_eq!(
         item,
-        ("Title From NFO".to_owned(), "Overview from NFO".to_owned())
+        (
+            "Title From NFO".to_owned(),
+            "Overview from NFO".to_owned(),
+            Some(8.4),
+            Some("NFO".to_owned()),
+        )
     );
 
     let images: Vec<(String, String)> =

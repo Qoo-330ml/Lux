@@ -1178,6 +1178,7 @@ impl MetadataEnricher {
             }
         }
         let source_fingerprint = nfo_content_fingerprint(&bytes);
+        let local_rating = projection.details.rating;
         if let Some(local_nfo) = &self.local_nfo {
             let current = local_nfo
                 .is_current(item_id, &source_fingerprint)
@@ -1261,6 +1262,8 @@ impl MetadataEnricher {
                     original_title: state.metadata.original_title.as_deref(),
                     overview: state.metadata.overview.as_deref(),
                     production_year: state.metadata.production_year.map(i64::from),
+                    rating: local_rating,
+                    rating_source: local_rating.map(|_| "NFO"),
                     metadata_fingerprint: fingerprint,
                     provenance_json: &provenance_json,
                     locked_fields_json: &locked_fields_json,

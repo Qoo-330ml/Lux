@@ -4278,6 +4278,8 @@ impl Database {
                  original_title = ?,
                  overview = ?,
                  production_year = ?,
+                 rating = COALESCE(?, rating),
+                 rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  metadata_fingerprint = ?,
                  metadata_provenance_json = ?,
                  locked_fields_json = ?
@@ -4288,6 +4290,9 @@ impl Database {
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
+        .bind(update.rating)
+        .bind(update.rating_source)
+        .bind(update.rating_source)
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
