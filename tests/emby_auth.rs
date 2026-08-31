@@ -2,8 +2,10 @@ use luxd::{
     api::{AppState, app_with_state},
     application::setup::SetupService,
     auth::{
+        admin_api_key::AdminApiKeyService,
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
+        users::UserStore,
     },
     config::Config,
     storage::Database,
@@ -19,6 +21,98 @@ impl<T> Drop for AbortOnDrop<T> {
     fn drop(&mut self) {
         self.0.abort();
     }
+}
+
+#[tokio::test]
+async fn emby_users_requires_server_manager_and_supports_both_prefixes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let users = UserStore::new(database.clone())?;
+    let viewer = users
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let admin_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+
+    for path in ["/Users", "/emby/Users"] {
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .query(&[("api_key", admin_key.as_str())])
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        assert_eq!(
+            response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next()),
+            Some("application/json"),
+            "{path}"
+        );
+        let body = response.json::<serde_json::Value>().await?;
+        let listed_users = body.as_array().ok_or("users response is not an array")?;
+        assert_eq!(listed_users.len(), 2, "{path}");
+        assert!(
+            listed_users
+                .iter()
+                .any(|user| user["Id"] == admin.id.to_string())
+        );
+        assert!(
+            listed_users
+                .iter()
+                .any(|user| user["Id"] == viewer.id.to_string())
+        );
+        assert!(body.to_string().find("password").is_none());
+    }
+
+    let viewer_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&serde_json::json!({
+            "Username": "viewer",
+            "Pw": "viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(viewer_login.status(), reqwest::StatusCode::OK);
+    let viewer_token = viewer_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned();
+    let viewer_response = client
+        .get(format!("http://{address}/Users"))
+        .header("X-Emby-Token", viewer_token)
+        .send()
+        .await?;
+    assert_eq!(viewer_response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let missing_key = client.get(format!("http://{address}/Users")).send().await?;
+    assert_eq!(missing_key.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
 }
 
 #[tokio::test]

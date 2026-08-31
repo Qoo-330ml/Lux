@@ -213,6 +213,35 @@ pub(super) async fn emby_public_users(State(state): State<AppState>) -> Json<Val
     ))
 }
 
+pub(super) async fn emby_users(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match auth.public_users().await {
+        Ok(users) => users,
+        Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    };
+    let server_name = current_emby_server_name(&state).await;
+    Json(Value::Array(
+        users
+            .iter()
+            .map(|user| emby_user_json(user, &state.server_id, &server_name, &[]))
+            .collect(),
+    ))
+    .into_response()
+}
+
 pub(super) async fn emby_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
