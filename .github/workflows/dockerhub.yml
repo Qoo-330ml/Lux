@@ -100,10 +100,28 @@ jobs:
               --sbom=true \
               --push \
               .
+            if ! docker buildx imagetools inspect "$runtime_image" >"$runtime_inspect" 2>&1; then
+              cat "$runtime_inspect" >&2
+              exit 1
+            fi
           fi
 
-          runtime_digest="$(docker buildx imagetools inspect "$runtime_image" \
-            | awk '$1 == "Digest:" { print $2; exit }')"
+          if ! runtime_digest="$(awk '
+            $1 == "Digest:" && !found {
+              digest = $2
+              found = 1
+            }
+            END {
+              if (!found) {
+                exit 1
+              }
+              print digest
+            }
+          ' "$runtime_inspect")"; then
+            cat "$runtime_inspect" >&2
+            echo "Could not resolve an immutable digest for $runtime_image" >&2
+            exit 1
+          fi
           if [[ ! "$runtime_digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "Could not resolve an immutable digest for $runtime_image" >&2
             exit 1
