@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Path, PathBuf},
     str::FromStr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -134,8 +137,16 @@ pub struct Database {
     backend: DatabaseBackend,
     person_credits_write_lock: Arc<AsyncMutex<()>>,
     metadata_write_lock: Arc<AsyncMutex<()>>,
+    recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
+    recommendation_rating_median_generation: Arc<AtomicU64>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
+}
+
+#[derive(Default)]
+struct RecommendationRatingMedianCache {
+    generation: u64,
+    values: HashMap<Vec<String>, f64>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -249,6 +260,10 @@ impl Database {
             backend,
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
+            recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+                RecommendationRatingMedianCache::default(),
+            )),
+            recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -366,6 +381,64 @@ impl Database {
             DatabaseBackend::Sqlite => "MIN",
             DatabaseBackend::Postgres => "LEAST",
         }
+    }
+
+    pub(crate) fn invalidate_recommendation_rating_cache(&self) {
+        self.recommendation_rating_median_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(crate) async fn recommendation_rating_median(
+        &self,
+        library_ids: &[String],
+    ) -> Result<f64, StorageError> {
+        let mut cache_key = library_ids.to_vec();
+        cache_key.sort_unstable();
+        cache_key.dedup();
+        let generation = self
+            .recommendation_rating_median_generation
+            .load(Ordering::Acquire);
+        let mut cache = self.recommendation_rating_median_cache.lock().await;
+        if cache.generation != generation {
+            cache.values.clear();
+            cache.generation = generation;
+        }
+        if let Some(value) = cache.values.get(&cache_key) {
+            return Ok(*value);
+        }
+
+        let placeholders = std::iter::repeat_n("?", cache_key.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT COALESCE(AVG(rating), 0.0)
+             FROM (
+                 SELECT mi.rating,
+                        ROW_NUMBER() OVER (ORDER BY mi.rating, mi.id) AS rating_rank,
+                        COUNT(*) OVER () AS rating_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                   AND mi.item_type IN ('MOVIE', 'SERIES')
+                   AND mi.library_id IN ({placeholders})
+                   AND mi.rating IS NOT NULL
+             ) AS rating_values
+             WHERE rating_rank IN ((rating_count + 1) / 2, (rating_count + 2) / 2)"
+        );
+        let mut statement = self.query_scalar::<f64>(sqlx::AssertSqlSafe(query));
+        for library_id in &cache_key {
+            statement = statement.bind(library_id);
+        }
+        let median =
+            statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        cache.values.insert(cache_key, median);
+        Ok(median)
     }
 
     pub async fn schema_version(&self) -> Result<i64, StorageError> {
@@ -2002,6 +2075,7 @@ fn resume_runtime_ticks_sql() -> &'static str {
 enum CatalogBind<'a> {
     Text(&'a str),
     Integer(i64),
+    Real(f64),
 }
 
 #[derive(Clone, Copy)]

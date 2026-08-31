@@ -548,17 +548,48 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
     assert_eq!(
         rows.iter()
             .map(|row| row.item_id.as_str())
-        .collect::<Vec<_>>(),
+            .collect::<Vec<_>>(),
         ["rating-top", "rating-unknown", "rating-low"]
     );
     assert_eq!(first_query_count, 2);
     assert_eq!(database.query_count(), 1);
     assert_eq!(
-        rows.iter().map(|row| row.item_id.as_str()).collect::<Vec<_>>(),
+        rows.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
         cached_rows
             .iter()
             .map(|row| row.item_id.as_str())
             .collect::<Vec<_>>()
+    );
+
+    database
+        .update_media_item_metadata(MediaMetadataUpdate {
+            item_id: "rating-low",
+            title: "rating-low",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            rating: Some(10.0),
+            rating_source: Some("TEST"),
+            metadata_fingerprint: &[],
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        })
+        .await
+        .expect("updated rating");
+    database.reset_query_count();
+    let refreshed_rows = database
+        .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)
+        .await
+        .expect("refreshed recommended catalog rows");
+    assert_eq!(database.query_count(), 2);
+    assert_eq!(
+        refreshed_rows
+            .iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["rating-low", "rating-top", "rating-unknown"]
     );
 }
 
@@ -725,6 +756,7 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         statement = match bind {
             CatalogBind::Text(value) => statement.bind(*value),
             CatalogBind::Integer(value) => statement.bind(*value),
+            CatalogBind::Real(value) => statement.bind(*value),
         };
     }
     let plan = statement
@@ -903,6 +935,10 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+            RecommendationRatingMedianCache::default(),
+        )),
+        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -2449,6 +2485,10 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+            RecommendationRatingMedianCache::default(),
+        )),
+        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -2507,6 +2547,10 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+            RecommendationRatingMedianCache::default(),
+        )),
+        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -2597,6 +2641,10 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+            RecommendationRatingMedianCache::default(),
+        )),
+        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -2700,6 +2748,10 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         backend: DatabaseBackend::Sqlite,
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
+        recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
+            RecommendationRatingMedianCache::default(),
+        )),
+        recommendation_rating_median_generation: Arc::new(AtomicU64::new(0)),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 

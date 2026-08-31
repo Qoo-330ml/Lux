@@ -390,6 +390,7 @@ impl CatalogService {
 
     pub(crate) fn invalidate_library_pages(&self) {
         self.library_page_cache.invalidate();
+        self.database.invalidate_recommendation_rating_cache();
     }
 
     pub async fn count_item_types(

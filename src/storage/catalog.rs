@@ -600,30 +600,12 @@ impl Database {
         }
         let max_function = self.scalar_max_function();
         let min_function = self.scalar_min_function();
-        let rating_placeholders = std::iter::repeat_n("?", library_ids.len())
-            .collect::<Vec<_>>()
-            .join(", ");
+        let median_rating = self.recommendation_rating_median(library_ids).await?;
         let catalog_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         let query = format!(
-            "WITH rating_values AS (
-                 SELECT mi.rating,
-                        ROW_NUMBER() OVER (ORDER BY mi.rating, mi.id) AS rating_rank,
-                        COUNT(*) OVER () AS rating_count
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                   AND mi.item_type IN ('MOVIE', 'SERIES')
-                   AND mi.library_id IN ({rating_placeholders})
-                   AND mi.rating IS NOT NULL
-             ),
-             median_rating AS (
-                 SELECT COALESCE(AVG(rating), 0.0) AS value
-                 FROM rating_values
-                 WHERE rating_rank IN ((rating_count + 1) / 2, (rating_count + 2) / 2)
-             ),
-             recent_playback_users AS (
+            "WITH recent_playback_users AS (
                  SELECT ps.item_id, ps.user_id
                  FROM playback_sessions ps
                  WHERE ps.last_event_at > unixepoch() - {RECOMMENDATION_PLAYBACK_WINDOW_SECONDS}
@@ -651,7 +633,7 @@ impl Database {
                             + CASE WHEN COALESCE(us.is_played, 0) = 1 THEN -35 ELSE 0 END
                             + {min_function}(50, 5 * COALESCE(fc.favorite_user_count, 0))
                             + {min_function}(50.0, {max_function}(0.0,
-                                COALESCE(mi.rating, median_rating.value) * 5.0))
+                                COALESCE(mi.rating, ?) * 5.0))
                             + {min_function}(50, COALESCE(pc.recent_playback_user_count, 0))
                             + {min_function}(7, {max_function}(0, 7 - CAST((unixepoch() - mi.added_at) / 86400 AS INTEGER)))
                             + CASE WHEN us.last_played_at IS NULL THEN 0 ELSE
@@ -662,7 +644,6 @@ impl Database {
                         mi.sort_title
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 CROSS JOIN median_rating
                  LEFT JOIN playback_counts pc ON pc.item_id = mi.id
                  LEFT JOIN favorite_counts fc ON fc.item_id = mi.id
                  LEFT JOIN user_item_state us
@@ -721,8 +702,8 @@ impl Database {
              ORDER BY paged.recommendation_score DESC, mi.added_at DESC,
                       mi.sort_title, mi.id, ms.id, mt.stream_index"
         );
-        let mut binds = Vec::with_capacity(library_ids.len() * 2 + 3);
-        binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
+        let mut binds = Vec::with_capacity(library_ids.len() * 2 + 4);
+        binds.push(CatalogBind::Real(median_rating));
         binds.push(CatalogBind::Text(user_id));
         binds.extend(library_ids.iter().map(|value| CatalogBind::Text(value)));
         binds.push(CatalogBind::Integer(limit));
@@ -1191,6 +1172,7 @@ impl Database {
             count_statement = match bind {
                 CatalogBind::Text(value) => count_statement.bind(*value),
                 CatalogBind::Integer(value) => count_statement.bind(*value),
+                CatalogBind::Real(value) => count_statement.bind(*value),
             };
         }
         let item_order = match (filter.sort_by, filter.descending) {
@@ -1632,6 +1614,7 @@ impl Database {
             statement = match bind {
                 CatalogBind::Text(value) => statement.bind(*value),
                 CatalogBind::Integer(value) => statement.bind(*value),
+                CatalogBind::Real(value) => statement.bind(*value),
             };
         }
         statement
@@ -4327,6 +4310,7 @@ impl Database {
         &self,
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
+        let rating_changed = update.rating.is_some();
         let sort_title = update.title.to_lowercase();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
@@ -4363,13 +4347,17 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        transaction
+        let result = transaction
             .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            });
+        if result.is_ok() && rating_changed {
+            self.invalidate_recommendation_rating_cache();
+        }
+        result
     }
 
     pub(crate) async fn media_item_metadata_fingerprint(
