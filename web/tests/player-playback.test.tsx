@@ -8,6 +8,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
+import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -32,6 +33,7 @@ describe("PlayerPage playback synchronization", () => {
   let mediaSessionDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(() => {
+    mockPlaybackBootstrap();
     vi.spyOn(api, "progress").mockResolvedValue(undefined);
     vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (_itemId, sourceId) => ({
       sessionId: `web-${sourceId}`,

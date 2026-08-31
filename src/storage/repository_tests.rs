@@ -772,6 +772,65 @@ async fn person_credits_migration_creates_the_index_table() {
 }
 
 #[tokio::test]
+async fn person_credit_replacement_batches_large_credit_sets() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('item-large-credits', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    let credits = (0..41)
+        .map(|index| NewPersonCredit {
+            person_id: format!("person-{index}"),
+            lux_person_id: None,
+            person_type: "Actor".to_owned(),
+            person_name: format!("演员{index}"),
+            provider: "tmdb".to_owned(),
+            role: format!("角色{index}"),
+            sort_order: index,
+            biography: None,
+            birthday: None,
+            deathday: None,
+            known_for_department: None,
+            place_of_birth: None,
+            provider_ids: BTreeMap::new(),
+            genres: Vec::new(),
+            tags: Vec::new(),
+            production_locations: Vec::new(),
+            premiere_date: None,
+            production_year: None,
+            taglines: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    database
+        .replace_person_credits("item-large-credits", &credits)
+        .await
+        .expect("large credit replacement");
+    assert_eq!(database.query_count(), 4);
+    let stored_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-large-credits'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored credit count");
+    assert_eq!(stored_count, 41);
+}
+
+#[tokio::test]
 async fn person_credit_list_uses_one_consistent_representative_row() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -952,6 +1011,134 @@ async fn canonical_people_reuse_one_lux_id_across_provider_identities() {
         .await
         .expect("identity count");
     assert_eq!(identity_count, 2);
+}
+
+#[tokio::test]
+async fn canonical_people_batch_identity_lookup_returns_all_matches_in_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let first = database
+        .resolve_or_create_canonical_person(
+            "华晨宇",
+            "tmdb",
+            "57975",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("first canonical person");
+    let second = database
+        .resolve_or_create_canonical_person(
+            "另一位演员",
+            "tmdb",
+            "57976",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("second canonical person");
+
+    database.reset_query_count();
+    let matches = database
+        .find_canonical_people_by_identities(&[
+            ("tmdb".to_owned(), "57975".to_owned()),
+            ("tmdb".to_owned(), "57976".to_owned()),
+            ("tmdb".to_owned(), "missing".to_owned()),
+        ])
+        .await
+        .expect("batch identity lookup");
+
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        matches,
+        vec![
+            ("tmdb".to_owned(), "57975".to_owned(), first.id),
+            ("tmdb".to_owned(), "57976".to_owned(), second.id),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn canonical_people_batch_identity_attach_is_atomic() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let owner = database
+        .resolve_or_create_canonical_person(
+            "人物甲",
+            "tmdb",
+            "57975",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("owner");
+    database.reset_query_count();
+    database
+        .attach_canonical_person_identities(
+            &owner.id,
+            &[
+                ("douban".to_owned(), "1313123".to_owned()),
+                ("imdb".to_owned(), "nm0000001".to_owned()),
+            ],
+            "SAME_SOURCE_ID_SET",
+            Some(0.99),
+            r#"{"method":"test"}"#,
+        )
+        .await
+        .expect("batch attach");
+    assert_eq!(database.query_count(), 3);
+    let identity_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_identities WHERE person_id = ?")
+            .bind(&owner.id)
+            .fetch_one(database.pool())
+            .await
+            .expect("identity count");
+    assert_eq!(identity_count, 3);
+
+    let other = database
+        .resolve_or_create_canonical_person(
+            "人物乙",
+            "tmdb",
+            "57976",
+            "PROVIDER_ID",
+            Some(1.0),
+            r#"{"source":"tmdb"}"#,
+        )
+        .await
+        .expect("other owner");
+    let result = database
+        .attach_canonical_person_identities(
+            &owner.id,
+            &[
+                ("douban".to_owned(), "new-id".to_owned()),
+                ("tmdb".to_owned(), "57976".to_owned()),
+            ],
+            "SAME_SOURCE_ID_SET",
+            Some(0.99),
+            r#"{"method":"conflict"}"#,
+        )
+        .await;
+    assert!(result.is_err());
+    let new_identity_owner: Option<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_identities
+         WHERE provider = 'douban' AND provider_id = 'new-id'",
+    )
+    .fetch_optional(database.pool())
+    .await
+    .expect("new identity lookup");
+    assert!(new_identity_owner.is_none());
+    assert_eq!(other.id, "lux-000002");
 }
 
 #[tokio::test]
@@ -1378,6 +1565,75 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
         assert_eq!(total, 2);
         assert_eq!(titles, expected, "descending={descending}");
     }
+}
+
+#[tokio::test]
+async fn catalog_root_counts_are_grouped_by_library_in_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let first = libraries
+        .create_library("First", LibraryKind::Mixed, false)
+        .await
+        .expect("first library");
+    let second = libraries
+        .create_library("Second", LibraryKind::Mixed, false)
+        .await
+        .expect("second library");
+    let first_id = first.id.to_string();
+    let second_id = second.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items
+         (id, library_id, item_type, title, sort_title, identification_status, has_available_source)
+         VALUES
+           ('root-count-movie-1', ?, 'MOVIE', 'Movie 1', 'movie 1', 'LOCAL_CONFIRMED', 1),
+           ('root-count-series-1', ?, 'SERIES', 'Series 1', 'series 1', 'LOCAL_CONFIRMED', 1),
+           ('root-count-movie-2', ?, 'MOVIE', 'Movie 2', 'movie 2', 'LOCAL_CONFIRMED', 1),
+           ('root-count-series-2', ?, 'SERIES', 'Series 2', 'series 2', 'LOCAL_CONFIRMED', 1),
+           ('root-count-folder', ?, 'FOLDER', 'Folder', 'folder', 'LOCAL_CONFIRMED', 1),
+           ('root-count-removed', ?, 'MOVIE', 'Removed', 'removed', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&first_id)
+    .bind(&first_id)
+    .bind(&second_id)
+    .bind(&second_id)
+    .bind(&first_id)
+    .bind(&first_id)
+    .execute(database.pool())
+    .await
+    .expect("media items");
+    sqlx::query("UPDATE media_items SET removed_at = 1 WHERE id = 'root-count-removed'")
+        .execute(database.pool())
+        .await
+        .expect("removed item");
+
+    database.reset_query_count();
+    let counts = database
+        .count_catalog_root_items_by_library(&[first_id.clone(), second_id.clone()])
+        .await
+        .expect("root counts");
+
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(
+        counts.get(&first_id).map(|value| value.movie_count),
+        Some(1)
+    );
+    assert_eq!(
+        counts.get(&first_id).map(|value| value.series_count),
+        Some(1)
+    );
+    assert_eq!(
+        counts.get(&second_id).map(|value| value.movie_count),
+        Some(1)
+    );
+    assert_eq!(
+        counts.get(&second_id).map(|value| value.series_count),
+        Some(1)
+    );
 }
 
 #[tokio::test]
@@ -2168,6 +2424,192 @@ async fn chapter_detection_job_creation_is_atomic_per_library() {
             .await
             .expect("active duplicate should be rejected")
     );
+}
+
+#[tokio::test]
+async fn scan_job_status_counts_are_aggregated_in_storage() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Scan jobs", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    for (id, status, job_type) in [
+        ("scan-count-pending", "PENDING", "INCREMENTAL_SCAN"),
+        ("scan-count-running", "RUNNING", "RECONCILE_LIBRARY"),
+        ("scan-count-failed", "FAILED", "INCREMENTAL_SCAN"),
+        ("scan-count-completed", "COMPLETED", "INCREMENTAL_SCAN"),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES (?, ?, ?, ?, 'generation')",
+        )
+        .bind(id)
+        .bind(&library_id)
+        .bind(job_type)
+        .bind(status)
+        .execute(database.pool())
+        .await
+        .expect("scan job");
+    }
+
+    assert_eq!(
+        database
+            .count_scan_jobs_by_status()
+            .await
+            .expect("status counts"),
+        StoredScanJobCounts {
+            running: 2,
+            failed: 1,
+        }
+    );
+}
+
+#[tokio::test]
+async fn chapter_detection_outcomes_commit_status_state_and_progress_as_one_batch() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Chapter jobs", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 root"))
+        .await
+        .expect("library root");
+    let root_id: String = sqlx::query_scalar("SELECT id FROM library_roots LIMIT 1")
+        .fetch_one(database.pool())
+        .await
+        .expect("root");
+    let item_id = "chapter-item";
+    let source_id = "chapter-source";
+    let entry_id = "chapter-entry";
+    sqlx::query(
+        "INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+         VALUES (?, ?, 'EPISODE', 'Episode', 'episode', 'LOCAL_CONFIRMED')",
+    )
+    .bind(item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO filesystem_entries
+         (id, library_root_id, relative_path, entry_kind, size, modified_at, last_seen_generation)
+         VALUES (?, ?, 'episode.mkv', 'FILE', 1, 1, 'generation')",
+    )
+    .bind(entry_id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("filesystem entry");
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, duration_ticks)
+         VALUES (?, ?, 'LOCAL_FILE', ?, 10000000)",
+    )
+    .bind(source_id)
+    .bind(item_id)
+    .bind(entry_id)
+    .execute(database.pool())
+    .await
+    .expect("media source");
+    database
+        .create_chapter_detection_job(NewChapterDetectionJob {
+            id: "chapter-job-batch",
+            library_id: &library.id.to_string(),
+            plugin_id: "builtin",
+            concurrency: 1,
+            intro_window_seconds: 15,
+            credits_window_seconds: 15,
+            match_threshold: 0.8,
+            total_count: 1,
+        })
+        .await
+        .expect("chapter job");
+    database
+        .claim_chapter_detection_job("chapter-job-batch")
+        .await
+        .expect("claim chapter job");
+    sqlx::query(
+        "INSERT INTO chapter_detection_job_items
+         (job_id, source_id, item_id, season_id, source_fingerprint, input_fingerprint, is_context, status)
+         VALUES (?, ?, ?, ?, ?, ?, 0, 'PENDING')",
+    )
+    .bind("chapter-job-batch")
+    .bind(source_id)
+    .bind(item_id)
+    .bind(item_id)
+    .bind(vec![1_u8])
+    .bind(vec![2_u8])
+    .execute(database.pool())
+    .await
+    .expect("chapter item");
+
+    database.reset_query_count();
+    database
+        .apply_chapter_detection_outcomes(
+            "chapter-job-batch",
+            "builtin",
+            &[ChapterDetectionOutcomeUpdate {
+                source_id: source_id.to_owned(),
+                status: "COMPLETED".to_owned(),
+                error: None,
+                source_state: Some(ChapterDetectionSourceStateUpdate {
+                    input_fingerprint: vec![2],
+                    status: "NOT_FOUND".to_owned(),
+                    last_checked_at: 10,
+                    last_success_at: None,
+                    next_retry_at: Some(20),
+                    error: None,
+                    intro_fingerprint: None,
+                    credits_fingerprint: None,
+                }),
+            }],
+            Some(source_id),
+            1,
+        )
+        .await
+        .expect("apply chapter batch");
+    assert_eq!(database.query_count(), 3);
+    let item_status: String = sqlx::query_scalar(
+        "SELECT status FROM chapter_detection_job_items WHERE job_id = ? AND source_id = ?",
+    )
+    .bind("chapter-job-batch")
+    .bind(source_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("item status");
+    let source_status: String = sqlx::query_scalar(
+        "SELECT status FROM chapter_detection_source_states WHERE source_id = ? AND plugin_id = ?",
+    )
+    .bind(source_id)
+    .bind("builtin")
+    .fetch_one(database.pool())
+    .await
+    .expect("source state");
+    let progress: (i64, String) =
+        sqlx::query_as("SELECT processed_count, cursor FROM chapter_detection_jobs WHERE id = ?")
+            .bind("chapter-job-batch")
+            .fetch_one(database.pool())
+            .await
+            .expect("job progress");
+    assert_eq!(item_status, "COMPLETED");
+    assert_eq!(source_status, "NOT_FOUND");
+    assert_eq!(progress, (1, source_id.to_owned()));
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
@@ -88,6 +88,23 @@ pub(crate) async fn read_image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i3
     .await
     .ok()
     .flatten()
+}
+
+pub(crate) async fn image_content_tag_and_dimensions_from_bytes(
+    bytes: Vec<u8>,
+) -> Result<(String, Option<(i32, i32)>), std::io::Error> {
+    tokio::task::spawn_blocking(move || {
+        let content_tag = format!("{:x}", Sha256::digest(&bytes));
+        let dimensions = image::load_from_memory(&bytes).ok().and_then(|image| {
+            Some((
+                i32::try_from(image.width()).ok()?,
+                i32::try_from(image.height()).ok()?,
+            ))
+        });
+        Ok((content_tag, dimensions))
+    })
+    .await
+    .map_err(|error| std::io::Error::other(format!("image metadata worker failed: {error}")))?
 }
 
 #[derive(Clone, Debug)]
@@ -1903,13 +1920,30 @@ impl ImageService {
         }
 
         let metadata_root = fs::canonicalize(metadata_root(&self.config_dir)).await.ok();
+        let mut canonical_roots = HashMap::<PathBuf, Option<PathBuf>>::new();
+        let mut canonical_paths = HashMap::<PathBuf, Option<PathBuf>>::new();
+        let mut metadata_by_path = HashMap::<PathBuf, std::fs::Metadata>::new();
         let mut saw_outside_root = false;
         for candidate in candidates {
             let path = PathBuf::from(&candidate.local_path);
-            let Ok(canonical_path) = fs::canonicalize(&path).await else {
+            let canonical_path = if let Some(canonical_path) = canonical_paths.get(&path) {
+                canonical_path.clone()
+            } else {
+                let canonical_path = fs::canonicalize(&path).await.ok();
+                canonical_paths.insert(path, canonical_path.clone());
+                canonical_path
+            };
+            let Some(canonical_path) = canonical_path else {
                 continue;
             };
-            let canonical_root = fs::canonicalize(&candidate.root_path).await.ok();
+            let root_path = PathBuf::from(&candidate.root_path);
+            let canonical_root = if let Some(canonical_root) = canonical_roots.get(&root_path) {
+                canonical_root.clone()
+            } else {
+                let canonical_root = fs::canonicalize(&root_path).await.ok();
+                canonical_roots.insert(root_path, canonical_root.clone());
+                canonical_root
+            };
             let in_media_root = canonical_root
                 .as_ref()
                 .is_some_and(|root| canonical_path.starts_with(root) && canonical_path != *root);
@@ -1920,13 +1954,19 @@ impl ImageService {
                 saw_outside_root = true;
                 continue;
             }
-            let metadata =
-                fs::metadata(&canonical_path)
-                    .await
-                    .map_err(|source| ImageError::Io {
-                        path: canonical_path.clone(),
-                        source,
-                    })?;
+            let metadata = if let Some(metadata) = metadata_by_path.get(&canonical_path) {
+                metadata.clone()
+            } else {
+                let metadata =
+                    fs::metadata(&canonical_path)
+                        .await
+                        .map_err(|source| ImageError::Io {
+                            path: canonical_path.clone(),
+                            source,
+                        })?;
+                metadata_by_path.insert(canonical_path.clone(), metadata.clone());
+                metadata
+            };
             if !metadata.is_file() {
                 return Ok(None);
             }
@@ -2210,8 +2250,9 @@ mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
         canonical_image_stems, global_image_download_permits, global_image_write_permits,
-        image_attempt_failure, image_download_retry_delay, image_lookup_stems,
-        is_allowed_scraper_image_url, retryable_image_status,
+        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
+        image_download_retry_delay, image_lookup_stems, is_allowed_scraper_image_url,
+        retryable_image_status,
     };
 
     #[test]
@@ -2250,6 +2291,23 @@ mod tests {
         let write = global_image_write_permits();
         assert!(!std::sync::Arc::ptr_eq(&first, &write));
         assert_eq!(write.available_permits(), IMAGE_GLOBAL_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn combined_local_image_metadata_reads_bytes_once() {
+        let image = image::RgbImage::from_pixel(3, 2, image::Rgb([12, 34, 56]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("png encoding");
+        let (content_tag, dimensions) = image_content_tag_and_dimensions_from_bytes(bytes)
+            .await
+            .expect("metadata worker");
+        assert_eq!(content_tag.len(), 64);
+        assert_eq!(dimensions, Some((3, 2)));
     }
 
     #[test]

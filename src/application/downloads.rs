@@ -14,7 +14,7 @@ use crate::{
         StrmLocalPathError, StrmTargetKind, canonical_local_strm_target, classify_strm_target,
     },
     network::{NetworkProxyError, client_builder_from_env_or},
-    storage::{Database, StorageError},
+    storage::{Database, StorageError, StoredPlaybackSource},
 };
 
 const MAX_STRM_BYTES: u64 = 8 * 1024;
@@ -89,8 +89,34 @@ impl DownloadService {
             None => self.database.find_download_source(item_id).await?,
         }
         .ok_or(DownloadError::ItemNotFound)?;
-        let root = fs::canonicalize(&source.root_path).await?;
-        let media_path = fs::canonicalize(root.join(&source.relative_path)).await?;
+        self.prepare_resolved_source(
+            &source.source_kind,
+            &source.root_path,
+            &source.relative_path,
+        )
+        .await
+    }
+
+    pub(crate) async fn prepare_authorized_source(
+        &self,
+        source: &StoredPlaybackSource,
+    ) -> Result<DownloadArtifact, DownloadError> {
+        self.prepare_resolved_source(
+            &source.source_kind,
+            &source.root_path,
+            &source.relative_path,
+        )
+        .await
+    }
+
+    async fn prepare_resolved_source(
+        &self,
+        source_kind: &str,
+        root_path: &str,
+        relative_path: &str,
+    ) -> Result<DownloadArtifact, DownloadError> {
+        let root = fs::canonicalize(root_path).await?;
+        let media_path = fs::canonicalize(root.join(relative_path)).await?;
         if !media_path.starts_with(&root) || media_path == root {
             return Err(DownloadError::PathOutsideRoot(media_path));
         }
@@ -103,22 +129,19 @@ impl DownloadService {
             .and_then(|value| value.to_str())
             .ok_or_else(|| DownloadError::InvalidFileName(media_path.clone()))?
             .to_owned();
-        if source.source_kind == "STRM_URL" {
+        if source_kind == "STRM_URL" {
             let strm_target = read_strm_target(&media_path).await?;
             match classify_strm_target(&strm_target).kind {
                 StrmTargetKind::Path => {
-                    let target_path = canonical_local_strm_target(
-                        &source.root_path,
-                        &source.relative_path,
-                        &strm_target,
-                    )
-                    .await
-                    .map_err(|error| match error {
-                        StrmLocalPathError::Missing => DownloadError::ItemNotFound,
-                        StrmLocalPathError::Forbidden => {
-                            DownloadError::PathOutsideRoot(media_path.clone())
-                        }
-                    })?;
+                    let target_path =
+                        canonical_local_strm_target(root_path, relative_path, &strm_target)
+                            .await
+                            .map_err(|error| match error {
+                                StrmLocalPathError::Missing => DownloadError::ItemNotFound,
+                                StrmLocalPathError::Forbidden => {
+                                    DownloadError::PathOutsideRoot(media_path.clone())
+                                }
+                            })?;
                     if target_path
                         .extension()
                         .and_then(|value| value.to_str())

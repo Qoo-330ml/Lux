@@ -1,11 +1,8 @@
-import Hls from "hls.js";
 import type { PlaybackEngine, PlaybackPerformance, PlaybackSnapshot } from "./playback-engine";
+import type Hls from "hls.js";
+export { canUseHls } from "./hls-capabilities";
 
 const HLS_MIME = "application/vnd.apple.mpegurl";
-
-export function canUseHls(video?: HTMLVideoElement | null) {
-  return Hls.isSupported() || Boolean(video && video.canPlayType(HLS_MIME) !== "");
-}
 
 export class HlsVideoEngine implements PlaybackEngine {
   readonly kind = "native" as const;
@@ -18,6 +15,12 @@ export class HlsVideoEngine implements PlaybackEngine {
   async setSource(source: string, poster?: string | null) {
     this.error = null;
     this.element.poster = poster ?? "";
+    if (this.element.canPlayType(HLS_MIME) !== "") {
+      this.element.src = source;
+      this.element.load();
+      return;
+    }
+    const { default: Hls } = await import("hls.js");
     if (Hls.isSupported()) {
       const hls = new Hls({
         enableWorker: true,
@@ -50,11 +53,7 @@ export class HlsVideoEngine implements PlaybackEngine {
       });
       return;
     }
-    if (this.element.canPlayType(HLS_MIME) === "") {
-      throw new Error("当前浏览器不支持 HLS");
-    }
-    this.element.src = source;
-    this.element.load();
+    throw new Error("当前浏览器不支持 HLS");
   }
 
   play() {

@@ -817,6 +817,32 @@ pub(crate) struct StoredScanJobPath {
     pub(crate) change_kind: String,
 }
 
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct StoredScanJobCounts {
+    pub(crate) running: i64,
+    pub(crate) failed: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChapterDetectionSourceStateUpdate {
+    pub(crate) input_fingerprint: Vec<u8>,
+    pub(crate) status: String,
+    pub(crate) last_checked_at: i64,
+    pub(crate) last_success_at: Option<i64>,
+    pub(crate) next_retry_at: Option<i64>,
+    pub(crate) error: Option<String>,
+    pub(crate) intro_fingerprint: Option<Vec<u8>>,
+    pub(crate) credits_fingerprint: Option<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ChapterDetectionOutcomeUpdate {
+    pub(crate) source_id: String,
+    pub(crate) status: String,
+    pub(crate) error: Option<String>,
+    pub(crate) source_state: Option<ChapterDetectionSourceStateUpdate>,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StoredReconciliationScanEntry {
     pub(crate) library_root_id: String,
@@ -1628,6 +1654,18 @@ pub(crate) struct ItemImageMetadata<'a> {
     pub(crate) source_url: Option<&'a str>,
 }
 
+pub(crate) struct ItemImageInsert {
+    pub(crate) image_type: String,
+    pub(crate) image_index: i64,
+    pub(crate) local_path: String,
+    pub(crate) file_size: i64,
+    pub(crate) width: Option<i32>,
+    pub(crate) height: Option<i32>,
+    pub(crate) content_tag: String,
+    pub(crate) source: String,
+    pub(crate) source_url: Option<String>,
+}
+
 pub(crate) struct MetadataImageAttemptUpdate<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) image_type: &'a str,
@@ -2046,7 +2084,9 @@ pub(crate) struct StoredItemScanPath {
 }
 
 pub(crate) struct StoredPlaybackSource {
+    pub(crate) source_id: String,
     pub(crate) source_kind: String,
+    pub(crate) container: Option<String>,
     pub(crate) external_url: Option<String>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,

@@ -111,16 +111,6 @@ pub(super) async fn lux_home(headers: HeaderMap, State(state): State<AppState>) 
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
     };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let ordered_views = match libraries
-        .list_libraries_for_user(&user_id, &accessible_library_ids)
-        .await
-    {
-        Ok(views) => views,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
     let latest_groups = snapshot
         .latest_groups
@@ -159,7 +149,7 @@ pub(super) async fn lux_home(headers: HeaderMap, State(state): State<AppState>) 
             .push(value);
     }
     let mut visible = Vec::new();
-    for view in &ordered_views {
+    for view in &snapshot.views {
         let library_id = view.library.id.to_string();
         if !accessible_library_ids.contains(&library_id) {
             continue;
@@ -596,60 +586,13 @@ pub(super) async fn lux_get_item(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let metadata_pending = match database
-        .list_pending_metadata_item_ids(std::slice::from_ref(&item_id))
-        .await
-    {
-        Ok(item_ids) => item_ids.contains(&item_id),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     match catalog.find_item(principal, &item_id).await {
-        Ok(Some(item)) => match database
-            .find_user_item_state(&user.id.to_string(), &item.id)
-            .await
-        {
-            Ok(user_state) => {
-                let actors = match state.people.as_ref() {
-                    Some(people) => match people.list_item_actors(&item.id).await {
-                        Ok(actors) => actors,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %item.id,
-                                %error,
-                                "derived actor relation is unavailable; returning an empty cast"
-                            );
-                            Vec::new()
-                        }
-                    },
-                    None => Vec::new(),
-                };
-                let nfo = match state.local_nfo.as_ref() {
-                    Some(local_nfo) => match local_nfo.read_item(&item.id).await {
-                        Ok(nfo) => nfo,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %item.id,
-                                %error,
-                                "derived local NFO cache is unavailable; returning partial item detail"
-                            );
-                            None
-                        }
-                    },
-                    None => None,
-                };
-                let mut body = lux_catalog_item_json_with_user_state(&item, user_state.as_ref());
-                if let Value::Object(object) = &mut body {
-                    object.insert("actors".to_owned(), json!(actors));
-                    object.insert("nfo".to_owned(), json!(nfo));
-                    object.insert("metadataPending".to_owned(), json!(metadata_pending));
-                    if let Some(nfo) = nfo.as_ref() {
-                        apply_local_nfo_details(object, nfo);
-                    }
-                }
-                Json(body).into_response()
+        Ok(Some(item)) => {
+            match load_lux_item_detail(&state, database, &item, &user.id.to_string()).await {
+                Ok(detail) => Json(detail.body).into_response(),
+                Err(()) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
-            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        },
+        }
         Ok(None) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
@@ -668,6 +611,79 @@ pub(super) async fn lux_get_item(
             unreachable!("inaccessible item is returned as not found")
         }
     }
+}
+
+pub(super) struct LuxItemDetail {
+    pub(super) body: Value,
+    pub(super) user_state: Option<crate::storage::StoredUserItemState>,
+}
+
+pub(super) async fn load_lux_item_detail(
+    state: &AppState,
+    database: &Database,
+    item: &CatalogItem,
+    user_id: &str,
+) -> Result<LuxItemDetail, ()> {
+    let (metadata_pending, user_state, actors, nfo) = tokio::try_join!(
+        async {
+            database
+                .list_pending_metadata_item_ids(std::slice::from_ref(&item.id))
+                .await
+                .map(|item_ids| item_ids.contains(&item.id))
+                .map_err(|_| ())
+        },
+        async {
+            database
+                .find_user_item_state(user_id, &item.id)
+                .await
+                .map_err(|_| ())
+        },
+        async {
+            let actors = match state.people.as_ref() {
+                Some(people) => match people.list_item_actors(&item.id).await {
+                    Ok(actors) => actors,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            %error,
+                            "derived actor relation is unavailable; returning an empty cast"
+                        );
+                        Vec::new()
+                    }
+                },
+                None => Vec::new(),
+            };
+            Ok::<_, ()>(actors)
+        },
+        async {
+            let nfo = match state.local_nfo.as_ref() {
+                Some(local_nfo) => match local_nfo.read_item(&item.id).await {
+                    Ok(nfo) => nfo,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %item.id,
+                            %error,
+                            "derived local NFO cache is unavailable; returning partial item detail"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+            Ok::<_, ()>(nfo)
+        },
+    )
+    .map_err(|_| ())?;
+    let mut body = lux_catalog_item_json_with_user_state(item, user_state.as_ref());
+    if let Value::Object(object) = &mut body {
+        object.insert("actors".to_owned(), json!(actors));
+        object.insert("nfo".to_owned(), json!(nfo));
+        object.insert("metadataPending".to_owned(), json!(metadata_pending));
+        if let Some(nfo) = nfo.as_ref() {
+            apply_local_nfo_details(object, nfo);
+        }
+    }
+    Ok(LuxItemDetail { body, user_state })
 }
 
 pub(super) async fn lux_get_metadata(
@@ -1358,24 +1374,25 @@ pub(super) async fn lux_download(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match access
-        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+    let source = match access
+        .authorized_playback_source(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &item_id,
+            query.source_id.as_deref(),
+        )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    };
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(downloads) = state.downloads.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let artifact = match downloads
-        .prepare(&item_id, query.source_id.as_deref())
-        .await
-    {
+    let artifact = match downloads.prepare_authorized_source(&source).await {
         Ok(artifact) => artifact,
         Err(error) => return download_error_response(error),
     };
@@ -2002,24 +2019,25 @@ pub(super) async fn emby_download(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match access
-        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+    let source = match access
+        .authorized_playback_source(
+            AccessPrincipal::new(user.id, user.is_admin),
+            &item_id,
+            query.media_source_id.as_deref(),
+        )
         .await
     {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    };
     if !user.can_download {
         return StatusCode::FORBIDDEN.into_response();
     }
     let Some(downloads) = state.downloads.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let artifact = match downloads
-        .prepare(&item_id, query.media_source_id.as_deref())
-        .await
-    {
+    let artifact = match downloads.prepare_authorized_source(&source).await {
         Ok(artifact) => artifact,
         Err(error) => return download_error_response(error),
     };
@@ -2084,18 +2102,10 @@ pub(super) async fn serve_media_file(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match access.can_view_item(principal, item_id).await {
-        Ok(true) => {}
-        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let source = database
-        .find_playback_source(item_id, media_source_id)
-        .await;
-    let source = match source {
+    let source = match access
+        .authorized_playback_source(principal, item_id, media_source_id)
+        .await
+    {
         Ok(Some(source)) => source,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2831,8 +2841,10 @@ pub(super) async fn lux_catalog_item_values_by_id(
             item_ids.push(item.id.clone());
         }
     }
-    let states = database.list_user_item_states(user_id, &item_ids).await?;
-    let pending_item_ids = database.list_pending_metadata_item_ids(&item_ids).await?;
+    let (states, pending_item_ids) = tokio::try_join!(
+        database.list_user_item_states(user_id, &item_ids),
+        database.list_pending_metadata_item_ids(&item_ids),
+    )?;
     Ok(items
         .iter()
         .map(|item| {

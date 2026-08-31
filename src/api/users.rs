@@ -783,7 +783,12 @@ pub(super) async fn auth_update_library_order(
         )
         .await
     {
-        Ok(library_order) => Json(json!({ "libraryOrder": library_order })).into_response(),
+        Ok(library_order) => {
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
+            Json(json!({ "libraryOrder": library_order })).into_response()
+        }
         Err(LibraryServiceError::InvalidLibraryOrder(message)) => api_error(
             &headers,
             StatusCode::BAD_REQUEST,

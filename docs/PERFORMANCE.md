@@ -66,6 +66,7 @@ ffprobe 合成基准包含 512 个文件，`observed` 是 fake ffprobe 进程的
 | 日期 | 提交 | 硬件/架构 | 数据集 | 命令 | 指标 | 优化前 | 优化后 | 备注 |
 |---|---|---|---|---|---|---:|---:|---|
 | 2026-08-11 | 899c961a / 65311847 | macOS ARM64 (`uname -m=arm64`) | Web production build；不含媒体库数据 | `pnpm --dir web build` | 主 JS（原始 / gzip） | 661.09 / 194.28 kB | 493.90 / 153.15 kB | 路由按需加载、首页 logo 复用已有标签；gzip 体积下降约 21%；未测量浏览器 LCP 或首页 API p95 |
+| 2026-08-31 | `ca737f79` / `170e41a5` | macOS ARM64 (`uname -m=arm64`) | Web production build；不含媒体库数据 | `pnpm --dir web build` | 主入口 / PlayerPage / router / HLS（原始 / gzip） | 99.54 / 26.22；78.78 / 25.14；0 / 0；594.13 / 185.60 kB | 99.72 / 26.25；79.07 / 25.26；38.71 / 14.02；594.13 / 185.60 kB | 时间线 React 更新限制为 100 ms；bootstrap/session 请求可取消；react-router 共享分包从空 chunk 修正为可复用 chunk；HLS 仍仅在服务端 HLS 路径动态加载；未测量真实浏览器 LCP，结果仅代表本机 ARM64 |
 
 ## Web 客户端 HEVC fallback 性能
 

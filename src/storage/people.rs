@@ -334,6 +334,7 @@ impl Database {
             })?;
         let mut seen_keys = HashSet::with_capacity(credits.len());
         let mut duplicates_skipped = 0;
+        let mut prepared = Vec::with_capacity(credits.len());
         for credit in credits {
             let key = (
                 credit.person_id.as_str(),
@@ -355,14 +356,31 @@ impl Database {
                 .map_err(|source| StorageError::Serialization(source.to_string()))?;
             let taglines_json = serde_json::to_string(&credit.taglines)
                 .map_err(|source| StorageError::Serialization(source.to_string()))?;
-            self.query(
+            prepared.push((
+                credit,
+                provider_ids_json,
+                genres_json,
+                tags_json,
+                production_locations_json,
+                taglines_json,
+            ));
+        }
+        const PERSON_CREDIT_INSERT_CHUNK_SIZE: usize = 40;
+        for chunk in prepared.chunks(PERSON_CREDIT_INSERT_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n(
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO person_credits (
                     item_id, person_id, person_type, person_name, provider, role,
                     sort_order, biography, birthday, deathday, known_for_department,
                     place_of_birth, provider_ids_json, genres_json, tags_json,
-                    production_locations_json, premiere_date, production_year, taglines_json
-                    , lux_person_id
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    production_locations_json, premiere_date, production_year, taglines_json,
+                    lux_person_id
+                ) VALUES {placeholders}
                 ON CONFLICT (item_id, person_type, provider, person_id, role) DO UPDATE SET
                     person_name = excluded.person_name,
                     sort_order = excluded.sort_order,
@@ -378,34 +396,46 @@ impl Database {
                     premiere_date = excluded.premiere_date,
                     production_year = excluded.production_year,
                     taglines_json = excluded.taglines_json,
-                    lux_person_id = excluded.lux_person_id",
-            )
-            .bind(item_id)
-            .bind(&credit.person_id)
-            .bind(&credit.person_type)
-            .bind(&credit.person_name)
-            .bind(&credit.provider)
-            .bind(&credit.role)
-            .bind(credit.sort_order)
-            .bind(&credit.biography)
-            .bind(&credit.birthday)
-            .bind(&credit.deathday)
-            .bind(&credit.known_for_department)
-            .bind(&credit.place_of_birth)
-            .bind(provider_ids_json)
-            .bind(genres_json)
-            .bind(tags_json)
-            .bind(production_locations_json)
-            .bind(&credit.premiere_date)
-            .bind(credit.production_year)
-            .bind(taglines_json)
-            .bind(&credit.lux_person_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                    lux_person_id = excluded.lux_person_id"
+            )));
+            for (
+                credit,
+                provider_ids_json,
+                genres_json,
+                tags_json,
+                production_locations_json,
+                taglines_json,
+            ) in chunk
+            {
+                statement = statement
+                    .bind(item_id)
+                    .bind(&credit.person_id)
+                    .bind(&credit.person_type)
+                    .bind(&credit.person_name)
+                    .bind(&credit.provider)
+                    .bind(&credit.role)
+                    .bind(credit.sort_order)
+                    .bind(&credit.biography)
+                    .bind(&credit.birthday)
+                    .bind(&credit.deathday)
+                    .bind(&credit.known_for_department)
+                    .bind(&credit.place_of_birth)
+                    .bind(provider_ids_json)
+                    .bind(genres_json)
+                    .bind(tags_json)
+                    .bind(production_locations_json)
+                    .bind(&credit.premiere_date)
+                    .bind(credit.production_year)
+                    .bind(taglines_json)
+                    .bind(&credit.lux_person_id);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         if duplicates_skipped > 0 {
             tracing::debug!(
@@ -636,6 +666,50 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn find_canonical_people_by_identities(
+        &self,
+        identities: &[(String, String)],
+    ) -> Result<Vec<(String, String, String)>, StorageError> {
+        const MAX_IDENTITIES_PER_QUERY: usize = 400;
+        let mut matches = Vec::new();
+        for chunk in identities.chunks(MAX_IDENTITIES_PER_QUERY) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let conditions =
+                std::iter::repeat_n("(pi.provider = ? AND pi.provider_id = ?)", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(" OR ");
+            let query = format!(
+                "SELECT pi.provider, pi.provider_id, p.id
+                 FROM person_identities pi
+                 JOIN people p ON p.id = pi.person_id
+                 WHERE {conditions}
+                 ORDER BY pi.provider, pi.provider_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (provider, provider_id) in chunk {
+                statement = statement.bind(provider).bind(provider_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            matches.extend(rows.into_iter().map(|row| {
+                (
+                    row.get::<String, _>("provider"),
+                    row.get::<String, _>("provider_id"),
+                    row.get::<String, _>("id"),
+                )
+            }));
+        }
+        Ok(matches)
     }
 
     pub(crate) async fn find_canonical_person_display_name(
@@ -1715,6 +1789,125 @@ impl Database {
         Ok(stored_canonical_person(person))
     }
 
+    pub(crate) async fn attach_canonical_person_identities(
+        &self,
+        person_id: &str,
+        identities: &[(String, String)],
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        const IDENTITY_INSERT_CHUNK_SIZE: usize = 100;
+        let now = current_unix_timestamp();
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let person = self
+            .query("SELECT id FROM people WHERE id = ?")
+            .bind(person_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .ok_or_else(|| {
+                StorageError::Conflict(format!("canonical person '{person_id}' does not exist"))
+            })?;
+
+        for chunk in identities.chunks(IDENTITY_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO person_identities (
+                    person_id, provider, provider_id, match_method, confidence,
+                    evidence_json, created_at, updated_at
+                 ) VALUES {placeholders}
+                 ON CONFLICT(provider, provider_id) DO NOTHING"
+            )));
+            for (provider, provider_id) in chunk {
+                statement = statement
+                    .bind(person_id)
+                    .bind(provider)
+                    .bind(provider_id)
+                    .bind(match_method)
+                    .bind(confidence)
+                    .bind(evidence_json)
+                    .bind(now)
+                    .bind(now);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let mut owners = HashMap::new();
+        for chunk in identities.chunks(IDENTITY_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let conditions = std::iter::repeat_n("(provider = ? AND provider_id = ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT provider, provider_id, person_id
+                 FROM person_identities
+                 WHERE {conditions}"
+            )));
+            for (provider, provider_id) in chunk {
+                statement = statement.bind(provider).bind(provider_id);
+            }
+            let rows = statement
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            owners.extend(rows.into_iter().map(|row| {
+                (
+                    (
+                        row.get::<String, _>("provider"),
+                        row.get::<String, _>("provider_id"),
+                    ),
+                    row.get::<String, _>("person_id"),
+                )
+            }));
+        }
+        for (provider, provider_id) in identities {
+            if owners
+                .get(&(provider.clone(), provider_id.clone()))
+                .is_none_or(|owner| owner != person_id)
+            {
+                return Err(StorageError::Conflict(format!(
+                    "provider identity '{provider}:{provider_id}' belongs to another person"
+                )));
+            }
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(stored_canonical_person(person))
+    }
+
     pub(crate) async fn list_person_credit_item_ids(
         &self,
         library_ids: &[String],
@@ -2239,35 +2432,6 @@ impl Database {
             .map(stored_person_credit)
             .collect();
         Ok(rows)
-    }
-
-    pub(crate) async fn list_media_item_ids_for_library(
-        &self,
-        library_id: &str,
-        offset: i64,
-        limit: i64,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query_scalar(
-            "SELECT id FROM media_items
-             WHERE library_id = ? AND removed_at IS NULL
-               AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
-             ORDER BY CASE item_type
-                          WHEN 'SERIES' THEN 0
-                          WHEN 'SEASON' THEN 1
-                          WHEN 'EPISODE' THEN 2
-                          ELSE 3
-                      END, id
-             LIMIT ? OFFSET ?",
-        )
-        .bind(library_id)
-        .bind(limit)
-        .bind(offset)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
     }
 
     pub(crate) async fn list_person_index_item_ids(

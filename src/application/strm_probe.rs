@@ -3,6 +3,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -38,6 +39,9 @@ const MAX_CONCURRENCY: i64 = 256;
 const SOURCE_PAGE_SIZE: i64 = 500;
 const JOB_ERROR: &str = "one or more STRM media sources failed";
 const MAX_STRM_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
+const PROGRESS_UPDATE_EVERY: usize = 32;
+const CANCEL_CHECK_EVERY: usize = 32;
+const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug)]
 pub struct StrmProbeOptions {
@@ -358,6 +362,7 @@ impl StrmProbeService {
         let mut failed = 0_usize;
         let mut cancelled = false;
         let mut after_source_id = None::<String>;
+        let mut progress = ProbeProgress::new(Instant::now());
 
         loop {
             let sources = if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
@@ -382,27 +387,30 @@ impl StrmProbeService {
             };
             after_source_id = Some(last_source_id);
             for source in sources {
-                if self
-                    .database
-                    .strm_probe_job_cancel_requested(&job.id)
-                    .await?
-                {
-                    cancelled = true;
-                    break;
+                progress.note_source_started();
+                let now = Instant::now();
+                if progress.should_check_cancel(now) {
+                    let cancel_requested = self
+                        .database
+                        .strm_probe_job_cancel_requested(&job.id)
+                        .await?;
+                    progress.mark_cancel_checked(now);
+                    if cancel_requested {
+                        cancelled = true;
+                        break;
+                    }
                 }
                 while pending.len() >= concurrency {
                     if let Some(result) = pending.join_next().await {
                         let outcome = result.map_err(|_| StrmProbeError::WorkerFailed)?;
-                        let next_cursor = outcome.source_id.clone();
-                        failed += self.finish_source(&job, outcome).await?;
-                        processed += 1;
-                        self.database
-                            .update_strm_probe_job_progress(
-                                &job.id,
-                                Some(next_cursor.as_str()),
-                                processed,
-                            )
-                            .await?;
+                        self.finish_probe_outcome(
+                            &job,
+                            outcome,
+                            &mut failed,
+                            &mut processed,
+                            &mut progress,
+                        )
+                        .await?;
                     }
                 }
                 let service = self.clone();
@@ -430,11 +438,11 @@ impl StrmProbeService {
         }
         while let Some(result) = pending.join_next().await {
             let outcome = result.map_err(|_| StrmProbeError::WorkerFailed)?;
-            let next_cursor = outcome.source_id.clone();
-            failed += self.finish_source(&job, outcome).await?;
-            processed += 1;
-            self.database
-                .update_strm_probe_job_progress(&job.id, Some(&next_cursor), processed)
+            self.finish_probe_outcome(&job, outcome, &mut failed, &mut processed, &mut progress)
+                .await?;
+        }
+        if progress.has_pending_progress() {
+            self.flush_probe_progress(&job, processed, &mut progress)
                 .await?;
         }
         if self
@@ -720,6 +728,93 @@ impl StrmProbeService {
         }
         Ok(0)
     }
+
+    async fn finish_probe_outcome(
+        &self,
+        job: &StoredStrmProbeJob,
+        outcome: SourceOutcome,
+        failed: &mut usize,
+        processed: &mut i64,
+        progress: &mut ProbeProgress,
+    ) -> Result<(), StrmProbeError> {
+        let next_cursor = outcome.source_id.clone();
+        *failed += self.finish_source(job, outcome).await?;
+        *processed += 1;
+        let now = Instant::now();
+        progress.record_completion(next_cursor);
+        if progress.should_flush_progress(now) {
+            self.flush_probe_progress(job, *processed, progress).await?;
+        }
+        Ok(())
+    }
+
+    async fn flush_probe_progress(
+        &self,
+        job: &StoredStrmProbeJob,
+        processed: i64,
+        progress: &mut ProbeProgress,
+    ) -> Result<(), StrmProbeError> {
+        if let Some(cursor) = progress.latest_cursor.as_deref() {
+            self.database
+                .update_strm_probe_job_progress(&job.id, Some(cursor), processed)
+                .await?;
+            progress.mark_progress_updated(Instant::now());
+        }
+        Ok(())
+    }
+}
+
+struct ProbeProgress {
+    sources_since_cancel_check: usize,
+    completions_since_progress: usize,
+    last_cancel_check: Instant,
+    last_progress_update: Instant,
+    latest_cursor: Option<String>,
+}
+
+impl ProbeProgress {
+    fn new(now: Instant) -> Self {
+        Self {
+            sources_since_cancel_check: CANCEL_CHECK_EVERY,
+            completions_since_progress: 0,
+            last_cancel_check: now,
+            last_progress_update: now,
+            latest_cursor: None,
+        }
+    }
+
+    fn note_source_started(&mut self) {
+        self.sources_since_cancel_check += 1;
+    }
+
+    fn should_check_cancel(&self, now: Instant) -> bool {
+        self.sources_since_cancel_check >= CANCEL_CHECK_EVERY
+            || now.duration_since(self.last_cancel_check) >= PROGRESS_UPDATE_INTERVAL
+    }
+
+    fn mark_cancel_checked(&mut self, now: Instant) {
+        self.sources_since_cancel_check = 0;
+        self.last_cancel_check = now;
+    }
+
+    fn record_completion(&mut self, cursor: String) {
+        self.completions_since_progress += 1;
+        self.latest_cursor = Some(cursor);
+    }
+
+    fn should_flush_progress(&self, now: Instant) -> bool {
+        self.completions_since_progress >= PROGRESS_UPDATE_EVERY
+            || now.duration_since(self.last_progress_update) >= PROGRESS_UPDATE_INTERVAL
+    }
+
+    fn mark_progress_updated(&mut self, now: Instant) {
+        self.completions_since_progress = 0;
+        self.last_progress_update = now;
+    }
+
+    fn has_pending_progress(&self) -> bool {
+        self.completions_since_progress > 0
+    }
 }
 
 fn is_valid_jpeg(bytes: &[u8]) -> bool {
@@ -886,6 +981,38 @@ mod tests {
 
         assert_eq!(semaphore.available_permits(), effective_limit);
         database.close().await;
+    }
+
+    #[test]
+    fn probe_progress_batches_updates_and_cancel_checks() {
+        let start = Instant::now();
+        let mut progress = ProbeProgress::new(start);
+
+        assert!(progress.should_check_cancel(start));
+        progress.mark_cancel_checked(start);
+        assert!(!progress.should_check_cancel(start));
+
+        for index in 0..(PROGRESS_UPDATE_EVERY - 1) {
+            progress.record_completion(format!("source-{index}"));
+            assert!(!progress.should_flush_progress(start));
+        }
+        progress.record_completion("source-last".to_owned());
+        assert!(progress.should_flush_progress(start));
+        progress.mark_progress_updated(start);
+        assert!(!progress.should_flush_progress(start));
+        assert!(!progress.has_pending_progress());
+
+        let later = start + PROGRESS_UPDATE_INTERVAL;
+        progress.record_completion("source-timed".to_owned());
+        assert!(progress.should_flush_progress(later));
+        assert!(progress.has_pending_progress());
+
+        for _ in 0..(CANCEL_CHECK_EVERY - 1) {
+            progress.note_source_started();
+        }
+        assert!(!progress.should_check_cancel(start));
+        progress.note_source_started();
+        assert!(progress.should_check_cancel(start));
     }
 }
 

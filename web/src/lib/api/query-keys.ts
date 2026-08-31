@@ -22,6 +22,8 @@ export const queryKeys = {
   children: (itemId: string, itemType?: string, seasonId?: string) =>
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,
   playback: (itemId: string) => ["playback", itemId] as const,
+  playbackBootstrap: (itemId: string, sourceId?: string | null, attempt = 0) =>
+    ["playback-bootstrap", itemId, sourceId ?? "default", attempt] as const,
   webPlaybackSession: (itemId: string, sourceId: string, attempt: number) =>
     ["web-playback-session", itemId, sourceId, attempt] as const,
   adminDashboard: ["admin", "dashboard"] as const,

@@ -9,6 +9,7 @@ import { MediaDetailPage } from "../src/features/detail/MediaDetailPage";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
+import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -17,6 +18,7 @@ describe("MediaDetailPage series hierarchy", () => {
   let root: Root | undefined;
 
   beforeEach(() => {
+    mockPlaybackBootstrap();
     vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
     vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (itemId, sourceId, capabilities) => ({
       sessionId: `web-${sourceId}`,

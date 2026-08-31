@@ -4292,13 +4292,24 @@ impl ScanJobService {
             .find_library(&job.library_id)
             .await?
             .ok_or(ScanJobError::LibraryNotFound)?;
+        let roots = self.database.list_library_roots(&job.library_id).await?;
+        let roots_by_id = roots
+            .into_iter()
+            .map(|root| (root.id.clone(), root))
+            .collect::<HashMap<_, _>>();
         let mut created_items = 0_usize;
         for path in &paths {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(job_id).await;
             }
             let created = match self
-                .process_incremental_path(&library.kind, &job, path, cancellation)
+                .process_incremental_path(
+                    &library.kind,
+                    &job,
+                    path,
+                    roots_by_id.get(&path.library_root_id),
+                    cancellation,
+                )
                 .await
             {
                 Ok(created) => created,
@@ -4409,28 +4420,27 @@ impl ScanJobService {
         library_kind: &str,
         job: &StoredScanJob,
         path: &StoredScanJobPath,
+        root: Option<&StoredLibraryRoot>,
         cancellation: &AtomicBool,
     ) -> Result<usize, ScannerError> {
-        let root = self
-            .database
-            .find_library_root(&path.library_root_id)
-            .await?
-            .ok_or(ScannerError::LibraryNotFound)?;
+        let root = root.ok_or(ScannerError::LibraryNotFound)?;
         let root_path = Path::new(&root.canonical_path);
         let media_path = root_path.join(&path.relative_path);
         let mut classification_cache = MixedClassificationCache::default();
-        if path.change_kind == "REMOVE" || fs::metadata(&media_path).await.is_err() {
+        let metadata = if path.change_kind == "REMOVE" {
+            None
+        } else {
+            fs::metadata(&media_path).await.ok()
+        };
+        if metadata.is_none() {
             self.database
                 .mark_filesystem_entry_missing_by_path(&root.id, &path.relative_path)
                 .await?;
             return Ok(0);
         }
-        let metadata = fs::metadata(&media_path)
-            .await
-            .map_err(|source| ScannerError::Io {
-                path: media_path.clone(),
-                source,
-            })?;
+        let Some(metadata) = metadata else {
+            return Ok(0);
+        };
         if metadata.is_dir() {
             let mut created_items = 0_usize;
             let mut walker = FileBatchWalker::new(&media_path);
@@ -4443,7 +4453,7 @@ impl ScanJobService {
                         self.process_incremental_file(
                             library_kind,
                             job,
-                            &root,
+                            root,
                             root_path,
                             &file,
                             &mut classification_cache,
@@ -4460,7 +4470,7 @@ impl ScanJobService {
             self.process_incremental_file(
                 library_kind,
                 job,
-                &root,
+                root,
                 root_path,
                 &media_path,
                 &mut classification_cache,

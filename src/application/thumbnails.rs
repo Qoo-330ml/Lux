@@ -3,11 +3,12 @@ use std::{
     fmt,
     path::{Component, Path, PathBuf},
     process::Stdio,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
 use sha2::{Digest, Sha256};
-use tokio::{fs, process::Command, time::timeout};
+use tokio::{fs, process::Command, sync::Semaphore, task::JoinSet, time::timeout};
 use uuid::Uuid;
 
 use crate::{
@@ -19,12 +20,22 @@ use crate::{
 const DEFAULT_FRAME: &str = "00:03:01";
 const MAX_THUMBNAIL_BYTES: u64 = 50 * 1024 * 1024;
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
+const THUMBNAIL_WORKER_CONCURRENCY: usize = 4;
+const GLOBAL_FFMPEG_CONCURRENCY: usize = 4;
+static GLOBAL_FFMPEG_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn global_ffmpeg_permits() -> Arc<Semaphore> {
+    GLOBAL_FFMPEG_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(GLOBAL_FFMPEG_CONCURRENCY)))
+        .clone()
+}
 
 #[derive(Clone)]
 pub struct ThumbnailService {
     database: Database,
     ffmpeg_binary: PathBuf,
     timeout: Duration,
+    ffmpeg_permits: Arc<Semaphore>,
 }
 
 impl ThumbnailService {
@@ -41,6 +52,7 @@ impl ThumbnailService {
             database,
             ffmpeg_binary: ffmpeg_binary.into(),
             timeout,
+            ffmpeg_permits: global_ffmpeg_permits(),
         }
     }
 
@@ -156,6 +168,7 @@ impl ThumbnailService {
         seen_items: &mut HashSet<String>,
         report: &mut ThumbnailReport,
     ) {
+        let mut pending = JoinSet::new();
         for candidate in candidates {
             if !seen_items.insert(candidate.item_id.clone()) {
                 continue;
@@ -165,18 +178,48 @@ impl ThumbnailService {
                 continue;
             }
             report.considered += 1;
-            match self.generate_for_source(&candidate).await {
-                Ok(ThumbnailOutcome::Generated) => report.generated += 1,
-                Ok(ThumbnailOutcome::Reused) => report.reused += 1,
-                Err(error) => {
-                    report.failed += 1;
-                    report.mark_item_failed(&candidate.item_id);
-                    tracing::warn!(
-                        item_id = %candidate.item_id,
-                        error = %error,
-                        "thumbnail generation failed"
-                    );
-                }
+            while pending.len() >= THUMBNAIL_WORKER_CONCURRENCY {
+                self.collect_thumbnail_task(&mut pending, report).await;
+            }
+            let service = self.clone();
+            pending.spawn(async move {
+                let item_id = candidate.item_id.clone();
+                let result = service.generate_for_source(&candidate).await;
+                (item_id, result)
+            });
+        }
+        while !pending.is_empty() {
+            self.collect_thumbnail_task(&mut pending, report).await;
+        }
+    }
+
+    async fn collect_thumbnail_task(
+        &self,
+        pending: &mut JoinSet<(String, Result<ThumbnailOutcome, ThumbnailFileError>)>,
+        report: &mut ThumbnailReport,
+    ) {
+        let Some(result) = pending.join_next().await else {
+            return;
+        };
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::error!(%error, "thumbnail worker panicked");
+                report.failed += 1;
+                return;
+            }
+        };
+        match result.1 {
+            Ok(ThumbnailOutcome::Generated) => report.generated += 1,
+            Ok(ThumbnailOutcome::Reused) => report.reused += 1,
+            Err(error) => {
+                report.failed += 1;
+                report.mark_item_failed(&result.0);
+                tracing::warn!(
+                    item_id = %result.0,
+                    error = %error,
+                    "thumbnail generation failed"
+                );
             }
         }
     }
@@ -235,6 +278,12 @@ impl ThumbnailService {
         source_path: &Path,
         output_path: &Path,
     ) -> Result<(), ThumbnailFileError> {
+        let _permit = self
+            .ffmpeg_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ThumbnailFileError::FfmpegLimit)?;
         let mut child = Command::new(&self.ffmpeg_binary)
             .args([
                 "-hide_banner",
@@ -434,6 +483,7 @@ enum ThumbnailFileError {
     OutsideRoot,
     OutputTooLarge,
     ProcessIo(std::io::Error),
+    FfmpegLimit,
     Storage(StorageError),
     SymlinkTarget,
     TargetUnavailable,
@@ -462,6 +512,7 @@ impl fmt::Display for ThumbnailFileError {
             Self::OutsideRoot => formatter.write_str("media path is outside its library root"),
             Self::OutputTooLarge => formatter.write_str("thumbnail output is too large"),
             Self::ProcessIo(error) => write!(formatter, "ffmpeg process: {error}"),
+            Self::FfmpegLimit => formatter.write_str("ffmpeg concurrency limit is closed"),
             Self::Storage(error) => write!(formatter, "thumbnail storage: {error}"),
             Self::SymlinkTarget => formatter.write_str("thumbnail path is a symlink"),
             Self::TargetUnavailable => {

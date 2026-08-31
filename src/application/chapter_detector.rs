@@ -30,7 +30,8 @@ use crate::{
     },
     domain::ids::LibraryId,
     storage::{
-        Database, NewChapterDetectionJob, NewChapterDetectionJobItem, NewMediaChapterMarker,
+        ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate, Database,
+        NewChapterDetectionJob, NewChapterDetectionJobItem, NewMediaChapterMarker,
         StoredChapterDetectionItem, StoredChapterDetectionJob,
     },
 };
@@ -508,6 +509,8 @@ impl ChapterDetectionService {
                         .process_season(&job, items.to_vec(), concurrency, &processed_source_ids)
                         .await?;
                     failed |= season_failed;
+                    let mut updates = Vec::with_capacity(outcomes.len());
+                    let mut batch_cursor = None;
                     for outcome in outcomes {
                         if !processed_source_ids.insert(outcome.source_id.clone()) {
                             continue;
@@ -519,23 +522,25 @@ impl ChapterDetectionService {
                         } else {
                             "COMPLETED"
                         };
-                        self.database
-                            .set_chapter_detection_item_status(
-                                &job.id,
-                                &outcome.source_id,
-                                status,
-                                outcome.error.as_deref(),
-                            )
-                            .await?;
-                        self.record_source_outcome(&job.plugin_id, &outcome).await?;
-                        if outcome.is_context {
-                            continue;
+                        let source_state = chapter_detection_source_state(&outcome);
+                        updates.push(ChapterDetectionOutcomeUpdate {
+                            source_id: outcome.source_id,
+                            status: status.to_owned(),
+                            error: outcome.error,
+                            source_state,
+                        });
+                        if !outcome.is_context {
+                            processed = processed.saturating_add(1);
+                            batch_cursor = updates.last().map(|update| update.source_id.clone());
                         }
-                        processed = processed.saturating_add(1);
+                    }
+                    if !updates.is_empty() {
                         self.database
-                            .update_chapter_detection_job_progress(
+                            .apply_chapter_detection_outcomes(
                                 &job.id,
-                                Some(&outcome.source_id),
+                                &job.plugin_id,
+                                &updates,
+                                batch_cursor.as_deref(),
                                 processed,
                             )
                             .await?;
@@ -568,54 +573,6 @@ impl ChapterDetectionService {
         };
         self.database
             .finish_chapter_detection_job(&job.id, status, error)
-            .await?;
-        Ok(())
-    }
-
-    async fn record_source_outcome(
-        &self,
-        plugin_id: &str,
-        outcome: &SourceOutcome,
-    ) -> Result<(), ChapterDetectionError> {
-        if outcome.is_context || outcome.skipped || outcome.input_fingerprint.is_empty() {
-            return Ok(());
-        }
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let (status, last_success_at, next_retry_at, error) = if outcome.failed {
-            (
-                "FAILED",
-                None,
-                Some(now.saturating_add(FAILED_RETRY_INTERVAL_SECONDS)),
-                outcome.error.as_deref(),
-            )
-        } else if outcome.markers_found {
-            (
-                "FOUND",
-                Some(now),
-                Some(now.saturating_add(FOUND_REFRESH_INTERVAL_SECONDS)),
-                None,
-            )
-        } else {
-            (
-                "NOT_FOUND",
-                None,
-                Some(now.saturating_add(NOT_FOUND_RETRY_INTERVAL_SECONDS)),
-                None,
-            )
-        };
-        self.database
-            .upsert_chapter_detection_source_state(
-                &outcome.source_id,
-                plugin_id,
-                &outcome.input_fingerprint,
-                status,
-                now,
-                last_success_at,
-                next_retry_at,
-                error,
-                outcome.intro_fingerprint.as_deref(),
-                outcome.credits_fingerprint.as_deref(),
-            )
             .await?;
         Ok(())
     }
@@ -1075,6 +1032,47 @@ struct SourceOutcome {
     intro_fingerprint: Option<Vec<u8>>,
     credits_fingerprint: Option<Vec<u8>>,
     error: Option<String>,
+}
+
+fn chapter_detection_source_state(
+    outcome: &SourceOutcome,
+) -> Option<ChapterDetectionSourceStateUpdate> {
+    if outcome.is_context || outcome.skipped || outcome.input_fingerprint.is_empty() {
+        return None;
+    }
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    let (status, last_success_at, next_retry_at, error) = if outcome.failed {
+        (
+            "FAILED",
+            None,
+            Some(now.saturating_add(FAILED_RETRY_INTERVAL_SECONDS)),
+            outcome.error.clone(),
+        )
+    } else if outcome.markers_found {
+        (
+            "FOUND",
+            Some(now),
+            Some(now.saturating_add(FOUND_REFRESH_INTERVAL_SECONDS)),
+            None,
+        )
+    } else {
+        (
+            "NOT_FOUND",
+            None,
+            Some(now.saturating_add(NOT_FOUND_RETRY_INTERVAL_SECONDS)),
+            None,
+        )
+    };
+    Some(ChapterDetectionSourceStateUpdate {
+        input_fingerprint: outcome.input_fingerprint.clone(),
+        status: status.to_owned(),
+        last_checked_at: now,
+        last_success_at,
+        next_retry_at,
+        error,
+        intro_fingerprint: outcome.intro_fingerprint.clone(),
+        credits_fingerprint: outcome.credits_fingerprint.clone(),
+    })
 }
 
 struct EligibleChapterDetectionSource {

@@ -8,6 +8,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 const fallbackState = vi.hoisted(() => ({
   assets: [] as Array<{ workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string }>,
@@ -58,6 +59,7 @@ describe("PlayerPage client fallback status", () => {
   let root: Root | undefined;
 
   beforeEach(() => {
+    mockPlaybackBootstrap();
     fallbackState.assets.length = 0;
     fallbackState.snapshotDuration = 8;
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);

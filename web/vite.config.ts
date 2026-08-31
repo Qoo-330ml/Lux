@@ -74,6 +74,17 @@ export default defineConfig({
         entryFileNames: "assets/lux.js",
         chunkFileNames: "assets/[name].js",
         assetFileNames: "assets/[name][extname]",
+        manualChunks(id) {
+          if (!id.includes("node_modules")) return undefined;
+          if (id.includes("hls.js")) return "hls";
+          if (id.includes("@tanstack/react-query")) return "react-query";
+          if (id.includes("framer-motion")) return "motion";
+          if (id.includes("lucide-react")) return "icons";
+          if (id.includes("react-router")) return "router";
+          if (id.includes("react-dom")) return "react-dom";
+          if (/[\\/]react[\\/]/.test(id)) return "react";
+          return undefined;
+        },
       },
     },
   },

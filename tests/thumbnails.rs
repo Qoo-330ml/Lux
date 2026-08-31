@@ -215,3 +215,68 @@ async fn ffmpeg_failure_does_not_fail_the_completed_scan() -> Result<(), Box<dyn
     assert_eq!(event, ("WARN".to_owned(), "THUMBNAIL_FAILED".to_owned()));
     Ok(())
 }
+
+#[tokio::test]
+async fn thumbnail_workers_run_ffmpeg_concurrently_with_a_global_bound()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for index in 0..4 {
+        let movie_dir = root.join(format!("Movie {index} (2024)"));
+        fs::create_dir_all(&movie_dir)?;
+        fs::write(movie_dir.join(format!("Movie.{index}.2024.mkv")), b"video")?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&scan.id, 100, None).await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let script = r#"#!/bin/sh
+set -eu
+state_dir="$(dirname "$0")/ffmpeg-state"
+mkdir -p "$state_dir"
+while ! mkdir "$state_dir/lock" 2>/dev/null; do sleep 0.001; done
+current=$(cat "$state_dir/current" 2>/dev/null || printf '0')
+current=$((current + 1))
+printf '%s' "$current" > "$state_dir/current"
+maximum=$(cat "$state_dir/maximum" 2>/dev/null || printf '0')
+if [ "$current" -gt "$maximum" ]; then printf '%s' "$current" > "$state_dir/maximum"; fi
+rmdir "$state_dir/lock"
+sleep 0.25
+while ! mkdir "$state_dir/lock" 2>/dev/null; do sleep 0.001; done
+current=$(cat "$state_dir/current")
+printf '%s' "$((current - 1))" > "$state_dir/current"
+rmdir "$state_dir/lock"
+output=''
+for argument in "$@"; do output="$argument"; done
+printf '\377\330lux-thumb\377\331' > "$output"
+"#;
+    fs::write(&fake, script)?;
+    let mut permissions = fs::metadata(&fake)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions)?;
+
+    let thumbnails = ThumbnailService::with_runner(database, fake.clone(), Duration::from_secs(5));
+    let report = thumbnails.generate_library(library.id).await?;
+    assert_eq!(report.generated, 4);
+    let maximum = fs::read_to_string(
+        fake.parent()
+            .ok_or("missing fake ffmpeg parent")?
+            .join("ffmpeg-state/maximum"),
+    )?
+    .trim()
+    .parse::<usize>()?;
+    assert!(
+        maximum >= 2,
+        "expected overlapping ffmpeg processes, saw {maximum}"
+    );
+    Ok(())
+}

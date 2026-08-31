@@ -32,6 +32,57 @@ impl Database {
             })
     }
 
+    pub(crate) async fn count_catalog_root_items_by_library(
+        &self,
+        library_ids: &[String],
+    ) -> Result<HashMap<String, StoredCatalogItemCounts>, StorageError> {
+        if library_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT mi.library_id,
+                    COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
+                    COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
+                    COUNT(*) AS item_count
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.removed_at IS NULL
+               AND mi.library_id IN ({placeholders})
+               AND mi.item_type IN ('MOVIE', 'SERIES')
+               {CATALOG_VISIBLE_PREDICATE}
+             GROUP BY mi.library_id"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for library_id in library_ids {
+            statement = statement.bind(library_id);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            row.get::<String, _>("library_id"),
+                            StoredCatalogItemCounts {
+                                movie_count: row.get("movie_count"),
+                                series_count: row.get("series_count"),
+                                item_count: row.get("item_count"),
+                                ..StoredCatalogItemCounts::default()
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn count_catalog_item_types(
         &self,
         library_ids: &[String],
@@ -2970,42 +3021,59 @@ impl Database {
         })
     }
 
-    pub(crate) async fn find_playback_source(
+    pub(crate) async fn find_authorized_playback_source(
         &self,
         item_id: &str,
         source_id: Option<&str>,
+        user_id: &str,
+        is_admin: bool,
     ) -> Result<Option<StoredPlaybackSource>, StorageError> {
-        self.query(
-            "SELECT ms.source_kind, ms.external_url,
+        let access_join = if is_admin {
+            ""
+        } else {
+            "JOIN user_library_access ula
+               ON ula.user_id = ?
+              AND ula.library_id = mi.library_id
+              AND ula.can_view = 1"
+        };
+        let query = format!(
+            "SELECT ms.id AS source_id, ms.source_kind, ms.container, ms.external_url,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             {access_join}
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             WHERE mi.id = ?
+             WHERE mi.id = ? AND mi.removed_at IS NULL
                AND (? IS NULL OR ms.id = ?)
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
              ORDER BY ms.is_default DESC, ms.id
-             LIMIT 1",
-        )
-        .bind(item_id)
-        .bind(source_id)
-        .bind(source_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| {
-            row.map(|row| StoredPlaybackSource {
-                source_kind: row.get("source_kind"),
-                external_url: row.get("external_url"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
+             LIMIT 1"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        if !is_admin {
+            statement = statement.bind(user_id);
+        }
+        statement = statement.bind(item_id).bind(source_id).bind(source_id);
+        statement
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| {
+                row.map(|row| StoredPlaybackSource {
+                    source_id: row.get("source_id"),
+                    source_kind: row.get("source_kind"),
+                    container: row.get("container"),
+                    external_url: row.get("external_url"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                })
             })
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn find_download_source_by_id(
@@ -3576,62 +3644,148 @@ impl Database {
             })
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) async fn upsert_chapter_detection_source_state(
-        &self,
-        source_id: &str,
-        plugin_id: &str,
-        input_fingerprint: &[u8],
-        status: &str,
-        last_checked_at: i64,
-        last_success_at: Option<i64>,
-        next_retry_at: Option<i64>,
-        error: Option<&str>,
-        intro_fingerprint: Option<&[u8]>,
-        credits_fingerprint: Option<&[u8]>,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO chapter_detection_source_states (
-                source_id, plugin_id, input_fingerprint, status, last_checked_at,
-                last_success_at, next_retry_at, error, intro_fingerprint,
-                credits_fingerprint, updated_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
-             ON CONFLICT(source_id, plugin_id) DO UPDATE SET
-                input_fingerprint = excluded.input_fingerprint,
-                status = excluded.status,
-                last_checked_at = excluded.last_checked_at,
-                last_success_at = excluded.last_success_at,
-                next_retry_at = excluded.next_retry_at,
-                error = excluded.error,
-                intro_fingerprint = excluded.intro_fingerprint,
-                credits_fingerprint = excluded.credits_fingerprint,
-                updated_at = unixepoch()",
-        )
-        .bind(source_id)
-        .bind(plugin_id)
-        .bind(input_fingerprint)
-        .bind(status)
-        .bind(last_checked_at)
-        .bind(last_success_at)
-        .bind(next_retry_at)
-        .bind(error)
-        .bind(intro_fingerprint)
-        .bind(credits_fingerprint)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn delete_chapter_detection_job(&self, id: &str) -> Result<(), StorageError> {
         self.query("DELETE FROM chapter_detection_jobs WHERE id = ?")
             .bind(id)
             .execute(&self.pool)
             .await
             .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn apply_chapter_detection_outcomes(
+        &self,
+        job_id: &str,
+        plugin_id: &str,
+        updates: &[ChapterDetectionOutcomeUpdate],
+        cursor: Option<&str>,
+        processed_count: i64,
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let status_cases = std::iter::repeat_n("WHEN ? THEN ?", updates.len())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let error_cases = std::iter::repeat_n("WHEN ? THEN ?", updates.len())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let source_placeholders = std::iter::repeat_n("?", updates.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let status_query = format!(
+            "UPDATE chapter_detection_job_items
+             SET status = CASE source_id {status_cases} ELSE status END,
+                 error = CASE source_id {error_cases} ELSE error END,
+                 updated_at = unixepoch()
+             WHERE job_id = ? AND source_id IN ({source_placeholders})"
+        );
+        let mut status_statement = self.query(sqlx::AssertSqlSafe(status_query));
+        for update in updates {
+            status_statement = status_statement
+                .bind(&update.source_id)
+                .bind(&update.status);
+        }
+        for update in updates {
+            status_statement = status_statement.bind(&update.source_id).bind(&update.error);
+        }
+        status_statement = status_statement.bind(job_id);
+        for update in updates {
+            status_statement = status_statement.bind(&update.source_id);
+        }
+        status_statement
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let source_updates = updates
+            .iter()
+            .filter(|update| update.source_state.is_some())
+            .collect::<Vec<_>>();
+        if !source_updates.is_empty() {
+            let values = std::iter::repeat_n(
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())",
+                source_updates.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+            let source_query = format!(
+                "INSERT INTO chapter_detection_source_states (
+                    source_id, plugin_id, input_fingerprint, status, last_checked_at,
+                    last_success_at, next_retry_at, error, intro_fingerprint,
+                    credits_fingerprint, updated_at
+                 ) VALUES {values}
+                 ON CONFLICT(source_id, plugin_id) DO UPDATE SET
+                    input_fingerprint = excluded.input_fingerprint,
+                    status = excluded.status,
+                    last_checked_at = excluded.last_checked_at,
+                    last_success_at = excluded.last_success_at,
+                    next_retry_at = excluded.next_retry_at,
+                    error = excluded.error,
+                    intro_fingerprint = excluded.intro_fingerprint,
+                    credits_fingerprint = excluded.credits_fingerprint,
+                    updated_at = unixepoch()"
+            );
+            let mut source_statement = self.query(sqlx::AssertSqlSafe(source_query));
+            for update in source_updates {
+                let Some(source_state) = update.source_state.as_ref() else {
+                    continue;
+                };
+                source_statement = source_statement
+                    .bind(&update.source_id)
+                    .bind(plugin_id)
+                    .bind(source_state.input_fingerprint.as_slice())
+                    .bind(&source_state.status)
+                    .bind(source_state.last_checked_at)
+                    .bind(source_state.last_success_at)
+                    .bind(source_state.next_retry_at)
+                    .bind(&source_state.error)
+                    .bind(source_state.intro_fingerprint.as_deref())
+                    .bind(source_state.credits_fingerprint.as_deref());
+            }
+            source_statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        if cursor.is_some() {
+            self.query(
+                "UPDATE chapter_detection_jobs
+                 SET cursor = ?, processed_count = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING'",
+            )
+            .bind(cursor)
+            .bind(processed_count)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
@@ -3870,54 +4024,6 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
-    }
-
-    pub(crate) async fn set_chapter_detection_item_status(
-        &self,
-        job_id: &str,
-        source_id: &str,
-        status: &str,
-        error: Option<&str>,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE chapter_detection_job_items
-             SET status = ?, error = ?, updated_at = unixepoch()
-             WHERE job_id = ? AND source_id = ?",
-        )
-        .bind(status)
-        .bind(error)
-        .bind(job_id)
-        .bind(source_id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
-    pub(crate) async fn update_chapter_detection_job_progress(
-        &self,
-        id: &str,
-        cursor: Option<&str>,
-        processed_count: i64,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE chapter_detection_jobs
-             SET cursor = ?, processed_count = ?, updated_at = unixepoch()
-             WHERE id = ? AND status = 'RUNNING'",
-        )
-        .bind(cursor)
-        .bind(processed_count)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
     }
 
     pub(crate) async fn chapter_detection_job_cancel_requested(
@@ -4556,57 +4662,69 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    pub(crate) async fn insert_item_image_at_index(
+    pub(crate) async fn insert_item_images_at_indices(
         &self,
         item_id: &str,
-        image_type: &str,
-        image_index: i64,
-        local_path: &std::path::Path,
-        metadata: ItemImageMetadata<'_>,
-    ) -> Result<bool, StorageError> {
-        let id = Uuid::now_v7().to_string();
+        images: &[ItemImageInsert],
+    ) -> Result<usize, StorageError> {
+        if images.is_empty() {
+            return Ok(0);
+        }
+
+        const MAX_ROWS_PER_BATCH: usize = 64;
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        let result = self
-            .query(
+        let mut inserted_count = 0_usize;
+        for batch in images.chunks(MAX_ROWS_PER_BATCH) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
                 "INSERT INTO item_images (
-                id, item_id, image_type, image_index, local_path, width, height,
-                file_size, content_tag, source, source_url
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
-                id = excluded.id,
-                local_path = excluded.local_path,
-                width = excluded.width,
-                height = excluded.height,
-                file_size = excluded.file_size,
-                content_tag = excluded.content_tag,
-                source = excluded.source,
-                source_url = excluded.source_url,
-                updated_at = unixepoch()
-            WHERE item_images.local_path <> excluded.local_path
-               OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
-               OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
-               OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
-               OR item_images.source <> excluded.source
-               OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')",
-            )
-            .bind(id)
-            .bind(item_id)
-            .bind(image_type)
-            .bind(image_index)
-            .bind(local_path.to_string_lossy().as_ref())
-            .bind(metadata.width)
-            .bind(metadata.height)
-            .bind(metadata.file_size)
-            .bind(metadata.content_tag)
-            .bind(metadata.source)
-            .bind(metadata.source_url)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                    id, item_id, image_type, image_index, local_path, width, height,
+                    file_size, content_tag, source, source_url
+                ) VALUES {values}
+                ON CONFLICT(item_id, image_type, image_index) DO UPDATE SET
+                    id = excluded.id,
+                    local_path = excluded.local_path,
+                    width = excluded.width,
+                    height = excluded.height,
+                    file_size = excluded.file_size,
+                    content_tag = excluded.content_tag,
+                    source = excluded.source,
+                    source_url = excluded.source_url,
+                    updated_at = unixepoch()
+                WHERE item_images.local_path <> excluded.local_path
+                   OR COALESCE(item_images.content_tag, '') <> COALESCE(excluded.content_tag, '')
+                   OR COALESCE(item_images.width, -1) <> COALESCE(excluded.width, -1)
+                   OR COALESCE(item_images.height, -1) <> COALESCE(excluded.height, -1)
+                   OR item_images.source <> excluded.source
+                   OR COALESCE(item_images.source_url, '') <> COALESCE(excluded.source_url, '')"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for image in batch {
+                statement = statement
+                    .bind(Uuid::now_v7().to_string())
+                    .bind(item_id)
+                    .bind(&image.image_type)
+                    .bind(image.image_index)
+                    .bind(&image.local_path)
+                    .bind(image.width)
+                    .bind(image.height)
+                    .bind(image.file_size)
+                    .bind(&image.content_tag)
+                    .bind(&image.source)
+                    .bind(image.source_url.as_deref());
+            }
+            let result = statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            inserted_count = inserted_count.saturating_add(result.rows_affected() as usize);
+        }
         transaction
             .commit()
             .await
@@ -4614,7 +4732,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(result.rows_affected() == 1)
+        Ok(inserted_count)
     }
 
     pub(crate) async fn set_poster_fallback_required(

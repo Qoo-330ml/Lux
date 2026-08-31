@@ -1,18 +1,17 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
-    io::Read,
     path::{Path, PathBuf},
+    sync::{Arc, OnceLock},
 };
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use tokio::fs;
+use tokio::{fs, sync::Semaphore, task::JoinSet};
 
 use crate::{
     application::scanner::compute_file_fingerprint,
     application::{
-        images::read_image_dimensions,
+        images::image_content_tag_and_dimensions_from_bytes,
         nfo::{
             LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
             parse_local_nfo_projection,
@@ -21,12 +20,20 @@ use crate::{
     },
     domain::ids::LibraryId,
     storage::{
-        Database, ItemImageMetadata, MediaMetadataUpdate, StorageError, StoredMediaSourcePath,
+        Database, ItemImageInsert, MediaMetadataUpdate, StorageError, StoredMediaSourcePath,
         StoredSeriesMetadataSource,
     },
 };
 
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
+const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
+static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn local_image_read_permits() -> Arc<Semaphore> {
+    LOCAL_IMAGE_READ_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(LOCAL_IMAGE_READ_CONCURRENCY)))
+        .clone()
+}
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct NfoMetadata {
@@ -601,6 +608,7 @@ impl MetadataEnricher {
             .database
             .list_series_metadata_sources_for_incremental_scan(scan_job_id)
             .await?;
+        let mut directory_cache = DirectoryPathCache::default();
         let mut last_series_id = String::new();
         let mut last_season_id = String::new();
         let mut last_episode_id = String::new();
@@ -610,6 +618,7 @@ impl MetadataEnricher {
             Some(&mut last_series_id),
             Some(&mut last_season_id),
             Some(&mut last_episode_id),
+            &mut directory_cache,
         )
         .await?;
         Ok(report)
@@ -667,6 +676,7 @@ impl MetadataEnricher {
         let mut last_series_id = None;
         let mut last_season_id = None;
         let mut last_episode_id = None;
+        let mut directory_cache = DirectoryPathCache::default();
         loop {
             let sources = self
                 .database
@@ -691,6 +701,7 @@ impl MetadataEnricher {
                     last_series_id.as_mut(),
                     last_season_id.as_mut(),
                     last_episode_id.as_mut(),
+                    &mut directory_cache,
                 )
                 .await
             {
@@ -835,77 +846,50 @@ impl MetadataEnricher {
         let has_primary_artwork = images
             .iter()
             .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
+        let prepared = prepare_local_images(images).await;
         let mut image_indexes = BTreeMap::<&'static str, i64>::new();
-        let mut inserted_count = 0;
-        for image in images {
-            let file_size = match fs::metadata(&image.path).await {
-                Ok(metadata) => metadata.len(),
+        let mut records = Vec::new();
+        for result in prepared {
+            let prepared = match result {
+                Ok(prepared) => prepared,
                 Err(error) => {
                     tracing::warn!(
                         item_id,
-                        path = %image.path.display(),
-                        %error,
+                        path = %error.path.display(),
+                        error = %error.error,
                         "local movie image could not be read; skipping image"
                     );
                     continue;
                 }
             };
-            let file_size = match i64::try_from(file_size) {
-                Ok(file_size) => file_size,
-                Err(_) => {
-                    tracing::warn!(
-                        item_id,
-                        path = %image.path.display(),
-                        file_size,
-                        "local movie image is too large for storage; skipping image"
-                    );
-                    continue;
-                }
-            };
-            let content_tag = match image_content_tag(&image.path).await {
-                Ok(content_tag) => content_tag,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        path = %image.path.display(),
-                        %error,
-                        "local movie image fingerprint could not be read; skipping image"
-                    );
-                    continue;
-                }
-            };
-            let dimensions = read_image_dimensions(&image.path).await;
-            let image_index = next_local_image_index(&mut image_indexes, image.image_type);
-            match self
-                .database
-                .insert_item_image_at_index(
-                    item_id,
-                    image.image_type.as_str(),
-                    image_index,
-                    &image.path,
-                    ItemImageMetadata {
-                        file_size,
-                        width: dimensions.map(|(width, _)| width),
-                        height: dimensions.map(|(_, height)| height),
-                        content_tag: &content_tag,
-                        source: "LOCAL",
-                        source_url: None,
-                    },
-                )
-                .await
-            {
-                Ok(true) => inserted_count += 1,
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        path = %image.path.display(),
-                        %error,
-                        "local movie image indexing failed; skipping image"
-                    );
-                }
-            }
+            let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+            records.push(ItemImageInsert {
+                image_type: prepared.image.image_type.as_str().to_owned(),
+                image_index,
+                local_path: prepared.image.path.to_string_lossy().into_owned(),
+                file_size: prepared.file_size,
+                width: prepared.dimensions.map(|(width, _)| width),
+                height: prepared.dimensions.map(|(_, height)| height),
+                content_tag: prepared.content_tag,
+                source: "LOCAL".to_owned(),
+                source_url: None,
+            });
         }
+        let inserted_count = match self
+            .database
+            .insert_item_images_at_indices(item_id, &records)
+            .await
+        {
+            Ok(count) => count,
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    %error,
+                    "local movie image batch indexing failed; skipping images"
+                );
+                0
+            }
+        };
         if has_primary_artwork {
             self.database
                 .set_poster_fallback_required(item_id, false)
@@ -924,6 +908,7 @@ impl MetadataEnricher {
         let mut last_series_id = None;
         let mut last_season_id = None;
         let mut last_episode_id = None;
+        let mut directory_cache = DirectoryPathCache::default();
         loop {
             let sources = self
                 .database
@@ -940,6 +925,7 @@ impl MetadataEnricher {
                 last_series_id.as_mut(),
                 last_season_id.as_mut(),
                 last_episode_id.as_mut(),
+                &mut directory_cache,
             )
             .await?;
             if last_page {
@@ -957,6 +943,7 @@ impl MetadataEnricher {
         last_series_id: Option<&mut String>,
         last_season_id: Option<&mut String>,
         last_episode_id: Option<&mut String>,
+        directory_cache: &mut DirectoryPathCache,
     ) -> Result<(), MetadataError> {
         let mut last_series_id = last_series_id;
         let mut last_season_id = last_season_id;
@@ -967,7 +954,7 @@ impl MetadataEnricher {
             let Some(series_dir) = series_directory(&root, &source.relative_path) else {
                 continue;
             };
-            let series_paths = read_directory_paths(&series_dir).await?;
+            let series_paths = directory_cache.get(&series_dir).await?;
             let new_series = last_series_id
                 .as_deref()
                 .is_none_or(|id| id != source.series_id.as_str());
@@ -995,15 +982,15 @@ impl MetadataEnricher {
             let new_season = last_season_id
                 .as_deref()
                 .is_none_or(|id| id != source.season_id.as_str());
-            let mut season_paths = series_paths;
+            let mut season_paths = series_paths.as_ref().clone();
             if season_dir != series_dir {
-                let mut directory_paths = read_directory_paths(season_dir).await?;
+                let directory_paths = directory_cache.get(season_dir).await?;
                 season_paths = season_paths
                     .iter()
                     .filter(|path| is_prefixed_season_image(path, season_number))
                     .cloned()
                     .collect();
-                season_paths.append(&mut directory_paths);
+                season_paths.extend(directory_paths.iter().cloned());
             }
             if new_season {
                 if let Some(nfo_path) =
@@ -1292,51 +1279,39 @@ impl MetadataEnricher {
         let has_primary_artwork = images
             .iter()
             .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
+        let prepared = prepare_local_images(images).await;
         let mut image_indexes = BTreeMap::<&'static str, i64>::new();
-        let mut inserted_count = 0;
-        for image in images {
-            let file_size = fs::metadata(&image.path)
-                .await
-                .map_err(|source| MetadataError::Io {
-                    path: image.path.clone(),
-                    source,
-                })?
-                .len();
-            let file_size =
-                i64::try_from(file_size).map_err(|_| MetadataError::FileSizeOutOfRange {
-                    path: image.path.clone(),
-                    size: file_size,
-                })?;
-            let content_tag =
-                image_content_tag(&image.path)
-                    .await
-                    .map_err(|source| MetadataError::Io {
-                        path: image.path.clone(),
-                        source,
-                    })?;
-            let dimensions = read_image_dimensions(&image.path).await;
-            let image_index = next_local_image_index(&mut image_indexes, image.image_type);
-            if self
-                .database
-                .insert_item_image_at_index(
-                    item_id,
-                    image.image_type.as_str(),
-                    image_index,
-                    &image.path,
-                    ItemImageMetadata {
-                        file_size,
-                        width: dimensions.map(|(width, _)| width),
-                        height: dimensions.map(|(_, height)| height),
-                        content_tag: &content_tag,
-                        source: "LOCAL",
-                        source_url: None,
-                    },
-                )
-                .await?
-            {
-                inserted_count += 1;
-            }
+        let mut records = Vec::new();
+        for result in prepared {
+            let prepared = match result {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        path = %error.path.display(),
+                        error = %error.error,
+                        "local series image could not be read; skipping image"
+                    );
+                    continue;
+                }
+            };
+            let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+            records.push(ItemImageInsert {
+                image_type: prepared.image.image_type.as_str().to_owned(),
+                image_index,
+                local_path: prepared.image.path.to_string_lossy().into_owned(),
+                file_size: prepared.file_size,
+                width: prepared.dimensions.map(|(width, _)| width),
+                height: prepared.dimensions.map(|(_, height)| height),
+                content_tag: prepared.content_tag,
+                source: "LOCAL".to_owned(),
+                source_url: None,
+            });
         }
+        let inserted_count = self
+            .database
+            .insert_item_images_at_indices(item_id, &records)
+            .await?;
         if has_primary_artwork {
             self.database
                 .set_poster_fallback_required(item_id, false)
@@ -1355,6 +1330,96 @@ fn next_local_image_index(indexes: &mut BTreeMap<&'static str, i64>, image_type:
     let current = *index;
     *index = index.saturating_add(1);
     current
+}
+
+#[derive(Debug)]
+struct PreparedLocalImage {
+    image: LocalImage,
+    file_size: i64,
+    content_tag: String,
+    dimensions: Option<(i32, i32)>,
+}
+
+#[derive(Debug)]
+struct LocalImageReadError {
+    path: PathBuf,
+    error: std::io::Error,
+}
+
+async fn prepare_local_images(
+    images: Vec<LocalImage>,
+) -> Vec<Result<PreparedLocalImage, LocalImageReadError>> {
+    let permits = local_image_read_permits();
+    let mut pending = JoinSet::new();
+    let mut results = (0..images.len())
+        .map(|_| None)
+        .collect::<Vec<Option<Result<PreparedLocalImage, LocalImageReadError>>>>();
+    for (index, image) in images.into_iter().enumerate() {
+        while pending.len() >= LOCAL_IMAGE_READ_CONCURRENCY {
+            collect_local_image_task(&mut pending, &mut results).await;
+        }
+        let path = image.path.clone();
+        let permit = match permits.clone().acquire_owned().await {
+            Ok(permit) => permit,
+            Err(error) => {
+                results[index] = Some(Err(LocalImageReadError {
+                    path,
+                    error: std::io::Error::other(format!("image read semaphore closed: {error}")),
+                }));
+                continue;
+            }
+        };
+        pending.spawn(async move {
+            let _permit = permit;
+            (index, prepare_local_image(image).await)
+        });
+    }
+    while !pending.is_empty() {
+        collect_local_image_task(&mut pending, &mut results).await;
+    }
+    results.into_iter().flatten().collect()
+}
+
+async fn collect_local_image_task(
+    pending: &mut JoinSet<(usize, Result<PreparedLocalImage, LocalImageReadError>)>,
+    results: &mut [Option<Result<PreparedLocalImage, LocalImageReadError>>],
+) {
+    if let Some(result) = pending.join_next().await {
+        match result {
+            Ok((index, result)) => results[index] = Some(result),
+            Err(error) => {
+                tracing::error!(%error, "local image metadata worker panicked");
+            }
+        }
+    }
+}
+
+async fn prepare_local_image(image: LocalImage) -> Result<PreparedLocalImage, LocalImageReadError> {
+    let bytes = fs::read(&image.path)
+        .await
+        .map_err(|error| LocalImageReadError {
+            path: image.path.clone(),
+            error,
+        })?;
+    let file_size = i64::try_from(bytes.len()).map_err(|_| LocalImageReadError {
+        path: image.path.clone(),
+        error: std::io::Error::other(format!(
+            "image is too large for storage: {} bytes",
+            bytes.len()
+        )),
+    })?;
+    let (content_tag, dimensions) = image_content_tag_and_dimensions_from_bytes(bytes)
+        .await
+        .map_err(|error| LocalImageReadError {
+            path: image.path.clone(),
+            error,
+        })?;
+    Ok(PreparedLocalImage {
+        image,
+        file_size,
+        content_tag,
+        dimensions,
+    })
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -1384,25 +1449,6 @@ impl MetadataReport {
     }
 }
 
-async fn image_content_tag(path: &Path) -> Result<String, std::io::Error> {
-    let path = path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let mut file = std::fs::File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
-        Ok(format!("{:x}", hasher.finalize()))
-    })
-    .await
-    .map_err(|error| std::io::Error::other(format!("image fingerprint worker failed: {error}")))?
-}
-
 pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     let metadata = fs::metadata(path).await?;
     let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
@@ -1420,6 +1466,29 @@ pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Err
         None,
         None,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn directory_path_cache_reuses_a_directory_snapshot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let directory = temp_dir.path().join("series");
+        tokio::fs::create_dir(&directory).await?;
+        tokio::fs::write(directory.join("episode-1.mkv"), b"episode").await?;
+
+        let mut cache = DirectoryPathCache::default();
+        let initial = cache.get(&directory).await?.to_vec();
+        tokio::fs::write(directory.join("episode-2.mkv"), b"episode").await?;
+        let cached = cache.get(&directory).await?.to_vec();
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cached, initial);
+        Ok(())
+    }
 }
 
 pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
@@ -1480,6 +1549,28 @@ async fn read_directory_paths(directory: &Path) -> Result<Vec<PathBuf>, Metadata
     }
     paths.sort();
     Ok(paths)
+}
+
+#[derive(Default)]
+struct DirectoryPathCache {
+    entries: HashMap<PathBuf, Arc<Vec<PathBuf>>>,
+}
+
+impl DirectoryPathCache {
+    async fn get(&mut self, directory: &Path) -> Result<Arc<Vec<PathBuf>>, MetadataError> {
+        if let Some(paths) = self.entries.get(directory) {
+            return Ok(Arc::clone(paths));
+        }
+        let paths = Arc::new(read_directory_paths(directory).await?);
+        self.entries
+            .insert(directory.to_owned(), Arc::clone(&paths));
+        Ok(paths)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }
 
 pub(crate) fn series_directory(root: &Path, relative_path: &str) -> Option<PathBuf> {

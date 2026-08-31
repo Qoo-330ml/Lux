@@ -284,6 +284,12 @@ export type WebPlaybackSession = {
   plan: WebPlaybackPlan;
 };
 
+export type WebPlaybackBootstrap = {
+  item: MediaItem;
+  playback: PlaybackState;
+  session: WebPlaybackSession;
+};
+
 /** Metadata for a registered, same-origin Lux Web danmaku sidecar. */
 export type WebDanmakuInfo = {
   available: true;

@@ -11,7 +11,7 @@ use std::{
 use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::application::{
-    access::{AccessPrincipal, MediaAccessService},
+    access::AccessPrincipal,
     catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
     libraries::{LibraryService, LibraryServiceError, LibraryView},
 };
@@ -68,6 +68,7 @@ struct HomeCacheKey {
 
 struct HomeCacheEntry {
     principal: AccessPrincipal,
+    library_ids: Vec<String>,
     value: Mutex<Option<CachedSnapshot>>,
     compute_lock: Mutex<()>,
 }
@@ -92,7 +93,6 @@ struct CachedSharedSnapshot {
 struct HomeServiceInner {
     catalog: CatalogService,
     libraries: LibraryService,
-    access: MediaAccessService,
     generation: AtomicU64,
     entries: Mutex<HashMap<HomeCacheKey, Arc<HomeCacheEntry>>>,
     shared: Mutex<Option<CachedSharedSnapshot>>,
@@ -108,16 +108,11 @@ pub(crate) struct HomeService {
 }
 
 impl HomeService {
-    pub(crate) fn new(
-        catalog: CatalogService,
-        libraries: LibraryService,
-        access: MediaAccessService,
-    ) -> Self {
+    pub(crate) fn new(catalog: CatalogService, libraries: LibraryService) -> Self {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let inner = Arc::new(HomeServiceInner {
             catalog,
             libraries,
-            access,
             generation: AtomicU64::new(0),
             shared: Mutex::new(None),
             entries: Mutex::new(HashMap::new()),
@@ -155,7 +150,7 @@ impl HomeService {
         let key = HomeCacheKey {
             user_id: principal.user_id.to_string(),
             is_admin: principal.is_admin,
-            library_ids,
+            library_ids: library_ids.clone(),
         };
         let entry = self.entry(key, principal).await;
         let generation = self.inner.generation.load(Ordering::Acquire);
@@ -185,7 +180,7 @@ impl HomeService {
             }
         }
 
-        let snapshot = Arc::new(self.build_snapshot(principal).await?);
+        let snapshot = Arc::new(self.build_snapshot(principal, &library_ids).await?);
         *entry.value.lock().await = Some(CachedSnapshot {
             generation,
             refreshed_at: Instant::now(),
@@ -215,11 +210,13 @@ impl HomeService {
         if !entries.contains_key(&key) && entries.len() >= MAX_HOME_CACHE_ENTRIES {
             entries.clear();
         }
+        let library_ids = key.library_ids.clone();
         entries
             .entry(key)
             .or_insert_with(|| {
                 Arc::new(HomeCacheEntry {
                     principal,
+                    library_ids,
                     value: Mutex::new(None),
                     compute_lock: Mutex::new(()),
                 })
@@ -297,7 +294,7 @@ impl HomeService {
             drop(cached);
             let notified = self.inner.invalidation_notify.notified();
             let result = tokio::select! {
-                result = self.build_snapshot(entry.principal) => Some(result),
+                result = self.build_snapshot(entry.principal, &entry.library_ids) => Some(result),
                 _ = notified => None,
             };
             match result {
@@ -316,41 +313,47 @@ impl HomeService {
         }
     }
 
-    async fn build_snapshot(&self, principal: AccessPrincipal) -> Result<HomeSnapshot, HomeError> {
+    async fn build_snapshot(
+        &self,
+        principal: AccessPrincipal,
+        accessible_library_ids: &[String],
+    ) -> Result<HomeSnapshot, HomeError> {
         let shared = self.shared_snapshot().await?;
-        let accessible_library_ids = self
-            .inner
-            .access
-            .accessible_library_ids(principal)
-            .await
-            .map_err(CatalogError::from)?;
         let user_id = principal.user_id.to_string();
-        let (continue_watching, recently_added, recommended) = tokio::try_join!(
-            self.inner.catalog.list_continue_watching_for_library_ids(
-                &accessible_library_ids,
-                &user_id,
-                0,
-                10,
-            ),
-            self.inner
-                .catalog
-                .list_recently_added_for_library_ids(&accessible_library_ids, 0, 12,),
-            self.inner.catalog.list_recommended_for_library_ids(
-                &accessible_library_ids,
-                &user_id,
-                12,
-            ),
+        let (continue_watching, recently_added, recommended, views) = tokio::try_join!(
+            async {
+                self.inner
+                    .catalog
+                    .list_continue_watching_for_library_ids(accessible_library_ids, &user_id, 0, 10)
+                    .await
+                    .map_err(HomeError::Catalog)
+            },
+            async {
+                self.inner
+                    .catalog
+                    .list_recently_added_for_library_ids(accessible_library_ids, 0, 12)
+                    .await
+                    .map_err(HomeError::Catalog)
+            },
+            async {
+                self.inner
+                    .catalog
+                    .list_recommended_for_library_ids(accessible_library_ids, &user_id, 12)
+                    .await
+                    .map_err(HomeError::Catalog)
+            },
+            async {
+                self.inner
+                    .libraries
+                    .order_views_for_user(&user_id, accessible_library_ids, shared.views.clone())
+                    .await
+                    .map_err(HomeError::Libraries)
+            },
         )?;
-        let accessible_library_ids = accessible_library_ids.into_iter().collect::<HashSet<_>>();
-        let views = shared
-            .views
+        let accessible_library_ids = accessible_library_ids
             .iter()
-            .filter(|view| {
-                view.library.is_enabled
-                    && accessible_library_ids.contains(&view.library.id.to_string())
-            })
             .cloned()
-            .collect();
+            .collect::<HashSet<_>>();
         let latest_groups = shared
             .latest_groups
             .iter()
@@ -413,7 +416,6 @@ mod tests {
         let home = HomeService::new(
             CatalogService::new(database.clone(), access.clone()),
             LibraryService::new(database),
-            access,
         );
 
         let first = home.shared_snapshot().await.expect("first snapshot");
@@ -439,7 +441,6 @@ mod tests {
         let home = HomeService::new(
             CatalogService::new(database.clone(), access.clone()),
             LibraryService::new(database),
-            access,
         );
         let first_user = AccessPrincipal::new(UserId::new(), false);
         let second_user = AccessPrincipal::new(UserId::new(), false);

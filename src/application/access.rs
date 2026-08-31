@@ -2,7 +2,7 @@ use std::fmt;
 
 use crate::{
     domain::ids::UserId,
-    storage::{Database, StorageError},
+    storage::{Database, StorageError, StoredPlaybackSource},
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +65,23 @@ impl MediaAccessService {
         Ok(self
             .database
             .list_accessible_library_ids(&principal.user_id.to_string())
+            .await?)
+    }
+
+    pub(crate) async fn authorized_playback_source(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+        source_id: Option<&str>,
+    ) -> Result<Option<StoredPlaybackSource>, AccessError> {
+        Ok(self
+            .database
+            .find_authorized_playback_source(
+                item_id,
+                source_id,
+                &principal.user_id.to_string(),
+                principal.is_admin,
+            )
             .await?)
     }
 }

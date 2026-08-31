@@ -4,7 +4,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[cfg(unix)]
@@ -26,6 +26,7 @@ const MAX_SOFTWARE_SESSIONS: usize = 1;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const MANIFEST_WAIT_ATTEMPTS: usize = 50;
+const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
 pub(crate) enum HlsError {
@@ -64,7 +65,22 @@ impl std::error::Error for HlsError {
 struct HlsProcess {
     directory: PathBuf,
     child: Mutex<Option<Child>>,
+    quota: Mutex<SessionQuotaCache>,
     _permit: OwnedSemaphorePermit,
+}
+
+#[derive(Debug, Default)]
+struct SessionQuotaCache {
+    checked_at: Option<Instant>,
+    total_bytes: u64,
+}
+
+impl SessionQuotaCache {
+    fn is_fresh(&self, now: Instant) -> bool {
+        self.checked_at.is_some_and(|checked_at| {
+            now.saturating_duration_since(checked_at) < SESSION_QUOTA_CACHE_TTL
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -167,6 +183,7 @@ impl HlsManager {
         let process = Arc::new(HlsProcess {
             directory,
             child: Mutex::new(Some(child)),
+            quota: Mutex::new(SessionQuotaCache::default()),
             _permit: permit,
         });
         let previous = self
@@ -249,20 +266,21 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
-        let mut entries = fs::read_dir(&process.directory)
-            .await
-            .map_err(HlsError::Io)?;
-        let mut total = 0_u64;
-        while let Some(entry) = entries.next_entry().await.map_err(HlsError::Io)? {
-            let metadata = entry.metadata().await.map_err(HlsError::Io)?;
-            if metadata.is_file() {
-                total = total.saturating_add(metadata.len());
-            }
-            if total > MAX_SESSION_BYTES {
-                return Ok(false);
-            }
+        let mut quota = process.quota.lock().await;
+        let now = Instant::now();
+        if quota.is_fresh(now) {
+            return Ok(quota.total_bytes <= MAX_SESSION_BYTES);
         }
-        Ok(true)
+        let total = match session_directory_bytes(&process.directory).await {
+            Ok(total) => total,
+            Err(error) => {
+                quota.checked_at = None;
+                return Err(error);
+            }
+        };
+        quota.total_bytes = total;
+        quota.checked_at = Some(Instant::now());
+        Ok(total <= MAX_SESSION_BYTES)
     }
 
     pub(crate) async fn stop(&self, session_id: &str) -> Result<(), HlsError> {
@@ -312,6 +330,21 @@ impl HlsManager {
             .try_acquire_owned()
             .map_err(|_| HlsError::Limit)
     }
+}
+
+async fn session_directory_bytes(directory: &Path) -> Result<u64, HlsError> {
+    let mut entries = fs::read_dir(directory).await.map_err(HlsError::Io)?;
+    let mut total = 0_u64;
+    while let Some(entry) = entries.next_entry().await.map_err(HlsError::Io)? {
+        let metadata = entry.metadata().await.map_err(HlsError::Io)?;
+        if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+            if total > MAX_SESSION_BYTES {
+                return Ok(total);
+            }
+        }
+    }
+    Ok(total)
 }
 
 async fn stop_process(process: Arc<HlsProcess>) {
@@ -487,9 +520,14 @@ fn available_free_bytes(_path: &Path) -> Result<u64, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::{
+        path::Path,
+        time::{Duration, Instant},
+    };
 
-    use super::{ServerTier, ffmpeg_args, is_valid_asset};
+    use super::{
+        SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, ffmpeg_args, is_valid_asset,
+    };
 
     #[test]
     fn remux_arguments_copy_video_and_audio_into_cmaf_hls() {
@@ -531,6 +569,18 @@ mod tests {
         assert!(is_valid_asset("segment_000001.m4s"));
         assert!(!is_valid_asset("../index.m3u8"));
         assert!(!is_valid_asset("other.txt"));
+    }
+
+    #[test]
+    fn session_quota_cache_expires_quickly() {
+        let checked_at = Instant::now();
+        let cache = SessionQuotaCache {
+            checked_at: Some(checked_at),
+            total_bytes: 1,
+        };
+
+        assert!(cache.is_fresh(checked_at + Duration::from_millis(100)));
+        assert!(!cache.is_fresh(checked_at + SESSION_QUOTA_CACHE_TTL));
     }
 
     #[cfg(unix)]

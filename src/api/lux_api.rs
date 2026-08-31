@@ -75,6 +75,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(lux_create_web_playback_session),
         )
         .route(
+            "/api/v1/playback/bootstrap",
+            post(lux_create_web_playback_bootstrap),
+        )
+        .route(
             "/api/v1/playback/sessions/{session_id}/events",
             post(lux_web_playback_event),
         )
