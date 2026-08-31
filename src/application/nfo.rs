@@ -85,6 +85,7 @@ pub struct MovieNfoMetadata {
     pub tagline: Option<String>,
     pub premiered: Option<String>,
     pub releasedate: Option<String>,
+    pub last_air_date: Option<String>,
     pub runtime: Option<i32>,
     pub status: Option<String>,
     pub original_language: Option<String>,
@@ -840,8 +841,17 @@ pub type MovieNfoMetadataStore = LocalNfoMetadataStore;
 pub type MovieNfoMetadataStoreError = LocalNfoMetadataStoreError;
 
 pub fn rewrite_nfo(original: &[u8], patch: &NfoMetadata) -> Result<Vec<u8>, NfoWriteError> {
+    rewrite_nfo_with_root(original, patch, "movie", false)
+}
+
+fn rewrite_nfo_with_root(
+    original: &[u8],
+    patch: &NfoMetadata,
+    root_tag: &str,
+    normalize_existing_root: bool,
+) -> Result<Vec<u8>, NfoWriteError> {
     if original.is_empty() {
-        return new_nfo(patch);
+        return new_nfo(patch, root_tag);
     }
     parse_nfo(original).map_err(NfoWriteError::Nfo)?;
 
@@ -868,11 +878,15 @@ pub fn rewrite_nfo(original: &[u8], patch: &NfoMetadata) -> Result<Vec<u8>, NfoW
                 if depth == 0 {
                     saw_root = true;
                 }
+                let mut event = event.to_owned();
+                if normalize_existing_root && depth == 0 {
+                    event.set_name(root_tag.as_bytes());
+                }
                 let field = (depth == 1)
                     .then(|| field_for_tag(event.name().as_ref()))
                     .flatten();
                 writer
-                    .write_event(Event::Start(event.to_owned()))
+                    .write_event(Event::Start(event))
                     .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
                 depth += 1;
                 if let Some(field) = field {
@@ -967,8 +981,13 @@ pub fn rewrite_nfo(original: &[u8], patch: &NfoMetadata) -> Result<Vec<u8>, NfoW
                 if depth == 1 {
                     append_missing_fields(&mut writer, patch, &mut updated)?;
                 }
+                let event = if normalize_existing_root && depth == 1 {
+                    BytesEnd::new(root_tag)
+                } else {
+                    event.to_owned()
+                };
                 writer
-                    .write_event(Event::End(event.to_owned()))
+                    .write_event(Event::End(event))
                     .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
                 depth = depth.saturating_sub(1);
             }
@@ -989,7 +1008,24 @@ pub fn rewrite_movie_nfo(
     patch: &MovieNfoMetadata,
 ) -> Result<Vec<u8>, NfoWriteError> {
     validate_movie_nfo_actors(patch)?;
-    let base = rewrite_nfo(original, &patch.base)?;
+    rewrite_rich_nfo(original, patch, "movie", false)
+}
+
+pub fn rewrite_series_nfo(
+    original: &[u8],
+    patch: &MovieNfoMetadata,
+) -> Result<Vec<u8>, NfoWriteError> {
+    validate_movie_nfo_actors(patch)?;
+    rewrite_rich_nfo(original, patch, "tvshow", true)
+}
+
+fn rewrite_rich_nfo(
+    original: &[u8],
+    patch: &MovieNfoMetadata,
+    root_tag: &str,
+    normalize_existing_root: bool,
+) -> Result<Vec<u8>, NfoWriteError> {
+    let base = rewrite_nfo_with_root(original, &patch.base, root_tag, normalize_existing_root)?;
     let mut reader = Reader::from_reader(base.as_slice());
     reader.config_mut().trim_text(false);
     let mut writer = Writer::new(Vec::new());
@@ -1035,15 +1071,17 @@ pub fn rewrite_movie_nfo(
                 }
                 if depth == 0 {
                     saw_root = true;
+                    let mut event = event.to_owned();
+                    if normalize_existing_root {
+                        event.set_name(root_tag.as_bytes());
+                    }
                     writer
-                        .write_event(Event::Start(event.to_owned()))
+                        .write_event(Event::Start(event))
                         .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
                     append_movie_nfo_fields(&mut writer, patch)?;
                     appended = true;
                     writer
-                        .write_event(Event::End(BytesEnd::new(
-                            String::from_utf8_lossy(event.name().as_ref()).as_ref(),
-                        )))
+                        .write_event(Event::End(BytesEnd::new(root_tag)))
                         .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
                 } else if depth == 1 && replace_rich_root_tag(event.name().as_ref(), patch) {
                     buffer.clear();
@@ -1103,6 +1141,10 @@ fn rich_root_tag(tag: &[u8]) -> bool {
             | b"mpaa"
             | b"premiered"
             | b"releasedate"
+            | b"lastaired"
+            | b"lastairdate"
+            | b"enddate"
+            | b"ended"
             | b"runtime"
             | b"status"
             | b"language"
@@ -1147,6 +1189,10 @@ fn replace_rich_root_tag(tag: &[u8], patch: &MovieNfoMetadata) -> bool {
             .is_some_and(|value| !value.trim().is_empty()),
         b"releasedate" => patch
             .releasedate
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty()),
+        b"lastaired" | b"lastairdate" | b"enddate" | b"ended" => patch
+            .last_air_date
             .as_deref()
             .is_some_and(|value| !value.trim().is_empty()),
         b"runtime" => patch.runtime.is_some(),
@@ -1265,6 +1311,9 @@ fn append_movie_nfo_fields(
     }
     if let Some(releasedate) = non_empty(patch.releasedate.as_deref()) {
         write_simple_element(writer, "releasedate", releasedate)?;
+    }
+    if let Some(last_air_date) = non_empty(patch.last_air_date.as_deref()) {
+        write_simple_element(writer, "lastaired", last_air_date)?;
     }
     if let Some(runtime) = patch.runtime {
         write_simple_element(writer, "runtime", &runtime.to_string())?;
@@ -1436,6 +1485,15 @@ pub async fn write_movie_nfo_atomically(
         .map(|_| ())
 }
 
+pub async fn write_series_nfo_atomically(
+    target: &Path,
+    patch: &MovieNfoMetadata,
+) -> Result<(), NfoWriteError> {
+    write_nfo_atomically_with_rewriter(target, |original| rewrite_series_nfo(original, patch), None)
+        .await
+        .map(|_| ())
+}
+
 #[derive(Clone)]
 pub struct NfoWriteService {
     database: Database,
@@ -1491,6 +1549,21 @@ impl NfoWriteService {
         let write = write_nfo_atomically_with_rewriter(
             &target,
             |original| rewrite_movie_nfo(original, patch),
+            None,
+        )
+        .await?;
+        self.finish_item_write(item_id, target, write).await
+    }
+
+    pub async fn write_item_series_nfo(
+        &self,
+        item_id: &str,
+        patch: &MovieNfoMetadata,
+    ) -> Result<NfoWriteReport, NfoWriteError> {
+        let target = self.item_nfo_target(item_id).await?;
+        let write = write_nfo_atomically_with_rewriter(
+            &target,
+            |original| rewrite_series_nfo(original, patch),
             None,
         )
         .await?;
@@ -1896,15 +1969,15 @@ where
     result.map(|_| write)
 }
 
-fn new_nfo(patch: &NfoMetadata) -> Result<Vec<u8>, NfoWriteError> {
+fn new_nfo(patch: &NfoMetadata, root_tag: &str) -> Result<Vec<u8>, NfoWriteError> {
     let mut writer = Writer::new(Vec::new());
     writer
-        .write_event(Event::Start(BytesStart::new("movie")))
+        .write_event(Event::Start(BytesStart::new(root_tag)))
         .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
     let mut updated = BTreeSet::new();
     append_missing_fields(&mut writer, patch, &mut updated)?;
     writer
-        .write_event(Event::End(BytesEnd::new("movie")))
+        .write_event(Event::End(BytesEnd::new(root_tag)))
         .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
     Ok(writer.into_inner())
 }

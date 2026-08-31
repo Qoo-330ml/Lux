@@ -7,7 +7,7 @@ use luxd::{
             LocalNfoMetadataStore, MovieNfoCredit, MovieNfoMetadata, NfoWriteService,
             parse_local_nfo_actors, parse_local_nfo_details, parse_local_nfo_projection,
             parse_movie_nfo_actors, parse_movie_nfo_details, rewrite_movie_nfo, rewrite_nfo,
-            write_nfo_atomically,
+            rewrite_series_nfo, write_nfo_atomically,
         },
         people::ActorCredit,
         scanner::LibraryScanner,
@@ -73,6 +73,7 @@ fn movie_nfo_rewrite_writes_rich_fields_and_preserves_unknown_xml()
             tagline: Some("速度与信念".to_owned()),
             premiered: Some("2026-02-17".to_owned()),
             releasedate: Some("2026-02-17".to_owned()),
+            last_air_date: None,
             runtime: Some(126),
             status: Some("Released".to_owned()),
             original_language: Some("zh".to_owned()),
@@ -172,6 +173,106 @@ fn movie_nfo_rewrite_keeps_existing_rich_fields_when_patch_is_partial()
     assert!(text.contains("<rating>8</rating>"));
     assert!(text.contains("<genre>旧类型</genre>"));
     assert!(text.contains("<name>旧演员</name>"));
+    Ok(())
+}
+
+#[test]
+fn series_nfo_rewrite_writes_rich_fields_with_tvshow_root() -> Result<(), Box<dyn std::error::Error>>
+{
+    let rewritten = rewrite_series_nfo(
+        &[],
+        &MovieNfoMetadata {
+            base: NfoMetadata {
+                title: Some("藏锋".to_owned()),
+                original_title: Some("藏锋".to_owned()),
+                overview: Some("剧集简介".to_owned()),
+                production_year: Some(2026),
+            },
+            rating: Some(8.0),
+            votes: Some(456),
+            premiered: Some("2026-08-17".to_owned()),
+            releasedate: Some("2026-08-17".to_owned()),
+            last_air_date: Some("2026-09-17".to_owned()),
+            runtime: Some(45),
+            status: Some("Continuing".to_owned()),
+            original_language: Some("zh".to_owned()),
+            countries: vec!["中国".to_owned()],
+            genres: vec!["犯罪".to_owned(), "悬疑".to_owned()],
+            studios: vec!["Tencent Video".to_owned()],
+            provider_ids: [
+                ("tmdb".to_owned(), "280133".to_owned()),
+                ("imdb".to_owned(), "tt36277135".to_owned()),
+                ("tvdb".to_owned(), "480823".to_owned()),
+            ]
+            .into_iter()
+            .collect(),
+            directors: vec![MovieNfoCredit {
+                provider_id: "11".to_owned(),
+                name: "导演甲".to_owned(),
+            }],
+            writers: vec![MovieNfoCredit {
+                provider_id: "12".to_owned(),
+                name: "编剧甲".to_owned(),
+            }],
+            actors: vec![ActorCredit {
+                id: "126736".to_owned(),
+                provider: Some("tmdb".to_owned()),
+                identities: Vec::new(),
+                name: "段奕宏".to_owned(),
+                character: Some("Tan Yan".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+            trailers: vec!["https://example.com/trailer".to_owned()],
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+    let text = String::from_utf8(rewritten)?;
+    assert!(text.starts_with("<tvshow>"));
+    assert!(text.contains("<title>藏锋</title>"));
+    assert!(text.contains("<rating>8</rating>"));
+    assert!(text.contains("<votes>456</votes>"));
+    assert!(text.contains("<premiered>2026-08-17</premiered>"));
+    assert!(text.contains("<releasedate>2026-08-17</releasedate>"));
+    assert!(text.contains("<lastaired>2026-09-17</lastaired>"));
+    assert!(text.contains("<runtime>45</runtime>"));
+    assert!(text.contains("<status>Continuing</status>"));
+    assert!(text.contains("<language>zh</language>"));
+    assert!(text.contains("<country>中国</country>"));
+    assert!(text.contains("<genre>犯罪</genre>"));
+    assert!(text.contains("<genre>悬疑</genre>"));
+    assert!(text.contains("<studio>Tencent Video</studio>"));
+    assert!(text.contains("<uniqueid type=\"tmdb\" default=\"true\">280133</uniqueid>"));
+    assert!(text.contains("<uniqueid type=\"imdb\">tt36277135</uniqueid>"));
+    assert!(text.contains("<uniqueid type=\"tvdb\">480823</uniqueid>"));
+    assert!(text.contains("<director tmdbid=\"11\">导演甲</director>"));
+    assert!(text.contains("<writer tmdbid=\"12\">编剧甲</writer>"));
+    assert!(text.contains("<name>段奕宏</name>"));
+    assert!(text.contains("<role>Tan Yan</role>"));
+    assert!(text.contains("<tmdbid>126736</tmdbid>"));
+    assert!(text.contains("<trailer>https://example.com/trailer</trailer>"));
+    assert!(text.ends_with("</tvshow>"));
+    Ok(())
+}
+
+#[test]
+fn series_nfo_rewrite_normalizes_an_existing_movie_root() -> Result<(), Box<dyn std::error::Error>>
+{
+    let rewritten = rewrite_series_nfo(
+        "<movie><title>旧剧名</title><rating>1</rating></movie>".as_bytes(),
+        &MovieNfoMetadata {
+            rating: Some(8.0),
+            last_air_date: Some("2026-09-17".to_owned()),
+            ..MovieNfoMetadata::default()
+        },
+    )?;
+    let text = String::from_utf8(rewritten)?;
+    assert!(text.starts_with("<tvshow>"));
+    assert!(text.ends_with("</tvshow>"));
+    assert!(text.contains("<rating>8</rating>"));
+    assert!(text.contains("<lastaired>2026-09-17</lastaired>"));
+    assert!(!text.contains("<movie>"));
     Ok(())
 }
 

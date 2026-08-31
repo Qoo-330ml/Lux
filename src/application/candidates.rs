@@ -2205,6 +2205,7 @@ impl MetadataSelectionService {
                 options.supplemental,
             );
             payload.actors = payload.movie_nfo.actors.clone();
+            payload.end_date = payload.movie_nfo.last_air_date.clone();
             if options.supplemental {
                 preserve_supplemental_scalar_values(&mut payload, &current);
             }
@@ -2262,10 +2263,10 @@ impl MetadataSelectionService {
                 .await?
         };
         let nfo_started = std::time::Instant::now();
-        let nfo_report = if current.item_type == "MOVIE" {
-            self.nfo.write_item_movie_nfo(item_id, &movie_nfo).await?
-        } else {
-            self.nfo.write_item_nfo(item_id, &state.metadata).await?
+        let nfo_report = match current.item_type.as_str() {
+            "MOVIE" => self.nfo.write_item_movie_nfo(item_id, &movie_nfo).await?,
+            "SERIES" => self.nfo.write_item_series_nfo(item_id, &movie_nfo).await?,
+            _ => self.nfo.write_item_nfo(item_id, &state.metadata).await?,
         };
         self.resources
             .record_metadata_stage("nfo_write", nfo_started.elapsed());
@@ -2552,11 +2553,13 @@ fn merge_supplemental_movie_nfo(
         replace_if_present(&mut candidate.votes, details.votes);
         replace_if_present(&mut candidate.tagline, details.tagline.clone());
         replace_if_present(&mut candidate.premiered, details.premiered.clone());
+        replace_if_present(&mut candidate.last_air_date, details.last_air_date.clone());
     } else {
         preserve!(rating);
         preserve!(votes);
         preserve!(tagline);
         preserve!(premiered);
+        preserve!(last_air_date);
     }
     if candidate.releasedate.is_none() {
         candidate.releasedate = details.release_date.clone();
@@ -3153,6 +3156,7 @@ fn candidate_payload(
         tagline,
         premiered: premiere_date.clone(),
         releasedate: premiere_date.clone(),
+        last_air_date: end_date.clone(),
         runtime,
         status: status.clone(),
         original_language: original_language.clone(),

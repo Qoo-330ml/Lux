@@ -1245,11 +1245,32 @@ async fn series_and_season_selection_writes_to_their_media_directories()
         &fixture.series_id,
         json!({
             "title": "Online Series",
+            "originalTitle": "Online Series Original",
             "overview": "Online Series Overview",
             "premiereDate": "2020-01-01",
             "endDate": "2020-02-01",
             "status": "Ended",
             "originalLanguage": "en",
+            "rating": 8.0,
+            "votes": 456,
+            "runtime": 45,
+            "countries": ["China"],
+            "genres": ["剧情", "悬疑"],
+            "studios": ["Stub Series"],
+            "providerIds": {
+                "Tmdb": "603",
+                "Imdb": "tt0000603",
+                "Tvdb": "480823"
+            },
+            "directors": [{"providerId": "11", "name": "导演甲"}],
+            "writers": [{"providerId": "12", "name": "编剧甲"}],
+            "actors": [{
+                "id": "10",
+                "name": "演员甲",
+                "character": "角色甲",
+                "order": 0
+            }],
+            "trailers": ["https://example.invalid/trailer"],
             "posterUrl": format!("{image_url}/poster")
         }),
     )
@@ -1306,6 +1327,30 @@ async fn series_and_season_selection_writes_to_their_media_directories()
             .await?
             .contains("<plot>Online Series Overview</plot>")
     );
+    let series_nfo = tokio::fs::read_to_string(fixture.series_dir.join("tvshow.nfo")).await?;
+    assert!(series_nfo.starts_with("<tvshow>"));
+    assert!(series_nfo.contains("<originaltitle>Online Series Original</originaltitle>"));
+    assert!(series_nfo.contains("<rating>8</rating>"));
+    assert!(series_nfo.contains("<votes>456</votes>"));
+    assert!(series_nfo.contains("<premiered>2020-01-01</premiered>"));
+    assert!(series_nfo.contains("<releasedate>2020-01-01</releasedate>"));
+    assert!(series_nfo.contains("<lastaired>2020-02-01</lastaired>"));
+    assert!(series_nfo.contains("<runtime>45</runtime>"));
+    assert!(series_nfo.contains("<status>Ended</status>"));
+    assert!(series_nfo.contains("<language>en</language>"));
+    assert!(series_nfo.contains("<country>China</country>"));
+    assert!(series_nfo.contains("<genre>剧情</genre>"));
+    assert!(series_nfo.contains("<genre>悬疑</genre>"));
+    assert!(series_nfo.contains("<studio>Stub Series</studio>"));
+    assert!(series_nfo.contains("<uniqueid type=\"tmdb\" default=\"true\">603</uniqueid>"));
+    assert!(series_nfo.contains("<uniqueid type=\"imdb\">tt0000603</uniqueid>"));
+    assert!(series_nfo.contains("<uniqueid type=\"tvdb\">480823</uniqueid>"));
+    assert!(series_nfo.contains("<director tmdbid=\"11\">导演甲</director>"));
+    assert!(series_nfo.contains("<writer tmdbid=\"12\">编剧甲</writer>"));
+    assert!(series_nfo.contains("<name>演员甲</name>"));
+    assert!(series_nfo.contains("<role>角色甲</role>"));
+    assert!(series_nfo.contains("<tmdbid>10</tmdbid>"));
+    assert!(series_nfo.contains("<trailer>https://example.invalid/trailer</trailer>"));
     assert!(fixture.series_dir.join("poster.png").exists());
     assert!(!fixture.root.join("Drama").join("tvshow.nfo").exists());
     assert!(
