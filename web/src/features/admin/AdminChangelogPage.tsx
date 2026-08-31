@@ -26,6 +26,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 NextEmby 请求管理员 Emby 用户列表时缺少 `/Users` 兼容端点的问题；该端点同时支持根路径与 `/emby` 前缀，并仅允许具备服务器管理权限的用户访问。",
         "修复 Emby 会话响应缺少当前播放条目和时长、导致部分客户端无法识别播放状态的问题；当会话未上报时长时，会安全回退到目录中的媒体时长。",
         "修复未知 Lux API、Emby API 或顶层 Emby 兼容路径可能回退为 Web HTML 的问题；这些请求现在统一返回 JSON 格式的 404。",
+        "修复部分反向代理在登录时丢弃 `Set-Cookie` 后，Lux Web 无法恢复 CSRF 令牌并继续进行写操作的问题；客户端现在会从受保护的登录响应中恢复同源 CSRF Cookie，并在登出成功后清除它。",
       ] },
       { kind: "changed", items: [
         "优化 Emby 目录列表：批量预读取本地 NFO 和人物附加数据，并保持原有响应顺序，降低多条目列表的重复 I/O。",
