@@ -24,7 +24,7 @@ export type DanmakuPlacement = ScheduledDanmaku & {
 
 export const DANMAKU_LIMITS = {
   maxBytes: 4 * 1024 * 1024,
-  maxEntries: 5_000,
+  maxEntries: 50_000,
   maxTextLength: 200,
   maxTimeSeconds: 24 * 60 * 60,
   minFontSize: 12,

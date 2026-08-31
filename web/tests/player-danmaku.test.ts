@@ -43,6 +43,13 @@ describe("LuxPlayer danmaku parser", () => {
     }]);
   });
 
+  it("accepts real-world-sized XML within the byte limit", () => {
+    const entry = '<d p="1,1,25,16777215,0,0,0,0">entry</d>';
+    const xml = `<i>${entry.repeat(30_271)}</i>`;
+
+    expect(parseBilibiliDanmaku(xml)).toHaveLength(30_271);
+  });
+
   it("rejects invalid XML and discards unsafe or unsupported entries", () => {
     expect(() => parseBilibiliDanmaku("<html>not danmaku</html>"))
       .toThrowError(new DanmakuParseError("INVALID_XML", "弹幕 XML 格式无效"));
@@ -66,7 +73,7 @@ describe("LuxPlayer danmaku parser", () => {
   it("rejects more raw entries than the parser limit", () => {
     const entry = '<d p="1,1,25,0,0,0,0,0">entry</d>';
     expect(() => parseBilibiliDanmaku(
-      `<i>${entry.repeat(5_001)}</i>`,
+      `<i>${entry.repeat(50_001)}</i>`,
     )).toThrowError(new DanmakuParseError("TOO_MANY_ENTRIES", "弹幕条目过多"));
   });
 
