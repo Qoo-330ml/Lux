@@ -27,6 +27,35 @@ function installCookieDocument(initialCookie: string) {
   };
 }
 
+function installLocalStorage(initialValue: string | null) {
+  const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
+  let value = initialValue;
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    value: {
+      getItem(key: string) {
+        return key === "lux_csrf_token" ? value : null;
+      },
+      setItem(key: string, nextValue: string) {
+        if (key === "lux_csrf_token") value = nextValue;
+      },
+      removeItem(key: string) {
+        if (key === "lux_csrf_token") value = null;
+      },
+    },
+  });
+  return {
+    current: () => value,
+    restore: () => {
+      if (storageDescriptor) {
+        Object.defineProperty(globalThis, "localStorage", storageDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "localStorage");
+      }
+    },
+  };
+}
+
 describe("LuxApiClient", () => {
   beforeEach(() => {
     vi.restoreAllMocks();
@@ -842,28 +871,76 @@ describe("LuxApiClient", () => {
     });
   });
 
+  it("uses the stored CSRF token when a proxy leaves only the session cookie", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const path = String(input);
+      if (path === "/api/v1/playback/sessions") {
+        return new Response(JSON.stringify({
+          sessionId: "session-1",
+          playSessionId: null,
+          sourceId: "source-1",
+          tier: 0,
+          expiresAt: 1_900_000_000,
+          plan: { type: "DIRECT", url: "/api/v1/items/item-1/stream" },
+        }), { status: 200 });
+      }
+      return new Response(null, { status: 204 });
+    });
+    const cookieDocument = installCookieDocument("lux_session=session-only");
+    const storage = installLocalStorage("csrf-from-login");
+    try {
+      const client = new LuxApiClient();
+      await client.setFavorite("item-1", true);
+      await client.setPlayed("item-1", true);
+      await client.createWebPlaybackSession("item-1", "source-1", {
+        directPlay: true,
+        hls: false,
+        videoCopyToFmp4: false,
+        audioCopyToFmp4: false,
+        hardwareTranscode: false,
+        softwareTranscode: false,
+      });
+      await client.logout();
+
+      expect(fetchMock.mock.calls).toHaveLength(4);
+      for (const [, options] of fetchMock.mock.calls) {
+        expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-from-login");
+      }
+      expect(storage.current()).toBe(null);
+    } finally {
+      storage.restore();
+      cookieDocument.restore();
+    }
+  });
+
   it("restores the CSRF cookie from the login envelope when a proxy drops Set-Cookie", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ user: { id: "user-1" }, csrfToken: "csrf from json" }), { status: 200 }),
     );
     const cookieDocument = installCookieDocument("");
+    const storage = installLocalStorage(null);
     try {
       await new LuxApiClient().login("user", "password");
 
       expect(cookieDocument.current()).toBe("lux_csrf=csrf%20from%20json; Path=/; SameSite=Lax");
+      expect(storage.current()).toBe("csrf from json");
     } finally {
+      storage.restore();
       cookieDocument.restore();
     }
   });
 
-  it("clears the client-readable CSRF cookie after logout succeeds", async () => {
+  it("clears client-side CSRF state after logout succeeds", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
     const cookieDocument = installCookieDocument("lux_csrf=csrf-token");
+    const storage = installLocalStorage("csrf-token");
     try {
       await new LuxApiClient().logout();
 
       expect(cookieDocument.current()).toBe("lux_csrf=; Path=/; Max-Age=0; SameSite=Lax");
+      expect(storage.current()).toBe(null);
     } finally {
+      storage.restore();
       cookieDocument.restore();
     }
   });

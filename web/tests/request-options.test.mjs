@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { requestOptions } from "../src/request-options.mjs";
+import {
+  clearCsrfToken,
+  readCsrfToken,
+  rememberCsrfToken,
+  requestOptions,
+} from "../src/request-options.mjs";
 
 test("request options preserve CSRF and JSON headers together", () => {
   const options = requestOptions({
@@ -13,4 +18,35 @@ test("request options preserve CSRF and JSON headers together", () => {
   assert.equal(options.headers.Accept, "application/json");
   assert.equal(options.headers["x-csrf-token"], "test-csrf");
   assert.equal(options.headers["Content-Type"], "application/json");
+});
+
+test("legacy web requests use the stored CSRF token when the cookie is missing", () => {
+  const previousStorage = globalThis.localStorage;
+  let storedValue = null;
+  globalThis.localStorage = {
+    getItem(key) {
+      return key === "lux_csrf_token" ? storedValue : null;
+    },
+    setItem(key, value) {
+      if (key === "lux_csrf_token") storedValue = value;
+    },
+    removeItem(key) {
+      if (key === "lux_csrf_token") storedValue = null;
+    },
+  };
+  try {
+    rememberCsrfToken("csrf-from-login");
+
+    assert.equal(readCsrfToken(), "csrf-from-login");
+    assert.equal(requestOptions({ method: "POST" }).headers["x-csrf-token"], "csrf-from-login");
+
+    clearCsrfToken();
+    assert.equal(readCsrfToken(), "");
+  } finally {
+    if (previousStorage === undefined) {
+      delete globalThis.localStorage;
+    } else {
+      globalThis.localStorage = previousStorage;
+    }
+  }
 });

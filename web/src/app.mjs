@@ -1,4 +1,9 @@
-import { requestOptions } from "./request-options.mjs";
+import {
+  clearCsrfToken,
+  readCsrfToken,
+  rememberCsrfToken,
+  requestOptions,
+} from "./request-options.mjs";
 import { ADMIN_NAV_ITEMS, adminSectionForRoute, isAdminRoute, renderAdminNavigation } from "./admin-navigation.mjs";
 
 const app = document.querySelector("#app");
@@ -35,13 +40,20 @@ const api = {
     if (!response.ok) throw new Error(body?.error?.message || "请求失败");
     return body;
   },
-  login(username, password) { return this.request("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) }); },
+  async login(username, password) {
+    const response = await this.request("/api/v1/auth/login", { method: "POST", body: JSON.stringify({ username, password }) });
+    rememberCsrfToken(response?.csrfToken);
+    return response;
+  },
   setup(data) { return this.request("/api/v1/setup/complete", { method: "POST", body: JSON.stringify(data) }); },
-  logout() { return this.request("/api/v1/auth/logout", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  async logout() {
+    await this.request("/api/v1/auth/logout", { method: "POST", headers: { "x-csrf-token": readCsrfToken() } });
+    clearCsrfToken();
+  },
   setupStatus() { return this.request("/api/v1/setup/status"); },
   me() { return this.request("/api/v1/auth/me"); },
   sessions() { return this.request("/api/v1/auth/sessions"); },
-  revokeSession(id) { return this.request("/api/v1/auth/sessions/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  revokeSession(id) { return this.request("/api/v1/auth/sessions/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCsrfToken() } }); },
   home() { return this.request("/api/v1/home"); },
   favorites(page = 1) { return this.request("/api/v1/favorites?page=" + encodeURIComponent(page) + "&pageSize=24"); },
   libraries() { return this.request("/api/v1/libraries"); },
@@ -61,22 +73,22 @@ const api = {
     return this.request("/api/v1/items/" + encodeURIComponent(id) + "/children?" + params.toString());
   },
   playback(id) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/playback"); },
-  favorite(id, favorite) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/favorite", { method: "PUT", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ favorite }) }); },
-  played(id, played) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/played", { method: "PUT", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ played }) }); },
+  favorite(id, favorite) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/favorite", { method: "PUT", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ favorite }) }); },
+  played(id, played) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/played", { method: "PUT", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ played }) }); },
   search(query, page = 1) { return this.request("/api/v1/search?q=" + encodeURIComponent(query) + "&page=" + encodeURIComponent(page) + "&pageSize=24"); },
   adminUsers() { return this.request("/api/v1/admin/users"); },
-  createUser(data) { return this.request("/api/v1/admin/users", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
-  disableUser(id) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
-  updateUser(id, data) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
+  createUser(data) { return this.request("/api/v1/admin/users", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify(data) }); },
+  disableUser(id) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCsrfToken() } }); },
+  updateUser(id, data) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify(data) }); },
   userLibraryAccess(id) { return this.request("/api/v1/admin/users/" + encodeURIComponent(id) + "/libraries"); },
-  setLibraryAccess(userId, libraryId, canView) { return this.request("/api/v1/admin/users/" + encodeURIComponent(userId) + "/libraries/" + encodeURIComponent(libraryId), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ canView }) }); },
+  setLibraryAccess(userId, libraryId, canView) { return this.request("/api/v1/admin/users/" + encodeURIComponent(userId) + "/libraries/" + encodeURIComponent(libraryId), { method: "PATCH", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ canView }) }); },
   adminLibraries() { return this.request("/api/v1/admin/libraries"); },
-  createLibrary(data) { return this.request("/api/v1/admin/libraries", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
-  updateLibrary(id, data) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
-  deleteLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
-  addLibraryRoot(id, path) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/roots", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ path }) }); },
-  deleteLibraryRoot(libraryId, rootId) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(libraryId) + "/roots/" + encodeURIComponent(rootId), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
-  scanLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/scan", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  createLibrary(data) { return this.request("/api/v1/admin/libraries", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify(data) }); },
+  updateLibrary(id, data) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "PATCH", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify(data) }); },
+  deleteLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id), { method: "DELETE", headers: { "x-csrf-token": readCsrfToken() } }); },
+  addLibraryRoot(id, path) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/roots", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ path }) }); },
+  deleteLibraryRoot(libraryId, rootId) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(libraryId) + "/roots/" + encodeURIComponent(rootId), { method: "DELETE", headers: { "x-csrf-token": readCsrfToken() } }); },
+  scanLibrary(id) { return this.request("/api/v1/admin/libraries/" + encodeURIComponent(id) + "/scan", { method: "POST", headers: { "x-csrf-token": readCsrfToken() } }); },
   adminJobs(status = "") { return this.request("/api/v1/admin/jobs?page=1&pageSize=50" + (status ? "&status=" + encodeURIComponent(status) : "")); },
   adminJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id)); },
   adminJobEvents(id, filters = {}) {
@@ -85,30 +97,25 @@ const api = {
     if (filters.eventCode) params.set("eventCode", filters.eventCode);
     return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/events?" + params.toString());
   },
-  cancelJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
-  retryJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  cancelJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/cancel", { method: "POST", headers: { "x-csrf-token": readCsrfToken() } }); },
+  retryJob(id) { return this.request("/api/v1/admin/jobs/" + encodeURIComponent(id) + "/retry", { method: "POST", headers: { "x-csrf-token": readCsrfToken() } }); },
   audit() { return this.request("/api/v1/admin/audit?page=1&pageSize=50"); },
   adminSettings() { return this.request("/api/v1/admin/settings"); },
-  updateSettings(data) { return this.request("/api/v1/admin/settings", { method: "PATCH", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(data) }); },
-  testNetworkProxy(networkProxyUrl) { return this.request("/api/v1/admin/settings/network-proxy/test", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify(networkProxyUrl ? { networkProxyUrl } : {}) }); },
+  updateSettings(data) { return this.request("/api/v1/admin/settings", { method: "PATCH", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify(data) }); },
+  testNetworkProxy(networkProxyUrl) { return this.request("/api/v1/admin/settings/network-proxy/test", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify(networkProxyUrl ? { networkProxyUrl } : {}) }); },
   logs() { return this.request("/api/v1/admin/logs?page=1&pageSize=50"); },
-  startBatchReidentify(itemIds) { return this.request("/api/v1/admin/metadata/reidentify", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ itemIds }) }); },
+  startBatchReidentify(itemIds) { return this.request("/api/v1/admin/metadata/reidentify", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ itemIds }) }); },
   metadataReidentifyJob(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id)); },
-  retryMetadataReidentify(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id), { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  retryMetadataReidentify(id) { return this.request("/api/v1/admin/metadata/reidentify/" + encodeURIComponent(id), { method: "POST", headers: { "x-csrf-token": readCsrfToken() } }); },
   adminCandidates(itemId) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates?page=1&pageSize=50"); },
-  searchCandidates(itemId, query, year) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ query, year: year || undefined }) }); },
-  selectCandidate(itemId, candidateId, mode) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates/" + encodeURIComponent(candidateId) + "/select", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ mode }) }); },
+  searchCandidates(itemId, query, year) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ query, year: year || undefined }) }); },
+  selectCandidate(itemId, candidateId, mode) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/identify/candidates/" + encodeURIComponent(candidateId) + "/select", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ mode }) }); },
   adminImages(itemId) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/images"); },
-  deleteAdminImage(itemId, imageId) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/images/" + encodeURIComponent(imageId), { method: "DELETE", headers: { "x-csrf-token": readCookie("lux_csrf") } }); },
+  deleteAdminImage(itemId, imageId) { return this.request("/api/v1/admin/items/" + encodeURIComponent(itemId) + "/images/" + encodeURIComponent(imageId), { method: "DELETE", headers: { "x-csrf-token": readCsrfToken() } }); },
   adminHealth() { return this.request("/api/v1/admin/health"); },
   ready() { return fetch("/health/ready", { credentials: "same-origin" }).then((response) => response.json()); },
-  progress(id, positionTicks, durationTicks) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/progress", { method: "POST", headers: { "x-csrf-token": readCookie("lux_csrf") }, body: JSON.stringify({ positionTicks, durationTicks }) }); },
+  progress(id, positionTicks, durationTicks) { return this.request("/api/v1/items/" + encodeURIComponent(id) + "/progress", { method: "POST", headers: { "x-csrf-token": readCsrfToken() }, body: JSON.stringify({ positionTicks, durationTicks }) }); },
 };
-
-function readCookie(name) {
-  const found = document.cookie.split("; ").find((part) => part.startsWith(name + "="));
-  return found ? found.slice(name.length + 1) : "";
-}
 
 function field(form, name) {
   return form.elements.namedItem(name);

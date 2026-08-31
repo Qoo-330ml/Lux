@@ -66,6 +66,7 @@ import type {
 } from "./types";
 
 const csrfCookie = "lux_csrf";
+const csrfTokenStorageKey = "lux_csrf_token";
 
 export type LibrarySortBy = "Name" | "DateCreated" | "PremiereDate" | "CommunityRating";
 export type LibrarySortOrder = "Ascending" | "Descending";
@@ -124,6 +125,32 @@ function writeClientCookie(name: string, value: string, maxAge?: number) {
   document.cookie = `${name}=${encodeURIComponent(value)}; Path=/;${maxAgeAttribute} SameSite=Lax${secureAttribute}`;
 }
 
+function readStoredCsrfToken(): string {
+  try {
+    if (typeof localStorage === "undefined") return "";
+    return localStorage.getItem(csrfTokenStorageKey) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function writeStoredCsrfToken(value: string | null) {
+  try {
+    if (typeof localStorage === "undefined") return;
+    if (value) {
+      localStorage.setItem(csrfTokenStorageKey, value);
+    } else {
+      localStorage.removeItem(csrfTokenStorageKey);
+    }
+  } catch {
+    // Private browsing and restrictive storage policies must not break login.
+  }
+}
+
+function readCsrfToken(): string {
+  return readStoredCsrfToken() || readCookie(csrfCookie);
+}
+
 async function readJson<T>(response: Response): Promise<T | undefined> {
   if (response.status === 204) return undefined;
   return (await response.json().catch(() => undefined)) as T | undefined;
@@ -138,7 +165,7 @@ export class LuxApiClient {
       headers.set("Content-Type", "application/json");
     }
     if (method !== "GET" && method !== "HEAD") {
-      const csrf = readCookie(csrfCookie);
+      const csrf = readCsrfToken();
       if (csrf) headers.set("X-CSRF-Token", csrf);
     }
 
@@ -209,6 +236,8 @@ export class LuxApiClient {
       body: JSON.stringify({ username, password }),
     }).then((response) => {
       if (typeof response.csrfToken === "string" && response.csrfToken.length > 0) {
+        // Only the CSRF nonce is client-readable; the session remains HttpOnly.
+        writeStoredCsrfToken(response.csrfToken);
         writeClientCookie(csrfCookie, response.csrfToken);
       }
       return response.user;
@@ -217,6 +246,7 @@ export class LuxApiClient {
 
   logout() {
     return this.request<void>("/api/v1/auth/logout", { method: "POST" }).then(() => {
+      writeStoredCsrfToken(null);
       writeClientCookie(csrfCookie, "", 0);
     });
   }
