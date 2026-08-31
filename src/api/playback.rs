@@ -573,10 +573,47 @@ pub(super) async fn emby_sessions(
         Ok(sessions) => sessions,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    Json(sessions.iter().map(emby_session_json).collect::<Vec<_>>()).into_response()
+    let catalog_items = if sessions
+        .iter()
+        .any(|session| session.duration_ticks.is_none_or(|ticks| ticks <= 0))
+    {
+        let item_ids = sessions
+            .iter()
+            .map(|session| session.item_id.clone())
+            .collect::<Vec<_>>();
+        let Some(catalog) = state.catalog.as_ref() else {
+            return Json(
+                sessions
+                    .iter()
+                    .map(|session| emby_session_json(session, None))
+                    .collect::<Vec<_>>(),
+            )
+            .into_response();
+        };
+        match catalog
+            .find_items(AccessPrincipal::new(user.id, user.is_admin), &item_ids)
+            .await
+        {
+            Ok(items) => items,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        HashMap::new()
+    };
+    Json(
+        sessions
+            .iter()
+            .map(|session| emby_session_json(session, catalog_items.get(&session.item_id)))
+            .collect::<Vec<_>>(),
+    )
+    .into_response()
 }
 
-pub(super) fn emby_session_json(session: &crate::storage::StoredPlaybackSession) -> Value {
+pub(super) fn emby_session_json(
+    session: &crate::storage::StoredPlaybackSession,
+    catalog_item: Option<&CatalogItem>,
+) -> Value {
+    let runtime_ticks = session_runtime_ticks(session, catalog_item);
     json!({
         "Id": session.id,
         "UserId": session.user_id,
@@ -595,9 +632,42 @@ pub(super) fn emby_session_json(session: &crate::storage::StoredPlaybackSession)
             "CanSeek": true,
             "PlayMethod": "DirectPlay",
         },
-        "RunTimeTicks": session.duration_ticks,
+        "NowPlayingItem": {
+            "Id": session.item_id,
+            "RunTimeTicks": runtime_ticks,
+        },
+        "RunTimeTicks": runtime_ticks,
         "LastActivityDate": session.last_event_at,
     })
+}
+
+fn session_runtime_ticks(
+    session: &crate::storage::StoredPlaybackSession,
+    catalog_item: Option<&CatalogItem>,
+) -> i64 {
+    session
+        .duration_ticks
+        .filter(|ticks| *ticks > 0)
+        .or_else(|| {
+            catalog_item.and_then(|item| {
+                item.runtime_ticks
+                    .filter(|ticks| *ticks > 0)
+                    .or_else(|| {
+                        item.media_sources
+                            .iter()
+                            .find(|source| source.is_default)
+                            .and_then(|source| source.duration_ticks)
+                            .filter(|ticks| *ticks > 0)
+                    })
+                    .or_else(|| {
+                        item.media_sources
+                            .iter()
+                            .find_map(|source| source.duration_ticks)
+                            .filter(|ticks| *ticks > 0)
+                    })
+            })
+        })
+        .unwrap_or_default()
 }
 
 pub(super) async fn lux_get_playback(

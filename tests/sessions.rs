@@ -148,12 +148,62 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let sessions_body = sessions.json::<Value>().await?;
     assert_eq!(sessions_body.as_array().map(Vec::len), Some(1));
     assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 900);
+    assert_eq!(sessions_body[0]["NowPlayingItem"]["Id"], event["ItemId"]);
+    assert_eq!(sessions_body[0]["NowPlayingItem"]["RunTimeTicks"], 1000);
+    assert_eq!(sessions_body[0]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["DeviceId"], "session-device");
     assert_eq!(sessions_body[0]["Client"], "SessionTest");
     assert_eq!(sessions_body[0]["DeviceName"], "Mac");
     assert_eq!(sessions_body[0]["DeviceType"], "Mac");
     assert_eq!(sessions_body[0]["ApplicationVersion"], "1");
     assert_eq!(sessions_body[0]["RemoteEndPoint"], "203.0.113.9");
+
+    sqlx::query("UPDATE media_items SET runtime_ticks = ? WHERE id = ?")
+        .bind(8_000_i64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let missing_duration = client
+        .post(&event_url)
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "session-without-duration",
+            "PositionTicks": 100,
+        }))
+        .send()
+        .await?;
+    assert_eq!(missing_duration.status(), reqwest::StatusCode::NO_CONTENT);
+    let sessions_with_fallback = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let fallback_session = sessions_with_fallback
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["PlaySessionId"] == "session-without-duration")
+        })
+        .ok_or("missing session without duration")?;
+    assert_eq!(fallback_session["NowPlayingItem"]["RunTimeTicks"], 8_000);
+    assert_eq!(fallback_session["RunTimeTicks"], 8_000);
+    let stop_fallback = client
+        .post(format!("{event_url}/Stopped"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "session-without-duration",
+            "PositionTicks": 100,
+        }))
+        .send()
+        .await?;
+    assert_eq!(stop_fallback.status(), reqwest::StatusCode::NO_CONTENT);
 
     sqlx::query(
         "UPDATE playback_sessions
