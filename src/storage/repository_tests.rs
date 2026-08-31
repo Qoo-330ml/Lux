@@ -374,6 +374,10 @@ async fn recommended_catalog_rows_cap_engagement_scores_and_expire_old_playback(
         .fetch_one(database.pool())
         .await
         .expect("current timestamp");
+    let playback_cutoff: i64 = sqlx::query_scalar("SELECT unixepoch('now', '-6 months')")
+        .fetch_one(database.pool())
+        .await
+        .expect("playback cutoff");
     let library_id = library.id.to_string();
     let user_id = user.id.to_string();
     let item_ids = [
@@ -441,7 +445,7 @@ async fn recommended_catalog_rows_cap_engagement_scores_and_expire_old_playback(
              VALUES (?, 'play-expired', ?)",
         )
         .bind(&playback_user_id)
-        .bind(now - 6 * 30 * 86_400 - 1)
+        .bind(playback_cutoff)
         .execute(database.pool())
         .await
         .expect("expired playback state");

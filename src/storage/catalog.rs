@@ -1,7 +1,5 @@
 use super::*;
 
-const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 6 * 30 * 86_400;
-
 impl Database {
     pub(crate) async fn count_catalog_items(
         &self,
@@ -600,6 +598,12 @@ impl Database {
         }
         let max_function = self.scalar_max_function();
         let min_function = self.scalar_min_function();
+        let playback_cutoff = match self.backend {
+            DatabaseBackend::Sqlite => "unixepoch('now', '-6 months')",
+            DatabaseBackend::Postgres => {
+                "FLOOR(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - INTERVAL '6 months')))"
+            }
+        };
         let rating_placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -626,11 +630,11 @@ impl Database {
              recent_playback_users AS (
                  SELECT ps.item_id, ps.user_id
                  FROM playback_sessions ps
-                 WHERE ps.last_event_at >= unixepoch() - {RECOMMENDATION_PLAYBACK_WINDOW_SECONDS}
+                 WHERE ps.last_event_at > {playback_cutoff}
                  UNION
                  SELECT us.item_id, us.user_id
                  FROM user_item_state us
-                 WHERE us.last_played_at >= unixepoch() - {RECOMMENDATION_PLAYBACK_WINDOW_SECONDS}
+                 WHERE us.last_played_at > {playback_cutoff}
              ),
              playback_counts AS (
                  SELECT item_id, COUNT(*) AS recent_playback_user_count
