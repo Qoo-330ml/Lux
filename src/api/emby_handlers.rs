@@ -511,17 +511,18 @@ pub(super) async fn emby_update_user(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(name) = request.name.as_deref() else {
-        return StatusCode::OK.into_response();
-    };
-    if name.trim().is_empty() {
+    if request
+        .name
+        .as_deref()
+        .is_some_and(|name| name.trim().is_empty())
+    {
         return StatusCode::BAD_REQUEST.into_response();
     }
     match users
         .update_user(
             &user_id,
             UserUpdate {
-                display_name: Some(name),
+                display_name: request.name.as_deref(),
                 ..UserUpdate::default()
             },
         )

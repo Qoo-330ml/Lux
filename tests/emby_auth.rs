@@ -531,6 +531,19 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
         reqwest::StatusCode::FORBIDDEN
     );
 
+    let missing_user_update = client
+        .post(format!(
+            "http://{address}/Users/00000000-0000-0000-0000-000000000000"
+        ))
+        .header(&admin_auth.0, &admin_auth.1)
+        .json(&json!({}))
+        .send()
+        .await;
+    assert_eq!(
+        missing_user_update?.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
     let oversized_for_handler = client
         .post(format!(
             "http://{address}/emby/Users/{}/Images/Primary",
