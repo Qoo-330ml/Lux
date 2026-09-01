@@ -1,4 +1,5 @@
 use super::*;
+use axum::extract::DefaultBodyLimit;
 
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
@@ -16,7 +17,25 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
-        .route("/Users/{user_id}", get(emby_user))
+        .route("/Users/{user_id}", get(emby_user).post(emby_update_user))
+        .route("/Users/{user_id}/Policy", post(emby_update_user_policy))
+        .route("/Users/{user_id}/Password", post(emby_update_user_password))
+        .route(
+            "/Users/{user_id}/Images/{image_type}",
+            get(emby_user_avatar)
+                .head(emby_user_avatar_head)
+                .post(emby_update_user_avatar)
+                .delete(emby_delete_user_avatar)
+                .layer(DefaultBodyLimit::max(MAX_USER_AVATAR_BYTES as usize)),
+        )
+        .route(
+            "/Users/{user_id}/Images/{image_type}/{image_index}",
+            get(emby_user_avatar_at_index)
+                .head(emby_user_avatar_at_index_head)
+                .post(emby_update_user_avatar_at_index)
+                .delete(emby_delete_user_avatar_at_index)
+                .layer(DefaultBodyLimit::max(MAX_USER_AVATAR_BYTES as usize)),
+        )
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Root", get(emby_user_root))
         .route("/Users/{user_id}/Items/Resume", get(emby_user_resume))

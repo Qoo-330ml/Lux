@@ -1,3 +1,4 @@
+use image::{DynamicImage, ImageFormat};
 use luxd::{
     api::{AppState, app_with_state},
     application::setup::SetupService,
@@ -13,6 +14,7 @@ use luxd::{
 use reqwest::header::AUTHORIZATION;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::io::Cursor;
 use tokio::net::TcpListener;
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -262,6 +264,304 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
         .await?;
     assert_eq!(after_logout.status(), reqwest::StatusCode::UNAUTHORIZED);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_user_routes_match_official_request_and_response_contracts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let users = UserStore::new(database.clone())?;
+    let viewer = users
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+
+    let admin_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "ADMIN",
+            "Pw": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_token = admin_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+    let admin_auth = (AUTHORIZATION, format!("Emby Token=\"{admin_token}\""));
+
+    let target_user = client
+        .get(format!("http://{address}/emby/Users/{}", viewer.id))
+        .header(&admin_auth.0, &admin_auth.1)
+        .send()
+        .await?;
+    assert_eq!(target_user.status(), reqwest::StatusCode::OK);
+    let target_user_body: serde_json::Value = target_user.json().await?;
+    assert_eq!(target_user_body["Id"], viewer.id.to_string());
+    assert_eq!(target_user_body["Name"], "Viewer");
+    assert!(target_user_body["HasPassword"].is_boolean());
+    assert!(target_user_body["Configuration"].is_object());
+    assert!(target_user_body["Policy"].is_object());
+
+    let rename = client
+        .post(format!("http://{address}/Users/{}", viewer.id))
+        .header(&admin_auth.0, &admin_auth.1)
+        .json(&json!({
+            "Name": "Viewer Renamed",
+            "Id": viewer.id.to_string(),
+            "ServerId": database.server_id()
+        }))
+        .send()
+        .await?;
+    assert_eq!(rename.status(), reqwest::StatusCode::OK);
+    assert!(rename.bytes().await?.is_empty());
+
+    let unsupported_put = client
+        .put(format!("http://{address}/Users/{}", viewer.id))
+        .header(&admin_auth.0, &admin_auth.1)
+        .json(&json!({ "Name": "Must Not Apply" }))
+        .send()
+        .await?;
+    assert_eq!(
+        unsupported_put.status(),
+        reqwest::StatusCode::METHOD_NOT_ALLOWED
+    );
+
+    let policy = client
+        .post(format!("http://{address}/emby/Users/{}/Policy", viewer.id))
+        .header(&admin_auth.0, &admin_auth.1)
+        .json(&json!({
+            "IsAdministrator": false,
+            "IsDisabled": false,
+            "EnableRemoteAccess": true,
+            "EnableContentDownloading": true,
+            "EnableRemoteControlOfOtherUsers": true,
+            "EnableSubtitleManagement": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(policy.status(), reqwest::StatusCode::OK);
+    assert!(policy.bytes().await?.is_empty());
+
+    let policy_xml = client
+        .post(format!("http://{address}/emby/Users/{}/Policy", viewer.id))
+        .header(&admin_auth.0, &admin_auth.1)
+        .header("Content-Type", "application/xml")
+        .body(
+            "<UserPolicy><EnableRemoteAccess>false</EnableRemoteAccess><EnableContentDownloading>false</EnableContentDownloading></UserPolicy>",
+        )
+        .send()
+        .await?;
+    assert_eq!(policy_xml.status(), reqwest::StatusCode::OK);
+
+    let policy_after = client
+        .get(format!("http://{address}/Users/{}", viewer.id))
+        .header(&admin_auth.0, &admin_auth.1)
+        .send()
+        .await?;
+    let policy_after_body: serde_json::Value = policy_after.json().await?;
+    assert_eq!(policy_after_body["Policy"]["EnableRemoteAccess"], false);
+    assert_eq!(
+        policy_after_body["Policy"]["EnableContentDownloading"],
+        false
+    );
+    assert_eq!(
+        policy_after_body["Policy"]["EnableRemoteControlOfOtherUsers"],
+        false
+    );
+    assert_eq!(
+        policy_after_body["Policy"]["EnableSubtitleManagement"],
+        false
+    );
+
+    let password = client
+        .post(format!(
+            "http://{address}/emby/Users/{}/Password",
+            viewer.id
+        ))
+        .header(&admin_auth.0, &admin_auth.1)
+        .json(&json!({
+            "Id": viewer.id.to_string(),
+            "NewPw": "new viewer password",
+            "ResetPassword": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(password.status(), reqwest::StatusCode::OK);
+    assert!(password.bytes().await?.is_empty());
+
+    let relogin = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "viewer",
+            "Pw": "new viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(relogin.status(), reqwest::StatusCode::OK);
+
+    let mut avatar = Cursor::new(Vec::new());
+    DynamicImage::new_rgba8(1, 1).write_to(&mut avatar, ImageFormat::Png)?;
+    let avatar_bytes = avatar.into_inner();
+    let avatar_upload = client
+        .post(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .header(&admin_auth.0, &admin_auth.1)
+        .header("Content-Type", "application/octet-stream")
+        .body(avatar_bytes.clone())
+        .send()
+        .await?;
+    assert_eq!(avatar_upload.status(), reqwest::StatusCode::OK);
+    assert!(avatar_upload.bytes().await?.is_empty());
+
+    let avatar_read = client
+        .get(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(avatar_read.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        avatar_read
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    assert_eq!(avatar_read.bytes().await?.as_ref(), avatar_bytes.as_slice());
+
+    let avatar_read_at_index = client
+        .get(format!(
+            "http://{address}/emby/Users/{}/Images/Primary/0",
+            viewer.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(avatar_read_at_index.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        avatar_read_at_index.bytes().await?.as_ref(),
+        avatar_bytes.as_slice()
+    );
+
+    let avatar_head = client
+        .head(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(avatar_head.status(), reqwest::StatusCode::OK);
+    assert_eq!(avatar_head.bytes().await?.len(), 0);
+
+    let avatar_delete = client
+        .delete(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .header(&admin_auth.0, &admin_auth.1)
+        .send()
+        .await?;
+    assert_eq!(avatar_delete.status(), reqwest::StatusCode::OK);
+    assert!(avatar_delete.bytes().await?.is_empty());
+
+    let avatar_after_delete = client
+        .get(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(avatar_after_delete.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let viewer_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "viewer",
+            "Pw": "new viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(viewer_login.status(), reqwest::StatusCode::OK);
+    let viewer_token = viewer_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned();
+    let viewer_policy = client
+        .post(format!("http://{address}/Users/{}/Policy", viewer.id))
+        .header("X-Emby-Token", &viewer_token)
+        .json(&json!({ "IsAdministrator": true }))
+        .send()
+        .await?;
+    assert_eq!(viewer_policy.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let viewer_other_user_update = client
+        .post(format!("http://{address}/Users/{}", admin.id))
+        .header("X-Emby-Token", &viewer_token)
+        .json(&json!({ "Name": "Must Not Apply" }))
+        .send()
+        .await?;
+    assert_eq!(
+        viewer_other_user_update.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    let oversized_for_handler = client
+        .post(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .header(&admin_auth.0, &admin_auth.1)
+        .header("Content-Type", "application/octet-stream")
+        .body(vec![0_u8; 3 * 1024 * 1024])
+        .send()
+        .await?;
+    assert_eq!(
+        oversized_for_handler.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let oversized_for_router = client
+        .post(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .header(&admin_auth.0, &admin_auth.1)
+        .header("Content-Type", "application/octet-stream")
+        .body(vec![0_u8; 5 * 1024 * 1024 + 1])
+        .send()
+        .await?;
+    assert_eq!(
+        oversized_for_router.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE
+    );
+
+    let _ = admin;
     Ok(())
 }
 

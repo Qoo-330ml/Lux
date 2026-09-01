@@ -74,6 +74,21 @@ impl UserAvatarService {
         }))
     }
 
+    pub async fn remove(&self, user_id: UserId) -> Result<(), UserAvatarError> {
+        let path = self.avatar_path(user_id);
+        let metadata = match fs::symlink_metadata(&path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(source) => return Err(UserAvatarError::io(path, source)),
+        };
+        if metadata.file_type().is_symlink() {
+            return Err(UserAvatarError::InvalidPath(path));
+        }
+        fs::remove_file(&path)
+            .await
+            .map_err(|source| UserAvatarError::io(path, source))
+    }
+
     fn avatar_path(&self, user_id: UserId) -> PathBuf {
         self.directory.join(user_id.to_string())
     }
@@ -86,10 +101,13 @@ fn avatar_content_type(content_type: &str, bytes: &[u8]) -> Result<&'static str,
         .map(str::trim)
         .unwrap_or_default();
     let detected = detected_content_type(bytes).ok_or(UserAvatarError::InvalidContent)?;
-    if !matches!(requested, "image/jpeg" | "image/png" | "image/webp") {
+    if !matches!(
+        requested,
+        "application/octet-stream" | "image/jpeg" | "image/png" | "image/webp"
+    ) {
         return Err(UserAvatarError::UnsupportedContentType);
     }
-    if requested != detected {
+    if requested != "application/octet-stream" && requested != detected {
         return Err(UserAvatarError::InvalidContent);
     }
     Ok(detected)
