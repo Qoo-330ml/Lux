@@ -4,8 +4,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { PlayerPage } from "../src/features/player/PlayerPage";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+import { episodeNavigationFor, PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
@@ -25,6 +25,10 @@ function dispatchPointer(
     clientY: { value: options.clientY },
   });
   target.dispatchEvent(event);
+}
+
+function CurrentPath() {
+  return <output data-testid="current-path">{useLocation().pathname}</output>;
 }
 
 describe("PlayerPage playback synchronization", () => {
@@ -61,6 +65,67 @@ describe("PlayerPage playback synchronization", () => {
     mediaSessionDescriptor = undefined;
     vi.unstubAllGlobals();
     vi.restoreAllMocks();
+  });
+
+  it("only exposes adjacent playable episodes in the same navigation list", () => {
+    const episodes = [
+      { id: "episode-1", itemType: "EPISODE", mediaSources: [{ id: "source-1" }], indexNumber: 1 },
+      { id: "episode-unplayable", itemType: "EPISODE", mediaSources: [], indexNumber: 2 },
+      { id: "episode-2", itemType: "EPISODE", mediaSources: [{ id: "source-2" }], indexNumber: 3 },
+      { id: "movie-1", itemType: "MOVIE", mediaSources: [{ id: "movie-source" }] },
+      { id: "episode-3", itemType: "EPISODE", mediaSources: [{ id: "source-3" }], indexNumber: 4 },
+    ];
+
+    expect(episodeNavigationFor(episodes, "episode-2")).toEqual({
+      previousEpisodeId: "episode-1",
+      nextEpisodeId: "episode-3",
+    });
+    expect(episodeNavigationFor(episodes, "episode-1").previousEpisodeId).toBeNull();
+    expect(episodeNavigationFor(episodes, "episode-3").nextEpisodeId).toBeNull();
+  });
+
+  it("navigates from an episode to its adjacent episode", async () => {
+    const episodes = {
+      "episode-1": { id: "episode-1", title: "第一集", itemType: "EPISODE" as const, seriesId: "series-1", parentId: "season-1", indexNumber: 1, mediaSources: [{ id: "source-1", isDefault: true }] },
+      "episode-2": { id: "episode-2", title: "第二集", itemType: "EPISODE" as const, seriesId: "series-1", parentId: "season-1", indexNumber: 2, mediaSources: [{ id: "source-2", isDefault: true }] },
+      "episode-3": { id: "episode-3", title: "第三集", itemType: "EPISODE" as const, seriesId: "series-1", parentId: "season-1", indexNumber: 3, mediaSources: [{ id: "source-3", isDefault: true }] },
+    };
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => episodes[itemId as keyof typeof episodes] ?? {
+      id: itemId,
+      title: "示例电影",
+      itemType: "MOVIE",
+      mediaSources: [{ id: "movie-source", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: Object.values(episodes) });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/episode-2"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<><PlayerPage /><CurrentPath /></>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const previous = container.querySelector<HTMLButtonElement>('[aria-label="上一集"]');
+    const next = container.querySelector<HTMLButtonElement>('[aria-label="下一集"]');
+    expect(previous?.disabled).toBe(false);
+    expect(next?.disabled).toBe(false);
+    await act(async () => next?.click());
+    expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/episode-3");
+    expect(api.item).toHaveBeenCalledWith("episode-3");
+
   });
 
   it("resumes the shared position and reports play, pause, and stop states", async () => {
@@ -100,6 +165,8 @@ describe("PlayerPage playback synchronization", () => {
 
     const video = container.querySelector<HTMLVideoElement>("video");
     expect(video).not.toBeNull();
+    expect(container.querySelector('[aria-label="上一集"]')).toBeNull();
+    expect(container.querySelector('[aria-label="下一集"]')).toBeNull();
     Object.defineProperty(video, "duration", { configurable: true, value: 120 });
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 0 });
 

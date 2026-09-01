@@ -8,6 +8,8 @@ import {
   PictureInPicture2,
   Play,
   Settings2,
+  SkipBack,
+  SkipForward,
   Volume1,
   Volume2,
   VolumeX,
@@ -33,6 +35,7 @@ export type PlayerControlsProps = {
   fullscreen: boolean;
   pictureInPictureEnabled: boolean;
   danmuVisible: boolean;
+  episodeNavigation?: PlayerEpisodeNavigation | null;
   airPlayAvailable?: boolean;
   chapters?: readonly PlayerChapterSegment[];
   introSkip?: PlayerIntroRange | null;
@@ -49,6 +52,7 @@ export type PlayerControlsProps = {
   onTimelineMouseLeave: () => void;
   onTimelineKeyDown: (event: ReactKeyboardEvent<HTMLDivElement>) => void;
   onTogglePlayPause: () => void;
+  onNavigateToEpisode?: (episodeId: string) => void;
   onToggleMute: () => void;
   onVolumeChange: (volume: number) => void;
   onToggleRemainingTime: () => void;
@@ -60,6 +64,11 @@ export type PlayerControlsProps = {
   onToggleSettings: () => void;
   onTogglePictureInPicture: () => void;
   onToggleFullscreen: () => void;
+};
+
+export type PlayerEpisodeNavigation = {
+  previousEpisodeId: string | null;
+  nextEpisodeId: string | null;
 };
 
 export function formatTime(seconds: number): string {
@@ -84,6 +93,7 @@ export function PlayerControls({
   fullscreen,
   pictureInPictureEnabled,
   danmuVisible,
+  episodeNavigation = null,
   airPlayAvailable = false,
   chapters = [],
   introSkip = null,
@@ -100,6 +110,7 @@ export function PlayerControls({
   onTimelineMouseLeave,
   onTimelineKeyDown,
   onTogglePlayPause,
+  onNavigateToEpisode = () => undefined,
   onToggleMute,
   onVolumeChange,
   onToggleRemainingTime,
@@ -183,6 +194,35 @@ export function PlayerControls({
           >
             {playing ? <Pause size={22} fill="currentColor" aria-hidden="true" /> : <Play size={22} fill="currentColor" aria-hidden="true" />}
           </button>
+
+          {episodeNavigation ? (
+            <>
+              <button
+                type="button"
+                className="lux-player-action-btn lux-player-episode-nav-btn"
+                aria-label="上一集"
+                title="上一集"
+                disabled={!episodeNavigation.previousEpisodeId}
+                onClick={() => {
+                  if (episodeNavigation.previousEpisodeId) onNavigateToEpisode(episodeNavigation.previousEpisodeId);
+                }}
+              >
+                <SkipBack size={20} aria-hidden="true" />
+              </button>
+              <button
+                type="button"
+                className="lux-player-action-btn lux-player-episode-nav-btn"
+                aria-label="下一集"
+                title="下一集"
+                disabled={!episodeNavigation.nextEpisodeId}
+                onClick={() => {
+                  if (episodeNavigation.nextEpisodeId) onNavigateToEpisode(episodeNavigation.nextEpisodeId);
+                }}
+              >
+                <SkipForward size={20} aria-hidden="true" />
+              </button>
+            </>
+          ) : null}
 
           <div className="lux-player-volume-group">
             <button

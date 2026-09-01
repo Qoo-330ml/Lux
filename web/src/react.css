@@ -657,6 +657,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-player-action-btn:hover, .lux-player-action-btn:focus-visible { color: #fff; background: rgba(255,255,255,.12); }
 .lux-player-action-btn:active { transform: scale(.93); }
 .lux-player-action-btn:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: -4px; }
+.lux-player-action-btn:disabled, .lux-player-action-btn:disabled:hover, .lux-player-action-btn:disabled:focus-visible { color: rgba(255,255,255,.32); background: transparent; cursor: not-allowed; transform: none; }
 .lux-player-action-btn.is-active { color: var(--lux-accent); }
 .lux-player-play-btn { color: #fff; }
 .lux-player-danmu-btn.is-active::after { position: absolute; right: 9px; bottom: 8px; width: 6px; height: 6px; border: 1px solid rgba(0,0,0,.5); border-radius: 50%; background: var(--lux-accent); content: ""; }

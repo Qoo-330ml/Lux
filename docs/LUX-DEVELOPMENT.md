@@ -2042,6 +2042,7 @@ services:
 | LUX-228 | web/src/features/player/、web/tests/；单次媒体读取的文本字幕解析实验，默认不改变 Direct Play |
 | LUX-229 | tests/strm_resolver_playback.rs、tests/web_playback.rs、web/tests/、docs/COMPATIBILITY.md；本地与远程 .strm 字幕兼容性阶段门 |
 | LUX-230 | src/application/scanner.rs、src/application/metadata.rs、src/storage/、src/api/media.rs、tests/、web/src/features/home/、web/src/lib/api/、web/src/react.css、docs/；全量扫描中的本地旁车流水线 |
+| LUX-231 | web/src/features/player/PlayerPage.tsx、web/src/features/player/components/player-controls.tsx、web/src/react.css、web/tests/；LuxPlayer 剧集上一集/下一集导航 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5418,6 +5419,26 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 
 - 不在本任务实现在线元数据匹配、缺失图片下载、刮削器请求或 TMDb 调用。
 - 不把旁车读取放回用户请求路径，不因旁车处理而串行暂停全量扫描。
+
+#### LUX-231：LuxPlayer 剧集集间导航
+
+范围：为 Lux Web 播放器增加剧集单集的“上一集”和“下一集”控制。播放器只在当前条目是单集时，复用已有剧集单集查询合同读取同一季度的可播放单集并按服务端顺序定位相邻条目；电影和其他媒体类型不显示这两个控件。
+
+验收：
+
+- [x] 单集播放时左下角控制栏显示带可访问名称的“上一集”和“下一集”；首集/末集对应按钮置灰，查询失败或尚未完成时不导航。
+- [x] 点击按钮进入相邻单集的 `/watch/{itemId}` 路由，旧播放会话按既有页面切换生命周期停止，新单集使用默认媒体源；不拼接媒体 URL、不改变播放会话 API 或进度合同。
+- [x] 只把同一剧集、同一季度且存在媒体源的单集纳入导航；电影、剧集容器、季度和无权/不可播放条目不显示或不能导航。
+- [x] 按钮具备键盘路径、焦点样式和明确的中文 `aria-label`/`title`，不造成桌面或窄屏控制栏横向溢出。
+
+验证：播放器组件单测、剧集播放导航组件/页面测试、`pnpm --dir web test`、`pnpm --dir web build`，真实浏览器检查首集/中间集/末集和电影播放页。
+
+依赖：现有 LUX-198 Web 播放会话、LUX-206 播放器 UI 与 LUX-220 的剧集单集查询合同。
+
+明确不做：
+
+- 不新增 Rust 路由、数据库字段、自动播放策略或跨季度/跨剧集的播放队列。
+- 不改变账户设置中的“自动播放下一集”开关语义；本任务只提供显式按钮导航。
 
 ## 26. 风险与缓解
 

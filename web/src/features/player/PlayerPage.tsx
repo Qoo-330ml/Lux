@@ -32,6 +32,7 @@ import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from 
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
+import type { PlayerEpisodeNavigation } from "./components/player-controls";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import type { PlayerSettingsSourceOption } from "./components/player-settings-panel";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
@@ -156,6 +157,19 @@ function timelinePosition(bar: HTMLDivElement, clientX: number, duration: number
   return progress * duration;
 }
 
+export function episodeNavigationFor(episodes: MediaItem[], currentEpisodeId: string): PlayerEpisodeNavigation {
+  const playableEpisodes = episodes.filter((episode) =>
+    episode.itemType === "EPISODE" && (episode.mediaSources?.length ?? 0) > 0,
+  );
+  const currentIndex = playableEpisodes.findIndex((episode) => episode.id === currentEpisodeId);
+  return {
+    previousEpisodeId: currentIndex > 0 ? playableEpisodes[currentIndex - 1].id : null,
+    nextEpisodeId: currentIndex >= 0 && currentIndex < playableEpisodes.length - 1
+      ? playableEpisodes[currentIndex + 1].id
+      : null,
+  };
+}
+
 export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -236,6 +250,18 @@ export function PlayerPage() {
   playbackDataRef.current = playbackData;
 
   const media = playbackBootstrap.data?.item ?? item.data;
+  const episodeSiblings = useQuery({
+    queryKey: queryKeys.children(media?.seriesId ?? "", "EPISODE", media?.parentId ?? undefined),
+    queryFn: () => api.children(media?.seriesId ?? "", {
+      itemType: "EPISODE",
+      seasonId: media?.parentId ?? undefined,
+    }),
+    enabled: media?.itemType === "EPISODE" && Boolean(media.seriesId) && Boolean(media.parentId),
+    staleTime: 60_000,
+  });
+  const episodeNavigation = media?.itemType === "EPISODE"
+    ? episodeNavigationFor(episodeSiblings.data?.items ?? [], media.id)
+    : null;
   const source =
     media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
     media?.mediaSources?.find((entry) => entry.isDefault) ??
@@ -1119,6 +1145,11 @@ export function PlayerPage() {
     }
   };
 
+  const navigateToEpisode = useCallback((episodeId: string) => {
+    setShowSettings(false);
+    navigate(`/watch/${encodeURIComponent(episodeId)}`);
+  }, [navigate]);
+
   if (playbackBootstrap.isPending || (useLegacyPlaybackQueries && item.isPending)) {
     return <PlayerLoadingState message="正在准备播放器…" />;
   }
@@ -1300,6 +1331,7 @@ export function PlayerPage() {
         fullscreen={isFullscreen}
         pictureInPictureEnabled={Boolean(document.pictureInPictureEnabled)}
         danmuVisible={danmuVisible}
+        episodeNavigation={episodeNavigation}
         airPlayAvailable={airPlay.available}
         chapters={chapterTimeline.segments}
         introSkip={activeIntroRange}
@@ -1316,6 +1348,7 @@ export function PlayerPage() {
         onTimelineMouseLeave={handleScrubberMouseLeave}
         onTimelineKeyDown={handleTimelineKeyDown}
         onTogglePlayPause={togglePlayPause}
+        onNavigateToEpisode={navigateToEpisode}
         onToggleMute={toggleMute}
         onVolumeChange={changeVolume}
         onToggleRemainingTime={() => setIsRemainingTime((remaining) => !remaining)}
