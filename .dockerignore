@@ -3,13 +3,13 @@
 .codex
 .env
 .env.*
-config
-media
-data
-logs
-target
-output
-dist
+/config
+/media
+/data
+/logs
+/target
+/output
+/dist
 web/node_modules
 web/dist
 docs
@@ -25,3 +25,4 @@ tools
 *.pem
 *.key
 Lux-开发规格与分步实施计划.md
+**/._*
