@@ -360,6 +360,13 @@ Lux 匹配；重叠结果按 Emby 条目 ID 去重。该优化不改变 `ITEM_ST
 | 用户资料/权限 | 已实现，真实版本待验证 | 用户名、显示名、启用状态、远程访问、内容下载和按 Emby 虚拟媒体库 ID/名称/路径映射的媒体库访问权限；Emby 管理员不会自动成为 Lux 管理员 |
 | 密码迁移 | 已实现，真实版本待验证 | 不读取密码哈希；首次 Lux 登录时向 Emby 验证一次原密码 |
 
+Emby 用户写接口已按当前官方 OpenAPI 记录并实现：`POST /Users/{Id}` 接收 `UserDto` 的 JSON/XML（当前只写入 Lux 支持的 `Name`），
+`POST /Users/{Id}/Policy` 接收 `UserPolicy` 的 JSON/XML（只映射管理员、禁用、远程访问和内容下载权限），
+`POST /Users/{Id}/Password` 接收 `UpdateUserPassword` 的 JSON/XML（使用 `NewPw`），成功均返回 `200` 空响应。
+用户头像实现 `GET/HEAD/POST/DELETE /Users/{Id}/Images/{Type}` 及带 `Index` 的路径；读取无需认证，写入/删除需要认证，上传请求体为
+`application/octet-stream` 二进制流，并只实现 `Primary` 类型。当前未以真实 Emby 客户端或受控 Emby 实例验证这些写接口。
+官方来源：https://swagger.emby.media/openapi.json 。
+
 Emby 官方源码中的 `SqliteUserDataRepository` 只持久化 `played`、`playCount`、`isFavorite`、
 `playbackPositionTicks` 和 `lastPlayedDate` 等条目聚合状态，没有公开事件流字段；官方 Session API
 描述的是当前会话列表，不是历史播放事件。因此当前能力保持 `ITEM_STATE`，直到受控实例证明存在可用的
