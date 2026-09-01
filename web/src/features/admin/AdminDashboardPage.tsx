@@ -156,9 +156,6 @@ export function AdminDashboardPage() {
             <div className="lux-bento-metric-body">
               <strong className="lux-admin-overview-metric-value lux-bento-big-num">{formatCount(stats.userCount)}</strong>
             </div>
-            <div className="lux-bento-card-footer">
-              <small>{stats.userCount} 个配置账户</small>
-            </div>
           </div>
 
           {/* CPU Card */}
@@ -185,9 +182,6 @@ export function AdminDashboardPage() {
                 </div>
               ) : null}
             </div>
-            <div className="lux-bento-card-footer">
-              <small>{health.resources.cpu.capacityCores ? `总核心：${health.resources.cpu.capacityCores.toFixed(1)} 核` : "CPU 资源"}</small>
-            </div>
           </div>
 
           {/* Memory Card */}
@@ -198,9 +192,6 @@ export function AdminDashboardPage() {
             </div>
             <div className="lux-bento-metric-body">
               <strong className="lux-admin-overview-metric-value">{formatMemory(health.resources.memory)}</strong>
-            </div>
-            <div className="lux-bento-card-footer">
-              <small>常驻内存</small>
             </div>
           </div>
 
@@ -227,13 +218,6 @@ export function AdminDashboardPage() {
                   />
                 </div>
               ) : null}
-            </div>
-            <div className="lux-bento-card-footer">
-              <small>
-                {health.resources.mediaStorage.availableBytes !== null && health.resources.mediaStorage.availableBytes !== undefined
-                  ? `剩余 ${formatBytes(health.resources.mediaStorage.availableBytes)} 可用`
-                  : "媒体存储空间"}
-              </small>
             </div>
           </div>
         </div>

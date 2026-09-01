@@ -998,7 +998,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   padding: 14px 16px;
   border: 1px solid var(--lux-line-soft);
   border-radius: 16px;
-  background: linear-gradient(135deg, rgba(24, 25, 30, .82) 0%, rgba(15, 16, 20, .92) 100%);
+  background: rgba(255, 255, 255, .008);
   box-shadow: 0 4px 20px rgba(0, 0, 0, .28), inset 0 1px 0 rgba(255, 255, 255, .04);
   backdrop-filter: blur(16px);
   -webkit-backdrop-filter: blur(16px);
@@ -1015,8 +1015,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   grid-column: span 4;
   min-height: 154px;
   padding: 16px;
-  background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 8%, transparent) 0%, transparent 70%),
-              linear-gradient(135deg, rgba(25, 28, 36, .9) 0%, rgba(14, 15, 19, .96) 100%);
+  background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 5%, transparent) 0%, transparent 72%),
+              rgba(255, 255, 255, .008);
 }
 
 .lux-bento-hero-top {
@@ -1067,6 +1067,12 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   grid-column: span 2;
   min-height: 154px;
   padding: 16px;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .lux-bento-card-header {
@@ -1105,8 +1111,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   gap: 5px;
   padding: 8px 10px;
   border: 1px solid var(--lux-line-soft);
-  border-radius: 9px;
-  background: rgba(255, 255, 255, 0.02);
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.008);
 }
 
 .lux-bento-media-subcard strong {
@@ -2462,7 +2468,7 @@ html[data-lux-theme="light"] .lux-admin-overview-card {
 }
 html[data-lux-theme="light"] .lux-bento-card {
   border-color: var(--lux-line-soft);
-  background: linear-gradient(135deg, rgba(255, 255, 255, .82) 0%, rgba(255, 255, 255, .64) 100%);
+  background: rgba(28, 28, 34, .012);
   box-shadow: 0 4px 16px rgba(30, 30, 38, .08), inset 0 1px 0 rgba(255, 255, 255, .74);
 }
 html[data-lux-theme="light"] .lux-bento-card:hover {
@@ -2470,15 +2476,19 @@ html[data-lux-theme="light"] .lux-bento-card:hover {
   box-shadow: 0 10px 26px rgba(30, 30, 38, .12), inset 0 1px 0 rgba(255, 255, 255, .9);
 }
 html[data-lux-theme="light"] .lux-bento-card-hero {
-  background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 8%, transparent) 0%, transparent 70%),
-              linear-gradient(135deg, rgba(255, 255, 255, .92) 0%, rgba(255, 255, 255, .72) 100%);
+  background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 5%, transparent) 0%, transparent 72%),
+              rgba(28, 28, 34, .012);
+}
+html[data-lux-theme="light"] .lux-bento-card-media {
+  background: transparent;
+  box-shadow: none;
 }
 html[data-lux-theme="light"] .lux-bento-hero-icon,
 html[data-lux-theme="light"] .lux-bento-icon-tile,
 html[data-lux-theme="light"] .lux-bento-version > span {
   background: rgba(28, 28, 34, .045);
 }
-html[data-lux-theme="light"] .lux-bento-media-subcard { background: rgba(28, 28, 34, .025); }
+html[data-lux-theme="light"] .lux-bento-media-subcard { background: rgba(28, 28, 34, .012); }
 html[data-lux-theme="light"] .lux-bento-progress-track { background: rgba(28, 28, 34, .1); }
 html[data-lux-theme="light"] .lux-status-pill.is-ok { color: #247b4b; background: rgba(36,123,75,.12); }
 html[data-lux-theme="light"] .lux-status-pill.is-warn { color: #9a5f13; background: rgba(154,95,19,.12); }

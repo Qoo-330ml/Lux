@@ -150,6 +150,14 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector(".lux-bento-version strong")?.textContent).toBe("v0.2.7");
     expect(overview?.querySelectorAll(".lux-bento-icon-tile")).toHaveLength(4);
     expect(overview?.querySelector(".lux-bento-icon-tile.is-storage")).not.toBeNull();
+    expect(overview?.querySelector(".lux-bento-card-users .lux-bento-card-footer")).toBeNull();
+    expect(overview?.querySelector(".lux-bento-card-cpu .lux-bento-card-footer")).toBeNull();
+    expect(overview?.querySelector(".lux-bento-card-mem .lux-bento-card-footer")).toBeNull();
+    expect(overview?.querySelector(".lux-bento-card-storage .lux-bento-card-footer")).toBeNull();
+    expect(overview?.textContent).not.toContain("个配置账户");
+    expect(overview?.textContent).not.toContain("总核心");
+    expect(overview?.textContent).not.toContain("常驻内存");
+    expect(overview?.textContent).not.toContain("剩余");
     expect(overview?.querySelector(".lux-admin-overview-device")).toBeNull();
     expect(overview?.querySelectorAll(".lux-admin-overview-info-icon")).toHaveLength(0);
     expect(overview?.textContent).toContain("存储空间");
