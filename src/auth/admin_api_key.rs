@@ -136,11 +136,14 @@ fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, AdminAp
         id,
         username_normalized: stored.username_normalized,
         display_name: stored.display_name,
+        has_password: stored.has_password,
         is_disabled: stored.is_disabled,
         is_admin: stored.is_admin,
         can_manage_server: stored.can_manage_server,
         can_remote_access: stored.can_remote_access,
         can_download: stored.can_download,
+        last_login_at: stored.last_login_at,
+        last_activity_at: stored.last_activity_at,
     })
 }
 

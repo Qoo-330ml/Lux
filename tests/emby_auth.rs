@@ -578,6 +578,178 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
     Ok(())
 }
 
+#[tokio::test]
+async fn emby_user_creation_deletion_and_configuration_are_persistent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let users = UserStore::new(database.clone())?;
+    let template = users
+        .create_user("Template", "Template", "template password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+
+    let admin_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "ADMIN",
+            "Pw": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_token = admin_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+
+    let template_policy = client
+        .post(format!(
+            "http://{address}/emby/Users/{}/Policy",
+            template.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "IsDisabled": false,
+            "EnableRemoteAccess": true,
+            "EnableContentDownloading": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(template_policy.status(), reqwest::StatusCode::OK);
+
+    let created = client
+        .post(format!("http://{address}/emby/Users/New"))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Name": "Managed",
+            "CopyFromUserId": template.id,
+            "UserCopyOptions": ["UserPolicy", "UserConfiguration"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+    let created_body = created.json::<serde_json::Value>().await?;
+    let created_id = created_body["Id"]
+        .as_str()
+        .ok_or("missing created user id")?
+        .to_owned();
+    assert_eq!(created_body["Name"], "Managed");
+    assert_eq!(created_body["HasPassword"], false);
+    assert_eq!(created_body["Policy"]["EnableRemoteAccess"], true);
+    assert_eq!(created_body["Policy"]["EnableContentDownloading"], true);
+
+    let updated = client
+        .post(format!("http://{address}/Users/{created_id}"))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Id": created_id,
+            "Name": "Managed Renamed",
+            "Configuration": {
+                "PlayDefaultAudioTrack": false,
+                "SubtitleMode": "Always",
+                "HidePlayedInLatest": true,
+                "EnableNextEpisodeAutoPlay": false
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(updated.status(), reqwest::StatusCode::OK);
+
+    let detail = client
+        .get(format!("http://{address}/Users/{created_id}"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body = detail.json::<serde_json::Value>().await?;
+    assert_eq!(detail_body["Name"], "Managed Renamed");
+    assert_eq!(detail_body["HasPassword"], false);
+    assert_eq!(detail_body["Configuration"]["PlayDefaultAudioTrack"], false);
+    assert_eq!(detail_body["Configuration"]["SubtitleMode"], "Always");
+    assert_eq!(detail_body["Configuration"]["HidePlayedInLatest"], true);
+    assert_eq!(
+        detail_body["Configuration"]["EnableNextEpisodeAutoPlay"],
+        false
+    );
+
+    let password = client
+        .post(format!("http://{address}/Users/{created_id}/Password"))
+        .header("X-Emby-Token", &admin_token)
+        .json(&json!({
+            "Id": created_id,
+            "NewPw": "managed password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(password.status(), reqwest::StatusCode::OK);
+
+    let managed_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "managed",
+            "Pw": "managed password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(managed_login.status(), reqwest::StatusCode::OK);
+    let managed_token = managed_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing managed token")?
+        .to_owned();
+
+    let deleted = client
+        .delete(format!("http://{address}/emby/Users/{created_id}"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), reqwest::StatusCode::OK);
+    assert!(deleted.bytes().await?.is_empty());
+
+    let missing = client
+        .get(format!("http://{address}/Users/{created_id}"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let revoked = client
+        .get(format!("http://{address}/System/Info"))
+        .header("X-Emby-Token", &managed_token)
+        .send()
+        .await?;
+    assert_eq!(revoked.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let last_manager = client
+        .delete(format!("http://{address}/Users/{}", admin.id))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(last_manager.status(), reqwest::StatusCode::CONFLICT);
+
+    Ok(())
+}
+
 #[test]
 fn emby_device_info_parser_keeps_only_expected_fields() {
     let info = EmbyDeviceInfo::parse(

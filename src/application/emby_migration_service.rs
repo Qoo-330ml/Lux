@@ -5409,11 +5409,14 @@ done
             id: Uuid::now_v7().into(),
             username_normalized: "alice".to_owned(),
             display_name: "Alice".to_owned(),
+            has_password: false,
             is_disabled: false,
             is_admin: false,
             can_manage_server: false,
             can_remote_access: true,
             can_download: false,
+            last_login_at: None,
+            last_activity_at: None,
         };
         let source_user = MigrationUser {
             id: "emby-user".to_owned(),

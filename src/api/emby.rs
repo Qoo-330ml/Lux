@@ -14,10 +14,16 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Users", get(emby_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/authenticatebyname", post(emby_authenticate))
+        .route("/Users/New", post(emby_create_user))
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
-        .route("/Users/{user_id}", get(emby_user).post(emby_update_user))
+        .route(
+            "/Users/{user_id}",
+            get(emby_user)
+                .post(emby_update_user)
+                .delete(emby_delete_user),
+        )
         .route("/Users/{user_id}/Policy", post(emby_update_user_policy))
         .route("/Users/{user_id}/Password", post(emby_update_user_password))
         .route(

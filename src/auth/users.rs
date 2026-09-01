@@ -3,17 +3,21 @@ use crate::{
     domain::ids::UserId,
     storage::{Database, StorageError, UpdateUser},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct UserRecord {
     pub id: UserId,
     pub username_normalized: String,
     pub display_name: String,
+    pub has_password: bool,
     pub is_disabled: bool,
     pub is_admin: bool,
     pub can_manage_server: bool,
     pub can_remote_access: bool,
     pub can_download: bool,
+    pub last_login_at: Option<i64>,
+    pub last_activity_at: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -49,6 +53,7 @@ impl UserStore {
                 &display_name,
                 &password_hash,
                 is_admin,
+                true,
             )
             .await?;
 
@@ -56,11 +61,52 @@ impl UserStore {
             id,
             username_normalized,
             display_name,
+            has_password: true,
             is_disabled: false,
             is_admin,
             can_manage_server: is_admin,
             can_remote_access: false,
             can_download: false,
+            last_login_at: None,
+            last_activity_at: None,
+        })
+    }
+
+    pub async fn create_user_without_password(
+        &self,
+        username: &str,
+        display_name: &str,
+        is_admin: bool,
+    ) -> Result<UserRecord, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        let display_name = normalized_display_name(display_name, &username_normalized);
+        let placeholder = format!("lux-unset-password-{}", UserId::new());
+        let password_hash = self.passwords.hash_password(&placeholder)?;
+        let id = UserId::new();
+
+        self.database
+            .insert_user(
+                &id.to_string(),
+                &username_normalized,
+                &display_name,
+                &password_hash,
+                is_admin,
+                false,
+            )
+            .await?;
+
+        Ok(UserRecord {
+            id,
+            username_normalized,
+            display_name,
+            has_password: false,
+            is_disabled: false,
+            is_admin,
+            can_manage_server: is_admin,
+            can_remote_access: false,
+            can_download: false,
+            last_login_at: None,
+            last_activity_at: None,
         })
     }
 
@@ -126,6 +172,7 @@ impl UserStore {
                 UpdateUser {
                     display_name: update.display_name,
                     password_hash: password_hash.as_deref(),
+                    has_password: password_hash.as_ref().map(|_| true),
                     is_disabled: update.is_disabled,
                     is_admin: update.is_admin,
                     can_manage_server: update.can_manage_server,
@@ -140,6 +187,17 @@ impl UserStore {
             Err(error) => return Err(UserStoreError::Storage(error)),
         };
         updated.map(user_record).transpose()
+    }
+
+    pub async fn delete_user(&self, user_id: &str) -> Result<bool, UserStoreError> {
+        if user_id.parse::<UserId>().is_err() {
+            return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
+        }
+        match self.database.delete_user(user_id).await {
+            Ok(deleted) => Ok(deleted),
+            Err(StorageError::LastManager) => Err(UserStoreError::LastManager),
+            Err(error) => Err(UserStoreError::Storage(error)),
+        }
     }
 
     pub async fn create_initial_admin(
@@ -169,11 +227,14 @@ impl UserStore {
             id,
             username_normalized,
             display_name,
+            has_password: true,
             is_disabled: false,
             is_admin: true,
             can_manage_server: true,
             can_remote_access: false,
             can_download: false,
+            last_login_at: None,
+            last_activity_at: None,
         })
     }
 
@@ -193,9 +254,14 @@ impl UserStore {
         let Some(stored) = stored else {
             return Ok(None);
         };
-        if !password_matches || stored.is_disabled {
+        if !stored.has_password || !password_matches || stored.is_disabled {
             return Ok(None);
         }
+        self.database.mark_user_logged_in(&stored.id).await?;
+        let last_login_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok());
 
         let id = stored
             .id
@@ -205,11 +271,14 @@ impl UserStore {
             id,
             username_normalized: stored.username_normalized,
             display_name: stored.display_name,
+            has_password: stored.has_password,
             is_disabled: stored.is_disabled,
             is_admin: stored.is_admin,
             can_manage_server: stored.can_manage_server,
             can_remote_access: stored.can_remote_access,
             can_download: stored.can_download,
+            last_login_at,
+            last_activity_at: stored.last_activity_at,
         }))
     }
 }
@@ -303,10 +372,13 @@ fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, UserSto
         id,
         username_normalized: stored.username_normalized,
         display_name: stored.display_name,
+        has_password: stored.has_password,
         is_disabled: stored.is_disabled,
         is_admin: stored.is_admin,
         can_manage_server: stored.can_manage_server,
         can_remote_access: stored.can_remote_access,
         can_download: stored.can_download,
+        last_login_at: stored.last_login_at,
+        last_activity_at: stored.last_activity_at,
     })
 }

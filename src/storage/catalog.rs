@@ -5558,9 +5558,14 @@ impl Database {
     ) -> Result<Option<StoredWebSession>, StorageError> {
         self.query(
             "SELECT ws.csrf_token_hash, u.id AS user_id,
-                    u.username_normalized, u.display_name, u.is_disabled,
-                    u.is_admin, u.can_manage_server, u.can_remote_access,
-                    u.can_download
+                    u.username_normalized, u.display_name, u.has_password,
+                    u.is_disabled, u.is_admin, u.can_manage_server,
+                    u.can_remote_access, u.can_download, u.last_login_at,
+                    COALESCE(
+                        (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                         FROM access_tokens at WHERE at.user_id = u.id),
+                        u.last_login_at
+                    ) AS last_activity_at
              FROM web_sessions ws
              JOIN users u ON u.id = ws.user_id
              WHERE ws.session_token_hash = ?
@@ -5576,11 +5581,14 @@ impl Database {
                 user_id: row.get("user_id"),
                 username_normalized: row.get("username_normalized"),
                 display_name: row.get("display_name"),
+                has_password: row.get::<i64, _>("has_password") != 0,
                 is_disabled: row.get::<i64, _>("is_disabled") != 0,
                 is_admin: row.get::<i64, _>("is_admin") != 0,
                 can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
                 can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
                 can_download: row.get::<i64, _>("can_download") != 0,
+                last_login_at: row.get("last_login_at"),
+                last_activity_at: row.get("last_activity_at"),
             })
         })
         .map_err(|source| StorageError::Sqlx {

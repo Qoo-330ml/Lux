@@ -651,11 +651,14 @@ pub(crate) struct StoredUser {
     pub(crate) username_normalized: String,
     pub(crate) display_name: String,
     pub(crate) password_hash: String,
+    pub(crate) has_password: bool,
     pub(crate) is_disabled: bool,
     pub(crate) is_admin: bool,
     pub(crate) can_manage_server: bool,
     pub(crate) can_remote_access: bool,
     pub(crate) can_download: bool,
+    pub(crate) last_login_at: Option<i64>,
+    pub(crate) last_activity_at: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -672,17 +675,21 @@ fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
         username_normalized: row.get("username_normalized"),
         display_name: row.get("display_name"),
         password_hash: row.get("password_hash"),
+        has_password: row.get::<i64, _>("has_password") != 0,
         is_disabled: row.get::<i64, _>("is_disabled") != 0,
         is_admin: row.get::<i64, _>("is_admin") != 0,
         can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
         can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
         can_download: row.get::<i64, _>("can_download") != 0,
+        last_login_at: row.get("last_login_at"),
+        last_activity_at: row.get("last_activity_at"),
     }
 }
 
 pub(crate) struct UpdateUser<'a> {
     pub(crate) display_name: Option<&'a str>,
     pub(crate) password_hash: Option<&'a str>,
+    pub(crate) has_password: Option<bool>,
     pub(crate) is_disabled: Option<bool>,
     pub(crate) is_admin: Option<bool>,
     pub(crate) can_manage_server: Option<bool>,
@@ -2525,11 +2532,14 @@ pub(crate) struct StoredWebSession {
     pub(crate) user_id: String,
     pub(crate) username_normalized: String,
     pub(crate) display_name: String,
+    pub(crate) has_password: bool,
     pub(crate) is_disabled: bool,
     pub(crate) is_admin: bool,
     pub(crate) can_manage_server: bool,
     pub(crate) can_remote_access: bool,
     pub(crate) can_download: bool,
+    pub(crate) last_login_at: Option<i64>,
+    pub(crate) last_activity_at: Option<i64>,
 }
 
 #[derive(Debug)]

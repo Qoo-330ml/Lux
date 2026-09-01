@@ -1,6 +1,7 @@
 use super::*;
 
 use quick_xml::{Reader, escape::unescape, events::Event};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use crate::domain::ids::UserId;
 
@@ -212,7 +213,14 @@ pub(super) async fn emby_public_users(State(state): State<AppState>) -> Json<Val
     Json(Value::Array(
         users
             .iter()
-            .map(|user| emby_user_json(user, &server_id, &server_name, &[]))
+            .map(|user| {
+                emby_user_json(
+                    user,
+                    &server_id,
+                    &server_name,
+                    emby_user_configuration_json(&[]),
+                )
+            })
             .collect(),
     ))
 }
@@ -240,7 +248,14 @@ pub(super) async fn emby_users(
     Json(Value::Array(
         users
             .iter()
-            .map(|user| emby_user_json(user, &state.server_id, &server_name, &[]))
+            .map(|user| {
+                emby_user_json(
+                    user,
+                    &state.server_id,
+                    &server_name,
+                    emby_user_configuration_json(&[]),
+                )
+            })
             .collect(),
     ))
     .into_response()
@@ -276,13 +291,189 @@ pub(super) async fn emby_user(
     };
     let server_name = current_emby_server_name(&state).await;
     let ordered_views = emby_ordered_views(&state, &user).await;
+    let configuration = emby_user_configuration(&state, &user, &ordered_views).await;
     Json(emby_user_json(
         &user,
         &state.server_id,
         &server_name,
-        &ordered_views,
+        configuration,
     ))
     .into_response()
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+pub(super) struct EmbyCreateUserRequest {
+    name: Option<String>,
+    copy_from_user_id: Option<String>,
+    user_copy_options: Option<Vec<String>>,
+}
+
+pub(super) async fn emby_create_user(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+    body: Bytes,
+) -> Response {
+    let request = match parse_emby_create_user_request(&headers, &body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
+    let acting_user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !acting_user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(name) = request
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let source = if let Some(source_id) = request.copy_from_user_id.as_deref() {
+        if source_id.parse::<UserId>().is_err() {
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+        let Some(auth) = state.emby_auth.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        match auth.user_by_id(source_id).await {
+            Ok(Some(source)) => Some(source),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        None
+    };
+    let copy_policy = source.is_some()
+        && request
+            .user_copy_options
+            .as_deref()
+            .is_some_and(|options| has_emby_copy_option(options, "UserPolicy"));
+    let copy_configuration = source.is_some()
+        && request
+            .user_copy_options
+            .as_deref()
+            .is_some_and(|options| has_emby_copy_option(options, "UserConfiguration"));
+    let mut created = match users
+        .create_user_without_password(
+            name,
+            name,
+            copy_policy && source.as_ref().is_some_and(|user| user.is_admin),
+        )
+        .await
+    {
+        Ok(user) => user,
+        Err(UserStoreError::InvalidUsername) => return StatusCode::BAD_REQUEST.into_response(),
+        Err(UserStoreError::Storage(error)) if error.is_unique_violation() => {
+            return StatusCode::CONFLICT.into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if copy_policy {
+        let Some(source) = source.as_ref() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        created = match users
+            .update_user(
+                &created.id.to_string(),
+                UserUpdate {
+                    is_admin: Some(source.is_admin),
+                    can_manage_server: Some(source.can_manage_server),
+                    is_disabled: Some(source.is_disabled),
+                    can_remote_access: Some(source.can_remote_access),
+                    can_download: Some(source.can_download),
+                    ..UserUpdate::default()
+                },
+            )
+            .await
+        {
+            Ok(Some(user)) => user,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(UserStoreError::LastManager) => return StatusCode::CONFLICT.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    }
+    if copy_configuration {
+        let Some(source) = source.as_ref() else {
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        };
+        let source_id = source.id.to_string();
+        let target_id = created.id.to_string();
+        if let Err(error) = database
+            .copy_user_library_settings(&source_id, &target_id)
+            .await
+        {
+            tracing::error!(error = %error, "failed to copy emby user library settings");
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if let Ok(Some(configuration)) = database.find_user_emby_configuration(&source_id).await {
+            if let Err(error) = database
+                .set_user_emby_configuration(&target_id, &configuration)
+                .await
+            {
+                tracing::error!(error = %error, "failed to copy emby user configuration");
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+        }
+        created = match users.find_by_id(&target_id).await {
+            Ok(Some(user)) => user,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    }
+    let server_name = current_emby_server_name(&state).await;
+    let ordered_views = emby_ordered_views(&state, &created).await;
+    let configuration = emby_user_configuration(&state, &created, &ordered_views).await;
+    Json(emby_user_json(
+        &created,
+        &state.server_id,
+        &server_name,
+        configuration,
+    ))
+    .into_response()
+}
+
+pub(super) async fn emby_delete_user(
+    headers: HeaderMap,
+    Path(user_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if user_id.parse::<UserId>().is_err() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let acting_user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !acting_user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let users = match UserStore::new(database.clone()) {
+        Ok(users) => users,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match users.delete_user(&user_id).await {
+        Ok(true) => StatusCode::OK.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(UserStoreError::LastManager) => StatusCode::CONFLICT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -290,6 +481,8 @@ pub(super) async fn emby_user(
 pub(super) struct EmbyUserUpdateRequest {
     id: Option<String>,
     name: Option<String>,
+    configuration: Option<Value>,
+    policy: Option<EmbyUserPolicyRequest>,
 }
 
 #[derive(Deserialize, Default)]
@@ -415,10 +608,44 @@ fn parse_emby_user_update_request(
             Ok(EmbyUserUpdateRequest {
                 id: fields.get("Id").cloned(),
                 name: fields.get("Name").cloned(),
+                configuration: None,
+                policy: None,
             })
         }
         _ => Err(StatusCode::UNSUPPORTED_MEDIA_TYPE),
     }
+}
+
+fn parse_emby_create_user_request(
+    headers: &HeaderMap,
+    body: &[u8],
+) -> Result<EmbyCreateUserRequest, StatusCode> {
+    match emby_request_content_type(headers) {
+        "application/json" => serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST),
+        "application/xml" | "text/xml" => {
+            let fields = parse_emby_xml_fields(body)?;
+            let user_copy_options = fields.get("UserCopyOptions").map(|value| {
+                value
+                    .split([',', ';'])
+                    .map(str::trim)
+                    .filter(|option| !option.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            });
+            Ok(EmbyCreateUserRequest {
+                name: fields.get("Name").cloned(),
+                copy_from_user_id: fields.get("CopyFromUserId").cloned(),
+                user_copy_options,
+            })
+        }
+        _ => Err(StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    }
+}
+
+fn has_emby_copy_option(options: &[String], requested: &str) -> bool {
+    options
+        .iter()
+        .any(|option| option.trim().eq_ignore_ascii_case(requested))
 }
 
 fn parse_emby_user_policy_request(
@@ -504,6 +731,9 @@ pub(super) async fn emby_update_user(
     if !acting_user.can_manage_server && acting_user.id.to_string() != user_id {
         return StatusCode::FORBIDDEN.into_response();
     }
+    if request.policy.is_some() && !acting_user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -518,17 +748,48 @@ pub(super) async fn emby_update_user(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
+    if request
+        .configuration
+        .as_ref()
+        .is_some_and(|configuration| !configuration.is_object())
+    {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let policy = request.policy.as_ref();
     match users
         .update_user(
             &user_id,
             UserUpdate {
                 display_name: request.name.as_deref(),
+                is_admin: policy.and_then(|policy| policy.is_administrator),
+                can_manage_server: policy.and_then(|policy| policy.is_administrator),
+                is_disabled: policy.and_then(|policy| policy.is_disabled),
+                can_remote_access: policy.and_then(|policy| policy.enable_remote_access),
+                can_download: policy.and_then(|policy| policy.enable_content_downloading),
                 ..UserUpdate::default()
             },
         )
         .await
     {
-        Ok(Some(_)) => StatusCode::OK.into_response(),
+        Ok(Some(user)) => {
+            if let Some(incoming) = request.configuration {
+                let ordered_views = emby_ordered_views(&state, &user).await;
+                let mut configuration =
+                    emby_user_configuration(&state, &user, &ordered_views).await;
+                merge_emby_json_object(&mut configuration, incoming);
+                let Ok(serialized) = serde_json::to_string(&configuration) else {
+                    return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+                };
+                if let Err(error) = database
+                    .set_user_emby_configuration(&user_id, &serialized)
+                    .await
+                {
+                    tracing::error!(error = %error, "failed to persist emby user configuration");
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                }
+            }
+            StatusCode::OK.into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(UserStoreError::LastManager) => StatusCode::CONFLICT.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -932,8 +1193,14 @@ pub(super) async fn emby_authenticate(
             .await;
             let server_name = current_emby_server_name(&state).await;
             let ordered_views = emby_ordered_views(&state, &result.user).await;
+            let configuration = emby_user_configuration(&state, &result.user, &ordered_views).await;
             Json(json!({
-                "User": emby_user_json(&result.user, &state.server_id, &server_name, &ordered_views),
+                "User": emby_user_json(
+                    &result.user,
+                    &state.server_id,
+                    &server_name,
+                    configuration,
+                ),
                 "SessionInfo": emby_login_session_json(&result, &state.server_id),
                 "AccessToken": result.token,
                 "ServerId": state.server_id
@@ -1222,22 +1489,60 @@ fn emby_user_json(
     user: &UserRecord,
     server_id: &str,
     server_name: &str,
-    ordered_views: &[String],
+    configuration: Value,
 ) -> Value {
     json!({
         "Id": user.id.to_string(),
         "ServerId": server_id,
         "ServerName": server_name,
         "Name": user.display_name,
-        "HasPassword": true,
-        "HasConfiguredPassword": true,
+        "HasPassword": user.has_password,
+        "HasConfiguredPassword": user.has_password,
         "HasConfiguredEasyPassword": false,
         "EnableAutoLogin": false,
-        "LastLoginDate": "1970-01-01T00:00:00.0000000Z",
-        "LastActivityDate": "1970-01-01T00:00:00.0000000Z",
-        "Configuration": emby_user_configuration_json(ordered_views),
+        "LastLoginDate": emby_user_date(user.last_login_at),
+        "LastActivityDate": emby_user_date(user.last_activity_at),
+        "Configuration": configuration,
         "Policy": emby_user_policy_json(user),
     })
+}
+
+fn emby_user_date(timestamp: Option<i64>) -> Value {
+    timestamp
+        .and_then(|timestamp| OffsetDateTime::from_unix_timestamp(timestamp).ok())
+        .and_then(|timestamp| timestamp.format(&Rfc3339).ok())
+        .map_or(Value::Null, Value::String)
+}
+
+async fn emby_user_configuration(
+    state: &AppState,
+    user: &UserRecord,
+    ordered_views: &[String],
+) -> Value {
+    let mut configuration = emby_user_configuration_json(ordered_views);
+    let Some(database) = state.database.as_ref() else {
+        return configuration;
+    };
+    let Ok(Some(serialized)) = database
+        .find_user_emby_configuration(&user.id.to_string())
+        .await
+    else {
+        return configuration;
+    };
+    let Ok(stored) = serde_json::from_str::<Value>(&serialized) else {
+        return configuration;
+    };
+    merge_emby_json_object(&mut configuration, stored);
+    configuration
+}
+
+fn merge_emby_json_object(target: &mut Value, overlay: Value) {
+    let (Some(target), Value::Object(overlay)) = (target.as_object_mut(), overlay) else {
+        return;
+    };
+    for (key, value) in overlay {
+        target.insert(key, value);
+    }
 }
 
 fn emby_user_configuration_json(ordered_views: &[String]) -> Value {

@@ -64,12 +64,13 @@ impl Database {
         display_name: &str,
         password_hash: &str,
         is_admin: bool,
+        has_password: bool,
     ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
-                is_admin, can_manage_server
-            ) VALUES (?, ?, ?, ?, ?, ?)",
+                is_admin, can_manage_server, has_password
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(id)
         .bind(username_normalized)
@@ -77,6 +78,7 @@ impl Database {
         .bind(password_hash)
         .bind(database_flag(is_admin))
         .bind(database_flag(is_admin))
+        .bind(database_flag(has_password))
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -92,8 +94,14 @@ impl Database {
     ) -> Result<Option<StoredUser>, StorageError> {
         self.query(
             "SELECT id, username_normalized, display_name, password_hash,
+                    has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download
+                    can_remote_access, can_download, last_login_at,
+                    COALESCE(
+                        (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                         FROM access_tokens at WHERE at.user_id = users.id),
+                        last_login_at
+                    ) AS last_activity_at
              FROM users WHERE username_normalized = ?",
         )
         .bind(username_normalized)
@@ -105,11 +113,14 @@ impl Database {
                 username_normalized: row.get("username_normalized"),
                 display_name: row.get("display_name"),
                 password_hash: row.get("password_hash"),
+                has_password: row.get::<i64, _>("has_password") != 0,
                 is_disabled: row.get::<i64, _>("is_disabled") != 0,
                 is_admin: row.get::<i64, _>("is_admin") != 0,
                 can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
                 can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
                 can_download: row.get::<i64, _>("can_download") != 0,
+                last_login_at: row.get("last_login_at"),
+                last_activity_at: row.get("last_activity_at"),
             })
         })
         .map_err(|source| StorageError::Sqlx {
@@ -132,8 +143,14 @@ impl Database {
                 .join(", ");
             let query = format!(
                 "SELECT id, username_normalized, display_name, password_hash,
+                        has_password,
                         is_disabled, is_admin, can_manage_server,
-                        can_remote_access, can_download
+                        can_remote_access, can_download, last_login_at,
+                        COALESCE(
+                            (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                             FROM access_tokens at WHERE at.user_id = users.id),
+                            last_login_at
+                        ) AS last_activity_at
                  FROM users WHERE username_normalized IN ({placeholders})
                  ORDER BY username_normalized"
             );
@@ -173,8 +190,14 @@ impl Database {
     pub(crate) async fn list_users(&self) -> Result<Vec<StoredUser>, StorageError> {
         self.query(
             "SELECT id, username_normalized, display_name, password_hash,
+                    has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download
+                    can_remote_access, can_download, last_login_at,
+                    COALESCE(
+                        (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                         FROM access_tokens at WHERE at.user_id = users.id),
+                        last_login_at
+                    ) AS last_activity_at
              FROM users WHERE is_disabled = 0 ORDER BY username_normalized",
         )
         .fetch_all(&self.pool)
@@ -186,11 +209,14 @@ impl Database {
                     username_normalized: row.get("username_normalized"),
                     display_name: row.get("display_name"),
                     password_hash: row.get("password_hash"),
+                    has_password: row.get::<i64, _>("has_password") != 0,
                     is_disabled: row.get::<i64, _>("is_disabled") != 0,
                     is_admin: row.get::<i64, _>("is_admin") != 0,
                     can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
                     can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
                     can_download: row.get::<i64, _>("can_download") != 0,
+                    last_login_at: row.get("last_login_at"),
+                    last_activity_at: row.get("last_activity_at"),
                 })
                 .collect()
         })
@@ -206,8 +232,14 @@ impl Database {
     ) -> Result<Option<StoredUser>, StorageError> {
         self.query(
             "SELECT id, username_normalized, display_name, password_hash,
+                    has_password,
                     is_disabled, is_admin, can_manage_server,
-                    can_remote_access, can_download
+                    can_remote_access, can_download, last_login_at,
+                    COALESCE(
+                        (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                         FROM access_tokens at WHERE at.user_id = users.id),
+                        last_login_at
+                    ) AS last_activity_at
              FROM users WHERE id = ?",
         )
         .bind(user_id)
@@ -278,6 +310,7 @@ impl Database {
             "UPDATE users
              SET display_name = COALESCE(?, display_name),
                  password_hash = COALESCE(?, password_hash),
+                 has_password = COALESCE(?, has_password),
                  is_disabled = COALESCE(?, is_disabled),
                  is_admin = COALESCE(?, is_admin),
                  can_manage_server = COALESCE(?, can_manage_server),
@@ -288,6 +321,7 @@ impl Database {
         )
         .bind(update.display_name)
         .bind(update.password_hash)
+        .bind(update.has_password.map(database_flag))
         .bind(is_disabled)
         .bind(is_admin)
         .bind(can_manage_server)
@@ -308,6 +342,182 @@ impl Database {
                 source,
             })?;
         self.find_user_by_id(user_id).await
+    }
+
+    pub(crate) async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(current) = self
+            .query(
+                "SELECT is_disabled, can_manage_server
+                 FROM users WHERE id = ?",
+            )
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(false);
+        };
+        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
+        let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
+        if current_can_manage && !current_disabled {
+            let remaining: i64 = self
+                .query_scalar(
+                    "SELECT COUNT(*) FROM users
+                     WHERE can_manage_server = 1 AND is_disabled = 0 AND id != ?",
+                )
+                .bind(user_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if remaining == 0 {
+                return Err(StorageError::LastManager);
+            }
+        }
+        self.query("DELETE FROM users WHERE id = ?")
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn find_user_emby_configuration(
+        &self,
+        user_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT configuration_json
+             FROM user_emby_configuration WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_user_emby_configuration(
+        &self,
+        user_id: &str,
+        configuration_json: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_emby_configuration (user_id, configuration_json)
+             VALUES (?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 configuration_json = excluded.configuration_json,
+                 updated_at = unixepoch()",
+        )
+        .bind(user_id)
+        .bind(configuration_json)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn copy_user_library_settings(
+        &self,
+        source_user_id: &str,
+        target_user_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "INSERT INTO user_library_access (user_id, library_id, can_view)
+             SELECT ?, library_id, can_view
+             FROM user_library_access WHERE user_id = ?",
+        )
+        .bind(target_user_id)
+        .bind(source_user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "INSERT INTO user_library_order (user_id, library_id, position)
+             SELECT ?, library_id, position
+             FROM user_library_order WHERE user_id = ?",
+        )
+        .bind(target_user_id)
+        .bind(source_user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn mark_user_logged_in(&self, user_id: &str) -> Result<(), StorageError> {
+        self.query("UPDATE users SET last_login_at = unixepoch() WHERE id = ?")
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn touch_access_token(&self, token_hash: &[u8]) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE access_tokens SET last_seen_at = unixepoch(), updated_at = unixepoch()
+             WHERE token_hash = ? AND revoked_at IS NULL",
+        )
+        .bind(token_hash)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn insert_audit_event(
@@ -419,8 +629,13 @@ impl Database {
     ) -> Result<Option<StoredUser>, StorageError> {
         self.query(
             "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
-                    u.is_disabled, u.is_admin, u.can_manage_server,
-                    u.can_remote_access, u.can_download
+                    u.has_password, u.is_disabled, u.is_admin, u.can_manage_server,
+                    u.can_remote_access, u.can_download, u.last_login_at,
+                    COALESCE(
+                        (SELECT MAX(COALESCE(at2.last_seen_at, at2.created_at))
+                         FROM access_tokens at2 WHERE at2.user_id = u.id),
+                        u.last_login_at
+                    ) AS last_activity_at
              FROM access_tokens at
              JOIN users u ON u.id = at.user_id
              WHERE at.token_hash = ? AND at.revoked_at IS NULL",
@@ -434,11 +649,14 @@ impl Database {
                 username_normalized: row.get("username_normalized"),
                 display_name: row.get("display_name"),
                 password_hash: row.get("password_hash"),
+                has_password: row.get::<i64, _>("has_password") != 0,
                 is_disabled: row.get::<i64, _>("is_disabled") != 0,
                 is_admin: row.get::<i64, _>("is_admin") != 0,
                 can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
                 can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
                 can_download: row.get::<i64, _>("can_download") != 0,
+                last_login_at: row.get("last_login_at"),
+                last_activity_at: row.get("last_activity_at"),
             })
         })
         .map_err(|source| StorageError::Sqlx {
