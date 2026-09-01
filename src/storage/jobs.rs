@@ -14,6 +14,28 @@ const SIDECAR_DIRECTORY_TARGET_QUERY: &str = "INSERT INTO scan_job_targets (
      GROUP BY ms.item_id
      ON CONFLICT(job_id, target_type, target_id) DO NOTHING";
 
+fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {
+    directories.sort();
+    directories.dedup();
+    if directories
+        .first()
+        .is_some_and(|directory| directory == ".")
+    {
+        return vec![".".to_owned()];
+    }
+
+    let mut retained = Vec::with_capacity(directories.len());
+    for directory in directories {
+        let covered = retained.iter().any(|parent: &String| {
+            directory.starts_with(parent) && directory.as_bytes().get(parent.len()) == Some(&b'/')
+        });
+        if !covered {
+            retained.push(directory);
+        }
+    }
+    retained
+}
+
 impl Database {
     pub(crate) async fn find_item_id_by_media_source_id(
         &self,
@@ -1161,7 +1183,7 @@ impl Database {
         library_root_id: &str,
         sidecar_paths: &[String],
     ) -> Result<(), StorageError> {
-        let mut directories = sidecar_paths
+        let directories = sidecar_paths
             .iter()
             .filter_map(|path| {
                 Path::new(path)
@@ -1176,8 +1198,7 @@ impl Database {
                     })
             })
             .collect::<Vec<_>>();
-        directories.sort();
-        directories.dedup();
+        let directories = prune_sidecar_directories(directories);
         if directories.is_empty() {
             return Ok(());
         }
@@ -4046,12 +4067,29 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::SIDECAR_DIRECTORY_TARGET_QUERY;
+    use super::{SIDECAR_DIRECTORY_TARGET_QUERY, prune_sidecar_directories};
 
     #[test]
     fn sidecar_target_query_uses_indexable_directory_ranges() {
         assert!(SIDECAR_DIRECTORY_TARGET_QUERY.contains("fe.relative_path >= ? || '/'"));
         assert!(SIDECAR_DIRECTORY_TARGET_QUERY.contains("fe.relative_path < ? || '0'"));
         assert!(!SIDECAR_DIRECTORY_TARGET_QUERY.contains("substr("));
+    }
+
+    #[test]
+    fn nested_sidecar_directories_are_covered_by_their_ancestor() {
+        let directories = prune_sidecar_directories(vec![
+            "Show/Season 01".to_owned(),
+            "Show".to_owned(),
+            "Show2".to_owned(),
+            "Show/Extras".to_owned(),
+            "Show".to_owned(),
+        ]);
+
+        assert_eq!(directories, vec!["Show".to_owned(), "Show2".to_owned()]);
+        assert_eq!(
+            prune_sidecar_directories(vec!["Show/Season 01".to_owned(), ".".to_owned()]),
+            vec![".".to_owned()]
+        );
     }
 }
