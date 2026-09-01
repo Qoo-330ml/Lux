@@ -2,6 +2,15 @@ use super::*;
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 
+const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
+             WHERE NOT EXISTS (
+                 SELECT 1
+                 FROM media_items
+                 WHERE media_items.id = recommendation_item_stats.item_id
+                   AND media_items.removed_at IS NULL
+                   AND media_items.item_type IN ('MOVIE', 'SERIES')
+             )";
+
 fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String {
     let values = std::iter::repeat_n("(?)", library_count)
         .collect::<Vec<_>>()
@@ -212,20 +221,13 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query(
-            "DELETE FROM recommendation_item_stats
-             WHERE item_id NOT IN (
-                 SELECT id
-                 FROM media_items
-                 WHERE removed_at IS NULL AND item_type IN ('MOVIE', 'SERIES')
-             )",
-        )
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        self.query(RECOMMENDATION_STATS_CLEANUP_QUERY)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         self.query(
             "INSERT INTO recommendation_stats_state (id, batch_key, refreshed_at)
              VALUES (1, ?, ?)
@@ -5665,8 +5667,17 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{
-        postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
+        RECOMMENDATION_STATS_CLEANUP_QUERY, postgres_recent_catalog_rows_by_library_query,
+        sqlite_recent_catalog_rows_by_library_query,
     };
+
+    #[test]
+    fn recommendation_stats_cleanup_uses_an_indexable_exists_lookup() {
+        assert!(RECOMMENDATION_STATS_CLEANUP_QUERY.contains(
+            "WHERE NOT EXISTS (\n                 SELECT 1\n                 FROM media_items\n                 WHERE media_items.id = recommendation_item_stats.item_id"
+        ));
+        assert!(!RECOMMENDATION_STATS_CLEANUP_QUERY.contains("NOT IN"));
+    }
 
     #[test]
     fn postgres_recent_catalog_limits_each_library_before_loading_details() {

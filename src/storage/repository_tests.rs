@@ -136,6 +136,26 @@ async fn recommendation_stats_are_refreshed_once_per_batch_and_deduplicate_users
             .await
             .expect("same-batch stats refresh")
     );
+
+    sqlx::query(
+        "UPDATE media_items
+         SET removed_at = ?
+         WHERE id = 'expired-item'",
+    )
+    .bind(now)
+    .execute(database.pool())
+    .await
+    .expect("remove recommendation item");
+    refresh_recommendation_stats(&database).await;
+    let remaining_stats: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM recommendation_item_stats
+         WHERE item_id IN ('playback-item', 'favorite-item', 'expired-item')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("remaining recommendation stats");
+    assert_eq!(remaining_stats, 2);
 }
 
 #[tokio::test]
