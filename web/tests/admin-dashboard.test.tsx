@@ -146,7 +146,10 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector('[data-overview-value="运行时长"]')?.textContent).toBe("运行时长：1天 1时 1分 1秒");
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-icon")).toHaveLength(0);
-    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "0.8 / 2.0 核（37.5%）", "1.0 GiB / 4.0 GiB（25.0%）", "10.0 GiB / 100.0 GiB"]);
+    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "0.8 / 2.0 核", "1.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    expect(overview?.querySelector(".lux-bento-version strong")?.textContent).toBe("v0.2.7");
+    expect(overview?.querySelectorAll(".lux-bento-icon-tile")).toHaveLength(4);
+    expect(overview?.querySelector(".lux-bento-icon-tile.is-storage")).not.toBeNull();
     expect(overview?.querySelector(".lux-admin-overview-device")).toBeNull();
     expect(overview?.querySelectorAll(".lux-admin-overview-info-icon")).toHaveLength(0);
     expect(overview?.textContent).toContain("存储空间");
@@ -272,7 +275,7 @@ describe("AdminDashboardPage", () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-card")).not.toBeNull());
     });
     const values = [...container.querySelectorAll(".lux-admin-overview-metric-value")].map((value) => value.textContent);
-    expect(values.slice(3)).toEqual(["1.8 / 8.0 核（22.5%）", "1.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    expect(values.slice(3)).toEqual(["1.8 / 8.0 核", "1.0 GiB", "10.0 GiB / 100.0 GiB"]);
     expect(container.textContent).not.toContain("容器可见容量");
     expect(container.textContent).not.toContain("未设置容器上限");
   });

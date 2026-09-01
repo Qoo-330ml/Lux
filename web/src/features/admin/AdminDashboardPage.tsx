@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Database, HardDrive, ListChecks, Pencil, Settings2, X } from "lucide-react";
-import { useEffect, useRef, useState } from "react";
+import { AlertTriangle, CheckCircle2, Clock3, Cpu, Database, HardDrive, ListChecks, MemoryStick, Pencil, Server, Settings2, Users, X } from "lucide-react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { AdminDashboardActivity } from "./AdminDashboardActivity";
 import { AdminDashboardNowPlaying } from "./AdminDashboardNowPlaying";
@@ -86,26 +86,156 @@ export function AdminDashboardPage() {
 
       <section className="lux-admin-overview-card" aria-labelledby="server-overview-heading">
         <h2 className="lux-sr-only" id="server-overview-heading">服务器概况</h2>
-        <div className="lux-admin-overview-top">
-          <div className="lux-admin-overview-identity">
-            <div className="lux-admin-overview-server-name-row">
-              <span className="lux-admin-overview-server-name">{serverName ?? server.name}</span>
-              <button ref={nameEditorTriggerRef} className="lux-admin-overview-name-edit" type="button" aria-label="编辑服务器名称" onClick={openServerNameEditor}><Pencil size={18} /></button>
+        <div className="lux-bento-grid" aria-label="服务器概况指标">
+          {/* Hero Bento Card */}
+          <div className="lux-bento-card lux-bento-card-hero">
+            <div className="lux-bento-hero-top">
+              <div className="lux-bento-badges">
+                <div className={`lux-admin-overview-status${status ? " is-online" : " is-alert"}`}>
+                  {overviewStatus(health.status) ? <><i />{overviewStatus(health.status)}</> : null}
+                </div>
+                <OverviewInfo className="lux-bento-version" label="版本" value={`v${server.version}`} />
+              </div>
+              <div className="lux-bento-hero-icon" aria-hidden="true">
+                <Server size={20} />
+              </div>
+            </div>
+
+            <div className="lux-admin-overview-identity">
+              <div className="lux-admin-overview-server-name-row">
+                <span className="lux-admin-overview-server-name">{serverName ?? server.name}</span>
+                <button
+                  ref={nameEditorTriggerRef}
+                  className="lux-admin-overview-name-edit"
+                  type="button"
+                  aria-label="编辑服务器名称"
+                  onClick={openServerNameEditor}
+                >
+                  <Pencil size={18} />
+                </button>
+              </div>
+            </div>
+
+            <div className="lux-bento-hero-footer">
+              <OverviewInfo icon={<Clock3 className="lux-bento-inline-icon" size={14} strokeWidth={1.8} />} label="运行时长" value={formatRuntime(health.runtime.seconds)} />
             </div>
           </div>
-          <div className={`lux-admin-overview-status${status ? " is-online" : " is-alert"}`}>
-            {overviewStatus(health.status) ? <><i />{overviewStatus(health.status)}</> : null}
+
+          {/* Media Assets Bento Card */}
+          <div className="lux-bento-card lux-bento-card-media">
+            <div className="lux-bento-card-header">
+              <span className="lux-bento-card-title">媒体库</span>
+              <span className="lux-bento-card-meta">{formatCount(stats.movieCount + stats.seriesCount)} 项</span>
+            </div>
+            <div className="lux-bento-media-grid">
+              <div className="lux-bento-media-subcard">
+                <div className="lux-bento-subcard-header">
+                  <small>电影数量</small>
+                </div>
+                <strong className="lux-admin-overview-metric-value">{formatCount(stats.movieCount)}</strong>
+              </div>
+              <div className="lux-bento-media-subcard">
+                <div className="lux-bento-subcard-header">
+                  <small>剧集数量</small>
+                </div>
+                <strong className="lux-admin-overview-metric-value">{formatCount(stats.seriesCount)}</strong>
+              </div>
+            </div>
+            <div className="lux-bento-card-footer">
+              <small>元数据已就绪</small>
+              <Link to="/admin/libraries" className="lux-bento-link">进入媒体库 →</Link>
+            </div>
           </div>
-          <OverviewInfo label="版本" value={`v${server.version}`} />
-          <OverviewInfo label="运行时长" value={formatRuntime(health.runtime.seconds)} />
-        </div>
-        <div className="lux-admin-overview-metrics" aria-label="服务器概况指标">
-          <OverviewMetric label="电影数量" value={formatCount(stats.movieCount)} />
-          <OverviewMetric label="剧集数量" value={formatCount(stats.seriesCount)} />
-          <OverviewMetric label="用户数量" value={formatCount(stats.userCount)} />
-          <OverviewMetric label="CPU 占用" value={formatCpu(health.resources.cpu)} />
-          <OverviewMetric label="内存占用" value={formatMemory(health.resources.memory)} />
-          <OverviewMetric label="存储空间" value={formatStorage(health.resources.mediaStorage)} />
+
+          {/* Users Card */}
+          <div className="lux-bento-card lux-bento-card-users">
+            <div className="lux-bento-card-header">
+              <span className="lux-bento-card-title">用户数量</span>
+              <span className="lux-bento-icon-tile is-users" aria-hidden="true"><Users size={14} strokeWidth={1.8} /></span>
+            </div>
+            <div className="lux-bento-metric-body">
+              <strong className="lux-admin-overview-metric-value lux-bento-big-num">{formatCount(stats.userCount)}</strong>
+            </div>
+            <div className="lux-bento-card-footer">
+              <small>{stats.userCount} 个配置账户</small>
+            </div>
+          </div>
+
+          {/* CPU Card */}
+          <div className="lux-bento-card lux-bento-card-cpu">
+            <div className="lux-bento-card-header">
+              <span className="lux-bento-card-title"><span className="lux-bento-icon-tile is-cpu" aria-hidden="true"><Cpu size={14} strokeWidth={1.8} /></span>CPU 占用</span>
+              {health.resources.cpu.available && health.resources.cpu.usagePercent !== null ? (
+                <span className="lux-bento-badge-accent">{health.resources.cpu.usagePercent.toFixed(1)}%</span>
+              ) : null}
+            </div>
+            <div className="lux-bento-metric-body">
+              <strong className="lux-admin-overview-metric-value">{formatCpu(health.resources.cpu)}</strong>
+              {health.resources.cpu.available && health.resources.cpu.usagePercent !== null ? (
+                <div className="lux-bento-progress-track">
+                  <div
+                    className="lux-bento-progress-fill is-cpu"
+                    role="progressbar"
+                    aria-label="CPU 使用率"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={health.resources.cpu.usagePercent}
+                    style={{ width: `${Math.min(100, Math.max(0, health.resources.cpu.usagePercent))}%` }}
+                  />
+                </div>
+              ) : null}
+            </div>
+            <div className="lux-bento-card-footer">
+              <small>{health.resources.cpu.capacityCores ? `总核心：${health.resources.cpu.capacityCores.toFixed(1)} 核` : "CPU 资源"}</small>
+            </div>
+          </div>
+
+          {/* Memory Card */}
+          <div className="lux-bento-card lux-bento-card-mem">
+            <div className="lux-bento-card-header">
+              <span className="lux-bento-card-title">内存占用</span>
+              <span className="lux-bento-icon-tile is-memory" aria-hidden="true"><MemoryStick size={14} strokeWidth={1.8} /></span>
+            </div>
+            <div className="lux-bento-metric-body">
+              <strong className="lux-admin-overview-metric-value">{formatMemory(health.resources.memory)}</strong>
+            </div>
+            <div className="lux-bento-card-footer">
+              <small>常驻内存</small>
+            </div>
+          </div>
+
+          {/* Storage Card */}
+          <div className="lux-bento-card lux-bento-card-storage">
+            <div className="lux-bento-card-header">
+              <span className="lux-bento-card-title"><span className="lux-bento-icon-tile is-storage" aria-hidden="true"><Database size={14} strokeWidth={1.8} /></span>存储空间</span>
+              {health.resources.mediaStorage.available && health.resources.mediaStorage.usagePercent !== null ? (
+                <span className="lux-bento-badge-purple">{health.resources.mediaStorage.usagePercent.toFixed(1)}% 已用</span>
+              ) : null}
+            </div>
+            <div className="lux-bento-metric-body">
+              <strong className="lux-admin-overview-metric-value">{formatStorage(health.resources.mediaStorage)}</strong>
+              {health.resources.mediaStorage.available && health.resources.mediaStorage.usagePercent !== null ? (
+                <div className="lux-bento-progress-track">
+                  <div
+                    className="lux-bento-progress-fill is-storage"
+                    role="progressbar"
+                    aria-label="存储空间使用率"
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={health.resources.mediaStorage.usagePercent}
+                    style={{ width: `${Math.min(100, Math.max(0, health.resources.mediaStorage.usagePercent))}%` }}
+                  />
+                </div>
+              ) : null}
+            </div>
+            <div className="lux-bento-card-footer">
+              <small>
+                {health.resources.mediaStorage.availableBytes !== null && health.resources.mediaStorage.availableBytes !== undefined
+                  ? `剩余 ${formatBytes(health.resources.mediaStorage.availableBytes)} 可用`
+                  : "媒体存储空间"}
+              </small>
+            </div>
+          </div>
         </div>
       </section>
       {saveServerName.error ? <p className="lux-error-copy lux-dashboard-inline-error">{saveServerName.error.message}</p> : null}
@@ -156,12 +286,8 @@ export function AdminDashboardPage() {
 
 function SettingsIcon() { return <span className="lux-quick-icon"><Settings2 size={17} /></span>; }
 
-function OverviewInfo({ label, value }: { label: string; value?: string }) {
-  return <div className="lux-admin-overview-info" data-overview-value={label}><span><small>{label}：</small><strong aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
-}
-
-function OverviewMetric({ label, value }: { label: string; value?: string }) {
-  return <div className="lux-admin-overview-metric"><span><small>{label}</small><strong className="lux-admin-overview-metric-value" aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
+function OverviewInfo({ label, value, className = "", icon }: { label: string; value?: string; className?: string; icon?: ReactNode }) {
+  return <div className={`lux-admin-overview-info ${className}`.trim()} data-overview-value={label}><span>{icon}<small>{label}：</small><strong aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;
 }
 
 function overviewStatus(status: string) {
@@ -187,15 +313,12 @@ function formatRuntime(seconds: number | null | undefined) {
 function formatCpu(cpu: AdminDashboard["health"]["resources"]["cpu"]) {
   if (!cpu.available) return "不可用";
   if (cpu.usageCores === null || cpu.capacityCores === null || cpu.usagePercent === null) return "采样中";
-  return `${cpu.usageCores.toFixed(1)} / ${cpu.capacityCores.toFixed(1)} 核（${cpu.usagePercent.toFixed(1)}%）`;
+  return `${cpu.usageCores.toFixed(1)} / ${cpu.capacityCores.toFixed(1)} 核`;
 }
 
 function formatMemory(memory: AdminDashboard["health"]["resources"]["memory"]) {
   if (!memory.available || memory.usedBytes === null) return "不可用";
-  const used = formatBytes(memory.usedBytes);
-  return memory.limitBytes === null || memory.usagePercent === null
-    ? used
-    : `${used} / ${formatBytes(memory.limitBytes)}（${memory.usagePercent.toFixed(1)}%）`;
+  return formatBytes(memory.usedBytes);
 }
 
 function formatStorage(storage: AdminDashboard["health"]["resources"]["mediaStorage"]) {

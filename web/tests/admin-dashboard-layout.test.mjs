@@ -28,29 +28,39 @@ test("dashboard panels use separators instead of card chrome", () => {
   assert.match(panelGridRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-line-soft\)/);
 });
 
-test("dashboard overview follows account settings section rhythm", () => {
+test("dashboard overview uses modern bento box grid rhythm", () => {
   const cardRule = stylesheet.match(/\.lux-admin-overview-card\s*\{([^}]*)\}/)?.[1] ?? "";
-  const topRule = stylesheet.match(/\.lux-admin-overview-top\s*\{([^}]*)\}/)?.[1] ?? "";
-  const identityRule = stylesheet.match(/\.lux-admin-overview-identity\s*\{([^}]*)\}/)?.[1] ?? "";
-  const nameRule = stylesheet.match(/\.lux-admin-overview-server-name\s*\{([^}]*)\}/)?.[1] ?? "";
+  const bentoGridRule = stylesheet.match(/\.lux-bento-grid\s*\{([^}]*)\}/)?.[1] ?? "";
+  const bentoCardRule = stylesheet.match(/\.lux-bento-card\s*\{([^}]*)\}/)?.[1] ?? "";
+  const bentoHeroRule = stylesheet.match(/\.lux-bento-card-hero\s*\{([^}]*)\}/)?.[1] ?? "";
+  const bentoIconTileRule = stylesheet.match(/\.lux-bento-icon-tile\s*\{([^}]*)\}/)?.[1] ?? "";
+  const bentoValueRule = stylesheet.match(/\.lux-bento-metric-body\s+strong\s*\{([^}]*)\}/)?.[1] ?? "";
+  const bentoStorageRule = stylesheet.match(/\.lux-bento-icon-tile\.is-storage\s*\{([^}]*)\}/)?.[1] ?? "";
+  const identityRule = stylesheet.match(/(?:^|\n)\.lux-admin-overview-identity\s*\{([^}]*)\}/)?.[1] ?? "";
+  const nameRule = stylesheet.match(/(?:^|\n)\.lux-admin-overview-server-name\s*\{([^}]*)\}/)?.[1] ?? "";
   const dialogRule = stylesheet.match(/\.lux-server-name-dialog\s*\{([^}]*)\}/)?.[1] ?? "";
   const dialogFormRule = stylesheet.match(/\.lux-server-name-dialog-form\s*\{([^}]*)\}/)?.[1] ?? "";
   const infoCopyRule = stylesheet.match(/\.lux-admin-overview-info\s*>\s*span:last-child\s*\{([^}]*)\}/)?.[1] ?? "";
-  const metricsRule = stylesheet.match(/\.lux-admin-overview-metrics\s*\{([^}]*)\}/)?.[1] ?? "";
-  const metricDividerRule = stylesheet.match(/\.lux-admin-overview-metric\s*\+\s*\.lux-admin-overview-metric\s*\{([^}]*)\}/)?.[1] ?? "";
 
   assert.match(cardRule, /padding:\s*0/);
   assert.match(cardRule, /border:\s*0/);
   assert.match(cardRule, /border-radius:\s*0/);
   assert.match(cardRule, /background:\s*transparent/);
   assert.match(cardRule, /box-shadow:\s*none/);
-  assert.match(topRule, /display:\s*grid/);
-  assert.match(topRule, /align-items:\s*center/);
-  assert.match(topRule, /padding:\s*20px\s+22px/);
-  assert.match(topRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-overview-line\)/);
+  assert.match(bentoGridRule, /display:\s*grid/);
+  assert.match(bentoGridRule, /grid-template-columns:\s*repeat\(6,\s*minmax\(0,\s*1fr\)\)/);
+  assert.match(bentoCardRule, /display:\s*flex/);
+  assert.match(bentoCardRule, /flex-direction:\s*column/);
+  assert.match(bentoCardRule, /border-radius:\s*16px/);
+  assert.match(bentoCardRule, /box-shadow:/);
+  assert.match(bentoHeroRule, /grid-column:\s*span 4/);
+  assert.match(bentoIconTileRule, /display:\s*grid/);
+  assert.match(bentoIconTileRule, /border-radius:\s*8px/);
+  assert.match(bentoValueRule, /color:\s*var\(--lux-overview-value\)/);
+  assert.match(bentoStorageRule, /color:\s*var\(--lux-overview-storage\)/);
   assert.match(identityRule, /display:\s*block/);
-  assert.match(infoCopyRule, /display:\s*flex/);
-  assert.match(infoCopyRule, /align-items:\s*baseline/);
+  assert.match(infoCopyRule, /display:\s*inline-flex/);
+  assert.match(infoCopyRule, /align-items:\s*center/);
   assert.match(nameRule, /overflow:\s*hidden/);
   assert.match(dialogRule, /width:\s*min\(568px,\s*calc\(100vw\s*-\s*20px\)\)/);
   assert.match(dialogRule, /min-height:\s*316px/);
@@ -58,11 +68,8 @@ test("dashboard overview follows account settings section rhythm", () => {
   assert.match(dialogFormRule, /display:\s*flex/);
   assert.doesNotMatch(stylesheet, /\.lux-admin-overview-device\s*\{/);
   assert.doesNotMatch(stylesheet, /\.lux-admin-overview-info-icon/);
-  assert.match(metricsRule, /display:\s*grid/);
-  assert.match(metricsRule, /padding:\s*22px\s+22px\s+0/);
-  assert.doesNotMatch(metricsRule, /border-top:/);
-  assert.doesNotMatch(stylesheet, /\.lux-admin-overview-info\s*\+\s*\.lux-admin-overview-info\s*\{[^}]*border-left:/);
-  assert.doesNotMatch(metricDividerRule, /border-left:/);
+  assert.doesNotMatch(stylesheet, /\.lux-admin-overview-top\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.lux-admin-overview-metrics\s*\{/);
 });
 
 test("light mode preserves the same flat admin surfaces", () => {
@@ -71,6 +78,8 @@ test("light mode preserves the same flat admin surfaces", () => {
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-layout \{[^}]*background:\s*var\(--lux-bg\)/);
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-sidebar \{[^}]*background:\s*transparent/);
   assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-panel \{[^}]*background:\s*transparent/);
+  assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-admin-overview-card \{[^}]*--lux-overview-value:\s*var\(--lux-text\)/);
+  assert.match(lightAdminStyles, /html\[data-lux-theme="light"\] \.lux-bento-card \{[^}]*background:/);
 });
 
 test("now-playing cards use theme tokens and compact proportions", () => {
