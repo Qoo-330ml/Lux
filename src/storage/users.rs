@@ -1,5 +1,10 @@
 use super::*;
 
+use std::time::{Duration, Instant};
+
+const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
+const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
+
 impl Database {
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
         self.query_scalar("SELECT CASE WHEN EXISTS(SELECT 1 FROM users LIMIT 1) THEN 1 ELSE 0 END")
@@ -256,6 +261,26 @@ impl Database {
         &self,
         user_id: &str,
         update: UpdateUser<'_>,
+    ) -> Result<Option<StoredUser>, StorageError> {
+        let retry_deadline = Instant::now() + SQLITE_USER_UPDATE_RETRY_WINDOW;
+        loop {
+            match self.update_user_once(user_id, &update).await {
+                Err(error)
+                    if self.backend == DatabaseBackend::Sqlite
+                        && is_sqlite_lock_error(&error)
+                        && Instant::now() < retry_deadline =>
+                {
+                    tokio::time::sleep(SQLITE_USER_UPDATE_RETRY_DELAY).await;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    async fn update_user_once(
+        &self,
+        user_id: &str,
+        update: &UpdateUser<'_>,
     ) -> Result<Option<StoredUser>, StorageError> {
         let mut transaction = self
             .pool
@@ -1357,6 +1382,19 @@ impl Database {
             source,
         })
     }
+}
+
+fn is_sqlite_lock_error(error: &StorageError) -> bool {
+    matches!(
+        error,
+        StorageError::Sqlx { source, .. }
+            if source.as_database_error().is_some_and(|database_error| {
+                database_error.message().contains("locked")
+                    || database_error
+                        .code()
+                        .is_some_and(|code| code == "5" || code == "6")
+            })
+    )
 }
 
 #[cfg(test)]

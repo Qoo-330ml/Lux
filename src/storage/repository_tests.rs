@@ -4071,3 +4071,56 @@ async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
             .expect("session state");
     assert_eq!(state, "STOPPED");
 }
+
+#[tokio::test]
+async fn user_updates_wait_for_a_concurrent_sqlite_writer() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user_id = Uuid::now_v7().to_string();
+    database
+        .insert_initial_user(&user_id, "admin", "Admin", "hash")
+        .await
+        .expect("user");
+
+    let mut blocker = database.pool().acquire().await.expect("blocker connection");
+    sqlx::query("BEGIN EXCLUSIVE")
+        .execute(&mut *blocker)
+        .await
+        .expect("begin exclusive transaction");
+
+    let update_database = database.clone();
+    let update = tokio::spawn(async move {
+        update_database
+            .update_user(
+                &user_id,
+                UpdateUser {
+                    display_name: Some("Updated"),
+                    password_hash: None,
+                    has_password: None,
+                    is_disabled: None,
+                    is_admin: None,
+                    can_manage_server: None,
+                    can_remote_access: None,
+                    can_download: None,
+                },
+            )
+            .await
+    });
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    sqlx::query("COMMIT")
+        .execute(&mut *blocker)
+        .await
+        .expect("release exclusive transaction");
+    let updated = update
+        .await
+        .expect("user update task")
+        .expect("user update")
+        .expect("updated user");
+
+    assert_eq!(updated.display_name, "Updated");
+}
