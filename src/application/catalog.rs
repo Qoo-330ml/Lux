@@ -438,6 +438,17 @@ impl CatalogService {
             .collect())
     }
 
+    pub(crate) async fn list_unplayed_episode_counts(
+        &self,
+        user_id: &str,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, i64>, CatalogError> {
+        Ok(self
+            .database
+            .list_unplayed_episode_counts(user_id, item_ids)
+            .await?)
+    }
+
     pub async fn list_library_items(
         &self,
         principal: AccessPrincipal,

@@ -1248,6 +1248,11 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
     {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
+    let unplayed_item_counts =
+        match emby_unplayed_episode_counts(catalog, user_id, &catalog_items).await {
+            Ok(counts) => counts,
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        };
     if emby_fields_include(fields, "Chapters")
         && catalog.populate_chapters(&mut catalog_items).await.is_err()
     {
@@ -1272,6 +1277,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
             nfo.as_ref(),
             can_download,
             fields,
+            unplayed_item_counts.get(&item.id).copied(),
         );
         if let Some(source_id) = preferred_source_id
             && let Some(Value::Array(sources)) = value.get_mut("MediaSources")
@@ -1297,6 +1303,35 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
         items.push(value);
     }
     Ok(items)
+}
+
+async fn emby_unplayed_episode_counts(
+    catalog: &CatalogService,
+    user_id: &str,
+    items: &[CatalogItem],
+) -> Result<HashMap<String, i64>, CatalogError> {
+    let item_ids = items
+        .iter()
+        .filter(|item| matches!(item.item_type.as_str(), "SERIES" | "SEASON"))
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+    catalog
+        .list_unplayed_episode_counts(user_id, &item_ids)
+        .await
+}
+
+async fn emby_unplayed_episode_count(
+    catalog: &CatalogService,
+    user_id: &str,
+    item: &CatalogItem,
+) -> Result<Option<i64>, CatalogError> {
+    if !matches!(item.item_type.as_str(), "SERIES" | "SEASON") {
+        return Ok(None);
+    }
+    let counts = catalog
+        .list_unplayed_episode_counts(user_id, std::slice::from_ref(&item.id))
+        .await?;
+    Ok(Some(counts.get(&item.id).copied().unwrap_or_default()))
 }
 
 async fn load_emby_item_extras(
@@ -1615,6 +1650,11 @@ pub(super) async fn emby_single_id_lookup_response(
         Ok(state) => state,
         Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
     };
+    let unplayed_item_count =
+        match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item).await {
+            Ok(count) => count,
+            Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
+        };
     let mut item_json = emby_catalog_item_json_with_state(
         &item,
         &state.server_id,
@@ -1622,6 +1662,7 @@ pub(super) async fn emby_single_id_lookup_response(
         nfo.as_ref(),
         can_download,
         query.fields.as_deref(),
+        unplayed_item_count,
     );
     if let Some(source_id) = preferred_source_id
         && let Some(Value::Array(sources)) = item_json.get_mut("MediaSources")
@@ -2064,6 +2105,13 @@ pub(super) async fn emby_item_response(
         };
     match catalog_item {
         Some(item) if resolved_from_media_source_id => {
+            let unplayed_item_count =
+                match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item)
+                    .await
+                {
+                    Ok(count) => count,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
             let item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
@@ -2074,6 +2122,7 @@ pub(super) async fn emby_item_response(
                     fields,
                     primary_image_aspect_ratio: None,
                     include_top_level_media_streams: true,
+                    unplayed_item_count,
                 },
             );
             Json(item_json).into_response()
@@ -2132,6 +2181,13 @@ pub(super) async fn emby_item_response(
                 Ok(state) => state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
+            let unplayed_item_count =
+                match emby_unplayed_episode_count(catalog, &principal.user_id.to_string(), &item)
+                    .await
+                {
+                    Ok(count) => count,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
             let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
@@ -2142,6 +2198,7 @@ pub(super) async fn emby_item_response(
                     fields,
                     primary_image_aspect_ratio: aspect_ratio,
                     include_top_level_media_streams: true,
+                    unplayed_item_count,
                 },
             );
             if work_plan.read_people
@@ -2556,6 +2613,7 @@ pub(super) fn emby_catalog_item_json_with_state(
     nfo: Option<&LocalNfoDetails>,
     can_download: bool,
     fields: Option<&str>,
+    unplayed_item_count: Option<i64>,
 ) -> Value {
     emby_catalog_item_json_with_state_and_aspect_ratio(
         item,
@@ -2567,6 +2625,7 @@ pub(super) fn emby_catalog_item_json_with_state(
             fields,
             primary_image_aspect_ratio: None,
             include_top_level_media_streams: false,
+            unplayed_item_count,
         },
     )
 }
@@ -2577,6 +2636,7 @@ pub(super) struct EmbyItemJsonOptions<'a> {
     fields: Option<&'a str>,
     primary_image_aspect_ratio: Option<f64>,
     include_top_level_media_streams: bool,
+    unplayed_item_count: Option<i64>,
 }
 
 pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
@@ -2591,6 +2651,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         fields,
         primary_image_aspect_ratio,
         include_top_level_media_streams,
+        unplayed_item_count,
     } = options;
     let default_source = item
         .media_sources
@@ -2708,6 +2769,11 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         if let Some(last_played_date) = emby_timestamp(last_played_at) {
             user_data.insert("LastPlayedDate".to_owned(), json!(last_played_date));
         }
+    }
+    if let Some(unplayed_item_count) = unplayed_item_count
+        && matches!(item.item_type.as_str(), "SERIES" | "SEASON")
+    {
+        user_data.insert("UnplayedItemCount".to_owned(), json!(unplayed_item_count));
     }
 
     let mut object = serde_json::Map::from_iter([

@@ -1483,7 +1483,7 @@ BaseItemDto 至少按场景提供：
 - Overview、ProductionYear、PremiereDate、RunTimeTicks。
 - ProviderIds。
 - ImageTags、BackdropImageTags。
-- UserData：Played、PlaybackPositionTicks、IsFavorite、PlayCount。
+- UserData：Played、PlaybackPositionTicks、IsFavorite、PlayCount；Series/Season 另提供按当前用户统计的 `UnplayedItemCount`。
 - MediaSources、MediaStreams。
 
 字段是否必填以实际目标客户端契约测试为准。不要返回内部数据库路径，除非特定兼容行为明确且经过安全评审。

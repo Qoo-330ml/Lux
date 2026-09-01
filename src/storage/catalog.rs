@@ -1059,6 +1059,67 @@ impl Database {
             })
     }
 
+    pub(crate) async fn list_unplayed_episode_counts(
+        &self,
+        user_id: &str,
+        item_ids: &[String],
+    ) -> Result<HashMap<String, i64>, StorageError> {
+        if item_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT parent.id,
+                    COUNT(DISTINCT CASE
+                        WHEN COALESCE(user_state.is_played, 0) = 0 THEN
+                            CASE
+                                WHEN parent.item_type = 'SERIES' THEN
+                                    COALESCE(CAST(child.season_number AS TEXT), '') || ':' ||
+                                    COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                                ELSE COALESCE(CAST(child.episode_number AS TEXT), child.id)
+                            END
+                    END) AS unplayed_episode_count
+             FROM media_items parent
+             JOIN libraries l ON l.id = parent.library_id AND l.is_enabled = 1
+             LEFT JOIN media_items child
+               ON child.item_type = 'EPISODE' AND child.removed_at IS NULL
+              AND ((parent.item_type = 'SERIES' AND child.series_id = parent.id)
+                OR (parent.item_type = 'SEASON' AND child.parent_id = parent.id))
+              AND EXISTS (
+                  SELECT 1
+                  FROM media_sources child_source
+                  JOIN filesystem_entries child_entry
+                    ON child_entry.id = child_source.filesystem_entry_id
+                  WHERE child_source.item_id = child.id
+                    AND child_entry.is_missing = 0
+              )
+             LEFT JOIN user_item_state user_state
+               ON user_state.item_id = child.id AND user_state.user_id = ?
+             WHERE parent.id IN ({placeholders})
+               AND parent.item_type IN ('SERIES', 'SEASON')
+               AND parent.removed_at IS NULL
+             GROUP BY parent.id"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(user_id);
+        for item_id in item_ids {
+            statement = statement.bind(item_id);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.get("id"), row.get("unplayed_episode_count")))
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn list_catalog_children(
         &self,
         parent_id: &str,

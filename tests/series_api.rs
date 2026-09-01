@@ -258,6 +258,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         "2013-12-02T00:00:00.0000000Z"
     );
     assert_eq!(emby_series_detail_body["ProviderIds"]["Tmdb"], "60625");
+    assert_eq!(emby_series_detail_body["UserData"]["UnplayedItemCount"], 2);
 
     let seasons = client
         .get(format!(
@@ -276,6 +277,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(seasons_body["Items"][0]["SeriesName"], "Example Show");
     assert_eq!(seasons_body["Items"][0]["IndexNumber"], 1);
     assert_eq!(seasons_body["Items"][0]["ChildCount"], 3);
+    assert_eq!(seasons_body["Items"][0]["UserData"]["UnplayedItemCount"], 2);
     assert_eq!(seasons_body["Items"][0]["ParentBackdropItemId"], series_id);
     assert_eq!(seasons_body["Items"][0]["ParentLogoItemId"], series_id);
     assert_eq!(seasons_body["Items"][0]["Genres"], serde_json::json!([]));
@@ -310,6 +312,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert!(series_library_items_body.get("StartIndex").is_none());
     assert_eq!(series_library_items_body["TotalRecordCount"], 1);
     assert_eq!(series_library_items_body["Items"][0]["Type"], "Series");
+    assert_eq!(
+        series_library_items_body["Items"][0]["UserData"]["UnplayedItemCount"],
+        2
+    );
 
     let episodes_from_season = client
         .get(format!(
