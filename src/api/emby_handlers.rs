@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::ids::UserId;
 
 #[derive(Deserialize, Default)]
 pub(super) struct DanmakuQuery {
