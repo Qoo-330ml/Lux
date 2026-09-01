@@ -2738,6 +2738,13 @@ services:
 
 依赖：LUX-081。
 
+实施记录（2026-09-01）：PostgreSQL 生产扫描期间，首页每库最新资源查询的
+`ROW_NUMBER()` 会对全部可见媒体排序后才取每库 20 条，并发刷新时产生大量临时写入。
+PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 `added_at` 索引限量，
+再加载媒体详情；SQLite 路径保持不变，不增加 migration 或依赖。真实生产计划使用
+`idx_media_items_library_added_visible`，20 条查询约 0.39 ms；两项扫描热修部署后，
+30 秒处理 11,200 个文件，PostgreSQL 临时写入增量为 0。
+
 #### LUX-083：多版本聚合
 
 验收：
@@ -4661,6 +4668,12 @@ ffprobe 使用独立的有界资源配额：默认 256 路，单库有效上限 
 - `uname -m`
 
 依赖：LUX-040、LUX-043、LUX-044、LUX-045、LUX-145、LUX-154。
+
+实施记录（2026-08-31）：PostgreSQL 生产全量校验在 385 万个剩余工作项下，30 秒处理 1,100 个文件却产生约
+799 MiB 临时写入；活动查询显示 sidecar 目标登记为最多 100 个目录生成 `substr(...) OR ...`，反复扫描同一媒体根。
+目标登记现改为一次短事务中按去重目录执行 `(library_root_id, relative_path)` B-tree 范围查询，不增加 schema 或索引；
+回归测试覆盖相似目录前缀和中文路径，完整 `scanning_jobs` 目标通过。与首页排序热修一起部署后，同一生产任务
+30 秒处理量从约 1,100 提高到 11,200，临时写入从约 799 MiB 降为 0；本机 ARM64 结果不外推 NAS/x86_64 性能。
 
 #### LUX-198：Web 播放会话、服务端 HLS 与 Jellyfin FFmpeg 7
 

@@ -677,6 +677,76 @@ async fn reconciliation_persists_removed_media_and_sidecar_targets()
 }
 
 #[tokio::test]
+async fn reconciliation_sidecar_targets_do_not_cross_directory_prefixes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for (directory, stem) in [
+        ("A", "Alpha.Movie.2020"),
+        ("A2", "Beta.Movie.2021"),
+        ("中文", "Chinese.Movie.2022"),
+        ("中文2", "Other.Movie.2023"),
+    ] {
+        tokio::fs::create_dir_all(root.join(directory)).await?;
+        tokio::fs::write(root.join(directory).join(format!("{stem}.mkv")), b"fixture").await?;
+        tokio::fs::write(
+            root.join(directory).join(format!("{stem}.nfo")),
+            b"<movie />",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first.id, 100, None).await?;
+    tokio::fs::write(
+        root.join("A/Alpha.Movie.2020.nfo"),
+        b"<movie><title>A</title></movie>",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("中文/Chinese.Movie.2022.nfo"),
+        b"<movie><title>Chinese</title></movie>",
+    )
+    .await?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&second.id, 100).await?.completed {
+            break;
+        }
+    }
+    let targeted_paths: Vec<String> = sqlx::query_scalar(
+        "SELECT fe.relative_path
+         FROM scan_job_targets targets
+         JOIN media_sources ms ON ms.item_id = targets.item_id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE targets.job_id = ? AND targets.change_kind = 'SIDECAR'
+         ORDER BY fe.relative_path",
+    )
+    .bind(&second.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        targeted_paths,
+        vec!["A/Alpha.Movie.2020.mkv", "中文/Chinese.Movie.2022.mkv"]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn completed_scan_enqueues_media_removed_for_missing_files()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
