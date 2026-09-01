@@ -1466,7 +1466,7 @@ mod tests {
             .insert_initial_user(&first_user_id, "alice", "Alice", "hash")
             .await?;
         database
-            .insert_user(&second_user_id, "bob", "Bob", "hash", false)
+            .insert_user(&second_user_id, "bob", "Bob", "hash", false, true)
             .await?;
         sqlx::query("UPDATE users SET is_disabled = 1 WHERE username_normalized = 'bob'")
             .execute(database.pool())

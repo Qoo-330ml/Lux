@@ -2753,6 +2753,7 @@ mod tests {
                     &format!("Migration {index}"),
                     "hash",
                     false,
+                    true,
                 )
                 .await?;
             bindings.push(StoredEmbyMigrationUserBinding {
