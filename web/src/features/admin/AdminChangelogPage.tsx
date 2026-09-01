@@ -24,6 +24,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "Emby 用户管理兼容接口支持创建、删除用户，并支持复制用户策略、配置、媒体库权限和媒体库顺序。",
         "支持 Emby 用户配置、密码状态、登录时间和活动时间持久化。",
         "GET /Sessions 支持 ActiveWithinSeconds 活动窗口过滤。",
+        "Emby 剧集和季度兼容 DTO 支持返回按当前用户统计的可播放未看分集数 UserData.UnplayedItemCount，覆盖列表、详情和季度列表。",
       ] },
       { kind: "fixed", items: [
         "修复请求不存在的 Emby 用户时未明确返回 404 Not Found 的问题。",
@@ -37,6 +38,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "弹幕插件版本同步至 0.1.3，保持插件包与清单版本一致。",
         "Emby 用户 DTO 不再返回固定的密码状态、登录时间和活动时间。",
         "默认播放会话活动窗口保持 90 秒，显式窗口限制为 1 秒至 30 天。",
+        "简化管理台服务器概况 Bento 卡片的视觉层级，移除重复辅助文本并收敛卡片背景、边框和阴影，让核心指标更突出。",
       ] },
     ],
   },
