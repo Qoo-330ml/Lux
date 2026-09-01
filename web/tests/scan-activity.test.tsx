@@ -64,6 +64,48 @@ describe("ScanActivityPopover", () => {
     });
   });
 
+  it("closes when clicking outside the activity popover", async () => {
+    vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
+      activities: [{
+        id: "scan-job-1",
+        kind: "scan",
+        taskType: "RECONCILE_LIBRARY",
+        libraryId: "library-1",
+        status: "RUNNING",
+        processedCount: 3,
+        totalCount: 10,
+      }],
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电视剧库" }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ScanActivityPopover />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector("button[aria-label*='后台任务活动']")).not.toBeNull());
+    });
+    act(() => container.querySelector<HTMLButtonElement>("button[aria-label*='后台任务活动']")?.click());
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+
+    act(() => container.querySelector<HTMLElement>('[role="dialog"]')?.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(container.querySelector('[role="dialog"]')).not.toBeNull();
+
+    act(() => document.body.dispatchEvent(new Event("pointerdown", { bubbles: true })));
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+  });
+
   it("keeps completed-index postprocessing visible as active work", async () => {
     vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
       activities: [{

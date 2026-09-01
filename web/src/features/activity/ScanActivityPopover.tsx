@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, FileClock, StopCircle } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -29,6 +29,7 @@ const PHASE_LABELS: Record<string, string> = {
 
 export function ScanActivityPopover() {
   const queryClient = useQueryClient();
+  const rootRef = useRef<HTMLDivElement>(null);
   const [open, setOpen] = useState(false);
   const activity = useQuery({
     queryKey: queryKeys.adminTaskActivity,
@@ -54,10 +55,20 @@ export function ScanActivityPopover() {
   const primary = jobs[0];
   const busy = activity.isPending;
 
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent) => {
+      const target = event.target;
+      if (target instanceof Node && !rootRef.current?.contains(target)) setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeOnOutsidePointer);
+    return () => document.removeEventListener("pointerdown", closeOnOutsidePointer);
+  }, [open]);
+
   if (!primary && !busy) return null;
 
   return (
-    <div className="lux-scan-activity">
+    <div ref={rootRef} className="lux-scan-activity">
       <button
         className={primary ? "lux-scan-activity-trigger is-active" : "lux-scan-activity-trigger"}
         type="button"
