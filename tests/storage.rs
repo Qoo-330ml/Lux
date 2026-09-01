@@ -1,4 +1,4 @@
-use std::fs;
+use std::{collections::BTreeMap, ffi::OsStr, fs, path::Path};
 
 use sha2::{Digest, Sha384};
 
@@ -8,6 +8,44 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
+
+#[test]
+fn migration_versions_are_unique_per_backend() -> Result<(), Box<dyn std::error::Error>> {
+    for directory in ["migrations", "migrations-postgres"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+        let mut versions = BTreeMap::<i64, Vec<String>>::new();
+
+        for entry in fs::read_dir(path)? {
+            let path = entry?.path();
+            if path.extension() != Some(OsStr::new("sql")) {
+                continue;
+            }
+            let file_name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .ok_or("migration filename is not valid UTF-8")?;
+            let version = file_name
+                .split_once('_')
+                .ok_or("migration filename has no version separator")?
+                .0
+                .parse::<i64>()?;
+            versions
+                .entry(version)
+                .or_default()
+                .push(file_name.to_owned());
+        }
+
+        let duplicates: Vec<_> = versions
+            .into_iter()
+            .filter(|(_, files)| files.len() > 1)
+            .collect();
+        assert!(
+            duplicates.is_empty(),
+            "{directory} has duplicate migration versions: {duplicates:?}"
+        );
+    }
+    Ok(())
+}
 
 #[test]
 fn historical_media_catalog_migration_keeps_its_original_checksum() {
