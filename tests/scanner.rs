@@ -153,6 +153,14 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(unavailable, 0);
+    let removed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT removed_at FROM media_items WHERE id = (
+             SELECT item_id FROM media_sources LIMIT 1
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(removed_at.is_some());
 
     tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"fixture").await?;
     scanner.scan_movie_library(library.id).await?;
@@ -164,6 +172,14 @@ async fn scanner_discovers_one_movie_and_is_idempotent_after_restart()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(available_after_restore, 1);
+    let restored_removed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT removed_at FROM media_items WHERE id = (
+             SELECT item_id FROM media_sources LIMIT 1
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(restored_removed_at.is_none());
 
     let item_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE item_type <> 'FOLDER'")
@@ -251,9 +267,8 @@ async fn scanner_aggregates_quality_sources_but_keeps_cuts_separate()
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
         .await?;
 
-    let report = LibraryScanner::new(database.clone())
-        .scan_movie_library(library.id)
-        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    let report = scanner.scan_movie_library(library.id).await?;
     assert_eq!(report.created_items, 2);
     assert_eq!(report.created_sources, 3);
 
@@ -289,6 +304,81 @@ async fn scanner_aggregates_quality_sources_but_keeps_cuts_separate()
             (Some("Director's Cut".to_owned()), Some("1080p".to_owned())),
         ]
     );
+
+    tokio::fs::remove_file(root.join("Example.Movie.2024.2160p.mkv")).await?;
+    scanner.scan_movie_library(library.id).await?;
+    let removed_at: Option<i64> = sqlx::query_scalar(
+        "SELECT removed_at FROM media_items
+         WHERE title = 'Example Movie' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        removed_at.is_none(),
+        "a movie with another available source must stay active"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn movie_scan_reuses_removed_item_after_path_move_without_inode()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let old_path = root.join("Old/Example.Movie.2020.mkv");
+    tokio::fs::create_dir_all(old_path.parent().ok_or("missing parent")?).await?;
+    tokio::fs::write(&old_path, b"fixture").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_movie_library(library.id).await?;
+    let original_item_id: String =
+        sqlx::query_scalar("SELECT item_id FROM media_sources WHERE source_kind = 'LOCAL_FILE'")
+            .fetch_one(database.pool())
+            .await?;
+
+    tokio::fs::remove_file(&old_path).await?;
+    scanner.scan_movie_library(library.id).await?;
+    let removed_at: Option<i64> =
+        sqlx::query_scalar("SELECT removed_at FROM media_items WHERE id = ?")
+            .bind(&original_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(removed_at.is_some());
+    sqlx::query("UPDATE filesystem_entries SET inode = NULL WHERE relative_path = ?")
+        .bind("Old/Example.Movie.2020.mkv")
+        .execute(database.pool())
+        .await?;
+
+    let new_path = root.join("New/Example.Movie.2020.mkv");
+    tokio::fs::create_dir_all(new_path.parent().ok_or("missing parent")?).await?;
+    tokio::fs::write(&new_path, b"fixture").await?;
+    scanner.scan_movie_library(library.id).await?;
+
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids, vec![original_item_id.clone()]);
+    let restored_removed_at: Option<i64> =
+        sqlx::query_scalar("SELECT removed_at FROM media_items WHERE id = ?")
+            .bind(original_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(restored_removed_at.is_none());
     Ok(())
 }
 
@@ -328,6 +418,11 @@ async fn unavailable_root_does_not_mark_entries_missing_and_recovers()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(state, (0, 0));
+    let removed_at: Option<i64> =
+        sqlx::query_scalar("SELECT removed_at FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(removed_at.is_none());
 
     tokio::fs::create_dir_all(&movie_dir).await?;
     tokio::fs::write(&movie_path, b"fixture").await?;

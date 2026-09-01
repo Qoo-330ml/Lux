@@ -1135,6 +1135,7 @@ impl LibraryScanner {
                     item.provider_ids_json,
                 )
                 .await?;
+            self.database.restore_media_item(&existing.id).await?;
             return Ok((existing.id, false));
         }
         if let Some(legacy_identity) = legacy_identity
@@ -1157,6 +1158,7 @@ impl LibraryScanner {
                     item.provider_ids_json,
                 )
                 .await?;
+            self.database.restore_media_item(&existing.id).await?;
             return Ok((existing.id, false));
         }
         let id = item.id.to_owned();
@@ -2302,6 +2304,7 @@ impl LibraryScanner {
             )
             .await?;
         let (item_id, created_item) = if let Some(item) = existing_item {
+            self.database.restore_media_item(&item.id).await?;
             (item.id, false)
         } else {
             let item_id = ItemId::new().to_string();

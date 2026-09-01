@@ -442,7 +442,8 @@ impl Database {
                 "SELECT id, sort_title, production_year, parent_id, provider_ids_json
                  FROM media_items
                  WHERE library_id = ? AND item_type = 'MOVIE'
-                   AND removed_at IS NULL AND sort_title IN ({placeholders})"
+                   AND sort_title IN ({placeholders})
+                 ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
             for sort_title in chunk {
@@ -486,14 +487,13 @@ impl Database {
                         path: self.path.clone(),
                         source,
                     })?;
-                movie_items.insert(
-                    (sort_title, production_year),
-                    PrefetchedMovieItem {
+                movie_items
+                    .entry((sort_title, production_year))
+                    .or_insert(PrefetchedMovieItem {
                         id,
                         parent_id,
                         provider_ids_json,
-                    },
-                );
+                    });
             }
         }
         Ok(movie_items)
@@ -1021,6 +1021,12 @@ impl Database {
                     source,
                 })?;
         }
+        let filesystem_entry_ids = source_rows
+            .iter()
+            .map(|(index, _, _)| files[*index].filesystem_entry_id.clone())
+            .collect::<Vec<_>>();
+        self.restore_media_items_for_filesystem_entries(&mut transaction, &filesystem_entry_ids)
+            .await?;
         let strm_item_ids = source_rows
             .iter()
             .filter(|(index, _, _)| files[*index].source_kind == "STRM_URL")
@@ -1519,7 +1525,8 @@ impl Database {
                      FROM media_items
                      WHERE library_id = ? AND item_type = 'MOVIE'
                        AND sort_title = ? AND production_year = ?
-                       AND removed_at IS NULL",
+                     ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id
+                     LIMIT 1",
                 )
                 .bind(library_id)
                 .bind(sort_title)
@@ -1533,7 +1540,8 @@ impl Database {
                      FROM media_items
                      WHERE library_id = ? AND item_type = 'MOVIE'
                        AND sort_title = ? AND production_year IS NULL
-                       AND removed_at IS NULL",
+                     ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id
+                     LIMIT 1",
                 )
                 .bind(library_id)
                 .bind(sort_title)
@@ -1586,7 +1594,7 @@ impl Database {
         &self,
         identity_key: &str,
     ) -> Result<Option<StoredMediaItem>, StorageError> {
-        self.query("SELECT id FROM media_items WHERE identity_key = ? AND removed_at IS NULL")
+        self.query("SELECT id FROM media_items WHERE identity_key = ?")
             .bind(identity_key)
             .fetch_optional(&self.pool)
             .await
