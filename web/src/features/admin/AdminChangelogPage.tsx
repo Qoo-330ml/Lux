@@ -29,6 +29,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复请求不存在的 Emby 用户时未明确返回 404 Not Found 的问题。",
         "修复删除 Emby 用户后其头像文件可能残留的问题。",
         "修复 SQLite 用户写操作遇到数据库锁时容易失败的问题；现在会在有限时间窗口内自动重试。",
+        "修复 PostgreSQL 用户密码状态字段类型与存储层不一致、导致用户查询可能失败的问题；现有密码状态会迁移为统一的 0/1 表示。",
       ] },
       { kind: "changed", items: [
         "管理台服务器概况改为响应式 Bento 卡片布局，补充 CPU、内存、存储进度展示，并优化深浅色主题和移动端适配。",
