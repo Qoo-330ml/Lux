@@ -111,7 +111,17 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert!(database.schema_version().await? > 0);
+    assert_eq!(database.schema_version().await?, 114);
+    let has_password_type: String = sqlx::query_scalar(
+        "SELECT data_type
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'users'
+           AND column_name = 'has_password'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(has_password_type, "bigint");
     let chapter_table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
