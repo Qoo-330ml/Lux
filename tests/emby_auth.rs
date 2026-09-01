@@ -11,8 +11,11 @@ use luxd::{
     storage::Database,
 };
 use reqwest::header::AUTHORIZATION;
+use reqwest::header::CONTENT_TYPE;
+use image::{DynamicImage, ImageFormat};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use std::io::Cursor;
 use tokio::net::TcpListener;
 
 struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
@@ -33,7 +36,7 @@ async fn emby_users_requires_server_manager_and_supports_both_prefixes()
     };
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
-    let admin = setup
+    let _admin = setup
         .complete("Admin", "Administrator", "correct password")
         .await?;
     let users = UserStore::new(database.clone())?;
@@ -111,6 +114,117 @@ async fn emby_users_requires_server_manager_and_supports_both_prefixes()
 
     let missing_key = client.get(format!("http://{address}/Users")).send().await?;
     assert_eq!(missing_key.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_user_policy_password_and_avatar_updates_round_trip()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let _admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let users = UserStore::new(database.clone())?;
+    let viewer = users
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+
+    let admin_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&serde_json::json!({
+            "Username": "ADMIN",
+            "Pw": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_token = admin_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+
+    let policy_update = client
+        .post(format!("http://{address}/emby/Users/{}/Policy", viewer.id))
+        .header(AUTHORIZATION, format!(r#"Emby Client="Infuse", Device="iPhone", DeviceId="device-2", Version="1.0.0", Token="{}""#, admin_token))
+        .json(&serde_json::json!({
+            "EnableRemoteControlOfOtherUsers": true,
+            "EnableRemoteAccess": true,
+            "EnableContentDownloading": true,
+            "EnableSubtitleManagement": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(policy_update.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let user_after_policy = client
+        .get(format!("http://{address}/emby/Users/{}", viewer.id))
+        .query(&[("api_key", admin_token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(user_after_policy.status(), reqwest::StatusCode::OK);
+    let user_after_policy_body: serde_json::Value = user_after_policy.json().await?;
+    assert_eq!(user_after_policy_body["Policy"]["EnableRemoteAccess"], true);
+    assert_eq!(user_after_policy_body["Policy"]["EnableContentDownloading"], true);
+
+    let password_update = client
+        .post(format!("http://{address}/emby/Users/{}/Password", viewer.id))
+        .query(&[("api_key", admin_token.as_str())])
+        .json(&serde_json::json!({
+            "NewPw": "new viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(password_update.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let relogin = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&serde_json::json!({
+            "Username": "viewer",
+            "Pw": "new viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(relogin.status(), reqwest::StatusCode::OK);
+
+    let mut avatar = Cursor::new(Vec::new());
+    DynamicImage::new_rgba8(1, 1)
+        .write_to(&mut avatar, ImageFormat::Png)?;
+    let avatar_bytes = avatar.into_inner();
+    let avatar_upload = client
+        .post(format!("http://{address}/emby/Users/{}/Images/Primary", viewer.id))
+        .query(&[("api_key", admin_token.as_str())])
+        .header(CONTENT_TYPE, "image/png")
+        .body(avatar_bytes.clone())
+        .send()
+        .await?;
+    assert_eq!(avatar_upload.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let avatar_path = temp_dir
+        .path()
+        .join("config")
+        .join("user-avatars")
+        .join(viewer.id.to_string());
+    assert_eq!(tokio::fs::read(avatar_path).await?, avatar_bytes);
 
     Ok(())
 }

@@ -17,6 +17,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
         .route("/Users/{user_id}", get(emby_user))
+        .route("/Users/{user_id}", post(emby_update_user).put(emby_update_user))
         .route("/Users/{user_id}/Views", get(emby_user_views))
         .route("/Users/{user_id}/Items/Root", get(emby_user_root))
         .route("/Users/{user_id}/Items/Resume", get(emby_user_resume))
@@ -24,6 +25,14 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Users/{user_id}/Items/NextUp", get(emby_user_next_up))
         .route("/Users/{user_id}/Items", get(emby_user_items))
         .route("/Users/{user_id}/Items/{item_id}", get(emby_user_item))
+        .route("/Users/{user_id}/Policy", post(emby_update_user_policy).put(emby_update_user_policy))
+        .route("/Users/{user_id}/Password", post(emby_update_user_password).put(emby_update_user_password))
+        .route(
+            "/Users/{user_id}/Images/Primary",
+            get(emby_user_avatar)
+                .post(emby_update_user_avatar)
+                .put(emby_update_user_avatar),
+        )
         .route(
             "/Persons/{person_id}/Images/{image_type}",
             get(emby_person_image).head(emby_person_image),
