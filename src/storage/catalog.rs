@@ -63,6 +63,75 @@ fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String
     )
 }
 
+fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
+    // The explicit `item_type <> 'FOLDER'` predicate lets SQLite match the
+    // existing partial index; the IN predicate alone is not inferred.
+    let libraries = (0..library_count)
+        .map(|_| {
+            "SELECT recent.id, recent.library_id
+             FROM (
+                 SELECT candidates.id, candidates.library_id
+                 FROM (
+                     SELECT available.id, available.library_id,
+                            available.added_at, available.sort_title
+                     FROM (
+                         SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                         FROM media_items mi
+                         JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                         WHERE mi.library_id = ?
+                           AND mi.item_type <> 'FOLDER'
+                           AND mi.item_type IN ('MOVIE', 'SERIES')
+                           AND mi.removed_at IS NULL
+                           AND mi.has_available_source = 1
+                         ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+                         LIMIT ?
+                     ) AS available
+                     UNION ALL
+                     SELECT unavailable_series.id, unavailable_series.library_id,
+                            unavailable_series.added_at, unavailable_series.sort_title
+                     FROM (
+                         SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                         FROM media_items mi
+                         JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                         WHERE mi.library_id = ?
+                           AND mi.item_type = 'SERIES'
+                           AND mi.removed_at IS NULL
+                           AND mi.has_available_source = 0
+                           AND (
+                               EXISTS (
+                                   SELECT 1
+                                   FROM media_items visible_child
+                                   WHERE visible_child.removed_at IS NULL
+                                     AND visible_child.has_available_source = 1
+                                     AND (visible_child.parent_id = mi.id
+                                          OR visible_child.series_id = mi.id)
+                               )
+                               OR EXISTS (
+                                   SELECT 1
+                                   FROM collection_items visible_collection_item
+                                   JOIN collections visible_collection
+                                     ON visible_collection.id = visible_collection_item.collection_id
+                                   JOIN media_items visible_child
+                                     ON visible_child.id = visible_collection_item.item_id
+                                   WHERE visible_collection.item_id = mi.id
+                                     AND visible_child.removed_at IS NULL
+                                     AND visible_child.has_available_source = 1
+                               )
+                           )
+                         ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+                         LIMIT ?
+                     ) AS unavailable_series
+                 ) AS candidates
+                 ORDER BY candidates.added_at DESC,
+                          candidates.sort_title, candidates.id
+                 LIMIT ?
+             ) AS recent"
+        })
+        .collect::<Vec<_>>()
+        .join("\n             UNION ALL\n             ");
+    format!("WITH selected AS (\n             {libraries}\n             )")
+}
+
 impl Database {
     pub(crate) async fn refresh_recommendation_stats_if_needed(
         &self,
@@ -744,9 +813,6 @@ impl Database {
         }
         let mut rows = Vec::new();
         for library_ids in library_ids.chunks(500) {
-            let placeholders = std::iter::repeat_n("?", library_ids.len())
-                .collect::<Vec<_>>()
-                .join(", ");
             let (selection_query, binds) = if self.backend == DatabaseBackend::Postgres {
                 let mut binds = Vec::with_capacity(library_ids.len() + 3);
                 binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
@@ -756,61 +822,15 @@ impl Database {
                     binds,
                 )
             } else {
-                let query = format!(
-                    "WITH visible_catalog AS (
-                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.library_id IN ({placeholders})
-                   AND mi.item_type IN ('MOVIE', 'SERIES')
-                   AND mi.removed_at IS NULL
-                   AND mi.has_available_source = 1
-                 UNION ALL
-                 SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
-                 FROM media_items mi
-                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.library_id IN ({placeholders})
-                   AND mi.item_type = 'SERIES'
-                   AND mi.removed_at IS NULL
-                   AND mi.has_available_source = 0
-                   AND (
-                       EXISTS (
-                           SELECT 1
-                           FROM media_items visible_child
-                           WHERE visible_child.removed_at IS NULL
-                             AND visible_child.has_available_source = 1
-                             AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
-                       )
-                       OR EXISTS (
-                           SELECT 1
-                           FROM collection_items visible_collection_item
-                           JOIN collections visible_collection
-                             ON visible_collection.id = visible_collection_item.collection_id
-                           JOIN media_items visible_child
-                             ON visible_child.id = visible_collection_item.item_id
-                           WHERE visible_collection.item_id = mi.id
-                             AND visible_child.removed_at IS NULL
-                             AND visible_child.has_available_source = 1
-                       )
-                   )
-             ), ranked AS (
-                 SELECT id, library_id,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY library_id
-                            ORDER BY added_at DESC, sort_title ASC, id ASC
-                        ) AS library_rank
-                 FROM visible_catalog
-             ), selected AS (
-                 SELECT id, library_id
-                 FROM ranked
-                 WHERE library_rank <= ?
-             )
-             "
-                );
-                let mut binds = Vec::with_capacity(library_ids.len() * 2 + 1);
-                binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
-                binds.extend(library_ids.iter().map(|id| CatalogBind::Text(id)));
-                binds.push(CatalogBind::Integer(limit));
+                let query = sqlite_recent_catalog_rows_by_library_query(library_ids.len());
+                let mut binds = Vec::with_capacity(library_ids.len() * 5);
+                for library_id in library_ids {
+                    binds.push(CatalogBind::Text(library_id));
+                    binds.push(CatalogBind::Integer(limit));
+                    binds.push(CatalogBind::Text(library_id));
+                    binds.push(CatalogBind::Integer(limit));
+                    binds.push(CatalogBind::Integer(limit));
+                }
                 (query, binds)
             };
             let query = format!(
@@ -5644,7 +5664,9 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::postgres_recent_catalog_rows_by_library_query;
+    use super::{
+        postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
+    };
 
     #[test]
     fn postgres_recent_catalog_limits_each_library_before_loading_details() {
@@ -5654,5 +5676,15 @@ mod tests {
         assert!(query.contains("VALUES (?), (?)"));
         assert_eq!(query.matches("LIMIT ?").count(), 3);
         assert!(!query.contains("ROW_NUMBER()"));
+    }
+
+    #[test]
+    fn sqlite_recent_catalog_limits_each_library_before_loading_details() {
+        let query = sqlite_recent_catalog_rows_by_library_query(2);
+
+        assert!(!query.contains("LATERAL"));
+        assert!(!query.contains("ROW_NUMBER()"));
+        assert_eq!(query.matches("LIMIT ?").count(), 6);
+        assert_eq!(query.matches("UNION ALL").count(), 3);
     }
 }

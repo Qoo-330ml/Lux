@@ -408,6 +408,76 @@ async fn recent_catalog_rows_use_one_query_for_multiple_libraries() {
 }
 
 #[tokio::test]
+async fn recent_catalog_rows_include_visible_unavailable_series() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Series", LibraryKind::Series, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+
+    for (item_id, title, added_at) in [
+        ("recent-series-movie-old", "Old movie", 10_i64),
+        ("recent-series-movie-new", "New movie", 20_i64),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, added_at, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(title)
+        .bind(title.to_ascii_lowercase())
+        .bind(added_at)
+        .execute(database.pool())
+        .await
+        .expect("movie");
+    }
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, added_at, has_available_source
+             ) VALUES ('recent-visible-series', ?, 'SERIES',
+                       'Visible series', 'visible series', 'LOCAL_CONFIRMED', 30, 0)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("unavailable series");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, parent_id, title, sort_title,
+                identification_status, added_at, has_available_source
+             ) VALUES ('recent-visible-episode', ?, 'EPISODE',
+                       'recent-visible-series', 'Visible episode', 'visible episode',
+                       'LOCAL_CONFIRMED', 40, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("visible episode");
+
+    let rows = database
+        .list_recent_catalog_rows_by_library(&[library_id], 2)
+        .await
+        .expect("recent catalog rows");
+
+    assert_eq!(
+        rows.iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["recent-visible-series", "recent-series-movie-new"]
+    );
+}
+
+#[tokio::test]
 async fn recommended_catalog_rows_stop_awarding_freshness_after_seven_days() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
