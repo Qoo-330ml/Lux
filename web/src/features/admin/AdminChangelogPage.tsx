@@ -15,6 +15,23 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.6",
+    date: "2026-09-01",
+    sections: [
+      { kind: "added", items: [
+        "增加与 Emby 官方用户管理接口兼容的用户资料、策略、密码和 Primary 用户头像读写能力，支持 JSON/XML 请求以及头像二进制上传。",
+      ] },
+      { kind: "fixed", items: [
+        "修复请求不存在的 Emby 用户时未明确返回 404 Not Found 的问题。",
+      ] },
+      { kind: "changed", items: [
+        "管理台服务器概况改为响应式 Bento 卡片布局，补充 CPU、内存、存储进度展示，并优化深浅色主题和移动端适配。",
+        "活动扫描浮层支持点击外部区域关闭，点击浮层内容不会误关闭。",
+        "弹幕插件版本同步至 0.1.3，保持插件包与清单版本一致。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.5",
     date: "2026-08-31",
     sections: [
