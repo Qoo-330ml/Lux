@@ -1,8 +1,12 @@
 use super::*;
 use crate::{
     application::{
-        access::MediaAccessService, candidates::MetadataCandidateService, catalog::CatalogService,
-        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
+        access::MediaAccessService,
+        candidates::MetadataCandidateService,
+        catalog::CatalogService,
+        libraries::LibraryService,
+        scanner::{LibraryScanner, ScanJobService},
+        setup::SetupService,
     },
     config::{Config, DatabaseBackend, PostgresConnection},
     library::LibraryKind,
@@ -260,6 +264,79 @@ fn database_pool_max_connections_rejects_invalid_overrides() {
             resolve_database_pool_max_connections(DatabaseBackend::Sqlite, Some(value)).is_err()
         );
     }
+}
+
+#[tokio::test]
+async fn changed_sidecar_target_requeues_completed_local_metadata() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Example Movie (2020)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"video")
+        .await
+        .expect("movie file");
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root")
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("initial index");
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs
+        .create_movie_scan_job(library.id)
+        .await
+        .expect("scan job");
+    let root_id = root.id.to_string();
+    let media_path = "Example Movie (2020)/Example.Movie.2020.mkv".to_owned();
+    database
+        .record_scan_job_targets(&job.id, &root_id, &[media_path], "NEW")
+        .await
+        .expect("record media target");
+    sqlx::query(
+        "UPDATE scan_job_targets
+         SET metadata_state = 'DONE'
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await
+    .expect("complete local metadata target");
+
+    database
+        .record_scan_job_sidecar_targets(
+            &job.id,
+            &root_id,
+            &["Example Movie (2020)/poster.jpg".to_owned()],
+        )
+        .await
+        .expect("record changed sidecar target");
+    let state: String = sqlx::query_scalar(
+        "SELECT metadata_state
+         FROM scan_job_targets
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("local metadata target state");
+    assert_eq!(state, "PENDING");
 }
 
 #[tokio::test]

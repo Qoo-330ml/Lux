@@ -190,7 +190,7 @@ Lux 的核心价值不是功能数量，而是：
   /config/metadata/library/<shard>/<item-id>/。媒体目录已有 NFO 和图片仍保留且优先，历史
   metadata 资源不自动搬迁。
 - 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按主/备用角色和高置信度选择最佳候选，再按补充角色补齐缺失元数据，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
-- 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。
+- 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。全量扫描时，媒体文件夹完成视频源入库后即可进入首页；本地 NFO/图片登记由独立有界后台 worker 并行补齐，不等待整库扫描完成。
 - 媒体详情页或媒体卡片上的“扫描所在文件夹”只扫描该媒体现有媒体源所在的文件夹；媒体库管理页上的“扫描媒体库文件”才扫描整个媒体库。两者都只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削。
 - 管理员从媒体库入口手动执行“整库元数据匹配”时，使用与新库首次处理相同的自动选择、NFO 写回和图片下载流程；低置信度条目仍进入待处理队列。
 - 回写使用临时文件、刷盘和原子重命名；失败时显示可重试状态，不谎报成功。
@@ -2041,6 +2041,7 @@ services:
 | LUX-227 | web/src/features/player/components/player-captions.ts、web/src/features/player/components/player-video-surface.tsx、web/src/features/player/PlayerPage.tsx、web/tests/player-captions.test.ts、web/tests/player-caption-surface.test.tsx；浏览器原生 in-band TextTrack 探测 |
 | LUX-228 | web/src/features/player/、web/tests/；单次媒体读取的文本字幕解析实验，默认不改变 Direct Play |
 | LUX-229 | tests/strm_resolver_playback.rs、tests/web_playback.rs、web/tests/、docs/COMPATIBILITY.md；本地与远程 .strm 字幕兼容性阶段门 |
+| LUX-230 | src/application/scanner.rs、src/application/metadata.rs、src/storage/、src/api/media.rs、tests/、web/src/features/home/、web/src/lib/api/、web/src/react.css、docs/；全量扫描中的本地旁车流水线 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3624,7 +3625,8 @@ ip138，不再把它作为回退。Hiofd 插件显示名称为“IP归属地查�
 批次结束后让出锁，确保实时索引优先完成。
 ffprobe、本地 NFO/图片、缩略图、自动封面和在线元数据调度属于后处理阶段，不持有扫描互斥锁，
 由各自的有界资源配额控制。该机制仍不引入跨库 worker pool，也不改变任务的持久化、恢复和
-取消模型。
+取消模型。LUX-230 进一步规定本地 NFO/图片可以在全量文件批次提交后立即消费，不再等待整库
+文件阶段结束。
 
 验收：
 
@@ -4638,7 +4640,8 @@ API 合同：
 unchanged 只批量标记本轮 seen，不进入媒体索引、NFO、图片、缩略图或 ffprobe。new/changed
 source 和受影响 item 持久化为扫描目标，后处理按目标集合执行并可在进程重启后恢复。NFO、图片
 和其他旁车文件的变化必须能把对应 item 标记为 metadata target，不能因视频文件 fingerprint
-未变化而永久跳过旁车更新。
+未变化而永久跳过旁车更新。按媒体文件夹产生的扫描目标允许在全量扫描仍继续时被本地旁车 worker
+消费，首页不必等整库文件阶段结束。
 
 已有文件的 `stat`/fingerprint 检查使用最多 64 个在途 I/O 任务；新文件不创建 fingerprint
 检查任务，结果按发现顺序回收，避免把扫描目录一次性展开为无限 Tokio 任务。
@@ -5379,6 +5382,41 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 - [ ] 远程 `.strm` 没有 Lux 媒体字节流量、服务端字幕抽取、ffmpeg 或 302/Redia 字幕专用合同。
 - [ ] PGS/SUP、服务器烧录、HLS 字幕组和完整 ASS 样式未被隐式加入，所有未验证浏览器能力均已记录。
 - [ ] Rust/Web 全量质量门、兼容性记录、本机架构记录和项目所有者确认均完成。
+
+#### LUX-230：全量扫描中的本地旁车流水线
+
+全量扫描按媒体文件夹持续建立可用视频源。一个文件夹的视频源和扫描目标提交后，条目立即可被首页查询；
+本地 NFO、海报、背景图和其他已存在的本地图片由独立、有界的旁车 worker 并行读取并写入索引，扫描 worker
+立即继续下一个文件夹。旁车 worker 不进行在线匹配、不调用 TMDb、不下载缺失图片，也不持有文件扫描互斥锁。
+
+旁车目标在数据库中复用现有扫描目标状态，首页只在目标仍待处理时返回 `localMetadataPending`。Web 卡片没有
+图片且该状态为真时显示占位图和动态等待图标；旁车完成、没有可用图片或处理失败后停止等待，保留普通占位图。
+本地旁车更新完成会发布首页失效事件，使已显示的条目及时获得本地元数据和图片。
+
+验收：
+
+- [x] 全量扫描中，首个媒体文件夹完成视频源入库后即可出现在首页，不等待其他文件夹或整库文件阶段完成。
+- [x] 本地旁车读取与下一个文件夹的发现、索引并行执行；旁车慢或失败不阻塞扫描进度。
+- [x] 已存在的本地 NFO、海报和图片只读取并登记，不发起在线匹配、TMDb 请求或缺失图片下载。
+- [x] 首页在旁车处理期间返回 `localMetadataPending`，无图片时显示可访问的占位等待状态；旁车完成后首页刷新并显示本地图片、标题、年份和简介。
+- [x] 没有本地海报或旁车处理失败时，等待状态结束且继续显示普通占位图。
+- [x] 进程重启、取消、失败和重试不丢失或重复完成未完成的旁车目标。
+
+验证：
+
+- `cargo test --locked --test scanning_jobs --test scanned_metadata --test catalog`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+- `uname -m`（本机结果：`arm64`）
+
+依赖：LUX-154、LUX-187、LUX-197、LUX-200。
+
+明确不做：
+
+- 不在本任务实现在线元数据匹配、缺失图片下载、刮削器请求或 TMDb 调用。
+- 不把旁车读取放回用户请求路径，不因旁车处理而串行暂停全量扫描。
 
 ## 26. 风险与缓解
 

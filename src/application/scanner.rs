@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 use tokio::{
     fs,
-    sync::{OwnedSemaphorePermit, Semaphore},
-    task::JoinSet,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    task::{JoinHandle, JoinSet},
 };
 use uuid::Uuid;
 
@@ -58,6 +58,7 @@ const DISCOVERY_BATCH_SIZE: usize = 16;
 const FILE_PREPARATION_CONCURRENCY: usize = 8;
 const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
 const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
+const LOCAL_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -2445,6 +2446,11 @@ pub struct ScanJobService {
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
 }
 
+struct LocalMetadataWorkerHandle {
+    stop: watch::Sender<bool>,
+    task: JoinHandle<()>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IncrementalScanChange {
     pub root_id: String,
@@ -4547,6 +4553,146 @@ impl ScanJobService {
         Ok(report.created_items)
     }
 
+    fn start_local_metadata_worker(&self, scan_job_id: &str) -> LocalMetadataWorkerHandle {
+        let (stop, mut stop_receiver) = watch::channel(false);
+        let database = self.database.clone();
+        let people = self.people.clone();
+        let local_nfo = self.local_nfo.clone();
+        let home = self.home.clone();
+        let user_events = self.user_events.clone();
+        let scan_job_id = scan_job_id.to_owned();
+        let task = tokio::spawn(async move {
+            let enricher = MetadataEnricher::new(database.clone());
+            let enricher = match people {
+                Some(people) => enricher.with_people(people),
+                None => enricher,
+            };
+            let enricher = match local_nfo {
+                Some(local_nfo) => enricher.with_nfo_store(local_nfo),
+                None => enricher,
+            };
+
+            loop {
+                if *stop_receiver.borrow() {
+                    return;
+                }
+                let job = match database.find_scan_job(&scan_job_id).await {
+                    Ok(Some(job)) => job,
+                    Ok(None) => return,
+                    Err(error) => {
+                        tracing::warn!(
+                            scan_job_id = %scan_job_id,
+                            %error,
+                            "local metadata worker could not load scan job; retrying"
+                        );
+                        tokio::select! {
+                            changed = stop_receiver.changed() => {
+                                if changed.is_err() || *stop_receiver.borrow() {
+                                    return;
+                                }
+                            }
+                            _ = tokio::time::sleep(LOCAL_METADATA_POLL_INTERVAL) => {}
+                        }
+                        continue;
+                    }
+                };
+                if matches!(job.status.as_str(), "FAILED" | "CANCELLED")
+                    || (job.status == "COMPLETED" && job.scan_phase == "IDLE")
+                {
+                    return;
+                }
+                let pending = match database
+                    .has_pending_scan_job_metadata_targets(&scan_job_id)
+                    .await
+                {
+                    Ok(pending) => pending,
+                    Err(error) => {
+                        tracing::warn!(
+                            scan_job_id = %scan_job_id,
+                            %error,
+                            "local metadata worker could not check pending targets"
+                        );
+                        false
+                    }
+                };
+                if pending {
+                    match enricher.enrich_scan_job(&scan_job_id).await {
+                        Ok(report) if report.items_processed > 0 => {
+                            if let Some(home) = &home {
+                                home.invalidate();
+                                user_events.publish(UserEventScope::Home);
+                            }
+                        }
+                        Ok(_) => {
+                            if let Err(error) = database
+                                .mark_pending_scan_job_metadata_targets_failed(
+                                    &scan_job_id,
+                                    "local metadata source unavailable",
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    scan_job_id = %scan_job_id,
+                                    %error,
+                                    "local metadata worker could not finish unavailable targets"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                scan_job_id = %scan_job_id,
+                                %error,
+                                "local metadata worker failed; pending targets marked for retry"
+                            );
+                            if let Err(mark_error) = database
+                                .mark_pending_scan_job_metadata_targets_failed(
+                                    &scan_job_id,
+                                    &error.to_string(),
+                                )
+                                .await
+                            {
+                                tracing::warn!(
+                                    scan_job_id = %scan_job_id,
+                                    %mark_error,
+                                    "local metadata worker could not mark failed targets"
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    changed = stop_receiver.changed() => {
+                        if changed.is_err() || *stop_receiver.borrow() {
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(LOCAL_METADATA_POLL_INTERVAL) => {}
+                }
+            }
+        });
+        LocalMetadataWorkerHandle { stop, task }
+    }
+
+    async fn wait_for_local_metadata(&self, scan_job_id: &str) -> Result<(), ScanJobError> {
+        while self
+            .database
+            .has_pending_scan_job_metadata_targets(scan_job_id)
+            .await?
+        {
+            tokio::time::sleep(LOCAL_METADATA_POLL_INTERVAL).await;
+        }
+        Ok(())
+    }
+
+    async fn stop_local_metadata_worker(worker: &mut Option<LocalMetadataWorkerHandle>) {
+        let Some(worker) = worker.take() else {
+            return;
+        };
+        let _ = worker.stop.send(true);
+        let _ = worker.task.await;
+    }
+
     pub async fn run_to_completion(
         &self,
         job_id: &str,
@@ -4581,12 +4727,25 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
+        let full_scan = self
+            .database
+            .find_scan_job(job_id)
+            .await?
+            .is_some_and(|job| job.job_type == "RECONCILE_LIBRARY");
         let mut scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
+        let mut local_metadata_worker = full_scan.then(|| self.start_local_metadata_worker(job_id));
         let mut created_items = 0_usize;
         loop {
-            let report = self
+            let report = match self
                 .run_batch_with_failure_handling(job_id, batch_size)
-                .await?;
+                .await
+            {
+                Ok(report) => report,
+                Err(error) => {
+                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+                    return Err(error);
+                }
+            };
             if report.processed > 0
                 && let Some(home) = &self.home
             {
@@ -4605,18 +4764,22 @@ impl ScanJobService {
             if report.status == "COMPLETED" {
                 let Some(completed_job) = self.database.find_scan_job(job_id).await? else {
                     if self.cancellation_requested_in_memory(job_id) {
+                        Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                         self.clear_cancellation_flag(job_id);
                         return Ok(());
                     }
+                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     return Err(ScanJobError::JobNotFound);
                 };
                 let incremental = completed_job.job_type == "INCREMENTAL_SCAN";
                 drop(scan_permit);
                 if self.cancellation_requested_in_memory(job_id) {
+                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     self.cancel_running_job(job_id).await?;
                     return Ok(());
                 }
                 if incremental {
+                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     self.run_metadata_after_incremental_scan(job_id).await?;
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
                         .await?;
@@ -4643,7 +4806,15 @@ impl ScanJobService {
                         .await;
                     return Ok(());
                 }
-                self.database.retry_failed_scan_job_targets(job_id).await?;
+                if let Err(error) = self.database.retry_failed_scan_job_targets(job_id).await {
+                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+                    return Err(error.into());
+                }
+                if let Err(error) = self.wait_for_local_metadata(job_id).await {
+                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+                    return Err(error);
+                }
+                Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                 self.update_activity(job_id, Some("媒体探测"), "POSTPROCESSING")
                     .await?;
                 self.run_probe_after_scan(job_id, probe).await?;
@@ -4674,6 +4845,7 @@ impl ScanJobService {
                         )
                         .await;
                     }
+                    Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
                     return Ok(());
                 }
                 if completed_job.auto_metadata_match {
@@ -4689,6 +4861,7 @@ impl ScanJobService {
                 self.publish_media_added_event(&completed_job, created_items)
                     .await;
             }
+            Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
             return Ok(());
         }
     }

@@ -12,7 +12,10 @@ const SIDECAR_DIRECTORY_TARGET_QUERY: &str = "INSERT INTO scan_job_targets (
        AND fe.relative_path >= ? || '/'
        AND fe.relative_path < ? || '0'
      GROUP BY ms.item_id
-     ON CONFLICT(job_id, target_type, target_id) DO NOTHING";
+     ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET
+         change_kind = 'SIDECAR', metadata_state = 'PENDING', error = NULL,
+         updated_at = unixepoch()
+     WHERE scan_job_targets.change_kind <> 'REMOVED'";
 
 fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {
     directories.sort();
@@ -1222,7 +1225,10 @@ impl Database {
                  JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                  WHERE fe.library_root_id = ? AND fe.is_missing = 0
                  GROUP BY ms.item_id
-                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+                 ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET
+                     change_kind = 'SIDECAR', metadata_state = 'PENDING', error = NULL,
+                     updated_at = unixepoch()
+                 WHERE scan_job_targets.change_kind <> 'REMOVED'",
             )
             .bind(job_id)
             .bind(library_root_id)
@@ -1482,6 +1488,90 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn has_pending_scan_job_metadata_targets(
+        &self,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM scan_job_targets
+                 WHERE job_id = ? AND target_type = 'ITEM'
+                   AND metadata_state = 'PENDING'
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn mark_pending_scan_job_metadata_targets_failed(
+        &self,
+        job_id: &str,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE scan_job_targets
+             SET metadata_state = 'FAILED', error = ?, updated_at = unixepoch()
+             WHERE job_id = ? AND target_type = 'ITEM'
+               AND metadata_state = 'PENDING'",
+        )
+        .bind(error)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_pending_local_metadata_item_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<HashSet<String>, StorageError> {
+        let mut pending = HashSet::new();
+        for chunk in item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT DISTINCT t.item_id
+                 FROM scan_job_targets t
+                 JOIN scan_jobs sj ON sj.id = t.job_id
+                 WHERE t.target_type = 'ITEM' AND t.metadata_state = 'PENDING'
+                   AND sj.job_type = 'RECONCILE_LIBRARY'
+                   AND (
+                       sj.status IN ('PENDING', 'RUNNING')
+                       OR (sj.status = 'COMPLETED' AND sj.scan_phase = 'POSTPROCESSING')
+                   )
+                   AND t.item_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            pending.extend(rows.into_iter().map(|row| row.get("item_id")));
+        }
+        Ok(pending)
     }
 
     pub(crate) async fn mark_scan_job_target_stage(

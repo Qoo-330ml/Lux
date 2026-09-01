@@ -266,7 +266,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-continue-copy strong { display: block; overflow: hidden; color: rgba(255,255,255,.92); font-size: .88rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-continue-copy small { display: block; margin-top: 4px; color: var(--lux-subtle); font-size: .74rem; }
 .lux-continue-remaining { flex: 0 0 auto; color: var(--lux-muted); font-size: .72rem; line-height: 1.4; white-space: nowrap; }
-.lux-media-placeholder { display: grid; place-items: center; height: 100%; padding: 18px; color: rgba(255,255,255,.7); background: radial-gradient(circle at 50% 22%, rgba(107,107,118,.28), transparent 44%), linear-gradient(145deg, #27272c, #101013); font-size: .88rem; text-align: center; }
+.lux-media-placeholder { display: grid; place-items: center; align-content: center; gap: 10px; height: 100%; padding: 18px; color: rgba(255,255,255,.7); background: radial-gradient(circle at 50% 22%, rgba(107,107,118,.28), transparent 44%), linear-gradient(145deg, #27272c, #101013); font-size: .88rem; text-align: center; }
+.lux-media-placeholder-status { display: grid; place-items: center; color: var(--lux-accent); }
+.lux-media-placeholder-spinner { animation: lux-media-placeholder-spin .9s linear infinite; }
+@keyframes lux-media-placeholder-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .lux-media-placeholder-spinner { animation: none; } }
 .lux-media-hover-play { position: absolute; top: 50%; left: 50%; display: grid; place-items: center; width: 50px; height: 50px; border: 1px solid rgba(255,255,255,.5); border-radius: 50%; color: #111; background: rgba(255,255,255,.92); opacity: 0; transform: translate(-50%, -43%) scale(.82); transition: opacity .22s ease, transform .22s var(--lux-ease); }
 .lux-media-card:hover .lux-media-hover-play { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 .lux-progress { position: absolute; right: 0; bottom: 0; left: 0; height: 4px; background: rgba(255,255,255,.16); }

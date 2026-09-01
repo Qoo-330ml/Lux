@@ -1,4 +1,4 @@
-import { Database, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
+import { Database, LoaderCircle, MoreHorizontal, Play, ScanLine, ScanSearch } from "lucide-react";
 import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import { useEffect, useLayoutEffect, useRef, useState, type MouseEvent } from "react";
@@ -96,6 +96,20 @@ export function EpisodeCount({ item }: { item: MediaItem }) {
   return <span className="lux-media-episode-count" aria-label={label} title={label}>{label}</span>;
 }
 
+function MediaPlaceholder({ item }: { item: MediaItem }) {
+  const pending = item.localMetadataPending === true;
+  return (
+    <div className="lux-media-placeholder">
+      {pending ? (
+        <span className="lux-media-placeholder-status" role="status" aria-label="正在读取本地海报和元数据">
+          <LoaderCircle className="lux-media-placeholder-spinner" size={24} aria-hidden="true" />
+        </span>
+      ) : null}
+      <span>{mediaTitle(item)}</span>
+    </div>
+  );
+}
+
 export function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; onSelectionChange?: (selected: boolean) => void }) {
   const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
   const progress = playbackProgress(item);
@@ -159,7 +173,7 @@ export function MediaCard({ item, landscape = false, metadataAttention = false, 
           ) : null}
           <Link className="lux-media-card-link" to={detailHref} aria-label={`查看 ${mediaTitle(item)} 详情`}>
             <div className="lux-media-art">
-              {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+              {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <MediaPlaceholder item={item} />}
               <Rating value={item.rating} placement="card" />
               <EpisodeCount item={item} />
               <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
@@ -210,7 +224,7 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
   return (
     <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={`继续播放 ${mediaTitle(item)}`}>
       <div className="lux-media-art">
-        {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <div className="lux-media-placeholder">{mediaTitle(item)}</div>}
+        {image ? <img src={image} alt="" loading="lazy" decoding="async" /> : <MediaPlaceholder item={item} />}
         <Rating value={item.rating} placement="card" />
         <EpisodeCount item={item} />
         <span className="lux-media-hover-play" aria-hidden="true"><Play size={22} fill="currentColor" /></span>

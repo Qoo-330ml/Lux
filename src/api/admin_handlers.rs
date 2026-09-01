@@ -1064,7 +1064,7 @@ pub(crate) async fn spawn_library_scan(
         return Ok(None);
     };
     let job = match scan_jobs
-        .create_movie_scan_job_with_metadata(library_id, true)
+        .create_movie_scan_job_with_metadata(library_id, false)
         .await
     {
         Ok(job) => job,

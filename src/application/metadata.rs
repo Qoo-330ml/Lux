@@ -776,6 +776,7 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
     ) {
         for source in sources {
+            report.items_processed += 1;
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
             match self.enrich_movie_nfo(&source.item_id, &media_path).await {
                 Ok(nfo_report) => {
@@ -949,6 +950,7 @@ impl MetadataEnricher {
         let mut last_season_id = last_season_id;
         let mut last_episode_id = last_episode_id;
         for source in sources {
+            report.items_processed += 1;
             let root = PathBuf::from(&source.root_path);
             let media_path = root.join(&source.relative_path);
             let Some(series_dir) = series_directory(&root, &source.relative_path) else {
@@ -1431,6 +1433,7 @@ pub struct MetadataReport {
     pub nfo_failed: usize,
     pub nfo_skipped: usize,
     pub images_found: usize,
+    pub items_processed: usize,
     pub(crate) failed_item_ids: Vec<String>,
 }
 
@@ -1440,6 +1443,7 @@ impl MetadataReport {
         self.nfo_failed += other.nfo_failed;
         self.nfo_skipped += other.nfo_skipped;
         self.images_found += other.images_found;
+        self.items_processed += other.items_processed;
         for item_id in other.failed_item_ids {
             self.mark_item_failed(&item_id);
         }

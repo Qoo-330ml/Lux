@@ -5,7 +5,7 @@ use luxd::{
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
         people::{ActorCredit, PeopleService},
-        scanner::LibraryScanner,
+        scanner::{LibraryScanner, ScanJobService},
         setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
@@ -1156,6 +1156,20 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     .bind(500_i64)
     .execute(database.pool())
     .await?;
+    let pending_sidecar_job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind,
+             probe_state, metadata_state, thumbnail_state
+         ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'SKIPPED', 'PENDING', 'PENDING')",
+    )
+    .bind(&pending_sidecar_job.id)
+    .bind(&item_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
     let home = client
         .get(format!("{base_url}/api/v1/home"))
         .header(COOKIE, &cookies)
@@ -1182,6 +1196,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
     assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
     assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
+    assert_eq!(home_body["recentlyAdded"][0]["localMetadataPending"], true);
     assert_eq!(
         home_body["recentlyAdded"][0]["userData"]["positionTicks"],
         1_700_000_000_i64

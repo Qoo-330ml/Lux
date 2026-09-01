@@ -624,10 +624,17 @@ pub(super) async fn load_lux_item_detail(
     item: &CatalogItem,
     user_id: &str,
 ) -> Result<LuxItemDetail, ()> {
-    let (metadata_pending, user_state, actors, nfo) = tokio::try_join!(
+    let (metadata_pending, local_metadata_pending, user_state, actors, nfo) = tokio::try_join!(
         async {
             database
                 .list_pending_metadata_item_ids(std::slice::from_ref(&item.id))
+                .await
+                .map(|item_ids| item_ids.contains(&item.id))
+                .map_err(|_| ())
+        },
+        async {
+            database
+                .list_pending_local_metadata_item_ids(std::slice::from_ref(&item.id))
                 .await
                 .map(|item_ids| item_ids.contains(&item.id))
                 .map_err(|_| ())
@@ -679,6 +686,10 @@ pub(super) async fn load_lux_item_detail(
         object.insert("actors".to_owned(), json!(actors));
         object.insert("nfo".to_owned(), json!(nfo));
         object.insert("metadataPending".to_owned(), json!(metadata_pending));
+        object.insert(
+            "localMetadataPending".to_owned(),
+            json!(local_metadata_pending),
+        );
         if let Some(nfo) = nfo.as_ref() {
             apply_local_nfo_details(object, nfo);
         }
@@ -2841,9 +2852,10 @@ pub(super) async fn lux_catalog_item_values_by_id(
             item_ids.push(item.id.clone());
         }
     }
-    let (states, pending_item_ids) = tokio::try_join!(
+    let (states, pending_item_ids, local_metadata_pending_item_ids) = tokio::try_join!(
         database.list_user_item_states(user_id, &item_ids),
         database.list_pending_metadata_item_ids(&item_ids),
+        database.list_pending_local_metadata_item_ids(&item_ids),
     )?;
     Ok(items
         .iter()
@@ -2853,6 +2865,10 @@ pub(super) async fn lux_catalog_item_values_by_id(
                 object.insert(
                     "metadataPending".to_owned(),
                     Value::Bool(pending_item_ids.contains(&item.id)),
+                );
+                object.insert(
+                    "localMetadataPending".to_owned(),
+                    Value::Bool(local_metadata_pending_item_ids.contains(&item.id)),
                 );
             }
             (item.id.clone(), value)

@@ -193,6 +193,7 @@ export type MediaItem = {
   indexNumber?: number | null;
   parentIndexNumber?: number | null;
   metadataPending?: boolean;
+  localMetadataPending?: boolean;
 };
 
 export type MetadataFieldName = "title" | "originalTitle" | "overview" | "productionYear";

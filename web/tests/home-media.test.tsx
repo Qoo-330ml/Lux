@@ -117,6 +117,33 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector(".lux-media-episode-count")?.textContent).toBe("8 集");
   });
 
+  it("shows a waiting placeholder while local sidecars are being indexed", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <MediaCard
+            item={{
+              id: "pending-local-metadata",
+              title: "正在读取本地资源",
+              itemType: "MOVIE",
+              localMetadataPending: true,
+            }}
+          />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector(".lux-media-placeholder")?.textContent)
+      .toContain("正在读取本地资源");
+    expect(container.querySelector(".lux-media-placeholder-spinner")).not.toBeNull();
+    expect(container.querySelector('[role="status"]')?.getAttribute("aria-label"))
+      .toBe("正在读取本地海报和元数据");
+  });
+
   it("hides the section when there are no resume items", () => {
     container = document.createElement("div");
     document.body.append(container);
