@@ -439,7 +439,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT id, sort_title, production_year, parent_id, provider_ids_json
+                "SELECT id, sort_title, production_year, parent_id, provider_ids_json, removed_at
                  FROM media_items
                  WHERE library_id = ? AND item_type = 'MOVIE'
                    AND sort_title IN ({placeholders})
@@ -487,12 +487,19 @@ impl Database {
                         path: self.path.clone(),
                         source,
                     })?;
+                let removed_at = row
+                    .try_get::<Option<i64>, _>("removed_at")
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
                 movie_items
                     .entry((sort_title, production_year))
                     .or_insert(PrefetchedMovieItem {
                         id,
                         parent_id,
                         provider_ids_json,
+                        removed_at,
                     });
             }
         }
@@ -907,6 +914,7 @@ impl Database {
                         id: item_id.clone(),
                         parent_id: None,
                         provider_ids_json: None,
+                        removed_at: None,
                     },
                 );
                 provider_baselines.insert(item_id.clone(), file.provider_ids_json.clone());
@@ -1021,12 +1029,17 @@ impl Database {
                     source,
                 })?;
         }
-        let filesystem_entry_ids = source_rows
-            .iter()
-            .map(|(index, _, _)| files[*index].filesystem_entry_id.clone())
-            .collect::<Vec<_>>();
-        self.restore_media_items_for_filesystem_entries(&mut transaction, &filesystem_entry_ids)
+        if movie_cache.values().any(|item| item.removed_at.is_some()) {
+            let filesystem_entry_ids = source_rows
+                .iter()
+                .map(|(index, _, _)| files[*index].filesystem_entry_id.clone())
+                .collect::<Vec<_>>();
+            self.restore_media_items_for_filesystem_entries(
+                &mut transaction,
+                &filesystem_entry_ids,
+            )
             .await?;
+        }
         let strm_item_ids = source_rows
             .iter()
             .filter(|(index, _, _)| files[*index].source_kind == "STRM_URL")

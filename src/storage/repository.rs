@@ -1197,6 +1197,7 @@ struct PrefetchedMovieItem {
     id: String,
     parent_id: Option<String>,
     provider_ids_json: Option<String>,
+    removed_at: Option<i64>,
 }
 
 #[derive(Debug)]
