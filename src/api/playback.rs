@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::storage::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
+
 pub(super) async fn emby_playback_info(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -566,8 +568,18 @@ pub(super) async fn emby_sessions(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let user_id = user.id.to_string();
+    let active_within_seconds = match query.active_within_seconds {
+        Some(seconds) if (1..=MAX_PLAYBACK_SESSION_WINDOW_SECONDS).contains(&seconds) => {
+            Some(seconds)
+        }
+        Some(_) => return StatusCode::BAD_REQUEST.into_response(),
+        None => None,
+    };
     let sessions = match database
-        .list_playback_sessions((!user.is_admin).then_some(user_id.as_str()))
+        .list_playback_sessions(
+            (!user.is_admin).then_some(user_id.as_str()),
+            active_within_seconds,
+        )
         .await
     {
         Ok(sessions) => sessions,

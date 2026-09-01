@@ -282,7 +282,11 @@ impl Database {
     pub(crate) async fn list_playback_sessions(
         &self,
         user_id: Option<&str>,
+        active_within_seconds: Option<i64>,
     ) -> Result<Vec<StoredPlaybackSession>, StorageError> {
+        let active_within_seconds = active_within_seconds
+            .unwrap_or(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
+            .clamp(1, MAX_PLAYBACK_SESSION_WINDOW_SECONDS);
         let (query, bind) = if user_id.is_some() {
             (
                 "SELECT id, user_id, item_id, media_source_id, play_session_id,
@@ -315,7 +319,7 @@ impl Database {
         if let Some(user_id) = bind {
             statement = statement.bind(user_id);
         }
-        statement = statement.bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        statement = statement.bind(active_within_seconds);
         statement
             .fetch_all(&self.pool)
             .await

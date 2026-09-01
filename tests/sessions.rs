@@ -228,6 +228,32 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         Some(0)
     );
 
+    sqlx::query(
+        "UPDATE playback_sessions
+         SET last_event_at = unixepoch() - 120
+         WHERE play_session_id = ?",
+    )
+    .bind("session-1")
+    .execute(database.pool())
+    .await?;
+    let sessions_with_explicit_window = client
+        .get(format!("{base_url}/Sessions?ActiveWithinSeconds=300"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(
+        sessions_with_explicit_window.status(),
+        reqwest::StatusCode::OK
+    );
+    assert_eq!(
+        sessions_with_explicit_window
+            .json::<Value>()
+            .await?
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
     let stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
         .header("X-Emby-Token", &token)

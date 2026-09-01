@@ -360,12 +360,17 @@ Lux 匹配；重叠结果按 Emby 条目 ID 去重。该优化不改变 `ITEM_ST
 | 用户资料/权限 | 已实现，真实版本待验证 | 用户名、显示名、启用状态、远程访问、内容下载和按 Emby 虚拟媒体库 ID/名称/路径映射的媒体库访问权限；Emby 管理员不会自动成为 Lux 管理员 |
 | 密码迁移 | 已实现，真实版本待验证 | 不读取密码哈希；首次 Lux 登录时向 Emby 验证一次原密码 |
 
-Emby 用户写接口已按当前官方 OpenAPI 记录并实现：`POST /Users/{Id}` 接收 `UserDto` 的 JSON/XML（当前只写入 Lux 支持的 `Name`），
-`POST /Users/{Id}/Policy` 接收 `UserPolicy` 的 JSON/XML（只映射管理员、禁用、远程访问和内容下载权限），
-`POST /Users/{Id}/Password` 接收 `UpdateUserPassword` 的 JSON/XML（使用 `NewPw`），成功均返回 `200` 空响应。
+Emby 用户管理接口已按当前官方 OpenAPI 的 `UserDto`、`UserPolicy`、`CreateUserByName`、`UpdateUserPassword`
+形态实现：`POST /Users/New` 接受 `Name` 创建无密码用户并返回 `200 UserDto`；同时兼容 NextEmby 实际发送的
+`CopyFromUserId` 和 `UserCopyOptions`，可真实复制模板的策略、用户配置、媒体库权限和媒体库顺序。`POST /Users/{Id}`
+会持久化 `Name`、`Configuration` 和支持的策略字段；`POST /Users/{Id}/Policy` 映射管理员、禁用、远程访问和内容下载权限；
+`POST /Users/{Id}/Password` 使用 `NewPw` 更新密码并使 `HasPassword`/`HasConfiguredPassword` 变为 true，成功均返回
+`200` 空响应。`DELETE /Users/{Id}` 成功返回 `200` 空响应，删除会级联撤销该用户的 Emby token 和设置；删除最后一个活动服务器管理员返回
+`409 Conflict`。用户 DTO 的 `HasPassword`、登录时间、活动时间和 `Configuration` 不再是固定假值，而是从持久化用户/令牌状态读取。
 用户头像实现 `GET/HEAD/POST/DELETE /Users/{Id}/Images/{Type}` 及带 `Index` 的路径；读取无需认证，写入/删除需要认证，上传请求体为
 `application/octet-stream` 二进制流，并只实现 `Primary` 类型。当前未以真实 Emby 客户端或受控 Emby 实例验证这些写接口。
-官方来源：https://swagger.emby.media/openapi.json 。
+`GET /Sessions` 保留无参数时的 90 秒活动窗口，并兼容 NextEmby 使用的 `ActiveWithinSeconds` 扩展参数；显式值按 1 秒至 30 天校验后在数据库查询层过滤，
+非法值返回 `400 Bad Request`。官方来源：https://swagger.emby.media/openapi.json 。
 
 Emby 官方源码中的 `SqliteUserDataRepository` 只持久化 `played`、`playCount`、`isFavorite`、
 `playbackPositionTicks` 和 `lastPlayedDate` 等条目聚合状态，没有公开事件流字段；官方 Session API

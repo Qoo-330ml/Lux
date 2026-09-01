@@ -1,5 +1,6 @@
 mod repository;
 
+pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 pub use repository::{Database, PersonListOptions, PersonSort, StorageError};
 
 #[allow(unused_imports)]

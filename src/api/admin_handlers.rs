@@ -4645,7 +4645,7 @@ pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppS
         Ok(stats) => stats,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let sessions = match database.list_playback_sessions(None).await {
+    let sessions = match database.list_playback_sessions(None, None).await {
         Ok(sessions) => sessions,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };

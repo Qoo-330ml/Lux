@@ -1,0 +1,8 @@
+ALTER TABLE users
+    ADD COLUMN has_password BOOLEAN NOT NULL DEFAULT TRUE;
+
+CREATE TABLE user_emby_configuration (
+    user_id TEXT PRIMARY KEY NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    configuration_json TEXT NOT NULL,
+    updated_at BIGINT NOT NULL DEFAULT (EXTRACT(EPOCH FROM NOW())::BIGINT)
+);

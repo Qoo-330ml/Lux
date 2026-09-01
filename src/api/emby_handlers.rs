@@ -1263,6 +1263,8 @@ pub(super) struct EmbyTokenQuery {
     pub(super) tag: Option<String>,
     #[serde(rename = "Fields", default)]
     pub(super) fields: Option<String>,
+    #[serde(rename = "ActiveWithinSeconds", alias = "activeWithinSeconds", default)]
+    pub(super) active_within_seconds: Option<i64>,
 }
 
 #[derive(Deserialize, Default)]
@@ -1440,6 +1442,7 @@ pub(super) async fn require_emby_user(
         api_key: api_key.map(str::to_owned),
         tag: None,
         fields: None,
+        active_within_seconds: None,
     };
     require_emby_user_with_query(headers, state, &query).await
 }
