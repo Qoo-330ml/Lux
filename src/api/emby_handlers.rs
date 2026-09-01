@@ -468,6 +468,14 @@ pub(super) async fn emby_delete_user(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if let Some(avatars) = state.user_avatars.as_ref() {
+        let Ok(target_user_id) = user_id.parse::<UserId>() else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        if avatars.remove(target_user_id).await.is_err() {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
     match users.delete_user(&user_id).await {
         Ok(true) => StatusCode::OK.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
