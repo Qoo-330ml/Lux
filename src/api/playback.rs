@@ -67,7 +67,15 @@ pub(super) async fn emby_playback_info(
                 let has_direct_stream_url = value
                     .get("DirectStreamUrl")
                     .is_some_and(Value::is_string);
-                if has_direct_stream_url && source.source_kind == "STRM_URL" {
+                let preserves_raw_strm_target = has_direct_stream_url
+                    && source.source_kind == "STRM_URL"
+                    && source.external_url.as_deref().is_some_and(|target| {
+                        matches!(
+                            classify_strm_target(target).kind,
+                            StrmTargetKind::Url | StrmTargetKind::Path
+                        )
+                    });
+                if preserves_raw_strm_target {
                     // Keep the original CMS/302 URL so downstream proxies can
                     // extract the pickcode and filename from the STRM source.
                     if let Value::Object(object) = &mut value {
