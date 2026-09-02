@@ -854,6 +854,7 @@ export class LuxApiClient {
     scraperId?: string | null;
     scrapers?: Array<{ scraperId: string; role: string }>;
     chapterSourceId?: string | null;
+    realtimeWatchEnabled?: boolean;
     realtimeMetadataAutoMatchEnabled?: boolean;
   }) {
     return this.request<{ library: AdminLibrary }>("/api/v1/admin/libraries", {

@@ -350,6 +350,7 @@ impl Database {
              FROM library_roots lr
              JOIN libraries l ON l.id = lr.library_id
              WHERE l.is_enabled = 1
+               AND l.realtime_watch_enabled = 1
              ORDER BY lr.canonical_path, lr.id",
         )
         .fetch_all(&self.pool)
