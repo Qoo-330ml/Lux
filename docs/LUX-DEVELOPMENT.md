@@ -5486,11 +5486,11 @@ Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访
 
 验收：
 
-- [ ] URL 与路径型 `.strm` 的 Emby `MediaSources[].Path` 均保留原始目标，且代理交接所需的 `Protocol`、`IsRemote`、
+- [x] URL 与路径型 `.strm` 的 Emby `MediaSources[].Path` 均保留原始目标，且代理交接所需的 `Protocol`、`IsRemote`、
       标准 `DirectStreamUrl` 和权限行为一致。
-- [ ] URL 与路径型 `.strm` 的 Lux Web Direct Play 计划均提供标准 `proxyUrl`；播放器继续在代理失败时回退到签名 Lux URL。
-- [ ] Lux 直连 URL 型 `.strm` 仍按播放器 User-Agent 返回有限 307；直连路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。
-- [ ] 扫描、`PlaybackInfo` 和外部代理交接测试不访问原始目标；不新增数据库字段、迁移、媒体字节代理、转码或具体代理适配。
+- [x] URL 与路径型 `.strm` 的 Lux Web Direct Play 计划均提供标准 `proxyUrl`；播放器继续在代理失败时回退到签名 Lux URL。
+- [x] Lux 直连 URL 型 `.strm` 仍按播放器 User-Agent 返回有限 307；直连路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。
+- [x] 扫描、`PlaybackInfo` 和外部代理交接测试不访问原始目标；不新增数据库字段、迁移、媒体字节代理、转码或具体代理适配。
 
 验证：
 
