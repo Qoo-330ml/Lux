@@ -265,6 +265,7 @@ describe("AdminLibrariesPage library cards", () => {
       name: "电影库",
       kind: "MOVIE",
       scraperId: null,
+      realtimeWatchEnabled: true,
       realtimeMetadataAutoMatchEnabled: true,
     });
     expect(createLibrary.mock.invocationCallOrder[0]).toBeLessThan(addRoot.mock.invocationCallOrder[0]);
@@ -552,7 +553,7 @@ describe("AdminLibrariesPage library cards", () => {
     });
   });
 
-  it("updates the realtime metadata auto-match switch", async () => {
+  it("updates the realtime watcher and metadata auto-match switches independently", async () => {
     const updateLibrary = vi.spyOn(api, "updateAdminLibrary").mockResolvedValue({ library });
     await renderPage();
 
@@ -563,6 +564,12 @@ describe("AdminLibrariesPage library cards", () => {
       [...container.querySelectorAll<HTMLButtonElement>("[role='menu'] button")]
         .find((button) => button.textContent?.includes("编辑"))
         ?.click();
+    });
+    const watchToggle = container.querySelector<HTMLInputElement>("[aria-label='01每日更新 启用实时文件监控']");
+    expect(watchToggle?.checked).toBe(true);
+    await act(async () => {
+      watchToggle?.click();
+      await vi.waitFor(() => expect(updateLibrary).toHaveBeenCalledWith("library-1", { realtimeWatchEnabled: false }));
     });
     const toggle = container.querySelector<HTMLInputElement>("[aria-label='01每日更新 实时新增资源自动刮削']");
     expect(toggle?.checked).toBe(false);

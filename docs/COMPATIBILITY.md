@@ -395,7 +395,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 
 当前只提供 Webhook 渠道；Telegram、企业微信和 Email 尚未实现。
 
-- 媒体库实时监听默认开启。复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引；全量调和遇到待处理的局部任务会在当前批次提交后让出唯一扫描锁，优先完成局部索引；旧版 `realtimeWatchEnabled` 请求字段不会关闭监听。
+- 媒体库实时监听默认开启，也可通过 `realtimeWatchEnabled` 关闭。关闭后不会为该库根路径创建实时 watcher，但手动扫描、调和和外部刷新仍可用；开启时复制到已配置根路径中的新视频会进入局部 `INCREMENTAL_SCAN`，只处理该事件路径，通常在几秒内进入索引。
 - LUX-000 至 LUX-003：仅完成仓库工程检查，尚未连接任何真实客户端。
 - LUX-023：已完成根路径/`/emby` 前缀的 System/Ping 本地协议 shape 测试；`GET/POST /System/Ping` 按 Emby OpenAPI 兼容为无需认证的空 200，并完成 VidHub/SenPlayer 真实登录前置探针。
 - 2026-08-23 Infuse 8.5.5726（macOS arm64）连接探针发现：登录成功后请求 `/DisplayPreferences/usersettings?userId=:userId&client=:client`，此前因路由缺失落入 Web 首页 HTML，导致 JSON 解码失败；现已补齐带认证的 `GET /DisplayPreferences/{displayPreferencesId}`，根路径和 `/emby` 前缀均有自动协议回归。完整 Infuse 媒体库、播放和状态流程仍待部署后复测。
