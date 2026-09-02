@@ -244,8 +244,9 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .await?;
     assert_eq!(playback.status(), reqwest::StatusCode::OK);
     let body = playback.json::<Value>().await?;
-    assert_eq!(body["MediaSources"][0]["Protocol"], "Http");
-    assert_eq!(body["MediaSources"][0]["IsRemote"], true);
+    assert_eq!(body["MediaSources"][0]["Protocol"], "File");
+    assert_eq!(body["MediaSources"][0]["IsRemote"], false);
+    assert_eq!(body["MediaSources"][0]["Path"], remote_target);
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
     let remote_direct_url = body["MediaSources"][0]["DirectStreamUrl"]

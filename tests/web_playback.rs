@@ -279,7 +279,10 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     assert_eq!(strm_direct_create.status(), reqwest::StatusCode::OK);
     let strm_direct_body = strm_direct_create.json::<Value>().await?;
     assert_eq!(strm_direct_body["plan"]["type"], "DIRECT");
-    assert!(strm_direct_body["plan"]["proxyUrl"].is_null());
+    assert_eq!(
+        strm_direct_body["plan"]["proxyUrl"],
+        format!("/Videos/{strm_item_id}/stream?MediaSourceId={strm_source_id}")
+    );
     assert!(strm_direct_body["sessionId"].is_string());
     let strm_direct_session_id = strm_direct_body["sessionId"]
         .as_str()
