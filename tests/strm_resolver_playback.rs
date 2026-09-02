@@ -1,6 +1,6 @@
 #[cfg(unix)]
 #[tokio::test]
-async fn smb_strm_playback_uses_a_protocol_resolver_plugin()
+async fn smb_and_ftp_strm_playback_use_a_protocol_resolver_plugin()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};
 
@@ -70,8 +70,13 @@ fi
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(
-        root.join("Path.Movie.2026.strm"),
+        root.join("Smb.Movie.2026.strm"),
         "smb://nas/media/movie.mp4\n",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Ftp.Movie.2027.strm"),
+        "ftp://nas/media/movie.mp4\n",
     )
     .await?;
     LibraryService::new(database.clone())
@@ -81,21 +86,19 @@ fi
         .scan_movie_library(library.id)
         .await?;
 
-    let item_id: String =
-        sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Path Movie'")
-            .fetch_one(database.pool())
-            .await?;
-    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
-        .bind(&item_id)
-        .fetch_one(database.pool())
-        .await?;
     PluginService::new(database.clone(), config_dir)
         .install("org.lux.test-strm-resolver")
         .await?;
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -114,45 +117,60 @@ fi
         .ok_or("missing token")?
         .to_owned();
 
-    let playback = client
-        .get(format!("http://{address}/Items/{item_id}/PlaybackInfo"))
-        .query(&[("api_key", token.as_str())])
-        .send()
-        .await?;
-    assert_eq!(playback.status(), reqwest::StatusCode::OK);
-    let playback_body = playback.json::<Value>().await?;
-    let direct_url = playback_body["MediaSources"][0]["DirectStreamUrl"]
-        .as_str()
-        .ok_or("missing signed direct stream URL")?;
-    assert!(direct_url.starts_with(&format!(
-        "/Videos/{item_id}/stream?MediaSourceId={source_id}&luxPlayback"
-    )));
-    assert!(!direct_url.contains(&token));
-    assert_eq!(
-        playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
-        false
-    );
-    assert_eq!(playback_body["MediaSources"][0]["Protocol"], "Http");
-    assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
-    assert_eq!(
-        playback_body["MediaSources"][0]["SupportsDirectStream"],
-        true
-    );
-
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let stream = no_redirect_client
-        .get(format!("http://{address}{direct_url}"))
-        .header(reqwest::header::USER_AGENT, "Hills/1.8.0 (android; 17)")
-        .send()
-        .await?;
-    assert_eq!(stream.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-    assert_eq!(
-        stream.headers()[reqwest::header::LOCATION],
-        "https://media.example.test/resolved.mkv"
-    );
-    assert!(stream.bytes().await?.is_empty());
+    for (title, target) in [
+        ("Smb Movie", "smb://nas/media/movie.mp4"),
+        ("Ftp Movie", "ftp://nas/media/movie.mp4"),
+    ] {
+        let item_id: String = sqlx::query_scalar("SELECT id FROM media_items WHERE title = ?")
+            .bind(title)
+            .fetch_one(database.pool())
+            .await?;
+        let source_id: String =
+            sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        let playback = client
+            .get(format!("http://{address}/Items/{item_id}/PlaybackInfo"))
+            .query(&[("api_key", token.as_str())])
+            .send()
+            .await?;
+        assert_eq!(playback.status(), reqwest::StatusCode::OK);
+        let playback_body = playback.json::<Value>().await?;
+        let direct_url = playback_body["MediaSources"][0]["DirectStreamUrl"]
+            .as_str()
+            .ok_or("missing signed direct stream URL")?;
+        assert!(direct_url.starts_with(&format!(
+            "/Videos/{item_id}/stream?MediaSourceId={source_id}&luxPlayback"
+        )));
+        assert_ne!(direct_url, target);
+        assert_eq!(
+            playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
+            false
+        );
+        assert_eq!(playback_body["MediaSources"][0]["Protocol"], "Http");
+        assert_eq!(playback_body["MediaSources"][0]["IsRemote"], true);
+        assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
+        assert_eq!(
+            playback_body["MediaSources"][0]["SupportsDirectStream"],
+            true
+        );
+
+        let stream = no_redirect_client
+            .get(format!("http://{address}{direct_url}"))
+            .header(reqwest::header::USER_AGENT, "Hills/1.8.0 (android; 17)")
+            .send()
+            .await?;
+        assert_eq!(stream.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            stream.headers()[reqwest::header::LOCATION],
+            "https://media.example.test/resolved.mkv"
+        );
+        assert!(stream.bytes().await?.is_empty());
+    }
 
     server.abort();
     Ok(())
