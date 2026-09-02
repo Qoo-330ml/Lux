@@ -2,7 +2,10 @@ use std::{path::PathBuf, time::Duration};
 
 use luxd::application::watch::{ChangeKind, EventCoalescer, FileChange, LibraryWatcher};
 use luxd::{
-    application::{libraries::LibraryService, watch::LibraryWatchService},
+    application::{
+        libraries::{LibraryService, LibrarySettingsPatch},
+        watch::LibraryWatchService,
+    },
     config::Config,
     library::LibraryKind,
     storage::Database,
@@ -105,7 +108,7 @@ async fn realtime_service_indexes_the_file_that_changed() -> Result<(), Box<dyn 
     let database = Database::connect(&config).await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
-        .create_library("Movies", LibraryKind::Movie, false)
+        .create_library("Movies", LibraryKind::Movie, true)
         .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
@@ -142,7 +145,7 @@ async fn realtime_service_indexes_the_file_that_changed() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
-async fn realtime_service_refreshes_roots_after_library_changes()
+async fn realtime_service_applies_watch_setting_changes_without_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -156,22 +159,39 @@ async fn realtime_service_refreshes_roots_after_library_changes()
         .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
 
     let watch_task = LibraryWatchService::new(database.clone())
         .with_library_change_notifications(libraries.change_notifier())
         .spawn();
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::fs::write(root.join("Ignored.Movie.2023.mkv"), b"ignored").await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let ignored_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(ignored_count, 0);
+
     libraries
-        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                realtime_watch_enabled: Some(true),
+                ..Default::default()
+            },
+        )
         .await?;
     tokio::time::sleep(Duration::from_millis(500)).await;
     tokio::fs::write(root.join("New.Movie.2024.mkv"), b"new").await?;
 
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
-                .fetch_one(database.pool())
-                .await?;
+            let count: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE title = 'New Movie'")
+                    .fetch_one(database.pool())
+                    .await?;
             if count == 1 {
                 break Ok::<(), sqlx::Error>(());
             }
@@ -179,6 +199,23 @@ async fn realtime_service_refreshes_roots_after_library_changes()
         }
     })
     .await??;
+
+    libraries
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                realtime_watch_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .await?;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::fs::write(root.join("Ignored.Again.2025.mkv"), b"ignored").await?;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let disabled_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM media_items")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(disabled_count, 1);
 
     watch_task.abort();
     let _ = watch_task.await;
