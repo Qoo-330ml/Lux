@@ -26,14 +26,17 @@ pub fn parse_media_name(input: &str, kind: MediaKind) -> Option<ParsedMediaName>
         return None;
     }
     let (stem_without_provider_ids, provider_ids) = strip_provider_id_tags(stem);
-    let normalized = normalize_separators(&stem_without_provider_ids);
+    let (stem_without_source_variant, source_variant) =
+        strip_source_variant_suffix(&stem_without_provider_ids);
+    let normalized = normalize_separators(&stem_without_source_variant);
     let words = normalized.split_whitespace().collect::<Vec<_>>();
     if words.is_empty() {
         return None;
     }
     let production_year = words.iter().find_map(|word| parse_year(word));
     let (season, episode) = extract_sequence(&normalized);
-    let edition_name = parse_edition_name(&words);
+    let has_source_variant = source_variant.is_some();
+    let edition_name = source_variant.or_else(|| parse_edition_name(&words));
     let quality_label = parse_quality_label(&words);
     let title_input = if matches!(kind, MediaKind::Movie) {
         production_year
@@ -52,7 +55,7 @@ pub fn parse_media_name(input: &str, kind: MediaKind) -> Option<ParsedMediaName>
     if title.is_empty() {
         return None;
     }
-    if matches!(kind, MediaKind::Movie) {
+    if matches!(kind, MediaKind::Movie) && !has_source_variant {
         if let Some(edition) = edition_name.as_deref() {
             title = format!("{title} ({edition})");
         }
@@ -140,8 +143,22 @@ pub fn has_multi_part_marker(input: &str) -> bool {
         .any(is_multi_part_marker)
 }
 
+pub fn has_source_variant_marker(input: &str) -> bool {
+    let Some(stem) = Path::new(input)
+        .file_stem()
+        .and_then(|value| value.to_str())
+    else {
+        return false;
+    };
+    let (stem_without_provider_ids, _) = strip_provider_id_tags(stem);
+    strip_source_variant_suffix(&stem_without_provider_ids)
+        .1
+        .is_some()
+}
+
 pub fn clean_title(value: &str) -> String {
-    let normalized = normalize_separators(value);
+    let (value_without_source_variant, _) = strip_source_variant_suffix(value);
+    let normalized = normalize_separators(&value_without_source_variant);
     let production_year = normalized.split_whitespace().find_map(parse_year);
     let (season, episode) = extract_sequence(&normalized);
     clean_title_with_metadata(&normalized, production_year, season, episode)
@@ -225,6 +242,28 @@ fn normalize_separators(value: &str) -> String {
         index += 1;
     }
     result
+}
+
+fn strip_source_variant_suffix(value: &str) -> (String, Option<String>) {
+    let characters = value.chars().collect::<Vec<_>>();
+    let boundary = (0..characters.len().saturating_sub(1)).rev().find(|index| {
+        is_group_closing_delimiter(characters[*index]) && characters[*index + 1] == '-'
+    });
+    let Some(boundary) = boundary else {
+        return (value.to_owned(), None);
+    };
+    let suffix = characters[boundary + 2..].iter().collect::<String>();
+    let normalized_suffix = normalize_separators(&suffix);
+    let suffix_words = normalized_suffix.split_whitespace().collect::<Vec<_>>();
+    if suffix_words.is_empty() || suffix_words.iter().all(|word| is_technical_word(word)) {
+        return (value.to_owned(), None);
+    }
+    let title = characters[..=boundary].iter().collect::<String>();
+    (title, Some(suffix_words.join(" ")))
+}
+
+fn is_group_closing_delimiter(value: char) -> bool {
+    matches!(value, ')' | ']' | '}' | '）' | '】')
 }
 
 fn parse_year(word: &str) -> Option<i32> {

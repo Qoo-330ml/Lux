@@ -238,6 +238,148 @@ async fn scanner_recurses_through_nested_movie_directories()
 }
 
 #[tokio::test]
+async fn movie_scan_groups_chinese_source_variants_into_one_item()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("ABF-301 (118abf301)-有码-C.mp4"), b"watermarked").await?;
+    tokio::fs::write(root.join("ABF-301 (118abf301)-破解-C.mp4"), b"cracked").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    let report = LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    assert_eq!(report.created_items, 1);
+    assert_eq!(report.created_sources, 2);
+
+    let item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item_count, 1);
+
+    let editions: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT ms.edition_name
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         ORDER BY fe.relative_path",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        editions,
+        vec![Some("有码 C".to_owned()), Some("破解 C".to_owned())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn movie_rescan_repairs_chinese_source_variants_split_by_an_older_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("ABF-301 (118abf301)-有码-C.mp4"), b"watermarked").await?;
+    tokio::fs::write(root.join("ABF-301 (118abf301)-破解-C.mp4"), b"cracked").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_movie_library(library.id).await?;
+
+    let original_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let cracked_source_id: String = sqlx::query_scalar(
+        "SELECT ms.id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path LIKE '%破解%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items
+         SET title = 'ABF 301 118abf301 有码 C', sort_title = 'abf 301 118abf301 有码 c'
+         WHERE id = ?",
+    )
+    .bind(&original_item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, original_title,
+             identification_status
+         ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'LOCAL_CONFIRMED')",
+    )
+    .bind("legacy-cracked-version")
+    .bind(library.id.to_string())
+    .bind("ABF 301 118abf301 破解 C")
+    .bind("abf 301 118abf301 破解 c")
+    .bind("ABF 301 118abf301 破解 C")
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_sources SET item_id = ? WHERE id = ?")
+        .bind("legacy-cracked-version")
+        .bind(&cracked_source_id)
+        .execute(database.pool())
+        .await?;
+
+    scanner.scan_movie_library(library.id).await?;
+
+    let active_item_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(active_item_count, 1);
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources
+         WHERE item_id = (
+             SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+         )",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
 async fn scanner_aggregates_quality_sources_but_keeps_cuts_separate()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

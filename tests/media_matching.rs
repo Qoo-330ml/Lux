@@ -65,6 +65,30 @@ fn removes_cd_part_marker_from_movie_title() {
 }
 
 #[test]
+fn parses_chinese_source_variants_as_one_movie_title() {
+    let with_watermark =
+        parse_media_name("ABF-301 (118abf301)-有码-C.mp4", MediaKind::Movie).expect("movie name");
+    let cracked =
+        parse_media_name("ABF-301 (118abf301)-破解-C.mp4", MediaKind::Movie).expect("movie name");
+
+    assert_eq!(with_watermark.title, "ABF 301 118abf301");
+    assert_eq!(with_watermark.title, cracked.title);
+    assert_eq!(with_watermark.sort_title, cracked.sort_title);
+    assert_eq!(with_watermark.edition_name.as_deref(), Some("有码 C"));
+    assert_eq!(cracked.edition_name.as_deref(), Some("破解 C"));
+}
+
+#[test]
+fn parses_unlisted_parenthesized_suffix_as_a_source_variant() {
+    let parsed =
+        parse_media_name("A Film (2024)-Alternative-C.mp4", MediaKind::Movie).expect("movie name");
+
+    assert_eq!(parsed.title, "A Film");
+    assert_eq!(parsed.production_year, Some(2024));
+    assert_eq!(parsed.edition_name.as_deref(), Some("Alternative C"));
+}
+
+#[test]
 fn parses_emby_tmdb_id_tags_without_polluting_movie_title() {
     for (tag, expected_id) in [
         ("[tmdbid=36557]", "36557"),

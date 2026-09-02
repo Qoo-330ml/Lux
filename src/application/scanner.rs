@@ -26,7 +26,10 @@ use crate::{
         admin_events::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope},
         home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
-        media_matching::{MediaKind, clean_title, has_multi_part_marker, parse_media_name},
+        media_matching::{
+            MediaKind, clean_title, has_multi_part_marker, has_source_variant_marker,
+            parse_media_name,
+        },
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
@@ -1482,8 +1485,8 @@ impl LibraryScanner {
         if existing_entry.parent_identity_key.as_deref() != expected_parent_identity.as_deref() {
             return Ok(None);
         }
-        // CD-part entries need the regular path to preserve the legacy merge repair.
-        if has_multi_part_marker(file_name) {
+        // CD-part and version-marker entries need the regular path to refresh their identity.
+        if has_multi_part_marker(file_name) || has_source_variant_marker(file_name) {
             return Ok(None);
         }
         Ok(Some((
@@ -2253,6 +2256,7 @@ impl LibraryScanner {
                 .await?;
         }
         if !has_multi_part_marker(file_name)
+            && !has_source_variant_marker(file_name)
             && let Some(existing_entry) = existing_entry.as_ref()
         {
             if existing_entry.fingerprint.as_deref() == Some(fingerprint.as_slice()) {
