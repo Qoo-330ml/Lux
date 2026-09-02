@@ -82,7 +82,7 @@ use crate::{
         people::{PeopleError, PeopleService, PersonMetadataUpdate},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
-        scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
+        scanner::{ScanJob, ScanJobError, ScanJobService},
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::{ScraperProvider, ScraperResolver},
@@ -486,57 +486,11 @@ impl AppState {
         self
     }
 
-    pub async fn resume_metadata_reidentify_jobs(&self) {
-        let Some(service) = self.metadata_reidentify.clone() else {
-            return;
-        };
-        let Ok(job_ids) = service.active_job_ids().await else {
-            tracing::error!("failed to discover active metadata reidentify jobs during startup");
-            return;
-        };
-        for job_id in job_ids {
-            let worker = service.clone();
-            tokio::spawn(async move {
-                worker.run(&job_id).await;
-            });
-        }
-    }
-
     pub async fn rebuild_people_index(&self) {
         let Some(service) = self.people.clone() else {
             return;
         };
         service.schedule_person_index_rebuild();
-    }
-
-    pub async fn resume_scan_jobs(&self) {
-        let Some(service) = self.scan_jobs.clone() else {
-            return;
-        };
-        let Ok(job_ids) = service.active_job_ids().await else {
-            tracing::error!("failed to discover active scan jobs during startup");
-            return;
-        };
-        for job_id in job_ids {
-            let worker = service.clone();
-            let worker_probe = self.probe.clone();
-            let worker_metadata = self.metadata_reidentify.clone();
-            let worker_thumbnails = self.thumbnails.clone();
-            tokio::spawn(async move {
-                if let Err(error) = worker
-                    .run_to_completion_with_metadata_and_thumbnails(
-                        &job_id,
-                        BACKGROUND_SCAN_BATCH_SIZE,
-                        worker_probe,
-                        worker_metadata,
-                        worker_thumbnails,
-                    )
-                    .await
-                {
-                    tracing::error!(job_id = %job_id, %error, "resumed scan job stopped");
-                }
-            });
-        }
     }
 
     pub async fn start_realtime_watchers(&self) {
@@ -558,72 +512,6 @@ impl AppState {
             None => watch_service,
         };
         watch_service.spawn();
-    }
-
-    pub async fn resume_strm_probe_jobs(&self) {
-        let Some(service) = self.strm_probe.clone() else {
-            return;
-        };
-        let Ok(job_ids) = service.active_job_ids().await else {
-            tracing::error!("failed to discover active STRM probe jobs during startup");
-            return;
-        };
-        for job_id in job_ids {
-            let worker = service.clone();
-            tokio::spawn(async move {
-                if let Err(error) = worker.run(&job_id).await {
-                    tracing::error!(job_id = %job_id, %error, "resumed STRM probe job stopped");
-                }
-            });
-        }
-    }
-
-    pub async fn resume_chapter_detection_jobs(&self) {
-        let Some(service) = self.chapter_detection.clone() else {
-            return;
-        };
-        let Ok(job_ids) = service.active_job_ids().await else {
-            tracing::error!("failed to discover active chapter detection jobs during startup");
-            return;
-        };
-        for job_id in job_ids {
-            let worker = service.clone();
-            tokio::spawn(async move {
-                if let Err(error) = worker.run(&job_id).await {
-                    tracing::error!(job_id = %job_id, %error, "resumed chapter detection job stopped");
-                }
-            });
-        }
-    }
-
-    pub async fn resume_library_cover_jobs(&self) {
-        let Some(service) = self.library_covers.clone() else {
-            return;
-        };
-        let Ok(job_ids) = service.active_job_ids().await else {
-            tracing::error!("failed to discover active library cover jobs during startup");
-            return;
-        };
-        for job_id in job_ids {
-            let worker = service.clone();
-            tokio::spawn(async move {
-                if let Err(error) = worker.run_job(&job_id).await {
-                    tracing::error!(job_id = %job_id, %error, "resumed library cover job stopped");
-                }
-            });
-        }
-        let reconciliation = service.clone();
-        tokio::spawn(async move {
-            match reconciliation.reconcile_auto_library_covers().await {
-                Ok(generated) if generated > 0 => {
-                    tracing::info!(generated, "reconciled automatic library covers at startup");
-                }
-                Ok(_) => {}
-                Err(error) => {
-                    tracing::error!(%error, "automatic library cover startup reconciliation failed");
-                }
-            }
-        });
     }
 
     pub async fn start_scheduled_tasks(&self) {
@@ -650,40 +538,6 @@ impl AppState {
     pub fn start_webhook_worker(&self) {
         if let Some(webhooks) = self.webhooks.as_ref() {
             webhooks.spawn_worker();
-        }
-    }
-
-    pub async fn resume_danmaku_match_jobs(&self) {
-        let Some(service) = self.danmaku.clone() else {
-            return;
-        };
-        let Ok(job_ids) = service.active_job_ids().await else {
-            tracing::error!("failed to discover active danmaku match jobs during startup");
-            return;
-        };
-        for job_id in job_ids {
-            let worker = service.clone();
-            tokio::spawn(async move {
-                if let Err(error) = worker.run(&job_id).await {
-                    tracing::error!(job_id = %job_id, %error, "resumed danmaku match job stopped");
-                }
-            });
-        }
-    }
-
-    pub async fn resume_emby_migration_jobs(&self) {
-        let Some(service) = self.emby_migration.clone() else {
-            return;
-        };
-        let Ok(jobs) = service.list_jobs(0, 100).await else {
-            tracing::error!("failed to discover active Emby migration jobs during startup");
-            return;
-        };
-        for job in jobs {
-            if !matches!(job.status.as_str(), "PENDING" | "RUNNING") {
-                continue;
-            }
-            service.clone().spawn(job.id);
         }
     }
 

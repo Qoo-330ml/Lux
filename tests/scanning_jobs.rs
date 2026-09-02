@@ -25,7 +25,8 @@ use luxd::{
 use tokio::sync::Semaphore;
 
 #[tokio::test]
-async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn std::error::Error>> {
+async fn scan_job_persists_batches_and_manual_rerun_can_continue()
+-> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -99,21 +100,21 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     assert_eq!(persisted.1, 1);
     assert!(persisted.2.is_some());
 
-    let restarted_jobs = ScanJobService::new(database.clone());
+    let next_worker = ScanJobService::new(database.clone());
     assert!(
-        restarted_jobs
+        next_worker
             .active_job_ids()
             .await?
             .iter()
             .any(|id| id == &job.id)
     );
-    let second_batch = restarted_jobs.run_batch(&job.id, 1).await?;
+    let second_batch = next_worker.run_batch(&job.id, 1).await?;
     assert_eq!(second_batch.status, "RUNNING");
     assert_eq!(second_batch.processed, 1);
-    let third_batch = restarted_jobs.run_batch(&job.id, 10).await?;
+    let third_batch = next_worker.run_batch(&job.id, 10).await?;
     assert_eq!(third_batch.status, "RUNNING");
     assert_eq!(third_batch.processed, 1);
-    let completed = restarted_jobs.run_batch(&job.id, 10).await?;
+    let completed = next_worker.run_batch(&job.id, 10).await?;
     assert_eq!(completed.status, "COMPLETED");
     assert!(completed.completed);
     let final_status: (String, i64, Option<String>, Option<i64>) = sqlx::query_as(
@@ -133,13 +134,13 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
             .await?;
     assert_eq!(completed_activity, (None, "POSTPROCESSING".to_owned()));
     assert!(
-        restarted_jobs
+        next_worker
             .active_job_ids()
             .await?
             .iter()
             .any(|id| id == &job.id)
     );
-    restarted_jobs.run_to_completion(&job.id, 10, None).await?;
+    next_worker.run_to_completion(&job.id, 10, None).await?;
     let final_status: (String, Option<i64>, String) =
         sqlx::query_as("SELECT status, finished_at, scan_phase FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
@@ -149,7 +150,7 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     assert!(final_status.1.is_some());
     assert_eq!(final_status.2, "IDLE");
     assert!(
-        !restarted_jobs
+        !next_worker
             .active_job_ids()
             .await?
             .iter()
@@ -174,9 +175,9 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     .await?;
     assert!(event_codes.is_empty());
 
-    let cancel_job = restarted_jobs.create_movie_scan_job(library.id).await?;
-    restarted_jobs.cancel(&cancel_job.id).await?;
-    let cancelled = restarted_jobs.run_batch(&cancel_job.id, 1).await?;
+    let cancel_job = next_worker.create_movie_scan_job(library.id).await?;
+    next_worker.cancel(&cancel_job.id).await?;
+    let cancelled = next_worker.run_batch(&cancel_job.id, 1).await?;
     assert_eq!(cancelled.status, "CANCELLED");
     assert!(cancelled.completed);
     let cancel_events: i64 = sqlx::query_scalar(
@@ -1364,7 +1365,7 @@ async fn reconciliation_hides_items_after_their_last_file_is_deleted()
 }
 
 #[tokio::test]
-async fn reconciliation_discovery_resumes_without_reading_completed_directories_again()
+async fn reconciliation_discovery_uses_persisted_snapshot_for_manual_retry()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1405,8 +1406,8 @@ async fn reconciliation_discovery_resumes_without_reading_completed_directories_
     tokio::fs::create_dir_all(&late_directory).await?;
     tokio::fs::write(late_directory.join("Gamma.Movie.2022.mkv"), b"late fixture").await?;
 
-    let restarted_jobs = ScanJobService::new(database.clone());
-    restarted_jobs.run_to_completion(&job.id, 1, None).await?;
+    let next_worker = ScanJobService::new(database.clone());
+    next_worker.run_to_completion(&job.id, 1, None).await?;
 
     let indexed_paths: Vec<String> =
         sqlx::query_scalar("SELECT relative_path FROM filesystem_entries ORDER BY relative_path")

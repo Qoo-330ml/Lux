@@ -1,4 +1,6 @@
 use super::*;
+use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CreateLibraryRequest {

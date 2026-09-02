@@ -6,7 +6,8 @@ use luxd::{
 };
 
 #[tokio::test]
-async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dyn std::error::Error>> {
+async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -103,9 +104,9 @@ async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dy
     .fetch_all(database.pool())
     .await?;
     assert_eq!(statuses.len(), 9);
-    assert!(statuses
-        .iter()
-        .all(|(status, error)| status == "CANCELLED" && error.as_deref() == Some("SERVER_SHUTDOWN")));
+    assert!(statuses.iter().all(
+        |(status, error)| status == "CANCELLED" && error.as_deref() == Some("SERVER_SHUTDOWN")
+    ));
 
     let active_count: i64 = sqlx::query_scalar(
         "SELECT SUM(count) FROM (
