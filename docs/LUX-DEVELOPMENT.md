@@ -5513,7 +5513,7 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 #### LUX-234：通用外部代理的 URL 型 `.strm` 交接
 
 范围：修正 URL 型 `.strm` 与本地路径型 `.strm` 在第三方媒体代理场景下的 Emby 播放源合同。两种目标都保留原始
-`MediaSources[].Path`，使用标准 `/Videos/{ItemId}/stream[.Container]?MediaSourceId=...` 播放入口，并使用
+条目 `Path` 和 `MediaSources[].Path`，使用标准 `/Videos/{ItemId}/stream[.Container]?MediaSourceId=...` 播放入口，并使用
 `Protocol=File`、`IsRemote=false` 的代理兼容表示，使任意具备自身映射或 302 能力的外部代理可以优先接管播放。
 Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访问 `.strm` 目标。
 
@@ -5523,7 +5523,7 @@ Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访
 
 验收：
 
-- [x] URL 与路径型 `.strm` 的 Emby `MediaSources[].Path` 均保留原始目标，且代理交接所需的 `Protocol`、`IsRemote`、
+- [x] URL 与路径型 `.strm` 的 Emby 条目 `Path` 和 `MediaSources[].Path` 均保留原始目标，且代理交接所需的 `Protocol`、`IsRemote`、
       标准 `DirectStreamUrl` 和权限行为一致。
 - [x] URL 与路径型 `.strm` 的 Lux Web Direct Play 计划均提供标准 `proxyUrl`；播放器继续在代理失败时回退到签名 Lux URL。
 - [x] Lux 直连 URL 型 `.strm` 仍按播放器 User-Agent 返回有限 307；直连路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。

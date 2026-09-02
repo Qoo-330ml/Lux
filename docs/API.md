@@ -212,11 +212,11 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL；返回所选单个媒体源，不打包 ZIP。`sourceId` 可选择源；本地源直接流式读取，`.strm` 读取首个非空远程 URL 并由 Lux 请求、流式转发该资源，不返回 `.strm` 文本。
 - `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流、DirectPlay 能力和服务端生成的 `PlaySessionId`；支持 `MediaSourceId` 显式选择，支持 DirectPlay/DirectStream，不声明转码。每个媒体源可带 `Edition`/`Quality` 版本标签。
 - 本地媒体源的 `MediaSources.Container` 使用实际文件扩展名（例如 `mkv`、`mp4`），不暴露 ffprobe 的复合 `format_name`。`DirectStreamUrl` 通过 `MediaSourceId` 定位源；`stream.{container}` 的后缀仅作兼容性后缀，服务端仍按媒体源记录读取文件。
-- `MediaSources.Path` 对 `.strm` 源返回旁车记录中的外部媒体地址；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
+- `.strm` 条目的 `Path` 和 `MediaSources.Path` 均返回旁车记录中的原始媒体目标，供外部 Emby 代理执行路径映射或 302 解析；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
 - `MediaStreams` 不返回 Matroska/MP4 中标记为 `attached_pic` 的封面附加图轨，避免客户端将封面误认为可播放视频轨。
 - `GET /Items/{collectionId}/Children`：返回按当前用户媒体库权限过滤的合集成员。
 
-`.strm` 媒体源在 PlaybackInfo 中以 `Protocol=Http`、`IsRemote=true` 返回；`Path` 保留原始上游地址，`DirectStreamUrl` 使用 Lux 的受保护 `/Videos/{itemId}/{mediaSourceId}/stream` 入口。播放器访问该入口时，Lux 只请求上游响应头并将播放器 User-Agent 转发给 302 服务，然后返回最终地址的 307；媒体字节仍由播放器直接从最终地址读取。PlaybackInfo 本身不访问上游。具有媒体库访问权限的客户端仍可能获得包含令牌的 Path，因此 URL 中的令牌仍按产品设计明文保存和返回。
+`.strm` 媒体源在 PlaybackInfo 中以 `Protocol=File`、`IsRemote=false` 返回；条目的 `Path` 和 `MediaSources.Path` 保留原始目标，标准 `DirectStreamUrl` 使用 `/Videos/{itemId}/stream[.Container]?MediaSourceId=...` 入口，外部 Emby 代理可以据此接管映射或 302 解析。播放器直接访问 Lux 入口时，URL 型 `.strm` 由 Lux 使用播放器 User-Agent 请求上游并有限返回 307，路径型 `.strm` 按本地文件规则处理；Lux 不代理媒体字节，PlaybackInfo 本身不访问上游。具有媒体库访问权限的客户端仍可能获得包含令牌的原始目标，因此 URL 中的令牌仍按产品设计明文保存和返回。
 
 - `GET /Sessions`：返回当前用户的活动播放会话；管理员可查看全部活动会话。每个会话按 Emby 兼容字段返回 `Client`、`DeviceName`、`DeviceId`、`DeviceType`、`ApplicationVersion` 和 `RemoteEndPoint`；无法获得的值为 `null`。
 - `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`：幂等记录播放事件，并将位置单调写入用户状态；事件体中的设备/客户端字段优先，缺失时从上述认证头回填。
