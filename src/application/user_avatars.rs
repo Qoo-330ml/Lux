@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     fmt,
     path::{Path, PathBuf},
 };
@@ -6,6 +7,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::ImageFormat;
 use tokio::{fs, fs::OpenOptions, io::AsyncWriteExt};
 use uuid::Uuid;
@@ -49,9 +51,10 @@ impl UserAvatarService {
                 max: MAX_USER_AVATAR_BYTES,
             });
         }
-        avatar_content_type(content_type, bytes)?;
+        let bytes = normalize_avatar_bytes(content_type, bytes)?;
+        avatar_content_type(content_type, &bytes)?;
         create_private_dir(&self.directory).await?;
-        write_atomically(&self.avatar_path(user_id), bytes).await
+        write_atomically(&self.avatar_path(user_id), &bytes).await
     }
 
     pub async fn load(&self, user_id: UserId) -> Result<Option<StoredUserAvatar>, UserAvatarError> {
@@ -95,11 +98,7 @@ impl UserAvatarService {
 }
 
 fn avatar_content_type(content_type: &str, bytes: &[u8]) -> Result<&'static str, UserAvatarError> {
-    let requested = content_type
-        .split(';')
-        .next()
-        .map(str::trim)
-        .unwrap_or_default();
+    let requested = requested_content_type(content_type);
     let detected = detected_content_type(bytes).ok_or(UserAvatarError::InvalidContent)?;
     if !matches!(
         requested,
@@ -111,6 +110,31 @@ fn avatar_content_type(content_type: &str, bytes: &[u8]) -> Result<&'static str,
         return Err(UserAvatarError::InvalidContent);
     }
     Ok(detected)
+}
+
+fn requested_content_type(content_type: &str) -> &str {
+    content_type
+        .split(';')
+        .next()
+        .map(str::trim)
+        .unwrap_or_default()
+}
+
+fn normalize_avatar_bytes<'a>(
+    content_type: &str,
+    bytes: &'a [u8],
+) -> Result<Cow<'a, [u8]>, UserAvatarError> {
+    let requested = requested_content_type(content_type);
+    if requested == "application/octet-stream" || detected_content_type(bytes).is_some() {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    if !matches!(requested, "image/jpeg" | "image/png" | "image/webp") {
+        return Ok(Cow::Borrowed(bytes));
+    }
+    let decoded = STANDARD
+        .decode(bytes)
+        .map_err(|_| UserAvatarError::InvalidContent)?;
+    Ok(Cow::Owned(decoded))
 }
 
 fn detected_content_type(bytes: &[u8]) -> Option<&'static str> {
@@ -238,6 +262,7 @@ impl std::error::Error for UserAvatarError {
 mod tests {
     use std::io::Cursor;
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use image::{DynamicImage, ImageFormat};
     use tempfile::tempdir;
 
@@ -263,6 +288,28 @@ mod tests {
             .store(user_id, "image/png", &bytes)
             .await
             .expect("valid avatar should be stored");
+
+        let avatar = service
+            .load(user_id)
+            .await
+            .expect("avatar should load")
+            .expect("stored avatar should exist");
+        assert_eq!(avatar.content_type, "image/png");
+        assert_eq!(avatar.bytes, bytes);
+    }
+
+    #[tokio::test]
+    async fn decodes_nextemby_base64_avatar_body_before_storing() {
+        let directory = tempdir().expect("temporary directory should be available");
+        let service = UserAvatarService::new(directory.path().to_owned());
+        let user_id = UserId::new();
+        let bytes = png_bytes();
+        let encoded = STANDARD.encode(&bytes);
+
+        service
+            .store(user_id, "image/png", encoded.as_bytes())
+            .await
+            .expect("base64 avatar should be stored");
 
         let avatar = service
             .load(user_id)

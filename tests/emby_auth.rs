@@ -1,3 +1,4 @@
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use image::{DynamicImage, ImageFormat};
 use luxd::{
     api::{AppState, app_with_state},
@@ -438,6 +439,19 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
         .await?;
     assert_eq!(avatar_upload.status(), reqwest::StatusCode::OK);
     assert!(avatar_upload.bytes().await?.is_empty());
+
+    let avatar_upload_as_base64 = client
+        .post(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .header(&admin_auth.0, &admin_auth.1)
+        .header("Content-Type", "image/png")
+        .body(STANDARD.encode(&avatar_bytes))
+        .send()
+        .await?;
+    assert_eq!(avatar_upload_as_base64.status(), reqwest::StatusCode::OK);
+    assert!(avatar_upload_as_base64.bytes().await?.is_empty());
 
     let avatar_read = client
         .get(format!(

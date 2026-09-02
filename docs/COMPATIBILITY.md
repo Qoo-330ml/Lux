@@ -367,8 +367,11 @@ Emby 用户管理接口已按当前官方 OpenAPI 的 `UserDto`、`UserPolicy`�
 `POST /Users/{Id}/Password` 使用 `NewPw` 更新密码并使 `HasPassword`/`HasConfiguredPassword` 变为 true，成功均返回
 `200` 空响应。`DELETE /Users/{Id}` 成功返回 `200` 空响应，删除会级联撤销该用户的 Emby token 和设置；删除最后一个活动服务器管理员返回
 `409 Conflict`。用户 DTO 的 `HasPassword`、登录时间、活动时间和 `Configuration` 不再是固定假值，而是从持久化用户/令牌状态读取。
-用户头像实现 `GET/HEAD/POST/DELETE /Users/{Id}/Images/{Type}` 及带 `Index` 的路径；读取无需认证，写入/删除需要认证，上传请求体为
-`application/octet-stream` 二进制流，并只实现 `Primary` 类型。当前未以真实 Emby 客户端或受控 Emby 实例验证这些写接口。
+用户头像实现 `GET/HEAD/POST/DELETE /Users/{Id}/Images/{Type}` 及带 `Index` 的路径；读取无需认证，写入/删除需要认证，且只实现
+`Primary` 类型。官方 Emby 的 `application/octet-stream` 二进制上传保持支持；实测 NextEmby v4.6.3 会发送
+`Content-Type: image/png`，但请求体是未带 Data URL 前缀的标准 Base64 PNG 文本。Lux 仅对声明为 JPEG、PNG 或 WebP
+的请求尝试解码该兼容形态，随后仍按解码后的实际图片签名和 5 MiB 上限校验，并保存为图片二进制。Policy、Password、用户删除和头像写入成功均返回
+`200` 空响应；其中 NextEmby v4.6.3 会把 Policy 的合法 `200` 空响应记录成客户端侧警告，但不影响策略写入。
 `GET /Sessions` 保留无参数时的 90 秒活动窗口，并兼容 NextEmby 使用的 `ActiveWithinSeconds` 扩展参数；显式值按 1 秒至 30 天校验后在数据库查询层过滤，
 非法值返回 `400 Bad Request`。官方来源：https://swagger.emby.media/openapi.json 。
 
