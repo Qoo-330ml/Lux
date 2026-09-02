@@ -4787,7 +4787,7 @@ impl ScanJobService {
                     self.run_metadata_after_incremental_scan(job_id).await?;
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
                         .await?;
-                    if completed_job.auto_metadata_match {
+                    let strm_probe_scheduled = if completed_job.auto_metadata_match {
                         if let Some(metadata) = metadata {
                             self.schedule_online_metadata_after_incremental_scan(job_id, metadata)
                                 .await;
@@ -4798,9 +4798,13 @@ impl ScanJobService {
                                 &completed_job.library_id,
                                 strm_probe,
                             )
-                            .await;
+                            .await
+                        } else {
+                            false
                         }
-                    }
+                    } else {
+                        false
+                    };
                     self.run_auto_library_cover_after_scan(job_id).await?;
                     if let Some(home) = &self.home {
                         home.invalidate();
@@ -4808,7 +4812,9 @@ impl ScanJobService {
                     }
                     self.publish_media_added_event(&completed_job, created_items)
                         .await;
-                    self.database.clear_scan_job_paths(job_id).await?;
+                    if !strm_probe_scheduled {
+                        self.database.clear_scan_job_paths(job_id).await?;
+                    }
                     return Ok(());
                 }
                 if let Err(error) = self.database.retry_failed_scan_job_targets(job_id).await {
@@ -5220,35 +5226,47 @@ impl ScanJobService {
         scan_job_id: &str,
         library_id: &str,
         strm_probe: StrmProbeService,
-    ) {
+    ) -> bool {
         let Ok(library_id) = library_id.parse::<LibraryId>() else {
             tracing::warn!(
                 scan_job_id,
                 library_id,
                 "incremental scan completed but automatic STRM probe skipped for invalid library ID"
             );
-            return;
+            return false;
         };
         let job = match strm_probe
             .create_configured_incremental_job(scan_job_id, library_id)
             .await
         {
             Ok(Some(job)) => job,
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(error) => {
                 tracing::warn!(
                     scan_job_id,
                     %error,
                     "incremental scan completed but automatic STRM probe could not be queued"
                 );
-                return;
+                return false;
             }
         };
         let job_id = job.id.clone();
         let worker = strm_probe;
+        let database = self.database.clone();
+        let scan_job_id_for_cleanup = scan_job_id.to_owned();
         tokio::spawn(async move {
             if let Err(error) = worker.run(&job_id).await {
                 tracing::error!(job_id = %job_id, %error, "automatic STRM probe stopped");
+            }
+            if let Err(error) = database
+                .clear_scan_job_paths(&scan_job_id_for_cleanup)
+                .await
+            {
+                tracing::warn!(
+                    scan_job_id = %scan_job_id_for_cleanup,
+                    %error,
+                    "automatic STRM probe finished but scan paths could not be cleared"
+                );
             }
         });
         self.record_event(
@@ -5262,6 +5280,7 @@ impl ScanJobService {
             ),
         )
         .await;
+        true
     }
 
     async fn run_metadata_after_scan(&self, job_id: &str) -> Result<(), ScanJobError> {

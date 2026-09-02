@@ -45,6 +45,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(None) => {}
         Err(error) => error!(%error, "one-time database lifecycle cleanup failed"),
     }
+    let cancelled_jobs = database.cancel_incomplete_jobs_for_shutdown().await?;
+    if cancelled_jobs > 0 {
+        info!(
+            cancelled_jobs,
+            "unfinished background jobs cancelled before startup"
+        );
+    }
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -60,15 +67,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         app_state = app_state.require_database_selection();
     }
     app_state.rebuild_people_index().await;
-    app_state.resume_scan_jobs().await;
     app_state.start_realtime_watchers().await;
-    app_state.resume_strm_probe_jobs().await;
-    app_state.resume_chapter_detection_jobs().await;
-    app_state.resume_library_cover_jobs().await;
     app_state.start_scheduled_tasks().await;
-    app_state.resume_danmaku_match_jobs().await;
-    app_state.resume_metadata_reidentify_jobs().await;
-    app_state.resume_emby_migration_jobs().await;
     app_state.start_webhook_worker();
     let app = app_with_state(app_state);
 
@@ -96,6 +96,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
+    match database.cancel_incomplete_jobs_for_shutdown().await {
+        Ok(cancelled_jobs) if cancelled_jobs > 0 => {
+            info!(
+                cancelled_jobs,
+                "unfinished background jobs cancelled before shutdown"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => error!(%error, "failed to cancel unfinished background jobs before shutdown"),
+    }
     database.close().await;
     Ok(())
 }
