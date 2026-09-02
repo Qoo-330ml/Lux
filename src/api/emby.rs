@@ -12,6 +12,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route("/Users/Public", get(emby_public_users))
         .route("/Users", get(emby_users))
+        .route("/Users/Query", get(emby_query_users))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/authenticatebyname", post(emby_authenticate))
         .route("/Users/New", post(emby_create_user))

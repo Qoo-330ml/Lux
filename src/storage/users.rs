@@ -231,6 +231,66 @@ impl Database {
         })
     }
 
+    pub(crate) async fn query_users(
+        &self,
+        is_disabled: Option<bool>,
+        name_starts_with_or_greater: Option<&str>,
+        descending: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredUser>, i64), StorageError> {
+        let mut conditions = Vec::new();
+        if is_disabled.is_some() {
+            conditions.push("is_disabled = ?");
+        }
+        if name_starts_with_or_greater.is_some() {
+            conditions.push("username_normalized >= ?");
+        }
+        let where_clause = if conditions.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", conditions.join(" AND "))
+        };
+        let direction = if descending { "DESC" } else { "ASC" };
+        let query = format!(
+            "SELECT id, username_normalized, display_name, password_hash,
+                    has_password,
+                    is_disabled, is_admin, can_manage_server,
+                    can_remote_access, can_download, last_login_at,
+                    COALESCE(
+                        (SELECT MAX(COALESCE(at.last_seen_at, at.created_at))
+                         FROM access_tokens at WHERE at.user_id = users.id),
+                        last_login_at
+                    ) AS last_activity_at,
+                    COUNT(*) OVER () AS total_count
+             FROM users{where_clause}
+             ORDER BY username_normalized {direction}, id {direction}
+             LIMIT ? OFFSET ?"
+        );
+        let mut query = self.query(sqlx::AssertSqlSafe(query));
+        if let Some(is_disabled) = is_disabled {
+            query = query.bind(database_flag(is_disabled));
+        }
+        if let Some(name_starts_with_or_greater) = name_starts_with_or_greater {
+            query = query.bind(name_starts_with_or_greater);
+        }
+        let rows = query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let total_count = rows
+            .first()
+            .map(|row| row.get::<i64, _>("total_count"))
+            .unwrap_or(0);
+        let users = rows.into_iter().map(stored_user).collect();
+        Ok((users, total_count))
+    }
+
     pub(crate) async fn find_user_by_id(
         &self,
         user_id: &str,

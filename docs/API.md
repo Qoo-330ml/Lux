@@ -131,6 +131,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 ## Emby 认证（LUX-024）
 
 - `GET /Users/Public`：返回未禁用用户的公开登录信息。
+- `GET /Users/Query`：管理员查询用户列表；支持 `StartIndex`、`Limit`、`IsDisabled`、`IsHidden`、`NameStartsWithOrGreater` 和 `SortOrder`，返回 Emby 的 `Items` 与 `TotalRecordCount`。
 - `POST /Users/AuthenticateByName`：读取 `Username`/`Pw`，解析 `Authorization`、`X-Emby-Authorization` 或 `X-Emby-Authentication` 中的 `Client`、`Device`、`DeviceId`、`Version`，返回 `AccessToken`、`ServerId`，以及包含 `ServerId`、`Configuration`、`Policy` 等兼容字段的 `User` 和 `SessionInfo`。
 - `POST /Sessions/Logout`：接受 `X-Emby-Token` 或 `api_key`，撤销对应 token，成功返回 204。
 - `System/Info`：需要有效的 `X-Emby-Token` 或 `api_key`；`System/Info/Public` 和 `System/Ping` 不要求认证。

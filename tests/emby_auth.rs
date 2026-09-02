@@ -7,7 +7,7 @@ use luxd::{
         admin_api_key::AdminApiKeyService,
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
-        users::UserStore,
+        users::{UserStore, UserUpdate},
     },
     config::Config,
     storage::Database,
@@ -114,6 +114,106 @@ async fn emby_users_requires_server_manager_and_supports_both_prefixes()
 
     let missing_key = client.get(format!("http://{address}/Users")).send().await?;
     assert_eq!(missing_key.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_users_query_returns_paginated_admin_user_result()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let users = UserStore::new(database.clone())?;
+    let viewer = users
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let disabled = users
+        .create_user("Disabled", "Disabled", "disabled password", false)
+        .await?;
+    users
+        .update_user(
+            &disabled.id.to_string(),
+            UserUpdate {
+                is_disabled: Some(true),
+                ..UserUpdate::default()
+            },
+        )
+        .await?;
+    let admin_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+
+    for path in ["/Users/Query", "/emby/Users/Query"] {
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .query(&[
+                ("StartIndex", "0"),
+                ("Limit", "1"),
+                ("IsDisabled", "false"),
+                ("api_key", admin_key.as_str()),
+            ])
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+        let body = response.json::<serde_json::Value>().await?;
+        assert_eq!(body["TotalRecordCount"], 2, "{path}");
+        let items = body["Items"].as_array().ok_or("missing Items")?;
+        assert_eq!(items.len(), 1, "{path}");
+        assert_eq!(items[0]["Id"], admin.id.to_string(), "{path}");
+        assert!(body["Items"].is_array(), "{path}");
+    }
+
+    let second_page = client
+        .get(format!("http://{address}/Users/Query"))
+        .query(&[
+            ("StartIndex", "1"),
+            ("Limit", "1"),
+            ("IsDisabled", "false"),
+            ("api_key", admin_key.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(second_page.status(), reqwest::StatusCode::OK);
+    let second_page_body = second_page.json::<serde_json::Value>().await?;
+    assert_eq!(second_page_body["TotalRecordCount"], 2);
+    assert_eq!(second_page_body["Items"][0]["Id"], viewer.id.to_string());
+
+    let disabled_response = client
+        .get(format!("http://{address}/emby/Users/Query"))
+        .query(&[
+            ("StartIndex", "0"),
+            ("Limit", "1"),
+            ("IsDisabled", "true"),
+            ("api_key", admin_key.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(disabled_response.status(), reqwest::StatusCode::OK);
+    let disabled_body = disabled_response.json::<serde_json::Value>().await?;
+    assert_eq!(disabled_body["TotalRecordCount"], 1);
+    assert_eq!(disabled_body["Items"][0]["Id"], disabled.id.to_string());
+    assert_eq!(disabled_body["Items"][0]["Policy"]["IsDisabled"], true);
 
     Ok(())
 }

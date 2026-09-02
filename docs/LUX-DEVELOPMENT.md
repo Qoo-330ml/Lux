@@ -1407,6 +1407,7 @@ COMPATIBILITY.md 是唯一兼容性事实来源。不能因为实现了官方 Sw
 - GET /Users/{UserId}/Items/{Id}
 - GET /Users/{UserId}/Items/Latest
 - GET /Users/{UserId}/Items/Resume
+- GET /Users/Query
 - GET /Items/Counts
 - GET /Items
 - GET /Items/Filters2，若目标客户端实际调用

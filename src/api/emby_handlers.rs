@@ -261,6 +261,123 @@ pub(super) async fn emby_users(
     .into_response()
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyUsersQuery {
+    #[serde(flatten)]
+    auth: EmbyTokenQuery,
+    #[serde(
+        rename = "IsHidden",
+        alias = "isHidden",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
+    is_hidden: Option<bool>,
+    #[serde(
+        rename = "IsDisabled",
+        alias = "isDisabled",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
+    is_disabled: Option<bool>,
+    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    start_index: Option<i64>,
+    #[serde(rename = "Limit", alias = "limit", default)]
+    limit: Option<i64>,
+    #[serde(
+        rename = "NameStartsWithOrGreater",
+        alias = "nameStartsWithOrGreater",
+        default
+    )]
+    name_starts_with_or_greater: Option<String>,
+    #[serde(rename = "SortOrder", alias = "sortOrder", default)]
+    sort_order: Option<String>,
+}
+
+pub(super) async fn emby_query_users(
+    headers: HeaderMap,
+    Query(query): Query<EmbyUsersQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let acting_user = match require_emby_user_with_query(&headers, &state, &query.auth).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !acting_user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let (offset, limit) = match emby_users_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let descending = match query
+        .sort_order
+        .as_deref()
+        .unwrap_or("Ascending")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ascending" => false,
+        "descending" => true,
+        _ => return StatusCode::BAD_REQUEST.into_response(),
+    };
+    let name_starts_with_or_greater = query
+        .name_starts_with_or_greater
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_lowercase);
+    if query.is_hidden == Some(true) {
+        return Json(json!({
+            "Items": [],
+            "TotalRecordCount": 0
+        }))
+        .into_response();
+    }
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let (users, total_count) = match auth
+        .query_users(
+            query.is_disabled,
+            name_starts_with_or_greater.as_deref(),
+            descending,
+            offset,
+            limit,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let server_name = current_emby_server_name(&state).await;
+    let mut items = Vec::with_capacity(users.len());
+    for user in users {
+        let ordered_views = emby_ordered_views(&state, &user).await;
+        let configuration = emby_user_configuration(&state, &user, &ordered_views).await;
+        items.push(emby_user_json(
+            &user,
+            &state.server_id,
+            &server_name,
+            configuration,
+        ));
+    }
+    Json(json!({
+        "Items": items,
+        "TotalRecordCount": total_count,
+    }))
+    .into_response()
+}
+
+fn emby_users_page_params(query: &EmbyUsersQuery) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(50);
+    if offset < 0 || !(1..=100).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((offset, limit))
+}
+
 pub(super) async fn emby_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,

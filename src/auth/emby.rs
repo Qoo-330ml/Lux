@@ -30,6 +30,31 @@ impl EmbyAuthService {
         stored_users.into_iter().map(user_record).collect()
     }
 
+    pub async fn query_users(
+        &self,
+        is_disabled: Option<bool>,
+        name_starts_with_or_greater: Option<&str>,
+        descending: bool,
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<UserRecord>, i64), EmbyAuthError> {
+        let (stored_users, total_count) = self
+            .database
+            .query_users(
+                is_disabled,
+                name_starts_with_or_greater,
+                descending,
+                offset,
+                limit,
+            )
+            .await?;
+        let users = stored_users
+            .into_iter()
+            .map(user_record)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((users, total_count))
+    }
+
     pub async fn user_by_id(&self, user_id: &str) -> Result<Option<UserRecord>, EmbyAuthError> {
         Ok(self.users.find_by_id(user_id).await?)
     }
