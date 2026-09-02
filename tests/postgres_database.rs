@@ -357,6 +357,19 @@ async fn postgres_metadata_priority_locks_images_and_people_regression()
     .bind(library.id.to_string())
     .fetch_one(database.pool())
     .await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        r#"<movie><title>本地标题</title><rating>8.2</rating><actor><name>本地演员</name><role>本地角色</role><order>0</order></actor></movie>"#,
+    )
+    .await?;
+    MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    let nfo_rating: f64 = sqlx::query_scalar("SELECT rating FROM media_items WHERE id = $1")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(nfo_rating, 8.2);
 
     sqlx::query("UPDATE media_items SET locked_fields_json = $1 WHERE id = $2")
         .bind(json!(["title"]).to_string())
@@ -394,8 +407,8 @@ async fn postgres_metadata_priority_locks_images_and_people_regression()
         .select(&item_id, &candidate_id, MetadataSelectionMode::FillMissing)
         .await?;
 
-    let metadata: (String, String, String, String) = sqlx::query_as(
-        "SELECT title, overview, locked_fields_json, metadata_provenance_json
+    let metadata: (String, String, f64, String, String) = sqlx::query_as(
+        "SELECT title, overview, rating, locked_fields_json, metadata_provenance_json
          FROM media_items WHERE id = $1",
     )
     .bind(&item_id)
@@ -403,11 +416,12 @@ async fn postgres_metadata_priority_locks_images_and_people_regression()
     .await?;
     assert_eq!(metadata.0, "本地标题");
     assert_eq!(metadata.1, "Online Overview");
+    assert_eq!(metadata.2, 8.2);
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&metadata.2)?,
+        serde_json::from_str::<serde_json::Value>(&metadata.3)?,
         json!(["title"])
     );
-    let provenance: serde_json::Value = serde_json::from_str(&metadata.3)?;
+    let provenance: serde_json::Value = serde_json::from_str(&metadata.4)?;
     assert_eq!(provenance["title"], "LOCKED_LOCAL");
     assert_eq!(provenance["overview"], "SCRAPER_LOCALIZED");
 
@@ -439,6 +453,37 @@ async fn postgres_metadata_priority_locks_images_and_people_regression()
     let nfo = tokio::fs::read_to_string(movie_dir.join("movie.nfo")).await?;
     assert!(nfo.contains("<title>本地标题</title>"));
     assert!(nfo.contains("<plot>Online Overview</plot>"));
+
+    let rating_candidate_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO metadata_candidates (
+            id, item_id, provider, provider_id, candidate_json, score, status
+         ) VALUES ($1, $2, 'TMDB', '124', $3, 100, 'PENDING')",
+    )
+    .bind(&rating_candidate_id)
+    .bind(&item_id)
+    .bind(
+        json!({
+            "title": "Online Title",
+            "rating": 9.1,
+            "providerIds": {"Tmdb": "124"}
+        })
+        .to_string(),
+    )
+    .execute(database.pool())
+    .await?;
+    selection
+        .select(
+            &item_id,
+            &rating_candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await?;
+    let selected_rating: f64 = sqlx::query_scalar("SELECT rating FROM media_items WHERE id = $1")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(selected_rating, 9.1);
 
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
