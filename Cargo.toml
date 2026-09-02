@@ -66,3 +66,10 @@ debug = "line-tables-only"
 [profile.test]
 debug = "line-tables-only"
 incremental = false
+
+# Rust 1.94 enables these style-only suggestions across existing code. Keep
+# them explicit until they can be handled outside the PostgreSQL bug fix.
+[lints.clippy]
+collapsible_if = "allow"
+manual_is_multiple_of = "allow"
+nonminimal_bool = "allow"
