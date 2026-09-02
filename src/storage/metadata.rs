@@ -512,7 +512,7 @@ impl Database {
                  last_air_date = COALESCE(?, last_air_date),
                  status = COALESCE(?, status),
                  original_language = COALESCE(?, original_language),
-                 rating = COALESCE(?, rating),
+                 rating = CASE WHEN ? = 1 THEN ? ELSE rating END,
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  provider_ids_json = ?,
                  metadata_scraper_id = CASE WHEN ? IS NULL THEN metadata_scraper_id ELSE ? END,
@@ -530,7 +530,8 @@ impl Database {
         .bind(update.last_air_date)
         .bind(update.status)
         .bind(update.original_language)
-        .bind(update.rating)
+        .bind(database_flag(update.rating.is_some()))
+        .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)

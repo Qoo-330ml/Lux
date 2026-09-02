@@ -11,7 +11,7 @@ RUN corepack enable \
 COPY web ./
 RUN pnpm build
 
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.94-bookworm AS builder
 
 WORKDIR /src
 RUN apt-get update \

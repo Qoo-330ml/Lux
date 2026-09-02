@@ -4652,7 +4652,7 @@ impl Database {
                  original_title = ?,
                  overview = ?,
                  production_year = ?,
-                 rating = COALESCE(?, rating),
+                 rating = CASE WHEN ? = 1 THEN ? ELSE rating END,
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  metadata_fingerprint = ?,
                  metadata_provenance_json = ?,
@@ -4664,7 +4664,8 @@ impl Database {
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
-        .bind(update.rating)
+        .bind(database_flag(update.rating.is_some()))
+        .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.metadata_fingerprint)
