@@ -81,21 +81,31 @@ async fn library_migration_creates_libraries_and_roots_tables()
 }
 
 #[tokio::test]
-async fn new_libraries_enable_realtime_indexing_by_default()
--> Result<(), Box<dyn std::error::Error>> {
+async fn new_libraries_preserve_realtime_watch_setting() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    let library = LibraryService::new(database)
+    let service = LibraryService::new(database.clone());
+    let library = service
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
 
-    assert!(library.realtime_watch_enabled);
+    assert!(!library.realtime_watch_enabled);
     assert_eq!(library.scan_concurrency, 32);
     assert_eq!(library.probe_concurrency, 256);
+    let updated = service
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                realtime_watch_enabled: Some(true),
+                ..Default::default()
+            },
+        )
+        .await?;
+    assert!(updated.library.realtime_watch_enabled);
     Ok(())
 }
 

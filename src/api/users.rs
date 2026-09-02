@@ -312,7 +312,7 @@ struct SetupFirstLibraryRequest {
     name: String,
     #[serde(default = "default_setup_library_kind")]
     kind: String,
-    #[serde(default)]
+    #[serde(default = "default_realtime_watch_enabled")]
     realtime_watch_enabled: bool,
     #[serde(default)]
     root_path: Option<String>,

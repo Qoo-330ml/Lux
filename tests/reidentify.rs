@@ -965,7 +965,7 @@ async fn metadata_job_skips_explicit_parent_folder_without_failing()
 }
 
 #[tokio::test]
-async fn metadata_job_requeues_running_items_after_restart()
+async fn metadata_job_requeues_running_items_when_explicitly_run()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_temp_dir, database, _library_id, folder_id) =
         setup_movie_library_with_parent_folder().await?;
