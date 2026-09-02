@@ -620,6 +620,156 @@ async fn rebuilding_people_does_not_clear_index_when_metadata_library_root_is_mi
 }
 
 #[tokio::test]
+async fn rebuilding_people_does_not_rewrite_unchanged_relations_on_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Example Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2024.mkv"), b"movie").await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_item_actors(
+            &item_id,
+            "tmdb",
+            &[ActorCredit {
+                id: "101".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    people.rebuild_person_credit_index().await?;
+    sqlx::query("UPDATE person_index_item_state SET updated_at = 1 WHERE item_id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE person_index_rebuild_jobs
+         SET status = 'COMPLETED', cursor_id = ?, processed_count = 1,
+             total_count = 1, cancel_requested = 0, run_token = NULL
+         WHERE library_id = ?",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    people.rebuild_person_credit_index().await?;
+
+    let updated_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM person_index_item_state WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(updated_at, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn rebuilding_people_restores_snapshots_when_index_state_is_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Example Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Example.Movie.2024.mkv"), b"movie").await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    people
+        .persist_item_actors(
+            &item_id,
+            "tmdb",
+            &[ActorCredit {
+                id: "101".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    people.rebuild_person_credit_index().await?;
+    sqlx::query("DELETE FROM person_credits")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM person_index_item_state")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE person_index_rebuild_jobs
+         SET status = 'COMPLETED', cursor_id = ?, processed_count = 1,
+             total_count = 1, cancel_requested = 0, run_token = NULL
+         WHERE library_id = ?",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    people.rebuild_person_credit_index().await?;
+
+    let restored_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(restored_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn rebuilding_people_clears_index_for_missing_item_metadata_directory()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -509,6 +509,13 @@ impl AppState {
         service.schedule_person_index_rebuild();
     }
 
+    pub async fn restore_people_index(&self) {
+        let Some(service) = self.people.clone() else {
+            return;
+        };
+        service.schedule_person_index_rebuild_with_relation_restore();
+    }
+
     pub async fn resume_scan_jobs(&self) {
         let Some(service) = self.scan_jobs.clone() else {
             return;

@@ -133,6 +133,14 @@ impl PeopleService {
     }
 
     pub(crate) fn schedule_person_index_rebuild(&self) {
+        self.schedule_person_index_rebuild_with_options(false);
+    }
+
+    pub(crate) fn schedule_person_index_rebuild_with_relation_restore(&self) {
+        self.schedule_person_index_rebuild_with_options(true);
+    }
+
+    fn schedule_person_index_rebuild_with_options(&self, force_relation_restore: bool) {
         let service = self.clone();
         let coordinator = self.rebuild_coordinator.clone();
         tokio::spawn(async move {
@@ -140,7 +148,10 @@ impl PeopleService {
                 return;
             }
             loop {
-                match service.rebuild_person_credit_index().await {
+                match service
+                    .rebuild_person_credit_index_with_relation_restore(force_relation_restore)
+                    .await
+                {
                     Ok(rebuilt_items) => {
                         tracing::info!(rebuilt_items, "person credit index rebuild completed");
                     }
@@ -156,6 +167,14 @@ impl PeopleService {
     }
 
     pub async fn rebuild_person_credit_index(&self) -> Result<usize, PeopleError> {
+        self.rebuild_person_credit_index_with_relation_restore(false)
+            .await
+    }
+
+    async fn rebuild_person_credit_index_with_relation_restore(
+        &self,
+        force_relation_restore: bool,
+    ) -> Result<usize, PeopleError> {
         let _rebuild_guard = self.rebuild_lock.lock().await;
         let Some(database) = &self.database else {
             return Err(PeopleError::Storage(
@@ -249,18 +268,27 @@ impl PeopleService {
                 "quarantined people relation snapshots returned to the active metadata tree"
             );
         }
-        let restored_relations = self.restore_person_relation_snapshots(database).await?;
-        if restored_relations > 0 {
-            tracing::info!(restored_relations, "people relation snapshots restored");
+        let mut rebuilt_items = 0;
+        let restore_relation_snapshots = force_relation_restore
+            || database
+                .person_index_snapshot_restore_needed()
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+        if restore_relation_snapshots {
+            let restored_relations = self.restore_person_relation_snapshots(database).await?;
+            if restored_relations > 0 {
+                tracing::info!(restored_relations, "people relation snapshots restored");
+            }
+            rebuilt_items += restored_relations;
         }
         let jobs = database
             .sync_person_index_rebuild_jobs(PERSON_INDEX_REBUILD_SCHEMA_VERSION)
             .await
             .map_err(|error| PeopleError::Storage(error.to_string()))?;
-        let mut rebuilt_items = 0;
         for job in jobs {
             let run_token = Uuid::now_v7().to_string();
-            let force_rebuild = job.cursor_id.is_none() && job.processed_count == 0;
+            let force_rebuild =
+                !restore_relation_snapshots && job.cursor_id.is_none() && job.processed_count == 0;
             if !database
                 .claim_person_index_rebuild_job(&job.library_id, &run_token)
                 .await
@@ -492,7 +520,7 @@ impl PeopleService {
             let mut pending = Vec::new();
             let mut identities = BTreeSet::new();
             for item_id in &item_ids {
-                let relation = match self.read_person_relation(item_id).await {
+                let relation = match self.read_person_relation_with_path(item_id).await {
                     Ok(relation) => relation,
                     Err(PeopleError::Serialization(message)) => {
                         tracing::warn!(item_id, %message, "skipping malformed people relation during index rebuild");
@@ -502,7 +530,7 @@ impl PeopleService {
                     }
                     Err(error) => return Err(error),
                 };
-                let Some(relation) = relation else {
+                let Some((relation_path, relation)) = relation else {
                     let cleared = database
                         .clear_person_credits(item_id)
                         .await
@@ -518,6 +546,37 @@ impl PeopleService {
                     cursor_id = Some(item_id.clone());
                     continue;
                 };
+                if relation.source_root.is_some()
+                    && relation.source_relative_path.is_some()
+                    && self
+                        .find_matching_media_source(database, &relation)
+                        .await?
+                        .is_none()
+                {
+                    if self
+                        .quarantine_person_relation_snapshot(&relation_path)
+                        .await?
+                    {
+                        tracing::debug!(
+                            item_id,
+                            "quarantined stale people relation during index rebuild"
+                        );
+                    }
+                    let cleared = database
+                        .clear_person_credits(item_id)
+                        .await
+                        .map_err(|error| PeopleError::Storage(error.to_string()))?;
+                    if cleared > 0 {
+                        tracing::debug!(
+                            item_id,
+                            cleared,
+                            "cleared person credits because relation snapshot is stale"
+                        );
+                    }
+                    processed_count += 1;
+                    cursor_id = Some(item_id.clone());
+                    continue;
+                }
                 if !force_rebuild
                     && database
                         .person_index_item_state_is_current(
@@ -1110,10 +1169,10 @@ impl PeopleService {
         credits
     }
 
-    async fn read_person_relation(
+    async fn read_person_relation_with_path(
         &self,
         item_id: &str,
-    ) -> Result<Option<StoredPeopleRelation>, PeopleError> {
+    ) -> Result<Option<(PathBuf, StoredPeopleRelation)>, PeopleError> {
         let new_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
@@ -1122,8 +1181,10 @@ impl PeopleService {
             .join(LEGACY_ITEMS_DIR)
             .join(format!("{item_id}.json"));
         match read_relation(&new_path).await? {
-            Some(relation) => Ok(Some(relation)),
-            None => read_relation(&legacy_path).await,
+            Some(relation) => Ok(Some((new_path, relation))),
+            None => Ok(read_relation(&legacy_path)
+                .await?
+                .map(|relation| (legacy_path, relation))),
         }
     }
 }

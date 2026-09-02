@@ -129,6 +129,34 @@ impl Database {
             })
     }
 
+    pub(crate) async fn person_index_snapshot_restore_needed(&self) -> Result<bool, StorageError> {
+        let media_item_count = self
+            .query_scalar::<i64>(
+                "SELECT COUNT(*)
+                 FROM media_items
+                 WHERE removed_at IS NULL
+                   AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if media_item_count == 0 {
+            return Ok(false);
+        }
+        let indexed_item_count = self
+            .query_scalar::<i64>("SELECT COUNT(*) FROM person_index_item_state")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(indexed_item_count == 0)
+    }
+
     pub(crate) async fn request_person_index_rebuild_job(
         &self,
         library_id: &str,
