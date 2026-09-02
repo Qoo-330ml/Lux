@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.7",
+    date: "2026-09-02",
+    sections: [
+      { kind: "added", items: [
+        "Emby 兼容接口新增 GET /Users/Query，支持管理员分页查询用户，并按禁用、隐藏、名称起点和排序条件过滤。",
+      ] },
+      { kind: "fixed", items: [
+        "修复服务升级和启动后扫描生命周期数据持续累积的问题；自动清理已完成或取消任务的路径与调和记录、已无需恢复的目标和过期事件，同时保留运行中及可恢复的失败任务。",
+        "修复人物关系索引对未变化关系重复写入的问题，降低数据库写入膨胀。",
+      ] },
+      { kind: "changed", items: [
+        "收紧人物关系快照的恢复边界；服务启动和后台索引重建不再从配置卷快照自动恢复关系，数据库清空后需重新扫描媒体库重建关系。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.6",
     date: "2026-09-01",
     sections: [
