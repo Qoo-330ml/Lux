@@ -953,7 +953,10 @@ async fn create_web_playback_session_json(
         WebPlaybackPlan::Direct => {
             let proxy_url = if source.source_kind == "STRM_URL"
                 && source.external_url.as_deref().is_some_and(|target| {
-                    matches!(classify_strm_target(target).kind, StrmTargetKind::Path)
+                    matches!(
+                        classify_strm_target(target).kind,
+                        StrmTargetKind::Url | StrmTargetKind::Path
+                    )
                 }) {
                 Some(super::emby_catalog::emby_media_source_stream_url_parts(
                     item_id,

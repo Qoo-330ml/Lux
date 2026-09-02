@@ -120,7 +120,7 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
 - Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径按 Lux 进程实际可读性处理，不要求落在当前媒体库根目录内。扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
-- HTTP(S) 目标沿用直接播放语义，但 `DirectStreamUrl` 指向 Lux 播放入口，由 Lux 用播放器 User-Agent 解析有限重定向后返回 307；媒体字节仍由播放器直连最终地址。本地路径在 Lux 进程可安全读取时按本地文件提供；SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
+- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过标准 Emby 媒体源交给外部播放代理；两者的代理兼容表示均使用原始 `Path`、`Protocol=File` 和 `IsRemote=false`，由外部代理自行完成映射或 302 解析。直接访问 Lux 的播放入口时，本地路径仍由 Lux 读取，HTTP(S) 目标仍由 Lux 使用播放器 User-Agent 有限解析重定向后返回 307，作为兼容回退；扫描和 `PlaybackInfo` 不访问目标。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
@@ -129,7 +129,7 @@ Lux 的核心价值不是功能数量，而是：
 - 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可以位于媒体库根目录之外；目标必须是 Lux 进程实际可读取、canonicalize 后存在的普通文件，且不会把目录或另一个 `.strm` 当作视频返回。
-- URL 型 `.strm` 在 `Path` 保留原始播放地址，`DirectStreamUrl` 指向受保护的 Lux 视频端点；端点使用入站播放器 User-Agent 和单区间请求解析 HTTP(S) 目标的有限重定向，再返回最终地址的 307，不代理媒体字节。播放 URL 不写死任何 STRM 服务路径；本地路径型 `.strm` 的第三方 Emby DTO 仍生成标准 `/Videos/{ItemId}/stream[.Container]?MediaSourceId=...` 入口，Lux Web 的 Direct Play 计划同时提供该代理入口和签名 Lux 入口，播放器优先让 Redia 等外部 Emby 代理按 `Path` 接管并在失败时回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
+- URL 和本地路径型 `.strm` 在 `Path` 保留原始目标，第三方 Emby DTO 统一生成标准 `/Videos/{ItemId}/stream[.Container]?MediaSourceId=...` 入口，并使用同一代理兼容语义；外部播放代理按 `Path` 接管并自行完成映射或 302 解析。Lux 仍保留直接访问 URL 型 `.strm` 时使用播放器 User-Agent 有限解析重定向并返回 307 的兼容回退；不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 只有在解析器返回 HTTP(S) 地址后才生成该端点；空目标和其他协议不可播放。
 - 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -1301,7 +1301,7 @@ locked local value
 
 - 读取文件的首个非空行并 trim BOM 与首尾空白，保存为原始播放目标。
 - 目标只做词法分类：HTTP(S) URL、路径、未知/其他目标；不在扫描或 PlaybackInfo 请求中访问目标。
-- URL 型目标由 `PlaybackInfo` 返回 Lux 的受保护播放入口；播放入口使用入站播放器 User-Agent 请求原始目标并有限跟随重定向后返回 307。路径型目标保留原始 `Path`，由标准 Emby `/Videos/...` 入口交给外部代理执行路径映射；路径型和其他目标不得被标记为已解析的 HTTP URL，需由路径转发或解析器策略决定播放方式。
+- URL 和路径型目标都保留原始 `Path`，并通过标准 Emby `/Videos/...` 入口交给外部代理执行映射或 302 解析；两者统一使用 `Protocol=File`、`IsRemote=false` 的代理兼容表示。直接请求 Lux 时，路径型目标按本地文件处理，URL 型目标仍可由 Lux 使用入站播放器 User-Agent 有限跟随重定向并返回 307；该回退不改变扫描和 `PlaybackInfo` 不访问目标的边界。
 - 下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，不能把路径型目标直接当作远程 URL 请求。
 
 ### 14.3 PlaybackInfo
@@ -1340,10 +1340,10 @@ locked local value
 ### 14.6 Web 播放
 
 - Web 播放通过独立的 `/api/v1/playback/sessions` 会话接口创建一次播放计划；Web API 与 Emby 播放接口、DTO 和领域类型分离。
-- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；普通 Direct Play 和 HLS 地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie；路径型 `.strm` 的 `DIRECT` 计划额外返回标准 `/Videos/...` `proxyUrl`，Web 播放器优先使用它并在代理鉴权/映射失败时回退到签名 `url`，该代理地址依赖 Emby token 或代理注入的 API Key。
+- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；普通 Direct Play 和 HLS 地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie；URL 和路径型 `.strm` 的 `DIRECT` 计划都额外返回标准 `/Videos/...` `proxyUrl`，Web 播放器优先使用它并在代理鉴权/映射失败时回退到签名 `url`，该代理地址依赖 Emby token 或代理注入的 API Key。
 - 档位 0 使用原生 Range 直放或现有客户端 fallback；档位 1～4 使用服务端 fMP4/CMAF HLS。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用 Web HLS 播放器。
 - 创建会话时固定媒体源、音频/字幕选择、起播位置和服务端计划；seek 必要时切换会话生成代次，不把客户端任意路径或外部 URL 交给服务端执行。
-- `.strm` 只能返回档位 0；URL 型直连、路径型外部代理接管或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
+- `.strm` 只能返回档位 0；URL/路径型外部代理接管、URL 型 Lux 直连回退或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
 - 内嵌文本字幕是独立于媒体计划的能力：浏览器原生轨道或客户端单次读取只能复用当前媒体资源，不能改变 `.strm` 的 Direct 规则。
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
@@ -2047,6 +2047,7 @@ services:
 | LUX-230 | src/application/scanner.rs、src/application/metadata.rs、src/storage/、src/api/media.rs、tests/、web/src/features/home/、web/src/lib/api/、web/src/react.css、docs/；全量扫描中的本地旁车流水线 |
 | LUX-231 | web/src/features/player/PlayerPage.tsx、web/src/features/player/components/player-controls.tsx、web/src/react.css、web/tests/；LuxPlayer 剧集上一集/下一集导航 |
 | LUX-232 | migrations/、migrations-postgres/、src/main.rs、src/storage/、src/application/scanner.rs、src/application/watch.rs、tests/、docs/API.md；数据库生命周期清理与写入膨胀控制 |
+| LUX-234 | src/api/emby_catalog.rs、src/api/playback.rs、tests/strm.rs、tests/web_playback.rs、docs/；通用外部代理的 URL 型 `.strm` 交接 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5508,6 +5509,42 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 
 - 不删除任务历史，不回滚已经提交的索引、元数据或旁车写回。
 - 不取消播放会话，不改变登录会话或 Webhook 投递 outbox 的独立恢复策略。
+
+#### LUX-234：通用外部代理的 URL 型 `.strm` 交接
+
+范围：修正 URL 型 `.strm` 与本地路径型 `.strm` 在第三方媒体代理场景下的 Emby 播放源合同。两种目标都保留原始
+`MediaSources[].Path`，使用标准 `/Videos/{ItemId}/stream[.Container]?MediaSourceId=...` 播放入口，并使用
+`Protocol=File`、`IsRemote=false` 的代理兼容表示，使任意具备自身映射或 302 能力的外部代理可以优先接管播放。
+Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访问 `.strm` 目标。
+
+直接请求 Lux 的兼容回退保持不变：路径型目标由 Lux 按相对路径或绝对路径读取本地普通文件，URL 型目标由 Lux
+使用入站播放器 User-Agent 有限跟随重定向并返回 307；外部代理接管时不应请求 Lux 的 URL 解析回退入口。SMB/FTP
+解析器和其他不支持的目标不在本任务内改变。
+
+验收：
+
+- [x] URL 与路径型 `.strm` 的 Emby `MediaSources[].Path` 均保留原始目标，且代理交接所需的 `Protocol`、`IsRemote`、
+      标准 `DirectStreamUrl` 和权限行为一致。
+- [x] URL 与路径型 `.strm` 的 Lux Web Direct Play 计划均提供标准 `proxyUrl`；播放器继续在代理失败时回退到签名 Lux URL。
+- [x] Lux 直连 URL 型 `.strm` 仍按播放器 User-Agent 返回有限 307；直连路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。
+- [x] 扫描、`PlaybackInfo` 和外部代理交接测试不访问原始目标；不新增数据库字段、迁移、媒体字节代理、转码或具体代理适配。
+
+验证：
+
+- `cargo test --locked --test strm --test web_playback --test strm_resolver_playback`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web install --frozen-lockfile`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+- `uname -m`，并明确本机 ARM64 结果不外推 NAS/x86_64 性能。
+
+依赖：LUX-159、LUX-161、LUX-198、LUX-199。
+
+明确不做：
+
+- 不删除 Lux 直接播放 URL 型 `.strm` 的现有 307 回退。
+- 不实现任何第三方代理的路径映射、302 API、缓存、媒体字节代理或转码。
 
 ## 26. 风险与缓解
 
