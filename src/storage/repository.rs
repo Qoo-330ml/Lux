@@ -19,6 +19,8 @@ use uuid::Uuid;
 
 #[path = "catalog.rs"]
 mod catalog;
+#[path = "database_cleanup.rs"]
+mod database_cleanup;
 #[path = "emby_migration.rs"]
 mod emby_migration;
 #[path = "jobs.rs"]
@@ -39,6 +41,8 @@ mod people;
 mod sessions;
 #[path = "users.rs"]
 mod users;
+
+pub use database_cleanup::DatabaseLifecycleCleanupReport;
 
 pub(crate) use emby_migration::{
     EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
@@ -1164,7 +1168,6 @@ pub(crate) struct StoredFilesystemEntry {
 
 #[derive(Debug)]
 pub(crate) struct StoredItemSourceLocator {
-    pub(crate) item_id: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,

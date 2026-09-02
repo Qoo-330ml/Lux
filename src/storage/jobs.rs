@@ -487,7 +487,8 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-             SET status = 'COMPLETED', current_item = NULL, scan_phase = 'IDLE',
+             SET status = 'COMPLETED', cursor = NULL, current_item = NULL,
+                 scan_phase = 'IDLE',
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')
                AND NOT EXISTS (
@@ -1664,15 +1665,9 @@ impl Database {
             .query(
                 "DELETE FROM scan_job_targets
                  WHERE job_id = ?
-                   AND NOT EXISTS (
-                       SELECT 1 FROM scan_job_targets pending
-                       WHERE pending.job_id = scan_job_targets.job_id
-                         AND (
-                             pending.probe_state IN ('PENDING', 'FAILED')
-                             OR pending.metadata_state IN ('PENDING', 'FAILED')
-                             OR pending.thumbnail_state IN ('PENDING', 'FAILED')
-                         )
-                   )",
+                   AND probe_state NOT IN ('PENDING', 'FAILED')
+                   AND metadata_state NOT IN ('PENDING', 'FAILED')
+                   AND thumbnail_state NOT IN ('PENDING', 'FAILED')",
             )
             .bind(job_id)
             .execute(&self.pool)
@@ -1852,6 +1847,9 @@ impl Database {
         &self,
         event: NewScanJobEvent<'_>,
     ) -> Result<(), StorageError> {
+        if event.level == "INFO" {
+            return Ok(());
+        }
         self.query(
             "INSERT INTO scan_job_events
              (id, job_id, level, event_code, message, details_json)
@@ -1865,11 +1863,14 @@ impl Database {
         .bind(event.details_json)
         .execute(&self.pool)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        if let Err(error) = self.prune_scan_job_events().await {
+            tracing::warn!(job_id = event.job_id, %error, "scan event retention cleanup failed");
+        }
+        Ok(())
     }
 
     pub(crate) async fn count_scan_job_events(
@@ -3285,7 +3286,8 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
-             SET status = ?, error = ?, current_item = NULL, scan_phase = 'IDLE',
+             SET status = ?, error = ?, cursor = NULL, current_item = NULL,
+                 scan_phase = 'IDLE',
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
@@ -3304,7 +3306,8 @@ impl Database {
     pub(crate) async fn mark_scan_job_postprocessing(&self, id: &str) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
-             SET status = 'COMPLETED', current_item = NULL, scan_phase = 'POSTPROCESSING',
+             SET status = 'COMPLETED', cursor = NULL, current_item = NULL,
+                 scan_phase = 'POSTPROCESSING',
                  error = NULL, finished_at = COALESCE(finished_at, unixepoch()),
                  updated_at = unixepoch()
              WHERE id = ? AND status = 'RUNNING'",
@@ -3326,7 +3329,8 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'COMPLETED', error = NULL, current_item = NULL,
+                 SET status = 'COMPLETED', error = NULL, cursor = NULL,
+                     current_item = NULL, cancel_requested = 0,
                      scan_phase = 'IDLE', finished_at = COALESCE(finished_at, unixepoch()),
                      updated_at = unixepoch()
                  WHERE id = ? AND status IN ('RUNNING', 'COMPLETED')
@@ -3359,7 +3363,8 @@ impl Database {
         let result = self
             .query(
                 "UPDATE scan_jobs
-                 SET status = 'COMPLETED', error = NULL, current_item = NULL,
+                 SET status = 'COMPLETED', error = NULL, cursor = NULL,
+                     current_item = NULL, cancel_requested = 0,
                      scan_phase = 'IDLE', finished_at = COALESCE(finished_at, unixepoch()),
                      updated_at = unixepoch()
                  WHERE id = ? AND status IN ('RUNNING', 'COMPLETED')

@@ -999,7 +999,7 @@ mod tests {
     }
 
     #[test]
-    fn relation_restore_rejects_a_replaced_file_at_the_same_path() {
+    fn relation_matching_rejects_a_replaced_file_at_the_same_path() {
         let relation = super::StoredPeopleRelation {
             schema_version: 4,
             generation: 1,
@@ -1016,7 +1016,6 @@ mod tests {
             actors: Vec::new(),
         };
         let current = crate::storage::StoredItemSourceLocator {
-            item_id: "new-item".to_owned(),
             root_path: "/library".to_owned(),
             relative_path: "movie.mkv".to_owned(),
             fingerprint: Some(b"new-fingerprint".to_vec()),

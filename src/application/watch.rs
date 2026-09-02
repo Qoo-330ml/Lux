@@ -121,7 +121,12 @@ impl LibraryWatcher {
         loop {
             tokio::select! {
                 event = self.receiver.recv() => match event {
-                    Some(event) => coalescer.push(event),
+                    Some(event) => {
+                        coalescer.push(event);
+                        deadline
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + coalescer.debounce());
+                    }
                     None => break,
                 },
                 _ = &mut deadline => break,

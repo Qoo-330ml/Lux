@@ -108,25 +108,22 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
         if events["events"].as_array().is_some_and(|items| {
             items
                 .iter()
-                .any(|item| item["eventCode"] == "JOB_COMPLETED")
-                && items
-                    .iter()
-                    .any(|item| item["eventCode"] == "POSTPROCESSING_FAILED")
+                .any(|item| item["eventCode"] == "POSTPROCESSING_FAILED")
         }) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    assert!(events["total"].as_i64().unwrap_or_default() >= 4);
+    assert!(events["total"].as_i64().unwrap_or_default() >= 1);
     assert!(events["events"].as_array().is_some_and(|items| {
         items
             .iter()
-            .any(|item| item["eventCode"] == "JOB_COMPLETED")
+            .any(|item| item["eventCode"] == "POSTPROCESSING_FAILED")
     }));
 
     let completed = client
         .get(format!(
-            "{base_url}/api/v1/admin/jobs/{job_id}/events?eventCode=JOB_COMPLETED&pageSize=1"
+            "{base_url}/api/v1/admin/jobs/{job_id}/events?eventCode=POSTPROCESSING_FAILED&pageSize=1"
         ))
         .header(COOKIE, &cookies)
         .send()
@@ -134,7 +131,7 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
     assert_eq!(completed.status(), reqwest::StatusCode::OK);
     let completed_body: Value = completed.json().await?;
     assert_eq!(completed_body["total"], 1);
-    assert_eq!(completed_body["events"][0]["level"], "INFO");
+    assert_eq!(completed_body["events"][0]["level"], "ERROR");
 
     let errors = client
         .get(format!(

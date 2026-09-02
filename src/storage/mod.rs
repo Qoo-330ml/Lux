@@ -1,7 +1,9 @@
 mod repository;
 
 pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
-pub use repository::{Database, PersonListOptions, PersonSort, StorageError};
+pub use repository::{
+    Database, DatabaseLifecycleCleanupReport, PersonListOptions, PersonSort, StorageError,
+};
 
 #[allow(unused_imports)]
 pub(crate) use repository::{

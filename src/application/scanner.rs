@@ -4808,6 +4808,7 @@ impl ScanJobService {
                     }
                     self.publish_media_added_event(&completed_job, created_items)
                         .await;
+                    self.database.clear_scan_job_paths(job_id).await?;
                     return Ok(());
                 }
                 if let Err(error) = self.database.retry_failed_scan_job_targets(job_id).await {

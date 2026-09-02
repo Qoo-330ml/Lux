@@ -1,5 +1,59 @@
 use super::*;
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PersonCreditKey {
+    person_id: String,
+    person_type: String,
+    provider: String,
+    role: String,
+}
+
+fn person_credit_key(credit: &NewPersonCredit) -> PersonCreditKey {
+    PersonCreditKey {
+        person_id: credit.person_id.clone(),
+        person_type: credit.person_type.clone(),
+        provider: credit.provider.clone(),
+        role: credit.role.clone(),
+    }
+}
+
+fn sql_value_changed(left: &str, right: &str) -> String {
+    format!(
+        "(({left} IS NULL AND {right} IS NOT NULL)
+         OR ({left} IS NOT NULL AND {right} IS NULL)
+         OR ({left} IS NOT NULL AND {right} IS NOT NULL AND {left} <> {right}))"
+    )
+}
+
+fn person_credit_change_predicate() -> String {
+    [
+        "person_name",
+        "sort_order",
+        "biography",
+        "birthday",
+        "deathday",
+        "known_for_department",
+        "place_of_birth",
+        "provider_ids_json",
+        "genres_json",
+        "tags_json",
+        "production_locations_json",
+        "premiere_date",
+        "production_year",
+        "taglines_json",
+        "lux_person_id",
+    ]
+    .into_iter()
+    .map(|column| {
+        sql_value_changed(
+            &format!("person_credits.{column}"),
+            &format!("excluded.{column}"),
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(" OR ")
+}
+
 impl Database {
     pub(crate) async fn sync_person_index_rebuild_jobs(
         &self,
@@ -127,34 +181,6 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
-    }
-
-    pub(crate) async fn person_index_snapshot_restore_needed(&self) -> Result<bool, StorageError> {
-        let media_item_count = self
-            .query_scalar::<i64>(
-                "SELECT COUNT(*)
-                 FROM media_items
-                 WHERE removed_at IS NULL
-                   AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')",
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if media_item_count == 0 {
-            return Ok(false);
-        }
-        let indexed_item_count = self
-            .query_scalar::<i64>("SELECT COUNT(*) FROM person_index_item_state")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(indexed_item_count == 0)
     }
 
     pub(crate) async fn request_person_index_rebuild_job(
@@ -352,24 +378,11 @@ impl Database {
         let _metadata_write_guard = self.acquire_metadata_write_lock().await;
         let _write_guard = self.person_credits_write_lock.lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query("DELETE FROM person_credits WHERE item_id = ?")
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         let mut seen_keys = HashSet::with_capacity(credits.len());
         let mut duplicates_skipped = 0;
         let mut prepared = Vec::with_capacity(credits.len());
         for credit in credits {
-            let key = (
-                credit.person_id.as_str(),
-                credit.person_type.as_str(),
-                credit.provider.as_str(),
-                credit.role.as_str(),
-            );
+            let key = person_credit_key(credit);
             if !seen_keys.insert(key) {
                 duplicates_skipped += 1;
                 continue;
@@ -393,6 +406,62 @@ impl Database {
                 taglines_json,
             ));
         }
+        let existing_keys = self
+            .query(
+                "SELECT person_id, person_type, provider, role
+                 FROM person_credits
+                 WHERE item_id = ?",
+            )
+            .bind(item_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(|row| PersonCreditKey {
+                person_id: row.get("person_id"),
+                person_type: row.get("person_type"),
+                provider: row.get("provider"),
+                role: row.get("role"),
+            })
+            .collect::<HashSet<_>>();
+        let obsolete_keys = existing_keys
+            .difference(&seen_keys)
+            .cloned()
+            .collect::<Vec<_>>();
+        for chunk in obsolete_keys.chunks(100) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let predicates = std::iter::repeat_n(
+                "(person_type = ? AND provider = ? AND person_id = ? AND role = ?)",
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(" OR ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
+                "DELETE FROM person_credits
+                 WHERE item_id = ? AND ({predicates})"
+            )));
+            statement = statement.bind(item_id);
+            for key in chunk {
+                statement = statement
+                    .bind(&key.person_type)
+                    .bind(&key.provider)
+                    .bind(&key.person_id)
+                    .bind(&key.role);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        let change_predicate = person_credit_change_predicate();
         const PERSON_CREDIT_INSERT_CHUNK_SIZE: usize = 40;
         for chunk in prepared.chunks(PERSON_CREDIT_INSERT_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n(
@@ -424,7 +493,8 @@ impl Database {
                     premiere_date = excluded.premiere_date,
                     production_year = excluded.production_year,
                     taglines_json = excluded.taglines_json,
-                    lux_person_id = excluded.lux_person_id"
+                    lux_person_id = excluded.lux_person_id
+                WHERE {change_predicate}"
             )));
             for (
                 credit,

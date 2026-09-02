@@ -31,6 +31,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let schema_version = database.schema_version().await?;
     info!(schema_version, "database migrations applied");
+    match database.run_database_lifecycle_cleanup().await {
+        Ok(Some(report)) => {
+            info!(
+                scan_job_paths_deleted = report.scan_job_paths_deleted,
+                reconciliation_entries_deleted = report.reconciliation_entries_deleted,
+                scan_job_targets_deleted = report.scan_job_targets_deleted,
+                scan_job_events_deleted = report.scan_job_events_deleted,
+                scan_jobs_summarized = report.scan_jobs_summarized,
+                "one-time database lifecycle cleanup completed"
+            );
+        }
+        Ok(None) => {}
+        Err(error) => error!(%error, "one-time database lifecycle cleanup failed"),
+    }
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;

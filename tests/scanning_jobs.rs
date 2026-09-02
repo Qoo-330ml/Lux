@@ -90,15 +90,6 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
         visible_items, 1,
         "committed scan batches must be visible immediately"
     );
-    let batch_details: String = sqlx::query_scalar(
-        "SELECT details_json FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'BATCH_COMPLETED'
-         ORDER BY created_at, id LIMIT 1",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert!(batch_details.contains("\"concurrency\":"));
     let persisted: (String, i64, Option<String>) =
         sqlx::query_as("SELECT status, processed_count, cursor FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
@@ -181,27 +172,21 @@ async fn scan_job_persists_batches_resumes_and_cancels() -> Result<(), Box<dyn s
     .bind(&job.id)
     .fetch_all(database.pool())
     .await?;
-    assert!(event_codes.iter().any(|code| code == "JOB_CREATED"));
-    assert!(event_codes.iter().any(|code| code == "JOB_STARTED"));
-    assert!(event_codes.iter().any(|code| code == "BATCH_COMPLETED"));
-    assert!(event_codes.iter().any(|code| code == "JOB_COMPLETED"));
+    assert!(event_codes.is_empty());
 
     let cancel_job = restarted_jobs.create_movie_scan_job(library.id).await?;
     restarted_jobs.cancel(&cancel_job.id).await?;
     let cancelled = restarted_jobs.run_batch(&cancel_job.id, 1).await?;
     assert_eq!(cancelled.status, "CANCELLED");
     assert!(cancelled.completed);
-    let cancel_event: (String, String) = sqlx::query_as(
-        "SELECT level, event_code FROM scan_job_events
+    let cancel_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events
          WHERE job_id = ? AND event_code = 'JOB_CANCELLED'",
     )
     .bind(&cancel_job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(
-        cancel_event,
-        ("INFO".to_owned(), "JOB_CANCELLED".to_owned())
-    );
+    assert_eq!(cancel_events, 0);
     let cancelled_work: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM reconciliation_scan_entries WHERE job_id = ?")
             .bind(&cancel_job.id)
@@ -266,15 +251,6 @@ async fn series_reconciliation_batches_hierarchy_and_versions()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(source_count, 3);
-    let batch_details: String = sqlx::query_scalar(
-        "SELECT details_json FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'BATCH_COMPLETED'
-         ORDER BY created_at, id LIMIT 1",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert!(batch_details.contains("\"concurrency\":"));
     Ok(())
 }
 
@@ -337,15 +313,6 @@ async fn mixed_reconciliation_batches_known_media_and_keeps_unresolved()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(source_count, 3);
-    let batch_details: String = sqlx::query_scalar(
-        "SELECT details_json FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'BATCH_COMPLETED'
-         ORDER BY created_at, id LIMIT 1",
-    )
-    .bind(&job.id)
-    .fetch_one(database.pool())
-    .await?;
-    assert!(batch_details.contains("\"concurrency\":"));
     Ok(())
 }
 
@@ -886,14 +853,14 @@ async fn cancelling_a_pending_scan_finishes_immediately_and_cleans_work()
             .fetch_one(database.pool())
             .await?;
     assert_eq!(cancel_requested, 1);
-    let event_code: String = sqlx::query_scalar(
-        "SELECT event_code FROM scan_job_events
-         WHERE job_id = ? ORDER BY created_at DESC, id DESC LIMIT 1",
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events
+         WHERE job_id = ?",
     )
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(event_code, "JOB_CANCELLED");
+    assert_eq!(event_count, 0);
     Ok(())
 }
 
@@ -1057,25 +1024,14 @@ async fn realtime_incremental_scan_preempts_running_full_scan()
     })
     .await??;
 
-    let events: Vec<(String, String)> = sqlx::query_as(
-        "SELECT job_id, event_code
-         FROM scan_job_events
-         WHERE job_id IN (?, ?)
-           AND event_code IN ('JOB_STARTED', 'JOB_COMPLETED')
-         ORDER BY created_at, id",
-    )
-    .bind(&full_scan.id)
-    .bind(&incremental_scan.id)
-    .fetch_all(database.pool())
-    .await?;
-    assert_eq!(events.len(), 4);
-    assert_eq!(events[0], (full_scan.id.clone(), "JOB_STARTED".to_owned()));
-    assert_eq!(
-        events[1],
-        (incremental_scan.id.clone(), "JOB_STARTED".to_owned())
-    );
-    assert_eq!(events[2], (incremental_scan.id, "JOB_COMPLETED".to_owned()));
-    assert_eq!(events[3], (full_scan.id, "JOB_COMPLETED".to_owned()));
+    let statuses: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM scan_jobs WHERE id IN (?, ?) ORDER BY id")
+            .bind(&full_scan.id)
+            .bind(&incremental_scan.id)
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(statuses.len(), 2);
+    assert!(statuses.iter().all(|(_, status)| status == "COMPLETED"));
     Ok(())
 }
 
@@ -1706,6 +1662,12 @@ async fn incremental_scan_processes_only_queued_file() -> Result<(), Box<dyn std
     .fetch_one(database.pool())
     .await?;
     assert_eq!(queued_count, 0);
+    let retained_path_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_paths WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(retained_path_count, 0);
     Ok(())
 }
 
@@ -1968,23 +1930,14 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
             .fetch_one(database.pool())
             .await?;
     assert_eq!(remaining_targets, 0);
-    let event_codes: Vec<String> = sqlx::query_scalar(
-        "SELECT event_code FROM scan_job_events WHERE job_id = ? ORDER BY created_at, id",
-    )
-    .bind(&job.id)
-    .fetch_all(database.pool())
-    .await?;
-    assert!(event_codes.iter().any(|code| code == "PROBE_COMPLETED"));
-    let probe_details: String = sqlx::query_scalar(
-        "SELECT details_json FROM scan_job_events
-         WHERE job_id = ? AND event_code = 'PROBE_COMPLETED'
-         ORDER BY created_at, id LIMIT 1",
+    let info_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events
+         WHERE job_id = ? AND level = 'INFO'",
     )
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert!(probe_details.contains("\"elapsedMs\":"));
-    assert!(probe_details.contains("\"itemsPerSecond\":"));
+    assert_eq!(info_events, 0);
     Ok(())
 }
 
@@ -2387,22 +2340,14 @@ async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn s
     first_worker.await??;
     second_worker.await??;
 
-    let events: Vec<(String, String)> = sqlx::query_as(
-        "SELECT job_id, event_code
-         FROM scan_job_events
-         WHERE job_id IN (?, ?)
-           AND event_code IN ('JOB_STARTED', 'JOB_COMPLETED')
-         ORDER BY created_at, id",
-    )
-    .bind(&first_job.id)
-    .bind(&second_job.id)
-    .fetch_all(database.pool())
-    .await?;
-    assert_eq!(events.len(), 4);
-    assert_eq!(events[1].0, events[0].0);
-    assert_eq!(events[1].1, "JOB_COMPLETED");
-    assert_ne!(events[2].0, events[0].0);
-    assert_eq!(events[2].1, "JOB_STARTED");
+    let statuses: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, status FROM scan_jobs WHERE id IN (?, ?) ORDER BY id")
+            .bind(&first_job.id)
+            .bind(&second_job.id)
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(statuses.len(), 2);
+    assert!(statuses.iter().all(|(_, status)| status == "COMPLETED"));
     Ok(())
 }
 

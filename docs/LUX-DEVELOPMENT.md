@@ -2043,6 +2043,7 @@ services:
 | LUX-229 | tests/strm_resolver_playback.rs、tests/web_playback.rs、web/tests/、docs/COMPATIBILITY.md；本地与远程 .strm 字幕兼容性阶段门 |
 | LUX-230 | src/application/scanner.rs、src/application/metadata.rs、src/storage/、src/api/media.rs、tests/、web/src/features/home/、web/src/lib/api/、web/src/react.css、docs/；全量扫描中的本地旁车流水线 |
 | LUX-231 | web/src/features/player/PlayerPage.tsx、web/src/features/player/components/player-controls.tsx、web/src/react.css、web/tests/；LuxPlayer 剧集上一集/下一集导航 |
+| LUX-232 | migrations/、migrations-postgres/、src/main.rs、src/storage/、src/application/scanner.rs、src/application/watch.rs、tests/、docs/API.md；数据库生命周期清理与写入膨胀控制 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -4144,13 +4145,13 @@ provider 切换由后台身份解析任务处理：优先使用已知 provider �
 关系可在姓名规范化、角色/排序一一对应且无冲突时自动桥接；完整生日与唯一候选可作为辅助证据。仅姓名或部分生日
 不得自动合并。高置信度结果自动关联，低置信度结果进入持久待处理队列；自动关联必须保留证据并支持撤销/拆分。
 
-人物资源和媒体人物关系必须可从配置卷恢复。`person.json` 保存 Lux 编号、provider 身份、别名、字段来源和版本；
-媒体条目的 `people.json` 保存 Lux 人物编号、角色/排序、旧 item ID、稳定媒体来源键以及用于迁移的 provider ID、
-规范化路径、标题、年份和指纹。数据库清空后，后台恢复任务先重建媒体来源映射，再导入人物资源和 provider 索引，
-最后恢复 `person_credits` 运行时索引。恢复过程必须可重试、幂等、可中断续跑，并隔离损坏或有歧义的快照。
+人物资源可以从配置卷恢复。`person.json` 保存 Lux 编号、provider 身份、别名、字段来源和版本；媒体条目的
+`people.json` 保存 Lux 人物编号、角色/排序、旧 item ID、稳定媒体来源键以及用于迁移的 provider ID、规范化路径、
+标题、年份和指纹。媒体人物关系快照不再作为数据库恢复源，服务启动和管理员索引重建均不得遍历
+`/config/metadata/library` 或关系隔离区来回迁 `person_credits`；数据库清空后必须重新扫描媒体库或重新生成关系。
 
-旧 provider 目录、旧 `people/assets` 文件和旧关系快照继续兼容读取，升级不得删除旧文件；新图片不得写入
-`people/assets`。
+旧 provider 目录、旧 `people/assets` 文件和当前媒体条目中的旧关系快照继续兼容读取；升级不得删除旧文件，
+但关系快照不再作为空数据库启动时的自动恢复源。新图片不得写入 `people/assets`。
 
 验收：
 
@@ -4161,14 +4162,14 @@ provider 切换由后台身份解析任务处理：优先使用已知 provider �
       仅姓名或不完整生日不得自动合并，未确认的同名人物保持隔离。
 - [x] 每个规范人物分配不可复用的 `lux-000001` 编号；目录使用可读姓名加 Lux 编号，不暴露 provider ID。
 - [x] provider 身份映射、自动匹配证据、撤销/拆分记录和字段锁定状态在配置卷快照中可恢复。
-- [x] 删除数据库后重新扫描同一媒体库，可以恢复人物、provider 映射、头像、NFO 和媒体人物关系；
+- [x] 删除数据库后重新扫描同一媒体库，可以恢复人物、provider 映射、头像、NFO 和媒体人物关系；仅凭配置卷快照不自动恢复关系；
       媒体移动、路径复用、损坏快照和多候选匹配不会静默关联错误条目。
-- [x] 恢复和在线刮削并发时使用 generation/租约或等价 compare-and-swap，不能以旧快照覆盖新结果。
+- [x] 扫描和在线刮削并发时使用 generation/租约或等价 compare-and-swap，不能以旧快照覆盖新结果。
 - [x] `people.json` 关系快照升级可读取版本 1，旧人物目录、旧图片索引和 Emby 兼容图片路由继续可用。
 - [x] 演员关系写入、人物资源写入和图片下载彼此解耦；任一资源失败都不丢失演员展示关系。
 
 验证：人物关系单测、NFO 扫描集成测试、跨 provider 自动合并/隔离/撤销测试、生日精度匹配测试、
-图片内容去重和损坏恢复测试、旧布局兼容测试、数据库清空后快照恢复测试、详情 API 和 Web 占位图测试。
+图片内容去重和损坏恢复测试、旧布局兼容测试、数据库清空后重新扫描重建测试、详情 API 和 Web 占位图测试。
 
 依赖：LUX-164、LUX-170、LUX-172。
 
@@ -4403,7 +4404,10 @@ API：
 范围：将人物出演关系索引重建从一次性的启动扫描改为按媒体库持久化、可恢复、可取消的后台任务。
 任务使用稳定 `media_items.id` 游标进行 keyset 分页，前台请求继续读取已有索引，不等待整库重建。
 服务重启时遗留的 `RUNNING` 任务重新排队；同一媒体库同一时间只能有一个 worker 领取任务。
-进程内重复触发会合并为 pending 标记，实际重建协调器保持单个运行器，避免重复整库恢复扫描。
+进程内重复触发会合并为 pending 标记，实际重建协调器保持单个运行器，避免重复整库索引扫描。
+
+人物关系不支持从 `/config/metadata/library` 或 `quarantine/people-relations` 自动恢复。关系文件只在当前媒体条目被
+扫描或已排队的索引任务处理时读取；`person_index_item_state` 为空不会触发配置卷关系快照的全量导入。
 
 每个条目保存关系来源指纹和关系 schema 版本。只有当前指纹与已保存的非空指纹相同，且 schema 版本
 一致时才跳过重建；没有指纹的条目必须重新读取关系文件。关系文件缺失时清理旧数据库关系，但不把
@@ -5241,7 +5245,7 @@ repository 方法或 People 用例。此任务不引入新依赖、不新增端�
 
 - [x] API facade 不再承载完整领域 handler；Emby 路由/DTO、Lux API、管理员、用户、媒体和播放实现位于明确子模块。
 - [x] Storage facade 不再承载完整 SQL repository；媒体、人物、会话、迁移和共享查询/模型边界清晰。
-- [x] PeopleService 的关系/匹配、元数据、资源和索引恢复实现分离，外部调用路径保持不变。
+- [x] PeopleService 的关系/匹配、元数据、资源和索引任务实现分离，外部调用路径保持不变。
 - [x] 现有 Rust/Web 行为测试不变且通过；模块移动没有改变公开 HTTP 合同、错误码或数据库行为。（最终 Rust/Web 全量质量门通过；此前曾观察到 `tests/users.rs::admin_can_manage_users_and_last_manager_is_protected` 的非确定性 503，见下方记录。）
 - [x] 每个增量独立可编译、可回滚，并记录模块边界和未纳入本任务的后续拆分。
 
@@ -5439,6 +5443,33 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 
 - 不新增 Rust 路由、数据库字段、自动播放策略或跨季度/跨剧集的播放队列。
 - 不改变账户设置中的“自动播放下一集”开关语义；本任务只提供显式按钮导航。
+
+#### LUX-232：数据库生命周期清理与写入膨胀控制
+
+数据库迁移完成后，Lux 在容器启动时后台自动执行一次幂等清理，并使用数据库标记记录完成状态；清理失败或进程中断时，下一次启动可以重试。清理不执行需要长时间独占数据库的全量压缩操作。
+
+验收：
+
+- [x] 升级迁移删除 `filesystem_entries` 上与唯一约束重复的显式索引，并为已有数据库写入一次性清理标记；空库和 SQLite/PostgreSQL 均可从迁移起点完成升级。
+- [x] 启动清理删除已完成扫描任务的 `scan_job_paths`、`reconciliation_scan_entries`，只删除终态任务中不再需要重试的 `scan_job_targets`，并将终态任务游标压缩为轻量摘要；运行中、后处理和仍可恢复的失败任务数据必须保留。
+- [x] `scan_job_events` 只保留 7 天内的 `WARN/ERROR`；扫描 INFO 过程事件不再持久化，事件保留清理在启动和新告警写入时执行。
+- [x] `person_credits` 刷新使用去重、差量删除和带变化条件的 UPSERT，未变化的关系不重复删除/插入/更新；实时文件变更采用防抖合并，避免每个事件产生完整扫描任务。
+- [x] 旧版本升级后的数据库清理由 Lux 容器自动触发，不依赖助手或管理员手工执行 SQL。
+
+验证：
+
+- `cargo build --locked`
+- `cargo test --locked --all-targets`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `uname -m`，并明确本机 ARM64 结果不外推 NAS/x86_64 性能。
+
+依赖：LUX-154、LUX-187、LUX-188、LUX-189。
+
+明确不做：
+
+- 不连接或直接修改用户线上 FNOS 数据库；本任务只交付迁移和容器启动逻辑。
+- 不删除运行中或失败后仍有待重试目标的扫描数据，不执行 `VACUUM FULL` 或等价的长时间独占式压缩。
 
 ## 26. 风险与缓解
 

@@ -4124,3 +4124,398 @@ async fn user_updates_wait_for_a_concurrent_sqlite_writer() {
 
     assert_eq!(updated.display_name, "Updated");
 }
+
+#[tokio::test]
+async fn database_lifecycle_cleanup_is_one_time_and_preserves_retry_state() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Cleanup", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("root directory");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("root path"))
+        .await
+        .expect("root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await
+        .expect("current timestamp");
+
+    for (job_id, job_type, status, cursor, current_item, cancel_requested) in [
+        (
+            "cleanup-completed",
+            "RECONCILE_LIBRARY",
+            "COMPLETED",
+            Some("completed-cursor"),
+            Some("completed-item"),
+            1_i64,
+        ),
+        (
+            "cleanup-failed",
+            "INCREMENTAL_SCAN",
+            "FAILED",
+            Some("failed-cursor"),
+            Some("failed-item"),
+            0_i64,
+        ),
+        (
+            "cleanup-active",
+            "INCREMENTAL_SCAN",
+            "RUNNING",
+            Some("active-cursor"),
+            Some("active-item"),
+            0_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_jobs (
+                id, library_id, job_type, status, generation, cursor,
+                current_item, cancel_requested, scan_phase, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'IDLE', ?, ?)",
+        )
+        .bind(job_id)
+        .bind(&library_id)
+        .bind(job_type)
+        .bind(status)
+        .bind(format!("generation-{job_id}"))
+        .bind(cursor)
+        .bind(current_item)
+        .bind(cancel_requested)
+        .bind(now - 10 * 86_400)
+        .bind(now - 10 * 86_400)
+        .execute(database.pool())
+        .await
+        .expect("scan job");
+    }
+    sqlx::query(
+        "INSERT INTO scan_jobs (
+            id, library_id, job_type, status, generation, cursor,
+            current_item, cancel_requested, scan_phase, created_at, updated_at
+         ) VALUES ('cleanup-postprocessing', ?, 'RECONCILE_LIBRARY', 'COMPLETED', ?,
+                   'postprocessing-cursor', 'postprocessing-item', 0, 'POSTPROCESSING', ?, ?)",
+    )
+    .bind(&library_id)
+    .bind("generation-cleanup-postprocessing")
+    .bind(now - 10 * 86_400)
+    .bind(now - 10 * 86_400)
+    .execute(database.pool())
+    .await
+    .expect("postprocessing scan job");
+
+    sqlx::query(
+        "INSERT INTO scan_job_paths (job_id, library_root_id, relative_path, change_kind)
+         VALUES ('cleanup-completed', ?, 'completed.mkv', 'MODIFY'),
+                ('cleanup-failed', ?, 'failed.mkv', 'MODIFY'),
+                ('cleanup-active', ?, 'active.mkv', 'MODIFY')",
+    )
+    .bind(&root_id)
+    .bind(&root_id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("scan job paths");
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+            job_id, library_root_id, relative_path, entry_type
+         ) VALUES ('cleanup-completed', ?, 'completed', 'FILE'),
+                  ('cleanup-failed', ?, 'failed', 'FILE'),
+                  ('cleanup-active', ?, 'active', 'FILE')",
+    )
+    .bind(&root_id)
+    .bind(&root_id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("reconciliation entries");
+
+    for (job_id, target_id, metadata_state) in [
+        ("cleanup-completed", "completed-target", "DONE"),
+        ("cleanup-failed", "failed-target-done", "DONE"),
+        ("cleanup-failed", "failed-target-retry", "FAILED"),
+        ("cleanup-active", "active-target", "PENDING"),
+        ("cleanup-postprocessing", "postprocessing-target", "PENDING"),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_job_targets (
+                job_id, target_type, target_id, item_id, change_kind,
+                probe_state, metadata_state, thumbnail_state
+             ) VALUES (?, 'ITEM', ?, ?, 'CHANGED', 'SKIPPED', ?, 'SKIPPED')",
+        )
+        .bind(job_id)
+        .bind(target_id)
+        .bind(target_id)
+        .bind(metadata_state)
+        .execute(database.pool())
+        .await
+        .expect("scan target");
+    }
+
+    sqlx::query(
+        "INSERT INTO scan_job_events (id, job_id, level, event_code, message, created_at)
+         VALUES ('cleanup-info', 'cleanup-completed', 'INFO', 'INFO', 'info', ?),
+                ('cleanup-old-warn', 'cleanup-completed', 'WARN', 'WARN', 'old warn', ?),
+                ('cleanup-old-error', 'cleanup-completed', 'ERROR', 'ERROR', 'old error', ?),
+                ('cleanup-recent-warn', 'cleanup-completed', 'WARN', 'WARN', 'recent warn', ?)",
+    )
+    .bind(now - 8 * 86_400)
+    .bind(now - 8 * 86_400)
+    .bind(now - 8 * 86_400)
+    .bind(now - 86_400)
+    .execute(database.pool())
+    .await
+    .expect("scan events");
+
+    let report = database
+        .run_database_lifecycle_cleanup()
+        .await
+        .expect("cleanup")
+        .expect("cleanup should be claimed");
+    assert_eq!(report.scan_job_paths_deleted, 1);
+    assert_eq!(report.reconciliation_entries_deleted, 1);
+    assert_eq!(report.scan_job_targets_deleted, 2);
+    assert_eq!(report.scan_job_events_deleted, 3);
+    assert_eq!(report.scan_jobs_summarized, 2);
+
+    let remaining_paths: Vec<String> =
+        sqlx::query_scalar("SELECT job_id FROM scan_job_paths ORDER BY job_id")
+            .fetch_all(database.pool())
+            .await
+            .expect("remaining paths");
+    assert_eq!(remaining_paths, ["cleanup-active", "cleanup-failed"]);
+    let remaining_entries: Vec<String> =
+        sqlx::query_scalar("SELECT job_id FROM reconciliation_scan_entries ORDER BY job_id")
+            .fetch_all(database.pool())
+            .await
+            .expect("remaining entries");
+    assert_eq!(remaining_entries, ["cleanup-active", "cleanup-failed"]);
+    let remaining_targets: Vec<(String, String)> =
+        sqlx::query_as("SELECT job_id, target_id FROM scan_job_targets ORDER BY job_id, target_id")
+            .fetch_all(database.pool())
+            .await
+            .expect("remaining targets");
+    assert_eq!(
+        remaining_targets,
+        [
+            ("cleanup-active".to_owned(), "active-target".to_owned()),
+            (
+                "cleanup-failed".to_owned(),
+                "failed-target-retry".to_owned()
+            ),
+            (
+                "cleanup-postprocessing".to_owned(),
+                "postprocessing-target".to_owned()
+            ),
+        ]
+    );
+    let event_levels: Vec<String> =
+        sqlx::query_scalar("SELECT level FROM scan_job_events ORDER BY id")
+            .fetch_all(database.pool())
+            .await
+            .expect("remaining events");
+    assert_eq!(event_levels, ["WARN"]);
+
+    let summary: (Option<String>, Option<String>, i64) = sqlx::query_as(
+        "SELECT cursor, current_item, cancel_requested
+         FROM scan_jobs WHERE id = 'cleanup-completed'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("completed summary");
+    assert_eq!(summary, (None, None, 0));
+    let active_cursor: Option<String> =
+        sqlx::query_scalar("SELECT cursor FROM scan_jobs WHERE id = 'cleanup-active'")
+            .fetch_one(database.pool())
+            .await
+            .expect("active job");
+    assert_eq!(active_cursor.as_deref(), Some("active-cursor"));
+    let postprocessing_summary: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT cursor, current_item FROM scan_jobs
+         WHERE id = 'cleanup-postprocessing'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("postprocessing job");
+    assert_eq!(
+        postprocessing_summary,
+        (
+            Some("postprocessing-cursor".to_owned()),
+            Some("postprocessing-item".to_owned())
+        )
+    );
+
+    assert!(
+        database
+            .run_database_lifecycle_cleanup()
+            .await
+            .expect("second cleanup")
+            .is_none()
+    );
+    let marker: String = sqlx::query_scalar(
+        "SELECT value FROM lux_meta WHERE key = 'database_lifecycle_cleanup_v1'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("cleanup marker");
+    assert_eq!(marker, "COMPLETED");
+
+    sqlx::query(
+        "INSERT INTO scan_job_events
+            (id, job_id, level, event_code, message, created_at)
+         VALUES ('cleanup-expired-after-completion', 'cleanup-completed',
+                 'ERROR', 'ERROR', 'expired after first run', ?)",
+    )
+    .bind(now - 8 * 86_400)
+    .execute(database.pool())
+    .await
+    .expect("expired scan event");
+    assert!(
+        database
+            .run_database_lifecycle_cleanup()
+            .await
+            .expect("recurring event cleanup")
+            .is_none()
+    );
+    let expired_event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_events
+         WHERE id = 'cleanup-expired-after-completion'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("expired event count");
+    assert_eq!(expired_event_count, 0);
+}
+
+#[tokio::test]
+async fn person_credit_refresh_preserves_unchanged_rows() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("People", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('credit-refresh-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    let credit = |person_id: &str, name: &str, role: &str| NewPersonCredit {
+        person_id: person_id.to_owned(),
+        lux_person_id: None,
+        person_type: "Actor".to_owned(),
+        person_name: name.to_owned(),
+        provider: "tmdb".to_owned(),
+        role: role.to_owned(),
+        sort_order: 0,
+        biography: None,
+        birthday: None,
+        deathday: None,
+        known_for_department: None,
+        place_of_birth: None,
+        provider_ids: BTreeMap::new(),
+        genres: Vec::new(),
+        tags: Vec::new(),
+        production_locations: Vec::new(),
+        premiere_date: None,
+        production_year: None,
+        taglines: Vec::new(),
+    };
+    let initial = vec![
+        credit("person-1", "Actor One", "Lead"),
+        credit("person-2", "Actor Two", "Friend"),
+    ];
+    database
+        .replace_person_credits("credit-refresh-item", &initial)
+        .await
+        .expect("initial credits");
+    let unchanged_row_id: i64 = sqlx::query_scalar(
+        "SELECT rowid FROM person_credits
+         WHERE item_id = 'credit-refresh-item' AND person_id = 'person-1'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("initial row");
+    sqlx::query(
+        "CREATE TABLE person_credit_update_probe (count INTEGER NOT NULL);
+         INSERT INTO person_credit_update_probe (count) VALUES (0);
+         CREATE TRIGGER person_credit_update_probe_trigger
+         AFTER UPDATE ON person_credits
+         BEGIN
+             UPDATE person_credit_update_probe SET count = count + 1;
+         END;",
+    )
+    .execute(database.pool())
+    .await
+    .expect("update probe");
+
+    database
+        .replace_person_credits("credit-refresh-item", &initial)
+        .await
+        .expect("unchanged credits");
+    let same_row_id: i64 = sqlx::query_scalar(
+        "SELECT rowid FROM person_credits
+         WHERE item_id = 'credit-refresh-item' AND person_id = 'person-1'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("unchanged row");
+    assert_eq!(same_row_id, unchanged_row_id);
+    let unchanged_updates: i64 = sqlx::query_scalar("SELECT count FROM person_credit_update_probe")
+        .fetch_one(database.pool())
+        .await
+        .expect("unchanged update count");
+    assert_eq!(unchanged_updates, 0);
+
+    let mut refreshed_credit = credit("person-1", "Actor One Updated", "Lead");
+    refreshed_credit.lux_person_id = Some("lux-person-1".to_owned());
+    let refreshed = vec![refreshed_credit, credit("person-3", "Actor Three", "New")];
+    database
+        .replace_person_credits("credit-refresh-item", &refreshed)
+        .await
+        .expect("changed credits");
+    let changed_credit: (i64, String, Option<String>) = sqlx::query_as(
+        "SELECT rowid, person_name, lux_person_id FROM person_credits
+         WHERE item_id = 'credit-refresh-item' AND person_id = 'person-1'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("changed row");
+    assert_eq!(changed_credit.0, unchanged_row_id);
+    assert_eq!(changed_credit.1, "Actor One Updated");
+    assert_eq!(changed_credit.2.as_deref(), Some("lux-person-1"));
+    let changed_updates: i64 = sqlx::query_scalar("SELECT count FROM person_credit_update_probe")
+        .fetch_one(database.pool())
+        .await
+        .expect("changed update count");
+    assert_eq!(changed_updates, 1);
+    let remaining_people: Vec<String> = sqlx::query_scalar(
+        "SELECT person_id FROM person_credits
+         WHERE item_id = 'credit-refresh-item' ORDER BY person_id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("remaining credits");
+    assert_eq!(remaining_people, ["person-1", "person-3"]);
+}

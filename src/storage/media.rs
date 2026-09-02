@@ -143,7 +143,7 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path, fe.relative_path,
+            "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at,
                     mi.title, mi.production_year
              FROM media_sources ms
@@ -159,7 +159,6 @@ impl Database {
         .await
         .map(|row| {
             row.map(|row| StoredItemSourceLocator {
-                item_id: row.get("item_id"),
                 root_path: row.get("canonical_path"),
                 relative_path: row.get("relative_path"),
                 fingerprint: row.get("fingerprint"),
@@ -181,7 +180,7 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path, fe.relative_path,
+            "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at,
                     mi.title, mi.production_year
              FROM media_sources ms
@@ -199,7 +198,6 @@ impl Database {
         .await
         .map(|row| {
             row.map(|row| StoredItemSourceLocator {
-                item_id: row.get("item_id"),
                 root_path: row.get("canonical_path"),
                 relative_path: row.get("relative_path"),
                 fingerprint: row.get("fingerprint"),
@@ -220,7 +218,7 @@ impl Database {
         fingerprint: &[u8],
     ) -> Result<Vec<StoredItemSourceLocator>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path, fe.relative_path,
+            "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at,
                     mi.title, mi.production_year
              FROM media_sources ms
@@ -237,7 +235,6 @@ impl Database {
         .map(|rows| {
             rows.into_iter()
                 .map(|row| StoredItemSourceLocator {
-                    item_id: row.get("item_id"),
                     root_path: row.get("canonical_path"),
                     relative_path: row.get("relative_path"),
                     fingerprint: row.get("fingerprint"),
