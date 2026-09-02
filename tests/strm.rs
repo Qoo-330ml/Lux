@@ -200,6 +200,18 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         popcorn_detail_body["MediaSources"][0]["Id"],
         remote_source_id
     );
+    assert_eq!(popcorn_detail_body["Path"], remote_target);
+
+    let path_detail = client
+        .get(format!(
+            "http://{address}/Items/{path_item_id}?Fields=Path,MediaSources"
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(path_detail.status(), reqwest::StatusCode::OK);
+    let path_detail_body = path_detail.json::<Value>().await?;
+    assert_eq!(path_detail_body["Path"], "targets/movie (4K).target");
 
     let popcorn_playback = client
         .post(format!(

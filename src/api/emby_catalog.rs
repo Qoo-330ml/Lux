@@ -3447,10 +3447,19 @@ pub(super) fn emby_file_name(
     Some(format!("{}.{}", item.title, container))
 }
 
-/// Emby always exposes a filesystem path on item DTOs. Lux never reveals real
-/// local paths, so synthesize a stable, harmless path from the library id and
-/// title; clients only display this value.
+/// Emby always exposes a filesystem path on item DTOs. External proxies need
+/// the original STRM target here to map playback, while ordinary local media
+/// continues to use a stable, harmless path instead of revealing the real
+/// filesystem location.
 pub(super) fn emby_safe_path(item: &CatalogItem, default_source: Option<&CatalogSource>) -> String {
+    if let Some(target) = default_source
+        .filter(|source| source.source_kind == "STRM_URL")
+        .and_then(|source| source.external_url.as_deref())
+        .filter(|target| !target.is_empty())
+    {
+        return target.to_owned();
+    }
+
     let title = &item.title;
     if matches!(
         item.item_type.as_str(),
