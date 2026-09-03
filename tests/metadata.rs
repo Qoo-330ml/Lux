@@ -830,3 +830,43 @@ async fn metadata_enrichment_ignores_conflicts_without_available_sources()
     assert!(current.2.is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn metadata_enrichment_allows_nfo_variants_in_one_movie_folder()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Variant Movie");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    for variant in ["有码", "破解"] {
+        tokio::fs::write(movie_dir.join(format!("Movie {variant}.mkv")), b"movie").await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Movie {variant}.nfo")),
+            "<movie><title>Variant Movie</title><year>2024</year></movie>",
+        )
+        .await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(report.nfo_loaded, 2);
+    assert_eq!(report.nfo_failed, 0);
+    Ok(())
+}
