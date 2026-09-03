@@ -237,11 +237,14 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     let popcorn_direct_url = popcorn_playback_body["MediaSources"][0]["DirectStreamUrl"]
         .as_str()
-        .ok_or("missing original popcorn direct stream URL")?;
-    assert_eq!(popcorn_direct_url, remote_target);
+        .ok_or("missing standard popcorn direct stream URL")?;
+    assert_eq!(
+        popcorn_direct_url,
+        format!("/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}")
+    );
     assert_eq!(
         popcorn_playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
-        false
+        true
     );
 
     let playback = client
@@ -260,9 +263,12 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
     let remote_direct_url = body["MediaSources"][0]["DirectStreamUrl"]
         .as_str()
-        .ok_or("missing original remote direct stream URL")?;
-    assert_eq!(remote_direct_url, remote_target);
-    assert_eq!(body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"], false);
+        .ok_or("missing standard remote direct stream URL")?;
+    assert_eq!(
+        remote_direct_url,
+        format!("/Videos/{remote_item_id}/stream?MediaSourceId={remote_source_id}")
+    );
+    assert_eq!(body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"], true);
 
     let path_playback = client
         .get(format!(
@@ -278,11 +284,14 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(path_body["MediaSources"][0]["SupportsDirectPlay"], true);
     let path_direct_url = path_body["MediaSources"][0]["DirectStreamUrl"]
         .as_str()
-        .ok_or("missing original path direct stream URL")?;
-    assert_eq!(path_direct_url, "targets/movie (4K).target");
+        .ok_or("missing standard path direct stream URL")?;
+    assert_eq!(
+        path_direct_url,
+        format!("/Videos/{path_item_id}/stream?MediaSourceId={path_source_id}")
+    );
     assert_eq!(
         path_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
-        false
+        true
     );
 
     let no_redirect_client = reqwest::Client::builder()
