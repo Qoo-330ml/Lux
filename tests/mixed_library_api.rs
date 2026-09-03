@@ -10,6 +10,12 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 async fn emby_login(
     client: &reqwest::Client,
     base_url: &str,
@@ -59,6 +65,7 @@ async fn all_emby_clients_use_the_standard_mixed_library_shape()
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::new();
+    let emby_library_id = emby_public_id(&library.id.to_string());
 
     let emby_token = emby_login(&client, &base_url, "Emby").await?;
     let emby_views = client
@@ -68,7 +75,7 @@ async fn all_emby_clients_use_the_standard_mixed_library_shape()
         .await?
         .json::<Value>()
         .await?;
-    assert_eq!(emby_views["Items"][0]["Id"], library.id.to_string());
+    assert_eq!(emby_views["Items"][0]["Id"], emby_library_id);
     assert!(emby_views["Items"][0]["CollectionType"].is_null());
 
     let vidhub_token = emby_login(&client, &base_url, "VidHub").await?;
@@ -79,13 +86,13 @@ async fn all_emby_clients_use_the_standard_mixed_library_shape()
         .await?
         .json::<Value>()
         .await?;
-    assert_eq!(vidhub_views["Items"][0]["Id"], library.id.to_string());
+    assert_eq!(vidhub_views["Items"][0]["Id"], emby_library_id);
     assert!(vidhub_views["Items"][0]["CollectionType"].is_null());
 
     let vidhub_detail = client
         .get(format!(
             "{base_url}/Users/{}/Items/{}",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &vidhub_token)
         .send()
@@ -121,13 +128,13 @@ async fn all_emby_clients_use_the_standard_mixed_library_shape()
         .await?
         .json::<Value>()
         .await?;
-    assert_eq!(yamby_views["Items"][0]["Id"], library.id.to_string());
+    assert_eq!(yamby_views["Items"][0]["Id"], emby_library_id);
     assert!(yamby_views["Items"][0]["CollectionType"].is_null());
 
     let yamby_detail = client
         .get(format!(
             "{base_url}/Users/{}/Items/{}",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &yamby_token)
         .send()

@@ -26,6 +26,12 @@ const PNG_1X1: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -119,6 +125,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
+    let emby_library_id = emby_public_id(&library.id.to_string());
+    let emby_series_library_id = emby_public_id(&series_library.id.to_string());
+    let emby_item_id = emby_public_id(&item_id);
+    let emby_beta_item_id = emby_public_id(&beta_item_id);
+    let emby_alpha_parent_id = emby_public_id(&alpha_parent_id);
     sqlx::query(
         "INSERT INTO media_streams (
             id, media_source_id, stream_index, stream_type, codec, title,
@@ -295,15 +306,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(views_body["TotalRecordCount"], 2);
     let movie_view = views_body["Items"]
         .as_array()
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|item| item["Id"] == library.id.to_string())
-        })
+        .and_then(|items| items.iter().find(|item| item["Id"] == emby_library_id))
         .ok_or("missing movie library view")?;
     assert_eq!(movie_view["CollectionType"], "movies");
     assert_eq!(movie_view["ChildCount"], 2);
-    assert_eq!(movie_view["PrimaryImageItemId"], library.id.to_string());
+    assert_eq!(movie_view["PrimaryImageItemId"], emby_library_id);
     let cover_tag = movie_view["ImageTags"]["Primary"]
         .as_str()
         .ok_or("missing movie library cover tag")?;
@@ -313,7 +320,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .and_then(|items| {
             items
                 .iter()
-                .find(|item| item["Id"] == series_library.id.to_string())
+                .find(|item| item["Id"] == emby_series_library_id)
         })
         .ok_or("missing series library view")?;
     assert_eq!(shows_view["CollectionType"], "tvshows");
@@ -373,14 +380,14 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_library_detail = client
         .get(format!(
             "{base_url}/Users/{}/Items/{}?EnableUserData=true&Fields=CollectionType,ChildCount",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
         .await?;
     assert_eq!(emby_library_detail.status(), reqwest::StatusCode::OK);
     let emby_library_detail_body: Value = emby_library_detail.json().await?;
-    assert_eq!(emby_library_detail_body["Id"], library.id.to_string());
+    assert_eq!(emby_library_detail_body["Id"], emby_library_id);
     assert_eq!(emby_library_detail_body["Name"], "Movies");
     assert_eq!(emby_library_detail_body["Type"], "CollectionFolder");
     assert_eq!(emby_library_detail_body["IsFolder"], true);
@@ -388,7 +395,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_library_detail_body["ChildCount"], 2);
 
     let emby_cover = client
-        .get(format!("{base_url}/Items/{}/Images/Primary", library.id))
+        .get(format!("{base_url}/Items/{emby_library_id}/Images/Primary"))
         .header("X-Emby-Token", &admin_token)
         .send()
         .await?;
@@ -399,7 +406,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_capability_cover = client
         .get(format!(
             "{base_url}/emby/Items/{}/Images/Primary?tag={cover_tag}",
-            library.id
+            emby_library_id
         ))
         .send()
         .await?;
@@ -409,7 +416,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_page = client
         .get(format!(
             "{base_url}/Users/{}/Items?ParentId={}&Limit=1",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -432,7 +439,10 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_page_body["Items"][0]["Genres"], json!(["动作"]));
     assert_eq!(emby_page_body["Items"][0]["Studios"][0]["Name"], "本地影业");
     assert!(emby_page_body["Items"][0]["Studios"][0]["Id"].is_string());
-    assert_eq!(emby_page_body["Items"][0]["PrimaryImageItemId"], item_id);
+    assert_eq!(
+        emby_page_body["Items"][0]["PrimaryImageItemId"],
+        emby_item_id
+    );
     assert_eq!(
         emby_page_body["Items"][0]["ImageTags"]["Primary"],
         alpha_poster_id
@@ -441,7 +451,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         emby_page_body["Items"][0]["BackdropImageTags"][0],
         alpha_fanart_id
     );
-    assert_eq!(emby_page_body["Items"][0]["ParentId"], alpha_parent_id);
+    assert_eq!(emby_page_body["Items"][0]["ParentId"], emby_alpha_parent_id);
     assert_eq!(
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
         "mkv"
@@ -450,7 +460,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let empty_optional_favorite = client
         .get(format!(
             "{base_url}/emby/Users/{}/Items?ParentId={}&IncludeItemTypes=Movie&Recursive=true&Limit=50&StartIndex=0&IsFavorite=",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -462,7 +472,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let latest_with_empty_optional_favorite = client
         .get(format!(
             "{base_url}/emby/Users/{}/Items/Latest?ParentId={}&Limit=16&IsFavorite=",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -483,7 +493,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_people_page = client
         .get(format!(
             "{base_url}/Users/{}/Items?ParentId={}&Limit=1&Fields=People",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -506,7 +516,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let popcorn_items = client
         .get(format!(
             "{base_url}/emby/Users/{}/Items?ExcludeItemTypes=Audio%2CBook%2CMusicVideo%2CMusicAlbum%2CGame%2CPhoto&StartIndex=0&Limit=50&ParentId={}&IncludeItemTypes=Movie&Recursive=true&SortOrder=Descending&SortBy=DateCreated%2CSortName&Fields=BasicSyncInfo%2CChildCount%2CRunTimeTicks%2CCommunityRating%2CPremiereDate%2CProductionYear%2CCanDownload",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -583,7 +593,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         Some(2)
     );
     assert_eq!(popcorn_item["PremiereDate"], "2020-01-02T00:00:00.0000000Z");
-    assert_eq!(popcorn_item["ParentId"], alpha_parent_id);
+    assert_eq!(popcorn_item["ParentId"], emby_alpha_parent_id);
     assert!(
         !popcorn_item["UserData"]
             .as_object()
@@ -593,7 +603,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     let folder_children = client
         .get(format!(
-            "{base_url}/Users/{}/Items?ParentId={alpha_parent_id}&IncludeItemTypes=Movie&Limit=50",
+            "{base_url}/Users/{}/Items?ParentId={emby_alpha_parent_id}&IncludeItemTypes=Movie&Limit=50",
             admin.id
         ))
         .header("X-Emby-Token", &admin_token)
@@ -602,11 +612,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(folder_children.status(), reqwest::StatusCode::OK);
     let folder_children_body: Value = folder_children.json().await?;
     assert_eq!(folder_children_body["TotalRecordCount"], 1);
-    assert_eq!(folder_children_body["Items"][0]["Id"], item_id);
+    assert_eq!(folder_children_body["Items"][0]["Id"], emby_item_id);
 
     let filtered_by_item_id = client
         .get(format!(
-            "{base_url}/Items?Ids={item_id}&Fields=Path,MediaSources&Limit=1"
+            "{base_url}/Items?Ids={emby_item_id}&Fields=Path,MediaSources&Limit=1"
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -618,11 +628,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         filtered_by_item_id_body["Items"].as_array().map(Vec::len),
         Some(1)
     );
-    assert_eq!(filtered_by_item_id_body["Items"][0]["Id"], item_id);
+    assert_eq!(filtered_by_item_id_body["Items"][0]["Id"], emby_item_id);
 
     let filtered_by_multiple_item_ids = client
         .get(format!(
-            "{base_url}/Items?Ids={item_id},{beta_item_id}&Limit=10"
+            "{base_url}/Items?Ids={emby_item_id},{emby_beta_item_id}&Limit=10"
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -659,21 +669,24 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
             .map(Vec::len),
         Some(1)
     );
-    assert_eq!(filtered_by_media_source_id_body["Items"][0]["Id"], item_id);
+    assert_eq!(
+        filtered_by_media_source_id_body["Items"][0]["Id"],
+        emby_item_id
+    );
     assert_eq!(
         filtered_by_media_source_id_body["Items"][0]["MediaSources"][0]["Id"],
         alpha_source_id
     );
 
     let unprojected_item_lookup = client
-        .get(format!("{base_url}/Items?Ids={item_id}&Limit=1"))
+        .get(format!("{base_url}/Items?Ids={emby_item_id}&Limit=1"))
         .header("X-Emby-Token", &admin_token)
         .send()
         .await?;
     assert_eq!(unprojected_item_lookup.status(), reqwest::StatusCode::OK);
     let unprojected_item_lookup_body: Value = unprojected_item_lookup.json().await?;
     assert_eq!(unprojected_item_lookup_body["TotalRecordCount"], 1);
-    assert_eq!(unprojected_item_lookup_body["Items"][0]["Id"], item_id);
+    assert_eq!(unprojected_item_lookup_body["Items"][0]["Id"], emby_item_id);
 
     let unprojected_media_source_lookup = client
         .get(format!("{base_url}/Items?Ids={alpha_source_id}&Limit=1"))
@@ -689,7 +702,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(unprojected_media_source_lookup_body["TotalRecordCount"], 1);
     assert_eq!(
         unprojected_media_source_lookup_body["Items"][0]["Id"],
-        item_id
+        emby_item_id
     );
     assert_eq!(
         unprojected_media_source_lookup_body["Items"][0]["MediaSources"][0]["Id"],
@@ -716,7 +729,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_compact_page = client
         .get(format!(
             "{base_url}/Users/{}/Items?ParentId={}&Limit=1&Fields=BasicSyncInfo,Container",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -736,7 +749,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let emby_latest = client
         .get(format!(
             "{base_url}/Users/{}/Items/Latest?ParentId={}&Limit=2",
-            admin.id, library.id
+            admin.id, emby_library_id
         ))
         .header("X-Emby-Token", &admin_token)
         .send()
@@ -748,23 +761,25 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .ok_or("Emby latest items should be returned as a bare array")?;
     assert_eq!(emby_latest_items.len(), 2);
     assert_eq!(emby_latest_items[0]["Name"], "Alpha Movie");
-    assert_eq!(emby_latest_items[0]["ParentId"], alpha_parent_id);
-    assert_eq!(emby_latest_items[0]["PrimaryImageItemId"], item_id);
+    assert_eq!(emby_latest_items[0]["ParentId"], emby_alpha_parent_id);
+    assert_eq!(emby_latest_items[0]["PrimaryImageItemId"], emby_item_id);
     assert_eq!(
         emby_latest_items[0]["ImageTags"]["Primary"],
         alpha_poster_id
     );
 
     let detail = client
-        .get(format!("{base_url}/Items/{item_id}?api_key={admin_token}"))
+        .get(format!(
+            "{base_url}/Items/{emby_item_id}?api_key={admin_token}"
+        ))
         .send()
         .await?;
     assert_eq!(detail.status(), reqwest::StatusCode::OK);
     let detail_body: Value = detail.json().await?;
-    assert_eq!(detail_body["Id"], item_id);
+    assert_eq!(detail_body["Id"], emby_item_id);
     assert_eq!(detail_body["Name"], "Alpha Movie");
     assert_eq!(detail_body["ProductionYear"], 2020);
-    assert_eq!(detail_body["PrimaryImageItemId"], item_id);
+    assert_eq!(detail_body["PrimaryImageItemId"], emby_item_id);
     assert_eq!(detail_body["ImageTags"]["Primary"], alpha_poster_id);
     assert_eq!(
         detail_body["PrimaryImageAspectRatio"].as_f64(),
@@ -773,7 +788,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     let user_scoped_detail = client
         .get(format!(
-            "{base_url}/emby/Users/{}/Items/{item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload",
+            "{base_url}/emby/Users/{}/Items/{emby_item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload",
             admin.id
         ))
         .header("X-Emby-Token", &admin_token)
@@ -781,7 +796,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(user_scoped_detail.status(), reqwest::StatusCode::OK);
     let user_scoped_detail_body: Value = user_scoped_detail.json().await?;
-    assert_eq!(user_scoped_detail_body["Id"], item_id);
+    assert_eq!(user_scoped_detail_body["Id"], emby_item_id);
     assert_eq!(user_scoped_detail_body["Name"], "Alpha Movie");
     assert!(user_scoped_detail_body["MediaSources"].is_array());
     assert_eq!(
@@ -817,7 +832,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     );
     assert_eq!(
         user_scoped_detail_body["MediaSources"][0]["ItemId"],
-        item_id
+        emby_item_id
     );
     assert_eq!(
         user_scoped_detail_body["MediaSources"][0]["DefaultAudioStreamIndex"],
@@ -873,9 +888,12 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .await?;
     assert_eq!(popcorn_detail.status(), reqwest::StatusCode::OK);
     let popcorn_detail_body: Value = popcorn_detail.json().await?;
-    assert_eq!(popcorn_detail_body["Id"], item_id);
+    assert_eq!(popcorn_detail_body["Id"], emby_item_id);
     assert!(popcorn_detail_body["MediaSources"].is_array());
-    assert_eq!(popcorn_detail_body["MediaSources"][0]["ItemId"], item_id);
+    assert_eq!(
+        popcorn_detail_body["MediaSources"][0]["ItemId"],
+        emby_item_id
+    );
     assert_eq!(popcorn_detail_body["SupportsSync"], true);
     assert_eq!(popcorn_detail_body["RunTimeTicks"], 75600000000_i64);
     // The Android filmly client maps the standard Emby detail scaffolding as
@@ -901,8 +919,8 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(popcorn_detail_body["LocalTrailerCount"], 0);
     assert_eq!(popcorn_detail_body["PartCount"], 1);
     assert_eq!(popcorn_detail_body["ForcedSortName"], "alpha movie");
-    assert_eq!(popcorn_detail_body["DisplayPreferencesId"], item_id);
-    assert_eq!(popcorn_detail_body["PresentationUniqueKey"], item_id);
+    assert_eq!(popcorn_detail_body["DisplayPreferencesId"], emby_item_id);
+    assert_eq!(popcorn_detail_body["PresentationUniqueKey"], emby_item_id);
     assert_eq!(popcorn_detail_body["Width"], 1920);
     assert_eq!(popcorn_detail_body["Height"], 1080);
     assert!(popcorn_detail_body["Etag"].is_string());
@@ -1240,8 +1258,11 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_resume.status(), reqwest::StatusCode::OK);
     let emby_resume_body: Value = emby_resume.json().await?;
     assert_eq!(emby_resume_body["TotalRecordCount"], 1);
-    assert_eq!(emby_resume_body["Items"][0]["Id"], item_id);
-    assert_eq!(emby_resume_body["Items"][0]["PrimaryImageItemId"], item_id);
+    assert_eq!(emby_resume_body["Items"][0]["Id"], emby_item_id);
+    assert_eq!(
+        emby_resume_body["Items"][0]["PrimaryImageItemId"],
+        emby_item_id
+    );
     assert_eq!(
         emby_resume_body["Items"][0]["ImageTags"]["Primary"],
         alpha_poster_id

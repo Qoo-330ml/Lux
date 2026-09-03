@@ -16,6 +16,12 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::mpsc};
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn playback_webhooks_emit_edges_and_throttled_progress()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -61,6 +67,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
         sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
             .fetch_one(database.pool())
             .await?;
+    let emby_item_id = emby_public_id(&item_id);
 
     let webhook_service = WebhookService::new(database.clone(), temp_dir.path().join("config"))?;
     webhook_service
@@ -107,7 +114,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
         .to_owned();
 
     let common = json!({
-        "ItemId": item_id,
+        "ItemId": emby_item_id,
         "PlaySessionId": "playback-hook-session",
         "PositionTicks": 100,
         "RunTimeTicks": 10_000,
@@ -128,6 +135,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
     let started: Value =
         serde_json::from_slice(&receiver.recv().await.ok_or("missing started event")?)?;
     assert_eq!(started["eventType"], "PLAYBACK_STARTED");
+    assert_eq!(started["itemId"], emby_item_id);
     assert!(started.get("userId").is_none());
 
     sqlx::query(
@@ -186,6 +194,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
     let stopped_event: Value =
         serde_json::from_slice(&receiver.recv().await.ok_or("missing stopped event")?)?;
     assert_eq!(stopped_event["eventType"], "PLAYBACK_STOPPED");
+    assert_eq!(stopped_event["itemId"], emby_item_id);
 
     let event_types: Vec<String> =
         sqlx::query_scalar("SELECT event_type FROM notification_events ORDER BY occurred_at, id")

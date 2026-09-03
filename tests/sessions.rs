@@ -11,6 +11,12 @@ use serde_json::{Value, json};
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn playback_events_are_idempotent_and_positions_never_regress()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +53,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    let emby_item_id = emby_public_id(&item_id);
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -83,7 +90,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .to_owned();
     let event_url = format!("{base_url}/Sessions/Playing");
     let event = json!({
-        "ItemId": item_id,
+        "ItemId": emby_item_id,
         "MediaSourceId": source_id,
         "PlaySessionId": "session-1",
         "PositionTicks": 100,
@@ -148,7 +155,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let sessions_body = sessions.json::<Value>().await?;
     assert_eq!(sessions_body.as_array().map(Vec::len), Some(1));
     assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 900);
-    assert_eq!(sessions_body[0]["NowPlayingItem"]["Id"], event["ItemId"]);
+    assert_eq!(sessions_body[0]["NowPlayingItem"]["Id"], emby_item_id);
     assert_eq!(sessions_body[0]["NowPlayingItem"]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["DeviceId"], "session-device");
@@ -167,7 +174,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .post(&event_url)
         .header("X-Emby-Token", &token)
         .json(&json!({
-            "ItemId": item_id,
+            "ItemId": emby_item_id,
             "MediaSourceId": source_id,
             "PlaySessionId": "session-without-duration",
             "PositionTicks": 100,
@@ -196,7 +203,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .post(format!("{event_url}/Stopped"))
         .header("X-Emby-Token", &token)
         .json(&json!({
-            "ItemId": item_id,
+            "ItemId": emby_item_id,
             "MediaSourceId": source_id,
             "PlaySessionId": "session-without-duration",
             "PositionTicks": 100,
@@ -295,7 +302,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         "SELECT position_ticks FROM user_item_state
          WHERE item_id = ? LIMIT 1",
     )
-    .bind(event["ItemId"].as_str().ok_or("missing item id")?)
+    .bind(&item_id)
     .fetch_one(database.pool())
     .await?;
     assert_eq!(position, 900);

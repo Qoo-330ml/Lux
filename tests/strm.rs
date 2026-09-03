@@ -196,11 +196,44 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(popcorn_detail.status(), reqwest::StatusCode::OK);
     let popcorn_detail_body = popcorn_detail.json::<Value>().await?;
     assert!(popcorn_detail_body["MediaSources"].is_array());
+    let remote_public_item_id = popcorn_detail_body["Id"]
+        .as_str()
+        .ok_or("missing proxy-compatible remote item id")?;
+    assert_ne!(remote_public_item_id, remote_item_id);
+    assert!(
+        remote_public_item_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    );
     assert_eq!(
         popcorn_detail_body["MediaSources"][0]["Id"],
         remote_source_id
     );
     assert_eq!(popcorn_detail_body["Path"], remote_target);
+
+    let public_detail = client
+        .get(format!("http://{address}/Items/{remote_public_item_id}"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(public_detail.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        public_detail.json::<Value>().await?["Id"],
+        remote_public_item_id
+    );
+
+    let public_playback = client
+        .get(format!(
+            "http://{address}/Items/{remote_public_item_id}/PlaybackInfo"
+        ))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(public_playback.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        public_playback.json::<Value>().await?["MediaSources"][0]["Path"],
+        remote_target
+    );
 
     let path_detail = client
         .get(format!(
@@ -212,6 +245,14 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(path_detail.status(), reqwest::StatusCode::OK);
     let path_detail_body = path_detail.json::<Value>().await?;
     assert_eq!(path_detail_body["Path"], "targets/movie (4K).target");
+    let path_public_item_id = path_detail_body["Id"]
+        .as_str()
+        .ok_or("missing numeric path item id")?;
+    assert!(
+        path_public_item_id
+            .chars()
+            .all(|character| character.is_ascii_digit())
+    );
 
     let popcorn_playback = client
         .post(format!(
@@ -305,6 +346,37 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         "http://media.example.test/cdn.mkv"
     );
 
+    let numeric_senplayer_stream = no_redirect_client
+        .get(format!(
+            "http://{address}/emby/videos/{remote_public_item_id}/stream.mkv"
+        ))
+        .query(&[("MediaSourceId", remote_source_id.as_str())])
+        .header(reqwest::header::USER_AGENT, player_user_agent)
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(
+        numeric_senplayer_stream.status(),
+        reqwest::StatusCode::TEMPORARY_REDIRECT
+    );
+    assert_eq!(
+        numeric_senplayer_stream.headers()[reqwest::header::LOCATION],
+        "http://media.example.test/cdn.mkv"
+    );
+
+    let numeric_path_stream = no_redirect_client
+        .get(format!(
+            "http://{address}/Videos/{path_public_item_id}/original.strm"
+        ))
+        .query(&[
+            ("MediaSourceId", path_source_id.as_str()),
+            ("api_key", token.as_str()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(numeric_path_stream.status(), reqwest::StatusCode::OK);
+    assert_eq!(numeric_path_stream.bytes().await?, "local path media");
+
     let duplicate_source_query_stream = no_redirect_client
         .get(format!(
             "http://{address}/emby/videos/{remote_item_id}/stream.mkv"
@@ -388,7 +460,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(source_id_items.status(), reqwest::StatusCode::OK);
     let source_id_body = source_id_items.json::<Value>().await?;
     assert_eq!(source_id_body["TotalRecordCount"], 1);
-    assert_eq!(source_id_body["Items"][0]["Id"], remote_item_id);
+    assert_eq!(source_id_body["Items"][0]["Id"], remote_public_item_id);
     assert_eq!(
         source_id_body["Items"][0]["MediaSources"][0]["Id"],
         remote_source_id
@@ -404,7 +476,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .await?;
     assert_eq!(source_id_detail.status(), reqwest::StatusCode::OK);
     let source_id_detail_body = source_id_detail.json::<Value>().await?;
-    assert_eq!(source_id_detail_body["Id"], remote_item_id);
+    assert_eq!(source_id_detail_body["Id"], remote_public_item_id);
     assert_eq!(
         source_id_detail_body["MediaSources"][0]["Id"],
         remote_source_id

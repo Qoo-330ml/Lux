@@ -12,6 +12,12 @@ use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -48,6 +54,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    let emby_item_id = emby_public_id(&item_id);
     let high_media_path = root.join("Range.Movie.2024.2160p.mkv");
     tokio::fs::write(&high_media_path, vec![b'X'; 8 * 1024 * 1024]).await?;
     LibraryScanner::new(database.clone())
@@ -91,7 +98,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .as_str()
         .ok_or("missing admin token")?
         .to_owned();
-    let stream_url = format!("{base_url}/Videos/{item_id}/stream");
+    let stream_url = format!("{base_url}/Videos/{emby_item_id}/stream");
 
     let full = client
         .get(&stream_url)
@@ -134,7 +141,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .as_str()
         .ok_or("missing generic direct stream URL")?;
     assert!(generic_direct_url.starts_with(&format!(
-        "/Videos/{item_id}/stream.mkv?MediaSourceId={source_id}&luxPlayback"
+        "/Videos/{emby_item_id}/stream.mkv?MediaSourceId={source_id}&luxPlayback"
     )));
     assert!(!generic_direct_url.contains(&token));
     assert_eq!(
@@ -149,7 +156,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_eq!(generic_stream.status(), reqwest::StatusCode::OK);
     assert_eq!(generic_stream.bytes().await?.as_ref(), b"0123456789");
     let yamby_playback = client
-        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .header(
             "X-Emby-Authorization",
             format!(
@@ -184,7 +191,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         reqwest::StatusCode::UNAUTHORIZED
     );
     let standard_stream = client
-        .get(format!("{base_url}/Videos/{item_id}/stream.mkv"))
+        .get(format!("{base_url}/Videos/{emby_item_id}/stream.mkv"))
         .query(&[
             ("MediaSourceId", source_id.as_str()),
             ("api_key", token.as_str()),
@@ -194,7 +201,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_eq!(standard_stream.status(), reqwest::StatusCode::OK);
     assert_eq!(standard_stream.bytes().await?.as_ref(), b"0123456789");
     let selected_playback = client
-        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .query(&[
             ("api_key", token.as_str()),
             ("mediaSourceId", high_source_id.as_str()),
@@ -208,7 +215,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
 
     let range_request = |start: u64, end: u64| {
         let client = client.clone();
-        let url = format!("{base_url}/Videos/{item_id}/{high_source_id}/stream.mkv");
+        let url = format!("{base_url}/Videos/{emby_item_id}/{high_source_id}/stream.mkv");
         let token = token.clone();
         async move {
             let mut response = client
@@ -244,7 +251,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     }
 
     let playback_post = client
-        .post(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .query(&[("api_key", token.as_str())])
         .send()
         .await?;
@@ -252,7 +259,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
 
     let source_route = client
         .get(format!(
-            "{base_url}/Videos/{item_id}/{source_id}/stream.mkv"
+            "{base_url}/Videos/{emby_item_id}/{source_id}/stream.mkv"
         ))
         .query(&[("api_key", token.as_str())])
         .send()
@@ -262,7 +269,7 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
 
     let legacy_container_route = client
         .get(format!(
-            "{base_url}/Videos/{item_id}/{source_id}/stream.matroska,webm"
+            "{base_url}/Videos/{emby_item_id}/{source_id}/stream.matroska,webm"
         ))
         .query(&[("api_key", token.as_str())])
         .send()
@@ -370,6 +377,7 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    let emby_item_id = emby_public_id(&item_id);
     sqlx::query("UPDATE media_sources SET duration_ticks = 1000 WHERE id = ?")
         .bind(&source_id)
         .execute(database.pool())
@@ -404,7 +412,7 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
         .to_owned();
     let playback_base = format!("{base_url}/Sessions/Playing");
     let common_event = json!({
-        "mediaServerItemId": item_id,
+        "mediaServerItemId": emby_item_id,
         "mediaServerMediaSourceId": source_id,
         "mediaServerPlaySessionId": "vidhub-playback-session",
         "RunTimeTicks": 1_000,
@@ -455,7 +463,10 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
     assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
 
     let item_response = client
-        .get(format!("{base_url}/Users/{}/Items/{item_id}", admin.id))
+        .get(format!(
+            "{base_url}/Users/{}/Items/{emby_item_id}",
+            admin.id
+        ))
         .header("X-Emby-Token", &token)
         .send()
         .await?;
@@ -463,7 +474,7 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
     let item_body = item_response.json::<Value>().await?;
     assert_eq!(item_body["UserData"]["PlaybackPositionTicks"], 300);
     assert_eq!(item_body["UserData"]["PlayedPercentage"], 30.0);
-    let library_id = library.id.to_string();
+    let library_id = emby_public_id(&library.id.to_string());
     let items_response = client
         .get(format!("{base_url}/Users/{}/Items", admin.id))
         .header("X-Emby-Token", &token)
@@ -509,7 +520,7 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
         .post(&playback_base)
         .header("X-Emby-Token", &token)
         .json(&json!({
-            "mediaServerItemId": item_id,
+            "mediaServerItemId": emby_item_id,
             "mediaServerMediaSourceId": source_id,
             "mediaServerPlaySessionId": "vidhub-completed-session",
             "RunTimeTicks": 1_000,

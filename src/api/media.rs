@@ -247,7 +247,7 @@ pub(super) async fn emby_search_hints(
         .iter()
         .map(|item| {
             json!({
-                "Id": item.id,
+                "Id": emby_public_id(&item.id),
                 "Name": item.title,
                 "Type": emby_item_type(&item.item_type),
                 "MediaType": "Video",
@@ -1419,6 +1419,7 @@ pub(super) async fn emby_image(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    let internal_item_id = emby_internal_id(&item_id);
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -1469,8 +1470,15 @@ pub(super) async fn emby_image(
         && query.tag.is_none()
         && normalize_image_type(&image_type) == Some("FANART");
     if (filmly_compat || untagged_backdrop_compat) && user.is_none() {
-        return serve_filmly_compat_image(images, &headers, &method, &item_id, &image_type, 0)
-            .await;
+        return serve_filmly_compat_image(
+            images,
+            &headers,
+            &method,
+            &internal_item_id,
+            &image_type,
+            0,
+        )
+        .await;
     }
     match principal {
         Some(principal) => {
@@ -1479,7 +1487,7 @@ pub(super) async fn emby_image(
                 principal,
                 &headers,
                 &method,
-                &item_id,
+                &internal_item_id,
                 &image_type,
                 0,
             )
@@ -1490,7 +1498,7 @@ pub(super) async fn emby_image(
                 images,
                 &headers,
                 &method,
-                &item_id,
+                &internal_item_id,
                 &image_type,
                 0,
                 query.tag.as_deref(),
@@ -1541,6 +1549,7 @@ pub(super) async fn emby_image_at_index(
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let internal_item_id = emby_internal_id(&item_id);
     let filmly_compat = state.filmly_image_compat_mode == FilmlyImageCompatMode::Compat
         && is_filmly_image_request(&headers)
         && query.tag.is_none();
@@ -1588,7 +1597,7 @@ pub(super) async fn emby_image_at_index(
             images,
             &headers,
             &method,
-            &item_id,
+            &internal_item_id,
             &image_type,
             image_index,
         )
@@ -1601,7 +1610,7 @@ pub(super) async fn emby_image_at_index(
                 principal,
                 &headers,
                 &method,
-                &item_id,
+                &internal_item_id,
                 &image_type,
                 image_index,
             )
@@ -1612,7 +1621,7 @@ pub(super) async fn emby_image_at_index(
                 images,
                 &headers,
                 &method,
-                &item_id,
+                &internal_item_id,
                 &image_type,
                 image_index,
                 query.tag.as_deref(),
@@ -1727,6 +1736,7 @@ pub(super) async fn emby_subtitle_with_source(
     let Ok(stream_index) = stream_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let item_id = emby_internal_id(&item_id);
     serve_subtitle(
         &state,
         AccessPrincipal::new(user.id, user.is_admin),
@@ -1752,6 +1762,7 @@ pub(super) async fn emby_subtitle_without_source(
     let Ok(stream_index) = stream_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let item_id = emby_internal_id(&item_id);
     serve_subtitle(
         &state,
         AccessPrincipal::new(user.id, user.is_admin),
@@ -1903,6 +1914,7 @@ pub(super) async fn emby_stream(
     State(state): State<AppState>,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
+    let item_id = emby_internal_id(&item_id);
     let principal = match emby_stream_principal(
         &headers,
         &state,
@@ -1936,6 +1948,7 @@ pub(super) async fn emby_stream_with_container(
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
+    let item_id = emby_internal_id(&item_id);
     let principal = match emby_stream_principal(
         &headers,
         &state,
@@ -1968,6 +1981,7 @@ pub(super) async fn emby_stream_with_source(
     State(state): State<AppState>,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
+    let item_id = emby_internal_id(&item_id);
     let principal =
         match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
             .await
@@ -1996,6 +2010,7 @@ pub(super) async fn emby_stream_with_source_and_container(
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
     let (container, query) = emby_stream_query_from_path(query, &container);
+    let item_id = emby_internal_id(&item_id);
     let principal =
         match emby_stream_principal(&headers, &state, &query, &item_id, Some(&media_source_id))
             .await
@@ -2023,6 +2038,7 @@ pub(super) async fn emby_download(
     State(state): State<AppState>,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
+    let item_id = emby_internal_id(&item_id);
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -2725,7 +2741,9 @@ pub(super) async fn serve_emby_library_cover(
     library_id: &str,
     image_index: i64,
 ) -> Option<Response> {
-    let library_id = library_id.parse::<crate::domain::ids::LibraryId>().ok()?;
+    let library_id = emby_internal_id(library_id)
+        .parse::<crate::domain::ids::LibraryId>()
+        .ok()?;
     let covers = state.library_covers.as_ref()?;
     let cover = match covers.resolve(library_id).await {
         Ok(Some(cover)) => cover,
