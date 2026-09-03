@@ -1583,6 +1583,7 @@ impl Database {
                   AND conflicting_item.sort_title = ?
                   AND conflicting_item.production_year = ?
                   AND conflicting_item.removed_at IS NULL
+                  AND conflicting_item.has_available_source = 1
                  WHERE current_item.id = ?
                    AND current_item.item_type = 'MOVIE'
                    AND current_item.removed_at IS NULL

@@ -767,3 +767,66 @@ async fn metadata_enrichment_skips_conflicting_nfo_and_indexes_following_images(
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn metadata_enrichment_ignores_conflicts_without_available_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let historical_dir = root.join("Target Movie (1987)");
+    let current_dir = root.join("Renamed Movie (2018)");
+    tokio::fs::create_dir_all(&historical_dir).await?;
+    tokio::fs::create_dir_all(&current_dir).await?;
+    tokio::fs::write(
+        historical_dir.join("Target Movie (1987).mkv"),
+        b"historical",
+    )
+    .await?;
+    tokio::fs::write(current_dir.join("Renamed Movie (2018).mkv"), b"current").await?;
+    tokio::fs::write(
+        current_dir.join("Renamed Movie (2018).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    sqlx::query(
+        "UPDATE media_items SET has_available_source = 0
+         WHERE library_id = ? AND production_year = 1987",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+
+    assert_eq!(report.nfo_loaded, 1);
+    assert_eq!(report.nfo_failed, 0);
+    let current: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT title, production_year, nfo_metadata_json
+         FROM media_items WHERE has_available_source = 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(current.0, "Target Movie");
+    assert_eq!(current.1, 1987);
+    assert!(current.2.is_some());
+    Ok(())
+}
