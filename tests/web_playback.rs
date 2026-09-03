@@ -10,6 +10,12 @@ use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
     headers
         .get_all(SET_COOKIE)
@@ -231,6 +237,7 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     )
     .fetch_one(database.pool())
     .await?;
+    let emby_strm_item_id = emby_public_id(&strm_item_id);
     let strm_create = client
         .post(format!("{base_url}/api/v1/playback/sessions"))
         .header(COOKIE, &cookies)
@@ -281,7 +288,7 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     assert_eq!(strm_direct_body["plan"]["type"], "DIRECT");
     assert_eq!(
         strm_direct_body["plan"]["proxyUrl"],
-        format!("/Videos/{strm_item_id}/stream?MediaSourceId={strm_source_id}")
+        format!("/Videos/{emby_strm_item_id}/stream?MediaSourceId={strm_source_id}")
     );
     assert!(strm_direct_body["sessionId"].is_string());
     let strm_direct_session_id = strm_direct_body["sessionId"]
@@ -316,6 +323,7 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     )
     .fetch_one(database.pool())
     .await?;
+    let emby_proxy_item_id = emby_public_id(&proxy_item_id);
     let proxy_create = client
         .post(format!("{base_url}/api/v1/playback/sessions"))
         .header(COOKIE, &cookies)
@@ -337,7 +345,7 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let proxy_body = proxy_create.json::<Value>().await?;
     assert_eq!(
         proxy_body["plan"]["proxyUrl"],
-        format!("/Videos/{proxy_item_id}/stream?MediaSourceId={proxy_source_id}")
+        format!("/Videos/{emby_proxy_item_id}/stream?MediaSourceId={proxy_source_id}")
     );
 
     let stopped = client

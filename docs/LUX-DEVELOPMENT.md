@@ -5510,12 +5510,18 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 - 不删除任务历史，不回滚已经提交的索引、元数据或旁车写回。
 - 不取消播放会话，不改变登录会话或 Webhook 投递 outbox 的独立恢复策略。
 
-#### LUX-234：通用外部代理的 URL 型 `.strm` 交接
+#### LUX-234：通用外部代理的 URL 型 `.strm` 交接与 Emby 数字条目 ID
 
 范围：修正 URL 型 `.strm` 与本地路径型 `.strm` 在第三方媒体代理场景下的 Emby 播放源合同。两种目标都保留原始
 条目 `Path` 和 `MediaSources[].Path`；在 `PlaybackInfo` 中保留原始 `DirectStreamUrl`，并使用
 `Protocol=File`、`IsRemote=false`、`AddApiKeyToDirectStreamUrl=false` 的代理兼容表示，使任意具备自身映射或 302 能力的外部代理可以优先接管播放。
 Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访问 `.strm` 目标。
+
+Emby 兼容层对外统一使用由内部 UUID 无状态编码得到的稳定纯数字媒体条目 ID；已有数据库条目不需要迁移，
+Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所有接收媒体条目 ID 的 Emby 详情、目录过滤、
+剧集关系、PlaybackInfo、视频/字幕/图片/下载入口、进度回调和已看/收藏接口都必须把该数字 ID还原为内部 UUID，
+并继续接受历史 UUID 请求。Emby DTO 中的 `Id`、`ItemId`、`ParentId`、`SeriesId`、`SeasonId`、媒体库条目 ID、
+图片引用 ID 和标准视频 URL 使用数字表示；媒体源自身的 `MediaSourceId` 不在本次转换范围内。
 
 直接请求 Lux 的兼容回退保持不变：路径型目标由 Lux 按相对路径或绝对路径读取本地普通文件，URL 型目标由 Lux
 使用入站播放器 User-Agent 有限跟随重定向并返回 307；外部代理接管时不应请求 Lux 的 URL 解析回退入口。SMB/FTP
@@ -5528,6 +5534,9 @@ Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访
 - [x] URL 与路径型 `.strm` 的 Lux Web Direct Play 计划均提供标准 `proxyUrl`；播放器继续在代理失败时回退到签名 Lux URL。
 - [x] Lux 直连 URL 型 `.strm` 仍按播放器 User-Agent 返回有限 307；直连路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。
 - [x] 扫描、`PlaybackInfo` 和外部代理交接测试不访问原始目标；不新增数据库字段、迁移、媒体字节代理、转码或具体代理适配。
+- [x] Emby 兼容层对已有和新建媒体条目统一输出稳定纯数字 ID；输入边界兼容数字 ID 与历史 UUID，内部数据库和 Lux API 不变。
+- [x] 数字 ID 兼容覆盖标准媒体详情、目录父子查询、PlaybackInfo、视频/字幕/图片/下载入口、进度回调以及已看/收藏操作；
+      SMB/FTP 的目标解析和 URL/Path STRM 的原始 `Path` 保持不变。
 
 验证：
 

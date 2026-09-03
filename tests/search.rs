@@ -10,6 +10,12 @@ use reqwest::header::AUTHORIZATION;
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +53,7 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
         sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Hidden Movie'")
             .fetch_one(database.pool())
             .await?;
+    let emby_chinese_id = emby_public_id(&chinese_id);
     sqlx::query(
         "INSERT INTO item_aliases (id, item_id, alias, language, alias_normalized)
          VALUES (?, ?, '星际守护者', 'zh-CN', '星际守护者')",
@@ -91,7 +98,7 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     assert_eq!(hints.status(), reqwest::StatusCode::OK);
     let hints_body = hints.json::<Value>().await?;
     assert_eq!(hints_body["TotalRecordCount"], 1);
-    assert_eq!(hints_body["SearchHints"][0]["Id"], chinese_id);
+    assert_eq!(hints_body["SearchHints"][0]["Id"], emby_chinese_id);
 
     let item_search = client
         .get(format!("{base_url}/Users/{}/Items", admin.id))
@@ -106,7 +113,7 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     assert_eq!(item_search.status(), reqwest::StatusCode::OK);
     let item_search_body = item_search.json::<Value>().await?;
     assert_eq!(item_search_body["TotalRecordCount"], 1);
-    assert_eq!(item_search_body["Items"][0]["Id"], chinese_id);
+    assert_eq!(item_search_body["Items"][0]["Id"], emby_chinese_id);
 
     let lux_login = client
         .post(format!("{base_url}/api/v1/auth/login"))

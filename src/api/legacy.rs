@@ -1446,15 +1446,16 @@ mod tests {
     use super::{
         CatalogSort, EmbyItemDetailWorkPlan, FilmlyImageCompatMode, MediaStrategySettings,
         MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby, emby_collection_type,
-        emby_item_detail_work_plan, emby_media_source_json, emby_media_source_json_with_resolver,
-        emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
-        emby_single_id_lookup, emby_source_needs_strm_resolver,
-        filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
-        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
-        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
+        emby_internal_id, emby_item_detail_work_plan, emby_media_source_json,
+        emby_media_source_json_with_resolver, emby_media_stream_item_id, emby_media_stream_json,
+        emby_playback_info_item_id, emby_public_id, emby_single_id_lookup,
+        emby_source_needs_strm_resolver, filmly_image_compat_mode_from_env_value,
+        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
+        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
+        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
+        metadata_candidate_failure_kind, normalize_strm_http_location, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -1468,6 +1469,18 @@ mod tests {
     use axum::http::{HeaderMap, HeaderValue, Uri};
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn emby_item_ids_are_reversible_decimal_wire_ids() {
+        let internal_id = "01a0680f-0a7a-7d22-8574-c119e7352790";
+        let public_id = emby_public_id(internal_id);
+
+        assert!(!public_id.is_empty());
+        assert!(public_id.bytes().all(|byte| byte.is_ascii_digit()));
+        assert_eq!(emby_internal_id(&public_id), internal_id);
+        assert_eq!(emby_internal_id(internal_id), internal_id);
+        assert_eq!(emby_public_id(&public_id), public_id);
+    }
 
     #[test]
     fn strm_http_location_percent_encodes_non_ascii_url_components() {
@@ -1577,8 +1590,10 @@ mod tests {
 
     #[test]
     fn emby_ids_filter_preserves_item_and_media_source_candidates() {
+        let internal_item_id = "01a0680f-0a7a-7d22-8574-c119e7352790";
+        let public_item_id = emby_public_id(internal_item_id);
         let query = super::EmbyItemsQuery {
-            ids: Some("item-1, source-2".to_owned()),
+            ids: Some(format!("{public_item_id}, source-2")),
             ..super::EmbyItemsQuery::default()
         };
 
@@ -1586,11 +1601,11 @@ mod tests {
 
         assert_eq!(
             filter.item_ids,
-            Some(vec!["item-1".to_owned(), "source-2".to_owned()])
+            Some(vec![internal_item_id.to_owned(), "source-2".to_owned()])
         );
         assert_eq!(
             filter.media_source_ids,
-            Some(vec!["item-1".to_owned(), "source-2".to_owned()])
+            Some(vec![public_item_id, "source-2".to_owned()])
         );
     }
 

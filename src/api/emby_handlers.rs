@@ -33,6 +33,8 @@ pub(super) async fn emby_danmaku_info(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let public_item_id = item_id.clone();
+    let item_id = emby_internal_id(&item_id);
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     match access.can_view_item(principal, &item_id).await {
         Ok(true) => {}
@@ -46,8 +48,8 @@ pub(super) async fn emby_danmaku_info(
         Ok(Some(_)) => Json(json!({
             "hasDanmaku": true,
             "format": "xml",
-            "url": format!("/api/danmu/{item_id}/raw"),
-            "rawUrl": format!("/api/danmu/{item_id}/raw"),
+            "url": format!("/api/danmu/{public_item_id}/raw"),
+            "rawUrl": format!("/api/danmu/{public_item_id}/raw"),
             "option": query.option,
         }))
         .into_response(),
@@ -69,6 +71,7 @@ pub(super) async fn emby_danmaku_raw(
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let item_id = emby_internal_id(&item_id);
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     match access.can_view_item(principal, &item_id).await {
         Ok(true) => {}
@@ -1259,6 +1262,9 @@ pub(super) async fn emby_ordered_views(state: &AppState, user: &UserRecord) -> V
         .saved_library_order_for_user(&user.id.to_string(), &accessible_library_ids)
         .await
         .unwrap_or_default()
+        .into_iter()
+        .map(|library_id| emby_public_id(&library_id))
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -1661,7 +1667,23 @@ async fn emby_user_configuration(
         return configuration;
     };
     merge_emby_json_object(&mut configuration, stored);
+    normalize_emby_ordered_views(&mut configuration);
     configuration
+}
+
+fn normalize_emby_ordered_views(configuration: &mut Value) {
+    let Some(views) = configuration
+        .as_object_mut()
+        .and_then(|object| object.get_mut("OrderedViews"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for view in views {
+        if let Value::String(view_id) = view {
+            *view_id = emby_public_id(view_id);
+        }
+    }
 }
 
 fn merge_emby_json_object(target: &mut Value, overlay: Value) {

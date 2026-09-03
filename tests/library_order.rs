@@ -10,6 +10,12 @@ use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)
@@ -41,6 +47,8 @@ async fn library_order_is_persisted_and_used_by_web_and_emby_views()
     let second = libraries
         .create_library("Movies B", LibraryKind::Movie, false)
         .await?;
+    let emby_first_id = emby_public_id(&first.id.to_string());
+    let emby_second_id = emby_public_id(&second.id.to_string());
     let app = app_with_state(AppState::ready(
         config,
         database.clone(),
@@ -117,7 +125,7 @@ async fn library_order_is_persisted_and_used_by_web_and_emby_views()
     let emby_login_body = emby_login.json::<Value>().await?;
     assert_eq!(
         emby_login_body["User"]["Configuration"]["OrderedViews"],
-        json!([second.id.to_string(), first.id.to_string()])
+        json!([emby_second_id, emby_first_id])
     );
     let emby_token = emby_login_body["AccessToken"]
         .as_str()
@@ -137,7 +145,7 @@ async fn library_order_is_persisted_and_used_by_web_and_emby_views()
             .iter()
             .map(|library| library["Id"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        vec![second.id.to_string(), first.id.to_string()]
+        vec![emby_second_id, emby_first_id]
     );
 
     server.abort();

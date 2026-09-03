@@ -133,8 +133,13 @@ fi
                 .bind(&item_id)
                 .fetch_one(database.pool())
                 .await?;
+        let emby_item_id = uuid::Uuid::parse_str(&item_id)
+            .map(|uuid| uuid.as_u128().to_string())
+            .unwrap_or_else(|_| item_id.clone());
         let playback = client
-            .get(format!("http://{address}/Items/{item_id}/PlaybackInfo"))
+            .get(format!(
+                "http://{address}/Items/{emby_item_id}/PlaybackInfo"
+            ))
             .query(&[("api_key", token.as_str())])
             .send()
             .await?;
@@ -144,7 +149,7 @@ fi
             .as_str()
             .ok_or("missing signed direct stream URL")?;
         assert!(direct_url.starts_with(&format!(
-            "/Videos/{item_id}/stream?MediaSourceId={source_id}&luxPlayback"
+            "/Videos/{emby_item_id}/stream?MediaSourceId={source_id}&luxPlayback"
         )));
         assert_ne!(direct_url, target);
         assert_eq!(

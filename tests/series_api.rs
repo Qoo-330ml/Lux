@@ -15,6 +15,12 @@ use reqwest::header::{AUTHORIZATION, COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_state()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -76,6 +82,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
             .bind(&episode_id)
             .fetch_one(database.pool())
             .await?;
+    let emby_series_id = emby_public_id(&series_id);
+    let emby_season_id = emby_public_id(&season_id);
+    let emby_episode_id = emby_public_id(&episode_id);
+    let emby_library_id = emby_public_id(&library.id.to_string());
     let episode_source_id: String = sqlx::query_scalar(
         "SELECT id FROM media_sources WHERE item_id = ? ORDER BY is_default DESC, id LIMIT 1",
     )
@@ -203,6 +213,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(emby_series_detail.status(), reqwest::StatusCode::OK);
     let emby_series_detail_body: Value = emby_series_detail.json().await?;
     assert_eq!(emby_series_detail_body["SortName"], "example show");
+    assert_eq!(emby_series_detail_body["Id"], emby_series_id);
     assert_eq!(emby_series_detail_body["ChildCount"], 1);
     assert_eq!(emby_series_detail_body["SupportsSync"], true);
     assert_eq!(emby_series_detail_body["CanDownload"], false);
@@ -234,8 +245,14 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(emby_series_detail_body["Status"], "Ended");
     assert_eq!(emby_series_detail_body["ForcedSortName"], "example show");
     assert_eq!(emby_series_detail_body["FileName"], "Example Show");
-    assert_eq!(emby_series_detail_body["DisplayPreferencesId"], series_id);
-    assert_eq!(emby_series_detail_body["PresentationUniqueKey"], series_id);
+    assert_eq!(
+        emby_series_detail_body["DisplayPreferencesId"],
+        emby_series_id
+    );
+    assert_eq!(
+        emby_series_detail_body["PresentationUniqueKey"],
+        emby_series_id
+    );
     assert!(emby_series_detail_body["Etag"].is_string());
     assert!(!emby_series_detail_body["Etag"].as_str().unwrap().is_empty());
     // Emby always emits these fields on detail DTOs. Lux derives the timestamps
@@ -272,14 +289,17 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(seasons_body["TotalRecordCount"], 1);
     assert_eq!(seasons_body["Items"][0]["Type"], "Season");
     assert_eq!(seasons_body["Items"][0]["IsFolder"], true);
-    assert_eq!(seasons_body["Items"][0]["ParentId"], series_id);
-    assert_eq!(seasons_body["Items"][0]["SeriesId"], series_id);
+    assert_eq!(seasons_body["Items"][0]["ParentId"], emby_series_id);
+    assert_eq!(seasons_body["Items"][0]["SeriesId"], emby_series_id);
     assert_eq!(seasons_body["Items"][0]["SeriesName"], "Example Show");
     assert_eq!(seasons_body["Items"][0]["IndexNumber"], 1);
     assert_eq!(seasons_body["Items"][0]["ChildCount"], 3);
     assert_eq!(seasons_body["Items"][0]["UserData"]["UnplayedItemCount"], 2);
-    assert_eq!(seasons_body["Items"][0]["ParentBackdropItemId"], series_id);
-    assert_eq!(seasons_body["Items"][0]["ParentLogoItemId"], series_id);
+    assert_eq!(
+        seasons_body["Items"][0]["ParentBackdropItemId"],
+        emby_series_id
+    );
+    assert_eq!(seasons_body["Items"][0]["ParentLogoItemId"], emby_series_id);
     assert_eq!(seasons_body["Items"][0]["Genres"], serde_json::json!([]));
     assert_eq!(
         seasons_body["Items"][0]["GenreItems"],
@@ -331,23 +351,29 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(episodes_from_season.status(), reqwest::StatusCode::OK);
     let episodes_from_season_body: Value = episodes_from_season.json().await?;
     assert_eq!(episodes_from_season_body["TotalRecordCount"], 3);
-    assert_eq!(episodes_from_season_body["Items"][0]["SeriesId"], series_id);
+    assert_eq!(
+        episodes_from_season_body["Items"][0]["SeriesId"],
+        emby_series_id
+    );
     assert_eq!(
         episodes_from_season_body["Items"][0]["SeriesName"],
         "Example Show"
     );
-    assert_eq!(episodes_from_season_body["Items"][0]["SeasonId"], season_id);
+    assert_eq!(
+        episodes_from_season_body["Items"][0]["SeasonId"],
+        emby_season_id
+    );
     assert_eq!(
         episodes_from_season_body["Items"][0]["ParentIndexNumber"],
         1
     );
     assert_eq!(
         episodes_from_season_body["Items"][0]["ParentBackdropItemId"],
-        series_id
+        emby_series_id
     );
     assert_eq!(
         episodes_from_season_body["Items"][0]["ParentLogoItemId"],
-        series_id
+        emby_series_id
     );
     assert_eq!(episodes_from_season_body["Items"][0]["IndexNumber"], 1);
     assert_eq!(episodes_from_season_body["Items"][0]["Index"], 1);
@@ -374,7 +400,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(
         episodes_from_season_path_body["Items"][0]["SeasonId"],
-        season_id
+        emby_season_id
     );
 
     let vidhub_episodes = client
@@ -418,7 +444,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         "2024-01-02T00:00:00.0000000Z"
     );
     assert_eq!(filmly_episode["SeasonName"], "Season 01");
-    assert_eq!(filmly_episode["ParentThumbItemId"], series_id);
+    assert_eq!(filmly_episode["ParentThumbItemId"], emby_series_id);
     assert_eq!(filmly_episode["Container"], "mkv");
     assert_eq!(filmly_episode["Size"], 123);
     assert_eq!(filmly_episode["Bitrate"], 456);
@@ -551,7 +577,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     let children_body: Value = children.json().await?;
     assert_eq!(children_body["StartIndex"], 0);
     assert_eq!(children_body["TotalRecordCount"], 1);
-    assert_eq!(children_body["Items"][0]["Id"], season_id);
+    assert_eq!(children_body["Items"][0]["Id"], emby_season_id);
 
     let inferred_seasons = client
         .get(format!(
@@ -590,7 +616,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(grouped_latest.status(), reqwest::StatusCode::OK);
     let grouped_latest_body: Value = grouped_latest.json().await?;
     assert_eq!(grouped_latest_body.as_array().map(Vec::len), Some(1));
-    assert_eq!(grouped_latest_body[0]["Id"], series_id);
+    assert_eq!(grouped_latest_body[0]["Id"], emby_series_id);
     assert_eq!(grouped_latest_body[0]["Type"], "Series");
     assert_eq!(grouped_latest_body[0]["ChildCount"], 3);
 
@@ -627,9 +653,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
             .is_some_and(|items| {
                 !items.is_empty()
                     && items.iter().all(|item| item["Type"] == "CollectionFolder")
-                    && items
-                        .iter()
-                        .all(|item| item["Id"] == library.id.to_string())
+                    && items.iter().all(|item| item["Id"] == emby_library_id)
                     && items
                         .iter()
                         .all(|item| item["RecursiveItemCount"] == item["ChildCount"])
@@ -710,9 +734,9 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(episodes_body["Items"][0]["Index"], 2);
     assert_eq!(episodes_body["Items"][0]["IndexNumber"], 2);
     assert_eq!(episodes_body["Items"][0]["ParentIndexNumber"], 1);
-    assert_eq!(episodes_body["Items"][0]["ParentId"], season_id);
-    assert_eq!(episodes_body["Items"][0]["SeasonId"], season_id);
-    assert_eq!(episodes_body["Items"][0]["SeriesId"], series_id);
+    assert_eq!(episodes_body["Items"][0]["ParentId"], emby_season_id);
+    assert_eq!(episodes_body["Items"][0]["SeasonId"], emby_season_id);
+    assert_eq!(episodes_body["Items"][0]["SeriesId"], emby_series_id);
     assert_eq!(episodes_body["Items"][0]["UserData"]["Played"], true);
     assert_eq!(episodes_body["Items"][0]["UserData"]["PlayCount"], 4);
 
@@ -724,7 +748,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(next_up.status(), reqwest::StatusCode::OK);
     let next_up_body: Value = next_up.json().await?;
     assert_eq!(next_up_body["TotalRecordCount"], 1);
-    assert_eq!(next_up_body["Items"][0]["Id"], episode_id);
+    assert_eq!(next_up_body["Items"][0]["Id"], emby_episode_id);
     assert_eq!(
         next_up_body["Items"][0]["UserData"]["PlaybackPositionTicks"],
         12345
@@ -741,7 +765,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .await?;
     assert_eq!(series_next_up.status(), reqwest::StatusCode::OK);
     let series_next_up_body: Value = series_next_up.json().await?;
-    assert_eq!(series_next_up_body["Items"][0]["SeriesId"], series_id);
+    assert_eq!(series_next_up_body["Items"][0]["SeriesId"], emby_series_id);
     assert!(series_next_up_body.get("StartIndex").is_none());
 
     let shows_next_up = client
@@ -755,7 +779,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(shows_next_up.status(), reqwest::StatusCode::OK);
     let shows_next_up_body: Value = shows_next_up.json().await?;
     assert_eq!(shows_next_up_body["TotalRecordCount"], 1);
-    assert_eq!(shows_next_up_body["Items"][0]["Id"], episode_id);
+    assert_eq!(shows_next_up_body["Items"][0]["Id"], emby_episode_id);
 
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))

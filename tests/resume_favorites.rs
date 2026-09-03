@@ -12,6 +12,12 @@ use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -48,6 +54,9 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Almost Movie'")
             .fetch_one(database.pool())
             .await?;
+    let emby_library_id = emby_public_id(&library.id.to_string());
+    let emby_eligible_id = emby_public_id(&eligible_id);
+    let emby_almost_id = emby_public_id(&almost_id);
     sqlx::query(
         "UPDATE media_sources SET duration_ticks = 2000000000
          WHERE item_id IN (?, ?)",
@@ -106,7 +115,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(resume.status(), reqwest::StatusCode::OK);
     let resume_body = resume.json::<Value>().await?;
     assert_eq!(resume_body["TotalRecordCount"], 1);
-    assert_eq!(resume_body["Items"][0]["Id"], eligible_id);
+    assert_eq!(resume_body["Items"][0]["Id"], emby_eligible_id);
 
     let filmly_resume = client
         .get(format!("{base_url}/emby/Users/{admin_id}/Items/Resume"))
@@ -116,7 +125,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(filmly_resume.status(), reqwest::StatusCode::OK);
     let filmly_resume_body = filmly_resume.json::<Value>().await?;
     assert_eq!(filmly_resume_body["TotalRecordCount"], 1);
-    assert_eq!(filmly_resume_body["Items"][0]["Id"], eligible_id);
+    assert_eq!(filmly_resume_body["Items"][0]["Id"], emby_eligible_id);
 
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -334,12 +343,12 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .await?;
     let relaxed_body = relaxed_resume.json::<Value>().await?;
     assert_eq!(relaxed_body["TotalRecordCount"], 2);
-    assert_eq!(relaxed_body["Items"][0]["Id"], almost_id);
-    assert_eq!(relaxed_body["Items"][1]["Id"], eligible_id);
+    assert_eq!(relaxed_body["Items"][0]["Id"], emby_almost_id);
+    assert_eq!(relaxed_body["Items"][1]["Id"], emby_eligible_id);
 
     let played = client
         .post(format!(
-            "{base_url}/Users/{admin_id}/PlayedItems/{eligible_id}"
+            "{base_url}/Users/{admin_id}/PlayedItems/{emby_eligible_id}"
         ))
         .header("X-Emby-Token", &token)
         .send()
@@ -347,7 +356,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(played.status(), reqwest::StatusCode::NO_CONTENT);
     let played_again = client
         .post(format!(
-            "{base_url}/Users/{admin_id}/PlayedItems/{eligible_id}"
+            "{base_url}/Users/{admin_id}/PlayedItems/{emby_eligible_id}"
         ))
         .header("X-Emby-Token", &token)
         .send()
@@ -355,7 +364,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(played_again.status(), reqwest::StatusCode::NO_CONTENT);
     let favorite = client
         .post(format!(
-            "{base_url}/Users/{admin_id}/FavoriteItems/{eligible_id}"
+            "{base_url}/Users/{admin_id}/FavoriteItems/{emby_eligible_id}"
         ))
         .header("X-Emby-Token", &token)
         .send()
@@ -373,7 +382,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(favorites.status(), reqwest::StatusCode::OK);
     let favorites_body = favorites.json::<Value>().await?;
     assert_eq!(favorites_body["TotalRecordCount"], 1);
-    assert_eq!(favorites_body["Items"][0]["Id"], eligible_id);
+    assert_eq!(favorites_body["Items"][0]["Id"], emby_eligible_id);
 
     let filmly_favorites = client
         .get(format!("{base_url}/emby/Users/{admin_id}/FavoriteItems"))
@@ -383,10 +392,10 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(filmly_favorites.status(), reqwest::StatusCode::OK);
     let filmly_favorites_body = filmly_favorites.json::<Value>().await?;
     assert_eq!(filmly_favorites_body["TotalRecordCount"], 1);
-    assert_eq!(filmly_favorites_body["Items"][0]["Id"], eligible_id);
+    assert_eq!(filmly_favorites_body["Items"][0]["Id"], emby_eligible_id);
 
     let detail = client
-        .get(format!("{base_url}/Items/{eligible_id}"))
+        .get(format!("{base_url}/Items/{emby_eligible_id}"))
         .header("X-Emby-Token", &token)
         .send()
         .await?
@@ -399,7 +408,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .get(format!("{base_url}/Users/{admin_id}/Items"))
         .query(&[
             ("api_key", token.as_str()),
-            ("ParentId", library.id.to_string().as_str()),
+            ("ParentId", emby_library_id.as_str()),
             ("IncludeItemTypes", "Movie"),
             ("IsPlayed", "true"),
             ("IsFavorite", "true"),
@@ -411,7 +420,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
 
     let unplayed = client
         .delete(format!(
-            "{base_url}/Users/{admin_id}/PlayedItems/{eligible_id}"
+            "{base_url}/Users/{admin_id}/PlayedItems/{emby_eligible_id}"
         ))
         .header("X-Emby-Token", &token)
         .send()
@@ -419,7 +428,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(unplayed.status(), reqwest::StatusCode::NO_CONTENT);
     let unfavorite = client
         .delete(format!(
-            "{base_url}/Users/{admin_id}/FavoriteItems/{eligible_id}"
+            "{base_url}/Users/{admin_id}/FavoriteItems/{emby_eligible_id}"
         ))
         .header("X-Emby-Token", &token)
         .send()
@@ -447,7 +456,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
     assert_eq!(denied_favorites.status(), reqwest::StatusCode::FORBIDDEN);
     let denied = client
         .post(format!(
-            "{base_url}/Users/{}/FavoriteItems/{eligible_id}",
+            "{base_url}/Users/{}/FavoriteItems/{emby_eligible_id}",
             viewer.id
         ))
         .header("X-Emby-Token", &viewer_token)

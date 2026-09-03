@@ -16,6 +16,12 @@ use tokio::net::TcpListener;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 #[tokio::test]
 async fn shared_admin_key_survives_restart_and_can_be_revoked()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -198,6 +204,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::new();
+    let emby_library_id = emby_public_id(&library.id.to_string());
 
     let views = client
         .get(format!(
@@ -209,7 +216,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     assert_eq!(views.status(), reqwest::StatusCode::OK);
     let views_body = views.json::<serde_json::Value>().await?;
     assert_eq!(views_body["TotalRecordCount"], 1);
-    assert_eq!(views_body["Items"][0]["Id"], library.id.to_string());
+    assert_eq!(views_body["Items"][0]["Id"], emby_library_id);
 
     for path in ["/Library/VirtualFolders", "/emby/Library/VirtualFolders"] {
         let virtual_folders = client
@@ -219,9 +226,9 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
         assert_eq!(virtual_folders.status(), reqwest::StatusCode::OK);
         let virtual_folders_body = virtual_folders.json::<serde_json::Value>().await?;
         assert_eq!(virtual_folders_body[0]["Name"], "Movies");
-        assert_eq!(virtual_folders_body[0]["Id"], library.id.to_string());
-        assert_eq!(virtual_folders_body[0]["Guid"], library.id.to_string());
-        assert_eq!(virtual_folders_body[0]["ItemId"], library.id.to_string());
+        assert_eq!(virtual_folders_body[0]["Id"], emby_library_id);
+        assert_eq!(virtual_folders_body[0]["Guid"], emby_library_id);
+        assert_eq!(virtual_folders_body[0]["ItemId"], emby_library_id);
         assert_eq!(virtual_folders_body[0]["CollectionType"], "movies");
         assert_eq!(
             virtual_folders_body[0]["Locations"][0],
