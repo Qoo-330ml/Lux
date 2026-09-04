@@ -1584,7 +1584,11 @@ impl Database {
                   AND conflicting_item.production_year = ?
                   AND conflicting_item.removed_at IS NULL
                   AND conflicting_item.has_available_source = 1
-                  AND conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
+                  AND (
+                      current_item.parent_id IS NULL
+                      OR conflicting_item.parent_id IS NULL
+                      OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
+                  )
                  WHERE current_item.id = ?
                    AND current_item.item_type = 'MOVIE'
                    AND current_item.removed_at IS NULL
