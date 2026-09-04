@@ -993,6 +993,7 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             original_title: None,
             overview: None,
             production_year: None,
+            premiere_date: None,
             rating: Some(10.0),
             rating_source: Some("TEST"),
             metadata_fingerprint: &[],

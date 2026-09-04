@@ -551,6 +551,27 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
     assert_eq!(details.genres, vec!["动作"]);
     assert_eq!(details.directors[0].name, "导演甲");
     assert_eq!(details.trailers, vec!["https://example.com/trailer"]);
+    let premiere_date: Option<String> = sqlx::query_scalar(
+        "SELECT premiere_date FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(premiere_date.as_deref(), Some("2026-02-17"));
+    sqlx::query("UPDATE media_items SET premiere_date = NULL WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let skipped = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(skipped.nfo_skipped, 1);
+    let repaired_premiere_date: Option<String> =
+        sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(repaired_premiere_date.as_deref(), Some("2026-02-17"));
     let stored_json: Option<String> = sqlx::query_scalar(
         "SELECT nfo_metadata_json FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
     )

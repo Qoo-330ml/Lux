@@ -1109,6 +1109,11 @@ impl MetadataEnricher {
                 self.database
                     .merge_local_provider_ids(item_id, &details.provider_ids)
                     .await?;
+                if let Some(premiere_date) = local_nfo_premiere_date(&details) {
+                    self.database
+                        .update_media_item_premiere_date_if_missing(item_id, premiere_date)
+                        .await?;
+                }
             }
             report.nfo_skipped = 1;
             return Ok(report);
@@ -1264,6 +1269,7 @@ impl MetadataEnricher {
                     original_title: state.metadata.original_title.as_deref(),
                     overview: state.metadata.overview.as_deref(),
                     production_year: state.metadata.production_year.map(i64::from),
+                    premiere_date: local_nfo_premiere_date(&projection.details),
                     rating: local_rating,
                     rating_source: local_rating.map(|_| "NFO"),
                     metadata_fingerprint: fingerprint,
@@ -1425,6 +1431,14 @@ async fn prepare_local_image(image: LocalImage) -> Result<PreparedLocalImage, Lo
         content_tag,
         dimensions,
     })
+}
+
+fn local_nfo_premiere_date(details: &crate::application::nfo::LocalNfoDetails) -> Option<&str> {
+    details
+        .premiered
+        .as_deref()
+        .or(details.release_date.as_deref())
+        .or(details.aired.as_deref())
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

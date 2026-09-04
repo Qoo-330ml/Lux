@@ -4652,6 +4652,7 @@ impl Database {
                  original_title = ?,
                  overview = ?,
                  production_year = ?,
+                 premiere_date = COALESCE(?, premiere_date),
                  rating = CASE WHEN ? = 1 THEN ? ELSE rating END,
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  metadata_fingerprint = ?,
@@ -4664,6 +4665,7 @@ impl Database {
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
+        .bind(update.premiere_date)
         .bind(database_flag(update.rating.is_some()))
         .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
@@ -4704,6 +4706,36 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn update_media_item_premiere_date_if_missing(
+        &self,
+        item_id: &str,
+        premiere_date: &str,
+    ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query(
+            "UPDATE media_items
+             SET premiere_date = ?
+             WHERE id = ? AND NULLIF(premiere_date, '') IS NULL",
+        )
+        .bind(premiere_date)
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn media_item_nfo_metadata_json(
