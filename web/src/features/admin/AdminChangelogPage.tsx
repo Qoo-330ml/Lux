@@ -15,6 +15,19 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.8",
+    date: "2026-09-04",
+    sections: [
+      { kind: "added", items: [
+        "新增 Emby 兼容媒体删除能力：服务器管理权限用户可通过 DELETE /Items/{itemId} 删除媒体源，并按权限返回详情 DTO 的 CanDelete。",
+      ] },
+      { kind: "fixed", items: [
+        "修复平铺电影目录中多个 NFO 变体及不可用媒体记录参与身份冲突判断不正确的问题；现在可以识别真实的同目录 NFO 冲突，并忽略已不可用记录。",
+        "修复本地 NFO 首映/发行日期未同步到媒体条目索引的问题；日期现在会在索引缺失时写入，并用于后续详情和查询响应。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.7",
     date: "2026-09-02",
     sections: [
