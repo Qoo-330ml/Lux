@@ -3852,6 +3852,12 @@ pub(super) fn emby_signed_direct_stream_url(
         expires_at,
     )?;
     let mut url = emby_media_source_stream_url(item_id, source);
+    // NextEmby uses the standard Emby UserId query parameter to associate
+    // headerless media requests with the playback user before it decides
+    // whether to proxy the request. This is only an identity hint: Lux still
+    // authorizes the request with the bound HMAC ticket below.
+    url.push_str("&UserId=");
+    url.push_str(&percent_encode_filename(&user_id));
     url.push_str("&luxPlaybackUserId=");
     url.push_str(&percent_encode_filename(&user_id));
     url.push_str("&luxPlaybackAdmin=");

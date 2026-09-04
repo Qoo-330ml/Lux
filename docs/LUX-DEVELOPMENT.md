@@ -129,7 +129,7 @@ Lux 的核心价值不是功能数量，而是：
 - 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可以位于媒体库根目录之外；目标必须是 Lux 进程实际可读取、canonicalize 后存在的普通文件，且不会把目录或另一个 `.strm` 当作视频返回。
-- URL 和本地路径型 `.strm` 在 `Path` 保留原始目标；`PlaybackInfo` 对这两类目标的 `DirectStreamUrl` 使用标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，`AddApiKeyToDirectStreamUrl=false`，外部播放代理从原始 `Path` 提取映射或 302 信息，客户端始终请求当前公网代理域名而不是 `.strm` 中的内网地址。Lux 仍保留直接访问 URL 型 `.strm` 时使用播放器 User-Agent 有限解析重定向并返回 307 的兼容回退；不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 继续使用 Lux 的协议解析器和受保护播放入口；空目标和其他协议不可播放。
+- URL 和本地路径型 `.strm` 在 `Path` 保留原始目标；`PlaybackInfo` 对这两类目标的 `DirectStreamUrl` 使用标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，可额外携带标准 `UserId` 供外部代理关联播放身份；`UserId` 不承担授权，`AddApiKeyToDirectStreamUrl=false`，外部播放代理从原始 `Path` 提取映射或 302 信息，客户端始终请求当前公网代理域名而不是 `.strm` 中的内网地址。Lux 仍保留直接访问 URL 型 `.strm` 时使用播放器 User-Agent 有限解析重定向并返回 307 的兼容回退；不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 继续使用 Lux 的协议解析器和受保护播放入口；空目标和其他协议不可播放。
 - 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。

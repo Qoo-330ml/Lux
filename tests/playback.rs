@@ -141,8 +141,9 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .as_str()
         .ok_or("missing generic direct stream URL")?;
     assert!(generic_direct_url.starts_with(&format!(
-        "/Videos/{emby_item_id}/stream.mkv?MediaSourceId={source_id}&luxPlayback"
+        "/Videos/{emby_item_id}/stream.mkv?MediaSourceId={source_id}&UserId="
     )));
+    assert!(generic_direct_url.contains("&luxPlayback"));
     assert!(!generic_direct_url.contains(&token));
     assert_eq!(
         playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
