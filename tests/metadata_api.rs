@@ -753,6 +753,10 @@ async fn admin_can_delete_a_media_source_and_matching_sidecars()
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
     setup.complete("Admin", "Admin", "correct password").await?;
+    let users = UserStore::new(database.clone())?;
+    users
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -795,13 +799,46 @@ async fn admin_can_delete_a_media_source_and_matching_sidecars()
 
     let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
     let client = reqwest::Client::new();
-    let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
-    let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
+    let viewer_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            r#"Emby Client="DeletionTest", Device="Mac", DeviceId="deletion-viewer", Version="1""#,
+        )
+        .json(&json!({ "Username": "viewer", "Pw": "viewer password" }))
+        .send()
+        .await?;
+    assert_eq!(viewer_login.status(), reqwest::StatusCode::OK);
+    let viewer_token = viewer_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer Emby token")?
+        .to_owned();
+    let forbidden = client
+        .delete(format!("{base_url}/Items/{item_id}"))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(media.exists());
+
+    let emby_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            reqwest::header::AUTHORIZATION,
+            r#"Emby Client="DeletionTest", Device="Mac", DeviceId="deletion-admin", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(emby_login.status(), reqwest::StatusCode::OK);
+    let emby_token = emby_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing Emby token")?
+        .to_owned();
     let response = client
-        .delete(format!("{base_url}/api/v1/admin/items/{item_id}"))
-        .query(&[("sourceId", source_id.as_str())])
-        .header(COOKIE, &admin_cookie)
-        .header("x-csrf-token", csrf)
+        .delete(format!("{base_url}/Items/{item_id}"))
+        .query(&[("MediaSourceId", source_id.as_str())])
+        .header("X-Emby-Token", &emby_token)
         .send()
         .await?;
     assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);

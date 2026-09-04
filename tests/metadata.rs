@@ -551,6 +551,27 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
     assert_eq!(details.genres, vec!["动作"]);
     assert_eq!(details.directors[0].name, "导演甲");
     assert_eq!(details.trailers, vec!["https://example.com/trailer"]);
+    let premiere_date: Option<String> = sqlx::query_scalar(
+        "SELECT premiere_date FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(premiere_date.as_deref(), Some("2026-02-17"));
+    sqlx::query("UPDATE media_items SET premiere_date = NULL WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let skipped = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(skipped.nfo_skipped, 1);
+    let repaired_premiere_date: Option<String> =
+        sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(repaired_premiere_date.as_deref(), Some("2026-02-17"));
     let stored_json: Option<String> = sqlx::query_scalar(
         "SELECT nfo_metadata_json FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
     )
@@ -765,5 +786,160 @@ async fn metadata_enrichment_skips_conflicting_nfo_and_indexes_following_images(
             .iter()
             .any(|path| path.ends_with("Z Later Movie (2020)/poster.jpg"))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_enrichment_ignores_conflicts_without_available_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let historical_dir = root.join("Target Movie (1987)");
+    let current_dir = root.join("Renamed Movie (2018)");
+    tokio::fs::create_dir_all(&historical_dir).await?;
+    tokio::fs::create_dir_all(&current_dir).await?;
+    tokio::fs::write(
+        historical_dir.join("Target Movie (1987).mkv"),
+        b"historical",
+    )
+    .await?;
+    tokio::fs::write(current_dir.join("Renamed Movie (2018).mkv"), b"current").await?;
+    tokio::fs::write(
+        current_dir.join("Renamed Movie (2018).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    sqlx::query(
+        "UPDATE media_items SET has_available_source = 0
+         WHERE library_id = ? AND production_year = 1987",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+
+    assert_eq!(report.nfo_loaded, 1);
+    assert_eq!(report.nfo_failed, 0);
+    let current: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT title, production_year, nfo_metadata_json
+         FROM media_items WHERE has_available_source = 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(current.0, "Target Movie");
+    assert_eq!(current.1, 1987);
+    assert!(current.2.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_enrichment_allows_same_parent_nfo_identity_variants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Variant Movie");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    for year in [2023, 2024] {
+        tokio::fs::write(
+            movie_dir.join(format!("Variant Movie ({year}).mkv")),
+            b"movie",
+        )
+        .await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Variant Movie ({year}).nfo")),
+            "<movie><title>Variant Movie</title><year>2023</year></movie>",
+        )
+        .await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(report.nfo_loaded, 2);
+    assert_eq!(report.nfo_failed, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_enrichment_rejects_conflicting_nfo_for_flat_movie_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Target Movie (1987).mkv"), b"existing movie").await?;
+    tokio::fs::write(
+        root.join("Target Movie (1987).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Different Movie (2018).mkv"),
+        b"conflicting movie",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Different Movie (2018).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+
+    assert_eq!(report.nfo_loaded, 1);
+    assert_eq!(report.nfo_failed, 1);
     Ok(())
 }

@@ -788,7 +788,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     let user_scoped_detail = client
         .get(format!(
-            "{base_url}/emby/Users/{}/Items/{emby_item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload",
+            "{base_url}/emby/Users/{}/Items/{emby_item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload%2CCanDelete",
             admin.id
         ))
         .header("X-Emby-Token", &admin_token)
@@ -798,6 +798,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let user_scoped_detail_body: Value = user_scoped_detail.json().await?;
     assert_eq!(user_scoped_detail_body["Id"], emby_item_id);
     assert_eq!(user_scoped_detail_body["Name"], "Alpha Movie");
+    assert_eq!(user_scoped_detail_body["CanDelete"], true);
     assert!(user_scoped_detail_body["MediaSources"].is_array());
     assert_eq!(
         user_scoped_detail_body["PrimaryImageAspectRatio"].as_f64(),
@@ -898,7 +899,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(popcorn_detail_body["RunTimeTicks"], 75600000000_i64);
     // The Android filmly client maps the standard Emby detail scaffolding as
     // non-null; empty collections and stable identifiers keep the DTO parseable.
-    assert_eq!(popcorn_detail_body["CanDelete"], false);
+    assert_eq!(popcorn_detail_body["CanDelete"], true);
     assert_eq!(popcorn_detail_body["LockData"], false);
     assert_eq!(popcorn_detail_body["LockedFields"], serde_json::json!([]));
     assert_eq!(

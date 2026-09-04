@@ -1825,6 +1825,7 @@ impl MetadataWriteService {
                 original_title: state.metadata.original_title.as_deref(),
                 overview: state.metadata.overview.as_deref(),
                 production_year: state.metadata.production_year.map(i64::from),
+                premiere_date: None,
                 rating: None,
                 rating_source: None,
                 metadata_fingerprint: &report.fingerprint,
