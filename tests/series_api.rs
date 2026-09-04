@@ -209,7 +209,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     // Emby always exposes the standard metadata scaffolding on item details.
     // Provide empty collections and stable identifiers instead of omitting
     // them, because the Android filmly client maps them as non-null.
-    assert_eq!(emby_series_detail_body["CanDelete"], false);
+    assert_eq!(emby_series_detail_body["CanDelete"], true);
     assert_eq!(emby_series_detail_body["LockData"], false);
     assert_eq!(
         emby_series_detail_body["LockedFields"],

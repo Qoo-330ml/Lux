@@ -880,7 +880,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(popcorn_detail_body["RunTimeTicks"], 75600000000_i64);
     // The Android filmly client maps the standard Emby detail scaffolding as
     // non-null; empty collections and stable identifiers keep the DTO parseable.
-    assert_eq!(popcorn_detail_body["CanDelete"], false);
+    assert_eq!(popcorn_detail_body["CanDelete"], true);
     assert_eq!(popcorn_detail_body["LockData"], false);
     assert_eq!(popcorn_detail_body["LockedFields"], serde_json::json!([]));
     assert_eq!(

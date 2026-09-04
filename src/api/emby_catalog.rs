@@ -670,6 +670,7 @@ pub(super) async fn emby_user_resume(
         &page,
         query.fields.as_deref(),
         user.can_download,
+        user.is_admin,
     )
     .await
 }
@@ -717,6 +718,7 @@ pub(super) async fn emby_user_latest(
             &grouped_page,
             query.fields.as_deref(),
             user.can_download,
+            user.is_admin,
         )
         .await
         {
@@ -743,6 +745,7 @@ pub(super) async fn emby_user_latest(
         &page,
         query.fields.as_deref(),
         user.can_download,
+        user.is_admin,
     )
     .await
     {
@@ -941,6 +944,7 @@ pub(super) async fn emby_next_up_response(
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
+                user.is_admin,
                 None,
                 query.enable_total_record_count != Some(false),
             )
@@ -987,6 +991,7 @@ pub(super) async fn emby_show_seasons(
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
+                user.is_admin,
             )
             .await
         }
@@ -1036,6 +1041,7 @@ pub(super) async fn emby_show_episodes(
                 query.fields.as_deref(),
                 user.can_download,
                 EmbyCatalogPageOptions {
+                    can_delete: user.is_admin,
                     preferred_source_id: None,
                     include_start_index: true,
                 },
@@ -1057,6 +1063,7 @@ pub(super) async fn emby_show_episodes(
                     query.fields.as_deref(),
                     user.can_download,
                     EmbyCatalogPageOptions {
+                        can_delete: user.is_admin,
                         preferred_source_id: None,
                         include_start_index: true,
                     },
@@ -1108,6 +1115,7 @@ pub(super) async fn emby_collection_children(
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
+                user.is_admin,
             )
             .await
         }
@@ -1124,6 +1132,7 @@ pub(super) async fn emby_catalog_page_for_user_with_fields(
     page: &CatalogPage,
     fields: Option<&str>,
     can_download: bool,
+    can_delete: bool,
 ) -> Response {
     emby_catalog_page_for_user_with_preferred_source(
         state,
@@ -1131,6 +1140,7 @@ pub(super) async fn emby_catalog_page_for_user_with_fields(
         page,
         fields,
         can_download,
+        can_delete,
         None,
         true,
     )
@@ -1143,6 +1153,7 @@ pub(super) async fn emby_catalog_page_for_user_with_preferred_source(
     page: &CatalogPage,
     fields: Option<&str>,
     can_download: bool,
+    can_delete: bool,
     preferred_source_id: Option<&str>,
     include_start_index: bool,
 ) -> Response {
@@ -1153,6 +1164,7 @@ pub(super) async fn emby_catalog_page_for_user_with_preferred_source(
         fields,
         can_download,
         EmbyCatalogPageOptions {
+            can_delete,
             preferred_source_id,
             include_start_index,
         },
@@ -1161,6 +1173,7 @@ pub(super) async fn emby_catalog_page_for_user_with_preferred_source(
 }
 
 pub(super) struct EmbyCatalogPageOptions<'a> {
+    pub(super) can_delete: bool,
     pub(super) preferred_source_id: Option<&'a str>,
     pub(super) include_start_index: bool,
 }
@@ -1179,6 +1192,7 @@ pub(super) async fn emby_catalog_page_for_user_with_preferred_source_and_options
         page,
         fields,
         can_download,
+        options.can_delete,
         options.preferred_source_id,
     )
     .await
@@ -1205,6 +1219,7 @@ pub(super) async fn emby_catalog_items_for_user(
     page: &CatalogPage,
     fields: Option<&str>,
     can_download: bool,
+    can_delete: bool,
 ) -> Result<Vec<Value>, StatusCode> {
     emby_catalog_items_for_user_with_preferred_source(
         state,
@@ -1212,6 +1227,7 @@ pub(super) async fn emby_catalog_items_for_user(
         page,
         fields,
         can_download,
+        can_delete,
         None,
     )
     .await
@@ -1223,6 +1239,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
     page: &CatalogPage,
     fields: Option<&str>,
     can_download: bool,
+    can_delete: bool,
     preferred_source_id: Option<&str>,
 ) -> Result<Vec<Value>, StatusCode> {
     let Some(database) = state.database.as_ref() else {
@@ -1276,6 +1293,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
             user_states.get(&item.id),
             nfo.as_ref(),
             can_download,
+            can_delete,
             fields,
             unplayed_item_counts.get(&item.id).copied(),
         );
@@ -1554,6 +1572,7 @@ pub(super) async fn emby_list_items(
                 &page,
                 query.fields.as_deref(),
                 can_download,
+                principal.is_admin,
                 preferred_source_id,
                 emby_query_requests_series_children(state, principal, query).await,
             )
@@ -1661,6 +1680,7 @@ pub(super) async fn emby_single_id_lookup_response(
         user_state.as_ref(),
         nfo.as_ref(),
         can_download,
+        principal.is_admin,
         query.fields.as_deref(),
         unplayed_item_count,
     );
@@ -2119,6 +2139,7 @@ pub(super) async fn emby_item_response(
                 EmbyItemJsonOptions {
                     nfo: None,
                     can_download,
+                    can_delete: principal.is_admin,
                     fields,
                     primary_image_aspect_ratio: None,
                     include_top_level_media_streams: true,
@@ -2195,6 +2216,7 @@ pub(super) async fn emby_item_response(
                 EmbyItemJsonOptions {
                     nfo: nfo.as_ref(),
                     can_download,
+                    can_delete: principal.is_admin,
                     fields,
                     primary_image_aspect_ratio: aspect_ratio,
                     include_top_level_media_streams: true,
@@ -2612,6 +2634,7 @@ pub(super) fn emby_catalog_item_json_with_state(
     user_state: Option<&crate::storage::StoredUserItemState>,
     nfo: Option<&LocalNfoDetails>,
     can_download: bool,
+    can_delete: bool,
     fields: Option<&str>,
     unplayed_item_count: Option<i64>,
 ) -> Value {
@@ -2622,6 +2645,7 @@ pub(super) fn emby_catalog_item_json_with_state(
         EmbyItemJsonOptions {
             nfo,
             can_download,
+            can_delete,
             fields,
             primary_image_aspect_ratio: None,
             include_top_level_media_streams: false,
@@ -2633,6 +2657,7 @@ pub(super) fn emby_catalog_item_json_with_state(
 pub(super) struct EmbyItemJsonOptions<'a> {
     nfo: Option<&'a LocalNfoDetails>,
     can_download: bool,
+    can_delete: bool,
     fields: Option<&'a str>,
     primary_image_aspect_ratio: Option<f64>,
     include_top_level_media_streams: bool,
@@ -2648,6 +2673,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
     let EmbyItemJsonOptions {
         nfo,
         can_download,
+        can_delete,
         fields,
         primary_image_aspect_ratio,
         include_top_level_media_streams,
@@ -2814,7 +2840,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 json!(item.original_title.clone().unwrap_or_default()),
             ),
             ("SupportsSync".to_owned(), json!(supports_sync)),
-            ("CanDelete".to_owned(), json!(false)),
+            ("CanDelete".to_owned(), json!(can_delete)),
             ("LockData".to_owned(), json!(false)),
             ("LockedFields".to_owned(), json!([])),
             ("ExternalUrls".to_owned(), json!([])),
