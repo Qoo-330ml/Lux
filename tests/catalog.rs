@@ -773,7 +773,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     let user_scoped_detail = client
         .get(format!(
-            "{base_url}/emby/Users/{}/Items/{item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload",
+            "{base_url}/emby/Users/{}/Items/{item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload%2CCanDelete",
             admin.id
         ))
         .header("X-Emby-Token", &admin_token)
@@ -783,6 +783,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     let user_scoped_detail_body: Value = user_scoped_detail.json().await?;
     assert_eq!(user_scoped_detail_body["Id"], item_id);
     assert_eq!(user_scoped_detail_body["Name"], "Alpha Movie");
+    assert_eq!(user_scoped_detail_body["CanDelete"], true);
     assert!(user_scoped_detail_body["MediaSources"].is_array());
     assert_eq!(
         user_scoped_detail_body["PrimaryImageAspectRatio"].as_f64(),

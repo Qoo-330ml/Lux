@@ -1416,9 +1416,18 @@ pub(crate) async fn admin_delete_item(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
+    delete_media_item(&headers, &state, &item_id, query.source_id.as_deref()).await
+}
+
+pub(crate) async fn delete_media_item(
+    headers: &HeaderMap,
+    state: &AppState,
+    item_id: &str,
+    source_id: Option<&str>,
+) -> Response {
     if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
         return api_error(
-            &headers,
+            headers,
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "媒体条目 ID 无效",
@@ -1428,11 +1437,11 @@ pub(crate) async fn admin_delete_item(
     let Some(deletion) = state.deletion.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let report = match deletion.delete(&item_id, query.source_id.as_deref()).await {
+    let report = match deletion.delete(item_id, source_id).await {
         Ok(report) => report,
         Err(MediaDeleteError::ItemNotFound) => {
             return api_error(
-                &headers,
+                headers,
                 StatusCode::NOT_FOUND,
                 lux::ApiErrorCode::NotFound,
                 "媒体文件不存在",
@@ -1441,7 +1450,7 @@ pub(crate) async fn admin_delete_item(
         }
         Err(MediaDeleteError::PathOutsideRoot(_)) => {
             return api_error(
-                &headers,
+                headers,
                 StatusCode::FORBIDDEN,
                 lux::ApiErrorCode::PermissionDenied,
                 "媒体路径不在媒体库根目录内",
@@ -1450,7 +1459,7 @@ pub(crate) async fn admin_delete_item(
         }
         Err(MediaDeleteError::InvalidFileName(_)) => {
             return api_error(
-                &headers,
+                headers,
                 StatusCode::BAD_REQUEST,
                 lux::ApiErrorCode::InvalidRequest,
                 "媒体文件名无效",
@@ -1470,8 +1479,8 @@ pub(crate) async fn admin_delete_item(
         ("media_item", report.item_id.as_str())
     };
     record_audit_event(
-        &state,
-        &headers,
+        state,
+        headers,
         "MEDIA_DELETED",
         Some(audit_target.0),
         Some(audit_target.1),

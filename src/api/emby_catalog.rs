@@ -670,7 +670,7 @@ pub(super) async fn emby_user_resume(
         &page,
         query.fields.as_deref(),
         user.can_download,
-        user.is_admin,
+        user.can_manage_server,
     )
     .await
 }
@@ -718,7 +718,7 @@ pub(super) async fn emby_user_latest(
             &grouped_page,
             query.fields.as_deref(),
             user.can_download,
-            user.is_admin,
+            user.can_manage_server,
         )
         .await
         {
@@ -745,7 +745,7 @@ pub(super) async fn emby_user_latest(
         &page,
         query.fields.as_deref(),
         user.can_download,
-        user.is_admin,
+        user.can_manage_server,
     )
     .await
     {
@@ -769,7 +769,15 @@ pub(super) async fn emby_user_favorites(
     }
     query.is_favorite = Some(true);
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_list_items(&headers, &state, principal, user.can_download, &query).await
+    emby_list_items(
+        &headers,
+        &state,
+        principal,
+        user.can_download,
+        user.can_manage_server,
+        &query,
+    )
+    .await
 }
 
 pub(super) async fn emby_parent_is_library(state: &AppState, parent_id: &str) -> bool {
@@ -938,15 +946,17 @@ pub(super) async fn emby_next_up_response(
         .await
     {
         Ok(page) => {
-            emby_catalog_page_for_user_with_preferred_source(
+            emby_catalog_page_for_user_with_preferred_source_and_options(
                 state,
                 user_id,
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
-                user.is_admin,
-                None,
-                query.enable_total_record_count != Some(false),
+                EmbyCatalogPageOptions {
+                    can_delete: user.can_manage_server,
+                    preferred_source_id: None,
+                    include_start_index: query.enable_total_record_count != Some(false),
+                },
             )
             .await
         }
@@ -991,7 +1001,7 @@ pub(super) async fn emby_show_seasons(
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
-                user.is_admin,
+                user.can_manage_server,
             )
             .await
         }
@@ -1041,7 +1051,7 @@ pub(super) async fn emby_show_episodes(
                 query.fields.as_deref(),
                 user.can_download,
                 EmbyCatalogPageOptions {
-                    can_delete: user.is_admin,
+                    can_delete: user.can_manage_server,
                     preferred_source_id: None,
                     include_start_index: true,
                 },
@@ -1063,7 +1073,7 @@ pub(super) async fn emby_show_episodes(
                     query.fields.as_deref(),
                     user.can_download,
                     EmbyCatalogPageOptions {
-                        can_delete: user.is_admin,
+                        can_delete: user.can_manage_server,
                         preferred_source_id: None,
                         include_start_index: true,
                     },
@@ -1115,7 +1125,7 @@ pub(super) async fn emby_collection_children(
                 &page,
                 query.fields.as_deref(),
                 user.can_download,
-                user.is_admin,
+                user.can_manage_server,
             )
             .await
         }
@@ -1134,29 +1144,6 @@ pub(super) async fn emby_catalog_page_for_user_with_fields(
     can_download: bool,
     can_delete: bool,
 ) -> Response {
-    emby_catalog_page_for_user_with_preferred_source(
-        state,
-        user_id,
-        page,
-        fields,
-        can_download,
-        can_delete,
-        None,
-        true,
-    )
-    .await
-}
-
-pub(super) async fn emby_catalog_page_for_user_with_preferred_source(
-    state: &AppState,
-    user_id: &str,
-    page: &CatalogPage,
-    fields: Option<&str>,
-    can_download: bool,
-    can_delete: bool,
-    preferred_source_id: Option<&str>,
-    include_start_index: bool,
-) -> Response {
     emby_catalog_page_for_user_with_preferred_source_and_options(
         state,
         user_id,
@@ -1165,8 +1152,8 @@ pub(super) async fn emby_catalog_page_for_user_with_preferred_source(
         can_download,
         EmbyCatalogPageOptions {
             can_delete,
-            preferred_source_id,
-            include_start_index,
+            preferred_source_id: None,
+            include_start_index: true,
         },
     )
     .await
@@ -1287,15 +1274,19 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
     .await;
     let mut items = Vec::with_capacity(catalog_items.len());
     for (item, (nfo, actors)) in catalog_items.iter().zip(extras) {
-        let mut value = emby_catalog_item_json_with_state(
+        let mut value = emby_catalog_item_json_with_state_and_aspect_ratio(
             item,
             &state.server_id,
             user_states.get(&item.id),
-            nfo.as_ref(),
-            can_download,
-            can_delete,
-            fields,
-            unplayed_item_counts.get(&item.id).copied(),
+            EmbyItemJsonOptions {
+                nfo: nfo.as_ref(),
+                can_download,
+                can_delete,
+                fields,
+                primary_image_aspect_ratio: None,
+                include_top_level_media_streams: false,
+                unplayed_item_count: unplayed_item_counts.get(&item.id).copied(),
+            },
         );
         if let Some(source_id) = preferred_source_id
             && let Some(Value::Array(sources)) = value.get_mut("MediaSources")
@@ -1445,7 +1436,15 @@ pub(super) async fn emby_user_items(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_list_items(&headers, &state, principal, user.can_download, &query).await
+    emby_list_items(
+        &headers,
+        &state,
+        principal,
+        user.can_download,
+        user.can_manage_server,
+        &query,
+    )
+    .await
 }
 
 pub(super) async fn emby_items(
@@ -1463,7 +1462,15 @@ pub(super) async fn emby_items(
         return status.into_response();
     }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    emby_list_items(&headers, &state, principal, user.can_download, &query).await
+    emby_list_items(
+        &headers,
+        &state,
+        principal,
+        user.can_download,
+        user.can_manage_server,
+        &query,
+    )
+    .await
 }
 
 pub(super) async fn emby_items_counts(
@@ -1544,6 +1551,7 @@ pub(super) async fn emby_list_items(
     state: &AppState,
     principal: AccessPrincipal,
     can_download: bool,
+    can_delete: bool,
     query: &EmbyItemsQuery,
 ) -> Response {
     let root_id = principal.user_id.to_string();
@@ -1559,22 +1567,27 @@ pub(super) async fn emby_list_items(
         };
     }
     if let Some(response) =
-        emby_single_id_lookup_response(state, principal, can_download, query).await
+        emby_single_id_lookup_response(state, principal, can_download, can_delete, query).await
     {
         return response;
     }
     match emby_catalog_page_from_query(state, principal, query).await {
         Ok(page) => {
             let preferred_source_id = emby_compat_media_source_id(query.ids.as_deref(), &page);
-            emby_catalog_page_for_user_with_preferred_source(
+            emby_catalog_page_for_user_with_preferred_source_and_options(
                 state,
                 &principal.user_id.to_string(),
                 &page,
                 query.fields.as_deref(),
                 can_download,
-                principal.is_admin,
-                preferred_source_id,
-                emby_query_requests_series_children(state, principal, query).await,
+                EmbyCatalogPageOptions {
+                    can_delete,
+                    preferred_source_id,
+                    include_start_index: emby_query_requests_series_children(
+                        state, principal, query,
+                    )
+                    .await,
+                },
             )
             .await
         }
@@ -1616,6 +1629,7 @@ pub(super) async fn emby_single_id_lookup_response(
     state: &AppState,
     principal: AccessPrincipal,
     can_download: bool,
+    can_delete: bool,
     query: &EmbyItemsQuery,
 ) -> Option<Response> {
     let requested_id = emby_single_id_lookup(query)?;
@@ -1674,15 +1688,19 @@ pub(super) async fn emby_single_id_lookup_response(
             Ok(count) => count,
             Err(_) => return Some(StatusCode::SERVICE_UNAVAILABLE.into_response()),
         };
-    let mut item_json = emby_catalog_item_json_with_state(
+    let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
         &item,
         &state.server_id,
         user_state.as_ref(),
-        nfo.as_ref(),
-        can_download,
-        principal.is_admin,
-        query.fields.as_deref(),
-        unplayed_item_count,
+        EmbyItemJsonOptions {
+            nfo: nfo.as_ref(),
+            can_download,
+            can_delete,
+            fields: query.fields.as_deref(),
+            primary_image_aspect_ratio: None,
+            include_top_level_media_streams: false,
+            unplayed_item_count,
+        },
     );
     if let Some(source_id) = preferred_source_id
         && let Some(Value::Array(sources)) = item_json.get_mut("MediaSources")
@@ -1926,9 +1944,40 @@ pub(super) async fn emby_item(
         principal,
         &item_id,
         user.can_download,
+        user.can_manage_server,
         fields.as_deref(),
     )
     .await
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyDeleteItemQuery {
+    #[serde(flatten)]
+    pub(super) auth: EmbyTokenQuery,
+    #[serde(
+        rename = "MediaSourceId",
+        alias = "mediaSourceId",
+        alias = "SourceId",
+        alias = "sourceId",
+        default
+    )]
+    pub(super) source_id: Option<String>,
+}
+
+pub(super) async fn emby_delete_item(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<EmbyDeleteItemQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    delete_media_item(&headers, &state, &item_id, query.source_id.as_deref()).await
 }
 
 #[derive(Deserialize)]
@@ -2055,6 +2104,7 @@ pub(super) async fn emby_user_item(
         principal,
         &item_id,
         user.can_download,
+        user.can_manage_server,
         fields.as_deref(),
     )
     .await
@@ -2065,6 +2115,7 @@ pub(super) async fn emby_item_response(
     principal: AccessPrincipal,
     item_id: &str,
     can_download: bool,
+    can_delete: bool,
     fields: Option<&str>,
 ) -> Response {
     if item_id == principal.user_id.to_string() {
@@ -2139,7 +2190,7 @@ pub(super) async fn emby_item_response(
                 EmbyItemJsonOptions {
                     nfo: None,
                     can_download,
-                    can_delete: principal.is_admin,
+                    can_delete,
                     fields,
                     primary_image_aspect_ratio: None,
                     include_top_level_media_streams: true,
@@ -2216,7 +2267,7 @@ pub(super) async fn emby_item_response(
                 EmbyItemJsonOptions {
                     nfo: nfo.as_ref(),
                     can_download,
-                    can_delete: principal.is_admin,
+                    can_delete,
                     fields,
                     primary_image_aspect_ratio: aspect_ratio,
                     include_top_level_media_streams: true,
@@ -2626,32 +2677,6 @@ pub(super) fn ensure_emby_user_scope(
     } else {
         Err(StatusCode::FORBIDDEN)
     }
-}
-
-pub(super) fn emby_catalog_item_json_with_state(
-    item: &CatalogItem,
-    server_id: &str,
-    user_state: Option<&crate::storage::StoredUserItemState>,
-    nfo: Option<&LocalNfoDetails>,
-    can_download: bool,
-    can_delete: bool,
-    fields: Option<&str>,
-    unplayed_item_count: Option<i64>,
-) -> Value {
-    emby_catalog_item_json_with_state_and_aspect_ratio(
-        item,
-        server_id,
-        user_state,
-        EmbyItemJsonOptions {
-            nfo,
-            can_download,
-            can_delete,
-            fields,
-            primary_image_aspect_ratio: None,
-            include_top_level_media_streams: false,
-            unplayed_item_count,
-        },
-    )
 }
 
 pub(super) struct EmbyItemJsonOptions<'a> {
@@ -3105,6 +3130,9 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         }
         if emby_fields_include(fields, "CanDownload") {
             object.insert("CanDownload".to_owned(), json!(can_download && !is_folder));
+        }
+        if emby_fields_include(fields, "CanDelete") {
+            object.insert("CanDelete".to_owned(), json!(can_delete));
         }
         if emby_fields_include(fields, "Overview") {
             emby_insert_optional(

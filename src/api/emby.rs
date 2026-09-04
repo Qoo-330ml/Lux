@@ -67,7 +67,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Search/Hints", get(emby_search_hints))
         .route(
             "/Items/{item_id}",
-            get(emby_item).head(emby_item).post(emby_update_item),
+            get(emby_item)
+                .head(emby_item)
+                .post(emby_update_item)
+                .delete(emby_delete_item),
         )
         .route("/Items/{item_id}/Children", get(emby_collection_children))
         .route("/api/danmu/{item_id}", get(emby_danmaku_info))
