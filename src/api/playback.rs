@@ -68,27 +68,7 @@ pub(super) async fn emby_playback_info(
                 let has_direct_stream_url = value
                     .get("DirectStreamUrl")
                     .is_some_and(Value::is_string);
-                let uses_external_proxy_handoff = has_direct_stream_url
-                    && source.source_kind == "STRM_URL"
-                    && source.external_url.as_deref().is_some_and(|target| {
-                        matches!(
-                            classify_strm_target(target).kind,
-                            StrmTargetKind::Url | StrmTargetKind::Path
-                        )
-                    });
-                if uses_external_proxy_handoff {
-                    // Preserve the original URL or local path so a downstream
-                    // Emby proxy can extract its own mapping identifiers from
-                    // the STRM target. SMB and FTP targets intentionally stay
-                    // on Lux's signed resolver entrypoint below.
-                    if let Value::Object(object) = &mut value {
-                        object.insert(
-                            "DirectStreamUrl".to_owned(),
-                            json!(source.external_url),
-                        );
-                        object.insert("AddApiKeyToDirectStreamUrl".to_owned(), json!(false));
-                    }
-                } else if has_direct_stream_url
+                if has_direct_stream_url
                     && let Some(service) = state.web_playback.as_ref()
                     && let Some(url) = emby_signed_direct_stream_url(service, &item.id, source, &user)
                     && let Value::Object(object) = &mut value
