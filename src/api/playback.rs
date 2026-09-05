@@ -131,12 +131,20 @@ pub(super) struct PlaybackEventRequest {
     device_type: Option<String>,
 }
 
+fn parse_emby_playback_event(body: &Bytes) -> Result<PlaybackEventRequest, StatusCode> {
+    serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
 pub(super) async fn emby_playing(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
-    Json(request): Json<PlaybackEventRequest>,
+    body: Bytes,
 ) -> Response {
+    let request = match parse_emby_playback_event(&body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
     handle_emby_playback_event(headers, query, state, request, "PLAYING").await
 }
 
@@ -144,8 +152,12 @@ pub(super) async fn emby_playing_progress(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
-    Json(request): Json<PlaybackEventRequest>,
+    body: Bytes,
 ) -> Response {
+    let request = match parse_emby_playback_event(&body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
     let state_name = if request.is_paused {
         "PAUSED"
     } else {
@@ -158,8 +170,12 @@ pub(super) async fn emby_playing_stopped(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
-    Json(request): Json<PlaybackEventRequest>,
+    body: Bytes,
 ) -> Response {
+    let request = match parse_emby_playback_event(&body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
     handle_emby_playback_event(headers, query, state, request, "STOPPED").await
 }
 

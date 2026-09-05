@@ -149,8 +149,9 @@ fi
             .as_str()
             .ok_or("missing signed direct stream URL")?;
         assert!(direct_url.starts_with(&format!(
-            "/Videos/{emby_item_id}/stream?MediaSourceId={source_id}&luxPlayback"
+            "/Videos/{emby_item_id}/stream?MediaSourceId={source_id}&UserId="
         )));
+        assert!(direct_url.contains("&luxPlayback"));
         assert_ne!(direct_url, target);
         assert_eq!(
             playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],

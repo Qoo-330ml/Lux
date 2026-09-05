@@ -101,10 +101,19 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .header("X-Emby-Token", &token)
         .header("x-lux-peer-ip", "203.0.113.9")
         .header("x-forwarded-for", "203.0.113.9")
-        .json(&event)
+        .header("Content-Type", "text/plain")
+        .body(serde_json::to_vec(&event)?)
         .send()
         .await?;
     assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+    let invalid_playing = client
+        .post(&event_url)
+        .header("X-Emby-Token", &token)
+        .header("Content-Type", "text/plain")
+        .body("not-json")
+        .send()
+        .await?;
+    assert_eq!(invalid_playing.status(), reqwest::StatusCode::BAD_REQUEST);
     let duplicate = client
         .post(&event_url)
         .header("X-Emby-Token", &token)
@@ -121,13 +130,17 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let high_request = tokio::spawn(async move {
         high.post(progress_url)
             .header("X-Emby-Token", high_token)
-            .json(&json!({
-                "ItemId": high_item_id,
-                "MediaSourceId": high_source_id,
-                "PlaySessionId": "session-1",
-                "PositionTicks": 900,
-                "RunTimeTicks": 1000,
-            }))
+            .header("Content-Type", "text/plain")
+            .body(
+                serde_json::to_vec(&json!({
+                    "ItemId": high_item_id,
+                    "MediaSourceId": high_source_id,
+                    "PlaySessionId": "session-1",
+                    "PositionTicks": 900,
+                    "RunTimeTicks": 1000,
+                }))
+                .expect("playback progress fixture should serialize"),
+            )
             .send()
             .await
     });
@@ -264,12 +277,13 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
         .header("X-Emby-Token", &token)
-        .json(&json!({
+        .header("Content-Type", "text/plain")
+        .body(serde_json::to_vec(&json!({
             "ItemId": event["ItemId"],
             "MediaSourceId": event["MediaSourceId"],
             "PlaySessionId": "session-1",
             "PositionTicks": 900,
-        }))
+        }))?)
         .send()
         .await?;
     assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);

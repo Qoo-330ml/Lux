@@ -24,6 +24,8 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "fixed", items: [
         "修复平铺电影目录中多个 NFO 变体及不可用媒体记录参与身份冲突判断不正确的问题；现在可以识别真实的同目录 NFO 冲突，并忽略已不可用记录。",
         "修复本地 NFO 首映/发行日期未同步到媒体条目索引的问题；日期现在会在索引缺失时写入，并用于后续详情和查询响应。",
+        "修复 Hills 等客户端在 Content-Type: text/plain 下发送 JSON 播放回调导致 Sessions/Playing、Progress 和 Stopped 返回 415 的问题；现在这些回调按 JSON body 兼容解析，非法 JSON 仍返回 400。",
+        "修复无鉴权头的代理媒体请求无法关联播放用户的问题；签名播放地址现在补充标准 UserId 身份提示，同时继续使用绑定条目、媒体源和用户的短期 HMAC 票据完成授权。",
       ] },
     ],
   },

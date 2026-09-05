@@ -308,6 +308,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .ok_or("missing proxy-compatible remote direct stream URL")?;
     assert!(remote_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
     assert!(remote_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
+    assert!(remote_direct_url.contains(&format!("&UserId={user_id}")));
     assert!(remote_direct_url.contains("luxPlayback"));
     assert!(!remote_direct_url.contains("192.168.10.50"));
     assert!(!remote_direct_url.contains("media.example.test"));
@@ -340,6 +341,18 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
+    let unsigned_remote_url = remote_direct_url
+        .split_once("&luxPlaybackUserId=")
+        .map(|(url, _)| url)
+        .ok_or("missing signed playback ticket")?;
+    let unsigned_remote_stream = no_redirect_client
+        .get(format!("http://{address}{unsigned_remote_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        unsigned_remote_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let signed_remote_stream = no_redirect_client
         .get(format!("http://{address}{remote_direct_url}"))
         .header(reqwest::header::USER_AGENT, "VidHub/9.0 (iPhone; iOS 18.0)")
