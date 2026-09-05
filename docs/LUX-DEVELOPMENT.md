@@ -5518,7 +5518,9 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby 用户 token 作为 `api_key` 写入同一签名 URL；本地文件和 SMB/FTP
 解析源不携带长期 token。无论提示取值如何，Lux 都要求短期票据，使具备自身映射或 302 能力的外部代理可以从原始 `Path`
 提取信息并优先接管播放。这样客户端请求始终回到当前公网代理域名，不会直接访问 `.strm` 中的内网 302 地址。
-Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访问 `.strm` 目标。
+无头媒体请求 URL 中的标准 `UserId` 仅作为外部代理的本地用户名提示，使用 Lux 登录用户名；Lux 内部 UUID
+只保存在 `luxPlaybackUserId` 绑定的短期 HMAC 票据中，不能用该提示字段替代授权。Lux 不绑定具体代理品牌，
+也不在扫描或 `PlaybackInfo` 请求中访问 `.strm` 目标。
 
 Emby 兼容层对外统一使用由内部 UUID 无状态编码得到的稳定纯数字媒体条目 ID；已有数据库条目不需要迁移，
 Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所有接收媒体条目 ID 的 Emby 详情、目录过滤、

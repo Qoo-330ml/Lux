@@ -326,7 +326,8 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .ok_or("missing proxy-compatible remote direct stream URL")?;
     assert!(remote_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
     assert!(remote_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
-    assert!(remote_direct_url.contains(&format!("&UserId={user_id}")));
+    assert!(remote_direct_url.contains("&UserId=admin"));
+    assert!(remote_direct_url.contains(&format!("&luxPlaybackUserId={user_id}")));
     assert!(remote_direct_url.contains(&format!("&api_key={}", token)));
     assert!(remote_direct_url.contains("luxPlayback"));
     assert!(!remote_direct_url.contains("192.168.10.50"));

@@ -3858,12 +3858,12 @@ pub(super) fn emby_signed_direct_stream_url(
         url.push_str("&api_key=");
         url.push_str(&percent_encode_filename(api_key));
     }
-    // NextEmby uses the standard Emby UserId query parameter to associate
-    // headerless media requests with the playback user before it decides
-    // whether to proxy the request. This is only an identity hint: Lux still
-    // authorizes the request with the bound HMAC ticket below.
+    // Some external Emby proxies use the standard UserId query parameter as
+    // their local username/identity lookup key. Lux's UUID is intentionally
+    // kept in the signed ticket; the login name is only an untrusted proxy
+    // hint and never authorizes the Lux request.
     url.push_str("&UserId=");
-    url.push_str(&percent_encode_filename(&user_id));
+    url.push_str(&percent_encode_filename(&user.username_normalized));
     url.push_str("&luxPlaybackUserId=");
     url.push_str(&percent_encode_filename(&user_id));
     url.push_str("&luxPlaybackAdmin=");
