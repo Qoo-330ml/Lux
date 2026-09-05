@@ -3828,6 +3828,9 @@ pub(super) fn emby_media_source_stream_url_parts(
     let item_id = emby_public_id(item_id);
     let stream_suffix = container
         .filter(|container| !(source_kind == "STRM_URL" && container.eq_ignore_ascii_case("strm")))
+        .filter(|container| {
+            !container.is_empty() && container.bytes().all(|byte| byte.is_ascii_alphanumeric())
+        })
         .map(|container| format!(".{container}"))
         .unwrap_or_default();
     format!("/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={source_id}")

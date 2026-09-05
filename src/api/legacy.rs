@@ -1447,15 +1447,15 @@ mod tests {
         CatalogSort, EmbyItemDetailWorkPlan, FilmlyImageCompatMode, MediaStrategySettings,
         MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby, emby_collection_type,
         emby_internal_id, emby_item_detail_work_plan, emby_media_source_json,
-        emby_media_source_json_with_resolver, emby_media_stream_item_id, emby_media_stream_json,
-        emby_playback_info_item_id, emby_public_id, emby_single_id_lookup,
-        emby_source_needs_strm_resolver, filmly_image_compat_mode_from_env_value,
-        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
-        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_video_path,
-        is_filmly_user_agent, is_registered_emby_video_path, lux_catalog_source_json,
-        metadata_candidate_failure_kind, normalize_strm_http_location, playback_client_label,
-        playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, validate_media_strategy,
+        emby_media_source_json_with_resolver, emby_media_source_stream_url_parts,
+        emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
+        emby_public_id, emby_single_id_lookup, emby_source_needs_strm_resolver,
+        filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
+        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
+        is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
+        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
+        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
+        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -2057,6 +2057,19 @@ mod tests {
             "/Videos/item-1/stream.mkv?MediaSourceId=source-1"
         );
         assert_eq!(body["Path"], "/cloud/library/movie.mp4");
+    }
+
+    #[test]
+    fn composite_container_names_use_the_generic_stream_entrypoint() {
+        assert_eq!(
+            emby_media_source_stream_url_parts(
+                "item-1",
+                "source-1",
+                "LOCAL_FILE",
+                Some("matroska,webm"),
+            ),
+            "/Videos/item-1/stream?MediaSourceId=source-1"
+        );
     }
 
     #[test]
