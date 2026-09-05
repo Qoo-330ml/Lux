@@ -406,6 +406,22 @@ pub(super) async fn handle_emby_playback_event(
         Ok(session) => session,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let duration_ticks = if let Some(duration_ticks) = request.duration_ticks {
+        Some(duration_ticks)
+    } else if let Some(duration_ticks) = previous_session
+        .as_ref()
+        .and_then(|session| session.duration_ticks)
+    {
+        Some(duration_ticks)
+    } else {
+        emby_playback_event_duration_ticks(
+            &state,
+            AccessPrincipal::new(user.id, user.is_admin),
+            &internal_item_id,
+            media_source_id,
+        )
+        .await
+    };
     let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
     let occurred_at = current_unix_timestamp();
     let webhook_event = webhook_event_type_for_playback(
@@ -437,7 +453,7 @@ pub(super) async fn handle_emby_playback_event(
             remote_ip: remote_ip.as_deref(),
             state: state_name,
             position_ticks: request.position_ticks,
-            duration_ticks: request.duration_ticks,
+            duration_ticks,
             played_percent,
             is_paused: request.is_paused || state_name == "PAUSED",
         })
@@ -479,7 +495,7 @@ pub(super) async fn handle_emby_playback_event(
                     &play_session_id,
                     state_name,
                     request.position_ticks,
-                    request.duration_ticks,
+                    duration_ticks,
                     request.is_paused || state_name == "PAUSED",
                     client,
                     device_name,
@@ -493,7 +509,7 @@ pub(super) async fn handle_emby_playback_event(
                 playback_state = state_name,
                 item_id_prefix = %item_id_prefix,
                 position_ticks = request.position_ticks,
-                duration_ticks_present = request.duration_ticks.is_some(),
+                duration_ticks_present = duration_ticks.is_some(),
                 is_paused = request.is_paused || state_name == "PAUSED",
                 client = playback_client_label(client),
                 "recorded emby playback callback"
@@ -513,6 +529,40 @@ pub(super) async fn handle_emby_playback_event(
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
     }
+}
+
+async fn emby_playback_event_duration_ticks(
+    state: &AppState,
+    principal: AccessPrincipal,
+    item_id: &str,
+    media_source_id: Option<&str>,
+) -> Option<i64> {
+    let catalog = state.catalog.as_ref()?;
+    let item = catalog.find_item(principal, item_id).await.ok().flatten()?;
+    item.runtime_ticks
+        .filter(|ticks| *ticks > 0)
+        .or_else(|| {
+            media_source_id.and_then(|source_id| {
+                item.media_sources
+                    .iter()
+                    .find(|source| source.id == source_id)
+                    .and_then(|source| source.duration_ticks)
+                    .filter(|ticks| *ticks > 0)
+            })
+        })
+        .or_else(|| {
+            item.media_sources
+                .iter()
+                .find(|source| source.is_default)
+                .and_then(|source| source.duration_ticks)
+                .filter(|ticks| *ticks > 0)
+        })
+        .or_else(|| {
+            item.media_sources
+                .iter()
+                .find_map(|source| source.duration_ticks)
+                .filter(|ticks| *ticks > 0)
+        })
 }
 
 pub(super) fn playback_identifier_prefix(value: &str) -> String {
