@@ -1775,10 +1775,54 @@ pub(super) async fn handle_emby_user_flag(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            StatusCode::NO_CONTENT.into_response()
+            let user_state = match database.find_user_item_state(&user_id, &item_id).await {
+                Ok(user_state) => user_state,
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            };
+            Json(emby_user_item_data_json(&item_id, user_state.as_ref())).into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+/// Emby's PlayedItems and FavoriteItems mutations return UserItemDataDto, not
+/// an empty 204 response. Some clients deserialize this response immediately
+/// after toggling the state, so keep the response shape aligned with the
+/// public Emby contract.
+fn emby_user_item_data_json(
+    item_id: &str,
+    user_state: Option<&crate::storage::StoredUserItemState>,
+) -> Value {
+    let mut object = serde_json::Map::from_iter([
+        (
+            "PlaybackPositionTicks".to_owned(),
+            json!(
+                user_state
+                    .map(|state| state.position_ticks)
+                    .unwrap_or_default()
+            ),
+        ),
+        (
+            "PlayCount".to_owned(),
+            json!(user_state.map(|state| state.play_count).unwrap_or_default()),
+        ),
+        (
+            "IsFavorite".to_owned(),
+            json!(user_state.map(|state| state.is_favorite).unwrap_or(false)),
+        ),
+        (
+            "Played".to_owned(),
+            json!(user_state.map(|state| state.is_played).unwrap_or(false)),
+        ),
+        ("ItemId".to_owned(), json!(emby_public_id(item_id))),
+        ("Key".to_owned(), json!(emby_public_id(item_id))),
+    ]);
+    if let Some(last_played_at) = user_state.and_then(|state| state.last_played_at)
+        && let Some(last_played_date) = emby_timestamp(last_played_at)
+    {
+        object.insert("LastPlayedDate".to_owned(), json!(last_played_date));
+    }
+    Value::Object(object)
 }
 
 #[derive(Deserialize)]

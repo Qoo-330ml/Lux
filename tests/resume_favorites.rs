@@ -353,7 +353,12 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .header("X-Emby-Token", &token)
         .send()
         .await?;
-    assert_eq!(played.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(played.status(), reqwest::StatusCode::OK);
+    let played_body = played.json::<Value>().await?;
+    assert_eq!(played_body["ItemId"], emby_eligible_id);
+    assert_eq!(played_body["Played"], true);
+    assert_eq!(played_body["IsFavorite"], false);
+    assert_eq!(played_body["PlayCount"], 1);
     let played_again = client
         .post(format!(
             "{base_url}/Users/{admin_id}/PlayedItems/{emby_eligible_id}"
@@ -361,7 +366,11 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .header("X-Emby-Token", &token)
         .send()
         .await?;
-    assert_eq!(played_again.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(played_again.status(), reqwest::StatusCode::OK);
+    let played_again_body = played_again.json::<Value>().await?;
+    assert_eq!(played_again_body["ItemId"], emby_eligible_id);
+    assert_eq!(played_again_body["Played"], true);
+    assert_eq!(played_again_body["PlayCount"], 1);
     let favorite = client
         .post(format!(
             "{base_url}/Users/{admin_id}/FavoriteItems/{emby_eligible_id}"
@@ -369,7 +378,11 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .header("X-Emby-Token", &token)
         .send()
         .await?;
-    assert_eq!(favorite.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(favorite.status(), reqwest::StatusCode::OK);
+    let favorite_body = favorite.json::<Value>().await?;
+    assert_eq!(favorite_body["ItemId"], emby_eligible_id);
+    assert_eq!(favorite_body["Played"], true);
+    assert_eq!(favorite_body["IsFavorite"], true);
     let favorites = client
         .get(format!("{base_url}/Users/{admin_id}/FavoriteItems"))
         .query(&[
@@ -425,7 +438,11 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .header("X-Emby-Token", &token)
         .send()
         .await?;
-    assert_eq!(unplayed.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(unplayed.status(), reqwest::StatusCode::OK);
+    let unplayed_body = unplayed.json::<Value>().await?;
+    assert_eq!(unplayed_body["ItemId"], emby_eligible_id);
+    assert_eq!(unplayed_body["Played"], false);
+    assert_eq!(unplayed_body["IsFavorite"], true);
     let unfavorite = client
         .delete(format!(
             "{base_url}/Users/{admin_id}/FavoriteItems/{emby_eligible_id}"
@@ -433,7 +450,11 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         .header("X-Emby-Token", &token)
         .send()
         .await?;
-    assert_eq!(unfavorite.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(unfavorite.status(), reqwest::StatusCode::OK);
+    let unfavorite_body = unfavorite.json::<Value>().await?;
+    assert_eq!(unfavorite_body["ItemId"], emby_eligible_id);
+    assert_eq!(unfavorite_body["Played"], false);
+    assert_eq!(unfavorite_body["IsFavorite"], false);
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
