@@ -3841,6 +3841,7 @@ pub(super) fn emby_signed_direct_stream_url(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     user: &UserRecord,
+    api_key: Option<&str>,
 ) -> Option<String> {
     let expires_at = current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
     let user_id = user.id.to_string();
@@ -3852,6 +3853,13 @@ pub(super) fn emby_signed_direct_stream_url(
         expires_at,
     )?;
     let mut url = emby_media_source_stream_url(item_id, source);
+    if let Some(api_key) = api_key.filter(|api_key| !api_key.is_empty()) {
+        // Hills 1.8.0 advertises AddApiKeyToDirectStreamUrl but drops the
+        // token on its independent media request. NextEmby needs that token
+        // to map the request back to the proxy user before resolving a STRM.
+        url.push_str("&api_key=");
+        url.push_str(&percent_encode_filename(api_key));
+    }
     // NextEmby uses the standard Emby UserId query parameter to associate
     // headerless media requests with the playback user before it decides
     // whether to proxy the request. This is only an identity hint: Lux still

@@ -13,6 +13,9 @@ pub(super) async fn emby_playback_info(
         .client
         .as_deref()
         .is_some_and(|client| client.eq_ignore_ascii_case("Hills"));
+    let hills_api_key = is_hills_client
+        .then(|| hills_direct_stream_api_key(&headers, query.api_key.as_deref()))
+        .flatten();
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -74,15 +77,21 @@ pub(super) async fn emby_playback_info(
                     .is_some_and(Value::is_string);
                 if has_direct_stream_url
                     && let Some(service) = state.web_playback.as_ref()
-                    && let Some(url) = emby_signed_direct_stream_url(service, &item.id, source, &user)
+                    && let Some(url) = emby_signed_direct_stream_url(
+                        service,
+                        &item.id,
+                        source,
+                        &user,
+                        hills_api_key.as_deref(),
+                    )
                     && let Value::Object(object) = &mut value
                 {
                     object.insert("DirectStreamUrl".to_owned(), json!(url));
                     // Hills sends media requests through an independent stack.
                     // NextEmby uses the standard Emby token to identify the
                     // proxy user, while Lux still requires the signed ticket.
-                    // Keep the token out of the response URL and let Hills
-                    // append its current token according to this flag.
+                    // Hills 1.8.0 drops the token despite this flag, so the
+                    // Hills-only URL already carries the token when available.
                     object.insert(
                         "AddApiKeyToDirectStreamUrl".to_owned(),
                         json!(is_hills_client),
@@ -93,6 +102,27 @@ pub(super) async fn emby_playback_info(
             .collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+fn hills_direct_stream_api_key(headers: &HeaderMap, query_api_key: Option<&str>) -> Option<String> {
+    for name in [
+        "X-Emby-Token",
+        "X-MediaBrowser-Token",
+        "X-Emby-Authorization",
+        "X-Emby-Authentication",
+        "Authorization",
+    ] {
+        if let Some(token) = headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .and_then(emby_token_header_value)
+        {
+            return Some(token);
+        }
+    }
+    query_api_key
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
 }
 
 #[derive(Deserialize, Default)]

@@ -318,7 +318,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .get(format!(
             "http://{address}/Items/{remote_item_id}/PlaybackInfo"
         ))
-        .query(&[("api_key", token.as_str()), ("X-Emby-Client", "Hills")])
+        .query(&[("X-Emby-Client", "Hills"), ("X-Emby-Token", token.as_str())])
         .send()
         .await?;
     assert_eq!(hills_playback.status(), reqwest::StatusCode::OK);
@@ -327,6 +327,10 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         hills_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
         true
     );
+    let hills_direct_url = hills_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing Hills direct stream URL")?;
+    assert!(hills_direct_url.contains(&format!("&api_key={token}")));
 
     let path_playback = client
         .get(format!(
