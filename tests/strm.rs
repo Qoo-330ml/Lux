@@ -4,7 +4,7 @@ use luxd::{
         libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
         strm_playback::StrmPlaybackResolver,
     },
-    auth::{emby::EmbyAuthService, sessions::WebAuthService},
+    auth::{admin_api_key::AdminApiKeyService, emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
     storage::Database,
@@ -159,6 +159,9 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     });
     let resolver =
         StrmPlaybackResolver::new_with_proxy_for_tests(format!("http://{proxy_address}"))?;
+    let admin_api_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
     let app = app_with_state(
         AppState::ready(config, database.clone(), setup, auth, emby_auth)
             .with_strm_playback_resolver(resolver),
@@ -185,6 +188,20 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .as_str()
         .ok_or("missing user id")?
         .to_owned();
+
+    let admin_key_playback = client
+        .get(format!(
+            "http://{address}/Items/{remote_item_id}/PlaybackInfo"
+        ))
+        .query(&[("api_key", admin_api_key.as_str())])
+        .send()
+        .await?;
+    assert_eq!(admin_key_playback.status(), reqwest::StatusCode::OK);
+    let admin_key_playback_body = admin_key_playback.json::<Value>().await?;
+    let admin_key_direct_url = admin_key_playback_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing admin-key direct stream URL")?;
+    assert!(!admin_key_direct_url.contains(&admin_api_key));
 
     let popcorn_detail = client
         .get(format!(
@@ -282,11 +299,12 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert!(popcorn_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
     assert!(popcorn_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
     assert!(popcorn_direct_url.contains("luxPlayback"));
+    assert!(popcorn_direct_url.contains(&format!("&api_key={}", token)));
     assert!(!popcorn_direct_url.contains("192.168.10.50"));
     assert!(!popcorn_direct_url.contains("media.example.test"));
     assert_eq!(
         popcorn_playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
-        false
+        true
     );
 
     let playback = client
@@ -309,10 +327,11 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert!(remote_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
     assert!(remote_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
     assert!(remote_direct_url.contains(&format!("&UserId={user_id}")));
+    assert!(remote_direct_url.contains(&format!("&api_key={}", token)));
     assert!(remote_direct_url.contains("luxPlayback"));
     assert!(!remote_direct_url.contains("192.168.10.50"));
     assert!(!remote_direct_url.contains("media.example.test"));
-    assert_eq!(body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"], false);
+    assert_eq!(body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"], true);
 
     let hills_playback = client
         .get(format!(
@@ -350,16 +369,18 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert!(path_direct_url.starts_with(&format!("/Videos/{path_public_item_id}/stream")));
     assert!(path_direct_url.contains(&format!("MediaSourceId={path_source_id}")));
     assert!(path_direct_url.contains("luxPlayback"));
+    assert!(path_direct_url.contains(&format!("&api_key={}", token)));
     assert!(!path_direct_url.contains("targets/movie"));
     assert_eq!(
         path_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
-        false
+        true
     );
 
     let no_redirect_client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
-    let unsigned_remote_url = remote_direct_url
+    let remote_url_without_api_key = remote_direct_url.replace(&format!("&api_key={token}"), "");
+    let unsigned_remote_url = remote_url_without_api_key
         .split_once("&luxPlaybackUserId=")
         .map(|(url, _)| url)
         .ok_or("missing signed playback ticket")?;

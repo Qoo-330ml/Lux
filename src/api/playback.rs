@@ -9,13 +9,8 @@ pub(super) async fn emby_playback_info(
     State(state): State<AppState>,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
-    let is_hills_client = query
-        .client
-        .as_deref()
-        .is_some_and(|client| client.eq_ignore_ascii_case("Hills"));
-    let hills_api_key = is_hills_client
-        .then(|| hills_direct_stream_api_key(&headers, query.api_key.as_deref()))
-        .flatten();
+    let standard_api_key =
+        standard_emby_playback_api_key(&headers, query.api_key.as_deref(), &state).await;
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -82,19 +77,24 @@ pub(super) async fn emby_playback_info(
                         &item.id,
                         source,
                         &user,
-                        hills_api_key.as_deref(),
+                        if emby_source_needs_proxy_identity(source) {
+                            standard_api_key.as_deref()
+                        } else {
+                            None
+                        },
                     )
                     && let Value::Object(object) = &mut value
                 {
                     object.insert("DirectStreamUrl".to_owned(), json!(url));
-                    // Hills sends media requests through an independent stack.
-                    // NextEmby uses the standard Emby token to identify the
-                    // proxy user, while Lux still requires the signed ticket.
-                    // Hills 1.8.0 drops the token despite this flag, so the
-                    // Hills-only URL already carries the token when available.
+                    // Third-party clients may send the media request through
+                    // an independent stack. External proxies use the
+                    // standard Emby token to identify the proxy user, while
+                    // Lux still requires the signed ticket. For URL/path STRM
+                    // sources the token is already embedded for clients that
+                    // ignore AddApiKeyToDirectStreamUrl.
                     object.insert(
                         "AddApiKeyToDirectStreamUrl".to_owned(),
-                        json!(is_hills_client),
+                        json!(emby_source_needs_proxy_identity(source)),
                     );
                 }
                 value
@@ -104,25 +104,33 @@ pub(super) async fn emby_playback_info(
     .into_response()
 }
 
-fn hills_direct_stream_api_key(headers: &HeaderMap, query_api_key: Option<&str>) -> Option<String> {
-    for name in [
-        "X-Emby-Token",
-        "X-MediaBrowser-Token",
-        "X-Emby-Authorization",
-        "X-Emby-Authentication",
-        "Authorization",
-    ] {
-        if let Some(token) = headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .and_then(emby_token_header_value)
-        {
-            return Some(token);
+async fn standard_emby_playback_api_key(
+    headers: &HeaderMap,
+    query_api_key: Option<&str>,
+    state: &AppState,
+) -> Option<String> {
+    // X-Lux-Api-Key is the shared Lux management credential, not a user
+    // identity that an external Emby proxy can safely receive.
+    let token = if headers.contains_key("X-Lux-Api-Key") {
+        None
+    } else {
+        emby_token_from_headers(headers).or_else(|| {
+            query_api_key
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+    }?;
+
+    // The shared management key is also accepted on Emby-compatible routes
+    // for administration. Never copy it into a playback URL, even when it
+    // was supplied as the query api_key.
+    if let Some(service) = state.admin_api_key.as_ref() {
+        match service.resolve(&token).await {
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
         }
     }
-    query_api_key
-        .filter(|value| !value.is_empty())
-        .map(str::to_owned)
+    Some(token)
 }
 
 #[derive(Deserialize, Default)]
