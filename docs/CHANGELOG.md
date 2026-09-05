@@ -17,6 +17,8 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 - 修复 Hills 等客户端在 `Content-Type: text/plain` 下发送 JSON 播放回调导致 `Sessions/Playing`、`Progress` 和 `Stopped` 返回 415 的问题；现在这些回调按 JSON body 兼容解析，非法 JSON 仍返回 400。
 - 修复无鉴权头的代理媒体请求无法关联播放用户的问题；签名播放地址现在补充标准 `UserId` 身份提示，同时继续使用绑定条目、媒体源和用户的短期 HMAC 票据完成授权。
 - 修复第三方播放器忽略 `AddApiKeyToDirectStreamUrl` 后，NextEmby 无法从独立 `/Videos/.../stream` 请求识别用户的问题；URL/路径型 `.strm` 的签名播放 URL 现在统一携带本次标准 Emby token 的 `api_key`，本地文件和 SMB/FTP 解析源仍不携带长期 token。
+- 修复复合容器名称生成无效代理播放路径的问题；`matroska,webm` 等复合值现在使用通用 `/Videos/.../stream` 入口，不再拼接为带逗号的 URL 后缀。
+- 修复部分客户端播放回调缺少媒体时长时无法正确记录播放完成状态的问题；现在会优先使用已有会话时长，并从条目或媒体源索引补齐缺失时长。
 
 ### Changed
 
