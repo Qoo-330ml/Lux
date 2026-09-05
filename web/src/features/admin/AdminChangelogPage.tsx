@@ -28,6 +28,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复无鉴权头的代理媒体请求无法关联播放用户的问题；签名播放地址现在补充标准 UserId 身份提示，同时继续使用绑定条目、媒体源和用户的短期 HMAC 票据完成授权。",
         "修复复合容器名称生成无效代理播放路径的问题；matroska,webm 等复合值现在使用通用 /Videos/.../stream 入口，不再拼接为带逗号的 URL 后缀。",
         "修复部分客户端播放回调缺少媒体时长时无法正确记录播放完成状态的问题；现在会优先使用已有会话时长，并从条目或媒体源索引补齐缺失时长。",
+        "修复 Emby 已看和收藏操作返回空 204 导致客户端无法立即读取状态的问题；成功操作现在返回包含 ItemId、Played、IsFavorite、PlayCount 和播放位置的 UserItemDataDto。",
       ] },
       { kind: "changed", items: [
         "兼容第三方播放器的代理播放请求：对 URL/路径型 .strm，Lux 返回标准 AddApiKeyToDirectStreamUrl=true，并将当前 token 写入签名 URL，以兼容播放器实际丢失鉴权的独立媒体请求；本地文件和 SMB/FTP 解析源仍不写入长期 token。",
