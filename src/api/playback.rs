@@ -9,6 +9,10 @@ pub(super) async fn emby_playback_info(
     State(state): State<AppState>,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
+    let is_hills_client = query
+        .client
+        .as_deref()
+        .is_some_and(|client| client.eq_ignore_ascii_case("Hills"));
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
         Ok(user) => user,
         Err(status) => return status.into_response(),
@@ -74,9 +78,15 @@ pub(super) async fn emby_playback_info(
                     && let Value::Object(object) = &mut value
                 {
                     object.insert("DirectStreamUrl".to_owned(), json!(url));
-                    // The signed URL is already authorized. Do not ask clients
-                    // to append a long-lived Emby token to it as well.
-                    object.insert("AddApiKeyToDirectStreamUrl".to_owned(), json!(false));
+                    // Hills sends media requests through an independent stack.
+                    // NextEmby uses the standard Emby token to identify the
+                    // proxy user, while Lux still requires the signed ticket.
+                    // Keep the token out of the response URL and let Hills
+                    // append its current token according to this flag.
+                    object.insert(
+                        "AddApiKeyToDirectStreamUrl".to_owned(),
+                        json!(is_hills_client),
+                    );
                 }
                 value
             })

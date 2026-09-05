@@ -314,6 +314,20 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert!(!remote_direct_url.contains("media.example.test"));
     assert_eq!(body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"], false);
 
+    let hills_playback = client
+        .get(format!(
+            "http://{address}/Items/{remote_item_id}/PlaybackInfo"
+        ))
+        .query(&[("api_key", token.as_str()), ("X-Emby-Client", "Hills")])
+        .send()
+        .await?;
+    assert_eq!(hills_playback.status(), reqwest::StatusCode::OK);
+    let hills_body = hills_playback.json::<Value>().await?;
+    assert_eq!(
+        hills_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
+        true
+    );
+
     let path_playback = client
         .get(format!(
             "http://{address}/Items/{path_item_id}/PlaybackInfo"

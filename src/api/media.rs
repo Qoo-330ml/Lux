@@ -1777,6 +1777,7 @@ pub(super) async fn emby_subtitle_without_source(
 #[derive(Default)]
 pub(super) struct EmbyStreamQuery {
     pub(super) api_key: Option<String>,
+    pub(super) client: Option<String>,
     pub(super) media_source_id: Option<String>,
     pub(super) playback_user_id: Option<String>,
     pub(super) playback_is_admin: Option<bool>,
@@ -1806,6 +1807,10 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
                 || name.eq_ignore_ascii_case("media_source_id"))
         {
             query.media_source_id = Some(value.into_owned());
+        } else if query.client.is_none()
+            && (name.eq_ignore_ascii_case("X-Emby-Client") || name.eq_ignore_ascii_case("client"))
+        {
+            query.client = Some(value.into_owned());
         } else if query.playback_user_id.is_none() && name.eq_ignore_ascii_case("luxPlaybackUserId")
         {
             query.playback_user_id = Some(value.into_owned());
@@ -1850,6 +1855,9 @@ pub(super) fn emby_stream_query_from_path(
     }
     if query.media_source_id.is_none() {
         query.media_source_id = embedded.media_source_id;
+    }
+    if query.client.is_none() {
+        query.client = embedded.client;
     }
     if query.playback_user_id.is_none() {
         query.playback_user_id = embedded.playback_user_id;
