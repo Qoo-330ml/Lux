@@ -16,10 +16,11 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 - 修复本地 NFO 首映/发行日期未同步到媒体条目索引的问题；日期现在会在索引缺失时写入，并用于后续详情和查询响应。
 - 修复 Hills 等客户端在 `Content-Type: text/plain` 下发送 JSON 播放回调导致 `Sessions/Playing`、`Progress` 和 `Stopped` 返回 415 的问题；现在这些回调按 JSON body 兼容解析，非法 JSON 仍返回 400。
 - 修复无鉴权头的代理媒体请求无法关联播放用户的问题；签名播放地址现在补充标准 `UserId` 身份提示，同时继续使用绑定条目、媒体源和用户的短期 HMAC 票据完成授权。
+- 修复 Hills 1.8.0 忽略 `AddApiKeyToDirectStreamUrl` 后，NextEmby 无法从独立 `/Videos/.../stream` 请求识别用户的问题；Hills 的签名播放 URL 现在携带本次标准 Emby token 的 `api_key`，普通客户端仍不携带长期 token。
 
 ### Changed
 
-- 兼容 Hills 1.8.0 的代理播放请求：当 `PlaybackInfo` 请求标识 `X-Emby-Client=Hills` 时，允许客户端按 Emby 规范追加当前 token，同时仍要求 Lux 短期签名票据；普通客户端仍不追加 token。
+- 兼容 Hills 1.8.0 的代理播放请求：当 `PlaybackInfo` 请求标识 `X-Emby-Client=Hills` 时，Lux 仍返回标准 `AddApiKeyToDirectStreamUrl=true`，并额外将当前 token 写入 Hills 专用签名 URL，以兼容该版本实际丢失 token 的独立媒体请求；普通客户端仍不追加或接收长期 token。
 
 ## [0.3.7] - 2026-09-02
 

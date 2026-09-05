@@ -120,7 +120,7 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
 - Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径按 Lux 进程实际可读性处理，不要求落在当前媒体库根目录内。扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
-- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；两者的代理兼容表示均使用原始 `Path`、`Protocol=File` 和 `IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据；普通客户端将 `AddApiKeyToDirectStreamUrl` 设为 `false`，Hills 1.8.0 在请求标识为 `X-Emby-Client=Hills` 时例外设为 `true`，由客户端按 Emby 规范追加当前 token 供外部代理识别身份。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；直接访问 Lux 的播放入口时，本地路径仍由 Lux 读取，HTTP(S) 目标仍由 Lux 使用播放器 User-Agent 有限解析重定向后返回 307，作为兼容回退；扫描和 `PlaybackInfo` 不访问目标。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
+- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；两者的代理兼容表示均使用原始 `Path`、`Protocol=File` 和 `IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据；普通客户端将 `AddApiKeyToDirectStreamUrl` 设为 `false` 且不在 URL 中携带长期 token。Hills 1.8.0 在请求标识为 `X-Emby-Client=Hills` 时例外设为 `true`；由于该版本实测仍会在独立媒体请求中丢弃客户端应追加的 token，Lux 会从本次 `PlaybackInfo` 的标准 Emby 鉴权中提取 token，并仅在 Hills 的签名 `DirectStreamUrl` 中以 `api_key` 形式写入，供外部代理识别身份。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；直接访问 Lux 的播放入口时，本地路径仍由 Lux 读取，HTTP(S) 目标仍由 Lux 使用播放器 User-Agent 有限解析重定向后返回 307，作为兼容回退；扫描和 `PlaybackInfo` 不访问目标。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
@@ -129,7 +129,7 @@ Lux 的核心价值不是功能数量，而是：
 - 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可以位于媒体库根目录之外；目标必须是 Lux 进程实际可读取、canonicalize 后存在的普通文件，且不会把目录或另一个 `.strm` 当作视频返回。
-- URL 和本地路径型 `.strm` 在 `Path` 保留原始目标；`PlaybackInfo` 对这两类目标的 `DirectStreamUrl` 使用标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，可额外携带标准 `UserId` 供外部代理关联播放身份；`UserId` 不承担授权。普通客户端的 `AddApiKeyToDirectStreamUrl=false`，Hills 1.8.0 的 `X-Emby-Client=Hills` 请求为 `true`，仅用于让 Hills 追加已有 Emby token 供 NextEmby 识别，Lux 仍强制验证 HMAC 票据。外部播放代理从原始 `Path` 提取映射或 302 信息，客户端始终请求当前公网代理域名而不是 `.strm` 中的内网地址。Lux 仍保留直接访问 URL 型 `.strm` 时使用播放器 User-Agent 有限解析重定向并返回 307 的兼容回退；不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 继续使用 Lux 的协议解析器和受保护播放入口；空目标和其他协议不可播放。
+- URL 和本地路径型 `.strm` 在 `Path` 保留原始目标；`PlaybackInfo` 对这两类目标的 `DirectStreamUrl` 使用标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，可额外携带标准 `UserId` 供外部代理关联播放身份；`UserId` 不承担授权。普通客户端的 `AddApiKeyToDirectStreamUrl=false` 且不携带长期 token；Hills 1.8.0 的 `X-Emby-Client=Hills` 请求为 `true`，但该版本实测不会按提示追加 token，因此 Lux 会从本次标准 Emby 鉴权中提取 token 并以 `api_key` 写入 Hills 专用签名 URL，供 NextEmby 识别，Lux 仍强制验证 HMAC 票据。外部播放代理从原始 `Path` 提取映射或 302 信息，客户端始终请求当前公网代理域名而不是 `.strm` 中的内网地址。Lux 仍保留直接访问 URL 型 `.strm` 时使用播放器 User-Agent 有限解析重定向并返回 307 的兼容回退；不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 继续使用 Lux 的协议解析器和受保护播放入口；空目标和其他协议不可播放。
 - 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -1301,7 +1301,7 @@ locked local value
 
 - 读取文件的首个非空行并 trim BOM 与首尾空白，保存为原始播放目标。
 - 目标只做词法分类：HTTP(S) URL、路径、未知/其他目标；不在扫描或 PlaybackInfo 请求中访问目标。
-- URL 和路径型目标都保留原始 `Path`；`PlaybackInfo` 对这两类目标使用标准带短期 Lux 播放票据的 `DirectStreamUrl`，并使用 `Protocol=File`、`IsRemote=false` 的代理兼容表示；普通客户端的 `AddApiKeyToDirectStreamUrl=false`，Hills 1.8.0 请求为 `true` 以便 NextEmby 从客户端追加的标准 token 识别用户。无论该提示取值如何，Lux 都要求短期票据，由外部代理从原始 `Path` 执行映射或 302 解析。直接请求 Lux 时，路径型目标按本地文件处理，URL 型目标仍可由 Lux 使用入站播放器 User-Agent 有限跟随重定向并返回 307；该回退不改变扫描和 `PlaybackInfo` 不访问目标的边界。
+- URL 和路径型目标都保留原始 `Path`；`PlaybackInfo` 对这两类目标使用标准带短期 Lux 播放票据的 `DirectStreamUrl`，并使用 `Protocol=File`、`IsRemote=false` 的代理兼容表示；普通客户端的 `AddApiKeyToDirectStreamUrl=false` 且不携带长期 token，Hills 1.8.0 请求为 `true`。由于 Hills 1.8.0 实测忽略该提示，Lux 仅对 Hills 从本次标准 Emby 鉴权提取 token 并将其作为 `api_key` 写入签名 URL，供 NextEmby 识别用户。无论该提示取值如何，Lux 都要求绑定用户、条目和媒体源的短期 HMAC 票据，由外部代理从原始 `Path` 执行映射或 302 解析。直接请求 Lux 时，路径型目标按本地文件处理，URL 型目标仍可由 Lux 使用入站播放器 User-Agent 有限跟随重定向并返回 307；该回退不改变扫描和 `PlaybackInfo` 不访问目标的边界，含 token 的兼容 URL 不得进入公开日志。
 - 下载路径按 LUX-091 使用独立的 URL 安全策略和上游流式转发，不能把路径型目标直接当作远程 URL 请求。
 
 ### 14.3 PlaybackInfo
@@ -5514,8 +5514,11 @@ source-scoped 字幕端点按需抽取文本字幕；远程 `.strm` 只尝试原
 
 范围：修正 URL 型 `.strm` 与本地路径型 `.strm` 在第三方媒体代理场景下的 Emby 播放源合同。两种目标都保留原始
 条目 `Path` 和 `MediaSources[].Path`；在 `PlaybackInfo` 中使用标准带短期票据的 `DirectStreamUrl`，并使用
-`Protocol=File`、`IsRemote=false` 的代理兼容表示；普通客户端的 `AddApiKeyToDirectStreamUrl=false`，Hills 1.8.0 为让
-NextEmby 识别客户端追加的标准 token 而设为 `true`。无论提示取值如何，Lux 都要求短期票据，使具备自身映射或 302 能力的外部代理可以从原始 `Path` 提取信息并优先接管播放。这样客户端请求始终回到当前公网代理域名，不会直接访问 `.strm` 中的内网 302 地址。
+`Protocol=File`、`IsRemote=false` 的代理兼容表示；普通客户端的 `AddApiKeyToDirectStreamUrl=false` 且不携带长期 token。
+Hills 1.8.0 虽将该字段设为 `true`，但实测仍会在独立媒体请求中丢弃 token，因此 Lux 从 Hills 本次标准 Emby 鉴权中提取
+token，并仅将其作为 `api_key` 写入同一签名 URL，供 NextEmby 识别用户。无论提示取值如何，Lux 都要求短期票据，使具备自身映射
+或 302 能力的外部代理可以从原始 `Path` 提取信息并优先接管播放。这样客户端请求始终回到当前公网代理域名，不会直接访问 `.strm`
+中的内网 302 地址。
 Lux 不绑定具体代理品牌，也不在扫描或 `PlaybackInfo` 请求中访问 `.strm` 目标。
 
 Emby 兼容层对外统一使用由内部 UUID 无状态编码得到的稳定纯数字媒体条目 ID；已有数据库条目不需要迁移，
@@ -5532,7 +5535,8 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 
 - [x] URL 与路径型 `.strm` 的 Emby 条目 `Path` 和 `MediaSources[].Path` 均保留原始目标，且 `PlaybackInfo` 中代理交接所需的
       `Protocol`、`IsRemote`、标准带短期票据的 `DirectStreamUrl` 和权限行为一致；普通客户端的
-      `AddApiKeyToDirectStreamUrl=false`，Hills 1.8.0 例外为 `true`。
+      `AddApiKeyToDirectStreamUrl=false` 且不携带长期 token，Hills 1.8.0 例外为 `true` 并将本次标准 Emby token 作为
+      `api_key` 写入签名 URL。
 - [x] URL 与路径型 `.strm` 的 Lux Web Direct Play 计划均提供标准 `proxyUrl`；播放器继续在代理失败时回退到签名 Lux URL。
 - [x] Lux 直连 URL 型 `.strm` 仍按播放器 User-Agent 返回有限 307；直连路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。
 - [x] 扫描、`PlaybackInfo` 和外部代理交接测试不访问原始目标；不新增数据库字段、迁移、媒体字节代理、转码或具体代理适配。
