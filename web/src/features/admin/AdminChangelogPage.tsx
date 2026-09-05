@@ -28,7 +28,8 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复无鉴权头的代理媒体请求无法关联播放用户的问题；签名播放地址现在补充标准 UserId 身份提示，同时继续使用绑定条目、媒体源和用户的短期 HMAC 票据完成授权。",
       ] },
       { kind: "changed", items: [
-        "兼容 Hills 1.8.0 的代理播放请求：当 PlaybackInfo 请求标识 X-Emby-Client=Hills 时，允许客户端按 Emby 规范追加当前 token，同时仍要求 Lux 短期签名票据；普通客户端仍不追加 token。",
+        "兼容第三方播放器的代理播放请求：对 URL/路径型 .strm，Lux 返回标准 AddApiKeyToDirectStreamUrl=true，并将当前 token 写入签名 URL，以兼容播放器实际丢失鉴权的独立媒体请求；本地文件和 SMB/FTP 解析源仍不写入长期 token。",
+        "调整 .strm 代理播放的 UserId 身份提示：现在使用 Lux 登录用户名，兼容按本地用户名映射播放身份的外部代理；内部 UUID 仍只保存在签名 HMAC 票据中，不能由该提示替代授权。",
       ] },
     ],
   },
