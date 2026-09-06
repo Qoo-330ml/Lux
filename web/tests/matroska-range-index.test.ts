@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { cueForTime, MatroskaIndexError, parseMatroskaRangeIndex } from "../src/features/player/matroska-range-index";
+import { cueForTime, hasMatroskaSeekHead, MatroskaIndexError, parseMatroskaRangeIndex } from "../src/features/player/matroska-range-index";
 
 function vint(value: number) {
   if (value < 0x7f) return new Uint8Array([0x80 | value]);
@@ -30,7 +30,9 @@ describe("Matroska SeekHead/Cues index", () => {
     const finalSeekHead = makeSeekHead(seekHead.byteLength);
     const segmentPayload = concat(finalSeekHead, cues);
     const segment = element([0x18, 0x53, 0x80, 0x67], segmentPayload);
-    const index = parseMatroskaRangeIndex(concat(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x80]), segment), 1_000);
+    const source = concat(new Uint8Array([0x1a, 0x45, 0xdf, 0xa3, 0x80]), segment);
+    expect(hasMatroskaSeekHead(source)).toBe(true);
+    const index = parseMatroskaRangeIndex(source, 1_000);
 
     expect(index.segmentDataOffset).toBe(5 + 5);
     expect(index.cues.length).toBe(1);

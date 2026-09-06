@@ -3,6 +3,7 @@ import { hasClientMkvHevcRuntime } from "./playback-selection";
 import { isHevcCodec } from "./media-codec";
 import type { HevcRuntimeAssets } from "./hevc-playback-engine";
 import { MatroskaRangeReader } from "./matroska-range-reader";
+import { hasMatroskaSeekHead } from "./matroska-range-index";
 
 type WorkerResponse =
   | { type: "ready" }
@@ -120,8 +121,13 @@ export class ClientMkvEngine implements PlaybackEngine {
     try {
       await ready;
       const rangeReader = new MatroskaRangeReader(source);
+      let firstRange = true;
       for await (const chunk of rangeReader.chunks(abortController.signal)) {
         if (generation !== this.generation) return;
+        if (firstRange && !hasMatroskaSeekHead(chunk.data)) {
+          throw new Error("客户端媒体索引不可用：缺少有效 SeekHead");
+        }
+        firstRange = false;
         const copy = chunk.data.slice();
         worker.postMessage({ type: "data", data: copy.buffer }, [copy.buffer]);
       }

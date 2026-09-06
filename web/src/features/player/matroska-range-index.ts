@@ -46,6 +46,13 @@ export class MatroskaIndexError extends Error {
   }
 }
 
+/** Validates the required index anchor without scanning Cluster payloads. */
+export function hasMatroskaSeekHead(data: Uint8Array) {
+  const segment = findElement(data, 0, data.byteLength, IDS.segment);
+  if (!segment) return false;
+  return findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead) !== null;
+}
+
 type Element = { id: number; start: number; dataStart: number; dataEnd: number; end: number; unknown: boolean };
 
 export function parseMatroskaRangeIndex(data: Uint8Array, totalLength = data.byteLength, videoTrack?: number): MatroskaRangeIndex {
