@@ -103,7 +103,7 @@ export type MatroskaStreamCallbacks = {
   onError?: (error: Error) => void;
 };
 
-type Element = { id: number; dataStart: number; dataEnd: number; end: number };
+type Element = { id: number; start: number; dataStart: number; dataEnd: number; end: number };
 
 export function parseMatroska(data: Uint8Array): MatroskaFile {
   const result: MatroskaFile = {
@@ -281,6 +281,7 @@ function parseRange(
   trackEntry: Partial<MatroskaTrack> | null,
   clusterTimecode: number | null,
   clusterScale: number | null,
+  clusterOffset: number | null = null,
 ) {
   let offset = start;
   let currentClusterTimecode = clusterTimecode;
@@ -289,14 +290,14 @@ function parseRange(
     const element = readElement(data, offset, end);
     if (!element) return;
     const boundedEnd = Math.min(element.dataEnd, end);
-    if (element.id === IDS.ebml || element.id === IDS.segment || element.id === IDS.info) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, clusterTimecode, clusterScale);
+    if (element.id === IDS.ebml || element.id === IDS.segment || element.id === IDS.info) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, clusterTimecode, clusterScale, clusterOffset);
     else if (element.id === IDS.timecodeScale) result.timecodeScale = readUnsigned(data, element.dataStart, boundedEnd) || 1_000_000;
-    else if (element.id === IDS.tracks) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, clusterTimecode, clusterScale);
+    else if (element.id === IDS.tracks) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, clusterTimecode, clusterScale, clusterOffset);
     else if (element.id === IDS.trackEntry) parseTrackEntry(data, element.dataStart, boundedEnd, result);
     else if (element.id === IDS.contentEncodings && trackEntry) trackEntry.contentEncodings = parseContentEncodings(data, element.dataStart, boundedEnd);
-    else if (element.id === IDS.cluster) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, 0, result.timecodeScale);
+    else if (element.id === IDS.cluster) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, 0, result.timecodeScale, element.start);
     else if (element.id === IDS.blockGroup && currentClusterTimecode !== null) {
-      parseBlockGroup(data, element.dataStart, boundedEnd, result, currentClusterTimecode, currentClusterScale ?? result.timecodeScale);
+      parseBlockGroup(data, element.dataStart, boundedEnd, result, currentClusterTimecode, currentClusterScale ?? result.timecodeScale, clusterOffset);
     }
     else if (element.id === IDS.clusterTimecode && currentClusterTimecode !== null) {
       const value = readUnsigned(data, element.dataStart, boundedEnd);
@@ -305,9 +306,9 @@ function parseRange(
         currentClusterScale = clusterScale;
       }
     } else if ((element.id === IDS.simpleBlock || element.id === IDS.block) && currentClusterTimecode !== null) {
-      parseBlock(data, element.dataStart, boundedEnd, result, currentClusterTimecode, currentClusterScale ?? result.timecodeScale, element.id === IDS.simpleBlock);
+      parseBlock(data, element.dataStart, boundedEnd, result, currentClusterTimecode, currentClusterScale ?? result.timecodeScale, element.id === IDS.simpleBlock, clusterOffset);
     } else if (element.id === IDS.video || element.id === IDS.audio) {
-      parseRange(data, element.dataStart, boundedEnd, result, trackEntry, clusterTimecode, clusterScale);
+      parseRange(data, element.dataStart, boundedEnd, result, trackEntry, clusterTimecode, clusterScale, clusterOffset);
     } else if (trackEntry) readTrackField(data, element, trackEntry);
     offset = element.end;
   }
@@ -320,6 +321,7 @@ function parseBlockGroup(
   result: MatroskaFile,
   clusterTimecode: number,
   scale: number,
+  clusterOffset: number | null,
 ) {
   let offset = start;
   let block: Uint8Array | null = null;
@@ -344,7 +346,7 @@ function parseBlockGroup(
   if (!track) return;
   const timestampMs = (clusterTimecode + parsed.timecode) * scale / 1_000_000;
   const duration = durationMs;
-  if (track.type === "subtitle" && duration <= 0) return;
+  if (track.type === "subtitle" && (duration <= 0 || parsed.laced)) return;
   const defaultDuration = duration;
   parsed.frames.forEach((frame, index) => {
     const sample: MatroskaSample = {
@@ -355,7 +357,7 @@ function parseBlockGroup(
       keyframe: !reference,
       data: frame,
       decodeOrder: samplesForTrack(result, track.number).length + index,
-      clusterOffset: null,
+      clusterOffset,
       ...(discardPaddingNs === undefined ? {} : { discardPaddingNs }),
     };
     if (track.type === "video") result.videoSamples.push(sample);
@@ -467,6 +469,7 @@ function parseBlock(
   clusterTimecode: number,
   scale: number,
   simple: boolean,
+  clusterOffset: number | null,
 ) {
   const block = parseSimpleBlockPayload(data.slice(start, end));
   if (!block) return;
@@ -474,7 +477,7 @@ function parseBlock(
   if (!track) return;
   const timestampMs = (clusterTimecode + block.timecode) * scale / 1_000_000;
   const defaultDuration = defaultSampleDurationMs(track);
-  if (track.type === "subtitle" && defaultDuration <= 0) return;
+  if (track.type === "subtitle" && (defaultDuration <= 0 || block.laced)) return;
   block.frames.forEach((frame, index) => {
     const sample: MatroskaSample = {
       trackNumber: track.number,
@@ -484,7 +487,7 @@ function parseBlock(
       keyframe: simple && Boolean(block.flags & 0x80),
       data: frame,
       decodeOrder: samplesForTrack(result, track.number).length + index,
-      clusterOffset: null,
+      clusterOffset,
     };
     if (track.type === "video") result.videoSamples.push(sample);
     else if (track.type === "audio") result.audioSamples.push(sample);
@@ -585,7 +588,7 @@ function readElement(data: Uint8Array, offset: number, end: number): Element | n
   if (!size) return null;
   const dataStart = size.next;
   const dataEnd = size.unknown ? end : Math.min(end, dataStart + size.value);
-  return { id: id.value, dataStart, dataEnd, end: dataEnd };
+  return { id: id.value, start: offset, dataStart, dataEnd, end: dataEnd };
 }
 
 function readVint(data: Uint8Array, offset: number, end: number, stripMarker = true): { value: number; next: number; unknown?: boolean } | null {
