@@ -1002,6 +1002,18 @@ pub(super) fn web_playback_resource_url(
     ))
 }
 
+pub(super) fn web_playback_range_url(
+    service: &WebPlaybackSessionService,
+    session_id: &str,
+    expires_at: i64,
+) -> Option<String> {
+    let signature = service.sign_resource(session_id, "range", expires_at)?;
+    Some(format!(
+        "/api/v1/playback/sessions/{session_id}/range?expires={}&signature={}",
+        signature.expires_at, signature.signature
+    ))
+}
+
 pub(super) fn web_playback_hls_url(
     service: &WebPlaybackSessionService,
     session_id: &str,
@@ -1087,6 +1099,12 @@ async fn create_web_playback_session_json(
                 "type": "DIRECT",
                 "url": web_playback_resource_url(service, &created.id, "direct", created.expires_at),
                 "proxyUrl": proxy_url,
+                "rangeUrl": (source.source_kind == "STRM_URL"
+                    && source.external_url.as_deref().is_some_and(|target| {
+                        matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
+                    }))
+                    .then(|| web_playback_range_url(service, &created.id, created.expires_at))
+                    .flatten(),
             })
         }
         WebPlaybackPlan::ServerHls { tier } => json!({
@@ -1282,6 +1300,91 @@ pub(super) async fn lux_web_playback_direct(
         None,
     )
     .await
+}
+
+pub(super) async fn lux_web_playback_range(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<WebPlaybackResourceQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let session = match service
+        .authorize_resource(&session_id, "range", query.expires, &query.signature)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return web_playback_error(&headers, error),
+    };
+    if session.plan != "DIRECT" {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(range) = headers.get("range").and_then(|value| value.to_str().ok()) else {
+        return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+    };
+    let Ok(user_id) = session.user_id.parse::<crate::domain::ids::UserId>() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let principal = AccessPrincipal::new(user_id, session.is_admin);
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let source = match access
+        .authorized_playback_source(
+            principal,
+            &session.item_id,
+            session.media_source_id.as_deref(),
+        )
+        .await
+    {
+        Ok(Some(source)) => source,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if source.source_kind != "STRM_URL" {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+    let Some(external_url) = source.external_url.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !matches!(classify_strm_target(external_url).kind, StrmTargetKind::Url) {
+        return StatusCode::NOT_IMPLEMENTED.into_response();
+    }
+    let Some(resolver) = state.strm_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let user_agent = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok());
+    let result = match resolver.fetch_range(external_url, range, user_agent).await {
+        Ok(result) => result,
+        Err(crate::application::strm_playback::StrmPlaybackError::InvalidRange) => {
+            return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
+        }
+        Err(crate::application::strm_playback::StrmPlaybackError::UnsupportedStatus(status))
+            if status == 401 || status == 403 =>
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        Err(_) => return StatusCode::BAD_GATEWAY.into_response(),
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::PARTIAL_CONTENT)
+        .header("Accept-Ranges", "bytes")
+        .header("Content-Range", result.content_range)
+        .header("Content-Length", result.content_length)
+        .header("Cache-Control", "private, no-store");
+    if let Some(content_type) = result.content_type {
+        response = response.header("Content-Type", content_type);
+    }
+    if let Some(etag) = result.etag {
+        response = response.header("ETag", etag);
+    }
+    response
+        .body(Body::from(result.body))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 pub(super) async fn lux_web_playback_hls(

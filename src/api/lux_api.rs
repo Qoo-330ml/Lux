@@ -91,6 +91,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(lux_web_playback_direct).head(lux_web_playback_direct),
         )
         .route(
+            "/api/v1/playback/sessions/{session_id}/range",
+            get(lux_web_playback_range),
+        )
+        .route(
             "/api/v1/playback/sessions/{session_id}/hls/{*asset}",
             get(lux_web_playback_hls).head(lux_web_playback_hls),
         )

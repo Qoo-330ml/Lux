@@ -100,6 +100,23 @@ describe("LuxPlayer caption selection", () => {
     expect(overlayCaptionSource("item", "remote-strm", options[0])).toBeNull();
   });
 
+  it("offers remote Matroska text captions without selecting them by default", () => {
+    const options = playerCaptionOptions({
+      id: "remote-mkv",
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mkv",
+      container: "matroska,webm",
+      streams: [{ index: 2, type: "SUBTITLE", codec: "subrip", title: "远程文本", isExternal: false, isDefault: true }],
+    }, true);
+
+    expect(options[0]).toEqual(expect.objectContaining({
+      available: true,
+      renderMode: "runtime-overlay",
+      isDefault: true,
+    }));
+    expect(defaultCaptionSelection(options)).toBeNull();
+  });
+
   it("maps runtime tracks only across supported embedded text streams", () => {
     const options = playerCaptionOptions({
       id: "local-mkv",

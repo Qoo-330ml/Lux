@@ -2,7 +2,7 @@
 
 ## 状态
 
-已部分取代（远程 HTTP(S) Matroska 路径由 ADR-035 取代；本地按需字幕和浏览器原生轨道决定继续有效）。
+已部分取代（远程 HTTP(S) Matroska 路径由 ADR-036 取代；本地按需字幕和浏览器原生轨道决定继续有效）。
 
 ## 日期
 
@@ -46,7 +46,7 @@ ArtPlayer 官方实现提供了可核验的边界，但没有证明普通网页�
 
 ### 2. 远程 `.strm` 保持 Direct Play 隔离
 
-除 ADR-035 定义的 URL 型 HTTP(S) Matroska 客户端单管线外，远程 URL/path `.strm` 不由 Lux 读取媒体字节，不由 Lux 启动
+除 ADR-036 定义的 URL 型 HTTP(S) Matroska 按需客户端单管线外，远程 URL/path `.strm` 不由 Lux 读取媒体字节，不由 Lux 启动
 ffprobe/ffmpeg，不进入 Lux HLS 或媒体代理，也不新增 302/Redia 字幕专用接口。其他视频仍按现有规则由播放器或已配置的
 外部代理直接请求目标资源。
 
@@ -55,8 +55,8 @@ ffprobe/ffmpeg，不进入 Lux HLS 或媒体代理，也不新增 302/Redia 字�
 - 当前浏览器的实际媒体管线把文本轨暴露为 `video.textTracks`，由 LuxPlayer 只切换当前 track；或
 - 后续实验性客户端管线在显式开关下满足 CORS、Range、鉴权、读取上限、单连接和生命周期取消条件，并复用当前媒体读取。
 
-该路径现由 ADR-035 规定为 URL 型 HTTP(S) Matroska 的正式客户端能力，不再以默认关闭实验实现。资源是一次性 User-Agent/令牌
-绑定、CORS/Range/索引不满足或解析器不支持时，当前客户端直接显示不支持；不得为了字幕隐式改成服务端 HLS、代理媒体字节、
+该路径现由 ADR-036 规定为用户显式选择后的 URL 型 HTTP(S) Matroska 客户端能力。资源是一次性 User-Agent/令牌
+绑定、Relay/Range/索引不满足或解析器不支持时，只禁用远程字幕并恢复原生视频；不得为了字幕隐式改成服务端 HLS、通用代理媒体字节、
 重新建立第二条远程连接或调用 302/Redia 字幕接口。
 
 ### 3. 字幕是媒体源外的展示状态

@@ -271,7 +271,10 @@ export function PlayerPage() {
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
   const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, nativeCaptionTracks);
   const selectedCaptionOption = captionSourceId === source?.id
-    ? captionOptions.find((caption) => caption.id === selectedCaptionId && caption.available) ?? null
+    ? captionOptions.find((caption) => (
+      (caption.id === selectedCaptionId || String(caption.streamIndex) === selectedCaptionId)
+      && caption.available
+    )) ?? null
     : null;
   const captionTrack = nativeCaptionTrack(itemId, source?.id ?? "", selectedCaptionOption);
   const captionOverlaySource = overlayCaptionSource(itemId, source?.id ?? "", selectedCaptionOption);
@@ -316,11 +319,19 @@ export function PlayerPage() {
     : playbackBootstrap.data?.session ?? webPlaybackSession.data;
   const playbackPlan = playbackSession?.plan;
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
+  const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const streamUrl = playbackPlan?.type === "DIRECT"
-    ? (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
+    ? remoteHttpSource
+      ? playbackPlan.url
+      : (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
+  const remoteCaptionRequested = remoteHttpSource
+    && selectedCaptionOption?.renderMode === "runtime-overlay";
+  const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
+    ? playbackPlan.rangeUrl ?? null
+    : null;
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
@@ -671,6 +682,13 @@ export function PlayerPage() {
           break;
         }
         case "ERROR":
+          if (activeEngine.kind === "client-mkv" && remoteCaptionRequested) {
+            setSelectedCaptionId(null);
+            setCaptionStatus("远程字幕不可用，已恢复视频播放");
+            setFailedStreamUrl(null);
+            setPlaybackFailure(null);
+            break;
+          }
           if (activeEngine.kind === "native" && playbackPlan?.type === "DIRECT") {
             void requestServerFallback(event.error.message);
           } else {
@@ -701,16 +719,17 @@ export function PlayerPage() {
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          const remoteHttpStrm = isRemoteHttpStrmSource(source);
-          // Keep the pre-caption behavior for remote HTTP(S) STRM: the
-          // signed Lux URL is consumed by the native media element. The
-          // client MKV pipeline is only safe for same-origin/local sources
-          // until an explicit remote subtitle reader is selected.
-          const useMkvFallback = remoteHttpStrm
-            ? false
-            : isMatroskaSource(source)
-              ? await shouldUseClientMkv(source, initialEngine.element)
-              : false;
+          const remoteHttpStrm = remoteHttpSource;
+          const useMkvFallback = isMatroskaSource(source)
+            && (remoteCaptionRequested || !remoteHttpStrm)
+            && Boolean(!remoteCaptionRequested || clientMkvSourceUrl)
+            ? await shouldUseClientMkv(source, initialEngine.element)
+            : false;
+          if (remoteCaptionRequested && !useMkvFallback) {
+            setSelectedCaptionId(null);
+            setCaptionStatus("当前浏览器不支持远程字幕管线，已保持视频播放");
+            return;
+          }
           const useHevcFallback =
             !useMkvFallback
             && !remoteHttpStrm
@@ -735,6 +754,9 @@ export function PlayerPage() {
           }
         }
         if (cancelled) return;
+        const engineSource = useClientEngine(activeEngine)
+          ? clientMkvSourceUrl ?? streamUrl
+          : streamUrl;
         await runtime.load(
           new LegacyPlaybackEngineAdapter(
             activeEngine,
@@ -742,7 +764,7 @@ export function PlayerPage() {
           ),
           {
             id: source?.id ?? "",
-            url: streamUrl,
+            url: engineSource,
             poster,
           },
         );
@@ -754,6 +776,13 @@ export function PlayerPage() {
           );
       } catch (cause) {
         if (!cancelled) {
+          if (remoteCaptionRequested && remoteHttpSource) {
+            setSelectedCaptionId(null);
+            setCaptionStatus("远程字幕不可用，已恢复视频播放");
+            setFailedStreamUrl(null);
+            setPlaybackFailure(null);
+            return;
+          }
           if (runtime.state.status === "FAILED") return;
           if (playbackPlan?.type === "DIRECT") {
             requestServerFallback(cause);
@@ -777,7 +806,7 @@ export function PlayerPage() {
       if (runtimeRef.current === runtime) runtimeRef.current = null;
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
-  }, [playbackKey, playbackPlan?.type, poster, requestServerFallback, source, streamUrl]);
+  }, [clientMkvSourceUrl, playbackKey, playbackPlan?.type, poster, remoteCaptionRequested, remoteHttpSource, requestServerFallback, source, streamUrl]);
 
   // Fullscreen change listener
   useEffect(() => {
@@ -1248,7 +1277,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
-        deferNativeSource={isMatroskaSource(source) && !isRemoteHttpStrmSource(source)}
+        deferNativeSource={isMatroskaSource(source) && (!remoteHttpSource || remoteCaptionRequested)}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
         title={mediaTitle(media)}
@@ -1412,4 +1441,8 @@ export function PlayerPage() {
 
 function isMatroskaSource(source: MediaSource | undefined) {
   return (source?.container ?? "").toLowerCase().split(",").some((part) => part.trim() === "mkv" || part.trim() === "matroska" || part.trim() === "webm");
+}
+
+function useClientEngine(engine: PlaybackEngine) {
+  return engine.kind === "client-mkv" || engine.kind === "client-hevc";
 }

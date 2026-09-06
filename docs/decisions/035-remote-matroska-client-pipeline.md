@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受（LUX-235；由 LUX-236 至 LUX-243 分阶段实施）。部分取代 ADR-032 的远程实验和失败回退决定。
+部分取代（ADR-036）。ADR-036 保留本 ADR 的 Worker、解封装、MSE 和字幕合同，但改为远程原生播放默认、字幕显式启用。
 
 ## 日期
 
@@ -10,8 +10,8 @@
 
 ## 背景
 
-当前 Web 播放页把远程 HTTP(S) STRM 固定交给原生 `<video>`。浏览器的媒体管线可能解封装 Matroska，但页面脚本不一定能从
-`HTMLVideoElement.textTracks` 看到内嵌字幕；ffprobe 的字幕列表也不能证明浏览器一定暴露对应轨道。
+当前 Web 播放页把远程 HTTP(S) STRM 交给原生 `<video>` 时，视频播放本身是稳定的；浏览器的媒体管线可能解封装 Matroska，
+但页面脚本不一定能从 `HTMLVideoElement.textTracks` 看到内嵌字幕。ffprobe 的字幕列表也不能证明浏览器一定暴露对应轨道。
 
 Lux 不能为远程 STRM 增加服务端拉取、字幕抽取、ffmpeg、HLS 或媒体代理：远程目标可能绑定 User-Agent、Cookie、短期令牌或
 单连接语义，服务端接管会破坏现有 Direct Play 边界。与此同时，用户需要在不预先抽取、不落盘、不生成外挂字幕的前提下使用
@@ -21,23 +21,24 @@ Lux 不能为远程 STRM 增加服务端拉取、字幕抽取、ffmpeg、HLS 或
 
 ### 1. 使用浏览器端单一逻辑媒体管线
 
-对于 URL 型 HTTP(S) STRM 的 Matroska/WebM，播放器可使用一个 JavaScript 主线程协调器和 Web Worker：
+对于用户显式选择远程内嵌文本字幕的 URL 型 HTTP(S) STRM Matroska/WebM，播放器可使用一个 JavaScript 主线程协调器和 Web Worker：
 
-1. 主线程使用当前播放 URL 发起顺序 Range 请求；首段为 `bytes=0-1048575`。
+1. 主线程使用播放会话授权的同源 Range Relay 发起顺序 Range 请求；首段为 `bytes=0-1048575`。
 2. Worker 解析 EBML、Segment、Info、Tracks、SeekHead、Cues 和 Cluster。
 3. Worker 同时处理音频、视频和文本字幕。音视频输出为浏览器 MSE 可消费的 fMP4，字幕输出为 Lux cue。
 4. `<video>` 继续作为 MSE 输出和渲染目标，不再直接负责解封装远程 Matroska。
 
-“单次读取”指一个逻辑媒体读取器，而不是只有一个 HTTP 请求：预取和 seek 可以产生多个串行 Range 请求，但同一代最多一个
-在途请求，不存在原生视频连接和字幕专用连接并行读取。
+没有选择远程内嵌字幕时，仍使用原生 `<video>`，不启动该管线。启用后，“单次读取”指一个逻辑媒体读取器，而不是只有一个
+HTTP 请求：预取和 seek 可以产生多个串行 Range 请求，但同一代最多一个在途请求，不存在原生视频连接和字幕专用连接并行读取。
 
 ### 2. 必须具备可定位索引
 
-远程响应必须是脚本可读取的 `206 + Content-Range`，且 Segment 中存在有效 SeekHead/Cues。Cues 必须能够定位所选视频轨的
+Relay 上游响应必须是脚本可读取的 `206 + Content-Range`，且 Segment 中存在有效 SeekHead/Cues。Cues 必须能够定位所选视频轨的
 关键 Cluster。禁止为了建立索引而顺序扫描整部文件；缺少索引、Range 被忽略、范围/总长度不一致、资源发生变化或解析超限时，
 当前客户端直接显示“不支持”，不回退到原生播放、Lux HLS、媒体代理或 302/Redia 字幕接口。
 
 首版只处理 HTTP(S) URL 型 STRM。SMB、FTP、路径型远程目标以及依赖远端 Cookie 或自定义 User-Agent 的资源不进入该管线。
+Relay 只接受当前播放会话的签名票据、单区间 Range，最大 32 MiB；不落盘、不缓存整部媒体、不调用 ffmpeg。
 
 ### 3. 首版 codec 和字幕边界
 
@@ -81,7 +82,8 @@ Track/Cue/cue 数量、文本长度、内存和取消状态；错误不能泄露
 ## 后果
 
 - 远程 MKV 内嵌文本字幕可以在浏览器端实时解封装并显示，不产生外挂文件或服务端媒体流量。
-- 远程播放的兼容性取决于 CORS、Range、SeekHead/Cues、MSE 和实际 codec 组合；未满足条件的客户端明确失败。
+- 远程视频播放继续由原生 `<video>` 保证；远程字幕模式的兼容性取决于 Relay、Range、SeekHead/Cues、MSE 和实际 codec 组合，
+  条件不满足时只禁用远程字幕，不得让原生视频播放失败。
 - MSE、Range reader、Matroska demuxer、字幕 cue 和播放器生命周期必须作为一个 generation 管理，seek/切源时清理旧请求和 cue。
 - ADR-032 的本地字幕按需抽取、native TextTrack 优先和不处理 PGS/SUP 等决定继续有效；其远程实验默认关闭和失败回退部分被本 ADR 取代。
 

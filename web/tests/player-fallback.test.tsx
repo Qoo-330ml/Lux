@@ -156,6 +156,7 @@ describe("PlayerPage client fallback status", () => {
       plan: {
         type: "DIRECT",
         url: "/api/v1/playback/sessions/web-remote-hevc/direct?expires=1900000000&signature=test",
+        proxyUrl: "/Videos/remote-hevc-strm/stream.mp4?MediaSourceId=remote-hevc-source",
       },
     });
 
@@ -182,6 +183,7 @@ describe("PlayerPage client fallback status", () => {
     expect(fallbackState.assets).toHaveLength(0);
     expect(shouldUseClientHevc).not.toHaveBeenCalled();
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
+    expect(container?.querySelector("video")?.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-hevc/direct");
     expect(api.createWebPlaybackSession).toHaveBeenCalledWith(
       "remote-hevc-strm",
       "remote-hevc-source",
@@ -243,6 +245,20 @@ describe("PlayerPage client fallback status", () => {
     expect(video?.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-mkv/direct");
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
+
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    expect(settings).not.toBeNull();
+    await act(async () => settings?.click());
+    const captionSelect = container?.querySelector<HTMLSelectElement>("#lux-player-caption-select");
+    expect(captionSelect?.options[1]?.disabled).not.toBe(true);
+    await act(async () => {
+      if (!captionSelect) return;
+      captionSelect.value = captionSelect.options[1]?.value ?? "";
+      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    expect(container?.textContent).toContain("当前浏览器不支持远程字幕管线");
+    expect(container?.querySelector("video")?.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-mkv/direct");
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {

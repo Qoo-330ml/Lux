@@ -1326,12 +1326,12 @@ locked local value
 - Web 播放器首先尝试浏览器实际暴露的 in-band `TextTrack`；该路径不产生额外字幕请求，也不改变媒体 URL。
 - 本地媒体的内嵌 SRT、ASS、SSA 在浏览器未暴露轨道时，可由 source-scoped 字幕端点按需做无转码抽取，再交给已有的
   Worker 文本解析器；不写回媒体、不烧录、不生成永久缓存。
-- 远程 HTTP(S) `.strm` 的 Matroska/WebM 媒体在满足 ADR-035 的 CORS、Range、SeekHead/Cues 和浏览器 MSE 条件时，进入
-  客户端单管线：Worker 同时解封装音频、视频和文本字幕，`<video>` 仍只作为 MSE 输出和渲染目标。字幕不预先抽取、不落盘、
-  不生成外挂文件，也不创建字幕专用请求。
-- 远程媒体必须使用可读取的 `206 + Content-Range`，且具备有效 SeekHead/Cues；条件不满足或运行中失败时直接判定当前客户端
-  播放不支持，不回退原生播放、Lux HLS、服务端媒体代理或 302/Redia 字幕接口。SMB、FTP、路径型远程目标和依赖远端 Cookie/
-  自定义 User-Agent 的资源不进入该管线。
+- 远程 HTTP(S) `.strm` 的 Matroska/WebM 默认继续使用原生 `<video>`，保持字幕功能改动前的 Direct Play 行为。只有用户显式
+  选择远程内嵌 SRT/ASS/SSA 后，才按 ADR-036 进入客户端单管线：Worker 同时解封装音频、视频和文本字幕，`<video>` 仍只作为
+  MSE 输出和渲染目标。字幕不预先抽取、不落盘、不生成外挂文件。
+- 客户端字幕管线通过当前播放会话授权的同源 Range Relay 读取远程字节；Relay 校验单区间 `Range`、`206 + Content-Range`、长度
+  和 ETag，单次最大 32 MiB，不缓存整部媒体。Relay、索引、codec 或 MSE 条件不满足时只禁用远程字幕并恢复原生视频，不得把视频
+  标记为播放器引擎失败。SMB、FTP、路径型远程目标和依赖远端 Cookie/自定义 User-Agent 的资源不进入该管线。
 - PGS/SUP 图形字幕不属于本阶段承诺；完整 ASS/SSA 样式、字幕烧录和 HLS 字幕组另行处理。
 
 ### 14.5 弹幕兼容
@@ -5290,13 +5290,14 @@ repository 方法或 People 用例。此任务不引入新依赖、不新增端�
 
 本阶段只处理文本字幕（SRT、ASS、SSA）的发现、按需抽取和浏览器侧显示，不处理 PGS/SUP 图形字幕。字幕是附着于
 当前媒体源的独立展示能力：切换字幕不能重新创建播放会话，不能改变 Direct/HLS/fallback 计划、媒体 URL、ACL、进度、
-心跳或停止语义。本阶段原先对远程 `.strm` 的 Direct Play 隔离约束已由阶段 21 的 ADR-035 更新：仅 URL 型 HTTP(S)
-Matroska/WebM 可在满足 CORS、Range、SeekHead/Cues 和 MSE 条件时进入客户端单管线；Lux 仍不运行 ffmpeg、不提供服务端
-字幕抽取、媒体代理或 302/Redia 字幕接口。
+心跳或停止语义。本阶段的远程字幕能力由 ADR-036 规定：远程 `.strm` 默认保持 Direct Play，只有显式选择 URL 型 HTTP(S)
+Matroska/WebM 文本字幕后才进入客户端单管线；Lux 仍不运行 ffmpeg、不生成外挂字幕，Relay 只提供受播放会话授权的有限 Range
+读取。
 
 浏览器优先级固定为：首先使用实际运行时暴露的 `HTMLVideoElement.textTracks`；本地媒体未暴露内嵌轨时，再从 Lux 已授权的
-source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 使用 ADR-035 的客户端单管线，其他远程 STRM 仍只尝试原生
-轨道。ffprobe 的轨道列表只用于索引和能力提示，不能作为浏览器一定能读取内嵌轨的证明。
+source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 默认保持原生播放，显式选择字幕后使用 ADR-036 的客户端单管线，
+其他远程 STRM 仍只尝试原生轨道。ffprobe 的轨道列表只用于索引和能力提示，不能作为浏览器
+一定能读取内嵌轨的证明。
 
 #### LUX-224：内嵌文本字幕规格与 ADR-032
 
@@ -5579,14 +5580,14 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 
 ### 阶段 21：远程 STRM Matroska 客户端单管线
 
-本阶段取代阶段 20 中远程单次读取实验的默认关闭和 Direct Play 回退约束。范围是 URL 型 HTTP(S) STRM 的 Matroska/WebM
-客户端读取：主线程按顺序发起 Range 请求，Worker 解析 SeekHead、Cues、Tracks 和 Cluster，同时产出 MSE 音视频片段以及
-S_TEXT/UTF8、S_TEXT/ASS、S_TEXT/SSA cue。字幕不写回媒体、不落盘、不生成外挂文件、不新增字幕端点；`<video>` 仍然是
-MSE 输出和渲染目标。
+本阶段保留阶段 20 的远程 Direct Play 默认行为，并为用户显式选择字幕的 URL 型 HTTP(S) STRM Matroska/WebM 增加客户端读取：
+主线程经播放会话授权的同源 Range Relay 按顺序读取，Worker 解析 SeekHead、Cues、Tracks 和 Cluster，同时产出 MSE 音视频片段
+以及 S_TEXT/UTF8、S_TEXT/ASS、S_TEXT/SSA cue。字幕不写回媒体、不落盘、不生成外挂文件、不新增字幕端点；`<video>` 仍然是
+MSE 输出和渲染目标。客户端字幕失败必须恢复原生视频。
 
 首版视频编码为 H.264、HEVC、VP9、AV1，音频编码为 AAC、AC-3、E-AC-3、Opus。浏览器必须通过实际的
-`MediaSource.isTypeSupported` 组合能力检查；不满足 CORS、Range、有效 SeekHead/Cues、索引边界、codec 或 MSE 条件时，
-当前客户端直接判定不支持，不回退原生播放、Lux HLS、服务端代理或 302/Redia 字幕接口。
+`MediaSource.isTypeSupported` 组合能力检查；不满足 Relay、Range、有效 SeekHead/Cues、索引边界、codec 或 MSE 条件时，只判定
+远程字幕不可用并恢复原生播放，不切换 Lux HLS 或创建第二条媒体读取管线。
 
 #### LUX-235：远程 Matroska 客户端管线规格与 ADR-035
 
@@ -5595,10 +5596,11 @@ MSE 输出和渲染目标。
 
 验收：
 
-- [ ] 规格明确 JS 负责读取/解封装，`<video>` 负责 MSE 输出与渲染；不预抽取、不落盘、不生成外挂字幕、不新增服务端媒体代理。
+- [ ] 规格明确 JS 负责读取/解封装，`<video>` 负责 MSE 输出与渲染；不预抽取、不落盘、不生成外挂字幕；只允许受播放会话签名保护的有限
+      Range Relay，不提供通用服务端媒体代理。
 - [ ] 明确 HTTP(S) 范围、单逻辑读取器、顺序 Range、SeekHead/Cues 必须存在，以及失败直接判定不支持的策略。
 - [ ] 明确支持的 Matroska TrackType、文本字幕 codec、音视频 codec、基础 ASS/SSA 样式、内存/元素上限和错误脱敏边界。
-- [ ] ADR-032 保留本地字幕和 native TextTrack 决定，远程 Matroska 单管线由 ADR-035 取代。
+- [ ] ADR-032 保留本地字幕和 native TextTrack 决定，ADR-035 的解封装合同由 ADR-036 的原生默认与按需 Relay 策略取代。
 
 验证：`git diff --check`，人工审阅规格和 ADR。
 
@@ -5695,13 +5697,13 @@ cue 和 Worker。
 
 #### LUX-242：远程 Matroska 播放接入与终止错误
 
-范围：远程 HTTP(S) Matroska 默认选择客户端单管线；删除未接入的整段读取实验；将 CORS、Range、索引、codec、MSE、解封装
-失败映射为不回退的可诊断播放错误。
+范围：远程 HTTP(S) Matroska 保持原生播放默认；用户显式选择字幕后才进入客户端单管线；将 Relay、Range、索引、codec、MSE、
+解封装失败映射为“远程字幕不可用”，并恢复原生视频。
 
 验收：
 
-- [ ] 远程 Matroska 不再被 PlayerPage 强制留在 native `<video>`，但非 Matroska 和原生轨道流程保持不变。
-- [ ] 任一管线失败都不触发原生、HLS、代理或字幕专用请求；错误消息不包含完整 URL、令牌、Cookie 或媒体内容。
+- [ ] 远程 Matroska 无字幕选择时保持 native `<video>`；选择远程文本字幕后才进入客户端管线。
+- [ ] 客户端字幕管线失败恢复原生视频，不触发 HLS、字幕端点或第二条媒体连接；错误消息不包含完整 URL、令牌、Cookie 或媒体内容。
 - [ ] 远程字幕切换、暂停、seek、停止和页面离开均不重建播放会话。
 
 验证：Web 播放、fallback、STRM 字幕兼容性测试和真实浏览器 network/console 检查。
