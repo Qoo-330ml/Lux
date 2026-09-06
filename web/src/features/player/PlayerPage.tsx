@@ -321,9 +321,7 @@ export function PlayerPage() {
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const streamUrl = playbackPlan?.type === "DIRECT"
-    ? remoteHttpSource
-      ? playbackPlan.url
-      : (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
+    ? (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";

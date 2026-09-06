@@ -5674,7 +5674,7 @@ cue 和 Worker。
 
 - [ ] 206、Content-Range、总长度和可选 ETag 校验失败会停止播放；不发 HEAD，不顺序读取整部文件。
 - [ ] seek 会取消旧请求、清理旧 MSE/cue generation，并从最近关键帧重新开始；旧 Worker 消息不能污染新代。
-- [ ] 失败不创建第二个视频连接、不调用字幕端点、不切换服务端 HLS 或原生播放。
+- [ ] 失败不创建第二个视频连接、不调用字幕端点或服务端 HLS；撤销远程字幕选择并恢复同一播放计划的原生 `proxyUrl`，必要时沿用既有签名 Lux Direct 回退。
 
 验证：Range 协调器、取消、缓冲、seek 和资源变化测试；`pnpm --dir web test`、`pnpm --dir web build`。
 

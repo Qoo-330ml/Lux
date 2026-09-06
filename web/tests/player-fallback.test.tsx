@@ -183,7 +183,9 @@ describe("PlayerPage client fallback status", () => {
     expect(fallbackState.assets).toHaveLength(0);
     expect(shouldUseClientHevc).not.toHaveBeenCalled();
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
-    expect(container?.querySelector("video")?.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-hevc/direct");
+    expect(container?.querySelector("video")?.getAttribute("src")).toBe(
+      "/Videos/remote-hevc-strm/stream.mp4?MediaSourceId=remote-hevc-source",
+    );
     expect(api.createWebPlaybackSession).toHaveBeenCalledWith(
       "remote-hevc-strm",
       "remote-hevc-source",
@@ -218,6 +220,8 @@ describe("PlayerPage client fallback status", () => {
       plan: {
         type: "DIRECT",
         url: "/api/v1/playback/sessions/web-remote-mkv/direct?expires=1900000000&signature=test",
+        proxyUrl: "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+        rangeUrl: "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
       },
     });
 
@@ -242,7 +246,9 @@ describe("PlayerPage client fallback status", () => {
     });
 
     const video = container.querySelector<HTMLVideoElement>("video");
-    expect(video?.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-mkv/direct");
+    expect(video?.getAttribute("src")).toBe(
+      "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+    );
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
 
@@ -258,7 +264,9 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
     expect(container?.textContent).toContain("当前浏览器不支持远程字幕管线");
-    expect(container?.querySelector("video")?.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-mkv/direct");
+    expect(container?.querySelector("video")?.getAttribute("src")).toBe(
+      "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+    );
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {

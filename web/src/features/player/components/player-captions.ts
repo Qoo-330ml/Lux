@@ -50,20 +50,19 @@ export function playerCaptionOptions(
     .map((stream) => {
       const format = captionFormat(stream);
       const runtimeTrack = !stream.isExternal && format ? runtimeTracks[embeddedTextOrdinal++] : undefined;
-      const remoteRuntimeCandidate = !runtimeTrack
-        && source?.sourceKind === "STRM_URL"
-        && isHttpUrl(source.externalUrl)
-        && isMatroskaContainer(source.container)
-        && !stream.isExternal
-        && Boolean(format && ["srt", "ass", "ssa"].includes(format));
+      const remoteMatroskaText = isRemoteMatroskaTextCaption(source, stream, format);
+      const remoteRuntimeCandidate = !runtimeTrack && remoteMatroskaText;
+      const runtimeMatroskaTrack = runtimeTrack && isMatroskaRuntimeTrack(runtimeTrack.id);
       const renderMode = runtimeTrack
-        ? (format === "ass" || format === "ssa") && /^(?:mkv:|mkv-track:)/u.test(runtimeTrack.id) ? "runtime-overlay" : "native-inband"
+        ? runtimeMatroskaTrack && (remoteMatroskaText || format === "ass" || format === "ssa")
+          ? "runtime-overlay"
+          : "native-inband"
         : remoteRuntimeCandidate
           ? "runtime-overlay"
         : stream.isExternal && format === "vtt" && nativeTracksSupported
           ? "native"
           : "overlay";
-      const unavailableReason = remoteRuntimeCandidate
+      const unavailableReason = remoteRuntimeCandidate || runtimeTrack
         ? undefined
         : captionUnavailableReason(source, stream, format, runtimeTrack);
       const name = captionName(stream);
@@ -203,4 +202,20 @@ function isHttpUrl(value: string | null | undefined) {
 
 function isMatroskaContainer(value: string | null | undefined) {
   return (value ?? "").toLowerCase().split(",").some((part) => ["mkv", "matroska", "webm"].includes(part.trim()));
+}
+
+function isRemoteMatroskaTextCaption(
+  source: MediaSource | undefined,
+  stream: MediaStream,
+  format: CaptionFormat | undefined,
+) {
+  return source?.sourceKind === "STRM_URL"
+    && isHttpUrl(source.externalUrl)
+    && isMatroskaContainer(source.container)
+    && !stream.isExternal
+    && Boolean(format && ["srt", "ass", "ssa"].includes(format));
+}
+
+function isMatroskaRuntimeTrack(trackId: string) {
+  return /^(?:mkv:|mkv-track:)/u.test(trackId);
 }

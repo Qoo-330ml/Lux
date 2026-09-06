@@ -117,6 +117,28 @@ describe("LuxPlayer caption selection", () => {
     expect(defaultCaptionSelection(options)).toBeNull();
   });
 
+  it("keeps remote SRT as a runtime overlay after the Matroska track is discovered", () => {
+    const options = playerCaptionOptions({
+      id: "remote-mkv",
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mkv",
+      container: "matroska,webm",
+      streams: [{ index: 2, type: "SUBTITLE", codec: "subrip", title: "远程文本", isExternal: false, isDefault: true }],
+    }, true, [{
+      id: "mkv:42",
+      label: "远程文本",
+      language: "zho",
+      kind: "subtitles",
+      ordinal: 0,
+    }]);
+
+    expect(options[0]).toEqual(expect.objectContaining({
+      id: "mkv:42",
+      renderMode: "runtime-overlay",
+      available: true,
+    }));
+  });
+
   it("maps runtime tracks only across supported embedded text streams", () => {
     const options = playerCaptionOptions({
       id: "local-mkv",
