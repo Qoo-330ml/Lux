@@ -124,7 +124,7 @@ export class ClientMkvEngine implements PlaybackEngine {
       let firstRange = true;
       for await (const chunk of rangeReader.chunks(abortController.signal)) {
         if (generation !== this.generation) return;
-        if (firstRange && !hasMatroskaSeekHead(chunk.data)) {
+        if (firstRange && !hasMatroskaSeekHead(chunk.data, chunk.range.total)) {
           throw new Error("客户端媒体索引不可用：缺少有效 SeekHead");
         }
         firstRange = false;

@@ -47,10 +47,14 @@ export class MatroskaIndexError extends Error {
 }
 
 /** Validates the required index anchor without scanning Cluster payloads. */
-export function hasMatroskaSeekHead(data: Uint8Array) {
+export function hasMatroskaSeekHead(data: Uint8Array, totalLength = data.byteLength) {
   const segment = findElement(data, 0, data.byteLength, IDS.segment);
   if (!segment) return false;
-  return findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead) !== null;
+  const seekHead = findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead);
+  const cuesPosition = seekHead ? parseSeekHead(data, seekHead.dataStart, seekHead.dataEnd).find((entry) => entry.id === IDS.cues)?.position : undefined;
+  return cuesPosition !== undefined && Number.isSafeInteger(cuesPosition)
+    && segment.dataStart + cuesPosition >= segment.dataStart
+    && segment.dataStart + cuesPosition < totalLength;
 }
 
 type Element = { id: number; start: number; dataStart: number; dataEnd: number; end: number; unknown: boolean };
