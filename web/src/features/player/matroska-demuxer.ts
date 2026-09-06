@@ -354,7 +354,7 @@ function parseBlockGroup(
       durationMs: defaultDuration,
       keyframe: !reference,
       data: frame,
-      decodeOrder: result.videoSamples.length + result.audioSamples.length + result.subtitleSamples.length + index,
+      decodeOrder: samplesForTrack(result, track.number).length + index,
       clusterOffset: null,
       ...(discardPaddingNs === undefined ? {} : { discardPaddingNs }),
     };
@@ -483,7 +483,7 @@ function parseBlock(
       durationMs: defaultDuration,
       keyframe: simple && Boolean(block.flags & 0x80),
       data: frame,
-      decodeOrder: result.videoSamples.length + result.audioSamples.length + result.subtitleSamples.length + index,
+      decodeOrder: samplesForTrack(result, track.number).length + index,
       clusterOffset: null,
     };
     if (track.type === "video") result.videoSamples.push(sample);
@@ -509,6 +509,10 @@ export function parseSimpleBlockPayload(data: Uint8Array) {
 
 function findTrack(result: MatroskaFile, number: number) {
   return [result.videoTrack, result.audioTrack, ...result.subtitleTracks].find((track) => track?.number === number) ?? null;
+}
+
+function samplesForTrack(result: MatroskaFile, number: number) {
+  return [...result.videoSamples, ...result.audioSamples, ...result.subtitleSamples].filter((sample) => sample.trackNumber === number);
 }
 
 function defaultSampleDurationMs(track: MatroskaTrack) {
