@@ -328,7 +328,11 @@ export function PlayerPage() {
       ? playbackPlan.manifestUrl
       : "";
   const remoteCaptionRequested = remoteHttpSource
-    && selectedCaptionOption?.renderMode === "runtime-overlay";
+    && Boolean(
+      selectedCaptionOption
+      && (selectedCaptionOption.renderMode === "runtime-overlay"
+        || isMatroskaRuntimeTrack(selectedCaptionOption.runtimeTrackId)),
+    );
   const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
     ? playbackPlan.rangeUrl ?? null
     : null;
@@ -976,6 +980,7 @@ export function PlayerPage() {
     style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number };
     runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[];
   }) => {
+    setCaptionStatus(null);
     const next: LuxCaptionCue = {
       id: `${cue.trackId}:${cue.startMs}:${cue.endMs}:${cue.layer ?? 0}:${cue.text.slice(0, 16)}`,
       start: cue.startMs / 1000,
@@ -1445,4 +1450,8 @@ function isMatroskaSource(source: MediaSource | undefined) {
 
 function useClientEngine(engine: PlaybackEngine) {
   return engine.kind === "client-mkv" || engine.kind === "client-hevc";
+}
+
+function isMatroskaRuntimeTrack(trackId: string | undefined) {
+  return Boolean(trackId && /^(?:mkv:|mkv-track:)/u.test(trackId));
 }
