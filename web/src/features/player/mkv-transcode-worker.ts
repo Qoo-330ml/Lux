@@ -2,7 +2,8 @@ import { FMP4Muxer, H264Encoder, HEVCDecoder, type HEVCFrame, type MuxerSample }
 import { Box, createFile, DataStream, ISOFile } from "mp4box";
 import processPolyfill from "process";
 import type { MatroskaSample, MatroskaStreamDemuxer, MatroskaTrack } from "./matroska-demuxer";
-import { addHevcTrack, concatBuffers, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, toLengthPrefixed } from "./mkv-remux";
+import { parseMatroskaSubtitleSample } from "./matroska-subtitles";
+import { addMatroskaVideoTrack, concatBuffers, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed } from "./mkv-remux";
 import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, toAnnexB } from "./mkv-transcode";
 
 type WorkerMessage =
@@ -15,6 +16,8 @@ type WorkerResponse =
   | { type: "ready" }
   | { type: "init"; initSegment: ArrayBuffer; codec: string }
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
+  | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean; ordinal: number }
+  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -28,6 +31,7 @@ let muxer: FMP4Muxer | null = null;
 let demuxer: MatroskaStreamDemuxer | null = null;
 let videoTrack: MatroskaTrack | null = null;
 let audioTrack: MatroskaTrack | null = null;
+let subtitleTracks = new Map<number, MatroskaTrack>();
 let audioConfig: ReturnType<typeof matroskaAudioConfig> = null;
 let pendingVideo: MuxerSample[] = [];
 let pendingAudio: TimestampedAudioSample[] = [];
@@ -80,6 +84,9 @@ async function initialize(message: Extract<WorkerMessage, { type: "init" }>) {
   const { MatroskaStreamDemuxer } = await import("./matroska-demuxer");
   demuxer = new MatroskaStreamDemuxer({
     onTrack: (track) => {
+      if (track.contentEncodings.some((encoding) => encoding.type !== 0 || encoding.algorithm !== null)) {
+        throw new Error("MKV ContentEncoding 不受支持");
+      }
       if (track.type === "video" && !videoTrack) {
         if (!isSupportedMatroskaVideo(track)) throw new Error(`MKV 视频编码不支持：${track.codecId}`);
         videoTrack = track;
@@ -90,6 +97,17 @@ async function initialize(message: Extract<WorkerMessage, { type: "init" }>) {
           audioTrack = track;
           audioConfig = config;
         }
+      } else if (track.type === "subtitle" && isSupportedMatroskaSubtitle(track)) {
+        subtitleTracks.set(track.number, track);
+        workerScope.postMessage({
+          type: "caption-track",
+          trackId: matroskaCaptionTrackId(track),
+          label: track.name?.trim() || track.languageBcp47?.trim() || track.language?.trim() || `字幕轨道 ${subtitleTracks.size}`,
+          language: track.languageBcp47?.trim() || track.language?.trim() || undefined,
+          isDefault: track.isDefault,
+          isForced: track.isForced,
+          ordinal: subtitleTracks.size - 1,
+        });
       }
     },
     onSample: (sample) => {
@@ -113,6 +131,25 @@ async function consumeSample(sample: MatroskaSample) {
     return;
   }
   if (fatalError || !decoder) return;
+  const subtitleTrack = subtitleTracks.get(sample.trackNumber);
+  if (subtitleTrack) {
+    const cue = parseMatroskaSubtitleSample(sample.data, subtitleTrack, sample.timestampMs, sample.durationMs);
+    if (cue) {
+      workerScope.postMessage({
+        type: "caption",
+        trackId: matroskaCaptionTrackId(subtitleTrack),
+        startMs: cue.start * 1000,
+        endMs: cue.end * 1000,
+        text: cue.text,
+        layer: cue.layer,
+        alignment: cue.alignment,
+        position: cue.position,
+        style: cue.style,
+        runs: cue.runs,
+      });
+    }
+    return;
+  }
   const track = sample.trackNumber === videoTrack?.number ? videoTrack : sample.trackNumber === audioTrack?.number ? audioTrack : null;
   if (!track) return;
   if (track.type === "audio") {
@@ -248,20 +285,20 @@ async function consumeRemuxSample(sample: MatroskaSample) {
 
 function ensureRemuxFile() {
   if (remuxFile) return remuxFile;
-  if (!videoTrack?.width || !videoTrack.height || videoTrack.codecPrivate.byteLength < 23) {
+  if (!videoTrack?.width || !videoTrack.height || videoTrack.codecPrivate.byteLength === 0) {
     throw new Error("MKV HEVC 缺少有效的视频配置");
   }
   if (audioTrack && !audioConfig) throw new Error("MKV 音频只支持 AAC-LC、AC-3 或 E-AC-3");
   remuxOriginMs ??= 0;
   const file = createFile();
-  const videoTrackId = addHevcTrack(file, videoTrack.codecPrivate, videoTrack.width, videoTrack.height);
+  const videoTrackId = addMatroskaVideoTrack(file, videoTrack);
   let audioTrackId: number | null = null;
   if (audioTrack && audioConfig) {
     const sampleRate = audioTrack.sampleRate;
     const channels = audioTrack.channels;
     if (!sampleRate || !channels) throw new Error("MKV AAC 音频缺少采样率或声道数");
     audioTrackId = file.addTrack({
-      type: audioConfig.codec === "ac-3" ? "ac-3" : audioConfig.codec === "ec-3" ? "ec-3" : "mp4a",
+      type: audioConfig.codec === "ac-3" ? "ac-3" : audioConfig.codec === "ec-3" ? "ec-3" : audioConfig.codec === "opus" ? "Opus" : "mp4a",
       timescale: sampleRate,
       channel_count: channels,
       samplerate: sampleRate,
@@ -273,11 +310,13 @@ function ensureRemuxFile() {
     const entry = track?.mdia.minf.stbl.stsd.entries[0];
     if (!entry) throw new Error("MKV fMP4 remux 缺少音频样本描述");
     const description = new Box();
-    description.type = audioConfig.codec === "ac-3" ? "dac3" : audioConfig.codec === "ec-3" ? "dec3" : "esds";
+    description.type = audioConfig.codec === "ac-3" ? "dac3" : audioConfig.codec === "ec-3" ? "dec3" : audioConfig.codec === "opus" ? "dOps" : "esds";
     description.data = audioConfig.codec === "ac-3"
       ? audioConfig.dac3.slice()
       : audioConfig.codec === "ec-3"
         ? audioConfig.dec3.slice()
+        : audioConfig.codec === "opus"
+          ? audioConfig.dOps.slice()
         : makeAacEsdsData(audioConfig.asc);
     entry.addBox(description);
   }
@@ -289,7 +328,7 @@ function ensureRemuxFile() {
   if (!workerScopeHasInit()) {
     const initSegment = ISOFile.writeInitializationSegment(file.ftyp, file.moov, 0, audioTrackId ? new Set([audioTrackId]) : undefined);
     const transfer = copyTransferBuffer(new Uint8Array(initSegment));
-    const codec = audioTrackId ? `${hevcCodecString(videoTrack.codecPrivate)},${audioConfig?.codec ?? "mp4a.40.2"}` : hevcCodecString(videoTrack.codecPrivate);
+    const codec = audioTrackId ? `${matroskaVideoCodecString(videoTrack)},${audioConfig?.codec ?? "mp4a.40.2"}` : matroskaVideoCodecString(videoTrack);
     (workerScope as typeof workerScope & { __mkvInitSent?: boolean }).__mkvInitSent = true;
     workerScope.postMessage({ type: "init", initSegment: transfer, codec }, [transfer]);
   }
@@ -335,6 +374,7 @@ function audioTrackPriority(track: MatroskaTrack) {
   if (codec.startsWith("A_AAC")) return 3;
   if (codec === "A_AC3") return 2;
   if (codec === "A_EAC3") return 1;
+  if (codec === "A_OPUS") return 2;
   return -1;
 }
 
@@ -364,6 +404,7 @@ function destroy() {
   muxer = null;
   videoTrack = null;
   audioTrack = null;
+  subtitleTracks = new Map();
   audioConfig = null;
   pendingVideo = [];
   pendingAudio = [];
@@ -398,4 +439,15 @@ function copyTransferBuffer(data: Uint8Array): ArrayBuffer {
   const copy = new Uint8Array(data.byteLength);
   copy.set(data);
   return copy.buffer;
+}
+
+function isSupportedMatroskaSubtitle(track: MatroskaTrack) {
+  const codec = track.codecId.trim().toUpperCase();
+  return codec === "S_TEXT/UTF8" || codec === "S_TEXT/ASS" || codec === "S_TEXT/SSA";
+}
+
+function matroskaCaptionTrackId(track: MatroskaTrack) {
+  return track.uid !== null && (typeof track.uid === "bigint" || Number.isSafeInteger(track.uid))
+    ? `mkv:${track.uid.toString()}`
+    : `mkv-track:${track.number}`;
 }

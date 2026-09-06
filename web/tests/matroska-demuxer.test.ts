@@ -41,6 +41,49 @@ function simpleBlock(track: number, timecode: number, keyframe: boolean, payload
 }
 
 describe("Matroska demuxer", () => {
+  it("recognizes text subtitle tracks and uses BlockDuration for cue samples", () => {
+    const subtitleTrack = element([0xae], concat(
+      element([0xd7], uint(3)),
+      element([0x73, 0xc5], uint(99, 2)),
+      element([0x83], uint(17)),
+      element([0x86], text("S_TEXT/UTF8")),
+      element([0x53, 0x6e], text("中文")),
+      element([0x22, 0xb5, 0x9d], text("zh-CN")),
+      element([0x88], uint(1)),
+      element([0x55, 0xaa], uint(1)),
+    ));
+    const videoTrack = element([0xae], concat(
+      element([0xd7], uint(1)), element([0x73, 0xc5], uint(1, 1)), element([0x83], uint(1)),
+      element([0x86], text("V_MPEG4/ISO/AVC")), element([0x63, 0xa2], new Uint8Array([1])),
+      element([0xe0], concat(element([0xb0], uint(16)), element([0xba], uint(16)))),
+    ));
+    const blockPayload = concat(new Uint8Array([0x83, 0, 0, 0]), text("你好"));
+    const blockGroup = element([0xa0], concat(
+      element([0xa1], blockPayload),
+      element([0x9b], uint(2_000, 2)),
+    ));
+    const source = concat(
+      element([0x1a, 0x45, 0xdf, 0xa3], new Uint8Array()),
+      element([0x18, 0x53, 0x80, 0x67], concat(
+        element([0x16, 0x54, 0xae, 0x6b], concat(videoTrack, subtitleTrack)),
+        element([0x1f, 0x43, 0xb6, 0x75], concat(element([0xe7], uint(100)), blockGroup)),
+      )),
+    );
+    const result = parseMatroska(source);
+    expect(result.subtitleTracks[0]).toMatchObject({
+      number: 3,
+      uid: 99,
+      type: "subtitle",
+      name: "中文",
+      languageBcp47: "zh-CN",
+      isDefault: true,
+      isForced: true,
+    });
+    expect(result.subtitleSamples).toHaveLength(1);
+    expect(result.subtitleSamples[0]).toMatchObject({ timestampMs: 100, durationMs: 2_000 });
+    expect(new TextDecoder().decode(result.subtitleSamples[0].data)).toBe("你好");
+  });
+
   it("extracts HEVC video and AAC audio samples with cluster timestamps", () => {
     const videoTrack = element([0xae], concat(
       element([0xd7], uint(1)),

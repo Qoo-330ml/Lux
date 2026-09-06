@@ -1,7 +1,7 @@
 import type { MediaSource, MediaStream } from "../../../lib/api/types";
 import type { CaptionFormat } from "../caption-parser";
 
-export type PlayerCaptionRenderMode = "native" | "native-inband" | "overlay";
+export type PlayerCaptionRenderMode = "native" | "native-inband" | "runtime-overlay" | "overlay";
 
 export type PlayerRuntimeCaptionTrack = {
   id: string;
@@ -12,6 +12,8 @@ export type PlayerRuntimeCaptionTrack = {
 };
 
 export type PlayerCaptionOption = {
+  /** Stable UI identity; Matroska tracks use TrackUID while legacy API access keeps streamIndex. */
+  id: string;
   streamIndex: number;
   name: string;
   label: string;
@@ -49,13 +51,14 @@ export function playerCaptionOptions(
       const format = captionFormat(stream);
       const runtimeTrack = !stream.isExternal && format ? runtimeTracks[embeddedTextOrdinal++] : undefined;
       const renderMode = runtimeTrack
-        ? "native-inband"
+        ? (format === "ass" || format === "ssa") && /^(?:mkv:|mkv-track:)/u.test(runtimeTrack.id) ? "runtime-overlay" : "native-inband"
         : stream.isExternal && format === "vtt" && nativeTracksSupported
           ? "native"
           : "overlay";
       const unavailableReason = captionUnavailableReason(source, stream, format, runtimeTrack);
       const name = captionName(stream);
       return {
+        id: runtimeTrack?.id ?? String(stream.index),
         streamIndex: stream.index,
         name,
         label: captionLabel(name, stream, Boolean(unavailableReason)),

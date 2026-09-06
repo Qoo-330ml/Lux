@@ -26,6 +26,7 @@ import {
   type PlaybackPerformance,
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
+import type { LuxCaptionCue } from "./caption-parser";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
 import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
@@ -205,10 +206,11 @@ export function PlayerPage() {
   const [hoverPercent, setHoverPercent] = useState<number | null>(null);
   const [danmuVisible, setDanmuVisible] = useState(true);
   const [screenshotStatus, setScreenshotStatus] = useState<string | null>(null);
-  const [selectedCaptionStreamIndex, setSelectedCaptionStreamIndex] = useState<number | null>(null);
+  const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
   const [captionStatus, setCaptionStatus] = useState<string | null>(null);
   const [captionOffset, setCaptionOffset] = useState(0);
+  const [runtimeCaptionCues, setRuntimeCaptionCues] = useState<LuxCaptionCue[]>([]);
   const [nativeCaptionTracks, setNativeCaptionTracks] = useState<PlayerRuntimeCaptionTrack[]>([]);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
   const currentTimeRef = useRef(0);
@@ -269,13 +271,21 @@ export function PlayerPage() {
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
   const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, nativeCaptionTracks);
   const selectedCaptionOption = captionSourceId === source?.id
-    ? captionOptions.find((caption) => caption.streamIndex === selectedCaptionStreamIndex && caption.available) ?? null
+    ? captionOptions.find((caption) => caption.id === selectedCaptionId && caption.available) ?? null
     : null;
   const captionTrack = nativeCaptionTrack(itemId, source?.id ?? "", selectedCaptionOption);
   const captionOverlaySource = overlayCaptionSource(itemId, source?.id ?? "", selectedCaptionOption);
+  const runtimeCaptionOverlayCues = selectedCaptionOption?.renderMode === "runtime-overlay"
+    ? runtimeCaptionCues.filter((cue) => cue.id.startsWith(`${selectedCaptionOption.id}:`))
+    : [];
   const nativeCaptionTrackId = selectedCaptionOption?.renderMode === "native-inband"
     ? selectedCaptionOption.runtimeTrackId ?? null
     : null;
+  useEffect(() => {
+    const controller = engineRef.current?.captionController;
+    if (!controller) return;
+    controller.select(nativeCaptionTrackId);
+  }, [nativeCaptionTrackId]);
   // For the first bootstrap request, keep the key tied to the URL selection
   // (or the default slot) rather than changing it when the response resolves
   // its default source. This prevents the newly-created bootstrap session from
@@ -418,6 +428,12 @@ export function PlayerPage() {
   }, []);
 
   const requestServerFallback = useCallback(async (reason?: unknown) => {
+    const remoteClientMkv = isRemoteHttpStrmSource(source) && isMatroskaSource(source);
+    if (remoteClientMkv) {
+      setFailedStreamUrl(streamUrl || null);
+      setPlaybackFailure(classifyPlayerEngineFailure(reason));
+      return;
+    }
     if (
       playbackPlan?.type === "DIRECT"
       && directProxyUrl
@@ -449,7 +465,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, stopActiveSession, streamUrl]);
+  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, source, stopActiveSession, streamUrl]);
 
   useEffect(() => {
     fallbackGenerationRef.current += 1;
@@ -478,11 +494,12 @@ export function PlayerPage() {
       playerCaptionOptions(source, nativeCaptionTracksSupported, []),
     );
     setCaptionSourceId(source?.id ?? null);
-    setSelectedCaptionStreamIndex(initialCaption?.streamIndex ?? null);
+    setSelectedCaptionId(initialCaption?.id ?? null);
     setCaptionStatus(null);
+    setRuntimeCaptionCues([]);
   }, [nativeCaptionTracksSupported, source?.id]);
 
-  const defaultCaptionStreamIndex = defaultCaptionSelection(captionOptions)?.streamIndex ?? null;
+  const defaultCaptionId = defaultCaptionSelection(captionOptions)?.id ?? null;
   useEffect(() => {
     if (
       captionSelectionTouchedRef.current
@@ -491,10 +508,10 @@ export function PlayerPage() {
     ) {
       return;
     }
-    setSelectedCaptionStreamIndex((previous) => (
-      previous === defaultCaptionStreamIndex ? previous : defaultCaptionStreamIndex
+    setSelectedCaptionId((previous) => (
+      previous === defaultCaptionId ? previous : defaultCaptionId
     ));
-  }, [captionSourceId, defaultCaptionStreamIndex, source?.id]);
+  }, [captionSourceId, defaultCaptionId, source?.id]);
 
   useEffect(() => {
     if (sessionGateKey === playbackKey) return;
@@ -690,14 +707,10 @@ export function PlayerPage() {
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          // A remote HTTP(S) STRM must remain on the native element. The
-          // signed Lux endpoint follows the upstream redirect, but a client
-          // fallback would fetch that redirect with CORS and cannot safely
-          // consume the remote response when the upstream omits CORS headers.
           const remoteHttpStrm = isRemoteHttpStrmSource(source);
-          const useMkvFallback = remoteHttpStrm
-            ? false
-            : await shouldUseClientMkv(source, initialEngine.element);
+          const useMkvFallback = isMatroskaSource(source)
+            ? await shouldUseClientMkv(source, initialEngine.element)
+            : false;
           const useHevcFallback =
             !useMkvFallback
             && !remoteHttpStrm
@@ -709,7 +722,8 @@ export function PlayerPage() {
             if (useMkvFallback) {
               const { ClientMkvEngine } = await import("./mkv-playback-engine");
               if (cancelled) return;
-              activeEngine = new ClientMkvEngine(initialEngine.element, HEVC_RUNTIME_ASSETS);
+              const inputCodec = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? "";
+              activeEngine = new ClientMkvEngine(initialEngine.element, HEVC_RUNTIME_ASSETS, inputCodec);
             } else {
               const { ClientHevcEngine } = await import("./hevc-playback-engine");
               if (cancelled) return;
@@ -741,7 +755,7 @@ export function PlayerPage() {
       } catch (cause) {
         if (!cancelled) {
           if (runtime.state.status === "FAILED") return;
-          if (playbackPlan?.type === "DIRECT") {
+          if (playbackPlan?.type === "DIRECT" && !(isRemoteHttpStrmSource(source) && isMatroskaSource(source))) {
             requestServerFallback(cause);
           } else {
             setFailedStreamUrl(streamUrl);
@@ -905,22 +919,47 @@ export function PlayerPage() {
     setPlaybackRate(rate);
   }, []);
 
-  const selectCaption = useCallback((streamIndex: number | null) => {
+  const selectCaption = useCallback((id: string | null) => {
     captionSelectionTouchedRef.current = true;
-    if (streamIndex === null) {
+    if (id === null) {
       setCaptionSourceId(source?.id ?? null);
-      setSelectedCaptionStreamIndex(null);
+      setSelectedCaptionId(null);
       setCaptionStatus(null);
       resetControlsTimeout();
       return;
     }
-    const option = captionOptions.find((caption) => caption.streamIndex === streamIndex);
+    const option = captionOptions.find((caption) => caption.id === id);
     if (!option?.available) return;
     setCaptionSourceId(source?.id ?? null);
-    setSelectedCaptionStreamIndex(option.streamIndex);
+    setSelectedCaptionId(option.id);
     setCaptionStatus(option.renderMode === "native-inband" ? null : "字幕加载中…");
     resetControlsTimeout();
   }, [captionOptions, resetControlsTimeout, source?.id]);
+
+  const handleRuntimeCaptionCue = useCallback((cue: {
+    trackId: string;
+    startMs: number;
+    endMs: number;
+    text: string;
+    layer?: number;
+    alignment?: number;
+    position?: { x: number; y: number };
+    style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number };
+    runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[];
+  }) => {
+    const next: LuxCaptionCue = {
+      id: `${cue.trackId}:${cue.startMs}:${cue.endMs}:${cue.layer ?? 0}:${cue.text.slice(0, 16)}`,
+      start: cue.startMs / 1000,
+      end: cue.endMs / 1000,
+      text: cue.text,
+      layer: cue.layer,
+      alignment: cue.alignment,
+      position: cue.position,
+      style: cue.style,
+      runs: cue.runs,
+    };
+    setRuntimeCaptionCues((previous) => previous.some((entry) => entry.id === next.id) ? previous : [...previous, next]);
+  }, []);
 
   const changeCaptionOffset = useCallback((offset: number) => {
     setCaptionOffset(normalizeCaptionOffset(offset));
@@ -1209,6 +1248,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
+        deferNativeSource={isMatroskaSource(source)}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
         title={mediaTitle(media)}
@@ -1241,6 +1281,7 @@ export function PlayerPage() {
         captionTrack={captionTrack}
         nativeCaptionTrackId={nativeCaptionTrackId}
         onNativeCaptionTracksChange={setNativeCaptionTracks}
+        onRuntimeCaptionCue={handleRuntimeCaptionCue}
         captionOffset={captionOffset}
         captionDuration={duration}
         captionLifecycleKey={playbackKey}
@@ -1258,6 +1299,7 @@ export function PlayerPage() {
         captionOffset={captionOffset}
         captionDuration={duration}
         lifecycleKey={playbackKey}
+        runtimeCues={runtimeCaptionOverlayCues}
         onStatusChange={setCaptionStatus}
       />
       <PlayerDanmakuOverlay
@@ -1306,7 +1348,7 @@ export function PlayerPage() {
             onChangeFlip: setFlip,
           }}
           captions={captionOptions}
-          selectedCaptionStreamIndex={captionSourceId === source?.id ? selectedCaptionStreamIndex : null}
+          selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
           captionStatus={captionStatus}
           onSelectCaption={selectCaption}
           captionOffset={captionOffset}
@@ -1366,4 +1408,8 @@ export function PlayerPage() {
       />
     </LuxPlayer>
   );
+}
+
+function isMatroskaSource(source: MediaSource | undefined) {
+  return (source?.container ?? "").toLowerCase().split(",").some((part) => part.trim() === "mkv" || part.trim() === "matroska" || part.trim() === "webm");
 }

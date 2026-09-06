@@ -70,4 +70,25 @@ describe("LuxPlayer caption overlay timing", () => {
     });
     expect(container.querySelector(".lux-player-caption-text")?.textContent).toBe("字幕内容");
   });
+
+  it("renders overlapping runtime cues as safe styled React nodes", async () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => {
+      root?.render(
+        <PlayerCaptionOverlay
+          source={null}
+          currentTime={1}
+          runtimeCues={[
+            { id: "mkv:1:0", start: 0, end: 2, text: "上层", layer: 1, runs: [{ text: "上层", color: "rgba(255, 0, 0, 1.000)", bold: true }] },
+            { id: "mkv:1:1", start: 0, end: 2, text: "下层", layer: 0 },
+          ]}
+        />,
+      );
+    });
+    expect(container.querySelectorAll(".lux-player-caption-text")).toHaveLength(2);
+    expect(container.textContent).toContain("上层");
+    expect(container.querySelector("strong")).toBeNull();
+  });
 });

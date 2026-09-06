@@ -13,6 +13,34 @@ export type PlaybackPerformance = {
   realtime: boolean;
 };
 
+export type PlaybackCaptionTrack = {
+  id: string;
+  label: string;
+  language?: string;
+  isDefault: boolean;
+  isForced: boolean;
+};
+
+export type PlaybackCaptionCue = {
+  id: string;
+  trackId: string;
+  startMs: number;
+  endMs: number;
+  text: string;
+  layer?: number;
+  alignment?: number;
+  position?: { x: number; y: number };
+  style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number };
+  runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[];
+};
+
+export type PlaybackCaptionController = {
+  tracks(): readonly PlaybackCaptionTrack[];
+  select(trackId: string | null): void;
+  cues(): readonly PlaybackCaptionCue[];
+  subscribe(listener: () => void): () => void;
+};
+
 export const PLAYBACK_PERFORMANCE_EVENT = "lux:playback-performance";
 
 export function summarizePlaybackPerformance(mediaDurationMs: number, processingDurationMs: number): PlaybackPerformance | null {
@@ -31,6 +59,7 @@ export interface PlaybackEngine {
   readonly element: HTMLVideoElement;
   readonly performance: PlaybackPerformance | null;
   readonly error: Error | null;
+  readonly captionController?: PlaybackCaptionController;
   setSource(source: string, poster?: string | null): Promise<void>;
   play(): Promise<void>;
   pause(): void;
