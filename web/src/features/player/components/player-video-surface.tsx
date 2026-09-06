@@ -135,6 +135,7 @@ export function PlayerVideoSurface({
     const textTracks = video.textTracks;
     publishTracks();
     video.addEventListener("loadedmetadata", publishTracks);
+    video.addEventListener("lux:caption-track", publishTracks);
     const supportsTrackEvents = typeof textTracks.addEventListener === "function";
     if (supportsTrackEvents) {
       textTracks.addEventListener("addtrack", publishTracks);
@@ -142,6 +143,7 @@ export function PlayerVideoSurface({
     }
     return () => {
       video.removeEventListener("loadedmetadata", publishTracks);
+      video.removeEventListener("lux:caption-track", publishTracks);
       if (supportsTrackEvents) {
         textTracks.removeEventListener("addtrack", publishTracks);
         textTracks.removeEventListener("removetrack", publishTracks);

@@ -6,6 +6,8 @@ type WorkerResponse =
   | { type: "ready" }
   | { type: "init"; initSegment: ArrayBuffer; codec: string }
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
+  | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean }
+  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -48,6 +50,7 @@ export class ClientMkvEngine implements PlaybackEngine {
   private generation = 0;
   private transcodedMediaDurationMs = 0;
   private transcodedProcessingDurationMs = 0;
+  private readonly captionTracks = new Map<string, TextTrack>();
 
   constructor(
     readonly element: HTMLVideoElement,
@@ -94,19 +97,25 @@ export class ClientMkvEngine implements PlaybackEngine {
 
     try {
       await ready;
-      const response = await fetch(source, { credentials: "same-origin", mode: "cors", signal: abortController.signal });
-      if (!response.ok) throw new Error(`客户端媒体读取失败：HTTP ${response.status}`);
-      if (!response.body) throw new Error("客户端媒体读取失败：浏览器不支持流式读取");
-      const reader = response.body.getReader();
+      const first = await fetchRange(source, 0, 1_048_575, abortController.signal);
       let offset = 0;
       while (true) {
-        const chunk = await reader.read();
-        if (chunk.done) break;
         if (generation !== this.generation) return;
-        const copy = chunk.value.slice();
-        offset += copy.byteLength;
-        void offset;
-        worker.postMessage({ type: "data", data: copy.buffer }, [copy.buffer]);
+        const reader = first.reader;
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          if (generation !== this.generation) return;
+          const copy = chunk.value.slice();
+          offset += copy.byteLength;
+          worker.postMessage({ type: "data", data: copy.buffer }, [copy.buffer]);
+        }
+        if (first.total === null || offset >= first.total) break;
+        const nextEnd = Math.min(first.total - 1, offset + 32 * 1024 * 1024 - 1);
+        const next = await fetchRange(source, offset, nextEnd, abortController.signal, first.etag);
+        if (next.total !== first.total) throw new Error("客户端媒体索引失效：资源大小发生变化");
+        first.reader = next.reader;
+        first.etag = next.etag;
       }
       worker.postMessage({ type: "flush" });
       await playbackReady;
@@ -146,6 +155,24 @@ export class ClientMkvEngine implements PlaybackEngine {
         if (!playbackStarted()) {
           setPlaybackStarted(true);
           resolvePlayback();
+        }
+      } else if (message.type === "caption-track") {
+        if (this.captionTracks.has(message.trackId)) return;
+        try {
+          const track = this.element.addTextTrack("subtitles", message.label, message.language ?? "");
+          track.mode = "disabled";
+          this.captionTracks.set(message.trackId, track);
+          this.element.dispatchEvent(new Event("lux:caption-track"));
+        } catch {
+          // Some browsers expose MSE but do not allow script-created text tracks.
+        }
+      } else if (message.type === "caption") {
+        const track = this.captionTracks.get(message.trackId);
+        if (!track || typeof VTTCue === "undefined") return;
+        try {
+          track.addCue(new VTTCue(message.startMs / 1000, message.endMs / 1000, message.text));
+        } catch {
+          // A malformed cue must not terminate audio/video playback.
         }
       } else if (message.type === "done") {
         if (mediaSource.readyState === "open") mediaSource.endOfStream();
@@ -196,7 +223,39 @@ export class ClientMkvEngine implements PlaybackEngine {
     this.error = null;
     this.transcodedMediaDurationMs = 0;
     this.transcodedProcessingDurationMs = 0;
+    this.captionTracks.forEach((track) => {
+      track.mode = "disabled";
+      for (const cue of Array.from(track.cues ?? [])) track.removeCue(cue);
+    });
+    this.captionTracks.clear();
   }
+}
+
+async function fetchRange(
+  source: string,
+  start: number,
+  end: number,
+  signal: AbortSignal,
+  expectedEtag?: string | null,
+) {
+  const response = await fetch(source, {
+    credentials: "same-origin",
+    mode: "cors",
+    headers: { Range: `bytes=${start}-${end}` },
+    signal,
+  });
+  if (!response.ok || response.status !== 206) throw new Error(`客户端媒体读取失败：HTTP ${response.status}`);
+  const contentRange = response.headers.get("content-range")?.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
+  if (!contentRange || Number(contentRange[1]) !== start || Number(contentRange[2]) < start || !response.body) {
+    throw new Error("客户端媒体读取失败：远程资源未提供有效 Range");
+  }
+  const etag = response.headers.get("etag");
+  if (expectedEtag && etag && etag !== expectedEtag) throw new Error("客户端媒体读取失败：远程资源发生变化");
+  return {
+    reader: response.body.getReader(),
+    total: Number(contentRange[3]),
+    etag,
+  };
 }
 
 function waitForMediaSourceOpen(mediaSource: MediaSource) {

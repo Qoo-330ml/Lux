@@ -3,14 +3,18 @@ import type { MatroskaTrack } from "./matroska-demuxer";
 export type MatroskaAudioConfig =
   | { codec: "mp4a.40.2"; asc: Uint8Array; sampleRate: number; channels: number }
   | { codec: "ac-3"; dac3: Uint8Array; sampleRate: number; channels: number }
-  | { codec: "ec-3"; dec3: Uint8Array; sampleRate: number; channels: number; frameDurationMs: number };
+  | { codec: "ec-3"; dec3: Uint8Array; sampleRate: number; channels: number; frameDurationMs: number }
+  | { codec: "opus"; dOps: Uint8Array; sampleRate: number; channels: number; frameDurationMs: number };
 
 export function isSupportedMatroskaVideo(track: Pick<MatroskaTrack, "codecId" | "codecPrivate">) {
-  return track.codecId.toUpperCase() === "V_MPEGH/ISO/HEVC" && track.codecPrivate.byteLength > 0;
+  const codec = track.codecId.toUpperCase();
+  return ["V_MPEG4/ISO/AVC", "V_MPEGH/ISO/HEVC", "V_VP9", "V_AV1"].includes(codec)
+    && track.codecPrivate.byteLength > 0;
 }
 
 export function isSupportedMatroskaAudio(track: Pick<MatroskaTrack, "codecId" | "codecPrivate">) {
   const codec = track.codecId.toUpperCase();
+  if (codec === "A_OPUS") return track.codecPrivate.byteLength >= 19 && new TextDecoder().decode(track.codecPrivate.subarray(0, 8)) === "OpusHead";
   const audioObjectType = (track.codecPrivate[0] ?? 0) >> 3;
   return (codec.startsWith("A_AAC") && audioObjectType === 2 && track.codecPrivate.byteLength >= 2)
     || (codec === "A_AC3" && (track.codecPrivate.byteLength === 0 || parseAc3Config(track.codecPrivate) !== null))
@@ -26,7 +30,23 @@ export function matroskaAudioConfig(track: Pick<MatroskaTrack, "codecId" | "code
   const dac3 = codec === "A_AC3" ? parseAc3Config(track.codecPrivate) : null;
   if (dac3) return { codec: "ac-3", dac3, sampleRate: track.sampleRate, channels: track.channels };
   const eac3 = codec === "A_EAC3" ? parseEac3Config(track.codecPrivate) : null;
-  return eac3 ? { codec: "ec-3", dec3: eac3.dec3, sampleRate: track.sampleRate, channels: track.channels, frameDurationMs: eac3.frameDurationMs } : null;
+  if (eac3) return { codec: "ec-3", dec3: eac3.dec3, sampleRate: track.sampleRate, channels: track.channels, frameDurationMs: eac3.frameDurationMs };
+  if (codec === "A_OPUS") {
+    const dOps = opusDops(track.codecPrivate, track.channels);
+    return dOps ? { codec: "opus", dOps, sampleRate: track.sampleRate, channels: track.channels, frameDurationMs: 20 } : null;
+  }
+  return null;
+}
+
+function opusDops(codecPrivate: Uint8Array, channels: number) {
+  if (codecPrivate.byteLength < 19) return null;
+  const signature = new TextDecoder().decode(codecPrivate.subarray(0, 8));
+  if (signature !== "OpusHead") return null;
+  const output = new Uint8Array(19);
+  output[0] = 0;
+  output[1] = codecPrivate[9] ?? channels;
+  output.set(codecPrivate.subarray(10, 19), 2);
+  return output;
 }
 
 export function encodedVideoDurationTicks(durationUs: number | undefined, fallbackDurationMs: number) {

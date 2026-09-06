@@ -28,7 +28,7 @@ import {
 import { normalizeCaptionOffset } from "./caption-offset";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
-import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { hasClientMkvCandidate, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -418,6 +418,12 @@ export function PlayerPage() {
   }, []);
 
   const requestServerFallback = useCallback(async (reason?: unknown) => {
+    const remoteClientMkv = isRemoteHttpStrmSource(source) && hasClientMkvCandidate(source);
+    if (remoteClientMkv) {
+      setFailedStreamUrl(streamUrl || null);
+      setPlaybackFailure(classifyPlayerEngineFailure(reason));
+      return;
+    }
     if (
       playbackPlan?.type === "DIRECT"
       && directProxyUrl
@@ -449,7 +455,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, stopActiveSession, streamUrl]);
+  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, source, stopActiveSession, streamUrl]);
 
   useEffect(() => {
     fallbackGenerationRef.current += 1;
@@ -690,14 +696,8 @@ export function PlayerPage() {
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          // A remote HTTP(S) STRM must remain on the native element. The
-          // signed Lux endpoint follows the upstream redirect, but a client
-          // fallback would fetch that redirect with CORS and cannot safely
-          // consume the remote response when the upstream omits CORS headers.
           const remoteHttpStrm = isRemoteHttpStrmSource(source);
-          const useMkvFallback = remoteHttpStrm
-            ? false
-            : await shouldUseClientMkv(source, initialEngine.element);
+          const useMkvFallback = await shouldUseClientMkv(source, initialEngine.element);
           const useHevcFallback =
             !useMkvFallback
             && !remoteHttpStrm
@@ -741,7 +741,7 @@ export function PlayerPage() {
       } catch (cause) {
         if (!cancelled) {
           if (runtime.state.status === "FAILED") return;
-          if (playbackPlan?.type === "DIRECT") {
+          if (playbackPlan?.type === "DIRECT" && !(isRemoteHttpStrmSource(source) && hasClientMkvCandidate(source))) {
             requestServerFallback(cause);
           } else {
             setFailedStreamUrl(streamUrl);

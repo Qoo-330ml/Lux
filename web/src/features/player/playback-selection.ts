@@ -4,7 +4,8 @@ import { isHevcCodec } from "./media-codec";
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
 const HEVC_MSE_CODECS = ["hvc1.2.4.L153.B0", "hvc1.1.6.L120.B0"] as const;
-const PASSTHROUGH_AUDIO_CODECS = new Set(["ac3", "ac-3", "eac3", "ec-3"]);
+const PASSTHROUGH_AUDIO_CODECS = new Set(["ac3", "ac-3", "eac3", "ec-3", "opus"]);
+const CLIENT_MKV_VIDEO_CODECS = new Set(["h264", "avc", "avc1", "hevc", "h265", "hvc1", "vp9", "vp09", "av1", "av01"]);
 
 export function isRemoteHttpStrmSource(source: MediaSource | undefined) {
   if (source?.sourceKind !== "STRM_URL" || !source.externalUrl) return false;
@@ -32,7 +33,7 @@ export function hasClientHevcCandidate(source: MediaSource | undefined) {
 export function hasClientMkvCandidate(source: MediaSource | undefined) {
   if (!source || (source.sourceKind === "STRM_URL" && !source.externalUrl) || !isMatroskaContainer(source.container)) return false;
   const video = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
-  if (!isHevcCodec(video?.codec)) return false;
+  if (!video?.codec || !CLIENT_MKV_VIDEO_CODECS.has(video.codec.toLowerCase().trim()) && !isHevcCodec(video.codec)) return false;
   const audio = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
   return audio.length === 0 || audio.some((stream) => /^aac$|^mp4a\./i.test(stream.codec ?? "") || PASSTHROUGH_AUDIO_CODECS.has((stream.codec ?? "").toLowerCase()));
 }
@@ -51,6 +52,15 @@ export async function shouldUseClientHevc(source: MediaSource | undefined, video
 
 export async function shouldUseClientMkv(source: MediaSource | undefined, video: HTMLVideoElement) {
   if (!source || !hasClientMkvCandidate(source)) return false;
+  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec?.toLowerCase() ?? "";
+  if (!isHevcCodec(videoCodec) && typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function") {
+    const codec = videoCodec.includes("vp9") || videoCodec.includes("vp09")
+      ? "vp09.00.10.08"
+      : videoCodec.includes("av1") || videoCodec.includes("av01")
+        ? "av01.0.04M.08"
+        : "avc1.640028";
+    return MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`);
+  }
   if (hasClientMkvHevcRuntime()) {
     if (!hasClientMkvAudioRuntime(source)) return false;
     return video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
@@ -66,8 +76,10 @@ function hasClientMkvAudioRuntime(source: MediaSource) {
     ? "aac"
     : audio.some((stream) => ["ac3", "ac-3"].includes((stream.codec ?? "").toLowerCase()))
       ? "ac-3"
-      : audio.some((stream) => ["eac3", "ec-3"].includes((stream.codec ?? "").toLowerCase()))
-        ? "ec-3"
+        : audio.some((stream) => ["eac3", "ec-3"].includes((stream.codec ?? "").toLowerCase()))
+          ? "ec-3"
+          : audio.some((stream) => (stream.codec ?? "").toLowerCase() === "opus")
+            ? "opus"
         : null;
   if (!codec || codec === "aac") return true;
   return HEVC_MSE_CODECS.some((videoCodec) => MediaSource.isTypeSupported(`video/mp4; codecs="${videoCodec},${codec}"`));

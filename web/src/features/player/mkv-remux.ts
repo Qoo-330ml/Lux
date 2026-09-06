@@ -1,4 +1,5 @@
 import { Box, createFile } from "mp4box";
+import type { MatroskaTrack } from "./matroska-demuxer";
 
 type RemuxFile = ReturnType<typeof createFile>;
 
@@ -19,6 +20,28 @@ export function addHevcTrack(file: RemuxFile, codecPrivate: Uint8Array, width: n
   hvcC.data = codecPrivate.slice();
   sampleEntry.addBox(hvcC);
   return trackId;
+}
+
+export function addMatroskaVideoTrack(file: RemuxFile, track: Pick<MatroskaTrack, "codecId" | "codecPrivate" | "width" | "height">) {
+  const codec = track.codecId.toUpperCase();
+  const type = codec === "V_MPEG4/ISO/AVC" ? "avc1" : codec === "V_VP9" ? "vp09" : codec === "V_AV1" ? "av01" : "hvc1";
+  const trackId = file.addTrack({ type, width: track.width ?? 320, height: track.height ?? 320, timescale: 90_000, hdlr: "vide" });
+  if (!trackId) throw new Error("MKV fMP4 创建视频轨失败");
+  const entry = file.moov.traks.find((item) => item.tkhd.track_id === trackId)?.mdia.minf.stbl.stsd.entries[0];
+  if (!entry) throw new Error("MKV fMP4 缺少视频样本描述");
+  const description = new Box();
+  description.type = type === "avc1" ? "avcC" : type === "hvc1" ? "hvcC" : type === "vp09" ? "vpcC" : "av1C";
+  description.data = track.codecPrivate.slice();
+  entry.addBox(description);
+  return trackId;
+}
+
+export function matroskaVideoCodecString(track: Pick<MatroskaTrack, "codecId">) {
+  const codec = track.codecId.toUpperCase();
+  if (codec === "V_MPEG4/ISO/AVC") return "avc1.640028";
+  if (codec === "V_VP9") return "vp09.00.10.08";
+  if (codec === "V_AV1") return "av01.0.04M.08";
+  return "hvc1.1.6.L120.B0";
 }
 
 export function hevcCodecString(codecPrivate: Uint8Array) {

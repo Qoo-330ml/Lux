@@ -12,6 +12,8 @@ export type PlayerRuntimeCaptionTrack = {
 };
 
 export type PlayerCaptionOption = {
+  /** Stable UI identity; Matroska tracks use TrackUID while legacy API access keeps streamIndex. */
+  id: string;
   streamIndex: number;
   name: string;
   label: string;
@@ -56,6 +58,7 @@ export function playerCaptionOptions(
       const unavailableReason = captionUnavailableReason(source, stream, format, runtimeTrack);
       const name = captionName(stream);
       return {
+        id: runtimeTrack?.id ?? `caption-${stream.index}`,
         streamIndex: stream.index,
         name,
         label: captionLabel(name, stream, Boolean(unavailableReason)),
