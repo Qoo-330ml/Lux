@@ -1,13 +1,14 @@
-import { summarizePlaybackPerformance, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
+import { summarizePlaybackPerformance, type PlaybackCaptionController, type PlaybackCaptionCue, type PlaybackCaptionTrack, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
 import { hasClientMkvHevcRuntime } from "./playback-selection";
 import type { HevcRuntimeAssets } from "./hevc-playback-engine";
+import { MatroskaRangeReader } from "./matroska-range-reader";
 
 type WorkerResponse =
   | { type: "ready" }
   | { type: "init"; initSegment: ArrayBuffer; codec: string }
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
-  | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean }
-  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string }
+  | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean; ordinal: number }
+  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -42,6 +43,7 @@ export class ClientMkvEngine implements PlaybackEngine {
   readonly kind = "client-mkv" as const;
   performance: PlaybackPerformance | null = null;
   error: Error | null = null;
+  readonly captionController: PlaybackCaptionController;
   private worker: Worker | null = null;
   private mediaSource: MediaSource | null = null;
   private objectUrl: string | null = null;
@@ -51,11 +53,29 @@ export class ClientMkvEngine implements PlaybackEngine {
   private transcodedMediaDurationMs = 0;
   private transcodedProcessingDurationMs = 0;
   private readonly captionTracks = new Map<string, TextTrack>();
+  private readonly captionTrackMetadata = new Map<string, PlaybackCaptionTrack>();
+  private readonly captionCueSnapshot: PlaybackCaptionCue[] = [];
+  private readonly captionListeners = new Set<() => void>();
+  private selectedCaptionId: string | null = null;
 
   constructor(
     readonly element: HTMLVideoElement,
     private readonly assets: HevcRuntimeAssets,
-  ) {}
+  ) {
+    this.captionController = {
+      tracks: () => [...this.captionTrackMetadata.values()],
+      select: (trackId) => {
+        this.selectedCaptionId = trackId;
+        this.captionTracks.forEach((track, id) => { track.mode = id === trackId ? "showing" : "disabled"; });
+        this.captionListeners.forEach((listener) => listener());
+      },
+      cues: () => [...this.captionCueSnapshot],
+      subscribe: (listener) => {
+        this.captionListeners.add(listener);
+        return () => this.captionListeners.delete(listener);
+      },
+    };
+  }
 
   async setSource(source: string, poster?: string | null) {
     this.destroy();
@@ -97,25 +117,11 @@ export class ClientMkvEngine implements PlaybackEngine {
 
     try {
       await ready;
-      const first = await fetchRange(source, 0, 1_048_575, abortController.signal);
-      let offset = 0;
-      while (true) {
+      const rangeReader = new MatroskaRangeReader(source);
+      for await (const chunk of rangeReader.chunks(abortController.signal)) {
         if (generation !== this.generation) return;
-        const reader = first.reader;
-        while (true) {
-          const chunk = await reader.read();
-          if (chunk.done) break;
-          if (generation !== this.generation) return;
-          const copy = chunk.value.slice();
-          offset += copy.byteLength;
-          worker.postMessage({ type: "data", data: copy.buffer }, [copy.buffer]);
-        }
-        if (first.total === null || offset >= first.total) break;
-        const nextEnd = Math.min(first.total - 1, offset + 32 * 1024 * 1024 - 1);
-        const next = await fetchRange(source, offset, nextEnd, abortController.signal, first.etag);
-        if (next.total !== first.total) throw new Error("客户端媒体索引失效：资源大小发生变化");
-        first.reader = next.reader;
-        first.etag = next.etag;
+        const copy = chunk.data.slice();
+        worker.postMessage({ type: "data", data: copy.buffer }, [copy.buffer]);
       }
       worker.postMessage({ type: "flush" });
       await playbackReady;
@@ -143,7 +149,11 @@ export class ClientMkvEngine implements PlaybackEngine {
         resolveReady();
       } else if (message.type === "init") {
         await openPromise;
-        this.sourceBuffer = new SourceBufferQueue(mediaSource.addSourceBuffer(`video/mp4; codecs="${message.codec}"`));
+        const mime = `video/mp4; codecs="${message.codec}"`;
+        if (typeof MediaSource.isTypeSupported === "function" && !MediaSource.isTypeSupported(mime)) {
+          throw new Error(`客户端 MSE 不支持当前编码组合：${message.codec}`);
+        }
+        this.sourceBuffer = new SourceBufferQueue(mediaSource.addSourceBuffer(mime));
         await this.sourceBuffer.append(message.initSegment);
       } else if (message.type === "segment") {
         if (!this.sourceBuffer) throw new Error("MKV fallback 缺少 MSE 初始化片段");
@@ -162,7 +172,16 @@ export class ClientMkvEngine implements PlaybackEngine {
           const track = this.element.addTextTrack("subtitles", message.label, message.language ?? "");
           track.mode = "disabled";
           this.captionTracks.set(message.trackId, track);
-          this.element.dispatchEvent(new Event("lux:caption-track"));
+          this.captionTrackMetadata.set(message.trackId, {
+            id: message.trackId,
+            label: message.label,
+            language: message.language,
+            isDefault: message.isDefault,
+            isForced: message.isForced,
+          });
+          if (this.selectedCaptionId === null && message.isDefault) this.selectedCaptionId = message.trackId;
+          this.element.dispatchEvent(new CustomEvent("lux:caption-track", { detail: { ...message } }));
+          this.captionListeners.forEach((listener) => listener());
         } catch {
           // Some browsers expose MSE but do not allow script-created text tracks.
         }
@@ -171,6 +190,19 @@ export class ClientMkvEngine implements PlaybackEngine {
         if (!track || typeof VTTCue === "undefined") return;
         try {
           track.addCue(new VTTCue(message.startMs / 1000, message.endMs / 1000, message.text));
+          this.captionCueSnapshot.push({
+            id: `${message.trackId}:${message.startMs}:${this.captionCueSnapshot.length}`,
+            trackId: message.trackId,
+            startMs: message.startMs,
+            endMs: message.endMs,
+            text: message.text,
+            layer: message.layer,
+            alignment: message.alignment,
+            position: message.position,
+            style: message.style,
+            runs: message.runs,
+          });
+          this.captionListeners.forEach((listener) => listener());
         } catch {
           // A malformed cue must not terminate audio/video playback.
         }
@@ -228,34 +260,10 @@ export class ClientMkvEngine implements PlaybackEngine {
       for (const cue of Array.from(track.cues ?? [])) track.removeCue(cue);
     });
     this.captionTracks.clear();
+    this.captionTrackMetadata.clear();
+    this.captionCueSnapshot.splice(0);
+    this.captionListeners.forEach((listener) => listener());
   }
-}
-
-async function fetchRange(
-  source: string,
-  start: number,
-  end: number,
-  signal: AbortSignal,
-  expectedEtag?: string | null,
-) {
-  const response = await fetch(source, {
-    credentials: "same-origin",
-    mode: "cors",
-    headers: { Range: `bytes=${start}-${end}` },
-    signal,
-  });
-  if (!response.ok || response.status !== 206) throw new Error(`客户端媒体读取失败：HTTP ${response.status}`);
-  const contentRange = response.headers.get("content-range")?.match(/^bytes\s+(\d+)-(\d+)\/(\d+)$/i);
-  if (!contentRange || Number(contentRange[1]) !== start || Number(contentRange[2]) < start || !response.body) {
-    throw new Error("客户端媒体读取失败：远程资源未提供有效 Range");
-  }
-  const etag = response.headers.get("etag");
-  if (expectedEtag && etag && etag !== expectedEtag) throw new Error("客户端媒体读取失败：远程资源发生变化");
-  return {
-    reader: response.body.getReader(),
-    total: Number(contentRange[3]),
-    etag,
-  };
 }
 
 function waitForMediaSourceOpen(mediaSource: MediaSource) {

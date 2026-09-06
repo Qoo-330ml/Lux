@@ -33,9 +33,9 @@ type PlayerSettingsPanelProps = {
   selectedSourceId?: string;
   onSourceChange?: (sourceId: string) => void;
   captions?: readonly PlayerCaptionOption[];
-  selectedCaptionStreamIndex?: number | null;
+  selectedCaptionId?: string | null;
   captionStatus?: string | null;
-  onSelectCaption?: (streamIndex: number | null) => void;
+  onSelectCaption?: (id: string | null) => void;
   captionOffset?: number;
   onChangeCaptionOffset?: (offset: number) => void;
   presentation?: PlayerPresentationSettings;
@@ -62,7 +62,7 @@ export function PlayerSettingsPanel({
   selectedSourceId = "",
   onSourceChange = () => undefined,
   captions = [],
-  selectedCaptionStreamIndex = null,
+  selectedCaptionId = null,
   captionStatus = null,
   onSelectCaption = () => undefined,
   captionOffset = 0,
@@ -183,17 +183,17 @@ export function PlayerSettingsPanel({
           id="lux-player-caption-select"
           className="lux-player-caption-select"
           aria-label="选择字幕"
-          value={selectedCaptionStreamIndex ?? ""}
+          value={selectedCaptionId ?? ""}
           onChange={(event) => {
             const value = event.target.value;
-            onSelectCaption(value === "" ? null : Number(value));
+            onSelectCaption(value === "" ? null : value);
           }}
         >
           <option value="">关闭字幕</option>
           {captions.map((caption) => (
             <option
-              key={caption.streamIndex}
-              value={caption.streamIndex}
+              key={caption.id}
+              value={caption.id}
               disabled={!caption.available}
             >
               {caption.unavailableReason

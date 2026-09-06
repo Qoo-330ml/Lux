@@ -2,6 +2,7 @@ import { FMP4Muxer, H264Encoder, HEVCDecoder, type HEVCFrame, type MuxerSample }
 import { Box, createFile, DataStream, ISOFile } from "mp4box";
 import processPolyfill from "process";
 import type { MatroskaSample, MatroskaStreamDemuxer, MatroskaTrack } from "./matroska-demuxer";
+import { parseMatroskaSubtitleSample } from "./matroska-subtitles";
 import { addMatroskaVideoTrack, concatBuffers, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed } from "./mkv-remux";
 import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, toAnnexB } from "./mkv-transcode";
 
@@ -15,8 +16,8 @@ type WorkerResponse =
   | { type: "ready" }
   | { type: "init"; initSegment: ArrayBuffer; codec: string }
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
-  | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean }
-  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string }
+  | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean; ordinal: number }
+  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -83,6 +84,9 @@ async function initialize(message: Extract<WorkerMessage, { type: "init" }>) {
   const { MatroskaStreamDemuxer } = await import("./matroska-demuxer");
   demuxer = new MatroskaStreamDemuxer({
     onTrack: (track) => {
+      if (track.contentEncodings.some((encoding) => encoding.type !== 0 || encoding.algorithm !== null)) {
+        throw new Error("MKV ContentEncoding 不受支持");
+      }
       if (track.type === "video" && !videoTrack) {
         if (!isSupportedMatroskaVideo(track)) throw new Error(`MKV 视频编码不支持：${track.codecId}`);
         videoTrack = track;
@@ -102,6 +106,7 @@ async function initialize(message: Extract<WorkerMessage, { type: "init" }>) {
           language: track.languageBcp47?.trim() || track.language?.trim() || undefined,
           isDefault: track.isDefault,
           isForced: track.isForced,
+          ordinal: subtitleTracks.size - 1,
         });
       }
     },
@@ -128,14 +133,19 @@ async function consumeSample(sample: MatroskaSample) {
   if (fatalError || !decoder) return;
   const subtitleTrack = subtitleTracks.get(sample.trackNumber);
   if (subtitleTrack) {
-    const text = decodeMatroskaSubtitle(sample.data, subtitleTrack.codecId);
-    if (text && sample.durationMs > 0) {
+    const cue = parseMatroskaSubtitleSample(sample.data, subtitleTrack, sample.timestampMs, sample.durationMs);
+    if (cue) {
       workerScope.postMessage({
         type: "caption",
         trackId: matroskaCaptionTrackId(subtitleTrack),
-        startMs: sample.timestampMs,
-        endMs: sample.timestampMs + sample.durationMs,
-        text,
+        startMs: cue.start * 1000,
+        endMs: cue.end * 1000,
+        text: cue.text,
+        layer: cue.layer,
+        alignment: cue.alignment,
+        position: cue.position,
+        style: cue.style,
+        runs: cue.runs,
       });
     }
     return;
@@ -440,25 +450,4 @@ function matroskaCaptionTrackId(track: MatroskaTrack) {
   return track.uid !== null && (typeof track.uid === "bigint" || Number.isSafeInteger(track.uid))
     ? `mkv:${track.uid.toString()}`
     : `mkv-track:${track.number}`;
-}
-
-function decodeMatroskaSubtitle(data: Uint8Array, codecId: string) {
-  let text: string;
-  try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(data);
-  } catch {
-    throw new Error("MKV 字幕编码无效");
-  }
-  if (text.length === 0 || text.length > 64 * 1024 || /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F]/u.test(text)) {
-    throw new Error("MKV 字幕文本无效");
-  }
-  if (codecId.trim().toUpperCase() === "S_TEXT/UTF8") return text.trim();
-  const fields = text.split(",");
-  const dialogue = fields.length >= 10 ? fields.slice(9).join(",") : text;
-  if (/\\p[0-9]+/i.test(dialogue)) return "";
-  return dialogue
-    .replace(/\{[^{}\n]{0,512}\}/g, "")
-    .replace(/\\N|\\n/g, "\n")
-    .replace(/\\h/g, " ")
-    .trim();
 }

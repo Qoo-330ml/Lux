@@ -5,6 +5,11 @@ export type LuxCaptionCue = {
   start: number;
   end: number;
   text: string;
+  layer?: number;
+  alignment?: number;
+  position?: { x: number; y: number };
+  style?: { color?: string; bold?: boolean; italic?: boolean };
+  runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[];
 };
 
 export type CaptionParseErrorCode =
@@ -50,20 +55,14 @@ export function parseCaptionText(input: string, format: CaptionFormat): LuxCapti
 }
 
 export function activeCaptionCue(cues: readonly LuxCaptionCue[], time: number) {
-  if (!Number.isFinite(time) || time < 0 || cues.length === 0) return null;
-  let low = 0;
-  let high = cues.length - 1;
-  let candidate = -1;
-  while (low <= high) {
-    const middle = Math.floor((low + high) / 2);
-    if (cues[middle].start <= time) {
-      candidate = middle;
-      low = middle + 1;
-    } else {
-      high = middle - 1;
-    }
-  }
-  return candidate >= 0 && time < cues[candidate].end ? cues[candidate] : null;
+  return activeCaptionCues(cues, time).at(-1) ?? null;
+}
+
+export function activeCaptionCues(cues: readonly LuxCaptionCue[], time: number) {
+  if (!Number.isFinite(time) || time < 0 || cues.length === 0) return [];
+  return cues
+    .filter((cue) => cue.start <= time && time < cue.end)
+    .sort((left, right) => (left.layer ?? 0) - (right.layer ?? 0) || left.start - right.start || left.id.localeCompare(right.id));
 }
 
 function parseSrt(input: string): LuxCaptionCue[] {

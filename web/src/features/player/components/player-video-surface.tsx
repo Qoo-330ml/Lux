@@ -106,6 +106,7 @@ export function PlayerVideoSurface({
   const videoElementRef = useRef<HTMLVideoElement | null>(null);
   const captionTrackRef = useRef<HTMLTrackElement>(null);
   const captionOffsetControllerRef = useRef<ReturnType<typeof createNativeCaptionOffsetController> | null>(null);
+  const runtimeCaptionIdsRef = useRef(new Map<number, string>());
   const [presentationSize, setPresentationSize] = useState<ReturnType<typeof playerVideoPresentationSize>>(null);
   const gestures = usePlayerSurfaceGestures({
     enabled: Boolean(gestureOptions),
@@ -131,7 +132,15 @@ export function PlayerVideoSurface({
       onNativeCaptionTracksChange?.([]);
       return;
     }
-    const publishTracks = () => onNativeCaptionTracksChange?.(readPlayerRuntimeCaptionTracks(video));
+    const publishTracks = (event?: Event) => {
+      const detail = event instanceof CustomEvent ? event.detail as { ordinal?: number; trackId?: string } | null : null;
+      if (detail?.trackId && Number.isInteger(detail.ordinal)) runtimeCaptionIdsRef.current.set(detail.ordinal as number, detail.trackId);
+      const tracks = readPlayerRuntimeCaptionTracks(video).map((track, ordinal) => ({
+        ...track,
+        id: runtimeCaptionIdsRef.current.get(ordinal) ?? track.id,
+      }));
+      onNativeCaptionTracksChange?.(tracks);
+    };
     const textTracks = video.textTracks;
     publishTracks();
     video.addEventListener("loadedmetadata", publishTracks);
@@ -149,6 +158,7 @@ export function PlayerVideoSurface({
         textTracks.removeEventListener("removetrack", publishTracks);
       }
       onNativeCaptionTracksChange?.([]);
+      runtimeCaptionIdsRef.current.clear();
     };
   }, [captionLifecycleKey, onNativeCaptionTracksChange, streamUrl]);
 

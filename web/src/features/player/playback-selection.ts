@@ -59,7 +59,9 @@ export async function shouldUseClientMkv(source: MediaSource | undefined, video:
       : videoCodec.includes("av1") || videoCodec.includes("av01")
         ? "av01.0.04M.08"
         : "avc1.640028";
-    return MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`);
+    const audioCodec = mseAudioCodec(source);
+    if (source.streams?.some((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") && !audioCodec) return false;
+    return MediaSource.isTypeSupported(`video/mp4; codecs="${[codec, audioCodec].filter(Boolean).join(",")}"`);
   }
   if (hasClientMkvHevcRuntime()) {
     if (!hasClientMkvAudioRuntime(source)) return false;
@@ -68,6 +70,15 @@ export async function shouldUseClientMkv(source: MediaSource | undefined, video:
   if (!hasClientHevcRuntime()) return false;
   if (!hasClientMkvH264Audio(source)) return false;
   return probeClientHevc(source, video, "video/x-matroska");
+}
+
+function mseAudioCodec(source: MediaSource) {
+  const codecs = source.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO").map((stream) => (stream.codec ?? "").toLowerCase()) ?? [];
+  if (codecs.some((codec) => /^aac$|^mp4a\./i.test(codec))) return "mp4a.40.2";
+  if (codecs.some((codec) => ["ac3", "ac-3"].includes(codec))) return "ac-3";
+  if (codecs.some((codec) => ["eac3", "ec-3"].includes(codec))) return "ec-3";
+  if (codecs.some((codec) => codec === "opus")) return "opus";
+  return null;
 }
 
 function hasClientMkvAudioRuntime(source: MediaSource) {

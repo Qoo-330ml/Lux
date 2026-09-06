@@ -1,6 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
-  activeCaptionCue,
+  activeCaptionCues,
   CAPTION_LIMITS,
   parseCaptionText,
   type LuxCaptionCue,
@@ -36,7 +36,7 @@ export function PlayerCaptionOverlay({
     () => offsetCaptionCues(cues, captionOffset, captionDuration),
     [captionDuration, captionOffset, cues],
   );
-  const activeCue = useMemo(() => activeCaptionCue(shiftedCues, currentTime), [currentTime, shiftedCues]);
+  const activeCues = useMemo(() => activeCaptionCues(shiftedCues, currentTime), [currentTime, shiftedCues]);
 
   useEffect(() => {
     const generation = ++generationRef.current;
@@ -101,12 +101,45 @@ export function PlayerCaptionOverlay({
     };
   }, [lifecycleKey, onStatusChange, source?.format, source?.id, source?.src]);
 
-  if (!source || loading || !activeCue) return null;
+  if (!source || loading || activeCues.length === 0) return null;
   return (
     <div className="lux-player-caption-overlay" aria-label="字幕" aria-live="polite">
-      <span className="lux-player-caption-text">{activeCue.text}</span>
+      {activeCues.map((cue) => (
+        <span
+          className="lux-player-caption-text"
+          key={cue.id}
+          style={captionPositionStyle(cue)}
+        >
+          {cue.runs?.length
+            ? cue.runs.map((run, index) => (
+              <span key={`${cue.id}-run-${index}`} style={captionRunStyle(run)}>{run.text}</span>
+            ))
+            : cue.text}
+        </span>
+      ))}
     </div>
   );
+}
+
+function captionPositionStyle(cue: { alignment?: number; position?: { x: number; y: number } }): CSSProperties {
+  const style: CSSProperties = {};
+  if (cue.position && Number.isFinite(cue.position.x) && Number.isFinite(cue.position.y)) {
+    style.position = "absolute";
+    style.left = `${Math.max(0, Math.min(100, cue.position.x))}%`;
+    style.top = `${Math.max(0, Math.min(100, cue.position.y))}%`;
+    style.transform = "translate(-50%, -50%)";
+  } else if (cue.alignment && cue.alignment >= 1 && cue.alignment <= 9) {
+    style.alignSelf = cue.alignment <= 3 ? "flex-end" : cue.alignment <= 6 ? "center" : "flex-start";
+  }
+  return style;
+}
+
+function captionRunStyle(run: { color?: string; bold?: boolean; italic?: boolean }): CSSProperties {
+  const style: CSSProperties = {};
+  if (run.color && /^rgba\(\d{1,3}, \d{1,3}, \d{1,3}, (?:0|1|0?\.\d+)\)$/u.test(run.color)) style.color = run.color;
+  if (run.bold === true) style.fontWeight = 700;
+  if (run.italic === true) style.fontStyle = "italic";
+  return style;
 }
 
 async function readCaptionResponse(response: Response, signal: AbortSignal) {

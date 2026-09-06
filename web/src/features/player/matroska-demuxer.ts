@@ -24,6 +24,7 @@ const IDS = {
   contentEncodingType: 0x5033,
   contentCompression: 0x5034,
   contentEncryption: 0x5035,
+  contentCompAlgo: 0x4254,
   codecId: 0x86,
   codecPrivate: 0x63a2,
   defaultDuration: 0x23e383,
@@ -292,6 +293,7 @@ function parseRange(
     else if (element.id === IDS.timecodeScale) result.timecodeScale = readUnsigned(data, element.dataStart, boundedEnd) || 1_000_000;
     else if (element.id === IDS.tracks) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, clusterTimecode, clusterScale);
     else if (element.id === IDS.trackEntry) parseTrackEntry(data, element.dataStart, boundedEnd, result);
+    else if (element.id === IDS.contentEncodings && trackEntry) trackEntry.contentEncodings = parseContentEncodings(data, element.dataStart, boundedEnd);
     else if (element.id === IDS.cluster) parseRange(data, element.dataStart, boundedEnd, result, trackEntry, 0, result.timecodeScale);
     else if (element.id === IDS.blockGroup && currentClusterTimecode !== null) {
       parseBlockGroup(data, element.dataStart, boundedEnd, result, currentClusterTimecode, currentClusterScale ?? result.timecodeScale);
@@ -375,6 +377,40 @@ function parseTrackEntry(data: Uint8Array, start: number, end: number, result: M
   if (complete.type === "video" && !result.videoTrack) result.videoTrack = complete;
   if (complete.type === "audio" && !result.audioTrack) result.audioTrack = complete;
   if (complete.type === "subtitle") result.subtitleTracks.push(complete);
+}
+
+function parseContentEncodings(data: Uint8Array, start: number, end: number) {
+  const encodings: MatroskaContentEncoding[] = [];
+  let offset = start;
+  while (offset < end) {
+    const element = readElement(data, offset, end);
+    if (!element) return encodings;
+    if (element.id === IDS.contentEncoding) {
+      const encoding: MatroskaContentEncoding = { order: 0, scope: 1, type: 0, algorithm: null };
+      let childOffset = element.dataStart;
+      while (childOffset < element.dataEnd) {
+        const child = readElement(data, childOffset, element.dataEnd);
+        if (!child) break;
+        const value = readUnsigned(data, child.dataStart, child.dataEnd);
+        if (child.id === IDS.contentEncodingOrder && value !== null) encoding.order = value;
+        else if (child.id === IDS.contentEncodingScope && value !== null) encoding.scope = value;
+        else if (child.id === IDS.contentEncodingType && value !== null) encoding.type = value;
+        else if (child.id === IDS.contentCompression) {
+          let compressionOffset = child.dataStart;
+          while (compressionOffset < child.dataEnd) {
+            const compression = readElement(data, compressionOffset, child.dataEnd);
+            if (!compression) break;
+            if (compression.id === IDS.contentCompAlgo) encoding.algorithm = readUnsigned(data, compression.dataStart, compression.dataEnd);
+            compressionOffset = compression.end;
+          }
+        }
+        childOffset = child.end;
+      }
+      encodings.push(encoding);
+    }
+    offset = element.end;
+  }
+  return encodings;
 }
 
 function readTrackField(data: Uint8Array, element: Element, track: Partial<MatroskaTrack>) {

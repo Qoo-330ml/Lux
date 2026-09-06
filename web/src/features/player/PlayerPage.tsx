@@ -205,7 +205,7 @@ export function PlayerPage() {
   const [hoverPercent, setHoverPercent] = useState<number | null>(null);
   const [danmuVisible, setDanmuVisible] = useState(true);
   const [screenshotStatus, setScreenshotStatus] = useState<string | null>(null);
-  const [selectedCaptionStreamIndex, setSelectedCaptionStreamIndex] = useState<number | null>(null);
+  const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
   const [captionStatus, setCaptionStatus] = useState<string | null>(null);
   const [captionOffset, setCaptionOffset] = useState(0);
@@ -269,13 +269,18 @@ export function PlayerPage() {
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
   const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, nativeCaptionTracks);
   const selectedCaptionOption = captionSourceId === source?.id
-    ? captionOptions.find((caption) => caption.streamIndex === selectedCaptionStreamIndex && caption.available) ?? null
+    ? captionOptions.find((caption) => caption.id === selectedCaptionId && caption.available) ?? null
     : null;
   const captionTrack = nativeCaptionTrack(itemId, source?.id ?? "", selectedCaptionOption);
   const captionOverlaySource = overlayCaptionSource(itemId, source?.id ?? "", selectedCaptionOption);
   const nativeCaptionTrackId = selectedCaptionOption?.renderMode === "native-inband"
     ? selectedCaptionOption.runtimeTrackId ?? null
     : null;
+  useEffect(() => {
+    const controller = engineRef.current?.captionController;
+    if (!controller) return;
+    controller.select(nativeCaptionTrackId);
+  }, [nativeCaptionTrackId]);
   // For the first bootstrap request, keep the key tied to the URL selection
   // (or the default slot) rather than changing it when the response resolves
   // its default source. This prevents the newly-created bootstrap session from
@@ -484,11 +489,11 @@ export function PlayerPage() {
       playerCaptionOptions(source, nativeCaptionTracksSupported, []),
     );
     setCaptionSourceId(source?.id ?? null);
-    setSelectedCaptionStreamIndex(initialCaption?.streamIndex ?? null);
+    setSelectedCaptionId(initialCaption?.id ?? null);
     setCaptionStatus(null);
   }, [nativeCaptionTracksSupported, source?.id]);
 
-  const defaultCaptionStreamIndex = defaultCaptionSelection(captionOptions)?.streamIndex ?? null;
+  const defaultCaptionId = defaultCaptionSelection(captionOptions)?.id ?? null;
   useEffect(() => {
     if (
       captionSelectionTouchedRef.current
@@ -497,10 +502,10 @@ export function PlayerPage() {
     ) {
       return;
     }
-    setSelectedCaptionStreamIndex((previous) => (
-      previous === defaultCaptionStreamIndex ? previous : defaultCaptionStreamIndex
+    setSelectedCaptionId((previous) => (
+      previous === defaultCaptionId ? previous : defaultCaptionId
     ));
-  }, [captionSourceId, defaultCaptionStreamIndex, source?.id]);
+  }, [captionSourceId, defaultCaptionId, source?.id]);
 
   useEffect(() => {
     if (sessionGateKey === playbackKey) return;
@@ -905,19 +910,19 @@ export function PlayerPage() {
     setPlaybackRate(rate);
   }, []);
 
-  const selectCaption = useCallback((streamIndex: number | null) => {
+  const selectCaption = useCallback((id: string | null) => {
     captionSelectionTouchedRef.current = true;
-    if (streamIndex === null) {
+    if (id === null) {
       setCaptionSourceId(source?.id ?? null);
-      setSelectedCaptionStreamIndex(null);
+      setSelectedCaptionId(null);
       setCaptionStatus(null);
       resetControlsTimeout();
       return;
     }
-    const option = captionOptions.find((caption) => caption.streamIndex === streamIndex);
+    const option = captionOptions.find((caption) => caption.id === id);
     if (!option?.available) return;
     setCaptionSourceId(source?.id ?? null);
-    setSelectedCaptionStreamIndex(option.streamIndex);
+    setSelectedCaptionId(option.id);
     setCaptionStatus(option.renderMode === "native-inband" ? null : "字幕加载中…");
     resetControlsTimeout();
   }, [captionOptions, resetControlsTimeout, source?.id]);
@@ -1306,7 +1311,7 @@ export function PlayerPage() {
             onChangeFlip: setFlip,
           }}
           captions={captionOptions}
-          selectedCaptionStreamIndex={captionSourceId === source?.id ? selectedCaptionStreamIndex : null}
+          selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
           captionStatus={captionStatus}
           onSelectCaption={selectCaption}
           captionOffset={captionOffset}
