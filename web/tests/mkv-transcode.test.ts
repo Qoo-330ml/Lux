@@ -4,11 +4,11 @@ import { addHevcTrack, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks,
 import { encodedVideoDurationTicks, isSupportedMatroskaAudio, isSupportedMatroskaVideo, matroskaAudioConfig, toAnnexB } from "../src/features/player/mkv-transcode";
 
 describe("MKV transcode input", () => {
-  it("accepts HEVC and AAC-LC Matroska tracks only", () => {
+  it("accepts the supported Matroska video and audio codecs", () => {
     expect(isSupportedMatroskaVideo({ codecId: "V_MPEGH/ISO/HEVC", codecPrivate: new Uint8Array([1]) })).toBe(true);
-    expect(isSupportedMatroskaVideo({ codecId: "V_MPEG4/ISO/AVC", codecPrivate: new Uint8Array([1]) })).toBe(false);
+    expect(isSupportedMatroskaVideo({ codecId: "V_MPEG4/ISO/AVC", codecPrivate: new Uint8Array([1]) })).toBe(true);
     expect(isSupportedMatroskaAudio({ codecId: "A_AAC/MPEG4/LC", codecPrivate: new Uint8Array([0x12, 0x10]) })).toBe(true);
-    expect(isSupportedMatroskaAudio({ codecId: "A_OPUS", codecPrivate: new Uint8Array([1]) })).toBe(false);
+    expect(isSupportedMatroskaAudio({ codecId: "A_OPUS", codecPrivate: new TextEncoder().encode("OpusHead\x01\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00") })).toBe(true);
     expect(matroskaAudioConfig({ codecId: "A_AAC/MPEG4/LC", codecPrivate: new Uint8Array([0x12, 0x10]), sampleRate: 48_000, channels: 2 })).toEqual({
       codec: "mp4a.40.2",
       asc: new Uint8Array([0x12, 0x10]),

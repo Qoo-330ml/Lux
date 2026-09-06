@@ -17,7 +17,7 @@ type WorkerResponse =
   | { type: "init"; initSegment: ArrayBuffer; codec: string }
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
   | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean; ordinal: number }
-  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
+  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
   | { type: "done" }
   | { type: "error"; message: string };
 

@@ -36,9 +36,15 @@ export function addMatroskaVideoTrack(file: RemuxFile, track: Pick<MatroskaTrack
   return trackId;
 }
 
-export function matroskaVideoCodecString(track: Pick<MatroskaTrack, "codecId">) {
+export function matroskaVideoCodecString(track: Pick<MatroskaTrack, "codecId" | "codecPrivate">) {
   const codec = track.codecId.toUpperCase();
-  if (codec === "V_MPEG4/ISO/AVC") return "avc1.640028";
+  if (codec === "V_MPEG4/ISO/AVC") {
+    const config = track.codecPrivate;
+    if (config.byteLength >= 4 && config[0] === 1) {
+      return `avc1.${[config[1], config[2], config[3]].map((value) => value.toString(16).padStart(2, "0")).join("")}`;
+    }
+    return "avc1.640028";
+  }
   if (codec === "V_VP9") return "vp09.00.10.08";
   if (codec === "V_AV1") return "av01.0.04M.08";
   return "hvc1.1.6.L120.B0";

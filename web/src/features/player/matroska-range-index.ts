@@ -47,7 +47,7 @@ export class MatroskaIndexError extends Error {
 
 type Element = { id: number; start: number; dataStart: number; dataEnd: number; end: number; unknown: boolean };
 
-export function parseMatroskaRangeIndex(data: Uint8Array, totalLength = data.byteLength): MatroskaRangeIndex {
+export function parseMatroskaRangeIndex(data: Uint8Array, totalLength = data.byteLength, videoTrack?: number): MatroskaRangeIndex {
   if (totalLength < data.byteLength) throw new MatroskaIndexError("Matroska 索引长度不一致");
   const segment = findElement(data, 0, data.byteLength, IDS.segment);
   if (!segment) throw new MatroskaIndexError("Matroska 缺少 Segment");
@@ -63,7 +63,7 @@ export function parseMatroskaRangeIndex(data: Uint8Array, totalLength = data.byt
   }
   const cues = findElement(data, cuesOffset, data.byteLength, IDS.cues);
   if (!cues || cues.dataEnd > totalLength) throw new MatroskaIndexError("Cues 尚未完整读取");
-  const parsed = parseCues(data, cues.dataStart, cues.dataEnd, segment.dataStart, totalLength);
+  const parsed = parseCues(data, cues.dataStart, cues.dataEnd, segment.dataStart, totalLength, videoTrack);
   if (parsed.length === 0) throw new MatroskaIndexError("Cues 不包含关键帧位置");
   return {
     segmentOffset: segment.start,
@@ -99,7 +99,7 @@ function parseSeekHead(data: Uint8Array, start: number, end: number) {
   return entries;
 }
 
-function parseCues(data: Uint8Array, start: number, end: number, segmentDataOffset: number, totalLength: number) {
+function parseCues(data: Uint8Array, start: number, end: number, segmentDataOffset: number, totalLength: number, videoTrack?: number) {
   const cues: MatroskaCue[] = [];
   forEachElement(data, start, end, (point) => {
     if (point.id !== IDS.cuePoint) return;
@@ -115,7 +115,7 @@ function parseCues(data: Uint8Array, start: number, end: number, segmentDataOffs
         if (position.id === IDS.cueClusterPosition) clusterPosition = readUnsigned(data, position.dataStart, position.dataEnd);
         if (position.id === IDS.cueBlockNumber) blockNumber = readUnsigned(data, position.dataStart, position.dataEnd) ?? 1;
       }, 2);
-      if (track === null || clusterPosition === null || !Number.isSafeInteger(clusterPosition)) return;
+      if (track === null || clusterPosition === null || !Number.isSafeInteger(clusterPosition) || (videoTrack !== undefined && track !== videoTrack)) return;
       const clusterOffset = segmentDataOffset + clusterPosition;
       if (clusterOffset < segmentDataOffset || clusterOffset >= totalLength) {
         throw new MatroskaIndexError("Cue ClusterPosition 越界");

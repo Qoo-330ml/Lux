@@ -18,6 +18,7 @@ type PlayerCaptionOverlayProps = {
   captionOffset?: number;
   captionDuration?: number | null;
   lifecycleKey?: string;
+  runtimeCues?: readonly LuxCaptionCue[];
   onStatusChange?: (status: string | null) => void;
 };
 
@@ -27,14 +28,15 @@ export function PlayerCaptionOverlay({
   captionOffset = 0,
   captionDuration = null,
   lifecycleKey = "",
+  runtimeCues = [],
   onStatusChange,
 }: PlayerCaptionOverlayProps) {
   const [cues, setCues] = useState<LuxCaptionCue[]>([]);
   const [loading, setLoading] = useState(false);
   const generationRef = useRef(0);
   const shiftedCues = useMemo(
-    () => offsetCaptionCues(cues, captionOffset, captionDuration),
-    [captionDuration, captionOffset, cues],
+    () => offsetCaptionCues(source ? cues : runtimeCues, captionOffset, captionDuration),
+    [captionDuration, captionOffset, cues, runtimeCues, source],
   );
   const activeCues = useMemo(() => activeCaptionCues(shiftedCues, currentTime), [currentTime, shiftedCues]);
 
@@ -101,7 +103,7 @@ export function PlayerCaptionOverlay({
     };
   }, [lifecycleKey, onStatusChange, source?.format, source?.id, source?.src]);
 
-  if (!source || loading || activeCues.length === 0) return null;
+  if (loading || activeCues.length === 0 || (!source && runtimeCues.length === 0)) return null;
   return (
     <div className="lux-player-caption-overlay" aria-label="字幕" aria-live="polite">
       {activeCues.map((cue) => (
@@ -121,7 +123,7 @@ export function PlayerCaptionOverlay({
   );
 }
 
-function captionPositionStyle(cue: { alignment?: number; position?: { x: number; y: number } }): CSSProperties {
+function captionPositionStyle(cue: { alignment?: number; position?: { x: number; y: number }; style?: { marginL?: number; marginR?: number; marginV?: number } }): CSSProperties {
   const style: CSSProperties = {};
   if (cue.position && Number.isFinite(cue.position.x) && Number.isFinite(cue.position.y)) {
     style.position = "absolute";
@@ -131,12 +133,15 @@ function captionPositionStyle(cue: { alignment?: number; position?: { x: number;
   } else if (cue.alignment && cue.alignment >= 1 && cue.alignment <= 9) {
     style.alignSelf = cue.alignment <= 3 ? "flex-end" : cue.alignment <= 6 ? "center" : "flex-start";
   }
+  if (cue.style?.marginL !== undefined) style.marginLeft = `${Math.max(0, Math.min(10_000, cue.style.marginL))}px`;
+  if (cue.style?.marginR !== undefined) style.marginRight = `${Math.max(0, Math.min(10_000, cue.style.marginR))}px`;
+  if (!cue.position && cue.style?.marginV !== undefined) style.marginBottom = `${Math.max(0, Math.min(10_000, cue.style.marginV))}px`;
   return style;
 }
 
 function captionRunStyle(run: { color?: string; bold?: boolean; italic?: boolean }): CSSProperties {
   const style: CSSProperties = {};
-  if (run.color && /^rgba\(\d{1,3}, \d{1,3}, \d{1,3}, (?:0|1|0?\.\d+)\)$/u.test(run.color)) style.color = run.color;
+  if (run.color && /^rgba\(\d{1,3}, \d{1,3}, \d{1,3}, (?:(?:0|1)(?:\.\d+)?|0?\.\d+)\)$/u.test(run.color)) style.color = run.color;
   if (run.bold === true) style.fontWeight = 700;
   if (run.italic === true) style.fontStyle = "italic";
   return style;

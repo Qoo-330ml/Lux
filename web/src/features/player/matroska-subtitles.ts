@@ -108,7 +108,7 @@ function parseDialogue(value: string) {
 
 function parseStyledText(text: string, header: AssHeader, styleName: string) {
   const base = header.styles.get(styleName.toLowerCase()) ?? {};
-  let current = { color: base.color, bold: base.bold, italic: base.italic };
+  let current = { color: base.color, bold: base.bold, italic: base.italic, marginL: base.marginL, marginR: base.marginR, marginV: base.marginV };
   let alignment = base.alignment;
   let position: { x: number; y: number } | undefined;
   const runs: Array<{ text: string; color?: string; bold?: boolean; italic?: boolean }> = [];
@@ -124,17 +124,17 @@ function parseStyledText(text: string, header: AssHeader, styleName: string) {
   let cursor = 0;
   for (const match of text.matchAll(tagPattern)) {
     append(text.slice(cursor, match.index));
-    for (const tag of match[1].matchAll(/\\([bi]|(?:1?[ca])|an[1-9]|pos\([^)]*\)|r(?:\s+[^\\]+)?)/giu)) {
+    for (const tag of match[1].matchAll(/\\([bi]|(?:alpha|1?[ca])|an[1-9]|pos\([^)]*\)|r(?:\s+[^\\]+)?)/giu)) {
       const value = tag[1];
       if (/^b$/i.test(value)) current = { ...current, bold: true };
       else if (/^i$/i.test(value)) current = { ...current, italic: true };
       else if (/^1?c/i.test(value)) current = { ...current, color: assColor(value.slice(value.indexOf("c") + 1)) };
-      else if (/^1?a/i.test(value)) current = { ...current, color: applyAlpha(current.color, value.slice(value.indexOf("a") + 1)) };
+      else if (/^(?:alpha|1?a)/i.test(value)) current = { ...current, color: applyAlpha(current.color, /^alpha/i.test(value) ? value.slice(5) : value.slice(value.indexOf("a") + 1)) };
       else if (/^an[1-9]$/i.test(value)) alignment = Number(value.slice(2));
       else if (/^pos\(/i.test(value) && header.playResX && header.playResY) {
         const values = value.slice(4, -1).split(",").map(Number);
         if (values.length === 2 && values.every(Number.isFinite)) position = { x: clamp(values[0] / header.playResX * 100, 0, 100), y: clamp(values[1] / header.playResY * 100, 0, 100) };
-      } else if (/^r/i.test(value)) current = { color: base.color, bold: base.bold, italic: base.italic };
+      } else if (/^r/i.test(value)) current = { color: base.color, bold: base.bold, italic: base.italic, marginL: base.marginL, marginR: base.marginR, marginV: base.marginV };
     }
     cursor = (match.index ?? cursor) + match[0].length;
   }

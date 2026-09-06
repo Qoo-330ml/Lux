@@ -1,5 +1,6 @@
 import { summarizePlaybackPerformance, type PlaybackCaptionController, type PlaybackCaptionCue, type PlaybackCaptionTrack, type PlaybackEngine, type PlaybackPerformance, type PlaybackSnapshot } from "./playback-engine";
 import { hasClientMkvHevcRuntime } from "./playback-selection";
+import { isHevcCodec } from "./media-codec";
 import type { HevcRuntimeAssets } from "./hevc-playback-engine";
 import { MatroskaRangeReader } from "./matroska-range-reader";
 
@@ -8,7 +9,7 @@ type WorkerResponse =
   | { type: "init"; initSegment: ArrayBuffer; codec: string }
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
   | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean; ordinal: number }
-  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
+  | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -61,6 +62,7 @@ export class ClientMkvEngine implements PlaybackEngine {
   constructor(
     readonly element: HTMLVideoElement,
     private readonly assets: HevcRuntimeAssets,
+    private readonly inputCodec = "",
   ) {
     this.captionController = {
       tracks: () => [...this.captionTrackMetadata.values()],
@@ -112,7 +114,7 @@ export class ClientMkvEngine implements PlaybackEngine {
       type: "init",
       wasmUrl: this.assets.wasmModuleUrl,
       wasmBinaryUrl: this.assets.wasmBinaryUrl,
-      mode: hasClientMkvHevcRuntime() ? "hevc-remux" : "sdr",
+      mode: this.sourceRequiresRemux(source) ? "hevc-remux" : "sdr",
     });
 
     try {
@@ -132,6 +134,13 @@ export class ClientMkvEngine implements PlaybackEngine {
       this.destroy();
       throw this.error;
     }
+  }
+
+  private sourceRequiresRemux(_source: string) {
+    // The worker receives no ffprobe DTO. Non-HEVC Matroska tracks are already
+    // browser-decodable in their Matroska-to-fMP4 form; HEVC alone needs the
+    // existing WASM -> H.264 fallback when HEVC MSE is unavailable.
+    return !isHevcCodec(this.inputCodec) || hasClientMkvHevcRuntime();
   }
 
   private async handleWorkerMessage(
@@ -202,6 +211,7 @@ export class ClientMkvEngine implements PlaybackEngine {
             style: message.style,
             runs: message.runs,
           });
+          this.element.dispatchEvent(new CustomEvent("lux:caption", { detail: message }));
           this.captionListeners.forEach((listener) => listener());
         } catch {
           // A malformed cue must not terminate audio/video playback.

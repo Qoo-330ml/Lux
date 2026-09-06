@@ -8,7 +8,7 @@ export type LuxCaptionCue = {
   layer?: number;
   alignment?: number;
   position?: { x: number; y: number };
-  style?: { color?: string; bold?: boolean; italic?: boolean };
+  style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number };
   runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[];
 };
 

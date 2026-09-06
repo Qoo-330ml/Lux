@@ -23,6 +23,7 @@ import {
 
 type PlayerVideoSurfaceProps = {
   streamUrl: string;
+  deferNativeSource?: boolean;
   corsEnabled?: boolean;
   poster?: string | null;
   title: string;
@@ -38,6 +39,7 @@ type PlayerVideoSurfaceProps = {
   captionTrack?: PlayerNativeCaptionTrack | null;
   nativeCaptionTrackId?: string | null;
   onNativeCaptionTracksChange?: (tracks: PlayerRuntimeCaptionTrack[]) => void;
+  onRuntimeCaptionCue?: (cue: { id: string; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }) => void;
   captionOffset?: number;
   captionDuration?: number | null;
   captionLifecycleKey?: string;
@@ -69,6 +71,7 @@ type PlayerVideoSurfaceProps = {
 
 export function PlayerVideoSurface({
   streamUrl,
+  deferNativeSource = false,
   corsEnabled = true,
   poster,
   title,
@@ -84,6 +87,7 @@ export function PlayerVideoSurface({
   captionTrack = null,
   nativeCaptionTrackId = null,
   onNativeCaptionTracksChange,
+  onRuntimeCaptionCue,
   captionOffset = 0,
   captionDuration = null,
   captionLifecycleKey = "",
@@ -145,6 +149,11 @@ export function PlayerVideoSurface({
     publishTracks();
     video.addEventListener("loadedmetadata", publishTracks);
     video.addEventListener("lux:caption-track", publishTracks);
+    const publishCue = (event: Event) => {
+      const detail = event instanceof CustomEvent ? event.detail : null;
+      if (detail?.trackId && Number.isFinite(detail.startMs) && Number.isFinite(detail.endMs)) onRuntimeCaptionCue?.(detail);
+    };
+    video.addEventListener("lux:caption", publishCue);
     const supportsTrackEvents = typeof textTracks.addEventListener === "function";
     if (supportsTrackEvents) {
       textTracks.addEventListener("addtrack", publishTracks);
@@ -153,6 +162,7 @@ export function PlayerVideoSurface({
     return () => {
       video.removeEventListener("loadedmetadata", publishTracks);
       video.removeEventListener("lux:caption-track", publishTracks);
+      video.removeEventListener("lux:caption", publishCue);
       if (supportsTrackEvents) {
         textTracks.removeEventListener("addtrack", publishTracks);
         textTracks.removeEventListener("removetrack", publishTracks);
@@ -160,7 +170,7 @@ export function PlayerVideoSurface({
       onNativeCaptionTracksChange?.([]);
       runtimeCaptionIdsRef.current.clear();
     };
-  }, [captionLifecycleKey, onNativeCaptionTracksChange, streamUrl]);
+  }, [captionLifecycleKey, onNativeCaptionTracksChange, onRuntimeCaptionCue, streamUrl]);
 
   useEffect(() => {
     const video = videoElementRef.current;
@@ -271,7 +281,7 @@ export function PlayerVideoSurface({
           ref={setVideoElementRef}
           className="lux-video"
           crossOrigin={corsEnabled ? "anonymous" : undefined}
-          src={streamUrl}
+          src={deferNativeSource ? undefined : streamUrl}
           poster={poster ?? undefined}
           preload="metadata"
           loop={presentation.loop}
