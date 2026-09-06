@@ -1,5 +1,16 @@
 import type { MatroskaTrack } from "./matroska-demuxer";
 
+export type MatroskaSampleRoute = "subtitle" | "remux" | "decode";
+
+export function matroskaSampleRoute(
+  trackNumber: number,
+  subtitleTracks: ReadonlyMap<number, MatroskaTrack>,
+  remuxMode: boolean,
+): MatroskaSampleRoute {
+  if (subtitleTracks.has(trackNumber)) return "subtitle";
+  return remuxMode ? "remux" : "decode";
+}
+
 export type MatroskaAudioConfig =
   | { codec: "mp4a.40.2"; asc: Uint8Array; sampleRate: number; channels: number }
   | { codec: "ac-3"; dac3: Uint8Array; sampleRate: number; channels: number }

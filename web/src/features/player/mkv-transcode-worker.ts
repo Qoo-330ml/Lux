@@ -4,7 +4,7 @@ import processPolyfill from "process";
 import type { MatroskaSample, MatroskaStreamDemuxer, MatroskaTrack } from "./matroska-demuxer";
 import { parseMatroskaSubtitleSample } from "./matroska-subtitles";
 import { addMatroskaVideoTrack, concatBuffers, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed } from "./mkv-remux";
-import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, toAnnexB } from "./mkv-transcode";
+import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, matroskaSampleRoute, toAnnexB } from "./mkv-transcode";
 
 type WorkerMessage =
   | { type: "init"; wasmUrl: string; wasmBinaryUrl: string; mode?: "sdr" | "hevc-remux" }
@@ -126,11 +126,6 @@ async function consumeData(data: ArrayBuffer) {
 }
 
 async function consumeSample(sample: MatroskaSample) {
-  if (remuxMode) {
-    await consumeRemuxSample(sample);
-    return;
-  }
-  if (fatalError || !decoder) return;
   const subtitleTrack = subtitleTracks.get(sample.trackNumber);
   if (subtitleTrack) {
     const cue = parseMatroskaSubtitleSample(sample.data, subtitleTrack, sample.timestampMs, sample.durationMs);
@@ -150,6 +145,11 @@ async function consumeSample(sample: MatroskaSample) {
     }
     return;
   }
+  if (matroskaSampleRoute(sample.trackNumber, subtitleTracks, remuxMode) === "remux") {
+    await consumeRemuxSample(sample);
+    return;
+  }
+  if (fatalError || !decoder) return;
   const track = sample.trackNumber === videoTrack?.number ? videoTrack : sample.trackNumber === audioTrack?.number ? audioTrack : null;
   if (!track) return;
   if (track.type === "audio") {

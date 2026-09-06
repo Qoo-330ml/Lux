@@ -189,6 +189,62 @@ describe("PlayerPage client fallback status", () => {
     );
   });
 
+  it("keeps remote Matroska STRM on the native path while captions are opt-in", async () => {
+    vi.mocked(api.item).mockResolvedValue({
+      id: "remote-mkv-strm",
+      title: "远程 MKV",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "remote-mkv-source",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/video.mkv",
+        container: "matroska,webm",
+        streams: [
+          { index: 0, type: "VIDEO", codec: "H264" },
+          { index: 1, type: "AUDIO", codec: "AAC" },
+          { index: 2, type: "SUBTITLE", codec: "SRT", isDefault: true },
+        ],
+      }],
+    });
+    vi.spyOn(api, "createWebPlaybackSession").mockResolvedValue({
+      sessionId: "web-remote-mkv",
+      playSessionId: "lux-web:web-remote-mkv",
+      sourceId: "remote-mkv-source",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-remote-mkv/direct?expires=1900000000&signature=test",
+      },
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/remote-mkv-strm"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    const video = container.querySelector<HTMLVideoElement>("video");
+    expect(video?.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-mkv/direct");
+    expect(shouldUseClientMkv).not.toHaveBeenCalled();
+    expect(container?.textContent).not.toContain("播放器引擎失败");
+  });
+
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {
     container = document.createElement("div");
     document.body.append(container);

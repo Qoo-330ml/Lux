@@ -428,12 +428,6 @@ export function PlayerPage() {
   }, []);
 
   const requestServerFallback = useCallback(async (reason?: unknown) => {
-    const remoteClientMkv = isRemoteHttpStrmSource(source) && isMatroskaSource(source);
-    if (remoteClientMkv) {
-      setFailedStreamUrl(streamUrl || null);
-      setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
-    }
     if (
       playbackPlan?.type === "DIRECT"
       && directProxyUrl
@@ -465,7 +459,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, source, stopActiveSession, streamUrl]);
+  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, stopActiveSession, streamUrl]);
 
   useEffect(() => {
     fallbackGenerationRef.current += 1;
@@ -708,9 +702,15 @@ export function PlayerPage() {
           engineRef.current = activeEngine;
         } else {
           const remoteHttpStrm = isRemoteHttpStrmSource(source);
-          const useMkvFallback = isMatroskaSource(source)
-            ? await shouldUseClientMkv(source, initialEngine.element)
-            : false;
+          // Keep the pre-caption behavior for remote HTTP(S) STRM: the
+          // signed Lux URL is consumed by the native media element. The
+          // client MKV pipeline is only safe for same-origin/local sources
+          // until an explicit remote subtitle reader is selected.
+          const useMkvFallback = remoteHttpStrm
+            ? false
+            : isMatroskaSource(source)
+              ? await shouldUseClientMkv(source, initialEngine.element)
+              : false;
           const useHevcFallback =
             !useMkvFallback
             && !remoteHttpStrm
@@ -755,7 +755,7 @@ export function PlayerPage() {
       } catch (cause) {
         if (!cancelled) {
           if (runtime.state.status === "FAILED") return;
-          if (playbackPlan?.type === "DIRECT" && !(isRemoteHttpStrmSource(source) && isMatroskaSource(source))) {
+          if (playbackPlan?.type === "DIRECT") {
             requestServerFallback(cause);
           } else {
             setFailedStreamUrl(streamUrl);
@@ -1248,7 +1248,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
-        deferNativeSource={isMatroskaSource(source)}
+        deferNativeSource={isMatroskaSource(source) && !isRemoteHttpStrmSource(source)}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
         title={mediaTitle(media)}
