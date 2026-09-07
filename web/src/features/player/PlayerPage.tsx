@@ -874,7 +874,10 @@ export function PlayerPage() {
       } catch (cause) {
         if (!cancelled) {
           if (runtime.state.status === "FAILED") return;
-          if (playbackPlan?.type === "DIRECT") {
+          if (mediaExtension) {
+            setFailedStreamUrl(streamUrl);
+            setPlaybackFailure(classifyPlayerEngineFailure(cause));
+          } else if (playbackPlan?.type === "DIRECT") {
             requestServerFallback(cause);
           } else {
             setFailedStreamUrl(streamUrl);
