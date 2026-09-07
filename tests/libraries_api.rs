@@ -1401,6 +1401,21 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         cover_schedule.json::<Value>().await?["scheduledTask"]["schedule"],
         "0 1 * * *"
     );
+    let cover_plan: (Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT p.cron_or_interval, p.is_enabled,
+                       (SELECT COUNT(*) FROM scheduled_task_plan_libraries l
+                        WHERE l.plan_id = p.id)
+         FROM scheduled_task_plans p
+         JOIN scheduled_task_configs c ON c.plan_id = p.id
+         WHERE c.owner_type = 'LIBRARY' AND c.owner_id = ?
+           AND c.task_type = 'AUTO_LIBRARY_COVER'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cover_plan.0.as_deref(), Some("0 1 * * *"));
+    assert_eq!(cover_plan.1, 1);
+    assert_eq!(cover_plan.2, 1);
 
     server.abort();
     Ok(())

@@ -2297,12 +2297,24 @@ pub(crate) struct AdminScheduledTaskRunRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AdminScheduledTaskPlanRequest {
+pub(crate) struct AdminScheduledTaskPlanCreateRequest {
     pub(crate) task_type: String,
     pub(crate) name: String,
     pub(crate) schedule: Option<String>,
     pub(crate) is_enabled: Option<bool>,
     pub(crate) library_ids: Vec<String>,
+    pub(crate) resource_limit: Option<Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminScheduledTaskPlanUpdateRequest {
+    pub(crate) name: Option<String>,
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    pub(crate) schedule: Option<Option<String>>,
+    pub(crate) is_enabled: Option<bool>,
+    pub(crate) library_ids: Option<Vec<String>>,
+    pub(crate) resource_limit: Option<Value>,
 }
 
 const SCHEDULE_TASK_TYPES: [&str; 4] = [
@@ -2625,7 +2637,7 @@ pub(crate) async fn admin_list_scheduled_task_plans(
 pub(crate) async fn admin_create_scheduled_task_plan(
     headers: HeaderMap,
     State(state): State<AppState>,
-    Json(request): Json<AdminScheduledTaskPlanRequest>,
+    Json(request): Json<AdminScheduledTaskPlanCreateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -2687,6 +2699,22 @@ pub(crate) async fn admin_create_scheduled_task_plan(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let resource_limit_json = match request.resource_limit {
+        Some(value) if !value.is_object() => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "资源限制必须是 JSON 对象",
+            )
+            .into_response();
+        }
+        Some(value) => match serde_json::to_string(&value) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => template.resource_limit_json.clone(),
+    };
     let plan_id = uuid::Uuid::now_v7().to_string();
     let is_enabled = request.is_enabled.unwrap_or(schedule.is_some());
     match database
@@ -2700,7 +2728,7 @@ pub(crate) async fn admin_create_scheduled_task_plan(
             template.plugin_id.as_deref(),
             schedule.as_deref(),
             is_enabled,
-            &template.resource_limit_json,
+            &resource_limit_json,
             &request.library_ids,
         )
         .await
@@ -2726,7 +2754,7 @@ pub(crate) async fn admin_update_scheduled_task_plan(
     headers: HeaderMap,
     Path(plan_id): Path<String>,
     State(state): State<AppState>,
-    Json(request): Json<AdminScheduledTaskPlanRequest>,
+    Json(request): Json<AdminScheduledTaskPlanUpdateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -2748,8 +2776,19 @@ pub(crate) async fn admin_update_scheduled_task_plan(
         )
         .into_response();
     };
-    let name = request.name.trim();
-    if name.is_empty() || name.chars().count() > 128 || request.library_ids.is_empty() {
+    let name = request
+        .name
+        .as_deref()
+        .unwrap_or(&existing.plan_name)
+        .trim();
+    let library_ids = request.library_ids.clone().unwrap_or_else(|| {
+        existing
+            .libraries
+            .iter()
+            .map(|library| library.id.clone())
+            .collect()
+    });
+    if name.is_empty() || name.chars().count() > 128 || library_ids.is_empty() {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
@@ -2758,13 +2797,11 @@ pub(crate) async fn admin_update_scheduled_task_plan(
         )
         .into_response();
     }
-    let schedule = match request
-        .schedule
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) if validate_cron(value).is_err() => {
+    let schedule = match request.schedule.as_ref() {
+        None => existing.cron_or_interval.clone(),
+        Some(None) => None,
+        Some(Some(value)) if value.trim().is_empty() => None,
+        Some(Some(value)) if validate_cron(value.trim()).is_err() => {
             return api_error(
                 &headers,
                 StatusCode::BAD_REQUEST,
@@ -2773,10 +2810,15 @@ pub(crate) async fn admin_update_scheduled_task_plan(
             )
             .into_response();
         }
-        Some(value) => Some(value.to_owned()),
-        None => None,
+        Some(Some(value)) => Some(value.trim().to_owned()),
     };
-    let is_enabled = request.is_enabled.unwrap_or(schedule.is_some());
+    let is_enabled = request.is_enabled.unwrap_or_else(|| {
+        if request.schedule.is_some() {
+            schedule.is_some()
+        } else {
+            existing.is_enabled
+        }
+    });
     let template = match existing.libraries.first() {
         Some(library) => database
             .find_scheduled_task_config("LIBRARY", &library.id, &existing.task_type)
@@ -2788,18 +2830,34 @@ pub(crate) async fn admin_update_scheduled_task_plan(
     let Some(template) = template else {
         return StatusCode::CONFLICT.into_response();
     };
+    let resource_limit_json = match request.resource_limit {
+        Some(value) if !value.is_object() => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "资源限制必须是 JSON 对象",
+            )
+            .into_response();
+        }
+        Some(value) => match serde_json::to_string(&value) {
+            Ok(value) => value,
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        },
+        None => existing.resource_limit_json.clone(),
+    };
     match database
         .update_scheduled_task_plan(
             &plan_id,
             name,
             schedule.as_deref(),
             is_enabled,
-            &request.library_ids,
+            &library_ids,
             &template.task_name,
             &template.task_description,
             &template.source_type,
             template.plugin_id.as_deref(),
-            &template.resource_limit_json,
+            &resource_limit_json,
         )
         .await
     {
