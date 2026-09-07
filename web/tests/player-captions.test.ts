@@ -118,7 +118,7 @@ describe("LuxPlayer caption selection", () => {
     expect(defaultCaptionSelection(options)).toBeNull();
   });
 
-  it("uses the browser native track after a remote SRT track is discovered", () => {
+  it("keeps a discovered remote Matroska SRT track on the runtime overlay", () => {
     const options = playerCaptionOptions({
       id: "remote-mkv",
       sourceKind: "STRM_URL",
@@ -135,7 +135,7 @@ describe("LuxPlayer caption selection", () => {
 
     expect(options[0]).toEqual(expect.objectContaining({
       id: "mkv:42",
-      renderMode: "native-inband",
+      renderMode: "runtime-overlay",
       available: true,
     }));
   });

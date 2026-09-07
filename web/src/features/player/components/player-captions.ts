@@ -58,7 +58,7 @@ export function playerCaptionOptions(
         && !stream.isExternal
         && Boolean(format && ["srt", "ass", "ssa"].includes(format));
       const renderMode = runtimeTrack
-        ? runtimeMatroskaTrack && (format === "ass" || format === "ssa")
+        ? runtimeMatroskaTrack
           ? "runtime-overlay"
           : "native-inband"
         : remoteRuntimeCandidate
