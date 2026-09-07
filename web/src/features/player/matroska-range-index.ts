@@ -56,7 +56,9 @@ export function hasMatroskaSeekHead(data: Uint8Array, totalLength = data.byteLen
   const segment = findElement(data, 0, data.byteLength, IDS.segment, 0, true);
   if (!segment) return false;
   const seekHead = findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead, true);
-  const cuesPosition = seekHead ? parseSeekHead(data, seekHead.dataStart, seekHead.dataEnd).find((entry) => entry.id === IDS.cues)?.position : undefined;
+  const cuesPosition = seekHead
+    ? parseSeekHead(data, seekHead.dataStart, seekHead.dataEnd, true).find((entry) => entry.id === IDS.cues)?.position
+    : undefined;
   return cuesPosition !== undefined && Number.isSafeInteger(cuesPosition)
     && segment.dataStart + cuesPosition >= segment.dataStart
     && segment.dataStart + cuesPosition < totalLength;
@@ -103,7 +105,7 @@ export function cueForTime(index: MatroskaRangeIndex, timecode: number, track: n
   return candidate;
 }
 
-function parseSeekHead(data: Uint8Array, start: number, end: number) {
+function parseSeekHead(data: Uint8Array, start: number, end: number, allowTruncated = false) {
   const entries: Array<{ id: number; position: number }> = [];
   forEachElement(data, start, end, (element) => {
     if (element.id !== IDS.seek) return;
@@ -112,9 +114,9 @@ function parseSeekHead(data: Uint8Array, start: number, end: number) {
     forEachElement(data, element.dataStart, element.dataEnd, (child) => {
       if (child.id === IDS.seekId) id = readUnsigned(data, child.dataStart, child.dataEnd);
       if (child.id === IDS.seekPosition) position = readUnsigned(data, child.dataStart, child.dataEnd);
-    }, 1);
+    }, 1, allowTruncated);
     if (id !== null && position !== null) entries.push({ id, position });
-  }, 1);
+  }, 1, allowTruncated);
   return entries;
 }
 

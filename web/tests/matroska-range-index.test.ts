@@ -55,5 +55,7 @@ describe("Matroska SeekHead/Cues index", () => {
     const firstRange = segment.slice(0, 64);
 
     expect(hasMatroskaSeekHead(firstRange, segment.byteLength)).toBe(true);
+    expect(() => hasMatroskaSeekHead(segment.slice(0, 12), segment.byteLength)).not.toThrow();
+    expect(hasMatroskaSeekHead(segment.slice(0, 12), segment.byteLength)).toBe(false);
   });
 });
