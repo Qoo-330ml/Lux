@@ -754,7 +754,9 @@ export function PlayerPage() {
           const useMkvFallback = isMatroskaSource(source)
             && (remoteCaptionRequested || !remoteHttpStrm)
             && Boolean(!remoteCaptionRequested || clientMkvSourceUrl)
-            ? await shouldUseClientMkv(source, initialEngine.element)
+            ? await shouldUseClientMkv(source, initialEngine.element, {
+              requireCaptionPipeline: remoteCaptionRequested,
+            })
             : false;
           if (remoteCaptionRequested && !useMkvFallback) {
             setSelectedCaptionId(null);

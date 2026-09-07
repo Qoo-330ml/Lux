@@ -296,6 +296,7 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
     expect(shouldUseClientMkv).toHaveBeenCalled();
+    expect(vi.mocked(shouldUseClientMkv).mock.calls.at(-1)?.[2]).toEqual({ requireCaptionPipeline: true });
     expect(container?.textContent).toContain("当前浏览器不支持远程字幕管线");
   });
 

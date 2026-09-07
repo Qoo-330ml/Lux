@@ -3,7 +3,14 @@ import { isHevcCodec } from "./media-codec";
 
 const CLIENT_HEVC_CONTAINERS = new Set(["mp4", "m4v", "mov"]);
 const H264_CODECS = ["avc1.640028", "avc1.64002a", "avc1.640033"] as const;
-const HEVC_MSE_CODECS = ["hvc1.2.4.L153.B0", "hvc1.1.6.L120.B0"] as const;
+const HEVC_MSE_CODECS = [
+  // Main 10 level 4.0/5.1 and the 8-bit Main baseline are common in MKV
+  // releases. Keep the concrete strings aligned with the codec string
+  // emitted from Matroska's hvcC instead of probing only one profile.
+  "hvc1.2.4.L120.B0",
+  "hvc1.2.4.L153.B0",
+  "hvc1.1.6.L120.B0",
+] as const;
 const PASSTHROUGH_AUDIO_CODECS = new Set(["ac3", "ac-3", "eac3", "ec-3", "opus"]);
 const CLIENT_MKV_VIDEO_CODECS = new Set(["h264", "avc", "avc1", "hevc", "h265", "hvc1", "vp9", "vp09", "av1", "av01"]);
 
@@ -50,8 +57,23 @@ export async function shouldUseClientHevc(source: MediaSource | undefined, video
   return probeClientHevc(source, video, "video/mp4");
 }
 
-export async function shouldUseClientMkv(source: MediaSource | undefined, video: HTMLVideoElement) {
+export type ClientMkvSelectionOptions = {
+  /**
+   * A native Matroska path is enough for ordinary playback, but it does not
+   * expose embedded text tracks consistently. Caption playback therefore
+   * must keep the client demux/remux path even when the video element reports
+   * that it can play Matroska directly.
+   */
+  requireCaptionPipeline?: boolean;
+};
+
+export async function shouldUseClientMkv(
+  source: MediaSource | undefined,
+  video: HTMLVideoElement,
+  options: ClientMkvSelectionOptions = {},
+) {
   if (!source || !hasClientMkvCandidate(source)) return false;
+  const requireCaptionPipeline = options.requireCaptionPipeline === true;
   const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec?.toLowerCase() ?? "";
   if (!isHevcCodec(videoCodec) && typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function") {
     const codec = videoCodec.includes("vp9") || videoCodec.includes("vp09")
@@ -65,11 +87,11 @@ export async function shouldUseClientMkv(source: MediaSource | undefined, video:
   }
   if (hasClientMkvHevcRuntime()) {
     if (!hasClientMkvAudioRuntime(source)) return false;
-    return video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
+    return requireCaptionPipeline || video.canPlayType('video/x-matroska; codecs="hvc1"') === "";
   }
   if (!hasClientHevcRuntime()) return false;
   if (!hasClientMkvH264Audio(source)) return false;
-  return probeClientHevc(source, video, "video/x-matroska");
+  return probeClientHevc(source, video, "video/x-matroska", requireCaptionPipeline);
 }
 
 function mseAudioCodec(source: MediaSource) {
@@ -106,11 +128,16 @@ export function hasClientMkvHevcRuntime() {
   return HEVC_MSE_CODECS.some((codec) => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`));
 }
 
-async function probeClientHevc(source: MediaSource, video: HTMLVideoElement, mime: string) {
+async function probeClientHevc(
+  source: MediaSource,
+  video: HTMLVideoElement,
+  mime: string,
+  ignoreNativePlayback = false,
+) {
   const videoStream = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
   const codec = videoStream?.codec;
   const codecHint = codec && /^(hvc1|hev1)\./i.test(codec) ? codec : "hvc1.1.6.L120.B0";
-  if (video.canPlayType(`${mime}; codecs="${codecHint}"`) !== "") return false;
+  if (!ignoreNativePlayback && video.canPlayType(`${mime}; codecs="${codecHint}"`) !== "") return false;
   const browserGlobals = globalThis as typeof globalThis & {
     VideoEncoder?: {
       isConfigSupported: (config: Record<string, unknown>) => Promise<{ supported?: boolean }>;

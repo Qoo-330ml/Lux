@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createFile } from "mp4box";
-import { addHevcTrack, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, toLengthPrefixed } from "../src/features/player/mkv-remux";
+import { addHevcTrack, hevcCodecString, makeAacEsdsData, matroskaTimestampTicks, matroskaVideoCodecString, toLengthPrefixed } from "../src/features/player/mkv-remux";
 import { encodedVideoDurationTicks, isSupportedMatroskaAudio, isSupportedMatroskaVideo, matroskaAudioConfig, matroskaSampleRoute, toAnnexB } from "../src/features/player/mkv-transcode";
 
 describe("MKV transcode input", () => {
@@ -78,6 +78,7 @@ describe("MKV transcode input", () => {
     hvcC[1] = 2;
     hvcC[12] = 153;
     expect(hevcCodecString(hvcC)).toBe("hvc1.2.4.L153.B0");
+    expect(matroskaVideoCodecString({ codecId: "V_MPEGH/ISO/HEVC", codecPrivate: hvcC })).toBe("hvc1.2.4.L153.B0");
     expect(matroskaTimestampTicks(1_234.5, 90_000)).toBe(111_105);
   });
 

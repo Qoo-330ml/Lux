@@ -47,7 +47,7 @@ export function matroskaVideoCodecString(track: Pick<MatroskaTrack, "codecId" | 
   }
   if (codec === "V_VP9") return "vp09.00.10.08";
   if (codec === "V_AV1") return "av01.0.04M.08";
-  return "hvc1.1.6.L120.B0";
+  return hevcCodecString(track.codecPrivate);
 }
 
 export function hevcCodecString(codecPrivate: Uint8Array) {
