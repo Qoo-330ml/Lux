@@ -301,6 +301,7 @@ TypeScript 检查和生产构建通过；Rust 定向播放测试 1 个通过，R
 | 无字幕选择的远程 HTTP(S) STRM | 自动化通过 | Web 回归断言远程源保持原生播放计划并沿用 `proxyUrl`（代理失败才回退签名 Direct）；不启动客户端 MKV/HEVC fallback、Worker、Range 或 MSE |
 | 远程 Matroska SRT/ASS/SSA 无 native track | 自动化通过 | 字幕项仍可主动选择；选择后通过可选 Chrome MV3 扩展读取当前直连 URL 的远程 Range 并返回 cue，不进入客户端音视频 MSE，不创建 `/subtitles/...` 或 Lux `/range` 媒体字节请求 |
 | 远程 Matroska 实际暴露 native `TextTrack` | 代码路径通过 | 优先使用原生 track；不启动客户端解封装，不重建播放会话、不改变媒体 URL/tier/进度 |
+| Chrome 151 远程 HEVC + E-AC-3 | 视频可直放，音频不支持 | 本机 Chrome 的 `canPlayType('audio/mp4; codecs="ec-3"')` 与 `ac-3` 均返回空；这是浏览器编解码限制，字幕扩展不转码，播放器设置会明确提示 |
 | 线上旧部署回归 | 已定位，待重新部署验证 | Chrome 抓包记录了 `/Videos/.../stream` 的 `401`；本次修复恢复播放会话 `proxyUrl`/307 直连，并提供 `tools/chrome-caption-extension` 发布包；新前端和扩展尚未在公网站点完成联调，因此不宣称线上已恢复 |
 
 本地验证：Web 全量 Node 104/104、Vitest 466/466，`pnpm --dir web build` 通过；Chrome 扩展 Vite 构建、manifest JSON、Service Worker/content script 语法检查和 ZIP 完整性检查通过；Rust `cargo build --locked`、

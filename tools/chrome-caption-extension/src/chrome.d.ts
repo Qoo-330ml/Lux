@@ -10,7 +10,4 @@ declare const chrome: {
     sendMessage(tabId: number, message: unknown): Promise<unknown>;
     onRemoved: { addListener(listener: (tabId: number) => void): void };
   };
-  declarativeNetRequest: {
-    updateDynamicRules(options: { addRules?: unknown[]; removeRuleIds?: number[] }): Promise<void>;
-  };
 };

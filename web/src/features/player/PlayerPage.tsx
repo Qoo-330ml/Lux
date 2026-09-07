@@ -348,6 +348,8 @@ export function PlayerPage() {
   const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
     ? playbackPlan.rangeUrl ?? null
     : null;
+  const audioCompatibilityWarning = remoteAudioCodecWarning(source);
+  const playerStatus = combinePlayerNotices(captionStatus, audioCompatibilityWarning);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
@@ -1493,7 +1495,7 @@ export function PlayerPage() {
           }}
           captions={captionOptions}
           selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
-          captionStatus={captionStatus}
+          captionStatus={playerStatus}
           onSelectCaption={selectCaption}
           captionOffset={captionOffset}
           onChangeCaptionOffset={changeCaptionOffset}
@@ -1556,6 +1558,28 @@ export function PlayerPage() {
 
 function isMatroskaSource(source: MediaSource | undefined) {
   return (source?.container ?? "").toLowerCase().split(",").some((part) => part.trim() === "mkv" || part.trim() === "matroska" || part.trim() === "webm");
+}
+
+export function remoteAudioCodecWarning(source: MediaSource | undefined) {
+  if (source?.sourceKind !== "STRM_URL") return null;
+  const audioCodecs = (source.streams ?? [])
+    .filter((stream) => stream.type?.toUpperCase() === "AUDIO")
+    .map((stream) => stream.codec?.trim().toLowerCase())
+    .filter((codec): codec is string => Boolean(codec));
+  // A browser-compatible secondary track is enough for native playback to
+  // retain sound even when the first/default Matroska track is AC-3/E-AC-3.
+  if (audioCodecs.some((codec) => /^(aac|mp4a)(?:\.|$)/u.test(codec) || codec === "opus")) return null;
+  const codec = audioCodecs[0];
+  if (!codec || !["ac3", "ac-3", "eac3", "ec-3"].includes(codec)) return null;
+  const video = typeof document === "undefined" ? null : document.createElement("video");
+  if (supportsMp4Codec(video, "audio", codec)) return null;
+  const label = codec === "eac3" || codec === "ec-3" ? "E-AC-3" : "AC-3";
+  return `当前 Chrome 无法解码 ${label} 音频，因此画面可能播放但没有声音；字幕扩展不负责音频解码。请改用 AAC/Opus 音轨、支持该编码的浏览器，或启用转码。`;
+}
+
+export function combinePlayerNotices(...notices: readonly (string | null | undefined)[]) {
+  const visible = notices.filter((notice): notice is string => Boolean(notice));
+  return visible.length > 0 ? visible.join("；") : null;
 }
 
 function useClientEngine(engine: PlaybackEngine) {

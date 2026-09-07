@@ -21,8 +21,8 @@ MSE/remux 会破坏原生音视频兼容性，并让媒体字节经过 Lux Range
 2. 用户选择远程 Matroska/WebM 的 SRT、ASS 或 SSA 后，页面通过 `window.postMessage` 将当前直连 URL 和轨道选择发送给可选 MV3
    扩展。扩展 Service Worker 只按串行 Range 读取 Tracks、SeekHead、Cues 和当前 Cluster，解析安全字幕 cue，再通过 content script 返回
    页面覆盖层；不生成外挂文件、不落盘、不创建第二条视频或字幕媒体连接。
-3. 扩展使用 `declarativeNetRequestWithHostAccess` 为当前 Lux 页面发起的远程媒体请求补齐 CORS 响应头，以便 Lux 已有客户端解封装/WASM
-   fallback 在需要时读取远端字节。规则按当前页面 hostname 动态安装，并在标签页关闭时清理；扩展不允许 SMB、FTP、路径型 STRM、DRM
+3. （已由 ADR-041 部分取代）扩展最初使用 `declarativeNetRequestWithHostAccess` 为当前 Lux 页面发起的远程媒体请求补齐 CORS
+   响应头；现行实现不再修改原生媒体响应，而是由 Service Worker 自己用主机权限读取字幕 Range。扩展不允许 SMB、FTP、路径型 STRM、DRM
    或无有效 `206 + Content-Range` 的媒体。
 4. 扩展不可用、权限被拒绝、Range/索引/字幕解析失败时，只显示“远程字幕不可用”，保持同一个原生媒体 URL、播放状态、进度和播放会话；不得
    回退到 Lux 字幕 URL、Lux 媒体 Range Relay 或销毁音视频引擎。
@@ -52,6 +52,6 @@ Jellyfin 的方案而同时保持本 ADR 的流量边界。扩展方案是为该
 ## 验证
 
 - Web 单测确认远程原生 `<video>` 使用 `proxyUrl`，字幕选择不调用客户端 MKV 引擎、不重建播放会话，桥接 URL 为当前直连 URL。
-- MV3 构建检查确认 manifest、content script、Service Worker 和 Range/CORS 边界均可加载；Release 附件为可直接“加载已解压的扩展程序”的 ZIP。
+- MV3 构建检查确认 manifest、content script、Service Worker 和 Range 边界均可加载；Release 附件为可直接“加载已解压的扩展程序”的 ZIP。
 - 真实 Chrome 发布前需在目标站点复查：远程音视频请求在 307 后直达 CDN，扩展 Range 请求返回 206，页面无 `/range`、`/subtitles/...` 或并行
   Lux 媒体字节请求；Chrome 原生支持的音频继续可听，选择字幕后 cue 出现在覆盖层。

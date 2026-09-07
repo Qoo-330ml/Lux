@@ -43,14 +43,12 @@ type PageMessage = {
 };
 
 const sessions = new Map<string, CaptionSession>();
-const tabRules = new Map<number, number>();
 
 chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
   const message = rawMessage as PageMessage;
   const tabId = sender.tab?.id;
   if (tabId === undefined || message.source !== PAGE_SOURCE || message.version !== PROTOCOL_VERSION || typeof message.sessionId !== "string") return;
   if (message.type === "hello") {
-    void allowPageMediaRequests(tabId, sender.tab?.url);
     sendResponse({ source: EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "ready", sessionId: message.sessionId });
     return;
   }
@@ -78,11 +76,6 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       session.stop();
       sessions.delete(key);
     }
-  }
-  const ruleId = tabRules.get(tabId);
-  if (ruleId !== undefined) {
-    tabRules.delete(tabId);
-    void chrome.declarativeNetRequest.updateDynamicRules({ removeRuleIds: [ruleId] });
   }
 });
 
@@ -344,24 +337,4 @@ function isSelection(value: unknown): value is Selection {
   if (selection.language !== undefined && (typeof selection.language !== "string" || selection.language.length > 64)) return false;
   if (selection.format !== undefined && !["srt", "ass", "ssa"].includes(selection.format)) return false;
   return selection.ordinal === undefined || (Number.isInteger(selection.ordinal) && selection.ordinal >= 0 && selection.ordinal < 64);
-}
-
-async function allowPageMediaRequests(tabId: number, pageUrl?: string) {
-  let parsedPage: URL;
-  try { parsedPage = new URL(pageUrl ?? ""); } catch { return; }
-  const hostname = parsedPage.hostname;
-  if (!hostname || tabRules.has(tabId)) return;
-  const ruleId = 1_000_000 + tabId;
-  await chrome.declarativeNetRequest.updateDynamicRules({
-    removeRuleIds: [ruleId],
-    addRules: [{
-      id: ruleId,
-      priority: 1,
-      action: { type: "modifyHeaders", responseHeaders: [
-        { header: "Access-Control-Allow-Origin", operation: "set", value: parsedPage.origin },
-        { header: "Access-Control-Expose-Headers", operation: "set", value: "Accept-Ranges, Content-Length, Content-Range, Content-Type, ETag" },
-      ] },
-      condition: { initiatorDomains: [hostname], resourceTypes: ["xmlhttprequest", "media", "other"] },
-    }],
-  }).then(() => tabRules.set(tabId, ruleId)).catch(() => undefined);
 }
