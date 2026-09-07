@@ -3,6 +3,7 @@ import { hasClientMkvHevcRuntime } from "./playback-selection";
 import { isHevcCodec } from "./media-codec";
 import type { HevcRuntimeAssets } from "./hevc-playback-engine";
 import { MatroskaRangeReader } from "./matroska-range-reader";
+import type { ChromeMediaRangeReader } from "./chrome-caption-extension";
 import { hasMatroskaSeekHead } from "./matroska-range-index";
 
 type WorkerResponse =
@@ -64,6 +65,7 @@ export class ClientMkvEngine implements PlaybackEngine {
     readonly element: HTMLVideoElement,
     private readonly assets: HevcRuntimeAssets,
     private readonly inputCodec = "",
+    private readonly rangeReaderFactory?: (source: string) => ChromeMediaRangeReader,
   ) {
     this.captionController = {
       tracks: () => [...this.captionTrackMetadata.values()],
@@ -120,7 +122,7 @@ export class ClientMkvEngine implements PlaybackEngine {
 
     try {
       await ready;
-      const rangeReader = new MatroskaRangeReader(source);
+      const rangeReader = this.rangeReaderFactory?.(source) ?? new MatroskaRangeReader(source);
       let firstRange = true;
       for await (const chunk of rangeReader.chunks(abortController.signal)) {
         if (generation !== this.generation) return;

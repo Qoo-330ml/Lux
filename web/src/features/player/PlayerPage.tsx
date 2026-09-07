@@ -27,7 +27,7 @@ import {
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
-import { ChromeCaptionExtension } from "./chrome-caption-extension";
+import { ChromeCaptionExtension, ChromeMediaExtension } from "./chrome-caption-extension";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
 import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
@@ -105,6 +105,29 @@ function screenshotFileName(title: string) {
     .trim()
     .slice(0, 80);
   return `${normalized || "lux-screenshot"}-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
+}
+
+function hasExtensionCompatibleAudio(source: MediaSource | undefined) {
+  const audioTracks = source?.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
+  return audioTracks.every((stream) => /^(?:aac|mp4a)(?:\.|$)/iu.test(stream.codec ?? "") || (stream.codec ?? "").trim().toLowerCase() === "opus");
+}
+
+function remoteMediaNeedsExtension(source: MediaSource | undefined, video: HTMLVideoElement) {
+  if (!source || !isMatroskaSource(source) || !hasExtensionCompatibleAudio(source)) return false;
+  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? "";
+  const audioCodecs = source.streams
+    ?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO")
+    .map((stream) => stream.codec ?? "")
+    .filter(Boolean) ?? [];
+  if (!videoCodec) return false;
+  const mime = `video/x-matroska; codecs="${[videoCodec, ...audioCodecs].join(",")}"`;
+  return video.canPlayType(mime) === "";
+}
+
+function hasChromeExtensionRuntime() {
+  if (typeof document !== "undefined" && document.documentElement?.getAttribute("data-lux-media-extension") === "1") return true;
+  const browserWindow = typeof window === "undefined" ? null : window as Window & { chrome?: { runtime?: unknown } };
+  return Boolean(browserWindow?.chrome?.runtime);
 }
 
 export function webPlaybackCapabilities(
@@ -279,10 +302,11 @@ export function PlayerPage() {
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
   const [extensionCaptionTracks, setExtensionCaptionTracks] = useState<PlayerRuntimeCaptionTrack[]>([]);
+  const [mediaExtensionActive, setMediaExtensionActive] = useState(false);
   const captionOptions = playerCaptionOptions(
     source,
     nativeCaptionTracksSupported,
-    remoteHttpSource ? extensionCaptionTracks : nativeCaptionTracks,
+    remoteHttpSource && !mediaExtensionActive ? extensionCaptionTracks : nativeCaptionTracks,
   );
   const selectedCaptionOption = captionSourceId === source?.id
     ? captionOptions.find((caption) => (
@@ -746,6 +770,7 @@ export function PlayerPage() {
       if (!cancelled) syncSnapshot(activeEngine.snapshot(), true);
     };
     initialEngine.element.addEventListener("durationchange", handleDurationChange);
+    let mediaExtension: ChromeMediaExtension | null = null;
     const load = async () => {
       try {
         if (playbackPlan?.type === "SERVER_HLS") {
@@ -756,6 +781,39 @@ export function PlayerPage() {
           engineRef.current = activeEngine;
         } else {
           const remoteHttpStrm = remoteHttpSource;
+          const useExtensionMedia = remoteHttpStrm
+            && isMatroskaSource(source)
+            && extensionCaptionSourceUrl.length > 0
+            && hasExtensionCompatibleAudio(source)
+            && remoteMediaNeedsExtension(source, initialEngine.element)
+            && hasChromeExtensionRuntime()
+            && typeof ChromeMediaExtension === "function";
+          if (useExtensionMedia) {
+            mediaExtension = new ChromeMediaExtension();
+            try {
+              await mediaExtension.start(extensionCaptionSourceUrl);
+            } catch {
+              mediaExtension.stop();
+              mediaExtension = null;
+            }
+            if (mediaExtension && !cancelled) {
+              initialEngine.destroy();
+              const { ClientMkvEngine } = await import("./mkv-playback-engine");
+              if (cancelled) return;
+              const inputCodec = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? "";
+              const activeMediaExtension = mediaExtension;
+              activeEngine = new ClientMkvEngine(
+                initialEngine.element,
+                HEVC_RUNTIME_ASSETS,
+                inputCodec,
+                () => activeMediaExtension.createRangeReader(extensionCaptionSourceUrl),
+              );
+              engineRef.current = activeEngine;
+              setMediaExtensionActive(true);
+              performanceElement = activeEngine.element;
+              performanceElement.addEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
+            }
+          }
           const useMkvFallback = isMatroskaSource(source)
             && !remoteHttpStrm
             ? await shouldUseClientMkv(source, initialEngine.element)
@@ -764,7 +822,7 @@ export function PlayerPage() {
             !useMkvFallback
             && !remoteHttpStrm
             && (await shouldUseClientHevc(source, initialEngine.element));
-          if (useMkvFallback || useHevcFallback) {
+          if (!mediaExtension && (useMkvFallback || useHevcFallback)) {
             setFallbackLoading(true);
             if (cancelled) return;
             initialEngine.destroy();
@@ -840,6 +898,8 @@ export function PlayerPage() {
         }
       }
       timelineScheduler.dispose();
+      mediaExtension?.stop();
+      setMediaExtensionActive(false);
       initialEngine.element.removeEventListener("durationchange", handleDurationChange);
       performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
       removeRuntimeSubscription();
@@ -1036,6 +1096,7 @@ export function PlayerPage() {
     setRuntimeCaptionCues([]);
     if (
       !extensionCaptionRequested
+      || mediaExtensionActive
       || !extensionCaptionSourceUrl
       || !extensionCaptionSelection
     ) {
@@ -1101,7 +1162,7 @@ export function PlayerPage() {
       if (chromeCaptionExtensionRef.current === bridge) chromeCaptionExtensionRef.current = null;
       setRuntimeCaptionCues([]);
     };
-  }, [extensionCaptionRequested, extensionCaptionSelection?.embeddedOrdinal, extensionCaptionSelection?.format, extensionCaptionSelection?.language, extensionCaptionSelection?.name, extensionCaptionSelection?.streamIndex, extensionCaptionSourceUrl, handleRuntimeCaptionCue, playbackKey]);
+  }, [extensionCaptionRequested, extensionCaptionSelection?.embeddedOrdinal, extensionCaptionSelection?.format, extensionCaptionSelection?.language, extensionCaptionSelection?.name, extensionCaptionSelection?.streamIndex, extensionCaptionSourceUrl, handleRuntimeCaptionCue, mediaExtensionActive, playbackKey]);
 
   useEffect(() => {
     chromeCaptionExtensionRef.current?.setTime(currentTime);
