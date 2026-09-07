@@ -299,7 +299,7 @@ fn content_range_matches(value: &str, requested: &str) -> bool {
     };
     start == requested_start
         && end >= requested_start
-        && requested_end.map_or(true, |requested_end| end <= requested_end)
+        && requested_end.is_none_or(|requested_end| end <= requested_end)
         && total > end
 }
 
