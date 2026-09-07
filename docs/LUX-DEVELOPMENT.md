@@ -1354,6 +1354,8 @@ locked local value
   客户端 Matroska Worker、Range、MSE 或字幕专用连接。
 - 用户明确选择远程内嵌 SRT/ASS/SSA 后，才使用当前播放会话签名的同源 `rangeUrl` 进入 `ClientMkvEngine`；Worker 从同一媒体读取器
   解封装音视频和字幕，音视频输出到 MSE，字幕交给 Lux cue/原生 TextTrack。不会读取外部 CDN URL、预先抽取、落盘或生成外挂文件。
+- 上述客户端 Matroska 管线仅适用于 Lux Web 内置播放器；远程 HTTP(S) STRM 的可选 Chrome 扩展媒体引擎由 LUX-245 单独定义，未完成前不得
+  把扩展声明为音视频解码器或为 E-AC-3/DTS 等浏览器不支持的音频伪造可播放状态。
 - Range、索引、codec、MSE 或字幕解析失败时，只清除远程字幕并恢复同一播放计划的原生视频，不停止或重建播放会话，不切换服务端 HLS。
 - PGS/SUP 图形字幕不属于本阶段承诺；完整 ASS/SSA 样式、字幕烧录和 HLS 字幕组另行处理。
 
@@ -1382,6 +1384,9 @@ locked local value
   正式播放路径，不读取或保存用户媒体数据。
 - LUX-185 可为 MP4/fMP4 的 HEVC 媒体增加浏览器端 WASM 解码、H.264 客户端编码和 MSE 播放 fallback；重型工作
   必须在 Web Worker 中执行，服务端只继续提供原始媒体 Range 数据。
+- LUX-245 可为远程 HTTP(S) STRM 增加可选 Chrome 扩展媒体引擎：扩展通过主机权限读取远端 Range，负责 Matroska/WebM 解封装、字幕和
+  音视频输出；原生支持的轨道可以使用 MSE，浏览器不支持的轨道必须经过实际可用的 WASM/WebCodecs 解码后再输出。扩展不得把媒体字节
+  上传到 Lux，也不得把无 Range 的资源整文件下载后冒充流式播放。
 - 客户端解码增强的目标包括具备相应硬件能力的 4K HEVC 8-bit、10-bit 和 HDR10；Dolby Vision 不属于当前承诺。
 - 若后续新增 WebCodecs 或 WASM 播放引擎，必须单独修改本节、补充 ADR，并通过实际浏览器性能阶段门；不得把
   “浏览器报告支持”直接等同于 4K 实时播放能力。
@@ -5767,6 +5772,27 @@ cue 和 Worker。
 - [x] SQLite 空库/已有库迁移、Rust API/调度测试、Web 测试、格式、Clippy 和构建通过；记录 `uname -m`。
 
 验证：参见 `docs/LUX-244-PLAN.md`。
+
+#### LUX-245：Chrome 扩展远程 Matroska 全媒体引擎
+
+范围：将当前只负责字幕的可选 MV3 扩展扩展为远程 HTTP(S) Matroska/WebM 的全媒体播放引擎。扩展使用单个受控 Range 读取器和 Worker
+解封装音频、视频、文本字幕；页面只接收播放控制、状态和安全 cue/帧，不读取媒体字节。原生可消费的组合优先使用 MSE，Chrome 不支持的
+音频/视频组合再使用经过许可审计的浏览器侧 WASM/WebCodecs 解码器。MP4、DRM、SMB、FTP、路径型 STRM 和不支持 Range 的资源不在首版承诺内。
+
+验收：
+
+- [ ] 扩展与 Lux 页面完成版本化媒体会话握手；页面可以选择 native、extension-MSE 或 extension-software 解码路径，字幕切换、seek、
+      暂停和停止不创建第二条媒体读取管线，也不改变 Lux 播放会话。
+- [ ] Range 必须返回匹配的 `206 + Content-Range`、稳定长度和可选 ETag；无效 Range、资源变化、索引缺失或越界直接报告具体类别，禁止整文件
+      下载、静默回退字幕端点或把媒体字节转发到 Lux。
+- [ ] 首批实际验证 H.264/HEVC/VP9/AV1 与 AAC/Opus；AC-3/E-AC-3/DTS 等需要额外解码器的轨道只有在真实 Chrome 设备上完成音画同步、seek、
+      暂停和资源上限验证后才声明支持。解码器依赖必须记录许可证、包体大小、内存上限和 CPU 性能。
+- [ ] 无扩展、扩展未授权或扩展媒体引擎失败时，浏览器原生可播放组合仍保持原生播放；不支持组合显示可诊断错误，不销毁已工作的原生媒体。
+
+验证：扩展协议和 Range 单测、固定媒体夹具的音画同步/seek 测试、Chrome 真实浏览器网络检查、扩展构建与 ZIP 完整性检查；完成后更新
+`docs/COMPATIBILITY.md` 并记录 `uname -m`。引入大型 WASM 解码器前必须先完成依赖和许可证审阅。
+
+依赖：LUX-240、LUX-242、LUX-243、ADR-042。
 
 依赖：LUX-105、LUX-154、LUX-189。
 
