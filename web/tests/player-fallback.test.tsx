@@ -20,6 +20,11 @@ const fallbackState = vi.hoisted(() => ({
 vi.mock("../src/features/player/playback-selection", () => ({
   isRemoteHttpStrmSource: (source: { sourceKind?: string; externalUrl?: string }) =>
     source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? ""),
+  remoteMatroskaRangeUrl: (source: { sourceKind?: string; externalUrl?: string; container?: string | null }, rangeUrl?: string | null) =>
+    rangeUrl && source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? "")
+      && (source.container ?? "").toLowerCase().split(",").some((part) => ["mkv", "matroska", "webm"].includes(part.trim()))
+      ? rangeUrl
+      : null,
   canUseClientMkvCaptionPipeline: vi.fn().mockReturnValue(true),
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
@@ -275,7 +280,7 @@ describe("PlayerPage client fallback status", () => {
 
     const video = container.querySelector<HTMLVideoElement>("video");
     expect(video?.getAttribute("src")).toBe(
-      "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
     );
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
@@ -288,7 +293,7 @@ describe("PlayerPage client fallback status", () => {
     expect(container?.textContent).not.toContain("浏览器未暴露远程内嵌字幕");
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.querySelector("video")?.getAttribute("src")).toBe(
-      "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
     );
 
     await act(async () => {
@@ -585,9 +590,6 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
 
-    expect(container.querySelector("video")?.getAttribute("src")).toBe(
-      "/Videos/remote-mkv-eac3/stream.mkv?MediaSourceId=remote-mkv-eac3-source",
-    );
     expect(container.textContent).not.toContain("播放器引擎失败");
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
   });

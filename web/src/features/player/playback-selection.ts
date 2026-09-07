@@ -24,6 +24,17 @@ export function isRemoteHttpStrmSource(source: MediaSource | undefined) {
   }
 }
 
+/**
+ * Native media playback for a remote Matroska source must stay on Lux's
+ * same-origin signed Range Relay.  This prevents the browser's media
+ * request from following the STRM target's redirect directly and gives a
+ * future caption tee one stable request surface to observe.
+ */
+export function remoteMatroskaRangeUrl(source: MediaSource | undefined, rangeUrl: string | null | undefined) {
+  if (!rangeUrl || !isRemoteHttpStrmSource(source) || !isMatroskaContainer(source?.container)) return null;
+  return rangeUrl;
+}
+
 export function h264CodecForDimensions(width: number, height: number) {
   const pixels = Math.max(1, width) * Math.max(1, height);
   if (pixels > 2_073_600) return "avc1.640033";

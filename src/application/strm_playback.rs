@@ -148,7 +148,7 @@ impl StrmPlaybackResolver {
             let mut response = self
                 .client
                 .get(current.clone())
-                .header(RANGE, range)
+                .header(RANGE, upstream_range(range))
                 .header(ACCEPT_ENCODING, "identity")
                 .header(USER_AGENT, user_agent)
                 .send()
@@ -232,7 +232,13 @@ fn validate_range(value: &str) -> Result<(), StrmPlaybackError> {
     let Some((start, end)) = specification.split_once('-') else {
         return Err(StrmPlaybackError::InvalidRange);
     };
-    let (Ok(start), Ok(end)) = (start.parse::<u64>(), end.parse::<u64>()) else {
+    let Ok(start) = start.parse::<u64>() else {
+        return Err(StrmPlaybackError::InvalidRange);
+    };
+    if end.is_empty() {
+        return Ok(());
+    }
+    let Ok(end) = end.parse::<u64>() else {
         return Err(StrmPlaybackError::InvalidRange);
     };
     if start > end || end - start + 1 > MAX_RANGE_BYTES {
@@ -241,12 +247,37 @@ fn validate_range(value: &str) -> Result<(), StrmPlaybackError> {
     Ok(())
 }
 
+fn upstream_range(value: &str) -> String {
+    let Some((start, end)) = value
+        .trim()
+        .strip_prefix("bytes=")
+        .and_then(|value| value.split_once('-'))
+    else {
+        return value.to_owned();
+    };
+    if end.is_empty() {
+        let Ok(start) = start.parse::<u64>() else {
+            return value.to_owned();
+        };
+        return format!(
+            "bytes={start}-{}",
+            start.saturating_add(MAX_RANGE_BYTES - 1)
+        );
+    }
+    value.to_owned()
+}
+
 fn content_range_matches(value: &str, requested: &str) -> bool {
     let Some((requested_start, requested_end)) = requested
         .trim()
         .strip_prefix("bytes=")
         .and_then(|value| value.split_once('-'))
-        .and_then(|(start, end)| Some((start.parse::<u64>().ok()?, end.parse::<u64>().ok()?)))
+        .and_then(|(start, end)| {
+            Some((
+                start.parse::<u64>().ok()?,
+                (!end.is_empty()).then(|| end.parse::<u64>().ok()).flatten(),
+            ))
+        })
     else {
         return false;
     };
@@ -266,7 +297,10 @@ fn content_range_matches(value: &str, requested: &str) -> bool {
     let Some(total) = total.parse::<u64>().ok() else {
         return false;
     };
-    start == requested_start && end >= requested_start && end <= requested_end && total > end
+    start == requested_start
+        && end >= requested_start
+        && requested_end.map_or(true, |requested_end| end <= requested_end)
+        && total > end
 }
 
 fn validate_url(value: &str) -> Result<Url, StrmPlaybackError> {
@@ -314,7 +348,9 @@ fn is_disallowed_address(address: IpAddr) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_RANGE_BYTES, content_range_matches, validate_range, validate_url};
+    use super::{
+        MAX_RANGE_BYTES, content_range_matches, upstream_range, validate_range, validate_url,
+    };
 
     #[test]
     fn accepts_internal_http_targets_without_hardcoded_paths() {
@@ -338,18 +374,29 @@ mod tests {
     }
 
     #[test]
-    fn accepts_only_one_bounded_range() {
+    fn accepts_bounded_and_open_ended_ranges() {
         assert!(validate_range("bytes=0-1023").is_ok());
         assert!(validate_range(&format!("bytes=0-{}", MAX_RANGE_BYTES - 1)).is_ok());
-        assert!(validate_range("bytes=0-").is_err());
+        assert!(validate_range("bytes=0-").is_ok());
+        assert!(validate_range("bytes=1048576-").is_ok());
         assert!(validate_range("bytes=0-1,4-5").is_err());
         assert!(validate_range(&format!("bytes=0-{}", MAX_RANGE_BYTES)).is_err());
+    }
+
+    #[test]
+    fn open_ended_ranges_are_bounded_before_the_upstream_request() {
+        assert_eq!(
+            upstream_range("bytes=10-"),
+            format!("bytes=10-{}", 10 + MAX_RANGE_BYTES - 1)
+        );
+        assert_eq!(upstream_range("bytes=10-20"), "bytes=10-20");
     }
 
     #[test]
     fn requires_the_upstream_content_range_to_match() {
         assert!(content_range_matches("bytes 0-99/1000", "bytes=0-99"));
         assert!(content_range_matches("bytes 0-49/50", "bytes=0-99"));
+        assert!(content_range_matches("bytes 0-49/50", "bytes=0-"));
         assert!(!content_range_matches("bytes 1-99/1000", "bytes=0-99"));
         assert!(!content_range_matches("bytes 0-99/*", "bytes=0-99"));
     }

@@ -29,7 +29,7 @@ import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
-import { canUseClientMkvCaptionPipeline, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { canUseClientMkvCaptionPipeline, isRemoteHttpStrmSource, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -325,10 +325,14 @@ export function PlayerPage() {
     ? webPlaybackSession.data
     : playbackBootstrap.data?.session ?? webPlaybackSession.data;
   const playbackPlan = playbackSession?.plan;
-  const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
+  const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
+  const directRangeUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.rangeUrl : undefined;
+  const remoteMatroskaRelayUrl = remoteMatroskaRangeUrl(source, directRangeUrl);
   const streamUrl = playbackPlan?.type === "DIRECT"
-    ? (directProxyFallbackRequested ? playbackPlan.url : directProxyUrl ?? playbackPlan.url)
+    ? (directProxyFallbackRequested
+      ? playbackPlan.url
+      : remoteMatroskaRelayUrl ?? directProxyUrl ?? playbackPlan.url)
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
