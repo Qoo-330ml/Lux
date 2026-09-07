@@ -8,6 +8,8 @@ import type {
   AdminTaskActivity,
   AdminScheduledTask,
   AdminScheduledTaskPage,
+  AdminScheduledTaskPlanPage,
+  AdminScheduledTaskPlan,
   AdminMetadataReidentifyJob,
   AdminStrmProbeJob,
   AdminChapterDetectionJob,
@@ -996,6 +998,58 @@ export class LuxApiClient {
   adminScheduledTasks(page = 1) {
     return this.request<AdminScheduledTaskPage>(
       `/api/v1/admin/scheduled-tasks?page=${page}&pageSize=100`,
+    );
+  }
+
+  adminScheduledTaskPlans(page = 1, taskType?: string, search?: string) {
+    const params = new URLSearchParams({ page: String(page), pageSize: "50" });
+    if (taskType) params.set("taskType", taskType);
+    if (search) params.set("search", search);
+    return this.request<AdminScheduledTaskPlanPage>(
+      `/api/v1/admin/scheduled-task-plans?${params}`,
+    );
+  }
+
+  createAdminScheduledTaskPlan(input: {
+    taskType: string;
+    name: string;
+    schedule?: string | null;
+    isEnabled?: boolean;
+    libraryIds: string[];
+    resourceLimit?: Record<string, unknown>;
+  }) {
+    return this.request<{ plan: AdminScheduledTaskPlan }>(
+      "/api/v1/admin/scheduled-task-plans",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  updateAdminScheduledTaskPlan(
+    planId: string,
+    input: {
+      name?: string;
+      schedule?: string | null;
+      isEnabled?: boolean;
+      libraryIds?: string[];
+      resourceLimit?: Record<string, unknown>;
+    },
+  ) {
+    return this.request<{ plan: AdminScheduledTaskPlan }>(
+      `/api/v1/admin/scheduled-task-plans/${encodeURIComponent(planId)}`,
+      { method: "PATCH", body: JSON.stringify(input) },
+    );
+  }
+
+  runAdminScheduledTaskPlan(planId: string) {
+    return this.request<{
+      status: string;
+      planId: string;
+      taskType: string;
+      runs?: Array<{ libraryId: string; run?: Record<string, unknown> }>;
+      skippedLibraryIds?: string[];
+    }>(
+      `/api/v1/admin/scheduled-task-plans/${encodeURIComponent(planId)}/run`,
+      { method: "POST" },
     );
   }
 

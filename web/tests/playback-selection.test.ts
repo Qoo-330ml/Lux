@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { canUseClientMkvCaptionPipeline, hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 
 describe("playback selection", () => {
   const source = {
@@ -49,6 +49,29 @@ describe("playback selection", () => {
     ] };
 
     expect(hasClientMkvCandidate(webm)).toBe(true);
+  });
+
+  it("uses the signed same-origin Range Relay for remote Matroska native playback", () => {
+    const rangeUrl = "/api/v1/playback/sessions/session-1/range?expires=1900000000&signature=test";
+    expect(remoteMatroskaRangeUrl({
+      ...source,
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mkv",
+      container: "matroska,webm",
+    }, rangeUrl)).toBe(rangeUrl);
+    expect(remoteMatroskaRangeUrl({
+      ...source,
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mp4",
+      container: "mp4",
+    }, rangeUrl)).toBeNull();
+    expect(remoteMatroskaRangeUrl({ ...source, container: "matroska" }, rangeUrl)).toBeNull();
+    expect(remoteMatroskaRangeUrl({
+      ...source,
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mkv",
+      container: "matroska",
+    }, null)).toBeNull();
   });
 
   it("accepts an MKV when a supported AAC track follows DTS and E-AC-3 tracks", () => {
@@ -125,6 +148,39 @@ describe("playback selection", () => {
 
     expect(hasClientMkvHevcRuntime()).toBe(true);
     expect(await shouldUseClientMkv(mkv, video)).toBe(true);
+  });
+
+  it("keeps the client MKV pipeline for captions when native MKV playback is available", async () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "EAC3" },
+      { index: 2, type: "SUBTITLE", codec: "ASS" },
+    ] };
+    vi.stubGlobal("MediaSource", {
+      isTypeSupported: (mime: string) => mime.includes("hvc1.2.4.L120") || mime.includes("avc1"),
+    });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder {
+      static isConfigSupported() { return Promise.resolve({ supported: true }); }
+    });
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("probably");
+
+    expect(await shouldUseClientMkv(mkv, video)).toBe(false);
+    expect(await shouldUseClientMkv(mkv, video, { requireCaptionPipeline: true })).toBe(true);
+  });
+
+  it("rejects remote caption remux when Chrome cannot MSE the HEVC plus E-AC-3 pair", () => {
+    const mkv = { ...source, container: "mkv", sourceKind: "STRM_URL", externalUrl: "https://media.example.test/video.mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "EAC3" },
+      { index: 2, type: "SUBTITLE", codec: "ASS" },
+    ] };
+    vi.stubGlobal("MediaSource", {
+      isTypeSupported: (mime: string) => mime.includes("hvc1") && !mime.includes("ec-3"),
+    });
+
+    expect(canUseClientMkvCaptionPipeline(mkv)).toBe(false);
   });
 
   it("selects MKV AC-3 only when HEVC and AC-3 share an MSE", async () => {

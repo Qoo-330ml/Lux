@@ -7,7 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
-import { shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { canUseClientMkvCaptionPipeline, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 const fallbackState = vi.hoisted(() => ({
@@ -20,6 +20,12 @@ const fallbackState = vi.hoisted(() => ({
 vi.mock("../src/features/player/playback-selection", () => ({
   isRemoteHttpStrmSource: (source: { sourceKind?: string; externalUrl?: string }) =>
     source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? ""),
+  remoteMatroskaRangeUrl: (source: { sourceKind?: string; externalUrl?: string; container?: string | null }, rangeUrl?: string | null) =>
+    rangeUrl && source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? "")
+      && (source.container ?? "").toLowerCase().split(",").some((part) => ["mkv", "matroska", "webm"].includes(part.trim()))
+      ? rangeUrl
+      : null,
+  canUseClientMkvCaptionPipeline: vi.fn().mockReturnValue(true),
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
 }));
@@ -89,6 +95,7 @@ describe("PlayerPage client fallback status", () => {
     fallbackState.mkvFailure = false;
     fallbackState.snapshotDuration = 8;
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
+    vi.mocked(canUseClientMkvCaptionPipeline).mockReturnValue(true);
     vi.mocked(shouldUseClientMkv).mockResolvedValue(false);
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-fallback",
@@ -273,7 +280,7 @@ describe("PlayerPage client fallback status", () => {
 
     const video = container.querySelector<HTMLVideoElement>("video");
     expect(video?.getAttribute("src")).toBe(
-      "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
     );
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
@@ -286,7 +293,7 @@ describe("PlayerPage client fallback status", () => {
     expect(container?.textContent).not.toContain("浏览器未暴露远程内嵌字幕");
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.querySelector("video")?.getAttribute("src")).toBe(
-      "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
     );
 
     await act(async () => {
@@ -296,6 +303,7 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
     expect(shouldUseClientMkv).toHaveBeenCalled();
+    expect(vi.mocked(shouldUseClientMkv).mock.calls.at(-1)?.[2]).toEqual({ requireCaptionPipeline: true });
     expect(container?.textContent).toContain("当前浏览器不支持远程字幕管线");
   });
 
@@ -523,6 +531,67 @@ describe("PlayerPage client fallback status", () => {
     expect(container.textContent).toContain("远程字幕不可用，已恢复视频播放");
     expect(container.textContent).not.toContain("播放器引擎失败");
     expect(api.stopWebPlaybackSession).not.toHaveBeenCalled();
+  });
+
+  it("keeps native playback and the selected option when the remote codec pair cannot enter MSE", async () => {
+    vi.mocked(canUseClientMkvCaptionPipeline).mockReturnValue(false);
+    vi.mocked(api.item).mockResolvedValue({
+      id: "remote-mkv-eac3",
+      title: "远程 HEVC E-AC-3",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "remote-mkv-eac3-source",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/video.mkv",
+        container: "mkv",
+        streams: [
+          { index: 0, type: "VIDEO", codec: "HEVC" },
+          { index: 1, type: "AUDIO", codec: "EAC3" },
+          { index: 2, type: "SUBTITLE", codec: "ASS" },
+        ],
+      }],
+    });
+    vi.mocked(api.createWebPlaybackSession).mockResolvedValue({
+      sessionId: "web-remote-mkv-eac3",
+      playSessionId: "lux-web:web-remote-mkv-eac3",
+      sourceId: "remote-mkv-eac3-source",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-remote-mkv-eac3/direct?expires=1900000000&signature=test",
+        proxyUrl: "/Videos/remote-mkv-eac3/stream.mkv?MediaSourceId=remote-mkv-eac3-source",
+        rangeUrl: "/api/v1/playback/sessions/web-remote-mkv-eac3/range?expires=1900000000&signature=test",
+      },
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/remote-mkv-eac3"]}>
+            <Routes><Route path="watch/:itemId" element={<PlayerPage />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    await act(async () => settings?.click());
+    const captionSelect = container.querySelector<HTMLSelectElement>("#lux-player-caption-select");
+    await act(async () => {
+      if (!captionSelect) return;
+      captionSelect.value = captionSelect.options[1]?.value ?? "";
+      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    expect(container.textContent).not.toContain("播放器引擎失败");
+    expect(shouldUseClientMkv).not.toHaveBeenCalled();
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {

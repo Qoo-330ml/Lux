@@ -33,7 +33,7 @@ use crate::{
         thumbnails::ThumbnailService,
     },
     domain::ids::LibraryId,
-    storage::{Database, StorageError, StoredScheduledTaskConfig},
+    storage::{Database, StorageError, StoredScheduledTaskConfig, StoredScheduledTaskPlan},
 };
 
 pub const RECONCILIATION_TASK_TYPE: &str = "RECONCILIATION_SCAN";
@@ -209,6 +209,44 @@ impl ScheduledTaskService {
         let mut offset = 0;
         let mut active_keys = HashSet::new();
         loop {
+            let (plans, total) = match self
+                .database
+                .list_scheduled_task_plans(offset, SCHEDULER_PAGE_SIZE, None, None)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(%error, "failed to read scheduled task plans");
+                    return;
+                }
+            };
+            for plan in plans {
+                let Some(schedule) = scheduler_plan_schedule(&plan) else {
+                    continue;
+                };
+                let key = plan_key(&plan);
+                active_keys.insert(key.clone());
+                if !schedule.matches(now)
+                    || !self
+                        .claim_minute(
+                            &key,
+                            plan.cron_or_interval.as_deref().unwrap_or_default(),
+                            current_minute,
+                        )
+                        .await
+                {
+                    continue;
+                }
+                self.dispatch_plan(&plan, &key).await;
+            }
+            if offset < total {
+                offset += SCHEDULER_PAGE_SIZE;
+                continue;
+            }
+            break;
+        }
+        let mut offset = 0;
+        loop {
             let (tasks, total) = match self
                 .database
                 .list_scheduled_task_configs(offset, SCHEDULER_PAGE_SIZE)
@@ -221,6 +259,9 @@ impl ScheduledTaskService {
                 }
             };
             for task in tasks {
+                if task.plan_id.is_some() {
+                    continue;
+                }
                 let Some(schedule_text) = task.cron_or_interval.as_deref() else {
                     continue;
                 };
@@ -256,6 +297,28 @@ impl ScheduledTaskService {
             .lock()
             .await
             .retain(|key, _| active_keys.contains(key));
+    }
+
+    async fn dispatch_plan(&self, plan: &StoredScheduledTaskPlan, key: &str) {
+        if plan.scope_type == "GLOBAL" {
+            if let Err(error) = self.run_task("GLOBAL", "global", &plan.task_type).await {
+                self.log_dispatch_error(key, error);
+            }
+            return;
+        }
+        for library in &plan.libraries {
+            if let Err(error) = self.run_task("LIBRARY", &library.id, &plan.task_type).await {
+                self.log_dispatch_error(key, error);
+            }
+        }
+    }
+
+    fn log_dispatch_error(&self, key: &str, error: ScheduledTaskError) {
+        match error {
+            ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))
+            | ScheduledTaskError::Strm(StrmProbeError::AlreadyActive) => {}
+            error => tracing::warn!(task = %key, %error, "scheduled task did not start"),
+        }
     }
 
     async fn claim_minute(&self, key: &str, schedule_text: &str, minute: i64) -> bool {
@@ -512,9 +575,29 @@ impl ScheduledTaskService {
 }
 
 fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> {
-    if !task.is_enabled
+    scheduler_schedule_values(
+        &task.task_type,
+        task.cron_or_interval.as_deref(),
+        task.is_enabled,
+    )
+}
+
+fn scheduler_plan_schedule(plan: &StoredScheduledTaskPlan) -> Option<CronSchedule> {
+    scheduler_schedule_values(
+        &plan.task_type,
+        plan.cron_or_interval.as_deref(),
+        plan.is_enabled,
+    )
+}
+
+fn scheduler_schedule_values(
+    task_type: &str,
+    schedule: Option<&str>,
+    is_enabled: bool,
+) -> Option<CronSchedule> {
+    if !is_enabled
         || !matches!(
-            task.task_type.as_str(),
+            task_type,
             RECONCILIATION_TASK_TYPE
                 | METADATA_TASK_TYPE
                 | STRM_MEDIA_INFO_TASK_TYPE
@@ -525,11 +608,11 @@ fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> 
     {
         return None;
     }
-    let schedule = task.cron_or_interval.as_deref()?;
+    let schedule = schedule?;
     match parse_cron(schedule) {
         Ok(schedule) => Some(schedule),
         Err(error) => {
-            tracing::warn!(task_type = %task.task_type, ?error, "ignoring invalid scheduled task cron expression");
+            tracing::warn!(task_type = %task_type, ?error, "ignoring invalid scheduled task cron expression");
             None
         }
     }
@@ -537,6 +620,10 @@ fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> 
 
 fn task_key(task: &StoredScheduledTaskConfig) -> String {
     format!("{}:{}:{}", task.owner_type, task.owner_id, task.task_type)
+}
+
+fn plan_key(plan: &StoredScheduledTaskPlan) -> String {
+    format!("PLAN:{}", plan.id)
 }
 
 #[cfg(test)]
@@ -550,6 +637,7 @@ mod tests {
             owner_type: "LIBRARY".to_owned(),
             owner_id: "library".to_owned(),
             task_type: "RECONCILIATION_SCAN".to_owned(),
+            plan_id: None,
             task_name: String::new(),
             task_description: String::new(),
             source_type: String::new(),

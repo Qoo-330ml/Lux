@@ -668,6 +668,50 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("manages grouped scheduled task plans with pagination and CSRF protection", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const path = String(input);
+      if (!init?.method) {
+        expect(path).toBe(
+          "/api/v1/admin/scheduled-task-plans?page=2&pageSize=50&taskType=RECONCILIATION_SCAN&search=%E7%94%B5%E5%BD%B1",
+        );
+        return new Response(JSON.stringify({
+          plans: [{ id: "plan-1", taskType: "RECONCILIATION_SCAN", libraries: [] }],
+          total: 1,
+          page: 2,
+          pageSize: 50,
+        }), { status: 200 });
+      }
+      expect(path).toBe("/api/v1/admin/scheduled-task-plans/plan-1");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toEqual({
+        name: "夜间校验",
+        schedule: "0 2 * * *",
+        isEnabled: true,
+        libraryIds: ["library-1", "library-2"],
+        resourceLimit: { scanConcurrency: 1 },
+      });
+      expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      return new Response(JSON.stringify({ plan: { id: "plan-1" } }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminScheduledTaskPlans(2, "RECONCILIATION_SCAN", "电影"))
+      .resolves.toMatchObject({ total: 1 });
+    await expect(client.updateAdminScheduledTaskPlan("plan-1", {
+      name: "夜间校验",
+      schedule: "0 2 * * *",
+      isEnabled: true,
+      libraryIds: ["library-1", "library-2"],
+      resourceLimit: { scanConcurrency: 1 },
+    })).resolves.toEqual({ plan: { id: "plan-1" } });
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("downloads an administrator log archive with a bounded date query", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response("zip-bytes", {

@@ -4,6 +4,7 @@ use luxd::application::{
     chapter_detector::{ChapterDetectionService, DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID},
     libraries::LibrarySettingsPatch,
     plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
+    scanner::ScanJobService,
     schedule::DANMAKU_MATCH_TASK_TYPE,
     scheduled_tasks::ScheduledTaskService,
     strm_probe::StrmProbeService,
@@ -232,5 +233,48 @@ async fn registered_danmaku_task_uses_the_danmaku_service() -> Result<(), Box<dy
         error,
         luxd::application::scheduled_tasks::ScheduledTaskError::ServiceUnavailable
     ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scheduled_plan_dispatches_each_library_once_per_cron_minute()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    })
+    .await?;
+    let libraries = luxd::application::libraries::LibraryService::new(database.clone());
+    libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .create_library("More Movies", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "UPDATE scheduled_task_plans
+         SET cron_or_interval = '* * * * *', is_enabled = 1
+         WHERE task_type = 'RECONCILIATION_SCAN' AND is_default = 1",
+    )
+    .execute(database.pool())
+    .await?;
+    let plugins = PluginService::new(database.clone(), config_dir);
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database.clone(), plugins),
+        None,
+    )
+    .with_library_services(ScanJobService::new(database.clone()), None, None, None);
+
+    scheduler.run_once().await;
+    scheduler.run_once().await;
+    let job_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE job_type = 'RECONCILE_LIBRARY'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(job_count, 2);
     Ok(())
 }

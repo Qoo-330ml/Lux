@@ -1401,6 +1401,241 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         cover_schedule.json::<Value>().await?["scheduledTask"]["schedule"],
         "0 1 * * *"
     );
+    let cover_plan: (Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT p.cron_or_interval, p.is_enabled,
+                       (SELECT COUNT(*) FROM scheduled_task_plan_libraries l
+                        WHERE l.plan_id = p.id)
+         FROM scheduled_task_plans p
+         JOIN scheduled_task_configs c ON c.plan_id = p.id
+         WHERE c.owner_type = 'LIBRARY' AND c.owner_id = ?
+           AND c.task_type = 'AUTO_LIBRARY_COVER'",
+    )
+    .bind(&library_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cover_plan.0.as_deref(), Some("0 1 * * *"));
+    assert_eq!(cover_plan.1, 1);
+    assert_eq!(cover_plan.2, 1);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+    let mut library_ids = Vec::new();
+    for name in ["Movies", "Series"] {
+        let response = client
+            .post(format!("{base_url}/api/v1/admin/libraries"))
+            .header(COOKIE, &cookies)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({ "name": name, "kind": "MOVIE" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        library_ids.push(
+            response.json::<Value>().await?["library"]["id"]
+                .as_str()
+                .ok_or("missing library id")?
+                .to_owned(),
+        );
+    }
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/scheduled-task-plans"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "taskType": "RECONCILIATION_SCAN",
+            "name": "电影与剧集夜间校验",
+            "schedule": "0 2 * * 1",
+            "isEnabled": true,
+            "libraryIds": library_ids
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created_body: Value = created.json().await?;
+    assert_eq!(created_body["plan"]["libraryCount"], 2);
+    assert_eq!(created_body["plan"]["schedule"], "0 2 * * 1");
+
+    let listed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans?page=1&pageSize=50&taskType=RECONCILIATION_SCAN"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed_body: Value = listed.json().await?;
+    assert_eq!(listed_body["total"], 2);
+    assert!(listed_body["plans"].as_array().is_some_and(|plans| {
+        plans
+            .iter()
+            .any(|plan| plan["name"] == "电影与剧集夜间校验" && plan["libraryCount"] == 2)
+    }));
+
+    let searched = client
+        .get(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans?page=1&pageSize=50&search=Series"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(searched.status(), reqwest::StatusCode::OK);
+    let searched_body: Value = searched.json().await?;
+    assert_eq!(
+        searched_body["total"], 2,
+        "unexpected plan search response: {searched_body}"
+    );
+    assert!(searched_body["plans"].as_array().is_some_and(|plans| {
+        plans
+            .iter()
+            .any(|plan| plan["name"] == "电影与剧集夜间校验")
+            && plans.iter().any(|plan| plan["name"] == "元数据刮削")
+    }));
+
+    let config_plan_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT plan_id FROM scheduled_task_configs
+         WHERE task_type = 'RECONCILIATION_SCAN' ORDER BY owner_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(config_plan_ids.len(), 2);
+    assert_eq!(config_plan_ids[0], config_plan_ids[1]);
+
+    let original_plan_id = created_body["plan"]["id"]
+        .as_str()
+        .ok_or("missing created plan id")?
+        .to_owned();
+    let moved = client
+        .post(format!("{base_url}/api/v1/admin/scheduled-task-plans"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "taskType": "RECONCILIATION_SCAN",
+            "name": "临时校验",
+            "schedule": "0 5 * * 1",
+            "isEnabled": true,
+            "libraryIds": library_ids
+        }))
+        .send()
+        .await?;
+    assert_eq!(moved.status(), reqwest::StatusCode::CREATED);
+
+    let restored = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans/{original_plan_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "libraryIds": [library_ids[0]] }))
+        .send()
+        .await?;
+    assert_eq!(restored.status(), reqwest::StatusCode::OK);
+    assert_eq!(restored.json::<Value>().await?["plan"]["libraryCount"], 1);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_plan_run_continues_after_one_library_rejection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let mut library_ids = Vec::new();
+    for name in ["A Missing", "B Ready"] {
+        let response = client
+            .post(format!("{base_url}/api/v1/admin/libraries"))
+            .header(COOKIE, &cookies)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({ "name": name, "kind": "MOVIE" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        library_ids.push(
+            response.json::<Value>().await?["library"]["id"]
+                .as_str()
+                .ok_or("missing library id")?
+                .to_owned(),
+        );
+    }
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/scheduled-task-plans"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "taskType": "RECONCILIATION_SCAN",
+            "name": "验证逐库派发",
+            "isEnabled": true,
+            "libraryIds": library_ids
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let plan_id = created.json::<Value>().await?["plan"]["id"]
+        .as_str()
+        .ok_or("missing plan id")?
+        .to_owned();
+
+    sqlx::query(
+        "DELETE FROM scheduled_task_configs
+         WHERE owner_type = 'LIBRARY' AND owner_id = ?
+           AND task_type = 'RECONCILIATION_SCAN'",
+    )
+    .bind(&library_ids[0])
+    .execute(database.pool())
+    .await?;
+
+    let run = client
+        .post(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans/{plan_id}/run"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(run.status(), reqwest::StatusCode::ACCEPTED);
+    let run_body: Value = run.json().await?;
+    assert_eq!(run_body["runs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(run_body["runs"][0]["libraryId"], library_ids[1]);
+    assert_eq!(run_body["skippedLibraryIds"], json!([library_ids[0]]));
 
     server.abort();
     Ok(())

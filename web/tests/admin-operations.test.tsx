@@ -41,6 +41,120 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).toContain("还没有注册任务");
   });
 
+  it("groups scheduled plans by task type and runs a plan by library", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [
+        {
+          id: "plan-night",
+          taskType: "RECONCILIATION_SCAN",
+          name: "夜间校验",
+          description: "按计划校验媒体库索引与文件系统的一致性。",
+          schedule: "0 2 * * *",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          libraries: [{ id: "library-1", name: "电影库" }, { id: "library-2", name: "剧集库" }],
+          libraryCount: 2,
+        },
+        {
+          id: "plan-weekend",
+          taskType: "RECONCILIATION_SCAN",
+          name: "周末校验",
+          description: "按计划校验媒体库索引与文件系统的一致性。",
+          schedule: "0 4 * * 6",
+          isEnabled: false,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          libraries: [{ id: "library-3", name: "纪录片库" }],
+          libraryCount: 1,
+        },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 50,
+    });
+    const runPlan = vi.spyOn(api, "runAdminScheduledTaskPlan").mockResolvedValue({
+      status: "ACCEPTED",
+      planId: "plan-night",
+      taskType: "RECONCILIATION_SCAN",
+      runs: [{ libraryId: "library-1" }, { libraryId: "library-2" }],
+    });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("夜间校验"));
+    });
+    expect(container.textContent).toContain("全量校验媒体库");
+    expect(container.textContent).toContain("2 个媒体库");
+    expect(container.textContent).toContain("周末校验");
+    expect(container.textContent).not.toContain("还没有注册任务");
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="立即执行夜间校验"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(runPlan).toHaveBeenCalledWith("plan-night"));
+    });
+  });
+
+  it("edits a plan cron and moves selected libraries with a searchable picker", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [{
+        id: "plan-night",
+        taskType: "RECONCILIATION_SCAN",
+        name: "夜间校验",
+        schedule: "0 2 * * *",
+        isEnabled: true,
+        sourceType: "SYSTEM",
+        scopeType: "LIBRARY",
+        libraries: [{ id: "library-1", name: "电影库" }],
+        libraryCount: 1,
+      }],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+    });
+    const updatePlan = vi.spyOn(api, "updateAdminScheduledTaskPlan").mockResolvedValue({
+      plan: { id: "plan-night" },
+    });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [
+      { id: "library-1", name: "电影库" },
+      { id: "library-2", name: "剧集库" },
+    ] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("夜间校验"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑夜间校验"]')?.click());
+    const librarySearch = container.querySelector<HTMLInputElement>('input[aria-label="搜索媒体库"]');
+    expect(librarySearch).not.toBeNull();
+    act(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(librarySearch, "剧集");
+      librarySearch?.dispatchEvent(new Event("input", { bubbles: true }));
+      librarySearch?.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+    const secondLibrary = container.querySelector<HTMLInputElement>('input[aria-label="选择媒体库 剧集库"]');
+    expect(secondLibrary).not.toBeNull();
+    act(() => secondLibrary?.click());
+    expect(secondLibrary?.checked).toBe(true);
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>(".lux-registered-plan-editor button[type='submit']")?.click();
+      await vi.waitFor(() => expect(updatePlan).toHaveBeenCalledWith("plan-night", {
+        name: "夜间校验",
+        schedule: "0 2 * * *",
+        isEnabled: true,
+        libraryIds: ["library-1", "library-2"],
+      }));
+    });
+  });
+
   it("separates registered tasks, runtime records, and redacted audit logs", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-1",
@@ -764,17 +878,19 @@ describe("AdminOperationsPage", () => {
   function renderPage() {
     container = document.createElement("div");
     document.body.append(container);
-    vi.spyOn(api, "adminLibraries").mockResolvedValue({
-      libraries: [{
-        id: "library-1",
-        name: "电影库",
-        kind: "MOVIE",
-        isEnabled: true,
-        realtimeWatchEnabled: true,
-        realtimeMetadataAutoMatchEnabled: false,
-        roots: [],
-      }],
-    });
+    if (!vi.isMockFunction(api.adminLibraries)) {
+      vi.spyOn(api, "adminLibraries").mockResolvedValue({
+        libraries: [{
+          id: "library-1",
+          name: "电影库",
+          kind: "MOVIE",
+          isEnabled: true,
+          realtimeWatchEnabled: true,
+          realtimeMetadataAutoMatchEnabled: false,
+          roots: [],
+        }],
+      });
+    }
     if (!vi.isMockFunction(api.adminStrmProbeJobs)) {
       vi.spyOn(api, "adminStrmProbeJobs").mockResolvedValue({ jobs: [] });
     }
