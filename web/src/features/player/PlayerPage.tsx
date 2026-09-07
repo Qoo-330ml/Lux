@@ -325,15 +325,6 @@ export function PlayerPage() {
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
-  const remoteCaptionRequested = remoteHttpSource
-    && Boolean(
-      selectedCaptionOption
-      && (selectedCaptionOption.renderMode === "runtime-overlay"
-        || isMatroskaRuntimeTrack(selectedCaptionOption.runtimeTrackId)),
-    );
-  const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
-    ? playbackPlan.rangeUrl ?? null
-    : null;
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
@@ -684,13 +675,6 @@ export function PlayerPage() {
           break;
         }
         case "ERROR":
-          if (activeEngine.kind === "client-mkv" && remoteCaptionRequested) {
-            setSelectedCaptionId(null);
-            setCaptionStatus("远程字幕不可用，已恢复视频播放");
-            setFailedStreamUrl(null);
-            setPlaybackFailure(null);
-            break;
-          }
           if (activeEngine.kind === "native" && playbackPlan?.type === "DIRECT") {
             void requestServerFallback(event.error.message);
           } else {
@@ -722,16 +706,9 @@ export function PlayerPage() {
           engineRef.current = activeEngine;
         } else {
           const remoteHttpStrm = remoteHttpSource;
-          const useMkvFallback = isMatroskaSource(source)
-            && (remoteCaptionRequested || !remoteHttpStrm)
-            && Boolean(!remoteCaptionRequested || clientMkvSourceUrl)
+          const useMkvFallback = !remoteHttpStrm && isMatroskaSource(source)
             ? await shouldUseClientMkv(source, initialEngine.element)
             : false;
-          if (remoteCaptionRequested && !useMkvFallback) {
-            setSelectedCaptionId(null);
-            setCaptionStatus("当前浏览器不支持远程字幕管线，已保持视频播放");
-            return;
-          }
           const useHevcFallback =
             !useMkvFallback
             && !remoteHttpStrm
@@ -756,9 +733,6 @@ export function PlayerPage() {
           }
         }
         if (cancelled) return;
-        const engineSource = useClientEngine(activeEngine)
-          ? clientMkvSourceUrl ?? streamUrl
-          : streamUrl;
         await runtime.load(
           new LegacyPlaybackEngineAdapter(
             activeEngine,
@@ -766,7 +740,7 @@ export function PlayerPage() {
           ),
           {
             id: source?.id ?? "",
-            url: engineSource,
+            url: streamUrl,
             poster,
           },
         );
@@ -778,13 +752,6 @@ export function PlayerPage() {
           );
       } catch (cause) {
         if (!cancelled) {
-          if (remoteCaptionRequested && remoteHttpSource) {
-            setSelectedCaptionId(null);
-            setCaptionStatus("远程字幕不可用，已恢复视频播放");
-            setFailedStreamUrl(null);
-            setPlaybackFailure(null);
-            return;
-          }
           if (runtime.state.status === "FAILED") return;
           if (playbackPlan?.type === "DIRECT") {
             requestServerFallback(cause);
@@ -808,7 +775,7 @@ export function PlayerPage() {
       if (runtimeRef.current === runtime) runtimeRef.current = null;
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
-  }, [clientMkvSourceUrl, playbackKey, playbackPlan?.type, poster, remoteCaptionRequested, remoteHttpSource, requestServerFallback, source, streamUrl]);
+  }, [playbackKey, playbackPlan?.type, poster, remoteHttpSource, requestServerFallback, source, streamUrl]);
 
   // Fullscreen change listener
   useEffect(() => {
@@ -1280,7 +1247,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
-        deferNativeSource={isMatroskaSource(source) && (!remoteHttpSource || remoteCaptionRequested)}
+        deferNativeSource={isMatroskaSource(source) && !remoteHttpSource}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
         title={mediaTitle(media)}
@@ -1444,12 +1411,4 @@ export function PlayerPage() {
 
 function isMatroskaSource(source: MediaSource | undefined) {
   return (source?.container ?? "").toLowerCase().split(",").some((part) => part.trim() === "mkv" || part.trim() === "matroska" || part.trim() === "webm");
-}
-
-function useClientEngine(engine: PlaybackEngine) {
-  return engine.kind === "client-mkv" || engine.kind === "client-hevc";
-}
-
-function isMatroskaRuntimeTrack(trackId: string | undefined) {
-  return Boolean(trackId && /^(?:mkv:|mkv-track:)/u.test(trackId));
 }

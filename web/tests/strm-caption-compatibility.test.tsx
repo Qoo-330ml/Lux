@@ -85,18 +85,21 @@ describe("LUX-229 local and remote STRM caption compatibility gate", () => {
     );
   });
 
-  it("keeps URL and path STRM media direct while making only URL Matroska captions opt-in", () => {
+  it("keeps URL and path STRM media direct while requiring a native track for embedded captions", () => {
     const remoteUrlOptions = playerCaptionOptions(remoteUrlSource, true);
     expect(remoteUrlOptions[0]).toEqual(expect.objectContaining({
-      available: true,
-      renderMode: "runtime-overlay",
+      available: false,
+      unavailableReason: "浏览器未暴露远程内嵌字幕",
     }));
     expect(overlayCaptionSource("fixed-item", remoteUrlSource.id, remoteUrlOptions[0])).toBeNull();
     expect(nativeCaptionTrack("fixed-item", remoteUrlSource.id, remoteUrlOptions[0])).toBeNull();
 
     for (const source of [remotePathSource]) {
       const withoutNative = playerCaptionOptions(source, true);
-      expect(withoutNative[0]).toEqual(expect.objectContaining({ available: false }));
+      expect(withoutNative[0]).toEqual(expect.objectContaining({
+        available: false,
+        unavailableReason: "浏览器未暴露远程内嵌字幕",
+      }));
       expect(overlayCaptionSource("fixed-item", source.id, withoutNative[0])).toBeNull();
       expect(nativeCaptionTrack("fixed-item", source.id, withoutNative[0])).toBeNull();
       expect(withoutNative[1]).toEqual(expect.objectContaining({ available: false }));

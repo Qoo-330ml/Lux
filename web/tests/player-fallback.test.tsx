@@ -193,7 +193,7 @@ describe("PlayerPage client fallback status", () => {
     );
   });
 
-  it("keeps remote Matroska STRM on the native path while captions are opt-in", async () => {
+  it("keeps remote Matroska STRM on the native path when embedded captions are unavailable", async () => {
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-strm",
       title: "远程 MKV",
@@ -256,14 +256,9 @@ describe("PlayerPage client fallback status", () => {
     expect(settings).not.toBeNull();
     await act(async () => settings?.click());
     const captionSelect = container?.querySelector<HTMLSelectElement>("#lux-player-caption-select");
-    expect(captionSelect?.options[1]?.disabled).not.toBe(true);
-    await act(async () => {
-      if (!captionSelect) return;
-      captionSelect.value = captionSelect.options[1]?.value ?? "";
-      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    });
-    expect(container?.textContent).toContain("当前浏览器不支持远程字幕管线");
+    expect(captionSelect?.options[1]?.disabled).toBe(true);
+    expect(container?.textContent).toContain("浏览器未暴露远程内嵌字幕");
+    expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.querySelector("video")?.getAttribute("src")).toBe(
       "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
     );

@@ -100,7 +100,7 @@ describe("LuxPlayer caption selection", () => {
     expect(overlayCaptionSource("item", "remote-strm", options[0])).toBeNull();
   });
 
-  it("offers remote Matroska text captions without selecting them by default", () => {
+  it("does not advertise remote Matroska text captions before the browser exposes a native track", () => {
     const options = playerCaptionOptions({
       id: "remote-mkv",
       sourceKind: "STRM_URL",
@@ -110,14 +110,15 @@ describe("LuxPlayer caption selection", () => {
     }, true);
 
     expect(options[0]).toEqual(expect.objectContaining({
-      available: true,
-      renderMode: "runtime-overlay",
+      available: false,
+      renderMode: "overlay",
+      unavailableReason: "浏览器未暴露远程内嵌字幕",
       isDefault: true,
     }));
     expect(defaultCaptionSelection(options)).toBeNull();
   });
 
-  it("keeps remote SRT as a runtime overlay after the Matroska track is discovered", () => {
+  it("uses the browser native track after a remote SRT track is discovered", () => {
     const options = playerCaptionOptions({
       id: "remote-mkv",
       sourceKind: "STRM_URL",
@@ -134,7 +135,7 @@ describe("LuxPlayer caption selection", () => {
 
     expect(options[0]).toEqual(expect.objectContaining({
       id: "mkv:42",
-      renderMode: "runtime-overlay",
+      renderMode: "native-inband",
       available: true,
     }));
   });
