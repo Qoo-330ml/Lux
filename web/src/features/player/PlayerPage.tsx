@@ -31,7 +31,7 @@ import { ChromeCaptionExtension, ChromeMediaExtension } from "./chrome-caption-e
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
 import { hasClientHevcRuntime, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
-import { classifyChromeExtensionMedia } from "./chrome-media-codec";
+import { shouldUseChromeExtensionMedia } from "./chrome-media-codec";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -116,6 +116,7 @@ function remoteMediaNeedsExtension(source: MediaSource | undefined, video: HTMLV
   const matroskaMime = `video/x-matroska; codecs="${matroskaCodecs.join(",")}"`;
   const nativeMseSupported = supportsMp4Codec(video, "video", videoCodec ?? "")
     && (!audioCodec || supportsMp4Codec(video, "audio", audioCodec));
+  const nativeDirectSupported = video.canPlayType(matroskaMime) !== "";
   // Keep the native path safe when an older test/runtime shim does not expose
   // the optional HEVC capability probe yet. A missing probe is not evidence
   // that software decoding is available, so it must never trigger extension
@@ -123,18 +124,15 @@ function remoteMediaNeedsExtension(source: MediaSource | undefined, video: HTMLV
   const hevcWasmAvailable = typeof hasClientHevcRuntime === "function"
     ? hasClientHevcRuntime()
     : false;
-  const capability = classifyChromeExtensionMedia({
+  return shouldUseChromeExtensionMedia({
     videoCodec,
     audioCodec,
+    nativeDirectSupported,
     nativeMseSupported,
     hevcWasmAvailable,
     h264OutputSupported: hevcWasmAvailable,
     eac3WasmAvailable: true,
   });
-  const audioNeedsSoftware = capability.audio === "eac3-wasm";
-  return capability.supported
-    && capability.requiresExtension
-    && (audioNeedsSoftware || video.canPlayType(matroskaMime) === "");
 }
 
 function hasChromeExtensionRuntime() {

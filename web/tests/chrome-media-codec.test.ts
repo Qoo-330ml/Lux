@@ -3,6 +3,7 @@ import {
   canonicalAudioCodec,
   canonicalVideoCodec,
   classifyChromeExtensionMedia,
+  shouldUseChromeExtensionMedia,
 } from "../src/features/player/chrome-media-codec";
 
 describe("Chrome extension media codec selection", () => {
@@ -88,5 +89,23 @@ describe("Chrome extension media codec selection", () => {
       audioCodec: "aac",
       nativeMseSupported: false,
     }).supported).toBe(false);
+  });
+
+  it("selects the extension when Matroska is not native even if fMP4 MSE is supported", () => {
+    expect(shouldUseChromeExtensionMedia({
+      videoCodec: "h264",
+      audioCodec: "aac",
+      nativeDirectSupported: false,
+      nativeMseSupported: true,
+    })).toBe(true);
+  });
+
+  it("keeps a directly playable Matroska pair on the native path", () => {
+    expect(shouldUseChromeExtensionMedia({
+      videoCodec: "h264",
+      audioCodec: "aac",
+      nativeDirectSupported: true,
+      nativeMseSupported: true,
+    })).toBe(false);
   });
 });

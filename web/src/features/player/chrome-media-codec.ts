@@ -22,6 +22,8 @@ export type ChromeExtensionMediaCapability = {
 export type ChromeExtensionMediaProbe = {
   videoCodec?: string | null;
   audioCodec?: string | null;
+  /** True only when the original Matroska source is directly playable by <video>. */
+  nativeDirectSupported?: boolean;
   /** True only after probing the complete video+audio MSE codec string. */
   nativeMseSupported: boolean;
   /** True when the bundled HEVC decoder and H.264 output path are available. */
@@ -31,6 +33,19 @@ export type ChromeExtensionMediaProbe = {
   /** True when the page can accept the H.264 output from the HEVC path. */
   h264OutputSupported?: boolean;
 };
+
+/**
+ * Select the extension only when the original Matroska source cannot stay on
+ * the native path. MP4/fMP4 MSE support alone is not enough: it describes the
+ * output the extension can produce, not whether the input container is native.
+ */
+export function shouldUseChromeExtensionMedia(
+  probe: ChromeExtensionMediaProbe & { nativeDirectSupported: boolean },
+) {
+  const capability = classifyChromeExtensionMedia(probe);
+  return capability.supported
+    && (!probe.nativeDirectSupported || capability.audio === "eac3-wasm");
+}
 
 export function classifyChromeExtensionMedia(
   probe: ChromeExtensionMediaProbe,
