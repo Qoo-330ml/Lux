@@ -125,7 +125,7 @@ for library in plan.libraries {
 
 2026-09-07，分支 `codex/scheduled-task-plans` 在本机 `uname -m=arm64` 上完成验证：
 
-- `cargo test --locked --all-targets -- --test-threads=1`：427 passed，4 ignored（其中 PostgreSQL 测试因本机无 PostgreSQL 实例而忽略）。
+- `cargo test --locked --all-targets -- --test-threads=1`：无失败；库测试 427 passed、4 ignored，其他已执行目标均通过；PostgreSQL 集成测试 4 项因本机无 PostgreSQL 实例而忽略，性能门测试 3 项按项目规则忽略。
 - `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`：通过。
 - `pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、`pnpm --dir web build`：通过；Web 静态测试 104 passed，Vitest 463 passed。
 - 本次验证仅代表本机 ARM64 环境，不外推 NAS/x86 性能。
