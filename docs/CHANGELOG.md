@@ -8,14 +8,19 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ### Added
 
-- 为 URL 型 HTTP(S) `.strm` 的 Matroska/WebM 媒体增加浏览器端单管线播放：通过有界 Range 请求、SeekHead/Cues 索引、Web Worker 和 MSE 同时处理音视频与字幕，不由 Lux 服务端代理媒体字节。
-- 支持远程 Matroska 内嵌 `S_TEXT/UTF8`、ASS 和 SSA 文本字幕，提供稳定的字幕轨道选择、实时 cue 更新以及基础颜色、粗体、斜体、对齐和位置样式。
+- 完善本地 Matroska/MKV 客户端 fallback 的有界解封装和文本字幕能力，支持可定位索引、字幕 cue 以及 `S_TEXT/UTF8`、ASS 和 SSA 的基础样式；该管线不用于远程 `.strm`。
+- 增加远程 `.strm` 原生字幕轨道发现与选择，字幕状态绑定当前 `<video>` 生命周期，不改变媒体 URL、播放会话或播放计划。
 
 ### Fixed
 
-- 修复远程 Matroska 播放中字幕 cue 与 seek、切源或销毁播放器之间的竞态；现在按播放代次清理请求、缓存和字幕状态，避免旧媒体内容串入当前播放。
-- 修复 Matroska 轨道解码顺序、Cluster 偏移和 BlockGroup 时长处理不稳定的问题，并拒绝不支持的字幕 lacing 与无效 Cue 目标。
-- 修复远程 Matroska 索引元数据可能无界增长或在缺少可定位索引时继续读取媒体的问题；现在对 EBML、轨道、Cue、字幕文本和 Range 读取施加上限，并要求有效索引后才进入该管线。
+- 修复本地 Matroska 播放中字幕 cue 与 seek、切源或销毁播放器之间的竞态；现在按播放代次清理请求、缓存和字幕状态，避免旧媒体内容串入当前播放。
+- 修复本地 Matroska 轨道解码顺序、Cluster 偏移和 BlockGroup 时长处理不稳定的问题，并拒绝不支持的字幕 lacing 与无效 Cue 目标。
+- 修复本地 Matroska 索引元数据可能无界增长的问题；现在对 EBML、轨道、Cue、字幕文本和 Range 读取施加上限，并要求有效索引后才进入该 fallback。
+- 修复远程 Matroska 字幕管线自动接管播放导致原生视频受 CORS、Range、索引或 MSE 条件影响的问题；远程 HTTP(S) `.strm` 现在始终保持原生 `<video>` Direct Play，字幕不可用时不影响音视频播放。
+
+### Changed
+
+- 收敛远程 `.strm` 字幕边界：只使用浏览器实际暴露的 `TextTrack`，不启动远程 Matroska Worker、Range Relay、MSE 或字幕专用请求；本地 Matroska fallback 与本地字幕 overlay 保持不变。
 
 ## [0.3.8] - 2026-09-04
 
