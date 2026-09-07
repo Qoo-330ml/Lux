@@ -12,7 +12,17 @@ struct LibraryTaskPlanAssignment {
     is_default: bool,
 }
 
+type LegacyScheduledTaskConfigRow = (
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
 impl Database {
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn ensure_library_task_plan(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -208,6 +218,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn ensure_global_task_plan(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -1353,6 +1364,7 @@ impl Database {
         Ok(true)
     }
 
+    #[allow(clippy::type_complexity)]
     async fn apply_legacy_task_config_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -1394,7 +1406,7 @@ impl Database {
                              WHERE l.plan_id = p.id)
                      FROM scheduled_task_plans p WHERE p.id = ?",
                 )
-                .bind(&old_plan_id)
+                .bind(old_plan_id)
                 .fetch_optional(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
@@ -1492,7 +1504,7 @@ impl Database {
         .bind(&plan_id)
         .bind(schedule)
         .bind(database_flag(schedule.is_some()))
-        .bind(&source_type)
+        .bind(source_type)
         .bind(plugin_id)
         .bind(resource_limit_json)
         .bind(library_id)
@@ -2129,14 +2141,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let existing: Option<(
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-            String,
-        )> = self
+        let existing: Option<LegacyScheduledTaskConfigRow> = self
             .query_as(
                 "SELECT task_name, task_description, source_type, plugin_id,
                         plan_id, resource_limit_json
