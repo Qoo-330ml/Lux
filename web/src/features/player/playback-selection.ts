@@ -128,6 +128,29 @@ export function hasClientMkvHevcRuntime() {
   return HEVC_MSE_CODECS.some((codec) => MediaSource.isTypeSupported(`video/mp4; codecs="${codec}"`));
 }
 
+/**
+ * Synchronous gate used by the player before it changes engines. It covers
+ * the codec checks that do not require an async WebCodecs probe, so a remote
+ * caption selection can leave native playback untouched when the MSE
+ * combination is impossible (for example HEVC + E-AC-3 in Chrome).
+ */
+export function canUseClientMkvCaptionPipeline(source: MediaSource | undefined) {
+  if (!source || !hasClientMkvCandidate(source)) return false;
+  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec?.toLowerCase() ?? "";
+  if (!isHevcCodec(videoCodec) && typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function") {
+    const codec = videoCodec.includes("vp9") || videoCodec.includes("vp09")
+      ? "vp09.00.10.08"
+      : videoCodec.includes("av1") || videoCodec.includes("av01")
+        ? "av01.0.04M.08"
+        : "avc1.640028";
+    const audioCodec = mseAudioCodec(source);
+    return (!source.streams?.some((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") || Boolean(audioCodec))
+      && MediaSource.isTypeSupported(`video/mp4; codecs="${[codec, audioCodec].filter(Boolean).join(",")}"`);
+  }
+  if (hasClientMkvHevcRuntime()) return hasClientMkvAudioRuntime(source);
+  return hasClientMkvH264Audio(source);
+}
+
 async function probeClientHevc(
   source: MediaSource,
   video: HTMLVideoElement,

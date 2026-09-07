@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { canUseClientMkvCaptionPipeline, hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 
 describe("playback selection", () => {
   const source = {
@@ -145,6 +145,19 @@ describe("playback selection", () => {
 
     expect(await shouldUseClientMkv(mkv, video)).toBe(false);
     expect(await shouldUseClientMkv(mkv, video, { requireCaptionPipeline: true })).toBe(true);
+  });
+
+  it("rejects remote caption remux when Chrome cannot MSE the HEVC plus E-AC-3 pair", () => {
+    const mkv = { ...source, container: "mkv", sourceKind: "STRM_URL", externalUrl: "https://media.example.test/video.mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "HEVC" },
+      { index: 1, type: "AUDIO", codec: "EAC3" },
+      { index: 2, type: "SUBTITLE", codec: "ASS" },
+    ] };
+    vi.stubGlobal("MediaSource", {
+      isTypeSupported: (mime: string) => mime.includes("hvc1") && !mime.includes("ec-3"),
+    });
+
+    expect(canUseClientMkvCaptionPipeline(mkv)).toBe(false);
   });
 
   it("selects MKV AC-3 only when HEVC and AC-3 share an MSE", async () => {
