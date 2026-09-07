@@ -1326,12 +1326,12 @@ locked local value
 - Web 播放器首先尝试浏览器实际暴露的 in-band `TextTrack`；该路径不产生额外字幕请求，也不改变媒体 URL。
 - 本地媒体的内嵌 SRT、ASS、SSA 在浏览器未暴露轨道时，可由 source-scoped 字幕端点按需做无转码抽取，再交给已有的
   Worker 文本解析器；不写回媒体、不烧录、不生成永久缓存。
-- 远程 HTTP(S) `.strm` 的 Matroska/WebM 默认继续使用原生 `<video>`，保持字幕功能改动前的 Direct Play 行为。只有用户显式
-  选择远程内嵌 SRT/ASS/SSA 后，才按 ADR-036 进入客户端单管线：Worker 同时解封装音频、视频和文本字幕，`<video>` 仍只作为
-  MSE 输出和渲染目标。字幕不预先抽取、不落盘、不生成外挂文件。
-- 客户端字幕管线通过当前播放会话授权的同源 Range Relay 读取远程字节；Relay 校验单区间 `Range`、`206 + Content-Range`、长度
-  和 ETag，单次最大 32 MiB，不缓存整部媒体。Relay、索引、codec 或 MSE 条件不满足时只禁用远程字幕并恢复原生视频，不得把视频
-  标记为播放器引擎失败。SMB、FTP、路径型远程目标和依赖远端 Cookie/自定义 User-Agent 的资源不进入该管线。
+- 远程 HTTP(S) `.strm` 的 Matroska/WebM 始终使用原生 `<video>`，保持字幕功能改动前的 Direct Play 行为。无论用户是否看到
+  远程字幕元数据，都不启动客户端 Matroska Worker、Range、MSE 或字幕专用连接。
+- 远程内嵌 SRT/ASS/SSA 只有在当前 `<video>` 实际暴露为 `TextTrack` 时才可选；选择只切换原生轨道的 `mode`，不改变媒体 URL、
+  播放会话、tier、进度、心跳或停止语义。浏览器未暴露轨道时显示“浏览器未暴露远程内嵌字幕”，但音视频继续播放。
+- 远程字幕不通过 Range Relay、服务端抽取、ffmpeg、HLS、预抽取、落盘或外挂字幕生成兜底。跨浏览器保证远程内嵌字幕需要另立完整
+  客户端媒体管线 ADR，不能混入普通播放 fallback。
 - PGS/SUP 图形字幕不属于本阶段承诺；完整 ASS/SSA 样式、字幕烧录和 HLS 字幕组另行处理。
 
 ### 14.5 弹幕兼容
@@ -1348,7 +1348,8 @@ locked local value
 - 档位 0 使用原生 Range 直放或现有客户端 fallback；档位 1～4 使用服务端 fMP4/CMAF HLS。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用 Web HLS 播放器。
 - 创建会话时固定媒体源、音频/字幕选择、起播位置和服务端计划；seek 必要时切换会话生成代次，不把客户端任意路径或外部 URL 交给服务端执行。
 - `.strm` 只能返回档位 0；URL/路径型外部代理接管、URL 型 Lux 直连回退或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
-- 内嵌文本字幕是独立于媒体计划的能力：浏览器原生轨道或客户端单次读取只能复用当前媒体资源，不能改变 `.strm` 的 Direct 规则。
+- 内嵌文本字幕是独立于媒体计划的能力：浏览器原生轨道或本地 source-scoped overlay 只能复用当前媒体资源，不能改变 `.strm` 的
+  Direct 规则。远程 HTTP(S) STRM 当前不使用客户端单次读取。
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
 - 不实现 DRM、服务器字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。LUX-212 的浏览器文本 cue
@@ -2052,7 +2053,7 @@ services:
 | LUX-231 | web/src/features/player/PlayerPage.tsx、web/src/features/player/components/player-controls.tsx、web/src/react.css、web/tests/；LuxPlayer 剧集上一集/下一集导航 |
 | LUX-232 | migrations/、migrations-postgres/、src/main.rs、src/storage/、src/application/scanner.rs、src/application/watch.rs、tests/、docs/API.md；数据库生命周期清理与写入膨胀控制 |
 | LUX-234 | src/api/emby_catalog.rs、src/api/playback.rs、tests/strm.rs、tests/web_playback.rs、docs/；通用外部代理的 URL 型 `.strm` 交接 |
-| LUX-235 | docs/LUX-DEVELOPMENT.md、docs/decisions/032-embedded-text-subtitles.md、docs/decisions/035-remote-matroska-client-pipeline.md；远程 Matroska 客户端字幕管线规格 |
+| LUX-235 | docs/LUX-DEVELOPMENT.md、docs/decisions/032-embedded-text-subtitles.md、docs/decisions/035-remote-matroska-client-pipeline.md、docs/decisions/037-remote-strm-native-caption-boundary.md；远程 Matroska 客户端字幕管线历史规格（当前不实施） |
 | LUX-236 | web/src/features/player/matroska-demuxer.ts、web/src/features/player/matroska-range-index.ts、web/tests/matroska-demuxer.test.ts、web/tests/matroska-range-index.test.ts；SeekHead/Cues 和字幕解封装 |
 | LUX-237 | web/src/features/player/matroska-subtitles.ts、web/src/features/player/caption-parser.ts、web/tests/player-caption-parser.test.ts；Matroska 文本字幕与安全 ASS/SSA 样式模型 |
 | LUX-238 | web/src/features/player/components/player-caption-overlay.tsx、web/src/react.css、web/tests/player-caption-overlay.test.tsx；多 cue 和基础样式渲染 |
@@ -2060,7 +2061,7 @@ services:
 | LUX-240 | web/src/features/player/matroska-range-reader.ts、web/src/features/player/mkv-playback-engine.ts、web/src/features/player/mkv-transcode-worker.ts、web/src/features/player/playback-engine.ts、web/tests/mkv-playback-engine.test.ts；Range、缓冲和 Cues seek |
 | LUX-241 | web/src/features/player/components/player-captions.ts、web/src/features/player/components/player-settings-panel.tsx、web/tests/player-captions.test.ts、web/tests/player-components.test.tsx；字符串字幕 ID 和引擎字幕控制器 |
 | LUX-242 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/tests/player-playback.test.tsx、web/tests/player-fallback.test.tsx、web/tests/strm-caption-compatibility.test.tsx；远程管线接入和终止错误策略 |
-| LUX-243 | docs/COMPATIBILITY.md、scripts/player-matroska-smoke.mjs、web/tests/；真实浏览器兼容性阶段门 |
+| LUX-243 | docs/COMPATIBILITY.md、scripts/player-matroska-smoke.mjs、web/tests/；远程 Matroska 客户端管线历史阶段门（当前不实施） |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5290,14 +5291,12 @@ repository 方法或 People 用例。此任务不引入新依赖、不新增端�
 
 本阶段只处理文本字幕（SRT、ASS、SSA）的发现、按需抽取和浏览器侧显示，不处理 PGS/SUP 图形字幕。字幕是附着于
 当前媒体源的独立展示能力：切换字幕不能重新创建播放会话，不能改变 Direct/HLS/fallback 计划、媒体 URL、ACL、进度、
-心跳或停止语义。本阶段的远程字幕能力由 ADR-036 规定：远程 `.strm` 默认保持 Direct Play，只有显式选择 URL 型 HTTP(S)
-Matroska/WebM 文本字幕后才进入客户端单管线；Lux 仍不运行 ffmpeg、不生成外挂字幕，Relay 只提供受播放会话授权的有限 Range
-读取。
+心跳或停止语义。本阶段的远程字幕能力由 ADR-037 规定：远程 `.strm` 始终保持 Direct Play，只有浏览器原生 `<video>` 实际
+暴露的 `TextTrack` 才可用；远程不启动客户端解封装、Range Relay、MSE 或服务端抽取。
 
 浏览器优先级固定为：首先使用实际运行时暴露的 `HTMLVideoElement.textTracks`；本地媒体未暴露内嵌轨时，再从 Lux 已授权的
-source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 默认保持原生播放，显式选择字幕后使用 ADR-036 的客户端单管线，
-其他远程 STRM 仍只尝试原生轨道。ffprobe 的轨道列表只用于索引和能力提示，不能作为浏览器
-一定能读取内嵌轨的证明。
+source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 和其他远程 STRM 始终只尝试原生轨道。ffprobe 的轨道列表只
+用于索引和能力提示，不能作为浏览器一定能读取内嵌轨的证明。
 
 #### LUX-224：内嵌文本字幕规格与 ADR-032
 
@@ -5366,10 +5365,10 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 默
 
 依赖：LUX-225、LUX-226。
 
-#### LUX-228：单次媒体读取字幕解析实验（由 LUX-235 至 LUX-242 取代）
+#### LUX-228：单次媒体读取字幕解析实验（由 ADR-037 关闭）
 
-范围：历史方案已由 LUX-235 至 LUX-242 的正式远程 Matroska 客户端管线取代。本任务保留为决策记录，不单独实施旧的默认关闭
-实验接口。
+范围：历史实验不进入当前运行时。本任务保留为决策记录，不单独实施远程媒体读取或字幕专用连接；当前远程字幕只使用浏览器
+实际暴露的 native `TextTrack`。
 
 验收（历史方案，不再单独执行）：
 
@@ -5382,9 +5381,9 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 默
 
 依赖：LUX-227。
 
-#### LUX-229：本地/远程 `.strm` 字幕兼容性阶段门（由 LUX-243 取代）
+#### LUX-229：本地/远程 `.strm` 字幕兼容性阶段门（由 ADR-037 收敛）
 
-范围：历史阶段门已由 LUX-243 取代。新的兼容性验证使用固定、无个人数据的媒体夹具，分别验证本地媒体、URL 型远程 `.strm`、
+范围：阶段门使用固定、无个人数据的媒体夹具，分别验证本地媒体、URL 型远程 `.strm`、
 路径型远程 `.strm`、浏览器原生轨道、按需
 本地抽取和实验关闭/失败路径。只记录已验证能力，不扩大 `.strm` 播放合同。
 
@@ -5578,18 +5577,14 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 - 不删除 Lux 直接播放 URL 型 `.strm` 的现有 307 回退。
 - 不实现任何第三方代理的路径映射、302 API、缓存、媒体字节代理或转码。
 
-### 阶段 21：远程 STRM Matroska 客户端单管线
+### 阶段 21：远程 STRM 原生播放边界（已由 ADR-037 收敛）
 
-本阶段保留阶段 20 的远程 Direct Play 默认行为，并为用户显式选择字幕的 URL 型 HTTP(S) STRM Matroska/WebM 增加客户端读取：
-主线程经播放会话授权的同源 Range Relay 按顺序读取，Worker 解析 SeekHead、Cues、Tracks 和 Cluster，同时产出 MSE 音视频片段
-以及 S_TEXT/UTF8、S_TEXT/ASS、S_TEXT/SSA cue。字幕不写回媒体、不落盘、不生成外挂文件、不新增字幕端点；`<video>` 仍然是
-MSE 输出和渲染目标。客户端字幕失败必须恢复原生视频。
+阶段 20 的远程 Direct Play 默认行为是当前实现的完整合同：远程 HTTP(S) STRM 始终交给原生 `<video>`，远程内嵌字幕只消费
+浏览器实际暴露的 `TextTrack`。不再实施远程 Matroska 的 Range Relay、Worker 解封装、MSE remux、服务端字幕抽取或字幕专用连接。
+下面 LUX-235 至 LUX-243 保留历史方案和验收背景，均标记为不进入当前运行时；任何未来跨浏览器远程字幕实现必须另立 ADR，且不能
+改变无字幕远程播放路径。
 
-首版视频编码为 H.264、HEVC、VP9、AV1，音频编码为 AAC、AC-3、E-AC-3、Opus。浏览器必须通过实际的
-`MediaSource.isTypeSupported` 组合能力检查；不满足 Relay、Range、有效 SeekHead/Cues、索引边界、codec 或 MSE 条件时，只判定
-远程字幕不可用并恢复原生播放，不切换 Lux HLS 或创建第二条媒体读取管线。
-
-#### LUX-235：远程 Matroska 客户端管线规格与 ADR-035
+#### LUX-235：远程 Matroska 客户端管线规格与 ADR-035（历史，不实施）
 
 范围：更新远程字幕产品合同，新增 ADR-035，标记 ADR-032 的远程部分被取代，并明确 Range、Cues、Worker、MSE、字幕 cue、
 错误终止和安全上限。只改规格和 ADR，不改运行时。
@@ -5606,7 +5601,7 @@ MSE 输出和渲染目标。客户端字幕失败必须恢复原生视频。
 
 依赖：LUX-234。
 
-#### LUX-236：SeekHead/Cues 索引与字幕解封装
+#### LUX-236：SeekHead/Cues 索引与字幕解封装（历史，不实施）
 
 范围：扩展浏览器 Matroska 解封装器，支持 TrackUID、语言、default/forced、BlockGroup、BlockDuration、ReferenceBlock、
 DiscardPadding、SeekHead 和 Cues；不顺序扫描远程文件。
@@ -5621,7 +5616,7 @@ DiscardPadding、SeekHead 和 Cues；不顺序扫描远程文件。
 
 依赖：LUX-235。
 
-#### LUX-237：Matroska 文本字幕与安全 ASS/SSA 样式模型
+#### LUX-237：Matroska 文本字幕与安全 ASS/SSA 样式模型（历史，不实施）
 
 范围：解析字幕样本和 CodecPrivate 全局头，扩展 LuxCaptionCue 为多 cue、layer、位置、对齐和安全文本 runs；SRT/VTT 既有
 行为保持兼容。
@@ -5636,7 +5631,7 @@ DiscardPadding、SeekHead 和 Cues；不顺序扫描远程文件。
 
 依赖：LUX-236。
 
-#### LUX-238：多 cue 和基础 ASS/SSA 覆盖层
+#### LUX-238：多 cue 和基础 ASS/SSA 覆盖层（历史，不实施）
 
 范围：升级字幕 overlay，支持多个同时活动 cue、layer/read-order、对齐定位和校验后的 inline style；生命周期切换时释放旧
 cue 和 Worker。
@@ -5651,7 +5646,7 @@ cue 和 Worker。
 
 依赖：LUX-237。
 
-#### LUX-239：多 codec fMP4 remux
+#### LUX-239：多 codec fMP4 remux（历史，不实施）
 
 范围：扩展 Worker/Muxer 处理 H.264、HEVC、VP9、AV1 与 AAC、AC-3、E-AC-3、Opus，保留 HEVC WASM→H.264 fallback。
 
@@ -5665,7 +5660,7 @@ cue 和 Worker。
 
 依赖：LUX-236。
 
-#### LUX-240：顺序 Range、缓冲和 Cues seek
+#### LUX-240：顺序 Range、缓冲和 Cues seek（历史，不实施）
 
 范围：增加主线程 Range 协调器和 Worker range-request 协议；首段 1 MiB，单次 Range 最大 32 MiB，同代最多一个在途请求；
 实现 10/30 秒前方缓冲、60 秒后方保留和 Cues seek。
@@ -5680,7 +5675,7 @@ cue 和 Worker。
 
 依赖：LUX-239。
 
-#### LUX-241：字幕字符串 ID 与引擎字幕控制器
+#### LUX-241：字幕字符串 ID 与引擎字幕控制器（历史，不实施）
 
 范围：将 `PlayerCaptionOption` 主键从 streamIndex 改为字符串 ID，增加可选 `PlaybackEngine.captionController`，允许运行时
 轨道发布、选择和 cue 订阅；本地 source-scoped 字幕 URL 保持兼容。
@@ -5695,7 +5690,7 @@ cue 和 Worker。
 
 依赖：LUX-238、LUX-240。
 
-#### LUX-242：远程 Matroska 播放接入与终止错误
+#### LUX-242：远程 Matroska 播放接入与终止错误（历史，不实施）
 
 范围：远程 HTTP(S) Matroska 保持原生播放默认；用户显式选择字幕后才进入客户端单管线；将 Relay、Range、索引、codec、MSE、
 解封装失败映射为“远程字幕不可用”，并恢复原生视频。
@@ -5710,7 +5705,7 @@ cue 和 Worker。
 
 依赖：LUX-241。
 
-#### LUX-243：远程 Matroska 兼容性阶段门
+#### LUX-243：远程 Matroska 兼容性阶段门（历史，不实施）
 
 范围：使用固定、无个人数据的 H.264+AAC+SRT、HEVC+E-AC-3+ASS、VP9+Opus+SSA、AV1+AAC+ASS 夹具，记录浏览器、平台、
 请求边界、夹具哈希、实际 codec 能力和性能；更新 `docs/COMPATIBILITY.md`。

@@ -298,14 +298,15 @@ TypeScript 检查和生产构建通过；Rust 定向播放测试 1 个通过，R
 
 | 场景 | 结果 | 证据与边界 |
 |---|---|---|
-| 无字幕选择的远程 HTTP(S) STRM | 自动化通过 | Web 回归断言远程源忽略 `proxyUrl`，使用签名 Lux Direct URL；不启动客户端 MKV/HEVC fallback |
-| 显式选择远程 Matroska SRT/ASS/SSA | 代码路径通过 | 仅 URL 型 HTTP(S) Matroska 文本轨进入同源播放会话 Range Relay；不生成外挂字幕、不落盘、不创建 `/subtitles/...` 请求 |
-| Relay/索引/codec/MSE 失败 | 自动化通过 | 清除选中的远程字幕并保持原生视频，不显示“MSE/播放器引擎失败”；Worker 暴露 SRT 轨后仍保持客户端字幕代次 |
+| 无字幕选择的远程 HTTP(S) STRM | 自动化通过 | Web 回归断言远程源保持原生播放计划并沿用 `proxyUrl`（代理失败才回退签名 Direct）；不启动客户端 MKV/HEVC fallback、Worker、Range 或 MSE |
+| 远程 Matroska SRT/ASS/SSA 无 native track | 自动化通过 | 字幕项显示“浏览器未暴露远程内嵌字幕”并保持原生视频；不创建 `/subtitles/...`、`/range` 或第二条媒体连接 |
+| 远程 Matroska 实际暴露 native `TextTrack` | 代码路径通过 | 只切换原生 track `mode`，不重建播放会话、不改变媒体 URL/tier/进度；不启动客户端解封装 |
 | 线上旧部署回归 | 已定位，待重新部署验证 | Chrome 抓包记录了 `/Videos/.../stream` 的 `401`；修复提交后尚未把新前端/服务端部署回公网站点，因此不宣称线上已恢复 |
 
-本地验证：Web 全量 Node 104/104、Vitest 450/450，`pnpm --dir web build` 通过；Rust `cargo build --locked`、
+本地验证：Web 全量 Node 104/104、Vitest 451/451，`pnpm --dir web build` 通过；Rust `cargo build --locked`、
 `cargo test --locked --all-targets`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和格式检查通过，
-本机架构为 `arm64`。真实站点重新部署后，必须复查无字幕请求签名 Direct、显式字幕的 `/range` 206、无并行原生远程媒体连接，
+本机架构为 `arm64`。真实站点重新部署后，必须复查无字幕和不可用字幕请求均保持签名 Direct/既有 proxy 顺序、没有 `/range` 或字幕端点、
+无并行原生远程媒体连接，
 以及 seek/切换/关闭字幕不重建播放会话。上述结果不外推为 Safari、Firefox 或 NAS/x86_64 性能。
 
 ## Lux Web Chrome 隐私浏览模式 CSRF 兼容性（2026-08-31）
