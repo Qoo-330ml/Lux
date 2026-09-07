@@ -29,7 +29,8 @@ import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
-import { canUseClientMkvCaptionPipeline, isRemoteHttpStrmSource, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -341,10 +342,12 @@ export function PlayerPage() {
       selectedCaptionOption
       && selectedCaptionOption.renderMode === "runtime-overlay",
   );
-  const remoteCaptionPipelineRequested = remoteCaptionRequested && canUseClientMkvCaptionPipeline(source);
   const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
     ? playbackPlan.rangeUrl ?? null
     : null;
+  const remoteCaptionSidecarRequested = remoteCaptionRequested
+    && canUseRemoteMkvCaptionSidecar(source)
+    && Boolean(clientMkvSourceUrl);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
@@ -372,6 +375,7 @@ export function PlayerPage() {
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
   const captionSelectionTouchedRef = useRef(false);
+  const remoteCaptionReaderRef = useRef<RemoteMkvCaptionReader | null>(null);
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
 
@@ -718,12 +722,6 @@ export function PlayerPage() {
           break;
         }
         case "ERROR":
-          if (activeEngine.kind === "client-mkv" && remoteCaptionPipelineRequested) {
-            setCaptionStatus("远程字幕不可用，已恢复视频播放");
-            setFailedStreamUrl(null);
-            setPlaybackFailure(null);
-            break;
-          }
           if (activeEngine.kind === "native" && playbackPlan?.type === "DIRECT") {
             void requestServerFallback(event.error.message);
           } else {
@@ -756,16 +754,9 @@ export function PlayerPage() {
         } else {
           const remoteHttpStrm = remoteHttpSource;
           const useMkvFallback = isMatroskaSource(source)
-            && (remoteCaptionPipelineRequested || !remoteHttpStrm)
-            && Boolean(!remoteCaptionPipelineRequested || clientMkvSourceUrl)
-            ? await shouldUseClientMkv(source, initialEngine.element, {
-              requireCaptionPipeline: remoteCaptionPipelineRequested,
-            })
+            && !remoteHttpStrm
+            ? await shouldUseClientMkv(source, initialEngine.element)
             : false;
-          if (remoteCaptionPipelineRequested && !useMkvFallback) {
-            setCaptionStatus("当前浏览器不支持远程字幕管线，已保持视频播放");
-            return;
-          }
           const useHevcFallback =
             !useMkvFallback
             && !remoteHttpStrm
@@ -813,12 +804,6 @@ export function PlayerPage() {
           );
       } catch (cause) {
         if (!cancelled) {
-          if (remoteCaptionPipelineRequested && remoteHttpSource) {
-            setCaptionStatus("远程字幕不可用，已恢复视频播放");
-            setFailedStreamUrl(null);
-            setPlaybackFailure(null);
-            return;
-          }
           if (runtime.state.status === "FAILED") return;
           if (playbackPlan?.type === "DIRECT") {
             requestServerFallback(cause);
@@ -859,7 +844,7 @@ export function PlayerPage() {
       if (runtimeRef.current === runtime) runtimeRef.current = null;
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
-  }, [clientMkvSourceUrl, playbackKey, playbackPlan?.type, poster, remoteCaptionPipelineRequested, remoteHttpSource, requestServerFallback, source, streamUrl]);
+  }, [playbackKey, playbackPlan?.type, poster, remoteHttpSource, requestServerFallback, source, streamUrl]);
 
   // Fullscreen change listener
   useEffect(() => {
@@ -1014,14 +999,7 @@ export function PlayerPage() {
     if (!option?.available) return;
     setCaptionSourceId(source?.id ?? null);
     setSelectedCaptionId(option.id);
-    const unsupportedRemotePipeline = remoteHttpSource
-      && option.renderMode === "runtime-overlay"
-      && !canUseClientMkvCaptionPipeline(source);
-    setCaptionStatus(option.renderMode === "native-inband"
-      ? null
-      : unsupportedRemotePipeline
-        ? "当前浏览器不支持此媒体的远程字幕管线，视频继续原生播放"
-        : "字幕加载中…");
+    setCaptionStatus(option.renderMode === "native-inband" ? null : "字幕加载中…");
     resetControlsTimeout();
   }, [captionOptions, remoteHttpSource, resetControlsTimeout, source]);
 
@@ -1050,6 +1028,64 @@ export function PlayerPage() {
     };
     setRuntimeCaptionCues((previous) => previous.some((entry) => entry.id === next.id) ? previous : [...previous, next]);
   }, []);
+
+  useEffect(() => {
+    setRuntimeCaptionCues([]);
+    if (
+      !remoteCaptionSidecarRequested
+      || !clientMkvSourceUrl
+      || !selectedCaptionOption
+      || selectedCaptionOption.renderMode !== "runtime-overlay"
+    ) {
+      remoteCaptionReaderRef.current?.destroy();
+      remoteCaptionReaderRef.current = null;
+      return;
+    }
+    let active = true;
+    const reader = new RemoteMkvCaptionReader({
+      source: clientMkvSourceUrl,
+      selection: {
+        id: selectedCaptionOption.id,
+        name: selectedCaptionOption.name,
+        language: selectedCaptionOption.language,
+        format: selectedCaptionOption.format,
+        ordinal: selectedCaptionOption.embeddedOrdinal,
+      },
+      currentTime: () => videoRef.current?.currentTime ?? currentTimeRef.current,
+      onReady: () => {
+        if (active) setCaptionStatus(null);
+      },
+      onCue: (cue) => {
+        if (!active) return;
+        handleRuntimeCaptionCue({
+          trackId: selectedCaptionOption.id,
+          startMs: cue.start * 1000,
+          endMs: cue.end * 1000,
+          text: cue.text,
+          layer: cue.layer,
+          alignment: cue.alignment,
+          position: cue.position,
+          style: cue.style,
+          runs: cue.runs,
+        });
+      },
+      onError: (error) => {
+        if (active) setCaptionStatus(`远程字幕不可用：${error.message}`);
+      },
+    });
+    remoteCaptionReaderRef.current = reader;
+    void reader.start();
+    return () => {
+      active = false;
+      reader.destroy();
+      if (remoteCaptionReaderRef.current === reader) remoteCaptionReaderRef.current = null;
+      setRuntimeCaptionCues([]);
+    };
+  }, [clientMkvSourceUrl, handleRuntimeCaptionCue, playbackKey, remoteCaptionSidecarRequested, selectedCaptionOption?.embeddedOrdinal, selectedCaptionOption?.format, selectedCaptionOption?.id, selectedCaptionOption?.language, selectedCaptionOption?.name, selectedCaptionOption?.renderMode]);
+
+  useEffect(() => {
+    remoteCaptionReaderRef.current?.setTime(currentTime);
+  }, [currentTime]);
 
   const changeCaptionOffset = useCallback((offset: number) => {
     setCaptionOffset(normalizeCaptionOffset(offset));
@@ -1338,7 +1374,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
-        deferNativeSource={isMatroskaSource(source) && (!remoteHttpSource || remoteCaptionPipelineRequested)}
+        deferNativeSource={isMatroskaSource(source) && !remoteHttpSource}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
         title={mediaTitle(media)}

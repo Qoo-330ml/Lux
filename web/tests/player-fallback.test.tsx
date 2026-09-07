@@ -7,12 +7,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
-import { canUseClientMkvCaptionPipeline, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { canUseClientMkvCaptionPipeline, canUseRemoteMkvCaptionSidecar, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 const fallbackState = vi.hoisted(() => ({
   assets: [] as Array<{ workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string }>,
   mkvSources: [] as string[],
+  captionSources: [] as string[],
   mkvFailure: false,
   snapshotDuration: 8 as number | null,
 }));
@@ -26,8 +27,22 @@ vi.mock("../src/features/player/playback-selection", () => ({
       ? rangeUrl
       : null,
   canUseClientMkvCaptionPipeline: vi.fn().mockReturnValue(true),
+  canUseRemoteMkvCaptionSidecar: vi.fn().mockReturnValue(true),
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
+}));
+
+vi.mock("../src/features/player/remote-mkv-caption-reader", () => ({
+  RemoteMkvCaptionReader: class MockRemoteMkvCaptionReader {
+    constructor(options: { source: string; onReady?: () => void }) {
+      fallbackState.captionSources.push(options.source);
+      queueMicrotask(() => options.onReady?.());
+    }
+
+    start() { return Promise.resolve(); }
+    setTime() {}
+    destroy() {}
+  },
 }));
 
 vi.mock("../src/features/player/hevc-playback-engine", () => ({
@@ -92,10 +107,12 @@ describe("PlayerPage client fallback status", () => {
     mockPlaybackBootstrap();
     fallbackState.assets.length = 0;
     fallbackState.mkvSources.length = 0;
+    fallbackState.captionSources.length = 0;
     fallbackState.mkvFailure = false;
     fallbackState.snapshotDuration = 8;
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
     vi.mocked(canUseClientMkvCaptionPipeline).mockReturnValue(true);
+    vi.mocked(canUseRemoteMkvCaptionSidecar).mockReturnValue(true);
     vi.mocked(shouldUseClientMkv).mockResolvedValue(false);
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-fallback",
@@ -300,11 +317,13 @@ describe("PlayerPage client fallback status", () => {
       if (!captionSelect) return;
       captionSelect.value = captionSelect.options[1]?.value ?? "";
       captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     });
-    expect(shouldUseClientMkv).toHaveBeenCalled();
-    expect(vi.mocked(shouldUseClientMkv).mock.calls.at(-1)?.[2]).toEqual({ requireCaptionPipeline: true });
-    expect(container?.textContent).toContain("当前浏览器不支持远程字幕管线");
+    expect(shouldUseClientMkv).not.toHaveBeenCalled();
+    expect(fallbackState.captionSources).toEqual([
+      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
+    ]);
+    expect(container?.textContent).not.toContain("当前浏览器不支持远程字幕管线");
   });
 
   it("reads selected remote embedded captions through the signed session Range URL", async () => {
@@ -367,10 +386,10 @@ describe("PlayerPage client fallback status", () => {
       if (!captionSelect) return;
       captionSelect.value = captionSelect.options[1]?.value ?? "";
       captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
+      await new Promise((resolve) => setTimeout(resolve, 100));
     });
 
-    expect(fallbackState.mkvSources).toEqual([
+    expect(fallbackState.captionSources).toEqual([
       "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
     ]);
   });
@@ -462,7 +481,7 @@ describe("PlayerPage client fallback status", () => {
 
     expect(currentTime).toBe(42);
     expect(playing).toBe(true);
-    expect(play).toHaveBeenCalled();
+    expect(play).not.toHaveBeenCalled();
   });
 
   it("does not turn a remote caption pipeline failure into a playback-engine failure", async () => {
@@ -528,7 +547,8 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
 
-    expect(container.textContent).toContain("远程字幕不可用，已恢复视频播放");
+    expect(container.textContent).not.toContain("播放器引擎失败");
+    expect(fallbackState.mkvSources).toHaveLength(0);
     expect(container.textContent).not.toContain("播放器引擎失败");
     expect(api.stopWebPlaybackSession).not.toHaveBeenCalled();
   });

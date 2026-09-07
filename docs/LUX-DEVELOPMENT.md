@@ -5608,23 +5608,23 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 
 ### 阶段 21：远程 STRM 原生默认与显式字幕单管线
 
-阶段 20 的远程 Direct Play 默认行为继续保留：远程 HTTP(S) STRM 未选择字幕时交给原生 `<video>`。用户明确选择 URL 型 HTTP(S)
-Matroska/WebM 的 SRT/ASS/SSA 后，才通过播放会话签名 `rangeUrl` 启动 `ClientMkvEngine`，由 Worker 解封装同一媒体中的音视频和字幕。
-字幕管线失败只撤销字幕并恢复原生视频；不停止或重建播放会话。当前实现恢复了 LUX-235 至 LUX-242 的显式接入部分，完整 Cues seek
-和跨浏览器阶段门仍需单独完成，不得改变无字幕远程播放路径。
+阶段 20 的远程 Direct Play 默认行为继续保留：远程 HTTP(S) STRM 始终交给原生 `<video>` 负责音视频。用户明确选择 URL 型
+HTTP(S) Matroska/WebM 的 SRT/ASS/SSA 后，才通过播放会话签名 `rangeUrl` 启动字幕旁路读取器，由 JavaScript 解封装 Cue-selected
+Cluster 并交给覆盖层；不切换到 `ClientMkvEngine`，不接管音频/视频。字幕旁路失败只清除字幕状态；不停止或重建播放会话。
+详细决定记录在 ADR-039。
 
 #### LUX-235：远程 Matroska 客户端管线规格与 ADR-035
 
-范围：更新远程字幕产品合同，新增 ADR-035，标记 ADR-032 的远程部分被取代，并明确 Range、Cues、Worker、MSE、字幕 cue、
-错误终止和安全上限。只改规格和 ADR，不改运行时。
+范围：更新远程字幕产品合同，新增 ADR-035，标记 ADR-032 的远程部分被取代，并明确 Range、Cues、字幕旁路、字幕 cue、错误终止和安全上限。
+远程音视频继续由原生 `<video>` 负责，不把 MSE codec 作为字幕可用性的前置条件。只改规格和 ADR，不改运行时。
 
 验收：
 
-- [ ] 规格明确 JS 负责读取/解封装，`<video>` 负责 MSE 输出与渲染；不预抽取、不落盘、不生成外挂字幕；只允许受播放会话签名保护的有限
+- [ ] 规格明确 JS 负责读取/解封装字幕，`<video>` 负责原生音视频输出与渲染；不预抽取、不落盘、不生成外挂字幕；只允许受播放会话签名保护的有限
       Range Relay，不提供通用服务端媒体代理。
 - [ ] 明确 HTTP(S) 范围、单逻辑读取器、顺序 Range、SeekHead/Cues 必须存在，以及失败直接判定不支持的策略。
 - [ ] 明确支持的 Matroska TrackType、文本字幕 codec、音视频 codec、基础 ASS/SSA 样式、内存/元素上限和错误脱敏边界。
-- [ ] ADR-032 保留本地字幕和 native TextTrack 决定；远程显式字幕接入和原生默认以 ADR-038 为准。
+- [ ] ADR-032 保留本地字幕和 native TextTrack 决定；远程显式字幕接入和原生默认以 ADR-039 为准。
 
 验证：`git diff --check`，人工审阅规格和 ADR。
 
@@ -5707,7 +5707,8 @@ cue 和 Worker。
 #### LUX-241：字幕字符串 ID 与引擎字幕控制器
 
 范围：将 `PlayerCaptionOption` 主键从 streamIndex 改为字符串 ID，增加可选 `PlaybackEngine.captionController`，允许运行时
-轨道发布、选择和 cue 订阅；本地 source-scoped 字幕 URL 保持兼容。
+轨道发布、选择和 cue 订阅；本地 source-scoped 字幕 URL 保持兼容。远程原生音视频字幕由 ADR-039 的旁路读取器直接发布 cue，
+不要求切换 `PlaybackEngine`。
 
 验收：
 
@@ -5721,13 +5722,13 @@ cue 和 Worker。
 
 #### LUX-242：远程 Matroska 播放接入与终止错误
 
-范围：远程 HTTP(S) Matroska 保持原生播放默认；用户显式选择字幕后才进入客户端单管线；将 Relay、Range、索引、codec、MSE、
-解封装失败映射为“远程字幕不可用”，并恢复原生视频。
+范围：远程 HTTP(S) Matroska 始终保持原生音视频播放；用户显式选择字幕后才进入字幕旁路；将 Relay、Range、索引和字幕解封装失败映射为
+“远程字幕不可用”，不切换 MSE、不销毁引擎、不恢复或重建媒体。
 
 验收：
 
-- [ ] 远程 Matroska 无字幕选择时保持 native `<video>`；选择远程文本字幕后才进入客户端管线。
-- [ ] 客户端字幕管线失败恢复原生视频，不触发 HLS、字幕端点或第二条媒体连接；错误消息不包含完整 URL、令牌、Cookie 或媒体内容。
+- [ ] 远程 Matroska 无字幕选择时保持 native `<video>`；选择远程文本字幕后只启动签名 Range 字幕旁路。
+- [ ] 字幕旁路失败只清除字幕，不触发 HLS、字幕端点、MSE 或播放器引擎失败；错误消息不包含完整 URL、令牌、Cookie 或媒体内容。
 - [ ] 远程字幕切换、暂停、seek、停止和页面离开均不重建播放会话。
 
 验证：Web 播放、fallback、STRM 字幕兼容性测试和真实浏览器 network/console 检查。

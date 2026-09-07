@@ -39,6 +39,13 @@ export type MatroskaRangeIndex = {
   cues: MatroskaCue[];
 };
 
+export type MatroskaIndexMetadata = {
+  segmentOffset: number;
+  segmentDataOffset: number;
+  segmentEnd: number | null;
+  cuesOffset: number;
+};
+
 export class MatroskaIndexError extends Error {
   constructor(message: string) {
     super(message);
@@ -68,32 +75,65 @@ type Element = { id: number; start: number; dataStart: number; dataEnd: number; 
 
 export function parseMatroskaRangeIndex(data: Uint8Array, totalLength = data.byteLength, videoTrack?: number): MatroskaRangeIndex {
   if (totalLength < data.byteLength) throw new MatroskaIndexError("Matroska 索引长度不一致");
-  const segment = findElement(data, 0, data.byteLength, IDS.segment);
+  const metadata = locateMatroskaIndex(data, totalLength);
+  const cuesOffset = metadata.cuesOffset;
+  const cues = findElement(data, cuesOffset, data.byteLength, IDS.cues);
+  if (!cues || cues.dataEnd > totalLength) throw new MatroskaIndexError("Cues 尚未完整读取");
+  if (cues.dataEnd - cues.dataStart > MAX_METADATA_BYTES) throw new MatroskaIndexError("Cues 元数据超限");
+  const parsed = parseCues(data, cues.dataStart, cues.dataEnd, metadata.segmentDataOffset, totalLength, videoTrack);
+  if (parsed.length === 0) throw new MatroskaIndexError("Cues 不包含关键帧位置");
+  return {
+    ...metadata,
+    cuesOffset,
+    cuesEnd: cues.end,
+    cues: parsed,
+  };
+}
+
+/** Locates the Segment-relative Cues position from a bounded metadata range. */
+export function locateMatroskaIndex(data: Uint8Array, totalLength = data.byteLength): MatroskaIndexMetadata {
+  const segment = findElement(data, 0, data.byteLength, IDS.segment, 0, true);
   if (!segment) throw new MatroskaIndexError("Matroska 缺少 Segment");
   const segmentEnd = segment.unknown ? null : segment.dataEnd;
-  const seekHead = findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead);
+  const seekHead = findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead, true);
   if (!seekHead) throw new MatroskaIndexError("Matroska 缺少有效 SeekHead");
   if (seekHead.dataEnd - seekHead.dataStart > MAX_METADATA_BYTES) throw new MatroskaIndexError("SeekHead 元数据超限");
-  const seekEntries = parseSeekHead(data, seekHead.dataStart, seekHead.dataEnd);
-  const cuesPosition = seekEntries.find((entry) => entry.id === IDS.cues)?.position;
+  const cuesPosition = parseSeekHead(data, seekHead.dataStart, seekHead.dataEnd, true).find((entry) => entry.id === IDS.cues)?.position;
   if (cuesPosition === undefined) throw new MatroskaIndexError("SeekHead 缺少 Cues 位置");
   const cuesOffset = segment.dataStart + cuesPosition;
   if (!Number.isSafeInteger(cuesOffset) || cuesOffset < segment.dataStart || cuesOffset >= totalLength) {
     throw new MatroskaIndexError("Cues 偏移越界");
   }
-  const cues = findElement(data, cuesOffset, data.byteLength, IDS.cues);
-  if (!cues || cues.dataEnd > totalLength) throw new MatroskaIndexError("Cues 尚未完整读取");
-  if (cues.dataEnd - cues.dataStart > MAX_METADATA_BYTES) throw new MatroskaIndexError("Cues 元数据超限");
-  const parsed = parseCues(data, cues.dataStart, cues.dataEnd, segment.dataStart, totalLength, videoTrack);
-  if (parsed.length === 0) throw new MatroskaIndexError("Cues 不包含关键帧位置");
   return {
     segmentOffset: segment.start,
     segmentDataOffset: segment.dataStart,
     segmentEnd,
     cuesOffset,
-    cuesEnd: cues.end,
-    cues: parsed,
   };
+}
+
+/** Parses a Cues element fetched as a separate absolute Range. */
+export function parseMatroskaCuesRange(
+  data: Uint8Array,
+  rangeStart: number,
+  totalLength: number,
+  metadata: MatroskaIndexMetadata,
+  videoTrack?: number,
+) {
+  if (!Number.isSafeInteger(rangeStart) || rangeStart < 0 || rangeStart > metadata.cuesOffset) {
+    throw new MatroskaIndexError("Cues Range 起点无效");
+  }
+  const localOffset = metadata.cuesOffset - rangeStart;
+  const cues = findElement(data, localOffset, data.byteLength, IDS.cues);
+  if (!cues || cues.dataEnd > data.byteLength) throw new MatroskaIndexError("Cues 尚未完整读取");
+  if (cues.dataEnd - cues.dataStart > MAX_METADATA_BYTES) throw new MatroskaIndexError("Cues 元数据超限");
+  const parsed = parseCues(data, cues.dataStart, cues.dataEnd, metadata.segmentDataOffset, totalLength, videoTrack);
+  if (parsed.length === 0) throw new MatroskaIndexError("Cues 不包含关键帧位置");
+  return {
+    ...metadata,
+    cuesEnd: rangeStart + cues.end,
+    cues: parsed,
+  } satisfies MatroskaRangeIndex;
 }
 
 export function cueForTime(index: MatroskaRangeIndex, timecode: number, track: number) {

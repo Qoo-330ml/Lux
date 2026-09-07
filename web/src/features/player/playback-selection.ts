@@ -162,6 +162,21 @@ export function canUseClientMkvCaptionPipeline(source: MediaSource | undefined) 
   return hasClientMkvH264Audio(source);
 }
 
+/**
+ * Remote Matroska captions can be read without remuxing the media.  Keep this
+ * capability independent from the MSE codec pair: native playback remains in
+ * charge of audio/video (including E-AC-3), while the caption sidecar only
+ * needs a signed Range URL and a supported text track.
+ */
+export function canUseRemoteMkvCaptionSidecar(source: MediaSource | undefined) {
+  if (!source || !isRemoteHttpStrmSource(source) || !isMatroskaContainer(source.container)) return false;
+  return (source.streams ?? []).some((stream) => {
+    if (stream.isExternal === true || (stream.type ?? "").toUpperCase() !== "SUBTITLE") return false;
+    const codec = (stream.codec ?? "").trim().toLowerCase();
+    return codec === "srt" || codec === "subrip" || codec === "ass" || codec === "ssa";
+  });
+}
+
 async function probeClientHevc(
   source: MediaSource,
   video: HTMLVideoElement,

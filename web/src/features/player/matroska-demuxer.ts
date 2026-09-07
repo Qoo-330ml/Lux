@@ -103,6 +103,11 @@ export type MatroskaStreamCallbacks = {
   onError?: (error: Error) => void;
 };
 
+export type MatroskaStreamOptions = {
+  tracks?: readonly MatroskaTrack[];
+  timecodeScale?: number;
+};
+
 type Element = { id: number; start: number; dataStart: number; dataEnd: number; end: number };
 
 export function parseMatroska(data: Uint8Array): MatroskaFile {
@@ -135,8 +140,12 @@ export class MatroskaStreamDemuxer {
   private pendingBlockGroup: { data: Uint8Array; durationMs: number | null; reference: boolean; discardPaddingNs?: number } | null = null;
   private readonly decodeOrders = new Map<number, number>();
 
-  constructor(callbacks: MatroskaStreamCallbacks) {
+  constructor(callbacks: MatroskaStreamCallbacks, options: MatroskaStreamOptions = {}) {
     this.callbacks = callbacks;
+    options.tracks?.forEach((track) => this.tracks.set(track.number, track));
+    if (Number.isFinite(options.timecodeScale) && (options.timecodeScale ?? 0) > 0) {
+      this.timecodeScale = options.timecodeScale as number;
+    }
     this.decoder = new Decoder();
     this.decoder.on("data", (chunk) => this.consume(chunk[0], chunk[1]));
     this.decoder.on("error", (error) => callbacks.onError?.(error));

@@ -25,6 +25,8 @@ export type PlayerCaptionOption = {
   format?: CaptionFormat;
   renderMode?: PlayerCaptionRenderMode;
   runtimeTrackId?: string;
+  /** Ordinal among supported embedded text tracks, used to match a Matroska TrackEntry. */
+  embeddedOrdinal?: number;
 };
 
 export type PlayerNativeCaptionTrack = {
@@ -49,7 +51,8 @@ export function playerCaptionOptions(
     .filter((stream): stream is MediaStream & { index: number } => Number.isInteger(stream.index) && stream.index >= 0)
     .map((stream) => {
       const format = captionFormat(stream);
-      const runtimeTrack = !stream.isExternal && format ? runtimeTracks[embeddedTextOrdinal++] : undefined;
+      const embeddedOrdinal = !stream.isExternal && format ? embeddedTextOrdinal++ : undefined;
+      const runtimeTrack = embeddedOrdinal === undefined ? undefined : runtimeTracks[embeddedOrdinal];
       const runtimeMatroskaTrack = runtimeTrack && isMatroskaRuntimeTrack(runtimeTrack.id);
       const remoteRuntimeCandidate = !runtimeTrack
         && source?.sourceKind === "STRM_URL"
@@ -83,6 +86,7 @@ export function playerCaptionOptions(
         format,
         renderMode,
         runtimeTrackId: runtimeTrack?.id,
+        embeddedOrdinal,
       };
     });
 }

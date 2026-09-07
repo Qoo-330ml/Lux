@@ -22,6 +22,8 @@ export class MatroskaRangeReader {
   private readonly initialBytes: number;
   private readonly maxRangeBytes: number;
   private readonly credentials: RequestCredentials;
+  private totalLength: number | null = null;
+  private etag: string | null = null;
 
   constructor(
     private readonly source: string,
@@ -37,24 +39,39 @@ export class MatroskaRangeReader {
 
   async *chunks(signal?: AbortSignal): AsyncGenerator<{ data: Uint8Array; range: MatroskaRangeResponse }, void, void> {
     let start = 0;
-    let total: number | null = null;
-    let etag: string | null = null;
     let first = true;
-    while (total === null || start < total) {
+    while (this.totalLength === null || start < this.totalLength) {
       const requestedEnd = Math.min(
-        (total ?? Number.MAX_SAFE_INTEGER) - 1,
+        (this.totalLength ?? Number.MAX_SAFE_INTEGER) - 1,
         start + (first ? this.initialBytes : this.maxRangeBytes) - 1,
       );
-      const result = await this.fetchRange(start, requestedEnd, signal);
-      if (total === null) total = result.range.total;
-      if (result.range.total !== total) throw new MatroskaRangeError("远程媒体长度发生变化");
-      if (etag !== null && result.range.etag !== etag) throw new MatroskaRangeError("远程媒体 ETag 发生变化");
-      etag ??= result.range.etag;
+      const result = await this.readRange(start, requestedEnd, signal);
       yield result;
       start = result.range.end + 1;
       first = false;
-      if (result.range.end < result.range.start || start > total) throw new MatroskaRangeError("远程媒体 Range 边界无效");
+      if (result.range.end < result.range.start || this.totalLength === null || start > this.totalLength) {
+        throw new MatroskaRangeError("远程媒体 Range 边界无效");
+      }
     }
+  }
+
+  async readRange(start: number, end: number, signal?: AbortSignal) {
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) {
+      throw new MatroskaRangeError("远程媒体 Range 边界无效");
+    }
+    if (end - start + 1 > this.maxRangeBytes) throw new MatroskaRangeError("远程媒体 Range 超过单次上限");
+    const requestedEnd = this.totalLength === null ? end : Math.min(end, this.totalLength - 1);
+    if (requestedEnd < start) throw new MatroskaRangeError("远程媒体 Range 超出资源长度");
+    const result = await this.fetchRange(start, requestedEnd, signal);
+    if (this.totalLength === null) this.totalLength = result.range.total;
+    if (result.range.total !== this.totalLength) throw new MatroskaRangeError("远程媒体长度发生变化");
+    if (this.etag !== null && result.range.etag !== this.etag) throw new MatroskaRangeError("远程媒体 ETag 发生变化");
+    this.etag ??= result.range.etag;
+    return result;
+  }
+
+  get total() {
+    return this.totalLength;
   }
 
   private async fetchRange(start: number, requestedEnd: number, signal?: AbortSignal) {
