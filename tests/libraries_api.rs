@@ -1501,9 +1501,14 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(searched.status(), reqwest::StatusCode::OK);
     let searched_body: Value = searched.json().await?;
-    assert_eq!(searched_body["total"], 2, "unexpected plan search response: {searched_body}");
+    assert_eq!(
+        searched_body["total"], 2,
+        "unexpected plan search response: {searched_body}"
+    );
     assert!(searched_body["plans"].as_array().is_some_and(|plans| {
-        plans.iter().any(|plan| plan["name"] == "电影与剧集夜间校验")
+        plans
+            .iter()
+            .any(|plan| plan["name"] == "电影与剧集夜间校验")
             && plans.iter().any(|plan| plan["name"] == "元数据刮削")
     }));
 
@@ -1521,9 +1526,7 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
         .ok_or("missing created plan id")?
         .to_owned();
     let moved = client
-        .post(format!(
-            "{base_url}/api/v1/admin/scheduled-task-plans"
-        ))
+        .post(format!("{base_url}/api/v1/admin/scheduled-task-plans"))
         .header(COOKIE, &cookies)
         .header("x-csrf-token", &csrf)
         .json(&json!({

@@ -69,13 +69,8 @@ impl Database {
                 && existing_source_type == source_type
                 && existing_plugin_id.as_deref() == plugin_id
             {
-                self.remove_library_from_other_task_plans(
-                    transaction,
-                    library_id,
-                    task_type,
-                    &id,
-                )
-                .await?;
+                self.remove_library_from_other_task_plans(transaction, library_id, task_type, &id)
+                    .await?;
                 return Ok(LibraryTaskPlanAssignment {
                     id,
                     task_name,
@@ -2781,11 +2776,8 @@ impl Database {
 #[cfg(test)]
 mod scheduled_task_plan_mirror_tests {
     use super::*;
-    use crate::{
-        application::libraries::LibraryService,
-        library::LibraryKind,
-    };
     use crate::config::Config;
+    use crate::{application::libraries::LibraryService, library::LibraryKind};
 
     async fn test_database() -> (tempfile::TempDir, Database) {
         let temp_dir = tempfile::tempdir().expect("temporary database directory should exist");
@@ -2974,6 +2966,9 @@ mod scheduled_task_plan_mirror_tests {
         assert_eq!(mirror.0, "chapter-custom-plan");
         assert_eq!(mirror.1.as_deref(), Some("0 4 * * 6"));
         assert_eq!(mirror.2, 1);
-        assert_eq!(mirror.3, r#"{"concurrency":8,"introWindowSeconds":180,"creditsWindowSeconds":180,"matchThreshold":90}"#);
+        assert_eq!(
+            mirror.3,
+            r#"{"concurrency":8,"introWindowSeconds":180,"creditsWindowSeconds":180,"matchThreshold":90}"#
+        );
     }
 }
