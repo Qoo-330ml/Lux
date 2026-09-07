@@ -51,10 +51,21 @@ describe("webPlaybackCapabilities", () => {
       id: "remote-mixed-audio",
       sourceKind: "STRM_URL",
       streams: [
-        { index: 1, type: "AUDIO", codec: "EAC3" },
-        { index: 2, type: "AUDIO", codec: "AAC" },
+        { index: 1, type: "AUDIO", codec: "EAC3", isDefault: false },
+        { index: 2, type: "AUDIO", codec: "AAC", isDefault: true },
       ],
     })).toBeNull();
+  });
+
+  it("warns when an unsupported default audio track precedes a compatible secondary track", () => {
+    expect(remoteAudioCodecWarning({
+      id: "remote-default-eac3",
+      sourceKind: "STRM_URL",
+      streams: [
+        { index: 1, type: "AUDIO", codec: "EAC3", isDefault: true },
+        { index: 2, type: "AUDIO", codec: "AAC", isDefault: false },
+      ],
+    })).toContain("没有声音");
   });
 
   it("keeps the caption error and audio warning visible together", () => {

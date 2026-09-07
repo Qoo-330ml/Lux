@@ -1562,14 +1562,10 @@ function isMatroskaSource(source: MediaSource | undefined) {
 
 export function remoteAudioCodecWarning(source: MediaSource | undefined) {
   if (source?.sourceKind !== "STRM_URL") return null;
-  const audioCodecs = (source.streams ?? [])
-    .filter((stream) => stream.type?.toUpperCase() === "AUDIO")
-    .map((stream) => stream.codec?.trim().toLowerCase())
-    .filter((codec): codec is string => Boolean(codec));
-  // A browser-compatible secondary track is enough for native playback to
-  // retain sound even when the first/default Matroska track is AC-3/E-AC-3.
-  if (audioCodecs.some((codec) => /^(aac|mp4a)(?:\.|$)/u.test(codec) || codec === "opus")) return null;
-  const codec = audioCodecs[0];
+  const audioStreams = (source.streams ?? []).filter((stream) => stream.type?.toUpperCase() === "AUDIO");
+  const selectedAudio = audioStreams.find((stream) => stream.isDefault === true) ?? audioStreams[0];
+  const codec = selectedAudio?.codec?.trim().toLowerCase();
+  if (codec && (/^(aac|mp4a)(?:\.|$)/u.test(codec) || codec === "opus")) return null;
   if (!codec || !["ac3", "ac-3", "eac3", "ec-3"].includes(codec)) return null;
   const video = typeof document === "undefined" ? null : document.createElement("video");
   if (supportsMp4Codec(video, "audio", codec)) return null;
