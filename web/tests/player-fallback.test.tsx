@@ -21,6 +21,7 @@ const fallbackState = vi.hoisted(() => ({
 vi.mock("../src/features/player/playback-selection", () => ({
   isRemoteHttpStrmSource: (source: { sourceKind?: string; externalUrl?: string }) =>
     source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? ""),
+  hasClientHevcRuntime: vi.fn().mockReturnValue(false),
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
 }));

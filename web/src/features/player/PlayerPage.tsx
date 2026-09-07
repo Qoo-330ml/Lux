@@ -30,7 +30,8 @@ import type { LuxCaptionCue } from "./caption-parser";
 import { ChromeCaptionExtension, ChromeMediaExtension } from "./chrome-caption-extension";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
-import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { hasClientHevcRuntime, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { classifyChromeExtensionMedia } from "./chrome-media-codec";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -107,34 +108,38 @@ function screenshotFileName(title: string) {
   return `${normalized || "lux-screenshot"}-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
 }
 
-function hasExtensionCompatibleAudio(source: MediaSource | undefined) {
-  const audioTracks = source?.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
-  return audioTracks.every((stream) => /^(?:aac|mp4a)(?:\.|$)/iu.test(stream.codec ?? "")
-    || (stream.codec ?? "").trim().toLowerCase() === "opus"
-    || /^(?:ac3|ac-3|eac3|ec-3)$/iu.test((stream.codec ?? "").trim()));
-}
-
 function remoteMediaNeedsExtension(source: MediaSource | undefined, video: HTMLVideoElement) {
-  if (!source || !isMatroskaSource(source) || !hasExtensionCompatibleAudio(source)) return false;
-  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? "";
-  const audioCodecs = source.streams
-    ?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO")
-    .map((stream) => stream.codec ?? "")
-    .filter(Boolean) ?? [];
-  if (!videoCodec) return false;
-  const unsupportedAudio = source.streams
-    ?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO")
-    .some((stream) => /^(?:ac3|ac-3|eac3|ec-3)$/iu.test((stream.codec ?? "").trim())
-      && video.canPlayType(`audio/mp4; codecs="${stream.codec}"`) === "");
-  if (unsupportedAudio) return true;
-  const mime = `video/x-matroska; codecs="${[videoCodec, ...audioCodecs].join(",")}"`;
-  return video.canPlayType(mime) === "";
+  if (!source || !isMatroskaSource(source)) return false;
+  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? null;
+  const audioCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "AUDIO")?.codec ?? null;
+  const matroskaCodecs = [videoCodec, audioCodec].filter((codec): codec is string => Boolean(codec));
+  const matroskaMime = `video/x-matroska; codecs="${matroskaCodecs.join(",")}"`;
+  const nativeMseSupported = supportsMp4Codec(video, "video", videoCodec ?? "")
+    && (!audioCodec || supportsMp4Codec(video, "audio", audioCodec));
+  // Keep the native path safe when an older test/runtime shim does not expose
+  // the optional HEVC capability probe yet. A missing probe is not evidence
+  // that software decoding is available, so it must never trigger extension
+  // playback or turn a working native session into an engine error.
+  const hevcWasmAvailable = typeof hasClientHevcRuntime === "function"
+    ? hasClientHevcRuntime()
+    : false;
+  const capability = classifyChromeExtensionMedia({
+    videoCodec,
+    audioCodec,
+    nativeMseSupported,
+    hevcWasmAvailable,
+    h264OutputSupported: hevcWasmAvailable,
+    eac3WasmAvailable: true,
+  });
+  const audioNeedsSoftware = capability.audio === "eac3-wasm";
+  return capability.supported
+    && capability.requiresExtension
+    && (audioNeedsSoftware || video.canPlayType(matroskaMime) === "");
 }
 
 function hasChromeExtensionRuntime() {
-  if (typeof document !== "undefined" && document.documentElement?.getAttribute("data-lux-media-extension") === "1") return true;
-  const browserWindow = typeof window === "undefined" ? null : window as Window & { chrome?: { runtime?: unknown } };
-  return Boolean(browserWindow?.chrome?.runtime);
+  return typeof document !== "undefined"
+    && document.documentElement?.getAttribute("data-lux-media-extension") === "1";
 }
 
 export function webPlaybackCapabilities(
@@ -791,7 +796,6 @@ export function PlayerPage() {
           const useExtensionMedia = remoteHttpStrm
             && isMatroskaSource(source)
             && extensionCaptionSourceUrl.length > 0
-            && hasExtensionCompatibleAudio(source)
             && remoteMediaNeedsExtension(source, initialEngine.element)
             && hasChromeExtensionRuntime()
             && typeof ChromeMediaExtension === "function";
