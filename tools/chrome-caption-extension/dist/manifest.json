@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Lux Remote Matroska Captions",
-  "version": "0.3.9",
-  "description": "让 Lux 在不转发媒体字节的情况下读取远程 Matroska 内嵌文本字幕。",
+  "name": "Lux Remote Matroska Media",
+  "version": "0.4.0",
+  "description": "让 Lux 在不转发媒体字节的情况下播放远程 Matroska 音视频并读取内嵌文本字幕。",
   "host_permissions": ["http://*/*", "https://*/*"],
   "background": { "service_worker": "service-worker.js" },
   "content_scripts": [{

@@ -15,6 +15,8 @@ import { parseMatroskaSubtitleSample } from "../../../web/src/features/player/ma
 
 const PAGE_SOURCE = "lux-caption-page";
 const EXTENSION_SOURCE = "lux-caption-extension";
+const MEDIA_PAGE_SOURCE = "lux-media-page";
+const MEDIA_EXTENSION_SOURCE = "lux-media-extension";
 const PROTOCOL_VERSION = 1;
 const INITIAL_RANGE_BYTES = 1 * 1024 * 1024;
 const HEADER_RETRY_BYTES = 8 * 1024 * 1024;
@@ -42,12 +44,30 @@ type PageMessage = {
   time?: number;
 };
 
+type MediaPageMessage = {
+  source: string;
+  version: number;
+  type: "hello" | "start" | "read-range" | "stop";
+  sessionId: string;
+  mediaUrl?: string;
+  requestId?: string;
+  start?: number;
+  end?: number;
+};
+
 const sessions = new Map<string, CaptionSession>();
+const mediaSessions = new Map<string, { sourceUrl: string }>();
+const mediaRequests = new Map<string, AbortController>();
 
 chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
-  const message = rawMessage as PageMessage;
+  const message = rawMessage as PageMessage | MediaPageMessage;
   const tabId = sender.tab?.id;
-  if (tabId === undefined || message.source !== PAGE_SOURCE || message.version !== PROTOCOL_VERSION || typeof message.sessionId !== "string") return;
+  if (tabId === undefined || message.version !== PROTOCOL_VERSION || typeof message.sessionId !== "string") return;
+  if (message.source === MEDIA_PAGE_SOURCE) {
+    void handleMediaMessage(message as MediaPageMessage, tabId, sender.tab?.url, sendResponse);
+    return true;
+  }
+  if (message.source !== PAGE_SOURCE) return;
   if (message.type === "hello") {
     sendResponse({ source: EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "ready", sessionId: message.sessionId });
     return;
@@ -77,7 +97,79 @@ chrome.tabs.onRemoved.addListener((tabId) => {
       sessions.delete(key);
     }
   }
+  for (const [key] of mediaSessions) {
+    if (key.startsWith(`${tabId}:`)) mediaSessions.delete(key);
+  }
+  for (const [key, controller] of mediaRequests) {
+    if (key.startsWith(`${tabId}:`)) {
+      controller.abort();
+      mediaRequests.delete(key);
+    }
+  }
 });
+
+async function handleMediaMessage(
+  message: MediaPageMessage,
+  tabId: number,
+  pageUrl: string | undefined,
+  sendResponse: (response?: unknown) => void,
+) {
+  const key = sessionKey(tabId, message.sessionId);
+  if (message.type === "hello") {
+    sendResponse({ source: MEDIA_EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "ready", sessionId: message.sessionId });
+    return;
+  }
+  if (message.type === "start" && isSafeMediaUrl(message.mediaUrl) && isPageScopedUrl(message.mediaUrl, pageUrl)) {
+    mediaSessions.set(key, { sourceUrl: message.mediaUrl });
+    sendResponse({ source: MEDIA_EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "started", sessionId: message.sessionId });
+    return;
+  }
+  if (message.type === "read-range" && typeof message.requestId === "string"
+    && Number.isSafeInteger(message.start) && Number.isSafeInteger(message.end)) {
+    const session = mediaSessions.get(key);
+    if (!session || message.start === undefined || message.end === undefined
+      || message.start < 0 || message.end < message.start || message.end - message.start + 1 > MAX_CLUSTER_RANGE_BYTES) {
+      sendResponse({ source: MEDIA_EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "error", sessionId: message.sessionId, message: "扩展媒体会话或 Range 无效" });
+      return;
+    }
+    try {
+      const requestKey = `${key}:${message.requestId}`;
+      const controller = new AbortController();
+      mediaRequests.set(requestKey, controller);
+      const range = await readRange(session.sourceUrl, message.start, message.end, controller.signal);
+      const data = range.data.slice().buffer;
+      sendResponse({
+        source: MEDIA_EXTENSION_SOURCE,
+        version: PROTOCOL_VERSION,
+        type: "range",
+        sessionId: message.sessionId,
+        requestId: message.requestId,
+        start: range.start,
+        end: range.end,
+        total: range.total,
+        etag: range.etag,
+        data,
+      });
+    } catch (error) {
+      sendResponse({ source: MEDIA_EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "error", sessionId: message.sessionId, requestId: message.requestId, message: error instanceof Error ? error.message : String(error) });
+    } finally {
+      mediaRequests.delete(`${key}:${message.requestId}`);
+    }
+    return;
+  }
+  if (message.type === "stop") {
+    mediaSessions.delete(key);
+    for (const [requestKey, controller] of mediaRequests) {
+      if (requestKey.startsWith(`${key}:`)) {
+        controller.abort();
+        mediaRequests.delete(requestKey);
+      }
+    }
+    sendResponse({ ok: true });
+    return;
+  }
+  sendResponse({ source: MEDIA_EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "error", sessionId: message.sessionId, message: "扩展媒体消息无效" });
+}
 
 class CaptionSession {
   private readonly abortController = new AbortController();
@@ -279,7 +371,7 @@ async function readRange(url: string, start: number, end: number, signal: AbortS
   const data = new Uint8Array(await response.arrayBuffer());
   const responseEnd = Number(match[2]);
   if (data.byteLength !== responseEnd - start + 1) throw new Error("远程媒体 Range 长度不一致");
-  return { data, start, end: responseEnd, total: Number(match[3]) };
+  return { data, start, end: responseEnd, total: Number(match[3]), etag: response.headers.get("etag") };
 }
 
 function isSupportedSubtitleTrack(track: MatroskaTrack) {
