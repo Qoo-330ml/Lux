@@ -1,4 +1,5 @@
 import { FMP4Muxer, H264Encoder, HEVCDecoder, type HEVCFrame, type MuxerSample } from "@hevcjs/core";
+import { decoder as createEac3Decoder } from "@audio/decode-eac3";
 import { Box, createFile, DataStream, ISOFile } from "mp4box";
 import processPolyfill from "process";
 import type { MatroskaSample, MatroskaStreamDemuxer, MatroskaTrack } from "./matroska-demuxer";
@@ -7,7 +8,7 @@ import { addMatroskaVideoTrack, concatBuffers, hevcCodecString, makeAacEsdsData,
 import { encodedVideoDurationTicks, isSupportedMatroskaVideo, matroskaAudioConfig, matroskaSampleRoute, toAnnexB } from "./mkv-transcode";
 
 type WorkerMessage =
-  | { type: "init"; wasmUrl: string; wasmBinaryUrl: string; mode?: "sdr" | "hevc-remux" }
+  | { type: "init"; wasmUrl: string; wasmBinaryUrl: string; mode?: "sdr" | "hevc-remux"; softwareAudio?: boolean }
   | { type: "data"; data: ArrayBuffer }
   | { type: "flush" }
   | { type: "destroy" };
@@ -18,6 +19,7 @@ type WorkerResponse =
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
   | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean; ordinal: number }
   | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
+  | { type: "audio-pcm"; timestampMs: number; durationMs: number; sampleRate: number; channels: ArrayBuffer[] }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -44,6 +46,8 @@ let sampleChain = Promise.resolve();
 let fatalError: Error | null = null;
 let initialized = false;
 let remuxMode = false;
+let softwareAudio = false;
+let eac3Decoder: Awaited<ReturnType<typeof createEac3Decoder>> | null = null;
 let remuxFile: RemuxFile | null = null;
 let remuxVideoTrackId: number | null = null;
 let remuxAudioTrackId: number | null = null;
@@ -77,6 +81,7 @@ async function initialize(message: Extract<WorkerMessage, { type: "init" }>) {
   destroy();
   (globalThis as typeof globalThis & { process?: unknown }).process ??= processPolyfill;
   remuxMode = message.mode === "hevc-remux";
+  softwareAudio = message.softwareAudio === true;
   if (!remuxMode) {
     decoder = await HEVCDecoder.create({ wasmUrl: message.wasmUrl, wasmBinaryUrl: message.wasmBinaryUrl });
     muxer = new FMP4Muxer();
@@ -154,6 +159,10 @@ async function consumeSample(sample: MatroskaSample) {
   if (!track) return;
   if (track.type === "audio") {
     if (!audioConfig || !audioTrack?.sampleRate) return;
+    if (softwareAudio && (audioConfig.codec === "ac-3" || audioConfig.codec === "ec-3")) {
+      await consumeSoftwareAudio(sample);
+      return;
+    }
     if (audioConfig.codec !== "mp4a.40.2") throw new Error("当前客户端路径不支持 AC-3/E-AC-3 音频");
     pendingAudio.push({
       timestampMs: sample.timestampMs,
@@ -253,6 +262,10 @@ async function consumeRemuxSample(sample: MatroskaSample) {
     pendingRemuxSamples = [];
     for (const pendingSample of pending) await consumeRemuxSample(pendingSample);
   }
+  if (track.type === "audio" && softwareAudio && (audioConfig?.codec === "ac-3" || audioConfig?.codec === "ec-3")) {
+    await consumeSoftwareAudio(sample);
+    return;
+  }
   const file = ensureRemuxFile();
   const timestampMs = Math.max(0, sample.timestampMs - (remuxOriginMs ?? sample.timestampMs));
   const durationMs = sample.durationMs > 0
@@ -293,7 +306,7 @@ function ensureRemuxFile() {
   const file = createFile();
   const videoTrackId = addMatroskaVideoTrack(file, videoTrack);
   let audioTrackId: number | null = null;
-  if (audioTrack && audioConfig) {
+  if (audioTrack && audioConfig && !softwareAudio) {
     const sampleRate = audioTrack.sampleRate;
     const channels = audioTrack.channels;
     if (!sampleRate || !channels) throw new Error("MKV AAC 音频缺少采样率或声道数");
@@ -333,6 +346,21 @@ function ensureRemuxFile() {
     workerScope.postMessage({ type: "init", initSegment: transfer, codec }, [transfer]);
   }
   return file;
+}
+
+async function consumeSoftwareAudio(sample: MatroskaSample) {
+  eac3Decoder ??= await createEac3Decoder();
+  const decoded = eac3Decoder.decode(sample.data);
+  if (decoded.channelData.length === 0 || decoded.sampleRate <= 0) return;
+  const channels = decoded.channelData.map((channel) => channel.slice().buffer);
+  const durationMs = decoded.channelData[0].length * 1000 / decoded.sampleRate;
+  workerScope.postMessage({
+    type: "audio-pcm",
+    timestampMs: sample.timestampMs,
+    durationMs,
+    sampleRate: decoded.sampleRate,
+    channels,
+  }, channels);
 }
 
 async function flushRemuxSegment() {
@@ -415,6 +443,9 @@ function destroy() {
   fatalError = null;
   initialized = false;
   remuxMode = false;
+  softwareAudio = false;
+  eac3Decoder?.free();
+  eac3Decoder = null;
   remuxFile = null;
   remuxVideoTrackId = null;
   remuxAudioTrackId = null;

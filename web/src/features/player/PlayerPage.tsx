@@ -109,7 +109,9 @@ function screenshotFileName(title: string) {
 
 function hasExtensionCompatibleAudio(source: MediaSource | undefined) {
   const audioTracks = source?.streams?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO") ?? [];
-  return audioTracks.every((stream) => /^(?:aac|mp4a)(?:\.|$)/iu.test(stream.codec ?? "") || (stream.codec ?? "").trim().toLowerCase() === "opus");
+  return audioTracks.every((stream) => /^(?:aac|mp4a)(?:\.|$)/iu.test(stream.codec ?? "")
+    || (stream.codec ?? "").trim().toLowerCase() === "opus"
+    || /^(?:ac3|ac-3|eac3|ec-3)$/iu.test((stream.codec ?? "").trim()));
 }
 
 function remoteMediaNeedsExtension(source: MediaSource | undefined, video: HTMLVideoElement) {
@@ -120,6 +122,11 @@ function remoteMediaNeedsExtension(source: MediaSource | undefined, video: HTMLV
     .map((stream) => stream.codec ?? "")
     .filter(Boolean) ?? [];
   if (!videoCodec) return false;
+  const unsupportedAudio = source.streams
+    ?.filter((stream) => (stream.type ?? "").toUpperCase() === "AUDIO")
+    .some((stream) => /^(?:ac3|ac-3|eac3|ec-3)$/iu.test((stream.codec ?? "").trim())
+      && video.canPlayType(`audio/mp4; codecs="${stream.codec}"`) === "");
+  if (unsupportedAudio) return true;
   const mime = `video/x-matroska; codecs="${[videoCodec, ...audioCodecs].join(",")}"`;
   return video.canPlayType(mime) === "";
 }

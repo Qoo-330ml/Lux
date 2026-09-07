@@ -12,6 +12,7 @@ type WorkerResponse =
   | { type: "segment"; mediaSegment: ArrayBuffer; mediaDurationMs: number; processingDurationMs: number }
   | { type: "caption-track"; trackId: string; label: string; language?: string; isDefault: boolean; isForced: boolean; ordinal: number }
   | { type: "caption"; trackId: string; startMs: number; endMs: number; text: string; layer?: number; alignment?: number; position?: { x: number; y: number }; style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number }; runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[] }
+  | { type: "audio-pcm"; timestampMs: number; durationMs: number; sampleRate: number; channels: ArrayBuffer[] }
   | { type: "done" }
   | { type: "error"; message: string };
 
@@ -60,6 +61,7 @@ export class ClientMkvEngine implements PlaybackEngine {
   private readonly captionCueSnapshot: PlaybackCaptionCue[] = [];
   private readonly captionListeners = new Set<() => void>();
   private selectedCaptionId: string | null = null;
+  private readonly audioOutput: PcmAudioOutput;
 
   constructor(
     readonly element: HTMLVideoElement,
@@ -67,6 +69,7 @@ export class ClientMkvEngine implements PlaybackEngine {
     private readonly inputCodec = "",
     private readonly rangeReaderFactory?: (source: string) => ChromeMediaRangeReader,
   ) {
+    this.audioOutput = new PcmAudioOutput(element);
     this.captionController = {
       tracks: () => [...this.captionTrackMetadata.values()],
       select: (trackId) => {
@@ -118,6 +121,7 @@ export class ClientMkvEngine implements PlaybackEngine {
       wasmUrl: this.assets.wasmModuleUrl,
       wasmBinaryUrl: this.assets.wasmBinaryUrl,
       mode: this.sourceRequiresRemux(source) ? "hevc-remux" : "sdr",
+      softwareAudio: Boolean(this.rangeReaderFactory),
     });
 
     try {
@@ -224,6 +228,8 @@ export class ClientMkvEngine implements PlaybackEngine {
         } catch {
           // A malformed cue must not terminate audio/video playback.
         }
+      } else if (message.type === "audio-pcm") {
+        this.audioOutput.append(message);
       } else if (message.type === "done") {
         if (mediaSource.readyState === "open") mediaSource.endOfStream();
       } else if (message.type === "error") {
@@ -238,10 +244,20 @@ export class ClientMkvEngine implements PlaybackEngine {
     }
   }
 
-  play() { return this.element.play(); }
-  pause() { this.element.pause(); }
+  play() {
+    const result = this.element.play();
+    void result.then(() => this.audioOutput.play()).catch(() => undefined);
+    return result;
+  }
+  pause() {
+    this.element.pause();
+    void this.audioOutput.pause();
+  }
   seek(seconds: number) {
-    if (Number.isFinite(seconds) && seconds >= 0) this.element.currentTime = seconds;
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      this.element.currentTime = seconds;
+      this.audioOutput.seek(seconds);
+    }
   }
   snapshot(): PlaybackSnapshot {
     return {
@@ -264,6 +280,7 @@ export class ClientMkvEngine implements PlaybackEngine {
     this.mediaSource = null;
     this.sourceBuffer = null;
     this.element.pause();
+    this.audioOutput.destroy();
     this.element.removeAttribute("src");
     this.element.removeAttribute("poster");
     this.element.load();
@@ -282,6 +299,96 @@ export class ClientMkvEngine implements PlaybackEngine {
     this.captionCueSnapshot.splice(0);
     this.captionListeners.forEach((listener) => listener());
   }
+}
+
+type PcmMessage = Extract<WorkerResponse, { type: "audio-pcm" }>;
+
+/** Plays software-decoded AC-3/E-AC-3 PCM beside the video-only MSE stream. */
+class PcmAudioOutput {
+  private context: AudioContext | null = null;
+  private gain: GainNode | null = null;
+  private scheduledEnd = 0;
+  private readonly sources = new Set<AudioBufferSourceNode>();
+
+  constructor(private readonly element: HTMLVideoElement) {
+    element.addEventListener("volumechange", this.syncVolume);
+    element.addEventListener("ratechange", this.syncRate);
+  }
+
+  append(message: PcmMessage) {
+    const context = this.ensureContext();
+    if (!context) throw new Error("当前浏览器没有可用的 Web Audio 输出");
+    const gain = this.gain;
+    if (!gain) throw new Error("E-AC-3 音频输出初始化失败");
+    const channelData = message.channels.map((channel) => new Float32Array(channel));
+    if (channelData.length === 0 || channelData[0].length === 0) return;
+    const buffer = context.createBuffer(channelData.length, channelData[0].length, message.sampleRate);
+    channelData.forEach((channel, index) => buffer.copyToChannel(channel, index));
+    const source = context.createBufferSource();
+    source.buffer = buffer;
+    source.playbackRate.value = this.element.playbackRate;
+    source.connect(gain);
+    const mediaTime = Number.isFinite(this.element.currentTime) ? this.element.currentTime : 0;
+    const mediaStart = message.timestampMs / 1000;
+    const alignedStart = context.currentTime + Math.max(0, mediaStart - mediaTime);
+    const start = Math.max(context.currentTime + 0.02, alignedStart, this.scheduledEnd);
+    source.start(start);
+    this.scheduledEnd = start + message.durationMs / 1000;
+    this.sources.add(source);
+    source.addEventListener("ended", () => this.sources.delete(source), { once: true });
+    this.syncVolume();
+  }
+
+  async play() {
+    await this.context?.resume();
+  }
+
+  async pause() {
+    await this.context?.suspend();
+  }
+
+  seek(seconds: number) {
+    this.scheduledEnd = 0;
+    this.sources.forEach((source) => {
+      try { source.stop(); } catch { /* already ended */ }
+    });
+    this.sources.clear();
+    if (this.context?.state === "suspended" && seconds <= 0) void this.context.resume();
+  }
+
+  destroy() {
+    this.element.removeEventListener("volumechange", this.syncVolume);
+    this.element.removeEventListener("ratechange", this.syncRate);
+    this.sources.forEach((source) => {
+      try { source.stop(); } catch { /* already ended */ }
+    });
+    this.sources.clear();
+    void this.context?.close();
+    this.context = null;
+    this.gain = null;
+    this.scheduledEnd = 0;
+  }
+
+  private ensureContext() {
+    if (this.context) return this.context;
+    const globalWithWebkit = globalThis as typeof globalThis & { webkitAudioContext?: typeof AudioContext };
+    const Constructor = globalThis.AudioContext ?? globalWithWebkit.webkitAudioContext;
+    if (!Constructor) return null;
+    this.context = new Constructor();
+    this.gain = this.context.createGain();
+    this.gain.connect(this.context.destination);
+    this.syncVolume();
+    return this.context;
+  }
+
+  private readonly syncVolume = () => {
+    if (!this.gain) return;
+    this.gain.gain.value = this.element.muted ? 0 : Math.max(0, Math.min(1, this.element.volume));
+  };
+
+  private readonly syncRate = () => {
+    this.sources.forEach((source) => { source.playbackRate.value = this.element.playbackRate; });
+  };
 }
 
 function waitForMediaSourceOpen(mediaSource: MediaSource) {
