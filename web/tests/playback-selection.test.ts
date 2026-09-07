@@ -42,6 +42,15 @@ describe("playback selection", () => {
     expect(hasClientMkvCandidate(matroska)).toBe(true);
   });
 
+  it("recognizes a WebM-only container label for remote caption playback", () => {
+    const webm = { ...source, container: "webm", streams: [
+      { index: 0, type: "VIDEO", codec: "VP9" },
+      { index: 1, type: "AUDIO", codec: "OPUS" },
+    ] };
+
+    expect(hasClientMkvCandidate(webm)).toBe(true);
+  });
+
   it("accepts an MKV when a supported AAC track follows DTS and E-AC-3 tracks", () => {
     const mkv = { ...source, container: "mkv", streams: [
       { index: 0, type: "VIDEO", codec: "HEVC" },

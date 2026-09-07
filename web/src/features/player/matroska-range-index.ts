@@ -48,9 +48,14 @@ export class MatroskaIndexError extends Error {
 
 /** Validates the required index anchor without scanning Cluster payloads. */
 export function hasMatroskaSeekHead(data: Uint8Array, totalLength = data.byteLength) {
-  const segment = findElement(data, 0, data.byteLength, IDS.segment);
+  // The first Range is only a prefix of the file. A finite Segment size may
+  // therefore extend beyond the bytes we have, while its SeekHead is already
+  // available near the beginning. Keep strict bounds for the full index
+  // parser, but allow this lightweight anchor check to inspect a clipped
+  // outer Segment element.
+  const segment = findElement(data, 0, data.byteLength, IDS.segment, 0, true);
   if (!segment) return false;
-  const seekHead = findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead);
+  const seekHead = findDirectChild(data, segment.dataStart, Math.min(segment.dataEnd, data.byteLength), IDS.seekHead, true);
   const cuesPosition = seekHead ? parseSeekHead(data, seekHead.dataStart, seekHead.dataEnd).find((entry) => entry.id === IDS.cues)?.position : undefined;
   return cuesPosition !== undefined && Number.isSafeInteger(cuesPosition)
     && segment.dataStart + cuesPosition >= segment.dataStart
@@ -141,38 +146,45 @@ function parseCues(data: Uint8Array, start: number, end: number, segmentDataOffs
   return cues.sort((left, right) => left.timecode - right.timecode || left.track - right.track);
 }
 
-function findDirectChild(data: Uint8Array, start: number, end: number, id: number) {
-  return findElement(data, start, end, id, 1);
+function findDirectChild(data: Uint8Array, start: number, end: number, id: number, allowTruncated = false) {
+  return findElement(data, start, end, id, 1, allowTruncated);
 }
 
-function findElement(data: Uint8Array, start: number, end: number, id: number, depth = 0): Element | null {
+function findElement(data: Uint8Array, start: number, end: number, id: number, depth = 0, allowTruncated = false): Element | null {
   let found: Element | null = null;
   forEachElement(data, start, end, (element) => {
     if (found === null && element.id === id) found = element;
-  }, depth);
+  }, depth, allowTruncated);
   return found;
 }
 
-function forEachElement(data: Uint8Array, start: number, end: number, callback: (element: Element) => void, depth: number) {
+function forEachElement(data: Uint8Array, start: number, end: number, callback: (element: Element) => void, depth: number, allowTruncated = false) {
   if (depth > MAX_DEPTH) throw new MatroskaIndexError("EBML 嵌套层级超限");
   let offset = start;
   while (offset < end) {
-    const element = readElement(data, offset, end);
-    if (!element || element.end <= offset) throw new MatroskaIndexError("EBML 元素边界无效");
+    const element = readElement(data, offset, end, allowTruncated);
+    if (!element || element.end <= offset) {
+      if (allowTruncated) break;
+      throw new MatroskaIndexError("EBML 元素边界无效");
+    }
     callback(element);
     offset = element.end;
   }
-  if (offset !== end) throw new MatroskaIndexError("EBML 元素未对齐");
+  if (offset !== end && !allowTruncated) throw new MatroskaIndexError("EBML 元素未对齐");
 }
 
-function readElement(data: Uint8Array, offset: number, end: number): Element | null {
+function readElement(data: Uint8Array, offset: number, end: number, allowTruncated = false): Element | null {
   const id = readVint(data, offset, end, false);
   if (!id) return null;
   const size = readVint(data, id.next, end, true);
   if (!size) return null;
   const dataStart = size.next;
   const dataEnd = size.unknown ? end : dataStart + size.value;
-  if (dataEnd > end || dataEnd < dataStart) throw new MatroskaIndexError("EBML 元素越界");
+  if (dataEnd < dataStart) throw new MatroskaIndexError("EBML 元素越界");
+  if (dataEnd > end) {
+    if (!allowTruncated) throw new MatroskaIndexError("EBML 元素越界");
+    return { id: id.value, start: offset, dataStart, dataEnd: end, end, unknown: true };
+  }
   return { id: id.value, start: offset, dataStart, dataEnd, end: dataEnd, unknown: Boolean(size.unknown) };
 }
 

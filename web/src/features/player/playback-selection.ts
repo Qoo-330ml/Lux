@@ -42,7 +42,7 @@ function isMatroskaContainer(container: string | null | undefined) {
   return (container ?? "")
     .toLowerCase()
     .split(",")
-    .some((part) => ["mkv", "matroska"].includes(part.trim()));
+    .some((part) => ["mkv", "matroska", "webm"].includes(part.trim()));
 }
 
 export async function shouldUseClientHevc(source: MediaSource | undefined, video: HTMLVideoElement) {

@@ -12,6 +12,8 @@ import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 const fallbackState = vi.hoisted(() => ({
   assets: [] as Array<{ workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string }>,
+  mkvSources: [] as string[],
+  mkvFailure: false,
   snapshotDuration: 8 as number | null,
 }));
 
@@ -52,6 +54,28 @@ vi.mock("../src/features/player/hevc-playback-engine", () => ({
   },
 }));
 
+vi.mock("../src/features/player/mkv-playback-engine", () => ({
+  ClientMkvEngine: class MockClientMkvEngine {
+    readonly kind = "client-mkv";
+    readonly error = null;
+    readonly performance = null;
+
+    constructor(readonly element: HTMLVideoElement) {}
+
+    setSource(source: string) {
+      fallbackState.mkvSources.push(source);
+      if (fallbackState.mkvFailure) return Promise.reject(new Error("Range 读取失败"));
+      return Promise.resolve();
+    }
+
+    destroy() {}
+    play() { return this.element.play(); }
+    pause() { this.element.pause(); }
+    seek(seconds: number) { this.element.currentTime = seconds; }
+    snapshot() { return { currentTime: 0, duration: 8, ended: false }; }
+  },
+}));
+
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 describe("PlayerPage client fallback status", () => {
@@ -61,6 +85,8 @@ describe("PlayerPage client fallback status", () => {
   beforeEach(() => {
     mockPlaybackBootstrap();
     fallbackState.assets.length = 0;
+    fallbackState.mkvSources.length = 0;
+    fallbackState.mkvFailure = false;
     fallbackState.snapshotDuration = 8;
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
     vi.mocked(shouldUseClientMkv).mockResolvedValue(false);
@@ -193,7 +219,7 @@ describe("PlayerPage client fallback status", () => {
     );
   });
 
-  it("keeps remote Matroska STRM on the native path when embedded captions are unavailable", async () => {
+  it("keeps remote Matroska STRM native until an embedded caption is selected", async () => {
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-strm",
       title: "远程 MKV",
@@ -256,12 +282,157 @@ describe("PlayerPage client fallback status", () => {
     expect(settings).not.toBeNull();
     await act(async () => settings?.click());
     const captionSelect = container?.querySelector<HTMLSelectElement>("#lux-player-caption-select");
-    expect(captionSelect?.options[1]?.disabled).toBe(true);
-    expect(container?.textContent).toContain("浏览器未暴露远程内嵌字幕");
+    expect(captionSelect?.options[1]?.disabled).toBe(false);
+    expect(container?.textContent).not.toContain("浏览器未暴露远程内嵌字幕");
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
     expect(container?.querySelector("video")?.getAttribute("src")).toBe(
       "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
     );
+
+    await act(async () => {
+      if (!captionSelect) return;
+      captionSelect.value = captionSelect.options[1]?.value ?? "";
+      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    expect(shouldUseClientMkv).toHaveBeenCalled();
+    expect(container?.textContent).toContain("当前浏览器不支持远程字幕管线");
+  });
+
+  it("reads selected remote embedded captions through the signed session Range URL", async () => {
+    vi.mocked(shouldUseClientMkv).mockResolvedValue(true);
+    vi.mocked(api.item).mockResolvedValue({
+      id: "remote-mkv-strm",
+      title: "远程 MKV",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "remote-mkv-source",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/video.mkv",
+        container: "matroska",
+        streams: [
+          { index: 0, type: "VIDEO", codec: "H264" },
+          { index: 1, type: "AUDIO", codec: "AAC" },
+          { index: 2, type: "SUBTITLE", codec: "SRT", isDefault: true },
+        ],
+      }],
+    });
+    vi.mocked(api.createWebPlaybackSession).mockResolvedValue({
+      sessionId: "web-remote-mkv",
+      playSessionId: "lux-web:web-remote-mkv",
+      sourceId: "remote-mkv-source",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-remote-mkv/direct?expires=1900000000&signature=test",
+        proxyUrl: "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+        rangeUrl: "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
+      },
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/remote-mkv-strm"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    await act(async () => settings?.click());
+    const captionSelect = container.querySelector<HTMLSelectElement>("#lux-player-caption-select");
+    await act(async () => {
+      if (!captionSelect) return;
+      captionSelect.value = captionSelect.options[1]?.value ?? "";
+      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    expect(fallbackState.mkvSources).toEqual([
+      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
+    ]);
+  });
+
+  it("does not turn a remote caption pipeline failure into a playback-engine failure", async () => {
+    fallbackState.mkvFailure = true;
+    vi.mocked(shouldUseClientMkv).mockResolvedValue(true);
+    vi.mocked(api.item).mockResolvedValue({
+      id: "remote-mkv-strm",
+      title: "远程 MKV",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: "remote-mkv-source",
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/video.mkv",
+        container: "matroska",
+        streams: [
+          { index: 0, type: "VIDEO", codec: "H264" },
+          { index: 1, type: "AUDIO", codec: "AAC" },
+          { index: 2, type: "SUBTITLE", codec: "SRT", isDefault: true },
+        ],
+      }],
+    });
+    vi.mocked(api.createWebPlaybackSession).mockResolvedValue({
+      sessionId: "web-remote-mkv",
+      playSessionId: "lux-web:web-remote-mkv",
+      sourceId: "remote-mkv-source",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-remote-mkv/direct?expires=1900000000&signature=test",
+        proxyUrl: "/Videos/remote-mkv-strm/stream.mkv?MediaSourceId=remote-mkv-source",
+        rangeUrl: "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
+      },
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/remote-mkv-strm"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    await act(async () => settings?.click());
+    const captionSelect = container.querySelector<HTMLSelectElement>("#lux-player-caption-select");
+    await act(async () => {
+      if (!captionSelect) return;
+      captionSelect.value = captionSelect.options[1]?.value ?? "";
+      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+
+    expect(container.textContent).toContain("远程字幕不可用，已恢复视频播放");
+    expect(container.textContent).not.toContain("播放器引擎失败");
+    expect(api.stopWebPlaybackSession).not.toHaveBeenCalled();
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {

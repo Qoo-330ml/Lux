@@ -45,4 +45,15 @@ describe("Matroska SeekHead/Cues index", () => {
     expect(() => parseMatroskaRangeIndex(missing)).toThrow(MatroskaIndexError);
     expect(() => parseMatroskaRangeIndex(new Uint8Array([0x18, 0x53, 0x80, 0x67, 0x80]))).toThrow("SeekHead");
   });
+
+  it("accepts a partial first range when the finite Segment continues beyond it", () => {
+    const seekHead = element([0x11, 0x4d, 0x9b, 0x74], element([0x4d, 0xbb], concat(
+      element([0x53, 0xab], new Uint8Array([0x1c, 0x53, 0xbb, 0x6b])),
+      element([0x53, 0xac], uint(180, 2)),
+    )));
+    const segment = element([0x18, 0x53, 0x80, 0x67], concat(seekHead, new Uint8Array(256)));
+    const firstRange = segment.slice(0, 64);
+
+    expect(hasMatroskaSeekHead(firstRange, segment.byteLength)).toBe(true);
+  });
 });
