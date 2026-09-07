@@ -51,14 +51,22 @@ export function playerCaptionOptions(
       const format = captionFormat(stream);
       const runtimeTrack = !stream.isExternal && format ? runtimeTracks[embeddedTextOrdinal++] : undefined;
       const runtimeMatroskaTrack = runtimeTrack && isMatroskaRuntimeTrack(runtimeTrack.id);
+      const remoteRuntimeCandidate = !runtimeTrack
+        && source?.sourceKind === "STRM_URL"
+        && isHttpUrl(source.externalUrl)
+        && isMatroskaContainer(source.container)
+        && !stream.isExternal
+        && Boolean(format && ["srt", "ass", "ssa"].includes(format));
       const renderMode = runtimeTrack
-        ? runtimeMatroskaTrack && (format === "ass" || format === "ssa")
+        ? runtimeMatroskaTrack
           ? "runtime-overlay"
           : "native-inband"
+        : remoteRuntimeCandidate
+          ? "runtime-overlay"
         : stream.isExternal && format === "vtt" && nativeTracksSupported
           ? "native"
           : "overlay";
-      const unavailableReason = runtimeTrack
+      const unavailableReason = remoteRuntimeCandidate || runtimeTrack
         ? undefined
         : captionUnavailableReason(source, stream, format, runtimeTrack);
       const name = captionName(stream);
@@ -185,6 +193,19 @@ function captionName(stream: MediaStream) {
 function normalizedText(value: string | null | undefined) {
   const normalized = value?.trim();
   return normalized || undefined;
+}
+
+function isHttpUrl(value: string | null | undefined) {
+  try {
+    const protocol = new URL(value ?? "").protocol;
+    return protocol === "http:" || protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function isMatroskaContainer(value: string | null | undefined) {
+  return (value ?? "").toLowerCase().split(",").some((part) => ["mkv", "matroska", "webm"].includes(part.trim()));
 }
 
 function isMatroskaRuntimeTrack(trackId: string) {

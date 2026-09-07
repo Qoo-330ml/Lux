@@ -85,11 +85,12 @@ describe("LUX-229 local and remote STRM caption compatibility gate", () => {
     );
   });
 
-  it("keeps URL and path STRM media direct while requiring a native track for embedded captions", () => {
+  it("keeps URL STRM media direct while offering embedded captions through the opt-in pipeline", () => {
     const remoteUrlOptions = playerCaptionOptions(remoteUrlSource, true);
     expect(remoteUrlOptions[0]).toEqual(expect.objectContaining({
-      available: false,
-      unavailableReason: "浏览器未暴露远程内嵌字幕",
+      available: true,
+      renderMode: "runtime-overlay",
+      unavailableReason: undefined,
     }));
     expect(overlayCaptionSource("fixed-item", remoteUrlSource.id, remoteUrlOptions[0])).toBeNull();
     expect(nativeCaptionTrack("fixed-item", remoteUrlSource.id, remoteUrlOptions[0])).toBeNull();
