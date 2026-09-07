@@ -52,6 +52,10 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/admin/jobs/{jobId}/retry`：重试已失败或已取消的扫描任务，创建新的扫描任务并返回 202。
 - `GET /api/v1/admin/scheduled-tasks?page=1&pageSize=100`：分页查看所有已注册的任务，包含 `ownerType`、媒体库名称、`taskType`、`name`、`description`、`sourceType`、可空 `pluginId`、`schedule`、启用状态、资源限制和更新时间；结果也包含已停用或尚未配置计划的注册项。
 - `PUT /api/v1/admin/scheduled-tasks`：只修改已注册任务的 cron 计划。媒体库任务使用 `{ "ownerType": "LIBRARY", "ownerId": "...", "taskType": "RECONCILIATION_SCAN|METADATA_PARSE", "schedule": "0 3 * * *", "isEnabled": true }`；全局 STRM 任务使用 `{ "ownerType": "GLOBAL", "ownerId": "global", "taskType": "STRM_MEDIA_INFO", "schedule": "0 3 * * *" }`；全局弹幕任务使用相同的 owner 字段和 `taskType: "DANMAKU_MATCH"`，例如 `{ "schedule": "0 2 * * *" }`。媒体库任务传 `schedule: null` 或 `isEnabled: false` 会清空计划；STRM 和 DANMAKU_MATCH 任务的计划必须非空，并会同步回对应插件配置。实时增量扫描（`INCREMENTAL_SCAN`）由文件系统事件触发，不属于此接口管理范围。不存在的注册项返回 404，不会因为管理请求凭空创建任务。写操作需要管理员 Web session 和 CSRF，并与对应的媒体库或插件配置保持同一份配置。Lux 按 UTC 解释 cron 表达式。
+- `GET /api/v1/admin/scheduled-task-plans?page=1&pageSize=50&taskType=...`：按任务类型分页查看执行计划，返回计划名称、计划类型、Cron、启停状态、来源、资源限制及目标媒体库摘要。计划列表不把一个计划内的多个媒体库展开成多条注册项。
+- `POST /api/v1/admin/scheduled-task-plans`：创建媒体库作用域执行计划，请求体为 `{ "taskType": "RECONCILIATION_SCAN", "name": "大库组", "schedule": "0 2 * * 1", "isEnabled": true, "libraryIds": ["..."] }`。选中的媒体库会从同一任务类型的旧计划原子移动到新计划；空媒体库列表、无效任务类型或跨插件来源的媒体库组合返回结构化校验错误。
+- `PATCH /api/v1/admin/scheduled-task-plans/{planId}`：更新计划名称、Cron、启停状态和媒体库范围。一个媒体库在同一任务类型下只能属于一个计划；默认计划不能把媒体库移成无计划状态。计划配置和旧媒体库级任务镜像在同一事务中更新。
+- `POST /api/v1/admin/scheduled-task-plans/{planId}/run`：立即派发执行计划，返回已接受的媒体库运行任务 ID；运行任务仍按媒体库独立记录、取消和重试，并受全局扫描队列限制。
  - `POST /api/v1/admin/strm-probe-jobs`：按 `org.lux.strm-media-info` 已保存的插件配置创建并异步执行 STRM 媒体信息/缩略图任务，返回 202 和按库拆分的任务；不从请求体读取媒体库或并发配置，也不返回 URL。
 - `GET /api/v1/admin/strm-probe-jobs?page=1&pageSize=50&status=FAILED`：分页查看 STRM 探测任务，状态支持 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 和 `FAILED`。
 - `GET /api/v1/admin/strm-probe-jobs/{jobId}`：查看单个 STRM 探测任务的状态、进度、并发、旁车开关和安全错误摘要。
