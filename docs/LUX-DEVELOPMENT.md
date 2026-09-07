@@ -5757,13 +5757,13 @@ cue 和 Worker。
 
 验收：
 
-- [ ] 新增 `scheduled_task_plans` 和 `scheduled_task_plan_libraries`，`scheduled_task_configs.plan_id` 保存旧配置镜像关系。
-- [ ] 旧数据库迁移后，原有不同 Cron、启停状态、插件来源和资源限制保持不变；相同有效配置按任务类型自动分组。
-- [ ] 新建媒体库加入匹配的默认执行计划；自定义计划可以原子移动多个媒体库，服务端拒绝同一任务类型的重复归属。
-- [ ] 计划 API 支持分页列表、创建、更新、媒体库范围更新和立即执行；旧 `/admin/scheduled-tasks` API 保持兼容。
-- [ ] 调度按计划触发、按媒体库运行；实时增量扫描优先，全量扫描默认串行，活动任务不重复排队。
-- [ ] Web 任务页按任务类型展示多个执行计划，支持搜索、多选媒体库、独立 Cron 和计划级立即执行。
-- [ ] SQLite 空库/已有库迁移、Rust API/调度测试、Web 测试、格式、Clippy 和构建通过；记录 `uname -m`。
+- [x] 新增 `scheduled_task_plans` 和 `scheduled_task_plan_libraries`，`scheduled_task_configs.plan_id` 保存旧配置镜像关系。
+- [x] 旧数据库迁移后，原有不同 Cron、启停状态、插件来源和资源限制保持不变；相同有效配置按任务类型自动分组。
+- [x] 新建媒体库加入匹配的默认执行计划；自定义计划可以原子移动多个媒体库，服务端拒绝同一任务类型的重复归属。
+- [x] 计划 API 支持分页列表、创建、更新、媒体库范围更新和立即执行；旧 `/admin/scheduled-tasks` API 保持兼容。
+- [x] 调度按计划触发、按媒体库运行；实时增量扫描优先，全量扫描默认串行，活动任务不重复排队。
+- [x] Web 任务页按任务类型展示多个执行计划，支持搜索、多选媒体库、独立 Cron 和计划级立即执行。
+- [x] SQLite 空库/已有库迁移、Rust API/调度测试、Web 测试、格式、Clippy 和构建通过；记录 `uname -m`。
 
 验证：参见 `docs/LUX-244-PLAN.md`。
 

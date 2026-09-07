@@ -121,6 +121,15 @@ for library in plan.libraries {
 - 现有数据库从空库和已有库均可完成迁移；原有每库计划行为保持不变。
 - 旧 API 测试、Rust/Web 测试、格式、Clippy 和 Web 构建通过。
 
+## Verification Record
+
+2026-09-07，分支 `codex/scheduled-task-plans` 在本机 `uname -m=arm64` 上完成验证：
+
+- `cargo test --locked --all-targets -- --test-threads=1`：427 passed，4 ignored（其中 PostgreSQL 测试因本机无 PostgreSQL 实例而忽略）。
+- `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`：通过。
+- `pnpm --dir web install --frozen-lockfile`、`pnpm --dir web test`、`pnpm --dir web build`：通过；Web 静态测试 104 passed，Vitest 463 passed。
+- 本次验证仅代表本机 ARM64 环境，不外推 NAS/x86 性能。
+
 ## Implementation Slices
 
 1. Schema and migration：新表、镜像列、旧配置分组迁移和迁移测试。
