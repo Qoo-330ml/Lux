@@ -797,8 +797,9 @@ export function PlayerPage() {
             && typeof ChromeMediaExtension === "function";
           if (useExtensionMedia) {
             mediaExtension = new ChromeMediaExtension();
+            const extensionMediaUrl = new URL(extensionCaptionSourceUrl, window.location.href).href;
             try {
-              await mediaExtension.start(extensionCaptionSourceUrl);
+              await mediaExtension.start(extensionMediaUrl);
             } catch {
               mediaExtension.stop();
               mediaExtension = null;
@@ -813,7 +814,7 @@ export function PlayerPage() {
                 initialEngine.element,
                 HEVC_RUNTIME_ASSETS,
                 inputCodec,
-                () => activeMediaExtension.createRangeReader(extensionCaptionSourceUrl),
+                () => activeMediaExtension.createRangeReader(extensionMediaUrl),
               );
               engineRef.current = activeEngine;
               setMediaExtensionActive(true);

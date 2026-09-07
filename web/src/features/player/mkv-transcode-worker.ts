@@ -158,7 +158,12 @@ async function consumeSample(sample: MatroskaSample) {
   const track = sample.trackNumber === videoTrack?.number ? videoTrack : sample.trackNumber === audioTrack?.number ? audioTrack : null;
   if (!track) return;
   if (track.type === "audio") {
-    if (!audioConfig || !audioTrack?.sampleRate) return;
+    if (!audioTrack?.sampleRate) return;
+    if (softwareAudio && !audioConfig && (audioTrack.codecId.toUpperCase() === "A_AC3" || audioTrack.codecId.toUpperCase() === "A_EAC3")) {
+      audioConfig = matroskaAudioConfig({ ...audioTrack, codecPrivate: sample.data });
+      if (!audioConfig) throw new Error("MKV AC-3/E-AC-3 首个音频样本无效");
+    }
+    if (!audioConfig) return;
     if (softwareAudio && (audioConfig.codec === "ac-3" || audioConfig.codec === "ec-3")) {
       await consumeSoftwareAudio(sample);
       return;
