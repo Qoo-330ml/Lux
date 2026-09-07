@@ -317,6 +317,18 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/scheduled-tasks/run",
             post(admin_run_scheduled_task),
         )
+        .route(
+            "/api/v1/admin/scheduled-task-plans",
+            get(admin_list_scheduled_task_plans).post(admin_create_scheduled_task_plan),
+        )
+        .route(
+            "/api/v1/admin/scheduled-task-plans/{plan_id}",
+            patch(admin_update_scheduled_task_plan),
+        )
+        .route(
+            "/api/v1/admin/scheduled-task-plans/{plan_id}/run",
+            post(admin_run_scheduled_task_plan),
+        )
         .route("/api/v1/admin/task-activity", get(admin_list_task_activity))
         .route(
             "/api/v1/admin/settings",

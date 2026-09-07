@@ -2268,6 +2268,15 @@ pub(crate) struct AdminScheduledTasksQuery {
     pub(crate) page_size: Option<i64>,
 }
 
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminScheduledTaskPlansQuery {
+    pub(crate) page: Option<i64>,
+    pub(crate) page_size: Option<i64>,
+    pub(crate) task_type: Option<String>,
+    pub(crate) search: Option<String>,
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AdminScheduledTaskRequest {
@@ -2284,6 +2293,16 @@ pub(crate) struct AdminScheduledTaskRunRequest {
     pub(crate) owner_type: String,
     pub(crate) owner_id: String,
     pub(crate) task_type: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdminScheduledTaskPlanRequest {
+    pub(crate) task_type: String,
+    pub(crate) name: String,
+    pub(crate) schedule: Option<String>,
+    pub(crate) is_enabled: Option<bool>,
+    pub(crate) library_ids: Vec<String>,
 }
 
 const SCHEDULE_TASK_TYPES: [&str; 4] = [
@@ -2557,6 +2576,307 @@ pub(crate) async fn admin_list_scheduled_tasks(
         .into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+pub(crate) async fn admin_list_scheduled_task_plans(
+    headers: HeaderMap,
+    Query(query): Query<AdminScheduledTaskPlansQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let (offset, limit) = match page_params(query.page, query.page_size) {
+        Ok(params) => params,
+        Err(message) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                message,
+            )
+            .into_response();
+        }
+    };
+    let task_type = query
+        .task_type
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_uppercase);
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database
+        .list_scheduled_task_plans(offset, limit, task_type.as_deref(), query.search.as_deref())
+        .await
+    {
+        Ok((plans, total)) => Json(json!({
+            "plans": plans.iter().map(scheduled_task_plan_json).collect::<Vec<_>>(),
+            "total": total,
+            "page": offset / limit + 1,
+            "pageSize": limit,
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_create_scheduled_task_plan(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AdminScheduledTaskPlanRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let task_type = request.task_type.trim().to_ascii_uppercase();
+    if !SCHEDULE_TASK_TYPES.contains(&task_type.as_str()) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "任务类型无效",
+        )
+        .into_response();
+    }
+    let name = request.name.trim();
+    if name.is_empty() || name.chars().count() > 128 || request.library_ids.is_empty() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "计划名称和媒体库不能为空",
+        )
+        .into_response();
+    }
+    let schedule = match request
+        .schedule
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) if validate_cron(value).is_err() => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "Cron 执行计划无效",
+            )
+            .into_response();
+        }
+        Some(value) => Some(value.to_owned()),
+        None => None,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let template = match database
+        .find_scheduled_task_config("LIBRARY", &request.library_ids[0], &task_type)
+        .await
+    {
+        Ok(Some(task)) => task,
+        Ok(None) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                "选中的媒体库尚未注册该任务",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let plan_id = uuid::Uuid::now_v7().to_string();
+    let is_enabled = request.is_enabled.unwrap_or(schedule.is_some());
+    match database
+        .create_scheduled_task_plan(
+            &plan_id,
+            &task_type,
+            name,
+            &template.task_name,
+            &template.task_description,
+            &template.source_type,
+            template.plugin_id.as_deref(),
+            schedule.as_deref(),
+            is_enabled,
+            &template.resource_limit_json,
+            &request.library_ids,
+        )
+        .await
+    {
+        Ok(Some(plan)) => (
+            StatusCode::CREATED,
+            Json(json!({ "plan": scheduled_task_plan_json(&plan) })),
+        )
+            .into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(StorageError::Conflict(message)) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_update_scheduled_task_plan(
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<AdminScheduledTaskPlanRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(existing) = database
+        .find_scheduled_task_plan(&plan_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "执行计划不存在",
+        )
+        .into_response();
+    };
+    let name = request.name.trim();
+    if name.is_empty() || name.chars().count() > 128 || request.library_ids.is_empty() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "计划名称和媒体库不能为空",
+        )
+        .into_response();
+    }
+    let schedule = match request
+        .schedule
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) if validate_cron(value).is_err() => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "Cron 执行计划无效",
+            )
+            .into_response();
+        }
+        Some(value) => Some(value.to_owned()),
+        None => None,
+    };
+    let is_enabled = request.is_enabled.unwrap_or(schedule.is_some());
+    let template = match existing.libraries.first() {
+        Some(library) => database
+            .find_scheduled_task_config("LIBRARY", &library.id, &existing.task_type)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let Some(template) = template else {
+        return StatusCode::CONFLICT.into_response();
+    };
+    match database
+        .update_scheduled_task_plan(
+            &plan_id,
+            name,
+            schedule.as_deref(),
+            is_enabled,
+            &request.library_ids,
+            &template.task_name,
+            &template.task_description,
+            &template.source_type,
+            template.plugin_id.as_deref(),
+            &template.resource_limit_json,
+        )
+        .await
+    {
+        Ok(Some(plan)) => Json(json!({ "plan": scheduled_task_plan_json(&plan) })).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(StorageError::Conflict(message)) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_run_scheduled_task_plan(
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(plan) = database
+        .find_scheduled_task_plan(&plan_id)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "执行计划不存在",
+        )
+        .into_response();
+    };
+    if plan.scope_type != "LIBRARY" {
+        return api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "全局插件计划不能通过媒体库计划接口执行",
+        )
+        .into_response();
+    }
+    let Some(scheduled_tasks) = state.scheduled_tasks.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut runs = Vec::new();
+    for library in plan.libraries {
+        match scheduled_tasks
+            .run_task("LIBRARY", &library.id, &plan.task_type)
+            .await
+        {
+            Ok(run) => runs.push(json!({
+                "libraryId": library.id,
+                "run": scheduled_task_run_json(&run),
+            })),
+            Err(ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))) => {}
+            Err(error) => return scheduled_task_error(&headers, error),
+        }
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "status": "ACCEPTED",
+            "planId": plan_id,
+            "taskType": plan.task_type,
+            "runs": runs,
+        })),
+    )
+        .into_response()
 }
 
 pub(crate) async fn admin_upsert_scheduled_task(
@@ -3216,6 +3536,32 @@ pub(crate) fn scheduled_task_json(task: &crate::storage::StoredScheduledTaskConf
         "resourceLimit": resource_limit,
         "createdAt": task.created_at,
         "updatedAt": task.updated_at,
+    })
+}
+
+pub(crate) fn scheduled_task_plan_json(plan: &crate::storage::StoredScheduledTaskPlan) -> Value {
+    let resource_limit =
+        serde_json::from_str::<Value>(&plan.resource_limit_json).unwrap_or_else(|_| json!({}));
+    json!({
+        "id": plan.id,
+        "taskType": plan.task_type,
+        "name": plan.plan_name,
+        "taskName": plan.task_name,
+        "description": plan.task_description,
+        "sourceType": plan.source_type,
+        "pluginId": plan.plugin_id,
+        "schedule": plan.cron_or_interval,
+        "isEnabled": plan.is_enabled,
+        "resourceLimit": resource_limit,
+        "scopeType": plan.scope_type,
+        "isDefault": plan.is_default,
+        "libraries": plan.libraries.iter().map(|library| json!({
+            "id": library.id,
+            "name": library.name,
+        })).collect::<Vec<_>>(),
+        "libraryCount": plan.libraries.len(),
+        "createdAt": plan.created_at,
+        "updatedAt": plan.updated_at,
     })
 }
 

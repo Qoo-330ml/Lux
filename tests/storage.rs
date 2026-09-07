@@ -686,6 +686,51 @@ async fn library_registers_reconciliation_and_metadata_tasks_only()
 }
 
 #[tokio::test]
+async fn scheduled_task_plans_group_new_library_registrations()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let first = libraries
+        .create_library("Movies", LibraryKind::Movie, true)
+        .await?;
+    let second = libraries
+        .create_library("More Movies", LibraryKind::Movie, true)
+        .await?;
+
+    let plan_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_task_plans WHERE task_type = 'RECONCILIATION_SCAN'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(plan_count, 1);
+    let membership_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scheduled_task_plan_libraries l
+         JOIN scheduled_task_plans p ON p.id = l.plan_id
+         WHERE p.task_type = 'RECONCILIATION_SCAN'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(membership_count, 2);
+    let plan_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT plan_id FROM scheduled_task_configs
+         WHERE task_type = 'RECONCILIATION_SCAN' AND owner_id IN (?, ?)
+         ORDER BY owner_id",
+    )
+    .bind(first.id.to_string())
+    .bind(second.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(plan_ids.len(), 2);
+    assert_eq!(plan_ids[0], plan_ids[1]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_persists_chapter_source_selection() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {

@@ -778,6 +778,7 @@ pub(crate) struct StoredScheduledTaskConfig {
     pub(crate) owner_type: String,
     pub(crate) owner_id: String,
     pub(crate) task_type: String,
+    pub(crate) plan_id: Option<String>,
     pub(crate) task_name: String,
     pub(crate) task_description: String,
     pub(crate) source_type: String,
@@ -788,6 +789,31 @@ pub(crate) struct StoredScheduledTaskConfig {
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
     pub(crate) library_name: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScheduledTaskPlan {
+    pub(crate) id: String,
+    pub(crate) task_type: String,
+    pub(crate) plan_name: String,
+    pub(crate) task_name: String,
+    pub(crate) task_description: String,
+    pub(crate) source_type: String,
+    pub(crate) plugin_id: Option<String>,
+    pub(crate) cron_or_interval: Option<String>,
+    pub(crate) is_enabled: bool,
+    pub(crate) resource_limit_json: String,
+    pub(crate) scope_type: String,
+    pub(crate) is_default: bool,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) libraries: Vec<StoredScheduledTaskPlanLibrary>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScheduledTaskPlanLibrary {
+    pub(crate) id: String,
+    pub(crate) name: String,
 }
 
 #[derive(Debug)]
@@ -877,6 +903,7 @@ fn stored_scheduled_task(row: sqlx::any::AnyRow) -> StoredScheduledTaskConfig {
         owner_type: row.get("owner_type"),
         owner_id: row.get("owner_id"),
         task_type: row.get("task_type"),
+        plan_id: row.get("plan_id"),
         task_name: row.get("task_name"),
         task_description: row.get("task_description"),
         source_type: row.get("source_type"),
@@ -887,6 +914,26 @@ fn stored_scheduled_task(row: sqlx::any::AnyRow) -> StoredScheduledTaskConfig {
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
         library_name: row.get("library_name"),
+    }
+}
+
+fn stored_scheduled_task_plan(row: sqlx::any::AnyRow) -> StoredScheduledTaskPlan {
+    StoredScheduledTaskPlan {
+        id: row.get("id"),
+        task_type: row.get("task_type"),
+        plan_name: row.get("plan_name"),
+        task_name: row.get("task_name"),
+        task_description: row.get("task_description"),
+        source_type: row.get("source_type"),
+        plugin_id: row.get("plugin_id"),
+        cron_or_interval: row.get("cron_or_interval"),
+        is_enabled: row.get::<i64, _>("is_enabled") != 0,
+        resource_limit_json: row.get("resource_limit_json"),
+        scope_type: row.get("scope_type"),
+        is_default: row.get::<i64, _>("is_default") != 0,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+        libraries: Vec::new(),
     }
 }
 

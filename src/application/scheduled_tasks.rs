@@ -550,6 +550,7 @@ mod tests {
             owner_type: "LIBRARY".to_owned(),
             owner_id: "library".to_owned(),
             task_type: "RECONCILIATION_SCAN".to_owned(),
+            plan_id: None,
             task_name: String::new(),
             task_description: String::new(),
             source_type: String::new(),

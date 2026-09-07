@@ -1,6 +1,122 @@
 use super::*;
 
+struct LibraryTaskPlanAssignment {
+    id: String,
+    task_name: String,
+    task_description: String,
+    source_type: String,
+    plugin_id: Option<String>,
+    schedule: Option<String>,
+    is_enabled: bool,
+    resource_limit_json: String,
+}
+
 impl Database {
+    async fn ensure_library_task_plan(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        task_type: &str,
+        task_name: &str,
+        task_description: &str,
+        source_type: &str,
+        plugin_id: Option<&str>,
+        schedule: Option<&str>,
+        is_enabled: bool,
+        resource_limit_json: &str,
+    ) -> Result<LibraryTaskPlanAssignment, StorageError> {
+        let default_plan: Option<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            i64,
+            String,
+        )> = self
+            .query_as(
+                "SELECT id, plan_name, task_name, task_description, source_type,
+                        plugin_id, cron_or_interval, is_enabled, resource_limit_json
+                 FROM scheduled_task_plans
+                 WHERE scope_type = 'LIBRARY' AND task_type = ? AND is_default = 1
+                   AND source_type = ?
+                   AND (plugin_id = ? OR (plugin_id IS NULL AND ? IS NULL))
+                 ORDER BY updated_at, id
+                 LIMIT 1",
+            )
+            .bind(task_type)
+            .bind(source_type)
+            .bind(plugin_id)
+            .bind(plugin_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        if let Some((
+            id,
+            _plan_name,
+            task_name,
+            task_description,
+            source_type,
+            plugin_id,
+            schedule,
+            enabled,
+            resource_limit_json,
+        )) = default_plan
+        {
+            return Ok(LibraryTaskPlanAssignment {
+                id,
+                task_name,
+                task_description,
+                source_type,
+                plugin_id,
+                schedule,
+                is_enabled: enabled != 0,
+                resource_limit_json,
+            });
+        }
+
+        let id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO scheduled_task_plans (
+                id, task_type, plan_name, task_name, task_description,
+                source_type, plugin_id, cron_or_interval, is_enabled,
+                resource_limit_json, scope_type, is_default
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIBRARY', 1)",
+        )
+        .bind(&id)
+        .bind(task_type)
+        .bind(task_name)
+        .bind(task_name)
+        .bind(task_description)
+        .bind(source_type)
+        .bind(plugin_id)
+        .bind(schedule)
+        .bind(database_flag(is_enabled))
+        .bind(resource_limit_json)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        Ok(LibraryTaskPlanAssignment {
+            id,
+            task_name: task_name.to_owned(),
+            task_description: task_description.to_owned(),
+            source_type: source_type.to_owned(),
+            plugin_id: plugin_id.map(str::to_owned),
+            schedule: schedule.map(str::to_owned),
+            is_enabled,
+            resource_limit_json: resource_limit_json.to_owned(),
+        })
+    }
+
     pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -78,28 +194,56 @@ impl Database {
         for (task_type, task_name, task_description, source_type, plugin_id, schedule) in
             registrations
         {
-            self.query(
-                "INSERT INTO scheduled_task_configs (
-                    owner_type, owner_id, task_type, task_name, task_description,
-                    source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
-                ) VALUES ('LIBRARY', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(library.id)
-            .bind(task_type)
-            .bind(task_name)
-            .bind(task_description)
-            .bind(source_type)
-            .bind(plugin_id)
-            .bind(schedule)
-            .bind(database_flag(schedule.is_some()))
-            .bind(if task_type == "RECONCILIATION_SCAN" {
+            let resource_limit_json = if task_type == "RECONCILIATION_SCAN" {
                 format!(
                     "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
                     library.scan_concurrency, library.probe_concurrency
                 )
             } else {
                 "{}".to_owned()
-            })
+            };
+            let assignment = self
+                .ensure_library_task_plan(
+                    &mut transaction,
+                    task_type,
+                    task_name,
+                    task_description,
+                    source_type,
+                    plugin_id,
+                    schedule,
+                    schedule.is_some(),
+                    &resource_limit_json,
+                )
+                .await?;
+            self.query(
+                "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+                 VALUES (?, ?) ON CONFLICT DO NOTHING",
+            )
+            .bind(&assignment.id)
+            .bind(library.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json,
+                    plan_id
+                ) VALUES ('LIBRARY', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(library.id)
+            .bind(task_type)
+            .bind(&assignment.task_name)
+            .bind(&assignment.task_description)
+            .bind(&assignment.source_type)
+            .bind(assignment.plugin_id.as_deref())
+            .bind(assignment.schedule.as_deref())
+            .bind(database_flag(assignment.is_enabled))
+            .bind(&assignment.resource_limit_json)
+            .bind(&assignment.id)
             .execute(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -368,31 +512,77 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let assignment = self
+            .ensure_library_task_plan(
+                &mut transaction,
+                "AUTO_LIBRARY_COVER",
+                "自动生成媒体库封面",
+                "首次达到至少 9 张海报后，随机选择 9 张海报生成带媒体库名称的旋转堆叠封面；管理员可手动执行或按计划重跑。",
+                "SYSTEM",
+                None,
+                None,
+                false,
+                "{}",
+            )
+            .await?;
         self.query(
-            "INSERT INTO scheduled_task_configs (
-                owner_type, owner_id, task_type, task_name, task_description,
-                source_type, plugin_id, cron_or_interval, is_enabled, resource_limit_json
-             ) VALUES (
-                'LIBRARY', ?, 'AUTO_LIBRARY_COVER',
-                '自动生成媒体库封面',
-                '首次达到至少 9 张海报后，随机选择 9 张海报生成带媒体库名称的旋转堆叠封面；管理员可手动执行或按计划重跑。',
-                'SYSTEM', NULL, NULL, 0, '{}'
-             ) ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
-                task_name = excluded.task_name,
-                task_description = excluded.task_description,
-                source_type = excluded.source_type,
-                resource_limit_json = excluded.resource_limit_json,
-                updated_at = unixepoch()
-             ",
+            "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+             VALUES (?, ?) ON CONFLICT DO NOTHING",
         )
+        .bind(&assignment.id)
         .bind(library_id)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|result| result.rows_affected() == 1)
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        let result = self
+            .query(
+                "INSERT INTO scheduled_task_configs (
+                    owner_type, owner_id, task_type, task_name, task_description,
+                    source_type, plugin_id, cron_or_interval, is_enabled,
+                    resource_limit_json, plan_id
+                 ) VALUES (
+                    'LIBRARY', ?, 'AUTO_LIBRARY_COVER', ?, ?,
+                    'SYSTEM', NULL, ?, ?, ?, ?
+                 ) ON CONFLICT(owner_type, owner_id, task_type) DO UPDATE SET
+                    task_name = excluded.task_name,
+                    task_description = excluded.task_description,
+                    source_type = excluded.source_type,
+                    resource_limit_json = excluded.resource_limit_json,
+                    plan_id = excluded.plan_id,
+                    updated_at = unixepoch()",
+            )
+            .bind(library_id)
+            .bind(&assignment.task_name)
+            .bind(&assignment.task_description)
+            .bind(assignment.schedule.as_deref())
+            .bind(database_flag(assignment.is_enabled))
+            .bind(&assignment.resource_limit_json)
+            .bind(&assignment.id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
     }
 
     pub(crate) async fn create_library_cover_job(
@@ -983,7 +1173,7 @@ impl Database {
             })?;
         let rows = self
             .query(
-                "SELECT s.owner_type, s.owner_id, s.task_type, s.task_name,
+                "SELECT s.owner_type, s.owner_id, s.task_type, s.plan_id, s.task_name,
                     s.task_description, s.source_type, s.plugin_id,
                     s.cron_or_interval, s.is_enabled, s.resource_limit_json,
                     s.created_at, s.updated_at,
@@ -1003,6 +1193,534 @@ impl Database {
                 source,
             })?;
         Ok((rows.into_iter().map(stored_scheduled_task).collect(), total))
+    }
+
+    pub(crate) async fn list_scheduled_task_plans(
+        &self,
+        offset: i64,
+        limit: i64,
+        task_type: Option<&str>,
+        search: Option<&str>,
+    ) -> Result<(Vec<StoredScheduledTaskPlan>, i64), StorageError> {
+        let search = search.map(str::trim).filter(|value| !value.is_empty());
+        let search_pattern = search.map(|value| format!("%{}%", value.to_ascii_lowercase()));
+        let filter = "WHERE (? IS NULL OR p.task_type = ?)
+                       AND (? IS NULL OR lower(p.plan_name) LIKE ?
+                            OR lower(p.task_name) LIKE ?
+                            OR lower(p.task_type) LIKE ?)";
+        let total = self
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM scheduled_task_plans p {filter}"
+            )))
+            .bind(task_type)
+            .bind(task_type)
+            .bind(search_pattern.as_deref())
+            .bind(search_pattern.as_deref())
+            .bind(search_pattern.as_deref())
+            .bind(search_pattern.as_deref())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = self
+            .query(sqlx::AssertSqlSafe(format!(
+                "SELECT p.id, p.task_type, p.plan_name, p.task_name,
+                        p.task_description, p.source_type, p.plugin_id,
+                        p.cron_or_interval, p.is_enabled, p.resource_limit_json,
+                        p.scope_type, p.is_default, p.created_at, p.updated_at
+                 FROM scheduled_task_plans p
+                 {filter}
+                 ORDER BY p.updated_at DESC, p.task_type, p.plan_name, p.id
+                 LIMIT ? OFFSET ?"
+            )))
+            .bind(task_type)
+            .bind(task_type)
+            .bind(search_pattern.as_deref())
+            .bind(search_pattern.as_deref())
+            .bind(search_pattern.as_deref())
+            .bind(search_pattern.as_deref())
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut plans = rows
+            .into_iter()
+            .map(stored_scheduled_task_plan)
+            .collect::<Vec<_>>();
+        let plan_ids = plans.iter().map(|plan| plan.id.clone()).collect::<Vec<_>>();
+        self.load_scheduled_task_plan_libraries(&mut plans, &plan_ids)
+            .await?;
+        Ok((plans, total))
+    }
+
+    async fn load_scheduled_task_plan_libraries(
+        &self,
+        plans: &mut [StoredScheduledTaskPlan],
+        plan_ids: &[String],
+    ) -> Result<(), StorageError> {
+        if plan_ids.is_empty() {
+            return Ok(());
+        }
+        let placeholders = std::iter::repeat_n("?", plan_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT pl.plan_id, l.id AS library_id, l.name AS library_name
+             FROM scheduled_task_plan_libraries pl
+             JOIN libraries l ON l.id = pl.library_id
+             WHERE pl.plan_id IN ({placeholders})
+             ORDER BY l.name, l.id"
+        )));
+        for plan_id in plan_ids {
+            query = query.bind(plan_id);
+        }
+        let rows = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut by_plan = HashMap::<String, Vec<StoredScheduledTaskPlanLibrary>>::new();
+        for row in rows {
+            by_plan
+                .entry(row.get("plan_id"))
+                .or_default()
+                .push(StoredScheduledTaskPlanLibrary {
+                    id: row.get("library_id"),
+                    name: row.get("library_name"),
+                });
+        }
+        for plan in plans {
+            plan.libraries = by_plan.remove(&plan.id).unwrap_or_default();
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn find_scheduled_task_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<Option<StoredScheduledTaskPlan>, StorageError> {
+        let row = self
+            .query(
+                "SELECT id, task_type, plan_name, task_name, task_description,
+                        source_type, plugin_id, cron_or_interval, is_enabled,
+                        resource_limit_json, scope_type, is_default, created_at, updated_at
+                 FROM scheduled_task_plans WHERE id = ?",
+            )
+            .bind(plan_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let mut plans = vec![stored_scheduled_task_plan(row)];
+        self.load_scheduled_task_plan_libraries(&mut plans, &[plan_id.to_owned()])
+            .await?;
+        Ok(plans.pop())
+    }
+
+    async fn validate_scheduled_task_plan_libraries(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        task_type: &str,
+        source_type: &str,
+        plugin_id: Option<&str>,
+        library_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let mut seen = HashSet::with_capacity(library_ids.len());
+        for library_id in library_ids {
+            if !seen.insert(library_id) {
+                return Err(StorageError::Conflict(
+                    "同一媒体库不能在计划中重复选择".to_owned(),
+                ));
+            }
+            let config: Option<(String, Option<String>)> = self
+                .query_as(
+                    "SELECT source_type, plugin_id
+                     FROM scheduled_task_configs
+                     WHERE owner_type = 'LIBRARY' AND owner_id = ? AND task_type = ?",
+                )
+                .bind(library_id)
+                .bind(task_type)
+                .fetch_optional(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let Some((actual_source_type, actual_plugin_id)) = config else {
+                return Err(StorageError::Conflict(format!(
+                    "媒体库 {library_id} 尚未注册任务 {task_type}"
+                )));
+            };
+            if actual_source_type != source_type || actual_plugin_id.as_deref() != plugin_id {
+                return Err(StorageError::Conflict(
+                    "一个执行计划不能混合不同的插件来源".to_owned(),
+                ));
+            }
+        }
+        if library_ids.is_empty() {
+            return Err(StorageError::Conflict(
+                "执行计划至少需要一个媒体库".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn create_scheduled_task_plan(
+        &self,
+        id: &str,
+        task_type: &str,
+        plan_name: &str,
+        task_name: &str,
+        task_description: &str,
+        source_type: &str,
+        plugin_id: Option<&str>,
+        schedule: Option<&str>,
+        is_enabled: bool,
+        resource_limit_json: &str,
+        library_ids: &[String],
+    ) -> Result<Option<StoredScheduledTaskPlan>, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.validate_scheduled_task_plan_libraries(
+            &mut transaction,
+            task_type,
+            source_type,
+            plugin_id,
+            library_ids,
+        )
+        .await?;
+        self.query(
+            "INSERT INTO scheduled_task_plans (
+                id, task_type, plan_name, task_name, task_description,
+                source_type, plugin_id, cron_or_interval, is_enabled,
+                resource_limit_json, scope_type, is_default
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LIBRARY', 0)",
+        )
+        .bind(id)
+        .bind(task_type)
+        .bind(plan_name)
+        .bind(task_name)
+        .bind(task_description)
+        .bind(source_type)
+        .bind(plugin_id)
+        .bind(schedule)
+        .bind(database_flag(is_enabled))
+        .bind(resource_limit_json)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.move_libraries_to_scheduled_task_plan(
+            &mut transaction,
+            id,
+            task_type,
+            task_name,
+            task_description,
+            source_type,
+            plugin_id,
+            schedule,
+            is_enabled,
+            resource_limit_json,
+            library_ids,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.find_scheduled_task_plan(id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn update_scheduled_task_plan(
+        &self,
+        plan_id: &str,
+        plan_name: &str,
+        schedule: Option<&str>,
+        is_enabled: bool,
+        library_ids: &[String],
+        task_name: &str,
+        task_description: &str,
+        source_type: &str,
+        plugin_id: Option<&str>,
+        resource_limit_json: &str,
+    ) -> Result<Option<StoredScheduledTaskPlan>, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let existing: Option<(String, String, i64)> = self
+            .query_as(
+                "SELECT task_type, scope_type, is_default
+                 FROM scheduled_task_plans WHERE id = ?",
+            )
+            .bind(plan_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((task_type, scope_type, is_default)) = existing else {
+            return Ok(None);
+        };
+        if scope_type != "LIBRARY" {
+            return Err(StorageError::Conflict(
+                "全局插件计划不能通过媒体库计划接口修改".to_owned(),
+            ));
+        }
+        self.validate_scheduled_task_plan_libraries(
+            &mut transaction,
+            &task_type,
+            source_type,
+            plugin_id,
+            library_ids,
+        )
+        .await?;
+        let current_ids: Vec<String> = self
+            .query_scalar("SELECT library_id FROM scheduled_task_plan_libraries WHERE plan_id = ?")
+            .bind(plan_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if is_default != 0 && current_ids.iter().any(|id| !library_ids.contains(id)) {
+            return Err(StorageError::Conflict(
+                "默认计划不能移出媒体库，请创建新的自定义计划".to_owned(),
+            ));
+        }
+        self.query(
+            "UPDATE scheduled_task_plans
+             SET plan_name = ?, cron_or_interval = ?, is_enabled = ?,
+                 task_name = ?, task_description = ?, source_type = ?,
+                 plugin_id = ?, resource_limit_json = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(plan_name)
+        .bind(schedule)
+        .bind(database_flag(is_enabled))
+        .bind(task_name)
+        .bind(task_description)
+        .bind(source_type)
+        .bind(plugin_id)
+        .bind(resource_limit_json)
+        .bind(plan_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if is_default == 0 {
+            let removed_ids = current_ids
+                .into_iter()
+                .filter(|id| !library_ids.contains(id))
+                .collect::<Vec<_>>();
+            if !removed_ids.is_empty() {
+                let default_plan_id: Option<String> = self
+                    .query_scalar(
+                        "SELECT id FROM scheduled_task_plans
+                         WHERE task_type = ? AND scope_type = 'LIBRARY' AND is_default = 1
+                           AND id <> ?
+                           AND source_type = ?
+                           AND (plugin_id = ? OR (plugin_id IS NULL AND ? IS NULL))
+                         ORDER BY id LIMIT 1",
+                    )
+                    .bind(&task_type)
+                    .bind(plan_id)
+                    .bind(source_type)
+                    .bind(plugin_id)
+                    .bind(plugin_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                let Some(default_plan_id) = default_plan_id else {
+                    return Err(StorageError::Conflict(
+                        "没有可接收移出媒体库的默认计划".to_owned(),
+                    ));
+                };
+                let placeholders = std::iter::repeat_n("?", removed_ids.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut update_query = self.query(sqlx::AssertSqlSafe(format!(
+                    "UPDATE scheduled_task_configs SET plan_id = ?, updated_at = unixepoch()
+                     WHERE owner_type = 'LIBRARY' AND task_type = ?
+                       AND owner_id IN ({placeholders})"
+                )));
+                update_query = update_query.bind(&default_plan_id).bind(&task_type);
+                for library_id in &removed_ids {
+                    update_query = update_query.bind(library_id);
+                }
+                update_query
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                for library_id in removed_ids {
+                    self.query(
+                        "DELETE FROM scheduled_task_plan_libraries
+                         WHERE plan_id = ? AND library_id = ?",
+                    )
+                    .bind(plan_id)
+                    .bind(&library_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                    self.query(
+                        "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+                         VALUES (?, ?) ON CONFLICT DO NOTHING",
+                    )
+                    .bind(&default_plan_id)
+                    .bind(library_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                }
+            }
+        }
+        self.move_libraries_to_scheduled_task_plan(
+            &mut transaction,
+            plan_id,
+            &task_type,
+            task_name,
+            task_description,
+            source_type,
+            plugin_id,
+            schedule,
+            is_enabled,
+            resource_limit_json,
+            library_ids,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.find_scheduled_task_plan(plan_id).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn move_libraries_to_scheduled_task_plan(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        plan_id: &str,
+        task_type: &str,
+        task_name: &str,
+        task_description: &str,
+        source_type: &str,
+        plugin_id: Option<&str>,
+        schedule: Option<&str>,
+        is_enabled: bool,
+        resource_limit_json: &str,
+        library_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut delete_query = self.query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM scheduled_task_plan_libraries
+             WHERE library_id IN ({placeholders})
+               AND plan_id IN (SELECT id FROM scheduled_task_plans WHERE task_type = ?)"
+        )));
+        for library_id in library_ids {
+            delete_query = delete_query.bind(library_id);
+        }
+        delete_query
+            .bind(task_type)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut update_query = self.query(sqlx::AssertSqlSafe(format!(
+            "UPDATE scheduled_task_configs
+             SET plan_id = ?, task_name = ?, task_description = ?, source_type = ?,
+                 plugin_id = ?, cron_or_interval = ?, is_enabled = ?,
+                 resource_limit_json = ?, updated_at = unixepoch()
+             WHERE owner_type = 'LIBRARY' AND task_type = ?
+               AND owner_id IN ({placeholders})"
+        )));
+        update_query = update_query
+            .bind(plan_id)
+            .bind(task_name)
+            .bind(task_description)
+            .bind(source_type)
+            .bind(plugin_id)
+            .bind(schedule)
+            .bind(database_flag(is_enabled))
+            .bind(resource_limit_json)
+            .bind(task_type);
+        for library_id in library_ids {
+            update_query = update_query.bind(library_id);
+        }
+        update_query
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for library_id in library_ids {
+            self.query(
+                "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+                 VALUES (?, ?)",
+            )
+            .bind(plan_id)
+            .bind(library_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn upsert_scheduled_task_config(
@@ -1224,7 +1942,7 @@ impl Database {
         task_type: &str,
     ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
         self.query(
-            "SELECT s.owner_type, s.owner_id, s.task_type, s.task_name,
+            "SELECT s.owner_type, s.owner_id, s.task_type, s.plan_id, s.task_name,
                     s.task_description, s.source_type, s.plugin_id,
                     s.cron_or_interval, s.is_enabled, s.resource_limit_json,
                     s.created_at, s.updated_at,

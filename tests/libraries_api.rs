@@ -1405,3 +1405,86 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+    let mut library_ids = Vec::new();
+    for name in ["Movies", "Series"] {
+        let response = client
+            .post(format!("{base_url}/api/v1/admin/libraries"))
+            .header(COOKIE, &cookies)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({ "name": name, "kind": "MOVIE" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        library_ids.push(
+            response.json::<Value>().await?["library"]["id"]
+                .as_str()
+                .ok_or("missing library id")?
+                .to_owned(),
+        );
+    }
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/scheduled-task-plans"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "taskType": "RECONCILIATION_SCAN",
+            "name": "电影与剧集夜间校验",
+            "schedule": "0 2 * * 1",
+            "isEnabled": true,
+            "libraryIds": library_ids
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let created_body: Value = created.json().await?;
+    assert_eq!(created_body["plan"]["libraryCount"], 2);
+    assert_eq!(created_body["plan"]["schedule"], "0 2 * * 1");
+
+    let listed = client
+        .get(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans?page=1&pageSize=50&taskType=RECONCILIATION_SCAN"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed.status(), reqwest::StatusCode::OK);
+    let listed_body: Value = listed.json().await?;
+    assert_eq!(listed_body["total"], 2);
+    assert!(listed_body["plans"].as_array().is_some_and(|plans| {
+        plans
+            .iter()
+            .any(|plan| plan["name"] == "电影与剧集夜间校验" && plan["libraryCount"] == 2)
+    }));
+
+    let config_plan_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT plan_id FROM scheduled_task_configs
+         WHERE task_type = 'RECONCILIATION_SCAN' ORDER BY owner_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(config_plan_ids.len(), 2);
+    assert_eq!(config_plan_ids[0], config_plan_ids[1]);
+    server.abort();
+    Ok(())
+}
