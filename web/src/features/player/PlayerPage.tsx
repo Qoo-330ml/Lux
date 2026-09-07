@@ -382,7 +382,7 @@ export function PlayerPage() {
   const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
     ? playbackPlan.rangeUrl ?? null
     : null;
-  const audioCompatibilityWarning = remoteAudioCodecWarning(source);
+  const audioCompatibilityWarning = mediaExtensionActive ? null : remoteAudioCodecWarning(source);
   const playerStatus = combinePlayerNotices(captionStatus, audioCompatibilityWarning);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const chapterTimeline = useMemo(
