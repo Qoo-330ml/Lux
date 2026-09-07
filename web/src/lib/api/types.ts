@@ -719,6 +719,37 @@ export type AdminScheduledTaskPage = {
   pageSize?: number;
 };
 
+export type AdminScheduledTaskPlanLibrary = {
+  id: string;
+  name: string;
+};
+
+export type AdminScheduledTaskPlan = {
+  id: string;
+  taskType: string;
+  name: string;
+  taskName?: string | null;
+  description?: string | null;
+  sourceType?: "SYSTEM" | "PLUGIN" | string;
+  pluginId?: string | null;
+  schedule?: string | null;
+  isEnabled: boolean;
+  resourceLimit?: Record<string, unknown>;
+  scopeType?: "GLOBAL" | "LIBRARY" | string;
+  isDefault?: boolean;
+  libraries?: AdminScheduledTaskPlanLibrary[];
+  libraryCount?: number;
+  createdAt?: string | number;
+  updatedAt?: string | number;
+};
+
+export type AdminScheduledTaskPlanPage = {
+  plans?: AdminScheduledTaskPlan[];
+  total?: number;
+  page?: number;
+  pageSize?: number;
+};
+
 export type AdminMetadataReidentifyJob = {
   id: string;
   libraryId?: string | null;
