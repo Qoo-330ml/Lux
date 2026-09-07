@@ -27,10 +27,10 @@ import {
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
+import { ChromeCaptionExtension } from "./chrome-caption-extension";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
-import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
-import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";
+import { isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -276,8 +276,14 @@ export function PlayerPage() {
     media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
     media?.mediaSources?.find((entry) => entry.isDefault) ??
     media?.mediaSources?.[0];
+  const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
-  const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, nativeCaptionTracks);
+  const [extensionCaptionTracks, setExtensionCaptionTracks] = useState<PlayerRuntimeCaptionTrack[]>([]);
+  const captionOptions = playerCaptionOptions(
+    source,
+    nativeCaptionTracksSupported,
+    remoteHttpSource ? extensionCaptionTracks : nativeCaptionTracks,
+  );
   const selectedCaptionOption = captionSourceId === source?.id
     ? captionOptions.find((caption) => (
       (caption.id === selectedCaptionId || String(caption.streamIndex) === selectedCaptionId)
@@ -326,28 +332,22 @@ export function PlayerPage() {
     ? webPlaybackSession.data
     : playbackBootstrap.data?.session ?? webPlaybackSession.data;
   const playbackPlan = playbackSession?.plan;
-  const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
-  const directRangeUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.rangeUrl : undefined;
-  const remoteMatroskaRelayUrl = remoteMatroskaRangeUrl(source, directRangeUrl);
   const streamUrl = playbackPlan?.type === "DIRECT"
     ? (directProxyFallbackRequested
       ? playbackPlan.url
-      : remoteMatroskaRelayUrl ?? directProxyUrl ?? playbackPlan.url)
+      : directProxyUrl ?? playbackPlan.url)
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
-  const remoteCaptionRequested = remoteHttpSource
-    && Boolean(
-      selectedCaptionOption
-      && selectedCaptionOption.renderMode === "runtime-overlay",
-  );
+  const extensionCaptionSelection = selectedCaptionOption;
+  const extensionCaptionRequested = remoteHttpSource
+    && isMatroskaSource(source)
+    && Boolean(extensionCaptionSelection?.format && ["srt", "ass", "ssa"].includes(extensionCaptionSelection.format));
+  const extensionCaptionSourceUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.url : "";
   const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
     ? playbackPlan.rangeUrl ?? null
     : null;
-  const remoteCaptionSidecarRequested = remoteCaptionRequested
-    && canUseRemoteMkvCaptionSidecar(source)
-    && Boolean(clientMkvSourceUrl);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
@@ -375,7 +375,7 @@ export function PlayerPage() {
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
   const captionSelectionTouchedRef = useRef(false);
-  const remoteCaptionReaderRef = useRef<RemoteMkvCaptionReader | null>(null);
+  const chromeCaptionExtensionRef = useRef<ChromeCaptionExtension | null>(null);
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
 
@@ -513,6 +513,7 @@ export function PlayerPage() {
   useEffect(() => {
     captionSelectionTouchedRef.current = false;
     setNativeCaptionTracks([]);
+    setExtensionCaptionTracks([]);
     const initialCaption = defaultCaptionSelection(
       playerCaptionOptions(source, nativeCaptionTracksSupported, []),
     );
@@ -1032,35 +1033,43 @@ export function PlayerPage() {
   useEffect(() => {
     setRuntimeCaptionCues([]);
     if (
-      !remoteCaptionSidecarRequested
-      || !clientMkvSourceUrl
-      || !selectedCaptionOption
-      || selectedCaptionOption.renderMode !== "runtime-overlay"
+      !extensionCaptionRequested
+      || !extensionCaptionSourceUrl
+      || !extensionCaptionSelection
     ) {
-      remoteCaptionReaderRef.current?.destroy();
-      remoteCaptionReaderRef.current = null;
+      chromeCaptionExtensionRef.current?.stop();
+      chromeCaptionExtensionRef.current = null;
+      setExtensionCaptionTracks([]);
       return;
     }
     let active = true;
-    const reader = new RemoteMkvCaptionReader({
-      source: clientMkvSourceUrl,
-      selection: {
-        id: selectedCaptionOption.id,
-        name: selectedCaptionOption.name,
-        language: selectedCaptionOption.language,
-        format: selectedCaptionOption.format,
-        ordinal: selectedCaptionOption.embeddedOrdinal,
+    let absoluteSource: string;
+    try {
+      absoluteSource = new URL(extensionCaptionSourceUrl, window.location.href).href;
+    } catch {
+      setCaptionStatus("远程字幕地址无效");
+      return;
+    }
+    const bridge = new ChromeCaptionExtension({
+      onTracks: (tracks) => {
+        if (!active) return;
+        setExtensionCaptionTracks(tracks.map((track) => ({
+          id: track.id,
+          label: track.label,
+          language: track.language,
+          kind: "subtitles",
+          ordinal: track.ordinal,
+        })));
       },
-      currentTime: () => videoRef.current?.currentTime ?? currentTimeRef.current,
       onReady: () => {
         if (active) setCaptionStatus(null);
       },
       onCue: (cue) => {
         if (!active) return;
         handleRuntimeCaptionCue({
-          trackId: selectedCaptionOption.id,
-          startMs: cue.start * 1000,
-          endMs: cue.end * 1000,
+          trackId: cue.trackId,
+          startMs: cue.startMs,
+          endMs: cue.endMs,
           text: cue.text,
           layer: cue.layer,
           alignment: cue.alignment,
@@ -1073,18 +1082,25 @@ export function PlayerPage() {
         if (active) setCaptionStatus(`远程字幕不可用：${error.message}`);
       },
     });
-    remoteCaptionReaderRef.current = reader;
-    void reader.start();
+    chromeCaptionExtensionRef.current = bridge;
+    bridge.start(absoluteSource, {
+      id: extensionCaptionSelection.id,
+      name: extensionCaptionSelection.name,
+      language: extensionCaptionSelection.language,
+      format: extensionCaptionSelection.format === "vtt" ? undefined : extensionCaptionSelection.format,
+      ordinal: extensionCaptionSelection.embeddedOrdinal,
+    });
     return () => {
       active = false;
-      reader.destroy();
-      if (remoteCaptionReaderRef.current === reader) remoteCaptionReaderRef.current = null;
+      bridge.stop();
+      if (chromeCaptionExtensionRef.current === bridge) chromeCaptionExtensionRef.current = null;
       setRuntimeCaptionCues([]);
+      setExtensionCaptionTracks([]);
     };
-  }, [clientMkvSourceUrl, handleRuntimeCaptionCue, playbackKey, remoteCaptionSidecarRequested, selectedCaptionOption?.embeddedOrdinal, selectedCaptionOption?.format, selectedCaptionOption?.id, selectedCaptionOption?.language, selectedCaptionOption?.name, selectedCaptionOption?.renderMode]);
+  }, [extensionCaptionRequested, extensionCaptionSelection?.embeddedOrdinal, extensionCaptionSelection?.format, extensionCaptionSelection?.id, extensionCaptionSelection?.language, extensionCaptionSelection?.name, extensionCaptionSourceUrl, handleRuntimeCaptionCue, playbackKey]);
 
   useEffect(() => {
-    remoteCaptionReaderRef.current?.setTime(currentTime);
+    chromeCaptionExtensionRef.current?.setTime(currentTime);
   }, [currentTime]);
 
   const changeCaptionOffset = useCallback((offset: number) => {
