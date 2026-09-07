@@ -70,6 +70,13 @@ const TIMELINE_UI_UPDATE_INTERVAL_MS = 100;
 const AUTO_HIDE_DELAY_MS = 3_000;
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
+type PlaybackEngineHandoff = {
+  playbackKey: string;
+  sourceId: string;
+  currentTime: number;
+  playing: boolean;
+};
+
 const HEVC_RUNTIME_ASSETS = {
   workerUrl: "/hevc/transcode-worker.js",
   wasmUrl: "/hevc/hevc-decode.js",
@@ -360,6 +367,7 @@ export function PlayerPage() {
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
   const captionSelectionTouchedRef = useRef(false);
+  const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
@@ -625,12 +633,34 @@ export function PlayerPage() {
       bufferedEndRef.current = next.bufferedEnd;
       timelineScheduler.schedule(next, immediate);
     };
+    const restoreEngineHandoff = async () => {
+      const handoff = playbackEngineHandoffRef.current;
+      if (
+        !handoff
+        || handoff.playbackKey !== playbackKey
+        || handoff.sourceId !== (source?.id ?? "")
+      ) {
+        return;
+      }
+      playbackEngineHandoffRef.current = null;
+      if (Number.isFinite(handoff.currentTime) && handoff.currentTime >= 0) {
+        currentTimeRef.current = handoff.currentTime;
+        setCurrentTime(handoff.currentTime);
+        activeEngine.seek(handoff.currentTime);
+      }
+      if (handoff.playing) {
+        await activeEngine.play().catch(() => undefined);
+      } else {
+        activeEngine.pause();
+      }
+    };
     const removeRuntimeSubscription = runtime.subscribeEvents((event) => {
       if (cancelled) return;
       switch (event.type) {
         case "SOURCE_READY":
           syncSnapshot(event.snapshot, true);
           restorePlaybackPosition();
+          void restoreEngineHandoff();
           break;
         case "PLAYING":
           hasStartedRef.current = true;
@@ -769,6 +799,7 @@ export function PlayerPage() {
             poster,
           },
         );
+        if (!cancelled) await restoreEngineHandoff();
         if (!cancelled && activeEngine.performance)
           handlePerformance(
             new CustomEvent(PLAYBACK_PERFORMANCE_EVENT, {
@@ -799,6 +830,23 @@ export function PlayerPage() {
     void load();
     return () => {
       cancelled = true;
+      if (remoteHttpSource && source?.id) {
+        const video = activeEngine.element;
+        const currentTime = Number.isFinite(video.currentTime)
+          ? Math.max(0, video.currentTime)
+          : currentTimeRef.current;
+        if (
+          playbackEngineHandoffRef.current?.playbackKey !== playbackKey
+          || playbackEngineHandoffRef.current?.sourceId !== source.id
+        ) {
+          playbackEngineHandoffRef.current = {
+            playbackKey,
+            sourceId: source.id,
+            currentTime,
+            playing: !video.paused && !video.ended,
+          };
+        }
+      }
       timelineScheduler.dispose();
       initialEngine.element.removeEventListener("durationchange", handleDurationChange);
       performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
