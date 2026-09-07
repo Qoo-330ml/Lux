@@ -1,4 +1,4 @@
-# Lux Remote Matroska Captions Chrome Extension
+# Lux Remote Matroska Media Chrome Extension
 
 这个 MV3 扩展是 Lux 远程 URL 型 STRM 的可选旁路：
 

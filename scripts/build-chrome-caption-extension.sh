@@ -5,7 +5,7 @@ repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 extension_root="$repo_root/tools/chrome-caption-extension"
 dist_dir="$extension_root/dist"
 artifact_dir="$repo_root/output"
-artifact_path="${1:-$artifact_dir/lux-remote-matroska-captions-v0.3.9.zip}"
+artifact_path="${1:-$artifact_dir/lux-remote-matroska-media-v0.4.0.zip}"
 
 mkdir -p "$artifact_dir"
 pnpm --dir "$repo_root/web" exec vite build --config ../tools/chrome-caption-extension/vite.config.ts
