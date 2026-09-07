@@ -2819,17 +2819,6 @@ pub(crate) async fn admin_update_scheduled_task_plan(
             existing.is_enabled
         }
     });
-    let template = match existing.libraries.first() {
-        Some(library) => database
-            .find_scheduled_task_config("LIBRARY", &library.id, &existing.task_type)
-            .await
-            .ok()
-            .flatten(),
-        None => None,
-    };
-    let Some(template) = template else {
-        return StatusCode::CONFLICT.into_response();
-    };
     let resource_limit_json = match request.resource_limit {
         Some(value) if !value.is_object() => {
             return api_error(
@@ -2853,10 +2842,10 @@ pub(crate) async fn admin_update_scheduled_task_plan(
             schedule.as_deref(),
             is_enabled,
             &library_ids,
-            &template.task_name,
-            &template.task_description,
-            &template.source_type,
-            template.plugin_id.as_deref(),
+            &existing.task_name,
+            &existing.task_description,
+            &existing.source_type,
+            existing.plugin_id.as_deref(),
             &resource_limit_json,
         )
         .await

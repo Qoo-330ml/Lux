@@ -1560,13 +1560,21 @@ impl Database {
         let filter = "WHERE (? IS NULL OR p.task_type = ?)
                        AND (? IS NULL OR lower(p.plan_name) LIKE ?
                             OR lower(p.task_name) LIKE ?
-                            OR lower(p.task_type) LIKE ?)";
+                            OR lower(p.task_type) LIKE ?
+                            OR EXISTS (
+                                SELECT 1
+                                FROM scheduled_task_plan_libraries pl
+                                JOIN libraries l ON l.id = pl.library_id
+                                WHERE pl.plan_id = p.id
+                                  AND lower(l.name) LIKE ?
+                            ))";
         let total = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(format!(
                 "SELECT COUNT(*) FROM scheduled_task_plans p {filter}"
             )))
             .bind(task_type)
             .bind(task_type)
+            .bind(search_pattern.as_deref())
             .bind(search_pattern.as_deref())
             .bind(search_pattern.as_deref())
             .bind(search_pattern.as_deref())
@@ -1590,6 +1598,7 @@ impl Database {
             )))
             .bind(task_type)
             .bind(task_type)
+            .bind(search_pattern.as_deref())
             .bind(search_pattern.as_deref())
             .bind(search_pattern.as_deref())
             .bind(search_pattern.as_deref())

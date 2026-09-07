@@ -1492,6 +1492,21 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
             .any(|plan| plan["name"] == "电影与剧集夜间校验" && plan["libraryCount"] == 2)
     }));
 
+    let searched = client
+        .get(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans?page=1&pageSize=50&search=Series"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(searched.status(), reqwest::StatusCode::OK);
+    let searched_body: Value = searched.json().await?;
+    assert_eq!(searched_body["total"], 2, "unexpected plan search response: {searched_body}");
+    assert!(searched_body["plans"].as_array().is_some_and(|plans| {
+        plans.iter().any(|plan| plan["name"] == "电影与剧集夜间校验")
+            && plans.iter().any(|plan| plan["name"] == "元数据刮削")
+    }));
+
     let config_plan_ids: Vec<String> = sqlx::query_scalar(
         "SELECT plan_id FROM scheduled_task_configs
          WHERE task_type = 'RECONCILIATION_SCAN' ORDER BY owner_id",
@@ -1500,6 +1515,40 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
     .await?;
     assert_eq!(config_plan_ids.len(), 2);
     assert_eq!(config_plan_ids[0], config_plan_ids[1]);
+
+    let original_plan_id = created_body["plan"]["id"]
+        .as_str()
+        .ok_or("missing created plan id")?
+        .to_owned();
+    let moved = client
+        .post(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "taskType": "RECONCILIATION_SCAN",
+            "name": "临时校验",
+            "schedule": "0 5 * * 1",
+            "isEnabled": true,
+            "libraryIds": library_ids
+        }))
+        .send()
+        .await?;
+    assert_eq!(moved.status(), reqwest::StatusCode::CREATED);
+
+    let restored = client
+        .patch(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans/{original_plan_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "libraryIds": [library_ids[0]] }))
+        .send()
+        .await?;
+    assert_eq!(restored.status(), reqwest::StatusCode::OK);
+    assert_eq!(restored.json::<Value>().await?["plan"]["libraryCount"], 1);
+
     server.abort();
     Ok(())
 }
