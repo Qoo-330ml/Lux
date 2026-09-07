@@ -57,6 +57,7 @@ type MediaPageMessage = {
 
 const sessions = new Map<string, CaptionSession>();
 const mediaSessions = new Map<string, { sourceUrl: string }>();
+const mediaRequests = new Map<string, AbortController>();
 
 chrome.runtime.onMessage.addListener((rawMessage, sender, sendResponse) => {
   const message = rawMessage as PageMessage | MediaPageMessage;
@@ -99,6 +100,12 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   for (const [key] of mediaSessions) {
     if (key.startsWith(`${tabId}:`)) mediaSessions.delete(key);
   }
+  for (const [key, controller] of mediaRequests) {
+    if (key.startsWith(`${tabId}:`)) {
+      controller.abort();
+      mediaRequests.delete(key);
+    }
+  }
 });
 
 async function handleMediaMessage(
@@ -126,7 +133,10 @@ async function handleMediaMessage(
       return;
     }
     try {
-      const range = await readRange(session.sourceUrl, message.start, message.end, new AbortController().signal);
+      const requestKey = `${key}:${message.requestId}`;
+      const controller = new AbortController();
+      mediaRequests.set(requestKey, controller);
+      const range = await readRange(session.sourceUrl, message.start, message.end, controller.signal);
       const data = range.data.slice().buffer;
       sendResponse({
         source: MEDIA_EXTENSION_SOURCE,
@@ -142,11 +152,19 @@ async function handleMediaMessage(
       });
     } catch (error) {
       sendResponse({ source: MEDIA_EXTENSION_SOURCE, version: PROTOCOL_VERSION, type: "error", sessionId: message.sessionId, requestId: message.requestId, message: error instanceof Error ? error.message : String(error) });
+    } finally {
+      mediaRequests.delete(`${key}:${message.requestId}`);
     }
     return;
   }
   if (message.type === "stop") {
     mediaSessions.delete(key);
+    for (const [requestKey, controller] of mediaRequests) {
+      if (requestKey.startsWith(`${key}:`)) {
+        controller.abort();
+        mediaRequests.delete(requestKey);
+      }
+    }
     sendResponse({ ok: true });
     return;
   }

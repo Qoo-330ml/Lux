@@ -250,6 +250,7 @@ export class ChromeMediaExtension {
     this.source = null;
     this.pending.forEach(({ reject }) => reject(new Error("扩展媒体会话已停止")));
     this.pending.clear();
+    this.readyReject?.(new Error("扩展媒体会话已停止"));
     this.clearReady();
     window.removeEventListener("message", this.handleMessage);
   }
