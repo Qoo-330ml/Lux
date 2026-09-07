@@ -27,11 +27,10 @@ import {
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
-import { ChromeCaptionExtension, ChromeMediaExtension } from "./chrome-caption-extension";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
-import { hasClientHevcRuntime, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
-import { shouldUseChromeExtensionMedia } from "./chrome-media-codec";
+import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -106,38 +105,6 @@ function screenshotFileName(title: string) {
     .trim()
     .slice(0, 80);
   return `${normalized || "lux-screenshot"}-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
-}
-
-function remoteMediaNeedsExtension(source: MediaSource | undefined, video: HTMLVideoElement) {
-  if (!source || !isMatroskaSource(source)) return false;
-  const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? null;
-  const audioCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "AUDIO")?.codec ?? null;
-  const matroskaCodecs = [videoCodec, audioCodec].filter((codec): codec is string => Boolean(codec));
-  const matroskaMime = `video/x-matroska; codecs="${matroskaCodecs.join(",")}"`;
-  const nativeMseSupported = supportsMp4Codec(video, "video", videoCodec ?? "")
-    && (!audioCodec || supportsMp4Codec(video, "audio", audioCodec));
-  const nativeDirectSupported = video.canPlayType(matroskaMime) !== "";
-  // Keep the native path safe when an older test/runtime shim does not expose
-  // the optional HEVC capability probe yet. A missing probe is not evidence
-  // that software decoding is available, so it must never trigger extension
-  // playback or turn a working native session into an engine error.
-  const hevcWasmAvailable = typeof hasClientHevcRuntime === "function"
-    ? hasClientHevcRuntime()
-    : false;
-  return shouldUseChromeExtensionMedia({
-    videoCodec,
-    audioCodec,
-    nativeDirectSupported,
-    nativeMseSupported,
-    hevcWasmAvailable,
-    h264OutputSupported: hevcWasmAvailable,
-    eac3WasmAvailable: true,
-  });
-}
-
-function hasChromeExtensionRuntime() {
-  return typeof document !== "undefined"
-    && document.documentElement?.getAttribute("data-lux-media-extension") === "1";
 }
 
 export function webPlaybackCapabilities(
@@ -309,15 +276,8 @@ export function PlayerPage() {
     media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
     media?.mediaSources?.find((entry) => entry.isDefault) ??
     media?.mediaSources?.[0];
-  const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
-  const [extensionCaptionTracks, setExtensionCaptionTracks] = useState<PlayerRuntimeCaptionTrack[]>([]);
-  const [mediaExtensionActive, setMediaExtensionActive] = useState(false);
-  const captionOptions = playerCaptionOptions(
-    source,
-    nativeCaptionTracksSupported,
-    remoteHttpSource && !mediaExtensionActive ? extensionCaptionTracks : nativeCaptionTracks,
-  );
+  const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, nativeCaptionTracks);
   const selectedCaptionOption = captionSourceId === source?.id
     ? captionOptions.find((caption) => (
       (caption.id === selectedCaptionId || String(caption.streamIndex) === selectedCaptionId)
@@ -366,24 +326,28 @@ export function PlayerPage() {
     ? webPlaybackSession.data
     : playbackBootstrap.data?.session ?? webPlaybackSession.data;
   const playbackPlan = playbackSession?.plan;
+  const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
+  const directRangeUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.rangeUrl : undefined;
+  const remoteMatroskaRelayUrl = remoteMatroskaRangeUrl(source, directRangeUrl);
   const streamUrl = playbackPlan?.type === "DIRECT"
     ? (directProxyFallbackRequested
       ? playbackPlan.url
-      : directProxyUrl ?? playbackPlan.url)
+      : remoteMatroskaRelayUrl ?? directProxyUrl ?? playbackPlan.url)
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
-  const extensionCaptionSelection = selectedCaptionOption;
-  const extensionCaptionRequested = remoteHttpSource
-    && isMatroskaSource(source)
-    && Boolean(extensionCaptionSelection?.format && ["srt", "ass", "ssa"].includes(extensionCaptionSelection.format));
-  const extensionCaptionSourceUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.url : "";
+  const remoteCaptionRequested = remoteHttpSource
+    && Boolean(
+      selectedCaptionOption
+      && selectedCaptionOption.renderMode === "runtime-overlay",
+  );
   const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
     ? playbackPlan.rangeUrl ?? null
     : null;
-  const audioCompatibilityWarning = mediaExtensionActive ? null : remoteAudioCodecWarning(source);
-  const playerStatus = combinePlayerNotices(captionStatus, audioCompatibilityWarning);
+  const remoteCaptionSidecarRequested = remoteCaptionRequested
+    && canUseRemoteMkvCaptionSidecar(source)
+    && Boolean(clientMkvSourceUrl);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
   const chapterTimeline = useMemo(
     () => normalizePlayerChapters(source?.chapters, duration),
@@ -411,7 +375,7 @@ export function PlayerPage() {
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
   const captionSelectionTouchedRef = useRef(false);
-  const chromeCaptionExtensionRef = useRef<ChromeCaptionExtension | null>(null);
+  const remoteCaptionReaderRef = useRef<RemoteMkvCaptionReader | null>(null);
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
 
@@ -549,7 +513,6 @@ export function PlayerPage() {
   useEffect(() => {
     captionSelectionTouchedRef.current = false;
     setNativeCaptionTracks([]);
-    setExtensionCaptionTracks([]);
     const initialCaption = defaultCaptionSelection(
       playerCaptionOptions(source, nativeCaptionTracksSupported, []),
     );
@@ -780,7 +743,6 @@ export function PlayerPage() {
       if (!cancelled) syncSnapshot(activeEngine.snapshot(), true);
     };
     initialEngine.element.addEventListener("durationchange", handleDurationChange);
-    let mediaExtension: ChromeMediaExtension | null = null;
     const load = async () => {
       try {
         if (playbackPlan?.type === "SERVER_HLS") {
@@ -791,39 +753,6 @@ export function PlayerPage() {
           engineRef.current = activeEngine;
         } else {
           const remoteHttpStrm = remoteHttpSource;
-          const useExtensionMedia = remoteHttpStrm
-            && isMatroskaSource(source)
-            && extensionCaptionSourceUrl.length > 0
-            && remoteMediaNeedsExtension(source, initialEngine.element)
-            && hasChromeExtensionRuntime()
-            && typeof ChromeMediaExtension === "function";
-          if (useExtensionMedia) {
-            mediaExtension = new ChromeMediaExtension();
-            const extensionMediaUrl = new URL(extensionCaptionSourceUrl, window.location.href).href;
-            try {
-              await mediaExtension.start(extensionMediaUrl);
-            } catch {
-              mediaExtension.stop();
-              mediaExtension = null;
-            }
-            if (mediaExtension && !cancelled) {
-              initialEngine.destroy();
-              const { ClientMkvEngine } = await import("./mkv-playback-engine");
-              if (cancelled) return;
-              const inputCodec = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec ?? "";
-              const activeMediaExtension = mediaExtension;
-              activeEngine = new ClientMkvEngine(
-                initialEngine.element,
-                HEVC_RUNTIME_ASSETS,
-                inputCodec,
-                () => activeMediaExtension.createRangeReader(extensionMediaUrl),
-              );
-              engineRef.current = activeEngine;
-              setMediaExtensionActive(true);
-              performanceElement = activeEngine.element;
-              performanceElement.addEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
-            }
-          }
           const useMkvFallback = isMatroskaSource(source)
             && !remoteHttpStrm
             ? await shouldUseClientMkv(source, initialEngine.element)
@@ -832,7 +761,7 @@ export function PlayerPage() {
             !useMkvFallback
             && !remoteHttpStrm
             && (await shouldUseClientHevc(source, initialEngine.element));
-          if (!mediaExtension && (useMkvFallback || useHevcFallback)) {
+          if (useMkvFallback || useHevcFallback) {
             setFallbackLoading(true);
             if (cancelled) return;
             initialEngine.destroy();
@@ -876,10 +805,7 @@ export function PlayerPage() {
       } catch (cause) {
         if (!cancelled) {
           if (runtime.state.status === "FAILED") return;
-          if (mediaExtension) {
-            setFailedStreamUrl(streamUrl);
-            setPlaybackFailure(classifyPlayerEngineFailure(cause));
-          } else if (playbackPlan?.type === "DIRECT") {
+          if (playbackPlan?.type === "DIRECT") {
             requestServerFallback(cause);
           } else {
             setFailedStreamUrl(streamUrl);
@@ -911,8 +837,6 @@ export function PlayerPage() {
         }
       }
       timelineScheduler.dispose();
-      mediaExtension?.stop();
-      setMediaExtensionActive(false);
       initialEngine.element.removeEventListener("durationchange", handleDurationChange);
       performanceElement?.removeEventListener(PLAYBACK_PERFORMANCE_EVENT, handlePerformance);
       removeRuntimeSubscription();
@@ -1108,44 +1032,35 @@ export function PlayerPage() {
   useEffect(() => {
     setRuntimeCaptionCues([]);
     if (
-      !extensionCaptionRequested
-      || mediaExtensionActive
-      || !extensionCaptionSourceUrl
-      || !extensionCaptionSelection
+      !remoteCaptionSidecarRequested
+      || !clientMkvSourceUrl
+      || !selectedCaptionOption
+      || selectedCaptionOption.renderMode !== "runtime-overlay"
     ) {
-      chromeCaptionExtensionRef.current?.stop();
-      chromeCaptionExtensionRef.current = null;
-      setExtensionCaptionTracks([]);
+      remoteCaptionReaderRef.current?.destroy();
+      remoteCaptionReaderRef.current = null;
       return;
     }
     let active = true;
-    let absoluteSource: string;
-    try {
-      absoluteSource = new URL(extensionCaptionSourceUrl, window.location.href).href;
-    } catch {
-      setCaptionStatus("远程字幕地址无效");
-      return;
-    }
-    const bridge = new ChromeCaptionExtension({
-      onTracks: (tracks) => {
-        if (!active) return;
-        setExtensionCaptionTracks(tracks.map((track) => ({
-          id: track.id,
-          label: track.label,
-          language: track.language,
-          kind: "subtitles",
-          ordinal: track.ordinal,
-        })));
+    const reader = new RemoteMkvCaptionReader({
+      source: clientMkvSourceUrl,
+      selection: {
+        id: selectedCaptionOption.id,
+        name: selectedCaptionOption.name,
+        language: selectedCaptionOption.language,
+        format: selectedCaptionOption.format,
+        ordinal: selectedCaptionOption.embeddedOrdinal,
       },
+      currentTime: () => videoRef.current?.currentTime ?? currentTimeRef.current,
       onReady: () => {
         if (active) setCaptionStatus(null);
       },
       onCue: (cue) => {
         if (!active) return;
         handleRuntimeCaptionCue({
-          trackId: cue.trackId,
-          startMs: cue.startMs,
-          endMs: cue.endMs,
+          trackId: selectedCaptionOption.id,
+          startMs: cue.start * 1000,
+          endMs: cue.end * 1000,
           text: cue.text,
           layer: cue.layer,
           alignment: cue.alignment,
@@ -1158,27 +1073,18 @@ export function PlayerPage() {
         if (active) setCaptionStatus(`远程字幕不可用：${error.message}`);
       },
     });
-    chromeCaptionExtensionRef.current = bridge;
-    bridge.start(absoluteSource, {
-      // TrackUID is discovered asynchronously by the extension. Keep the
-      // request identity tied to the API stream index so discovery does not
-      // restart this bridge or invalidate the user's selection.
-      id: String(extensionCaptionSelection.streamIndex),
-      name: extensionCaptionSelection.name,
-      language: extensionCaptionSelection.language,
-      format: extensionCaptionSelection.format === "vtt" ? undefined : extensionCaptionSelection.format,
-      ordinal: extensionCaptionSelection.embeddedOrdinal,
-    });
+    remoteCaptionReaderRef.current = reader;
+    void reader.start();
     return () => {
       active = false;
-      bridge.stop();
-      if (chromeCaptionExtensionRef.current === bridge) chromeCaptionExtensionRef.current = null;
+      reader.destroy();
+      if (remoteCaptionReaderRef.current === reader) remoteCaptionReaderRef.current = null;
       setRuntimeCaptionCues([]);
     };
-  }, [extensionCaptionRequested, extensionCaptionSelection?.embeddedOrdinal, extensionCaptionSelection?.format, extensionCaptionSelection?.language, extensionCaptionSelection?.name, extensionCaptionSelection?.streamIndex, extensionCaptionSourceUrl, handleRuntimeCaptionCue, mediaExtensionActive, playbackKey]);
+  }, [clientMkvSourceUrl, handleRuntimeCaptionCue, playbackKey, remoteCaptionSidecarRequested, selectedCaptionOption?.embeddedOrdinal, selectedCaptionOption?.format, selectedCaptionOption?.id, selectedCaptionOption?.language, selectedCaptionOption?.name, selectedCaptionOption?.renderMode]);
 
   useEffect(() => {
-    chromeCaptionExtensionRef.current?.setTime(currentTime);
+    remoteCaptionReaderRef.current?.setTime(currentTime);
   }, [currentTime]);
 
   const changeCaptionOffset = useCallback((offset: number) => {
@@ -1569,7 +1475,7 @@ export function PlayerPage() {
           }}
           captions={captionOptions}
           selectedCaptionId={captionSourceId === source?.id ? selectedCaptionId : null}
-          captionStatus={playerStatus}
+          captionStatus={captionStatus}
           onSelectCaption={selectCaption}
           captionOffset={captionOffset}
           onChangeCaptionOffset={changeCaptionOffset}
@@ -1632,24 +1538,6 @@ export function PlayerPage() {
 
 function isMatroskaSource(source: MediaSource | undefined) {
   return (source?.container ?? "").toLowerCase().split(",").some((part) => part.trim() === "mkv" || part.trim() === "matroska" || part.trim() === "webm");
-}
-
-export function remoteAudioCodecWarning(source: MediaSource | undefined) {
-  if (source?.sourceKind !== "STRM_URL") return null;
-  const audioStreams = (source.streams ?? []).filter((stream) => stream.type?.toUpperCase() === "AUDIO");
-  const selectedAudio = audioStreams.find((stream) => stream.isDefault === true) ?? audioStreams[0];
-  const codec = selectedAudio?.codec?.trim().toLowerCase();
-  if (codec && (/^(aac|mp4a)(?:\.|$)/u.test(codec) || codec === "opus")) return null;
-  if (!codec || !["ac3", "ac-3", "eac3", "ec-3"].includes(codec)) return null;
-  const video = typeof document === "undefined" ? null : document.createElement("video");
-  if (supportsMp4Codec(video, "audio", codec)) return null;
-  const label = codec === "eac3" || codec === "ec-3" ? "E-AC-3" : "AC-3";
-  return `当前 Chrome 无法解码 ${label} 音频，因此画面可能播放但没有声音；字幕扩展不负责音频解码。请改用 AAC/Opus 音轨、支持该编码的浏览器，或启用转码。`;
-}
-
-export function combinePlayerNotices(...notices: readonly (string | null | undefined)[]) {
-  const visible = notices.filter((notice): notice is string => Boolean(notice));
-  return visible.length > 0 ? visible.join("；") : null;
 }
 
 function useClientEngine(engine: PlaybackEngine) {

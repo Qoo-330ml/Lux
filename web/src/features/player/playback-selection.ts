@@ -25,10 +25,10 @@ export function isRemoteHttpStrmSource(source: MediaSource | undefined) {
 }
 
 /**
- * Legacy helper retained for callers that still need a signed Range URL.
- * The player no longer uses it as the native media source: remote STRM
- * playback must keep the original direct/307 path so media bytes do not pass
- * through Lux. The Chrome caption extension reads that direct URL itself.
+ * Native media playback for a remote Matroska source must stay on Lux's
+ * same-origin signed Range Relay.  This prevents the browser's media
+ * request from following the STRM target's redirect directly and gives a
+ * future caption tee one stable request surface to observe.
  */
 export function remoteMatroskaRangeUrl(source: MediaSource | undefined, rangeUrl: string | null | undefined) {
   if (!rangeUrl || !isRemoteHttpStrmSource(source) || !isMatroskaContainer(source?.container)) return null;
@@ -163,9 +163,10 @@ export function canUseClientMkvCaptionPipeline(source: MediaSource | undefined) 
 }
 
 /**
- * Remote Matroska captions can be read without remuxing the media. The Chrome
- * extension owns the cross-origin Range fetch, so this capability remains
- * independent from the MSE codec pair and native audio/video path.
+ * Remote Matroska captions can be read without remuxing the media.  Keep this
+ * capability independent from the MSE codec pair: native playback remains in
+ * charge of audio/video (including E-AC-3), while the caption sidecar only
+ * needs a signed Range URL and a supported text track.
  */
 export function canUseRemoteMkvCaptionSidecar(source: MediaSource | undefined) {
   if (!source || !isRemoteHttpStrmSource(source) || !isMatroskaContainer(source.container)) return false;

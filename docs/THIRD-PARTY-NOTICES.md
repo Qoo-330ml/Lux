@@ -49,11 +49,3 @@ MIT License 要求在软件的所有副本或实质性部分中保留版权和�
 ## 其他依赖
 
 Web 播放已有依赖的许可证继续由包管理文件和发布构建记录负责；新增播放器依赖或 WASM 组件时，必须在引入同一提交中补充名称、版本、许可证、上游地址和发布包是否包含该组件。
-
-### @audio/decode-eac3 1.0.0
-
-- 项目：https://github.com/audiojs/decode-eac3（npm `@audio/decode-eac3@1.0.0`）
-- 许可证：LGPL-2.1-or-later；随包附带 FFmpeg 许可证声明
-- 用途：浏览器 Worker 中将 AC-3/E-AC-3 syncframe 解为 PCM；仅在扩展媒体会话选择软件音频路径时加载
-- 发布包：Web Worker 构建包含单文件 WASM；Chrome 字幕扩展 ZIP 不单独复制该依赖
-- 体积记录：解包约 0.5 MiB，实际 Web 构建以构建产物为准；不引入完整 FFmpeg
