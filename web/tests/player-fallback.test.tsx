@@ -27,11 +27,22 @@ vi.mock("../src/features/player/playback-selection", () => ({
 
 vi.mock("../src/features/player/chrome-caption-extension", () => ({
   ChromeCaptionExtension: class MockChromeCaptionExtension {
-    constructor(private readonly options: { onReady?: () => void }) {}
+    constructor(private readonly options: { onReady?: () => void; onTracks?: (tracks: Array<{ id: string; label: string; language?: string; format: "srt"; isDefault: boolean; isForced: boolean; ordinal: number }>) => void }) {}
 
     start(source: string) {
       fallbackState.captionSources.push(source);
-      queueMicrotask(() => this.options.onReady?.());
+      queueMicrotask(() => {
+        this.options.onTracks?.([{
+          id: "mkv:42",
+          label: "Chinese Simplified",
+          language: "zho",
+          format: "srt",
+          isDefault: true,
+          isForced: false,
+          ordinal: 0,
+        }]);
+        this.options.onReady?.();
+      });
     }
 
     setTime() {}

@@ -1084,7 +1084,10 @@ export function PlayerPage() {
     });
     chromeCaptionExtensionRef.current = bridge;
     bridge.start(absoluteSource, {
-      id: extensionCaptionSelection.id,
+      // TrackUID is discovered asynchronously by the extension. Keep the
+      // request identity tied to the API stream index so discovery does not
+      // restart this bridge or invalidate the user's selection.
+      id: String(extensionCaptionSelection.streamIndex),
       name: extensionCaptionSelection.name,
       language: extensionCaptionSelection.language,
       format: extensionCaptionSelection.format === "vtt" ? undefined : extensionCaptionSelection.format,
@@ -1095,9 +1098,8 @@ export function PlayerPage() {
       bridge.stop();
       if (chromeCaptionExtensionRef.current === bridge) chromeCaptionExtensionRef.current = null;
       setRuntimeCaptionCues([]);
-      setExtensionCaptionTracks([]);
     };
-  }, [extensionCaptionRequested, extensionCaptionSelection?.embeddedOrdinal, extensionCaptionSelection?.format, extensionCaptionSelection?.id, extensionCaptionSelection?.language, extensionCaptionSelection?.name, extensionCaptionSourceUrl, handleRuntimeCaptionCue, playbackKey]);
+  }, [extensionCaptionRequested, extensionCaptionSelection?.embeddedOrdinal, extensionCaptionSelection?.format, extensionCaptionSelection?.language, extensionCaptionSelection?.name, extensionCaptionSelection?.streamIndex, extensionCaptionSourceUrl, handleRuntimeCaptionCue, playbackKey]);
 
   useEffect(() => {
     chromeCaptionExtensionRef.current?.setTime(currentTime);
