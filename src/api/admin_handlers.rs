@@ -2901,6 +2901,7 @@ pub(crate) async fn admin_run_scheduled_task_plan(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let mut runs = Vec::new();
+    let mut skipped_library_ids = Vec::new();
     for library in plan.libraries {
         match scheduled_tasks
             .run_task("LIBRARY", &library.id, &plan.task_type)
@@ -2910,8 +2911,15 @@ pub(crate) async fn admin_run_scheduled_task_plan(
                 "libraryId": library.id,
                 "run": scheduled_task_run_json(&run),
             })),
-            Err(ScheduledTaskError::Scan(ScanJobError::AlreadyActive(_))) => {}
-            Err(error) => return scheduled_task_error(&headers, error),
+            Err(error) => {
+                tracing::warn!(
+                    plan_id = %plan_id,
+                    library_id = %library.id,
+                    %error,
+                    "scheduled task plan member was not started"
+                );
+                skipped_library_ids.push(library.id);
+            }
         }
     }
     (
@@ -2921,6 +2929,7 @@ pub(crate) async fn admin_run_scheduled_task_plan(
             "planId": plan_id,
             "taskType": plan.task_type,
             "runs": runs,
+            "skippedLibraryIds": skipped_library_ids,
         })),
     )
         .into_response()

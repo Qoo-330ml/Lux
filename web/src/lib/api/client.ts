@@ -1046,6 +1046,7 @@ export class LuxApiClient {
       planId: string;
       taskType: string;
       runs?: Array<{ libraryId: string; run?: Record<string, unknown> }>;
+      skippedLibraryIds?: string[];
     }>(
       `/api/v1/admin/scheduled-task-plans/${encodeURIComponent(planId)}/run`,
       { method: "POST" },

@@ -1555,3 +1555,88 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn admin_plan_run_continues_after_one_library_rejection()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let mut library_ids = Vec::new();
+    for name in ["A Missing", "B Ready"] {
+        let response = client
+            .post(format!("{base_url}/api/v1/admin/libraries"))
+            .header(COOKIE, &cookies)
+            .header("x-csrf-token", &csrf)
+            .json(&json!({ "name": name, "kind": "MOVIE" }))
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        library_ids.push(
+            response.json::<Value>().await?["library"]["id"]
+                .as_str()
+                .ok_or("missing library id")?
+                .to_owned(),
+        );
+    }
+
+    let created = client
+        .post(format!("{base_url}/api/v1/admin/scheduled-task-plans"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "taskType": "RECONCILIATION_SCAN",
+            "name": "验证逐库派发",
+            "isEnabled": true,
+            "libraryIds": library_ids
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::CREATED);
+    let plan_id = created.json::<Value>().await?["plan"]["id"]
+        .as_str()
+        .ok_or("missing plan id")?
+        .to_owned();
+
+    sqlx::query(
+        "DELETE FROM scheduled_task_configs
+         WHERE owner_type = 'LIBRARY' AND owner_id = ?
+           AND task_type = 'RECONCILIATION_SCAN'",
+    )
+    .bind(&library_ids[0])
+    .execute(database.pool())
+    .await?;
+
+    let run = client
+        .post(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans/{plan_id}/run"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(run.status(), reqwest::StatusCode::ACCEPTED);
+    let run_body: Value = run.json().await?;
+    assert_eq!(run_body["runs"].as_array().map(Vec::len), Some(1));
+    assert_eq!(run_body["runs"][0]["libraryId"], library_ids[1]);
+    assert_eq!(run_body["skippedLibraryIds"], json!([library_ids[0]]));
+
+    server.abort();
+    Ok(())
+}
