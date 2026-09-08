@@ -477,7 +477,18 @@ function RegisteredPlansSection({
               <span>{taskPlans.length} 个执行计划</span>
             </div>
             <div className="lux-registered-task-list">
-              {taskPlans.map((plan) => <ScheduledTaskPlanRow key={plan.id} plan={plan} libraries={libraries} onSaved={onRefresh} />)}
+              {taskPlans.map((plan) => <ScheduledTaskPlanRow
+                key={plan.id}
+                plan={plan}
+                libraries={libraries}
+                onSaved={onRefresh}
+                onDeleted={() => {
+                  const remainingTotal = Math.max(0, total - 1);
+                  const lastAvailablePage = Math.max(1, Math.ceil(remainingTotal / pageSize));
+                  onPageChange(Math.min(page, lastAvailablePage));
+                  onRefresh();
+                }}
+              />)}
             </div>
           </section>
         ))}
@@ -491,7 +502,7 @@ function RegisteredPlansEmpty({ creating }: { creating: boolean }) {
   return <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>{creating ? "请选择任务类型和媒体库" : "还没有执行计划"}</strong><p>{creating ? "新建计划后，同一任务类型下的多个媒体库可以共用时间，也可以继续拆成不同时间的计划。" : "系统功能或插件注册后台工作后，执行计划会显示在这里。"}</p></div></div>;
 }
 
-function ScheduledTaskPlanRow({ plan, libraries, onSaved }: { plan: AdminScheduledTaskPlan; libraries: AdminLibrary[]; onSaved: () => void }) {
+function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: AdminScheduledTaskPlan; libraries: AdminLibrary[]; onSaved: () => void; onDeleted: () => void }) {
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [schedule, setSchedule] = useState(plan.schedule ?? "");
@@ -539,7 +550,7 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved }: { plan: AdminSchedul
   const canDelete = !globalPlan && plan.isDefault !== true;
   const deletePlan = useMutation({
     mutationFn: () => api.deleteAdminScheduledTaskPlan(plan.id),
-    onSuccess: onSaved,
+    onSuccess: onDeleted,
   });
   const handleDelete = () => {
     if (!window.confirm(`删除“${name}”后，${knownLibraries} 个媒体库将回到默认计划，并恢复默认 Cron 和启停状态。确定删除吗？`)) {

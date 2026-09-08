@@ -273,6 +273,76 @@ describe("AdminOperationsPage", () => {
     expect(confirmDelete).toHaveBeenCalledWith(expect.stringContaining("媒体库将回到默认计划"));
   });
 
+  it("returns to the previous available plan page after deleting its last item", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    let deleted = false;
+    vi.spyOn(api, "adminScheduledTaskPlans").mockImplementation(async (page = 1) => {
+      if (page === 2) {
+        return deleted ? {
+          plans: [],
+          total: 50,
+          page: 2,
+          pageSize: 50,
+        } : {
+          plans: [{
+            id: "plan-last",
+            taskType: "RECONCILIATION_SCAN",
+            name: "最后一个计划",
+            schedule: "0 4 * * *",
+            isEnabled: true,
+            scopeType: "LIBRARY",
+            isDefault: false,
+            libraries: [{ id: "library-1", name: "电影库" }],
+            libraryCount: 1,
+          }],
+          total: 51,
+          page: 2,
+          pageSize: 50,
+        };
+      }
+      return {
+        plans: [{
+          id: "plan-first",
+          taskType: "RECONCILIATION_SCAN",
+          name: "第一页计划",
+          schedule: "0 3 * * *",
+          isEnabled: true,
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [{ id: "library-1", name: "电影库" }],
+          libraryCount: 1,
+        }],
+        total: deleted ? 50 : 51,
+        page: 1,
+        pageSize: 50,
+      };
+    });
+    vi.spyOn(api, "deleteAdminScheduledTaskPlan").mockImplementation(async () => {
+      deleted = true;
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("第一页计划"));
+    });
+    const nextPage = container.querySelectorAll<HTMLButtonElement>(".lux-admin-pagination button")[1];
+    act(() => nextPage?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("最后一个计划"));
+    });
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="删除最后一个计划"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("第一页计划"));
+    });
+    expect(container.textContent).not.toContain("最后一个计划");
+    expect(container.textContent).not.toContain("还没有执行计划");
+  });
+
   it("separates registered tasks, runtime records, and redacted audit logs", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-1",
