@@ -210,6 +210,69 @@ describe("AdminOperationsPage", () => {
     });
   });
 
+  it("allows deleting custom plans after confirmation while protecting default and global plans", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [
+        {
+          id: "plan-custom",
+          taskType: "RECONCILIATION_SCAN",
+          name: "夜间校验",
+          schedule: "0 2 * * *",
+          isEnabled: true,
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [{ id: "library-1", name: "电影库" }],
+          libraryCount: 1,
+        },
+        {
+          id: "plan-default",
+          taskType: "RECONCILIATION_SCAN",
+          name: "默认校验",
+          schedule: "0 3 * * 0",
+          isEnabled: true,
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [{ id: "library-2", name: "剧集库" }],
+          libraryCount: 1,
+        },
+        {
+          id: "plan-global",
+          taskType: "STRM_MEDIA_INFO",
+          name: "STRM 信息",
+          schedule: "0 4 * * *",
+          isEnabled: true,
+          scopeType: "GLOBAL",
+          isDefault: true,
+          libraries: [],
+          libraryCount: 0,
+        },
+      ],
+      total: 3,
+      page: 1,
+      pageSize: 50,
+    });
+    const deletePlan = vi.spyOn(api, "deleteAdminScheduledTaskPlan").mockResolvedValue(undefined);
+    const confirmDelete = vi.spyOn(window, "confirm").mockReturnValue(true);
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("夜间校验"));
+    });
+    expect(container.querySelector('button[aria-label="删除夜间校验"]')).not.toBeNull();
+    expect(container.querySelector('button[aria-label="删除默认校验"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="删除STRM 信息"]')).toBeNull();
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="删除夜间校验"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(deletePlan).toHaveBeenCalledWith("plan-custom"));
+    });
+    expect(confirmDelete).toHaveBeenCalledWith(expect.stringContaining("媒体库将回到默认计划"));
+  });
+
   it("separates registered tasks, runtime records, and redacted audit logs", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-1",

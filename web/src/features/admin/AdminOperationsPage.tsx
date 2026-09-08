@@ -15,6 +15,7 @@ import {
   RotateCcw,
   Save,
   StopCircle,
+  Trash2,
   X,
 } from "lucide-react";
 import { useMemo, useState, type FormEvent, type ReactNode } from "react";
@@ -96,6 +97,7 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   LIBRARY_ROOT_DELETED: "删除媒体库路径",
   LIBRARY_DELETED: "删除媒体库",
   SCHEDULE_UPDATED: "更新计划任务",
+  SCHEDULE_PLAN_DELETED: "删除执行计划",
   LIBRARY_COVER_GENERATION_STARTED: "开始生成媒体库封面",
   STRM_PROBE_STARTED: "开始 STRM 媒体信息扫描",
   STRM_PROBE_CANCEL_REQUESTED: "取消 STRM 媒体信息扫描",
@@ -534,6 +536,17 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved }: { plan: AdminSchedul
   const configured = Boolean(plan.schedule);
   const stateLabel = plan.isEnabled && configured ? "已启用" : configured ? "已停用" : "未配置计划";
   const knownLibraries = (plan.libraries ?? []).length || plan.libraryCount || 0;
+  const canDelete = !globalPlan && plan.isDefault !== true;
+  const deletePlan = useMutation({
+    mutationFn: () => api.deleteAdminScheduledTaskPlan(plan.id),
+    onSuccess: onSaved,
+  });
+  const handleDelete = () => {
+    if (!window.confirm(`删除“${name}”后，${knownLibraries} 个媒体库将回到默认计划，并恢复默认 Cron 和启停状态。确定删除吗？`)) {
+      return;
+    }
+    deletePlan.mutate();
+  };
   const beginEditing = () => {
     setSchedule(plan.schedule ?? "");
     setEnabled(plan.isEnabled);
@@ -556,8 +569,9 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved }: { plan: AdminSchedul
           {update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}
         </form> : <span className="lux-registered-task-schedule">{plan.schedule || "尚未配置执行计划"}</span>}
       </div>
-      {!editing ? <div className="lux-registered-task-actions"><button className="lux-button lux-button-compact lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button><button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing}><Pencil size={15} /></button></div> : null}
+      {!editing ? <div className="lux-registered-task-actions"><button className="lux-button lux-button-compact lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending || deletePlan.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button><button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing} disabled={deletePlan.isPending}><Pencil size={15} /></button>{canDelete ? <button className="lux-icon-button lux-icon-button-small lux-danger-icon" type="button" aria-label={`删除${name}`} onClick={handleDelete} disabled={deletePlan.isPending} title="删除执行计划"><Trash2 size={15} /></button> : null}</div> : null}
       {runNow.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{runNow.error.message}</p> : null}
+      {deletePlan.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{deletePlan.error.message}</p> : null}
     </article>
   );
 }
