@@ -1040,6 +1040,13 @@ export class LuxApiClient {
     );
   }
 
+  deleteAdminScheduledTaskPlan(planId: string) {
+    return this.request<void>(
+      `/api/v1/admin/scheduled-task-plans/${encodeURIComponent(planId)}`,
+      { method: "DELETE" },
+    );
+  }
+
   runAdminScheduledTaskPlan(planId: string) {
     return this.request<{
       status: string;

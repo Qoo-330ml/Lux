@@ -682,6 +682,11 @@ describe("LuxApiClient", () => {
           pageSize: 50,
         }), { status: 200 });
       }
+      if (init.method === "DELETE") {
+        expect(path).toBe("/api/v1/admin/scheduled-task-plans/plan-1");
+        expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(null, { status: 204 });
+      }
       expect(path).toBe("/api/v1/admin/scheduled-task-plans/plan-1");
       expect(init.method).toBe("PATCH");
       expect(JSON.parse(String(init.body))).toEqual({
@@ -709,7 +714,8 @@ describe("LuxApiClient", () => {
       libraryIds: ["library-1", "library-2"],
       resourceLimit: { scanConcurrency: 1 },
     })).resolves.toEqual({ plan: { id: "plan-1" } });
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    await expect(client.deleteAdminScheduledTaskPlan("plan-1")).resolves.toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 
   it("downloads an administrator log archive with a bounded date query", async () => {
