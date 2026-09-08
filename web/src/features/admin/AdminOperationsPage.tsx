@@ -592,10 +592,35 @@ function taskGroupLabel(taskType: string) {
 }
 
 function PlanLibraryPicker({ libraries, selectedIds, onChange }: { libraries: AdminLibrary[]; selectedIds: string[]; onChange: (ids: string[]) => void }) {
-  const [search, setSearch] = useState("");
-  const filtered = libraries.filter((library) => library.name.toLowerCase().includes(search.trim().toLowerCase()));
-  const toggle = (libraryId: string) => onChange(selectedIds.includes(libraryId) ? selectedIds.filter((id) => id !== libraryId) : [...selectedIds, libraryId]);
-  return <fieldset className="lux-registered-plan-library-picker"><legend>目标媒体库（已选 {selectedIds.length} 个）</legend><input aria-label="搜索媒体库" type="search" value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索媒体库" />{filtered.length === 0 ? <p className="lux-admin-muted">没有匹配的媒体库。</p> : <div className="lux-registered-plan-library-options">{filtered.map((library) => <label key={library.id}><input type="checkbox" aria-label={`选择媒体库 ${library.name}`} checked={selectedIds.includes(library.id)} onChange={() => toggle(library.id)} /><span>{library.name}</span></label>)}</div>}</fieldset>;
+  const selectedLibraryIds = new Set(selectedIds);
+  const selectedLibraries = selectedIds
+    .map((libraryId) => libraries.find((library) => library.id === libraryId))
+    .filter((library): library is AdminLibrary => Boolean(library));
+  const availableLibraries = libraries.filter((library) => !selectedLibraryIds.has(library.id));
+  const addLibrary = (libraryId: string) => {
+    if (!selectedLibraryIds.has(libraryId)) onChange([...selectedIds, libraryId]);
+  };
+  const removeLibrary = (libraryId: string) => onChange(selectedIds.filter((id) => id !== libraryId));
+  return <fieldset className="lux-registered-plan-library-picker">
+    <legend>目标媒体库（已选 {selectedIds.length} 个）</legend>
+    <div className="lux-registered-plan-library-field">
+      <div className="lux-registered-plan-library-tags" aria-live="polite">
+        {selectedLibraries.length === 0 ? <span className="lux-registered-plan-library-placeholder">暂未选择媒体库</span> : selectedLibraries.map((library) => <span className="lux-registered-plan-library-tag" key={library.id}>
+          <span>{library.name}</span>
+          <button type="button" aria-label={`移除媒体库 ${library.name}`} onClick={() => removeLibrary(library.id)}><X size={12} aria-hidden="true" /></button>
+        </span>)}
+      </div>
+      <LuxSelect
+        className="lux-registered-plan-library-select"
+        value=""
+        options={availableLibraries.map((library) => ({ value: library.id, label: library.name }))}
+        onChange={addLibrary}
+        placeholder={availableLibraries.length ? "选择媒体库" : "已选全部媒体库"}
+        disabled={availableLibraries.length === 0}
+        aria-label="选择目标媒体库"
+      />
+    </div>
+  </fieldset>;
 }
 
 function RegisteredTasksEmpty() {

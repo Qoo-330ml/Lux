@@ -99,7 +99,7 @@ describe("AdminOperationsPage", () => {
     });
   });
 
-  it("edits a plan cron and moves selected libraries with a searchable picker", async () => {
+  it("edits a plan cron with a tag-style dropdown that hides selected libraries", async () => {
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
     vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
       plans: [{
@@ -133,24 +133,31 @@ describe("AdminOperationsPage", () => {
       await vi.waitFor(() => expect(container.textContent).toContain("夜间校验"));
     });
     act(() => container.querySelector<HTMLButtonElement>('button[aria-label="编辑夜间校验"]')?.click());
-    const librarySearch = container.querySelector<HTMLInputElement>('input[aria-label="搜索媒体库"]');
-    expect(librarySearch).not.toBeNull();
-    act(() => {
-      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(librarySearch, "剧集");
-      librarySearch?.dispatchEvent(new Event("input", { bubbles: true }));
-      librarySearch?.dispatchEvent(new Event("change", { bubbles: true }));
-    });
-    const secondLibrary = container.querySelector<HTMLInputElement>('input[aria-label="选择媒体库 剧集库"]');
+    expect(container.querySelector('input[aria-label="搜索媒体库"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="移除媒体库 电影库"]')).not.toBeNull();
+
+    const librarySelect = container.querySelector<HTMLButtonElement>('button[role="combobox"][aria-label="选择目标媒体库"]');
+    expect(librarySelect).not.toBeNull();
+    await act(async () => librarySelect?.click());
+    expect(document.querySelector('[role="option"][data-value="library-1"]')).toBeNull();
+    const secondLibrary = document.querySelector<HTMLButtonElement>('[role="option"][data-value="library-2"]');
     expect(secondLibrary).not.toBeNull();
-    act(() => secondLibrary?.click());
-    expect(secondLibrary?.checked).toBe(true);
+    await act(async () => secondLibrary?.click());
+    expect(container.querySelector('button[aria-label="移除媒体库 剧集库"]')).not.toBeNull();
+
+    await act(async () => librarySelect?.click());
+    expect(document.querySelector('[role="option"][data-value="library-2"]')).toBeNull();
+    const removeFirstLibrary = container.querySelector<HTMLButtonElement>('button[aria-label="移除媒体库 电影库"]');
+    expect(removeFirstLibrary).not.toBeNull();
+    act(() => removeFirstLibrary?.click());
+    expect(container.querySelector('button[aria-label="移除媒体库 电影库"]')).toBeNull();
     await act(async () => {
       container.querySelector<HTMLButtonElement>(".lux-registered-plan-editor button[type='submit']")?.click();
       await vi.waitFor(() => expect(updatePlan).toHaveBeenCalledWith("plan-night", {
         name: "夜间校验",
         schedule: "0 2 * * *",
         isEnabled: true,
-        libraryIds: ["library-1", "library-2"],
+        libraryIds: ["library-2"],
       }));
     });
   });
