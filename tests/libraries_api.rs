@@ -1661,6 +1661,11 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
         .send()
         .await?;
     assert_eq!(moved.status(), reqwest::StatusCode::CREATED);
+    let moved_body: Value = moved.json().await?;
+    let moved_plan_id = moved_body["plan"]["id"]
+        .as_str()
+        .ok_or("missing moved plan id")?
+        .to_owned();
 
     let restored = client
         .patch(format!(
@@ -1673,6 +1678,39 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
         .await?;
     assert_eq!(restored.status(), reqwest::StatusCode::OK);
     assert_eq!(restored.json::<Value>().await?["plan"]["libraryCount"], 1);
+
+    let default_plan_id: String = sqlx::query_scalar(
+        "SELECT id FROM scheduled_task_plans
+         WHERE task_type = 'RECONCILIATION_SCAN' AND scope_type = 'LIBRARY'
+           AND is_default = 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let default_delete = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans/{default_plan_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(default_delete.status(), reqwest::StatusCode::CONFLICT);
+
+    let deleted = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/scheduled-task-plans/{moved_plan_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    let deleted_plan_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scheduled_task_plans WHERE id = ?")
+            .bind(&moved_plan_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(deleted_plan_count, 0);
 
     server.abort();
     Ok(())

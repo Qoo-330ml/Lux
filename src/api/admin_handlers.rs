@@ -2939,6 +2939,48 @@ pub(crate) async fn admin_update_scheduled_task_plan(
     }
 }
 
+pub(crate) async fn admin_delete_scheduled_task_plan(
+    headers: HeaderMap,
+    Path(plan_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match database.delete_scheduled_task_plan(&plan_id).await {
+        Ok(true) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "SCHEDULE_PLAN_DELETED",
+                Some("scheduled_task_plan"),
+                Some(&plan_id),
+                "{}",
+            )
+            .await;
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "执行计划不存在",
+        )
+        .into_response(),
+        Err(StorageError::Conflict(message)) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            &message,
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 pub(crate) async fn admin_run_scheduled_task_plan(
     headers: HeaderMap,
     Path(plan_id): Path<String>,
@@ -3965,7 +4007,7 @@ pub(crate) fn admin_event_scope_for_audit(event_type: &str) -> AdminEventScope {
     if event_type.starts_with("USER_") || event_type == "LIBRARY_ACCESS_UPDATED" {
         return AdminEventScope::Users;
     }
-    if event_type.starts_with("LIBRARY_") || event_type == "SCHEDULE_UPDATED" {
+    if event_type.starts_with("LIBRARY_") || event_type.starts_with("SCHEDULE_") {
         return AdminEventScope::Libraries;
     }
     if event_type.starts_with("METADATA_") {

@@ -323,7 +323,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/admin/scheduled-task-plans/{plan_id}",
-            patch(admin_update_scheduled_task_plan),
+            patch(admin_update_scheduled_task_plan).delete(admin_delete_scheduled_task_plan),
         )
         .route(
             "/api/v1/admin/scheduled-task-plans/{plan_id}/run",

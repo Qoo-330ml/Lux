@@ -55,6 +55,7 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/admin/scheduled-task-plans?page=1&pageSize=50&taskType=...`：按任务类型分页查看执行计划，返回计划名称、计划类型、Cron、启停状态、来源、资源限制及目标媒体库摘要。计划列表不把一个计划内的多个媒体库展开成多条注册项。
 - `POST /api/v1/admin/scheduled-task-plans`：创建媒体库作用域执行计划，请求体为 `{ "taskType": "RECONCILIATION_SCAN", "name": "大库组", "schedule": "0 2 * * 1", "isEnabled": true, "libraryIds": ["..."] }`。选中的媒体库会从同一任务类型的旧计划原子移动到新计划；空媒体库列表、无效任务类型或跨插件来源的媒体库组合返回结构化校验错误。
 - `PATCH /api/v1/admin/scheduled-task-plans/{planId}`：更新计划名称、Cron、启停状态和媒体库范围。一个媒体库在同一任务类型下只能属于一个计划；默认计划不能把媒体库移成无计划状态。计划配置和旧媒体库级任务镜像在同一事务中更新。
+- `DELETE /api/v1/admin/scheduled-task-plans/{planId}`：删除自定义媒体库执行计划，计划内媒体库和旧任务配置镜像原子回到匹配的默认计划，成功返回 204。默认计划和全局插件计划不可删除，返回结构化冲突错误。
 - `POST /api/v1/admin/scheduled-task-plans/{planId}/run`：立即派发执行计划，返回已接受的媒体库运行任务 ID；未接受（已有活动任务或单库校验/服务错误）的媒体库 ID 通过 `skippedLibraryIds` 返回。运行任务仍按媒体库独立记录、取消和重试，并受全局扫描队列限制；单个媒体库失败不会阻止计划内其他媒体库派发。
  - `POST /api/v1/admin/strm-probe-jobs`：按 `org.lux.strm-media-info` 已保存的插件配置创建并异步执行 STRM 媒体信息/缩略图任务，返回 202 和按库拆分的任务；不从请求体读取媒体库或并发配置，也不返回 URL。
 - `GET /api/v1/admin/strm-probe-jobs?page=1&pageSize=50&status=FAILED`：分页查看 STRM 探测任务，状态支持 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 和 `FAILED`。
