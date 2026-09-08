@@ -10,6 +10,7 @@
 
 | 日期 | 提交 | 硬件/架构 | 数据集 | 命令 | 场景 | p50 | p95 | 错误率 | 内存 | 备注 |
 |---|---|---|---|---|---|---:|---:|---:|---:|---|
+| 2026-09-08 | 6bd90d21 | macOS ARM64 (`uname -m=arm64`) | SQLite；1,025 条无个人数据扫描发现路径 | `cargo test --locked --lib storage::repository::repository_tests::reconciliation_entries_use_scan_safe_batches -- --exact` | 扫描发现中间表批量写入 | 11 → 6 条 DML | - | 0% | - | 扫描专用批次从 100 增至 200；每条语句最多 800 个绑定参数，低于 SQLite 历史 999 参数上限；约减少 45.5% 批量写入语句；不外推 PostgreSQL WAL 或 NAS/x86_64 性能 |
 | 2026-08-29 | 0c621c60 | macOS ARM64 (`aarch64-apple-darwin`, `uname -m=arm64`) | 确定性 60,000 MKV / 600 目录 | `./scripts/run-performance.sh` | 首次扫描 / 无变化重扫 / 单目录增量；目录列表 / 搜索 | 5,123 / 1,291 / 1,421 ms；56 / 104 ms | 5,123 / 1,291 / 1,421 ms；61 / 302 ms | 0% | - | release；前台 50 请求 p95 203 ms，`foregroundErrors=0`、`metadataFingerprintCount=0`、`nonPendingProbeCount=0`；后台剧集/混合库批量索引、指纹有界并发、混合分类 NFO 缓存、超大目录发现分块由 `scanning_jobs` 集成测试覆盖；本机 ARM64，不外推 NAS/x86_64 |
 | 2026-08-02 | 740de3c | macOS ARM64 (`aarch64-apple-darwin`), Rust 1.97.1 | 确定性 60,000 MKV / 600 目录 | `./scripts/run-performance.sh` | 首次全库扫描 | 14,104 ms | 14,104 ms | 0% | - | 60,000 条目；release 模式；未触发 NFO/ffprobe |
 | 2026-08-02 | 740de3c | macOS ARM64 (`aarch64-apple-darwin`), Rust 1.97.1 | 同上 | `./scripts/run-performance.sh` | 无变化全库重扫 | 4,061 ms | 4,061 ms | 0% | - | 60,000 条目全部 fingerprint 命中并跳过 |

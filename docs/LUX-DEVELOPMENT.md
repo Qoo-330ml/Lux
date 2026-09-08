@@ -5830,6 +5830,19 @@ cue 和 Worker。
 - 不执行 `VACUUM FULL`、在线重建全库索引或其他长时间独占数据库的操作。
 - 不连接或直接修改用户线上 FNOS 数据库；优化通过 Lux 迁移和 storage 实现交付。
 
+实现文件：`migrations/0117_redundant_child_indexes.sql`、`migrations-postgres/0117_redundant_child_indexes.sql`、
+`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`、
+`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/danmaku.rs`、`tests/ready_version.rs` 和
+`tests/scanner.rs`；性能记录见 `docs/PERFORMANCE.md`。
+
+验证记录（2026-09-08，`uname -m=arm64`）：`cargo build --locked`、
+`cargo test --locked --all-targets`（库测试 429 passed、4 ignored，所有集成目标通过）、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和
+`git diff --check` 均通过。扫描发现批量 DML 的 SQLite 回归基准由 1,025 条路径对应 11 条降至 6 条，
+约减少 45.5%；该结果只代表本机 ARM64/SQLite，不外推 PostgreSQL WAL 或 NAS/x86_64。
+PostgreSQL 集成测试目标已编译，但其 4 个运行测试因本机没有可用 PostgreSQL 实例而保持 ignored，
+因此真实 PostgreSQL 迁移/WAL 证据仍待可用测试环境复测。
+
 ## 26. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
