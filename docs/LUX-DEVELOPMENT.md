@@ -5831,6 +5831,7 @@ cue 和 Worker。
 - 不连接或直接修改用户线上 FNOS 数据库；优化通过 Lux 迁移和 storage 实现交付。
 
 实现文件：`migrations/0117_redundant_child_indexes.sql`、`migrations-postgres/0117_redundant_child_indexes.sql`、
+`migrations/0118_scan_index_compaction.sql`、`migrations-postgres/0118_scan_index_compaction.sql`、
 `src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`、
 `tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/danmaku.rs`、`tests/ready_version.rs` 和
 `tests/scanner.rs`；性能记录见 `docs/PERFORMANCE.md`。
@@ -5842,6 +5843,14 @@ cue 和 Worker。
 约减少 45.5%；该结果只代表本机 ARM64/SQLite，不外推 PostgreSQL WAL 或 NAS/x86_64。
 PostgreSQL 集成测试目标已编译，但其 4 个运行测试因本机没有可用 PostgreSQL 实例而保持 ignored，
 因此真实 PostgreSQL 迁移/WAL 证据仍待可用测试环境复测。
+
+补充记录（2026-09-08）：0118 迁移将 `reconciliation_scan_entries` 的主键列顺序调整为
+`(job_id, entry_type, library_root_id, relative_path)`，删除与新主键重复的宽索引；将
+`scan_job_targets` 的三个阶段索引限制为 `PENDING/FAILED`，并删除未发现独立查询路径的
+`media_streams.external_path` 索引。`item_images`、`person_credits` 的冗余索引已由 0117
+处理；`media_items` 未发现可安全删除的明确冗余索引，因此保持不变。新增测试会先运行 1–117
+迁移、写入代表性旧数据，再单独运行 118，确认扫描条目、扫描目标和外键约束均被保留。
+该验证覆盖 SQLite 的真实升级路径；PostgreSQL 仍需在可用实例上运行被忽略的集成测试。
 
 ## 26. 风险与缓解
 
