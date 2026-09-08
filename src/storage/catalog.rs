@@ -19,22 +19,42 @@ fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String
         "WITH requested_libraries(library_id) AS (
              VALUES {values}
          ), selected AS (
-             SELECT requested.library_id, recent.id
+             SELECT requested.library_id, recent.id, recent.latest_added_at
              FROM requested_libraries requested
              CROSS JOIN LATERAL (
-                 SELECT visible.id, visible.added_at, visible.sort_title
+                 SELECT visible.id, visible.latest_added_at, visible.sort_title
                  FROM (
-                     (SELECT mi.id, mi.added_at, mi.sort_title
+                     (SELECT mi.id,
+                             CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
+                                 (SELECT MAX(child.added_at)
+                                  FROM media_items child
+                                  WHERE child.item_type = 'EPISODE'
+                                    AND child.removed_at IS NULL
+                                    AND child.has_available_source = 1
+                                    AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                                 mi.added_at
+                             ) ELSE mi.added_at END AS latest_added_at,
+                             mi.sort_title
                       FROM media_items mi
                       JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                       WHERE mi.library_id = requested.library_id
                         AND mi.item_type IN ('MOVIE', 'SERIES')
                         AND mi.removed_at IS NULL
                         AND mi.has_available_source = 1
-                      ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+                      ORDER BY latest_added_at DESC, mi.sort_title, mi.id
                       LIMIT ?)
                      UNION ALL
-                     (SELECT mi.id, mi.added_at, mi.sort_title
+                     (SELECT mi.id,
+                             COALESCE(
+                                 (SELECT MAX(child.added_at)
+                                  FROM media_items child
+                                  WHERE child.item_type = 'EPISODE'
+                                    AND child.removed_at IS NULL
+                                    AND child.has_available_source = 1
+                                    AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                                 mi.added_at
+                             ) AS latest_added_at,
+                             mi.sort_title
                       FROM media_items mi
                       JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                       WHERE mi.library_id = requested.library_id
@@ -62,10 +82,10 @@ fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String
                                   AND visible_child.has_available_source = 1
                             )
                         )
-                      ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+                      ORDER BY latest_added_at DESC, mi.sort_title, mi.id
                       LIMIT ?)
                  ) visible
-                 ORDER BY visible.added_at DESC, visible.sort_title, visible.id
+                 ORDER BY visible.latest_added_at DESC, visible.sort_title, visible.id
                  LIMIT ?
              ) recent
          )"
@@ -77,14 +97,24 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
     // existing partial index; the IN predicate alone is not inferred.
     let libraries = (0..library_count)
         .map(|_| {
-            "SELECT recent.id, recent.library_id
+             "SELECT recent.id, recent.library_id, recent.latest_added_at
              FROM (
-                 SELECT candidates.id, candidates.library_id
+                 SELECT candidates.id, candidates.library_id, candidates.latest_added_at
                  FROM (
                      SELECT available.id, available.library_id,
-                            available.added_at, available.sort_title
+                            available.added_at, available.sort_title,
+                            available.latest_added_at
                      FROM (
-                         SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                         SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title,
+                                CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
+                                    (SELECT MAX(child.added_at)
+                                     FROM media_items child
+                                     WHERE child.item_type = 'EPISODE'
+                                       AND child.removed_at IS NULL
+                                       AND child.has_available_source = 1
+                                       AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                                    mi.added_at
+                                ) ELSE mi.added_at END AS latest_added_at
                          FROM media_items mi
                          JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                          WHERE mi.library_id = ?
@@ -92,14 +122,24 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
                            AND mi.item_type IN ('MOVIE', 'SERIES')
                            AND mi.removed_at IS NULL
                            AND mi.has_available_source = 1
-                         ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+                         ORDER BY latest_added_at DESC, mi.sort_title, mi.id
                          LIMIT ?
                      ) AS available
                      UNION ALL
                      SELECT unavailable_series.id, unavailable_series.library_id,
-                            unavailable_series.added_at, unavailable_series.sort_title
+                            unavailable_series.added_at, unavailable_series.sort_title,
+                            unavailable_series.latest_added_at
                      FROM (
-                         SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title
+                         SELECT mi.id, mi.library_id, mi.added_at, mi.sort_title,
+                                COALESCE(
+                                    (SELECT MAX(child.added_at)
+                                     FROM media_items child
+                                     WHERE child.item_type = 'EPISODE'
+                                       AND child.removed_at IS NULL
+                                       AND child.has_available_source = 1
+                                       AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                                    mi.added_at
+                                ) AS latest_added_at
                          FROM media_items mi
                          JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                          WHERE mi.library_id = ?
@@ -127,11 +167,11 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
                                      AND visible_child.has_available_source = 1
                                )
                            )
-                         ORDER BY mi.added_at DESC, mi.sort_title, mi.id
+                         ORDER BY latest_added_at DESC, mi.sort_title, mi.id
                          LIMIT ?
                      ) AS unavailable_series
                  ) AS candidates
-                 ORDER BY candidates.added_at DESC,
+                 ORDER BY candidates.latest_added_at DESC,
                           candidates.sort_title, candidates.id
                  LIMIT ?
              ) AS recent"
@@ -867,7 +907,7 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
              )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY selected.library_id, mi.added_at DESC, mi.sort_title ASC,
+             ORDER BY selected.library_id, selected.latest_added_at DESC, mi.sort_title ASC,
                       mi.id ASC, ms.id, mt.stream_index"
             );
             rows.extend(self.fetch_catalog_rows(&query, &binds).await?);
