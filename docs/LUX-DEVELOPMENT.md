@@ -163,10 +163,10 @@ Lux 的核心价值不是功能数量，而是：
 - 本地 .nfo 和已有海报、背景图优先。
 - 常规自动处理和“仅补全”不覆盖本地已有标题、简介和图片；“完整刮削”只刷新未锁定的 NFO 字段并替换已有图片。
 - 锁定的 NFO 字段在任何刮削模式下都不覆盖；在线没有返回的图片不删除本地图片。
-- TMDb 插件提供可配置的首选语言，默认使用简体中文 `zh-CN`；可选语言按 `zh-CN`、`zh-SG`、`zh-HK`、`zh-TW`、其他 TMDb 主翻译语言的顺序展示。
-- TMDb 语言回退开关默认关闭；开启后，电影、剧集、季度和单集元数据按管理员选择的语言顺序逐字段补全，默认预选 `zh-SG`、`zh-HK`、`zh-TW`。
+- TMDb 插件提供可配置的首选语言，默认使用简体中文 `zh-CN`；界面按语言组展示，每个语言组只保留一个 canonical locale，简体中文合并 `zh-CN`/`zh-SG`，繁體中文合并 `zh-TW`/`zh-HK`，英语等地区变体同样合并并使用友好名称。
+- TMDb 语言回退开关默认关闭；开启后，电影、剧集、季度和单集详情只请求一次并 append `translations`，再按管理员选择的语言组顺序逐字段补全，默认预选繁體中文 `zh-TW`。图片请求继续使用 `include_image_language`，并保留英文与无语言图片兜底。
 - TMDb 插件提供默认关闭的替代 API 地址开关；开启后可选择默认官方地址 `https://api.themoviedb.org`、`https://api.tmdb.org` 或自定义 HTTP(S) 基础地址。自定义地址不得包含凭据、查询参数或片段，并由插件配置持久化到 `/config/plugin-config/org.lux.tmdb.json`。
-- 图片优先本地；在线图片按 zh-CN、无语言、英文的顺序选择。
+- 图片优先本地；在线图片按首选语言组、无语言、英文的顺序选择。
 - 电影、剧集、季度和单集 NFO 均应兼容常见 Emby/Kodi 旁挂形式。
 - 至少识别 movie.nfo、tvshow.nfo、与视频同名的 .nfo、poster、fanart/backdrop、seasonXX-poster 等常见命名。
 - 写回时使用稳定、公开记录的 Lux NFO 子集，同时尽量保留未知 XML 字段，避免破坏其他软件写入的信息。
@@ -1247,13 +1247,13 @@ locked local value
   > filename/probe fallback
 ~~~
 
-空字符串不应覆盖有效值。TMDb 语言回退按选定语言顺序逐字段补全，而不是整条记录一次性切换语言；回退请求失败时保留首选语言已获得的字段。
+空字符串不应覆盖有效值。TMDb 语言回退按选定语言组顺序逐字段补全，而不是整条记录一次性切换语言；详情使用一次 `append_to_response=translations`，回退开关关闭时忽略翻译载荷，首选语言已获得的字段不会被覆盖。
 
 ### 13.3 刮削器客户端
 
 - TMDb 外置插件的客户端同时兼容 v3 API Key 和历史 v4 Read Access Token。管理员通过 TMDb 插件详情配置自己的 API Key。
 - TMDb 插件自行决定默认凭据、管理员 API Key 和历史 token 的优先级；Lux 不内置、不解析这些凭据，也不在自身 API 或日志中返回它们。
-- TMDb 插件配置包括首选语言、语言回退开关和有序回退语言列表，由宿主保存于 `/config/plugin-config/org.lux.tmdb.json` 并通过 `LUX_PLUGIN_CONFIG_PATH` 传给插件；敏感字段仍不可返回。
+- TMDb 插件配置包括首选语言组、语言回退开关和有序回退语言组列表，由宿主保存于 `/config/plugin-config/org.lux.tmdb.json` 并通过 `LUX_PLUGIN_CONFIG_PATH` 传给外置插件；宿主和插件都会将旧的地区 locale 归一化为 canonical 语言组，敏感字段仍不可返回。
 - 主进程的元数据匹配、候选搜索、图片候选和合集请求统一通过媒体库有序刮削器协议；主进程不得直接访问第三方元数据 API。主刮削器先处理全部请求能力，备用刮削器按能力逐项接管主来源空、无效、不支持或重试失败的项目；补充刮削器只对已确认条目继续补全和合并内容，不重新决定媒体身份。
 - 插件内部使用统一 HTTP client、超时、16 并发配额、每秒 32 次请求限流、重试和 User-Agent。
 - 插件 stdin/stdout RPC 支持有界多路复用；响应按 request ID 分发并允许乱序返回，插件进程故障或超时会结束其全部 pending 请求。
@@ -3338,19 +3338,20 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 
 #### LUX-144：TMDb 多语言首选与回退配置
 
-范围：为 `org.lux.tmdb` 插件增加首选语言、语言回退开关、有序回退语言列表、标题别名替换和替代 API 地址配置。语言选项来自 TMDb 的主翻译语言列表，界面按简体中文、其他中文地区语言、其他语言排序；非敏感配置持久化到 `/config/tmdb_settings.json`。插件对电影、剧集、季度和单集详情按首选语言请求，并在回退开启时按选择顺序逐字段补全；标题别名替换开启且中文首选语言没有中文标题时，使用 TMDb `alternative_titles` 返回的第一个 `CN` 别名；替代 API 地址开启后使用管理员保存的地址。
+范围：为外置 `org.lux.tmdb` 插件增加首选语言组、语言回退开关、有序回退语言组列表、标题别名替换和替代 API 地址配置。语言选项来自 TMDb 的主翻译语言列表并合并地区变体为 73 个 canonical 语言组，非敏感配置由宿主持久化到 `/config/plugin-config/org.lux.tmdb.json`。插件对电影、剧集、季度和单集详情按首选语言发起一次请求并 append `translations`，回退开启时按选择顺序在本地逐字段补全；标题别名替换开启且中文首选语言没有中文标题时，使用 TMDb `alternative_titles` 返回的第一个 `CN` 别名；替代 API 地址开启后使用管理员保存的地址。
 
 验收：
 
-- [ ] TMDb 插件配置返回语言下拉选项；首项为简体中文 `zh-CN`，其次为 `zh-SG`、`zh-HK`、`zh-TW`，之后为 TMDb 主翻译语言；默认首选为 `zh-CN`。
-- [ ] 管理员可以保存语言回退开关和多个有序回退语言；默认预选 `zh-SG`、`zh-HK`、`zh-TW`，配置重启后保持，API 不返回任何凭据。
-- [ ] 回退开启时，电影、剧集、季度、单集元数据只补全空字段，并严格遵循选择顺序；关闭时不发起回退请求。
-- [ ] 标题别名替换默认关闭；开启后电影和剧集在中文首选语言返回非中文标题时尝试使用第一个 `CN` 中文别名，已有中文标题和别名接口失败时保持原值。
-- [ ] 替代 API 地址默认关闭并使用官方地址；开启后可选择 `https://api.tmdb.org` 或自定义 HTTP(S) 地址，插件请求实际经过所选地址。
+- [x] TMDb 插件配置返回 73 个 canonical 语言组；首项为简体中文 `zh-CN`，其次为繁體中文 `zh-TW`、英语 `en-US`；默认首选为 `zh-CN`，旧地区 locale 会自动归一化。
+- [x] 管理员可以保存语言回退开关和多个有序语言组；默认预选繁體中文 `zh-TW`，配置重启后保持，API 不返回任何凭据。
+- [x] 回退开启时，电影、剧集、季度、单集详情只请求一次并从 `translations` 只补全空字段，严格遵循精确 locale、同语言组和选择顺序；关闭时忽略翻译回退。
+- [x] 标题别名替换默认关闭；开启后电影和剧集在中文首选语言返回非中文标题时尝试使用第一个 `CN` 中文别名，已有中文标题和别名接口失败时保持原值。
+- [x] 替代 API 地址默认关闭并使用官方地址；开启后可选择 `https://api.tmdb.org` 或自定义 HTTP(S) 地址，插件请求实际经过所选地址。
 
 验证：
 
-- `cargo test --locked --test plugin_protocol --test plugins --test tmdb_plugin`
+- `cargo test --locked --test plugins`
+- 外置 `Lux-plugins`：`cargo test --locked --lib`、`cargo test --locked --bin lux-plugin-tmdb`、`python3 -m unittest discover -s tests`
 - `pnpm --dir web test`
 - `pnpm --dir web build`
 - `cargo fmt --all -- --check`
