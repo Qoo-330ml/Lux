@@ -2456,6 +2456,18 @@ pub(crate) async fn admin_list_task_activity(
             Ok(jobs) => jobs,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
+        let metadata_labels = match database
+            .list_current_metadata_reidentify_items(
+                &metadata_jobs
+                    .iter()
+                    .map(|job| job.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        {
+            Ok(items) => activity_item_labels(items),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
         activities.extend(metadata_jobs.iter().map(|job| {
             json!({
                 "id": job.id,
@@ -2466,6 +2478,7 @@ pub(crate) async fn admin_list_task_activity(
                 "processedCount": job.processed_count,
                 "totalCount": job.total_count,
                 "cancelRequested": job.cancel_requested,
+                "currentItem": metadata_labels.get(&job.id),
             })
         }));
 
@@ -2493,6 +2506,18 @@ pub(crate) async fn admin_list_task_activity(
             Ok(jobs) => jobs,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
+        let chapter_labels = match database
+            .list_current_chapter_detection_items(
+                &chapter_jobs
+                    .iter()
+                    .map(|job| job.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        {
+            Ok(items) => activity_item_labels(items),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
         activities.extend(chapter_jobs.iter().map(|job| {
             json!({
                 "id": job.id,
@@ -2503,11 +2528,24 @@ pub(crate) async fn admin_list_task_activity(
                 "processedCount": job.processed_count,
                 "totalCount": job.total_count,
                 "cancelRequested": job.cancel_requested,
+                "currentItem": chapter_labels.get(&job.id),
             })
         }));
 
         let danmaku_jobs = match database.list_danmaku_match_jobs(Some(status), 0, 100).await {
             Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        let danmaku_labels = match database
+            .list_current_danmaku_match_items(
+                &danmaku_jobs
+                    .iter()
+                    .map(|job| job.id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await
+        {
+            Ok(items) => activity_item_labels(items),
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
         activities.extend(danmaku_jobs.iter().map(|job| {
@@ -2520,6 +2558,7 @@ pub(crate) async fn admin_list_task_activity(
                 "processedCount": job.processed_count,
                 "totalCount": job.total_count,
                 "cancelRequested": job.cancel_requested,
+                "currentItem": danmaku_labels.get(&job.id),
             })
         }));
 
@@ -2553,6 +2592,43 @@ pub(crate) async fn admin_list_task_activity(
             })
     });
     Json(json!({ "activities": activities })).into_response()
+}
+
+fn activity_item_labels(
+    items: Vec<(String, crate::storage::StoredJobActivityItem)>,
+) -> std::collections::HashMap<String, String> {
+    items
+        .into_iter()
+        .map(|(job_id, item)| (job_id, activity_item_label(&item)))
+        .collect()
+}
+
+fn activity_item_label(item: &crate::storage::StoredJobActivityItem) -> String {
+    if item.item_type != "EPISODE" {
+        return item.title.clone();
+    }
+    let series_title = item
+        .series_title
+        .as_deref()
+        .filter(|title| !title.trim().is_empty())
+        .unwrap_or(item.title.as_str());
+    let episode_number = item.episode_number.map(|number| format!("E{number:02}"));
+    let season_number = item.season_number.map(|number| format!("S{number:02}"));
+    let season_episode = match (season_number, episode_number) {
+        (Some(season), Some(episode)) => Some(format!("{season}{episode}")),
+        (Some(season), None) => Some(season),
+        (None, Some(episode)) => Some(episode),
+        (None, None) => None,
+    };
+    [
+        Some(series_title.to_owned()),
+        season_episode,
+        Some(item.title.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 pub(crate) async fn admin_list_scheduled_tasks(

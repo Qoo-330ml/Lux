@@ -64,6 +64,45 @@ describe("ScanActivityPopover", () => {
     });
   });
 
+  it("shows the current media title and an accurate status for running non-scan work", async () => {
+    vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
+      activities: [{
+        id: "chapter-job-1",
+        kind: "chapter",
+        taskType: "CHAPTER_DETECTION",
+        libraryId: "library-1",
+        status: "RUNNING",
+        processedCount: 7448,
+        totalCount: 25661,
+        currentItem: "动漫 · S01E08 · 第八集",
+      }],
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "动漫" }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ScanActivityPopover />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector("button[aria-label*='后台任务活动']")).not.toBeNull());
+    });
+    act(() => container.querySelector<HTMLButtonElement>("button[aria-label*='后台任务活动']")?.click());
+
+    expect(container.textContent).toContain("处理中 · 动漫 · S01E08 · 第八集");
+    expect(container.textContent).not.toContain("等待调度");
+  });
+
   it("closes when clicking outside the activity popover", async () => {
     vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
       activities: [{

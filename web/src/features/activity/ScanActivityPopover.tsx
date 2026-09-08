@@ -126,7 +126,8 @@ function libraryLabel(job: AdminTaskActivity, libraries?: Array<{ id: string; na
 
 function phaseLabel(job: AdminTaskActivity) {
   if (job.kind === "cover") return job.status === "RUNNING" ? "生成封面" : "等待执行";
-  return PHASE_LABELS[job.scanPhase ?? "IDLE"] ?? "处理中";
+  if (job.scanPhase) return PHASE_LABELS[job.scanPhase] ?? "处理中";
+  return job.status === "PENDING" || job.status === "QUEUED" ? "等待调度" : "处理中";
 }
 
 function progressValue(job: AdminTaskActivity) {
