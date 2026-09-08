@@ -827,6 +827,7 @@ pub async fn get_item(
 - client_name
 - device_name
 - client_version
+- device_type，可空；客户端平台（例如 `macOS`、`Windows`），旧令牌为空
 - created_at
 - last_seen_at
 - revoked_at
@@ -2094,6 +2095,7 @@ services:
 | LUX-243 | docs/COMPATIBILITY.md、scripts/player-matroska-smoke.mjs、web/tests/；远程 Matroska 客户端管线历史阶段门（当前不实施） |
 | LUX-245 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/src/features/player/remote-mkv-caption-reader.ts、web/tests/；远程 STRM 浏览器直连与客户端解码 fallback |
 | LUX-247 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/discovery.rs、src/main.rs、compose.yaml、docs/DEPLOYMENT.md；Emby 兼容局域网发现 |
+| LUX-248 | docs/LUX-DEVELOPMENT.md、docs/decisions/041-device-pairing.md、migrations/0119_device_pairings.sql、migrations-postgres/0119_device_pairings.sql、src/auth/device_pairings.rs、src/security.rs、src/storage/device_pairings.rs、src/storage/catalog.rs、src/storage/repository.rs、src/storage/users.rs、src/storage/mod.rs、src/auth/emby.rs、src/auth/mod.rs、src/api/legacy.rs、src/api/routes.rs、src/api/users.rs、tests/device_pairings.rs、tests/admin_health.rs、tests/danmaku.rs、tests/ready_version.rs、tests/scanner.rs、tests/storage.rs；Lux Prism 一次性设备配对 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5902,6 +5904,87 @@ UDP 请求、响应和来源地址候选。记录 `uname -m`；本机 ARM64 结�
 处理；`media_items` 未发现可安全删除的明确冗余索引，因此保持不变。新增测试会先运行 1–117
 迁移、写入代表性旧数据，再单独运行 118，确认扫描条目、扫描目标和外键约束均被保留。
 该验证覆盖 SQLite 的真实升级路径；PostgreSQL 仍需在可用实例上运行被忽略的集成测试。
+
+#### LUX-248：Lux Prism 一次性设备配对
+
+为 Lux Prism 提供仅限 Lux 的一次性设备配对合同。Web 登录会话通过
+`POST /api/v1/auth/device-pairings` 创建一个有效期 5 分钟的票据；创建接口必须同时
+验证 `lux_session` 会话和 `x-csrf-token`，不接受共享管理员 API Key。服务端只保存随机
+`secret` 的 SHA-256 哈希，不保存或记录完整二维码 URI。Web 使用当前页面 origin 拼接
+二维码 URI：
+
+```text
+lux-prism://pair?v=1&server=<percent-encoded-origin>&id=<pairingId>&secret=<secret>&expiresAt=<unix-seconds>
+```
+
+`server` 必须是二维码生成页面的当前 HTTP(S) origin；Prism 扫码后应展示服务器名称和
+地址，用户确认后向该地址调用兑换接口。Emby 不生成此二维码。
+
+创建响应为：
+
+```json
+{
+  "pairingId": "019...",
+  "secret": "url-safe-random-secret",
+  "expiresAt": 1770000000
+}
+```
+
+Prism 通过 `POST /api/v1/device-pairings/{pairingId}/redeem` 兑换，提交：
+
+```json
+{
+  "secret": "url-safe-random-secret",
+  "deviceId": "stable-prism-device-id",
+  "deviceName": "Qoo's Mac",
+  "platform": "macOS",
+  "version": "0.1.0"
+}
+```
+
+服务端在一个数据库事务中校验票据、原子标记已消费并创建已有 Emby
+`access_tokens` 记录；新记录的 `client_name` 固定为 `Lux Prism`，`device_type` 保存
+`platform`。兑换成功响应为：
+
+```json
+{
+  "accessToken": "returned-once",
+  "userId": "user-id",
+  "serverId": "server-id"
+}
+```
+
+`accessToken` 只在成功兑换响应中返回，不能写入日志、SQLite/PostgreSQL 或二维码缓存。
+兑换不需要 Web session，但必须提交有效 secret；票据不存在、secret 错误、已过期、已取消
+或已消费分别返回稳定的 `DEVICE_PAIRING_NOT_FOUND`、`DEVICE_PAIRING_INVALID_SECRET`、
+`DEVICE_PAIRING_EXPIRED`、`DEVICE_PAIRING_CANCELLED` 和 `DEVICE_PAIRING_CONSUMED` 错误码。
+取消使用 `DELETE /api/v1/auth/device-pairings/{pairingId}`，同样要求当前创建者的 Web
+session + CSRF，且不能取消其他用户的票据。
+
+创建和兑换分别按用户/来源地址限流；超限返回 `429 TOO MANY REQUESTS`、错误码
+`RATE_LIMITED` 和不超过 60 秒的 `Retry-After`。所有设备字段在 API 边界限制长度并拒绝空值，
+请求体限制为 16 KiB。取消是显式资源操作：不存在、已取消或已消费的票据不再产生新的 token。
+
+验收：
+
+- [ ] 从空 SQLite 和已有 SQLite 数据库升级到 0119；PostgreSQL 迁移保持相同表、字段和约束。
+- [ ] 未登录、缺少/错误 CSRF 或仅使用共享 API Key 不能创建/取消票据。
+- [ ] 创建返回 5 分钟有效的票据和一次性 secret，数据库只保存 secret 哈希。
+- [ ] 错误 secret、过期、取消、已消费和不存在票据分别返回上面定义的错误码；设备字段越界被拒绝。
+- [ ] 两个并发兑换请求至多一个成功，成功者获得可调用 Emby API 的 AccessToken，另一个得到已消费错误。
+- [ ] 兑换事务失败时票据和 AccessToken 一起回滚；取消权限按创建用户隔离。
+- [ ] 创建和兑换限流可验证，限流响应不包含 secret、token 或完整 URI。
+- [ ] 运行 `cargo test --locked --test device_pairings`、`cargo test --locked --lib security`、
+  `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，
+  并在可用 PostgreSQL 环境运行对应迁移/并发测试。
+
+依赖：LUX-247。
+
+明确不做：
+
+- 不支持 Emby 的二维码配对，不在 Prism 或服务器保存相机画面。
+- 不改变现有 Web session 或普通 Emby 登录合同，不引入离线写队列。
+- 不在本任务实现 Prism 客户端、二维码渲染组件、摄像头权限或系统凭据库存储。
 
 ## 26. 风险与缓解
 
