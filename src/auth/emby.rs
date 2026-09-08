@@ -81,6 +81,7 @@ impl EmbyAuthService {
                 client_name: &device.client,
                 device_name: &device.device,
                 client_version: &device.version,
+                device_type: None,
             })
             .await?;
         Ok(Some(EmbyAuthResult {

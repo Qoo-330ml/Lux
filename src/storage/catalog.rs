@@ -5604,8 +5604,8 @@ impl Database {
         self.query(
             "INSERT INTO access_tokens (
                 id, token_hash, user_id, device_id, client_name,
-                device_name, client_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                device_name, client_version, device_type
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(token.id)
         .bind(token.token_hash)
@@ -5614,6 +5614,7 @@ impl Database {
         .bind(token.client_name)
         .bind(token.device_name)
         .bind(token.client_version)
+        .bind(token.device_type)
         .execute(&self.pool)
         .await
         .map(|_| ())
