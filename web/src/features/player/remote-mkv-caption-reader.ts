@@ -28,9 +28,10 @@ export type RemoteMkvCaptionReaderOptions = {
 
 /**
  * Reads only Matroska metadata/Cue-selected clusters for text captions. The
- * native video element keeps the original media connection and decodes audio
+ * native video element (or a client engine) keeps responsibility for audio
  * and video; this reader never creates a MediaSource or touches audio/video
- * samples. Every request goes through the signed same-origin Range Relay.
+ * samples. The source is fetched directly by the browser and must support
+ * CORS and bounded byte ranges.
  */
 export class RemoteMkvCaptionReader {
   private readonly abortController = new AbortController();

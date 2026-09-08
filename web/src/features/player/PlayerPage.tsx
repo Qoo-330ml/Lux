@@ -29,7 +29,7 @@ import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
 import { HlsVideoEngine } from "./hls-playback-engine";
 import { canUseHls } from "./hls-capabilities";
-import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
+import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
@@ -192,6 +192,7 @@ export function PlayerPage() {
   const [playbackFailure, setPlaybackFailure] = useState<PlayerFailure | null>(null);
   const [fallbackLoading, setFallbackLoading] = useState(false);
   const [fallbackSpeedX, setFallbackSpeedX] = useState<number | null>(null);
+  const [clientEngineActive, setClientEngineActive] = useState(false);
 
   // Playback control states
   const [currentTime, setCurrentTime] = useState(0);
@@ -327,13 +328,13 @@ export function PlayerPage() {
     : playbackBootstrap.data?.session ?? webPlaybackSession.data;
   const playbackPlan = playbackSession?.plan;
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
+  const remoteDirectUrl = remoteHttpSource ? source?.externalUrl ?? null : null;
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
-  const directRangeUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.rangeUrl : undefined;
-  const remoteMatroskaRelayUrl = remoteMatroskaRangeUrl(source, directRangeUrl);
   const streamUrl = playbackPlan?.type === "DIRECT"
-    ? (directProxyFallbackRequested
-      ? playbackPlan.url
-      : remoteMatroskaRelayUrl ?? directProxyUrl ?? playbackPlan.url)
+    ? (remoteDirectUrl
+      ?? (directProxyFallbackRequested
+        ? playbackPlan.url
+        : directProxyUrl ?? playbackPlan.url))
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
@@ -343,9 +344,10 @@ export function PlayerPage() {
       && selectedCaptionOption.renderMode === "runtime-overlay",
   );
   const clientMkvSourceUrl = playbackPlan?.type === "DIRECT"
-    ? playbackPlan.rangeUrl ?? null
+    ? remoteDirectUrl ?? playbackPlan.rangeUrl ?? null
     : null;
   const remoteCaptionSidecarRequested = remoteCaptionRequested
+    && !clientEngineActive
     && canUseRemoteMkvCaptionSidecar(source)
     && Boolean(clientMkvSourceUrl);
   const poster = media ? imageUrl(media, "fanart") ?? imageUrl(media) : null;
@@ -457,6 +459,11 @@ export function PlayerPage() {
   }, []);
 
   const requestServerFallback = useCallback(async (reason?: unknown) => {
+    if (remoteHttpSource) {
+      setFailedStreamUrl(streamUrl || null);
+      setPlaybackFailure(classifyPlayerEngineFailure(reason));
+      return;
+    }
     if (
       playbackPlan?.type === "DIRECT"
       && directProxyUrl
@@ -488,7 +495,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, stopActiveSession, streamUrl]);
+  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, remoteHttpSource, stopActiveSession, streamUrl]);
 
   useEffect(() => {
     fallbackGenerationRef.current += 1;
@@ -501,6 +508,7 @@ export function PlayerPage() {
     setFailedStreamUrl(null);
     setPlaybackFailure(null);
     setFallbackLoading(false);
+    setClientEngineActive(false);
     setFallbackSpeedX(null);
     currentTimeRef.current = 0;
     durationRef.current = 0;
@@ -745,6 +753,7 @@ export function PlayerPage() {
     initialEngine.element.addEventListener("durationchange", handleDurationChange);
     const load = async () => {
       try {
+        setClientEngineActive(false);
         if (playbackPlan?.type === "SERVER_HLS") {
           initialEngine.destroy();
           const { HlsVideoEngine } = await import("./hls-playback-engine");
@@ -752,17 +761,15 @@ export function PlayerPage() {
           activeEngine = new HlsVideoEngine(initialEngine.element);
           engineRef.current = activeEngine;
         } else {
-          const remoteHttpStrm = remoteHttpSource;
           const useMkvFallback = isMatroskaSource(source)
-            && !remoteHttpStrm
             ? await shouldUseClientMkv(source, initialEngine.element)
             : false;
           const useHevcFallback =
             !useMkvFallback
-            && !remoteHttpStrm
             && (await shouldUseClientHevc(source, initialEngine.element));
           if (useMkvFallback || useHevcFallback) {
             setFallbackLoading(true);
+            setClientEngineActive(true);
             if (cancelled) return;
             initialEngine.destroy();
             if (useMkvFallback) {
@@ -1069,8 +1076,8 @@ export function PlayerPage() {
           runs: cue.runs,
         });
       },
-      onError: (error) => {
-        if (active) setCaptionStatus(`远程字幕不可用：${error.message}`);
+      onError: () => {
+        if (active) setCaptionStatus("远程字幕不可用：上游不支持 CORS/Range 或媒体索引不可用");
       },
     });
     remoteCaptionReaderRef.current = reader;
@@ -1081,7 +1088,7 @@ export function PlayerPage() {
       if (remoteCaptionReaderRef.current === reader) remoteCaptionReaderRef.current = null;
       setRuntimeCaptionCues([]);
     };
-  }, [clientMkvSourceUrl, handleRuntimeCaptionCue, playbackKey, remoteCaptionSidecarRequested, selectedCaptionOption?.embeddedOrdinal, selectedCaptionOption?.format, selectedCaptionOption?.id, selectedCaptionOption?.language, selectedCaptionOption?.name, selectedCaptionOption?.renderMode]);
+  }, [clientEngineActive, clientMkvSourceUrl, handleRuntimeCaptionCue, playbackKey, remoteCaptionSidecarRequested, selectedCaptionOption?.embeddedOrdinal, selectedCaptionOption?.format, selectedCaptionOption?.id, selectedCaptionOption?.language, selectedCaptionOption?.name, selectedCaptionOption?.renderMode]);
 
   useEffect(() => {
     remoteCaptionReaderRef.current?.setTime(currentTime);

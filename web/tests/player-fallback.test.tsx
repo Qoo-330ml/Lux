@@ -7,13 +7,15 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
-import { canUseClientMkvCaptionPipeline, canUseRemoteMkvCaptionSidecar, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { canUseRemoteMkvCaptionSidecar, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
 
 const fallbackState = vi.hoisted(() => ({
   assets: [] as Array<{ workerUrl: string; wasmUrl: string; wasmModuleUrl: string; wasmBinaryUrl: string }>,
+  hevcSources: [] as string[],
   mkvSources: [] as string[],
   captionSources: [] as string[],
+  captionFailure: false,
   mkvFailure: false,
   snapshotDuration: 8 as number | null,
 }));
@@ -21,12 +23,6 @@ const fallbackState = vi.hoisted(() => ({
 vi.mock("../src/features/player/playback-selection", () => ({
   isRemoteHttpStrmSource: (source: { sourceKind?: string; externalUrl?: string }) =>
     source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? ""),
-  remoteMatroskaRangeUrl: (source: { sourceKind?: string; externalUrl?: string; container?: string | null }, rangeUrl?: string | null) =>
-    rangeUrl && source.sourceKind === "STRM_URL" && /^https?:\/\//i.test(source.externalUrl ?? "")
-      && (source.container ?? "").toLowerCase().split(",").some((part) => ["mkv", "matroska", "webm"].includes(part.trim()))
-      ? rangeUrl
-      : null,
-  canUseClientMkvCaptionPipeline: vi.fn().mockReturnValue(true),
   canUseRemoteMkvCaptionSidecar: vi.fn().mockReturnValue(true),
   shouldUseClientHevc: vi.fn().mockResolvedValue(true),
   shouldUseClientMkv: vi.fn().mockResolvedValue(false),
@@ -34,9 +30,12 @@ vi.mock("../src/features/player/playback-selection", () => ({
 
 vi.mock("../src/features/player/remote-mkv-caption-reader", () => ({
   RemoteMkvCaptionReader: class MockRemoteMkvCaptionReader {
-    constructor(options: { source: string; onReady?: () => void }) {
+    constructor(options: { source: string; onReady?: () => void; onError?: (error: Error) => void }) {
       fallbackState.captionSources.push(options.source);
       queueMicrotask(() => options.onReady?.());
+      if (fallbackState.captionFailure) {
+        queueMicrotask(() => options.onError?.(new Error("upstream caption read failed")));
+      }
     }
 
     start() { return Promise.resolve(); }
@@ -63,7 +62,8 @@ vi.mock("../src/features/player/hevc-playback-engine", () => ({
       fallbackState.assets.push(assets);
     }
 
-    setSource() {
+    setSource(source: string) {
+      fallbackState.hevcSources.push(source);
       return Promise.resolve();
     }
 
@@ -106,12 +106,13 @@ describe("PlayerPage client fallback status", () => {
   beforeEach(() => {
     mockPlaybackBootstrap();
     fallbackState.assets.length = 0;
+    fallbackState.hevcSources.length = 0;
     fallbackState.mkvSources.length = 0;
     fallbackState.captionSources.length = 0;
+    fallbackState.captionFailure = false;
     fallbackState.mkvFailure = false;
     fallbackState.snapshotDuration = 8;
     vi.mocked(shouldUseClientHevc).mockResolvedValue(true);
-    vi.mocked(canUseClientMkvCaptionPipeline).mockReturnValue(true);
     vi.mocked(canUseRemoteMkvCaptionSidecar).mockReturnValue(true);
     vi.mocked(shouldUseClientMkv).mockResolvedValue(false);
     vi.spyOn(api, "item").mockResolvedValue({
@@ -183,7 +184,7 @@ describe("PlayerPage client fallback status", () => {
     });
   });
 
-  it("keeps remote HTTP STRM on native direct playback instead of client fallback", async () => {
+  it("uses the original remote HTTP STRM URL for the client HEVC fallback", async () => {
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-hevc-strm",
       title: "远程 HEVC",
@@ -230,12 +231,10 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
 
-    expect(fallbackState.assets).toHaveLength(0);
-    expect(shouldUseClientHevc).not.toHaveBeenCalled();
+    expect(fallbackState.assets).toHaveLength(1);
+    expect(fallbackState.hevcSources).toEqual(["https://media.example.test/video.mp4"]);
+    expect(shouldUseClientHevc).toHaveBeenCalled();
     expect(shouldUseClientMkv).not.toHaveBeenCalled();
-    expect(container?.querySelector("video")?.getAttribute("src")).toBe(
-      "/Videos/remote-hevc-strm/stream.mp4?MediaSourceId=remote-hevc-source",
-    );
     expect(api.createWebPlaybackSession).toHaveBeenCalledWith(
       "remote-hevc-strm",
       "remote-hevc-source",
@@ -243,7 +242,8 @@ describe("PlayerPage client fallback status", () => {
     );
   });
 
-  it("keeps remote Matroska STRM native until an embedded caption is selected", async () => {
+  it("keeps remote Matroska STRM on the original URL while reading selected captions directly", async () => {
+    vi.mocked(shouldUseClientHevc).mockResolvedValue(false);
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-strm",
       title: "远程 MKV",
@@ -296,10 +296,8 @@ describe("PlayerPage client fallback status", () => {
     });
 
     const video = container.querySelector<HTMLVideoElement>("video");
-    expect(video?.getAttribute("src")).toBe(
-      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
-    );
-    expect(shouldUseClientMkv).not.toHaveBeenCalled();
+    expect(video?.getAttribute("src")).toBe("https://media.example.test/video.mkv");
+    expect(shouldUseClientMkv).toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
 
     const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
@@ -308,10 +306,8 @@ describe("PlayerPage client fallback status", () => {
     const captionSelect = container?.querySelector<HTMLSelectElement>("#lux-player-caption-select");
     expect(captionSelect?.options[1]?.disabled).toBe(false);
     expect(container?.textContent).not.toContain("浏览器未暴露远程内嵌字幕");
-    expect(shouldUseClientMkv).not.toHaveBeenCalled();
-    expect(container?.querySelector("video")?.getAttribute("src")).toBe(
-      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
-    );
+    expect(shouldUseClientMkv).toHaveBeenCalled();
+    expect(container?.querySelector("video")?.getAttribute("src")).toBe("https://media.example.test/video.mkv");
 
     await act(async () => {
       if (!captionSelect) return;
@@ -319,14 +315,12 @@ describe("PlayerPage client fallback status", () => {
       captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 100));
     });
-    expect(shouldUseClientMkv).not.toHaveBeenCalled();
-    expect(fallbackState.captionSources).toEqual([
-      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
-    ]);
+    expect(shouldUseClientMkv).toHaveBeenCalled();
+    expect(fallbackState.captionSources).toEqual(["https://media.example.test/video.mkv"]);
     expect(container?.textContent).not.toContain("当前浏览器不支持远程字幕管线");
   });
 
-  it("reads selected remote embedded captions through the signed session Range URL", async () => {
+  it("reads selected remote embedded captions through the original remote URL", async () => {
     vi.mocked(shouldUseClientMkv).mockResolvedValue(true);
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-strm",
@@ -389,12 +383,11 @@ describe("PlayerPage client fallback status", () => {
       await new Promise((resolve) => setTimeout(resolve, 100));
     });
 
-    expect(fallbackState.captionSources).toEqual([
-      "/api/v1/playback/sessions/web-remote-mkv/range?expires=1900000000&signature=test",
-    ]);
+    expect(fallbackState.captionSources).toHaveLength(0);
+    expect(fallbackState.mkvSources).toEqual(["https://media.example.test/video.mkv"]);
   });
 
-  it("preserves remote playback position and playing state when entering the caption pipeline", async () => {
+  it("preserves remote playback position and playing state when the client engine is selected", async () => {
     vi.mocked(shouldUseClientMkv).mockResolvedValue(true);
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-handoff",
@@ -484,9 +477,9 @@ describe("PlayerPage client fallback status", () => {
     expect(play).not.toHaveBeenCalled();
   });
 
-  it("does not turn a remote caption pipeline failure into a playback-engine failure", async () => {
-    fallbackState.mkvFailure = true;
-    vi.mocked(shouldUseClientMkv).mockResolvedValue(true);
+  it("does not turn a remote caption sidecar failure into a playback-engine failure", async () => {
+    vi.mocked(shouldUseClientHevc).mockResolvedValue(false);
+    fallbackState.captionFailure = true;
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-strm",
       title: "远程 MKV",
@@ -548,13 +541,15 @@ describe("PlayerPage client fallback status", () => {
     });
 
     expect(container.textContent).not.toContain("播放器引擎失败");
+    expect(container.textContent).not.toContain("https://media.example.test/video.mkv");
     expect(fallbackState.mkvSources).toHaveLength(0);
     expect(container.textContent).not.toContain("播放器引擎失败");
     expect(api.stopWebPlaybackSession).not.toHaveBeenCalled();
   });
 
   it("keeps native playback and the selected option when the remote codec pair cannot enter MSE", async () => {
-    vi.mocked(canUseClientMkvCaptionPipeline).mockReturnValue(false);
+    vi.mocked(shouldUseClientHevc).mockResolvedValue(false);
+    vi.mocked(shouldUseClientMkv).mockResolvedValue(false);
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-eac3",
       title: "远程 HEVC E-AC-3",
@@ -611,7 +606,6 @@ describe("PlayerPage client fallback status", () => {
     });
 
     expect(container.textContent).not.toContain("播放器引擎失败");
-    expect(shouldUseClientMkv).not.toHaveBeenCalled();
   });
 
   it("shows safe Lux guidance instead of the fallback engine reason", async () => {

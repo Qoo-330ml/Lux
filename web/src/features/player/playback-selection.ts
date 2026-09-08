@@ -24,17 +24,6 @@ export function isRemoteHttpStrmSource(source: MediaSource | undefined) {
   }
 }
 
-/**
- * Native media playback for a remote Matroska source must stay on Lux's
- * same-origin signed Range Relay.  This prevents the browser's media
- * request from following the STRM target's redirect directly and gives a
- * future caption tee one stable request surface to observe.
- */
-export function remoteMatroskaRangeUrl(source: MediaSource | undefined, rangeUrl: string | null | undefined) {
-  if (!rangeUrl || !isRemoteHttpStrmSource(source) || !isMatroskaContainer(source?.container)) return null;
-  return rangeUrl;
-}
-
 export function h264CodecForDimensions(width: number, height: number) {
   const pixels = Math.max(1, width) * Math.max(1, height);
   if (pixels > 2_073_600) return "avc1.640033";
@@ -86,6 +75,9 @@ export async function shouldUseClientMkv(
   if (!source || !hasClientMkvCandidate(source)) return false;
   const requireCaptionPipeline = options.requireCaptionPipeline === true;
   const videoCodec = source.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO")?.codec?.toLowerCase() ?? "";
+  if (!requireCaptionPipeline && video.canPlayType(`video/x-matroska; codecs="${matroskaCodecHint(videoCodec)}"`) !== "") {
+    return false;
+  }
   if (!isHevcCodec(videoCodec) && typeof MediaSource !== "undefined" && typeof MediaSource.isTypeSupported === "function") {
     const codec = videoCodec.includes("vp9") || videoCodec.includes("vp09")
       ? "vp09.00.10.08"
@@ -103,6 +95,13 @@ export async function shouldUseClientMkv(
   if (!hasClientHevcRuntime()) return false;
   if (!hasClientMkvH264Audio(source)) return false;
   return probeClientHevc(source, video, "video/x-matroska", requireCaptionPipeline);
+}
+
+function matroskaCodecHint(videoCodec: string) {
+  if (videoCodec.includes("vp9") || videoCodec.includes("vp09")) return "vp09";
+  if (videoCodec.includes("av1") || videoCodec.includes("av01")) return "av01";
+  if (videoCodec.includes("hevc") || videoCodec.includes("h265") || videoCodec.includes("hvc1") || videoCodec.includes("hev1")) return "hvc1";
+  return "avc1";
 }
 
 function mseAudioCodec(source: MediaSource) {
@@ -166,7 +165,7 @@ export function canUseClientMkvCaptionPipeline(source: MediaSource | undefined) 
  * Remote Matroska captions can be read without remuxing the media.  Keep this
  * capability independent from the MSE codec pair: native playback remains in
  * charge of audio/video (including E-AC-3), while the caption sidecar only
- * needs a signed Range URL and a supported text track.
+ * needs a CORS/Range-capable remote source and a supported text track.
  */
 export function canUseRemoteMkvCaptionSidecar(source: MediaSource | undefined) {
   if (!source || !isRemoteHttpStrmSource(source) || !isMatroskaContainer(source.container)) return false;

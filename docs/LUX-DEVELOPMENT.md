@@ -1352,8 +1352,9 @@ locked local value
   Worker 文本解析器；不写回媒体、不烧录、不生成永久缓存。
 - 远程 HTTP(S) `.strm` 的 Matroska/WebM 默认使用原生 `<video>`，保持字幕功能改动前的 Direct Play 行为。未选择字幕时不启动
   客户端 Matroska Worker、Range、MSE 或字幕专用连接。
-- 用户明确选择远程内嵌 SRT/ASS/SSA 后，才使用当前播放会话签名的同源 `rangeUrl` 进入 `ClientMkvEngine`；Worker 从同一媒体读取器
-  解封装音视频和字幕，音视频输出到 MSE，字幕交给 Lux cue/原生 TextTrack。不会读取外部 CDN URL、预先抽取、落盘或生成外挂文件。
+- 用户明确选择远程内嵌 SRT/ASS/SSA 后，才由浏览器直接对媒体源 `externalUrl` 发起带 CORS 的有限 Range 读取，使用已有的客户端
+  Matroska/WASM 管线解码音视频和字幕；远程音视频 fallback 的 MSE 输出、字幕 cue 和音频均由浏览器完成，Lux 不接收媒体字节。
+  不会预先抽取、落盘或生成外挂文件。上游不支持 CORS/Range、索引或客户端 codec 时只报告能力不足，不回退到 Lux Relay。
 - Range、索引、codec、MSE 或字幕解析失败时，只清除远程字幕并恢复同一播放计划的原生视频，不停止或重建播放会话，不切换服务端 HLS。
 - PGS/SUP 图形字幕不属于本阶段承诺；完整 ASS/SSA 样式、字幕烧录和 HLS 字幕组另行处理。
 
@@ -1367,12 +1368,12 @@ locked local value
 ### 14.6 Web 播放
 
 - Web 播放通过独立的 `/api/v1/playback/sessions` 会话接口创建一次播放计划；Web API 与 Emby 播放接口、DTO 和领域类型分离。
-- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；普通 Direct Play 和 HLS 地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie；URL 和路径型 `.strm` 的 `DIRECT` 计划都额外返回标准 `/Videos/...` `proxyUrl`，Web 播放器优先使用它并在代理鉴权/映射失败时回退到签名 `url`，该代理地址依赖 Emby token 或代理注入的 API Key。
+- 会话计划使用 `tier: 0..4` 和 `plan.kind: DIRECT | SERVER_HLS | UNSUPPORTED` 的判别联合；普通 Direct Play 和 HLS 地址为短期签名 URL，不能要求 `<video>` 或 HLS 请求携带 Lux Cookie；路径型 `.strm` 的 `DIRECT` 计划继续额外返回标准 `/Videos/...` `proxyUrl`，Web 播放器优先使用它并在代理鉴权/映射失败时回退到签名 `url`。远程 HTTP(S) `.strm` 的 Web 媒体则直接使用 `MediaSources[].externalUrl`，忽略 `proxyUrl`、`rangeUrl` 和 Lux Direct。
 - 档位 0 使用原生 Range 直放或现有客户端 fallback；档位 1～4 使用服务端 fMP4/CMAF HLS。Safari 使用原生 HLS，其他支持 MSE 的浏览器使用 Web HLS 播放器。
 - 创建会话时固定媒体源、音频/字幕选择、起播位置和服务端计划；seek 必要时切换会话生成代次，不把客户端任意路径或外部 URL 交给服务端执行。
 - `.strm` 只能返回档位 0；URL/路径型外部代理接管、URL 型 Lux 直连回退或本地安全读取失败时直接展示错误，不创建 ffmpeg 进程。
-- 内嵌文本字幕是独立于媒体计划的能力：浏览器原生轨道或本地 source-scoped overlay 只能复用当前媒体资源，不能改变 `.strm` 的
-  Direct 规则。远程 HTTP(S) STRM 当前不使用客户端单次读取。
+- 内嵌文本字幕是独立于媒体计划的能力：浏览器原生轨道或客户端 overlay 只能复用当前媒体资源，不能改变 `.strm` 的
+  Direct 规则。远程 HTTP(S) STRM 的客户端读取必须直连 `externalUrl`，不使用 Lux 的 `rangeUrl`。
 - 记录开始、定时进度、暂停、心跳和停止；事件带有幂等 `eventId` 与单调 `sequence`，服务端使用数据库媒体时长计算已看状态。
 - 服务端 HLS 会话必须有界：独立进程组、stderr drain、临时目录配额、Remux/硬件/软件并发限制、心跳超时回收、孤儿目录清理和低磁盘拒绝策略。
 - 不实现 DRM、服务器字幕转换/烧录、多码率自适应 HLS 或 `.strm` 服务端代理。LUX-212 的浏览器文本 cue
@@ -1381,7 +1382,8 @@ locked local value
 - LUX-184 允许提供独立的浏览器媒体能力探针，用于实测原生 video、MediaCapabilities 和 WebCodecs；探针不接入
   正式播放路径，不读取或保存用户媒体数据。
 - LUX-185 可为 MP4/fMP4 的 HEVC 媒体增加浏览器端 WASM 解码、H.264 客户端编码和 MSE 播放 fallback；重型工作
-  必须在 Web Worker 中执行，服务端只继续提供原始媒体 Range 数据。
+  必须在 Web Worker 中执行。本地媒体继续使用 Lux 的受保护 Range；远程 HTTP(S) `.strm` 的原始媒体字节由浏览器
+  直接从 `MediaSources[].externalUrl` 读取，要求上游自行提供 CORS、Range 和稳定资源校验，Lux 不作为媒体代理。
 - 客户端解码增强的目标包括具备相应硬件能力的 4K HEVC 8-bit、10-bit 和 HDR10；Dolby Vision 不属于当前承诺。
 - 若后续新增 WebCodecs 或 WASM 播放引擎，必须单独修改本节、补充 ADR，并通过实际浏览器性能阶段门；不得把
   “浏览器报告支持”直接等同于 4K 实时播放能力。
@@ -2090,6 +2092,7 @@ services:
 | LUX-241 | web/src/features/player/components/player-captions.ts、web/src/features/player/components/player-settings-panel.tsx、web/tests/player-captions.test.ts、web/tests/player-components.test.tsx；字符串字幕 ID 和引擎字幕控制器 |
 | LUX-242 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/tests/player-playback.test.tsx、web/tests/player-fallback.test.tsx、web/tests/strm-caption-compatibility.test.tsx；远程管线接入和终止错误策略 |
 | LUX-243 | docs/COMPATIBILITY.md、scripts/player-matroska-smoke.mjs、web/tests/；远程 Matroska 客户端管线历史阶段门（当前不实施） |
+| LUX-245 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/src/features/player/remote-mkv-caption-reader.ts、web/tests/；远程 STRM 浏览器直连与客户端解码 fallback |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5409,7 +5412,7 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 
 依赖：LUX-227。
 
-#### LUX-229：本地/远程 `.strm` 字幕兼容性阶段门（由 ADR-038 收敛）
+#### LUX-229：本地/远程 `.strm` 字幕兼容性阶段门（历史记录，已由 LUX-245 取代）
 
 范围：阶段门使用固定、无个人数据的媒体夹具，分别验证本地媒体、URL 型远程 `.strm`、
 路径型远程 `.strm`、浏览器原生轨道、按需
@@ -5418,8 +5421,9 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 验收：
 
 - [ ] 本地内嵌文本字幕可按轨选择并与 Direct/HLS/fallback 生命周期一致；PGS/SUP 明确显示不支持且视频仍可播放。
-- [ ] 远程 URL/path `.strm` 未选择字幕时仍由播放器/外部代理按既有规则直连；仅 URL 型 HTTP(S) Matroska 在明确选择文本轨后通过
-      当前播放会话的有限 Range Relay 读取，不能读取外部 CDN URL、调用 ffmpeg/ffprobe 或创建字幕专用代理。
+- [ ] （历史方案）远程 URL/path `.strm` 未选择字幕时仍由播放器/外部代理按既有规则直连；旧方案仅允许 URL 型 HTTP(S) Matroska
+      在明确选择文本轨后通过当前播放会话的有限 Range Relay 读取。该 Relay 约束已由 LUX-245 的浏览器 `externalUrl` 直连取代，
+      当前实现不能据此验收；仍不允许调用 ffmpeg/ffprobe 或创建服务端媒体代理。
 - [ ] source 切换、seek、停止、页面离开和失败回退不残留字幕；兼容性记录包含浏览器、平台、夹具哈希和请求边界。
 - [ ] 阶段 Rust/Web 全量质量门通过，并记录 `uname -m`；本机 ARM64 结果不外推 NAS/x86_64 性能，项目所有者确认后关闭阶段。
 
@@ -5432,8 +5436,8 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 阶段门：
 
 - [ ] 本地文本字幕与浏览器 native track 均不改变播放会话和 `.strm` Direct Play 边界。
-- [ ] 远程 `.strm` 未选择字幕时没有 Lux 媒体字节流量；显式字幕仅允许同源 Range Relay，不增加服务端字幕抽取、ffmpeg 或
-      302/Redia 字幕专用合同。
+- [ ] （历史方案，已取代）远程 `.strm` 未选择字幕时没有 Lux 媒体字节流量；显式字幕仅允许同源 Range Relay。当前验收以 LUX-245
+      为准：显式字幕和客户端解码均由浏览器直连 `externalUrl`，不增加服务端字幕抽取、ffmpeg 或 302/Redia 字幕专用合同。
 - [ ] PGS/SUP、服务器烧录、HLS 字幕组和完整 ASS 样式未被隐式加入，所有未验证浏览器能力均已记录。
 - [ ] Rust/Web 全量质量门、兼容性记录、本机架构记录和项目所有者确认均完成。
 
@@ -5606,12 +5610,16 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 - 不删除 Lux 直接播放 URL 型 `.strm` 的现有 307 回退。
 - 不实现任何第三方代理的路径映射、302 API、缓存、媒体字节代理或转码。
 
-### 阶段 21：远程 STRM 原生默认与显式字幕单管线
+### 阶段 21：远程 STRM 浏览器直连与客户端解码 fallback
 
-阶段 20 的远程 Direct Play 默认行为继续保留：远程 HTTP(S) STRM 始终交给原生 `<video>` 负责音视频。用户明确选择 URL 型
-HTTP(S) Matroska/WebM 的 SRT/ASS/SSA 后，才通过播放会话签名 `rangeUrl` 启动字幕旁路读取器，由 JavaScript 解封装 Cue-selected
-Cluster 并交给覆盖层；不切换到 `ClientMkvEngine`，不接管音频/视频。字幕旁路失败只清除字幕状态；不停止或重建播放会话。
-详细决定记录在 ADR-039。
+远程 HTTP(S) STRM 的 Web Direct Play 直接使用 `externalUrl`，不使用 Lux 的 `proxyUrl`、`rangeUrl` 或签名 Direct URL。原生 `<video>`
+仍是第一路径；浏览器原生能力不足时，才由客户端 WASM/WebCodecs 管线从同一 `externalUrl` 读取。用户明确选择 URL 型
+HTTP(S) Matroska/WebM 的 SRT/ASS/SSA 后，字幕旁路读取器也直接读取 `externalUrl`；所有远程媒体字节都不经过 Lux。
+直连、CORS/Range、WASM/WebCodecs 或解析失败只显示能力错误，不切换到 Lux Relay/HLS。详细决定记录在 ADR-040，ADR-039
+保留为已取代的 Relay 方案历史记录。
+
+> 说明：下列 LUX-235 至 LUX-243 保留为此前的远程字幕 Relay 方案记录；其未完成的验收条件不再是当前实现目标，远程媒体边界以
+> LUX-245 和 ADR-040 为准。
 
 #### LUX-235：远程 Matroska 客户端管线规格与 ADR-035
 
@@ -5743,11 +5751,31 @@ cue 和 Worker。
 验收：
 
 - [ ] Chrome、Firefox、Safari 分别只记录真实可播放的 codec 组合，不把 `isTypeSupported` 单独当作成功。
-- [ ] 确认无字幕端点请求、无第二条原生媒体连接、无服务端抽取/ffmpeg/通用媒体代理流量；显式字幕只使用同源 Range Relay。
+- [ ] （历史方案，已由 LUX-245 取代）确认无字幕端点请求、无第二条原生媒体连接、无服务端抽取/ffmpeg/通用媒体代理流量；旧方案显式字幕只使用同源 Range Relay。
 - [ ] `pnpm --dir web install --frozen-lockfile`、Web 全量测试/构建、Rust 全量质量门、`uname -m` 均通过；ARM64 结果不外推 NAS/x86。
 - [ ] 项目所有者确认阶段门后才关闭本阶段。
 
 依赖：LUX-242。
+
+#### LUX-245：远程 STRM 浏览器直连与客户端解码 fallback
+
+范围：修正 Lux Web 对远程 HTTP(S) `.strm` 的媒体边界。原生播放、客户端 Matroska/HEVC WASM fallback 和远程字幕读取器
+均直接使用媒体源的 `externalUrl`；Lux 只创建/维护播放会话、记录进度并提供权限控制，不接收远程视频、音频或字幕媒体字节。
+本地媒体和路径型 `.strm` 的现有 Lux 受保护播放/代理兼容行为保持不变。
+
+验收：
+
+- [ ] 远程 HTTP(S) `.strm` 的原生 `<video>`、`ClientMkvEngine`、`ClientHevcEngine` 和 `RemoteMkvCaptionReader` 输入均为
+  原始 `externalUrl`；Web 不使用远程 `proxyUrl`、`rangeUrl`、Lux Direct、Lux HLS 或服务端 ffmpeg 传输媒体字节。
+- [ ] 浏览器原生能力不足时，远程 MP4/fMP4 HEVC 和 Matroska fallback 可在上游支持 CORS/Range 时使用现有 WASM/WebCodecs
+  Worker；不支持时给出可诊断失败，且不自动回退到 Lux Relay。
+- [ ] 远程字幕旁路使用浏览器到 `externalUrl` 的有限 CORS/Range 请求；旁路失败只清除字幕，不停止/重建会话，不影响原生音视频。
+- [ ] 路径型 `.strm`、本地媒体、Emby 兼容层、播放会话/进度接口和媒体字节不相关的 Lux 控制请求不回归。
+
+验证：相关 Web 单测、`pnpm --dir web test`、`pnpm --dir web build`、远程 CORS/Range 浏览器 smoke test、`git diff --check`；
+记录 `uname -m`，本机 ARM64 结果不外推 NAS/x86 性能。
+
+依赖：LUX-185、LUX-198、LUX-234。
 
 #### LUX-244：任务类型与执行计划聚合
 
