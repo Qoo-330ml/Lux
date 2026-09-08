@@ -2072,6 +2072,164 @@ impl Database {
         self.find_scheduled_task_plan(plan_id).await
     }
 
+    pub(crate) async fn delete_scheduled_task_plan(
+        &self,
+        plan_id: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let existing: Option<(String, String, i64, String, Option<String>)> = self
+            .query_as(
+                "SELECT task_type, scope_type, is_default, source_type, plugin_id
+                 FROM scheduled_task_plans WHERE id = ?",
+            )
+            .bind(plan_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((task_type, scope_type, is_default, source_type, plugin_id)) = existing else {
+            return Ok(false);
+        };
+        if scope_type != "LIBRARY" {
+            return Err(StorageError::Conflict(
+                "全局插件计划不能通过媒体库计划接口删除".to_owned(),
+            ));
+        }
+        if is_default != 0 {
+            return Err(StorageError::Conflict(
+                "默认计划不能删除，请通过自定义计划调整媒体库范围".to_owned(),
+            ));
+        }
+
+        let library_ids: Vec<String> = self
+            .query_scalar(
+                "SELECT library_id FROM scheduled_task_plan_libraries
+                 WHERE plan_id = ?",
+            )
+            .bind(plan_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if !library_ids.is_empty() {
+            let default_plan: Option<String> = self
+                .query_scalar(
+                    "SELECT id FROM scheduled_task_plans
+                     WHERE task_type = ? AND scope_type = 'LIBRARY' AND is_default = 1
+                       AND source_type = ?
+                       AND (plugin_id = ? OR (plugin_id IS NULL AND ? IS NULL))
+                     ORDER BY id LIMIT 1",
+                )
+                .bind(&task_type)
+                .bind(&source_type)
+                .bind(plugin_id.as_deref())
+                .bind(plugin_id.as_deref())
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let Some(default_plan_id) = default_plan else {
+                return Err(StorageError::Conflict(
+                    "没有可接收计划媒体库的默认计划".to_owned(),
+                ));
+            };
+            let default_config: (
+                String,
+                String,
+                String,
+                Option<String>,
+                Option<String>,
+                i64,
+                String,
+            ) = self
+                .query_as(
+                    "SELECT task_name, task_description, source_type, plugin_id,
+                            cron_or_interval, is_enabled, resource_limit_json
+                     FROM scheduled_task_plans WHERE id = ?",
+                )
+                .bind(&default_plan_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "UPDATE scheduled_task_configs
+                 SET plan_id = ?, task_name = ?, task_description = ?, source_type = ?,
+                     plugin_id = ?, cron_or_interval = ?, is_enabled = ?,
+                     resource_limit_json = ?, updated_at = unixepoch()
+                 WHERE owner_type = 'LIBRARY' AND task_type = ? AND plan_id = ?",
+            )
+            .bind(&default_plan_id)
+            .bind(&default_config.0)
+            .bind(&default_config.1)
+            .bind(&default_config.2)
+            .bind(default_config.3.as_deref())
+            .bind(default_config.4.as_deref())
+            .bind(default_config.5)
+            .bind(&default_config.6)
+            .bind(&task_type)
+            .bind(plan_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+                 SELECT ?, library_id FROM scheduled_task_plan_libraries
+                 WHERE plan_id = ? ON CONFLICT DO NOTHING",
+            )
+            .bind(&default_plan_id)
+            .bind(plan_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.query("DELETE FROM scheduled_task_plan_libraries WHERE plan_id = ?")
+            .bind(plan_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("DELETE FROM scheduled_task_plans WHERE id = ?")
+            .bind(plan_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn move_libraries_to_scheduled_task_plan(
         &self,
@@ -3055,5 +3213,86 @@ mod scheduled_task_plan_mirror_tests {
             mirror.3,
             r#"{"concurrency":8,"introWindowSeconds":180,"creditsWindowSeconds":180,"matchThreshold":90}"#
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_custom_plan_moves_libraries_back_to_default_plan() {
+        let (_temp_dir, database) = test_database().await;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("library should be created");
+        let library_id = library.id.to_string();
+        let default_plan_id: String = sqlx::query_scalar(
+            "SELECT c.plan_id
+             FROM scheduled_task_configs c
+             WHERE c.owner_type = 'LIBRARY' AND c.owner_id = ?
+               AND c.task_type = 'RECONCILIATION_SCAN'",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("default plan should be assigned");
+        let default_schedule_and_enabled: (Option<String>, i64) = sqlx::query_as(
+            "SELECT cron_or_interval, is_enabled
+             FROM scheduled_task_plans WHERE id = ?",
+        )
+        .bind(&default_plan_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("default plan configuration should be queryable");
+
+        database
+            .create_scheduled_task_plan(
+                "reconciliation-custom-plan",
+                "RECONCILIATION_SCAN",
+                "夜间校验",
+                "全量校验媒体库",
+                "按计划校验媒体库索引与文件系统的一致性。",
+                "SYSTEM",
+                None,
+                Some("0 2 * * *"),
+                true,
+                r#"{"scanConcurrency":2,"probeConcurrency":2}"#,
+                std::slice::from_ref(&library_id),
+            )
+            .await
+            .expect("custom plan should be created");
+
+        let default_delete = database.delete_scheduled_task_plan(&default_plan_id).await;
+        assert!(matches!(default_delete, Err(StorageError::Conflict(_))));
+
+        assert!(
+            database
+                .delete_scheduled_task_plan("reconciliation-custom-plan")
+                .await
+                .expect("custom plan should be deleted")
+        );
+
+        let custom_plan_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plans
+             WHERE id = 'reconciliation-custom-plan'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("deleted plan should be countable");
+        assert_eq!(custom_plan_count, 0);
+
+        let mirror: (String, Option<String>, i64, i64) = sqlx::query_as(
+            "SELECT c.plan_id, c.cron_or_interval, c.is_enabled,
+                    (SELECT COUNT(*) FROM scheduled_task_plan_libraries l
+                     WHERE l.plan_id = c.plan_id AND l.library_id = c.owner_id)
+             FROM scheduled_task_configs c
+             WHERE c.owner_type = 'LIBRARY' AND c.owner_id = ?
+               AND c.task_type = 'RECONCILIATION_SCAN'",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("library task mirror should remain");
+        assert_eq!(mirror.0, default_plan_id);
+        assert_eq!(mirror.1, default_schedule_and_enabled.0);
+        assert_eq!(mirror.2, default_schedule_and_enabled.1);
+        assert_eq!(mirror.3, 1);
     }
 }
