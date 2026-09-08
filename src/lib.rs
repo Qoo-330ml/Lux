@@ -4,6 +4,7 @@ pub mod api;
 pub mod application;
 pub mod auth;
 pub mod config;
+pub mod discovery;
 pub mod domain;
 pub mod library;
 pub mod network;

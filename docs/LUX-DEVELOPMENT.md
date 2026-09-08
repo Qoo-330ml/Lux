@@ -2093,6 +2093,7 @@ services:
 | LUX-242 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/tests/player-playback.test.tsx、web/tests/player-fallback.test.tsx、web/tests/strm-caption-compatibility.test.tsx；远程管线接入和终止错误策略 |
 | LUX-243 | docs/COMPATIBILITY.md、scripts/player-matroska-smoke.mjs、web/tests/；远程 Matroska 客户端管线历史阶段门（当前不实施） |
 | LUX-245 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/src/features/player/remote-mkv-caption-reader.ts、web/tests/；远程 STRM 浏览器直连与客户端解码 fallback |
+| LUX-247 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/discovery.rs、src/main.rs、compose.yaml、docs/DEPLOYMENT.md；Emby 兼容局域网发现 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5844,6 +5845,55 @@ cue 和 Worker。
 约减少 45.5%；该结果只代表本机 ARM64/SQLite，不外推 PostgreSQL WAL 或 NAS/x86_64。
 PostgreSQL 集成测试目标已编译，但其 4 个运行测试因本机没有可用 PostgreSQL 实例而保持 ignored，
 因此真实 PostgreSQL 迁移/WAL 证据仍待可用测试环境复测。
+
+#### LUX-247：Emby 兼容局域网发现
+
+为 Lux Prism 的局域网服务器发现增加独立 UDP 服务。服务监听 UDP `7359`，仅处理包含
+`who is EmbyServer?` 的 UTF-8 或 UTF-16LE 请求，并返回 Emby 兼容的 JSON：
+
+```json
+{
+  "Address": "http://192.168.1.20:8097",
+  "Id": "server-id",
+  "Name": "Lux Server"
+}
+```
+
+`Address` 默认根据请求来源选择本机网络接口和 Lux HTTP 端口；容器、反向代理或多网卡场景可以用
+`LUX_DISCOVERY_ADVERTISE_URL` 显式指定对客户端可达的 HTTP(S) 基地址。该地址只允许 HTTP/HTTPS，
+拒绝 userinfo、query 和 fragment。监听地址可用 `LUX_DISCOVERY_BIND_ADDR` 覆盖，默认
+`0.0.0.0:7359`，主要用于测试和受限网络部署。
+
+Prism 必须校验发现 JSON 中的地址，并同时探测返回的 `Address` 与 UDP 响应包来源地址加 Lux HTTP
+端口；以 `Id` 去重，不得把 UDP 返回的地址直接当作已验证的连接地址。发现服务不接触认证令牌，
+不记录完整 UDP 数据包或地址中的凭据。
+
+验收：
+
+- [x] Lux 启动后监听 UDP `7359`，有效的大小写不敏感 `who is EmbyServer?` 请求返回 `Address`、`Id`、`Name` 三个字段。
+- [x] UTF-8 和 UTF-16LE 请求都能得到同编码的 JSON 响应；无关、空包和来源端口为 0 的数据包不响应。
+- [x] `LUX_DISCOVERY_ADVERTISE_URL` 通过 HTTP(S) 地址校验，拒绝 userinfo、query、fragment 和无效地址；未配置时使用请求对应的本机接口地址。
+- [x] UDP 服务随 HTTP 服务收到 Ctrl-C/SIGTERM 后退出，不遗留任务；发现错误不会泄露请求内容、令牌或完整外部 URL。
+- [x] Compose 暴露 `7359/udp`，部署文档说明 Docker、反向代理和多网卡场景的显式广播地址配置；不改变现有 HTTP、Emby 或数据库合同。
+
+验证：`cargo test --locked --lib discovery`、`cargo fmt --all -- --check`、
+`cargo clippy --locked --all-targets --all-features -- -D warnings`，并在 Docker 网络中用固定夹具验证
+UDP 请求、响应和来源地址候选。记录 `uname -m`；本机 ARM64 结果不外推 NAS/x86_64 性能。
+
+依赖：LUX-246。
+
+明确不做：
+
+- 不在本任务实现 Prism 客户端、服务器 ID 去重逻辑或二维码设备配对；后者属于 LUX-248。
+- 不新增认证、广播加密、通用 UDP 代理或额外 Emby 端点。
+
+验证记录（2026-09-09，`uname -m=arm64`）：`cargo test --locked --test discovery`（3 passed）、
+`cargo test --locked --lib discovery`（4 passed）、`cargo build --locked`、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 和
+`docker compose config --quiet` 均通过。`cargo test --locked --all-targets` 的发现测试及其他已运行目标通过，
+但在既有 `tests/libraries_api.rs:admin_can_list_and_update_library_schedules_from_operations_page` 中，
+`AUTO_LIBRARY_COVER` 调度更新返回 503；该测试单独重跑仍复现，且本任务未修改其覆盖的代码。真实 Docker
+网络中的 UDP 广播验证仍待在目标部署环境执行。本机 ARM64 结果不外推 NAS/x86_64 性能。
 
 补充记录（2026-09-08）：0118 迁移将 `reconciliation_scan_entries` 的主键列顺序调整为
 `(job_id, entry_type, library_root_id, relative_path)`，删除与新主键重复的宽索引；将

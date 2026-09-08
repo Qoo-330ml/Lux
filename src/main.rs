@@ -5,16 +5,18 @@ use luxd::{
     application::{settings::read_network_proxy_url, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
+    discovery::{DiscoveryConfig, DiscoveryService},
     observability,
     storage::Database,
 };
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
+    let discovery_config = DiscoveryConfig::from_env(config.http_addr)?;
     let _logging_guard = observability::init(&config.config_dir).await;
     luxd::application::plugin_compat::migrate_legacy_tmdb_config(&config.config_dir).await?;
     let explicit_database_configuration = config.load_explicit_database_configuration().await?;
@@ -86,15 +88,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
     });
 
+    let discovery = DiscoveryService::bind_with_database(discovery_config, &database).await?;
+    let discovery_addr = discovery.local_addr()?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let discovery_task = tokio::spawn(async move {
+        if let Err(error) = discovery.run(shutdown_rx).await {
+            error!(%error, "LAN discovery service stopped unexpectedly");
+        }
+    });
+    info!(address = %discovery_addr, "lux LAN discovery listening");
+
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
 
-    axum::serve(
+    let serve_result = axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
+    .await;
+    let _ = shutdown_tx.send(true);
+    let _ = discovery_task.await;
+    serve_result?;
 
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
@@ -110,7 +125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(shutdown: watch::Sender<bool>) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             error!(%error, "failed to install Ctrl-C handler");
@@ -136,4 +151,6 @@ async fn shutdown_signal() {
 
     #[cfg(not(unix))]
     ctrl_c.await;
+
+    let _ = shutdown.send(true);
 }

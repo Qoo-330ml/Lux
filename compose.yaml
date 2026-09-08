@@ -8,8 +8,11 @@ services:
       MALLOC_ARENA_MAX: ${LUX_MALLOC_ARENA_MAX:-2}
       LUX_DB_MAX_CONNECTIONS: ${LUX_DB_MAX_CONNECTIONS-}
       LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY-}
+      LUX_DISCOVERY_BIND_ADDR: ${LUX_DISCOVERY_BIND_ADDR:-0.0.0.0:7359}
+      LUX_DISCOVERY_ADVERTISE_URL: ${LUX_DISCOVERY_ADVERTISE_URL-}
     ports:
       - "8097:8097"
+      - "7359:7359/udp"
     volumes:
       - ./config:/config:rw
       - ./media:/media:rw
