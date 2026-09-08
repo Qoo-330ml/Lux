@@ -959,7 +959,7 @@ impl Database {
                     "INSERT INTO reconciliation_scan_entries (
                          job_id, library_root_id, relative_path, entry_type
                      ) VALUES {values}
-                     ON CONFLICT(job_id, library_root_id, entry_type, relative_path) DO NOTHING"
+                     ON CONFLICT(job_id, entry_type, library_root_id, relative_path) DO NOTHING"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
                 for path in chunk {
