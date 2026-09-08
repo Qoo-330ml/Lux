@@ -178,7 +178,8 @@ fn key_digest(key: &str) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::{
-        CLEANUP_INTERVAL, LoginAttempt, LoginRateLimiter, MAX_ENTRIES, WINDOW, key_digest,
+        CLEANUP_INTERVAL, DevicePairingRateLimiter, LoginAttempt, LoginRateLimiter, MAX_ENTRIES,
+        WINDOW, key_digest,
     };
     use std::time::{Duration, Instant};
 
@@ -234,5 +235,14 @@ mod tests {
 
         assert!(limiter.is_allowed("fresh-user").await);
         assert!(limiter.state.lock().await.attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn device_pairing_rate_limiter_applies_per_key_limits() {
+        let limiter = DevicePairingRateLimiter::default();
+        assert!(limiter.try_acquire("client-a", 2).await);
+        assert!(limiter.try_acquire("client-a", 2).await);
+        assert!(!limiter.try_acquire("client-a", 2).await);
+        assert!(limiter.try_acquire("client-b", 2).await);
     }
 }

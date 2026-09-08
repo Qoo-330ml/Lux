@@ -673,8 +673,7 @@ pub(super) async fn auth_create_device_pairing(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let client_ip =
-        request_client_ip(&headers, &state.remote_access).unwrap_or_else(|| "local".to_owned());
+    let client_ip = pairing_rate_limit_client_ip(&headers, &state.remote_access);
     let rate_key = format!("create:{}:{client_ip}", session.user.id);
     if !state
         .device_pairing_rate_limiter
@@ -778,8 +777,7 @@ pub(super) async fn redeem_device_pairing(
     State(state): State<AppState>,
     Json(request): Json<DevicePairingRedeemRequest>,
 ) -> Response {
-    let client_ip =
-        request_client_ip(&headers, &state.remote_access).unwrap_or_else(|| "local".to_owned());
+    let client_ip = pairing_rate_limit_client_ip(&headers, &state.remote_access);
     if !state
         .device_pairing_rate_limiter
         .try_acquire(&format!("redeem:{client_ip}"), DEVICE_PAIRING_REDEEM_LIMIT)
@@ -920,6 +918,16 @@ fn bounded_non_empty(value: &str, max_bytes: usize) -> Option<&str> {
     (!value.is_empty() && value.len() <= max_bytes).then_some(value)
 }
 
+fn pairing_rate_limit_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> String {
+    policy
+        .client_ip(
+            header_str(headers, "x-lux-peer-ip"),
+            header_str(headers, "x-forwarded-for"),
+        )
+        .map(|address| address.to_string())
+        .unwrap_or_else(|| "local".to_owned())
+}
+
 fn rate_limited_response(headers: &HeaderMap) -> Response {
     let (status, body) = api_error(
         headers,
@@ -927,17 +935,18 @@ fn rate_limited_response(headers: &HeaderMap) -> Response {
         lux::ApiErrorCode::RateLimited,
         "请求过于频繁，请稍后重试",
     );
-    Response::builder()
-        .status(status)
-        .header("Content-Type", "application/json")
-        .header(
-            "Retry-After",
-            DEVICE_PAIRING_RETRY_AFTER_SECONDS.to_string(),
-        )
-        .body(Body::from(
-            serde_json::to_vec(&body.0).unwrap_or_else(|_| b"{\"error\":{}}".to_vec()),
-        ))
-        .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response())
+    (
+        status,
+        [
+            (
+                "Retry-After",
+                DEVICE_PAIRING_RETRY_AFTER_SECONDS.to_string(),
+            ),
+            ("Cache-Control", "no-store".to_owned()),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn device_pairing_error(headers: &HeaderMap, error: DevicePairingError) -> Response {

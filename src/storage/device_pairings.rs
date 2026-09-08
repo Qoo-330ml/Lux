@@ -116,7 +116,32 @@ impl Database {
                 source,
             })?;
         if consumed.rows_affected() != 1 {
-            return Ok(DevicePairingRedeemResult::Consumed);
+            let Some(current) = self
+                .query(
+                    "SELECT expires_at, consumed_at, cancelled_at
+                     FROM device_pairings
+                     WHERE id = ?",
+                )
+                .bind(pairing_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            else {
+                return Ok(DevicePairingRedeemResult::NotFound);
+            };
+            if current.get::<Option<i64>, _>("cancelled_at").is_some() {
+                return Ok(DevicePairingRedeemResult::Cancelled);
+            }
+            if current.get::<Option<i64>, _>("consumed_at").is_some() {
+                return Ok(DevicePairingRedeemResult::Consumed);
+            }
+            if now >= current.get::<i64, _>("expires_at") {
+                return Ok(DevicePairingRedeemResult::Expired);
+            }
+            return Ok(DevicePairingRedeemResult::InvalidSecret);
         }
 
         let user_id: String = row.get("user_id");
