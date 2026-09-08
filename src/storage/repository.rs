@@ -2642,6 +2642,16 @@ pub(crate) struct NewDevicePairing<'a> {
     pub(crate) expires_at: i64,
 }
 
+pub(crate) struct NewDeviceAccessToken<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) token_hash: &'a [u8],
+    pub(crate) device_id: &'a str,
+    pub(crate) client_name: &'a str,
+    pub(crate) device_name: &'a str,
+    pub(crate) client_version: &'a str,
+    pub(crate) device_type: Option<&'a str>,
+}
+
 pub(crate) struct NewLibrary<'a> {
     pub(crate) id: &'a str,
     pub(crate) name: &'a str,

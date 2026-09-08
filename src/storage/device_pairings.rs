@@ -60,7 +60,7 @@ impl Database {
         &self,
         pairing_id: &str,
         secret_hash: &[u8],
-        token: NewAccessToken<'_>,
+        token: NewDeviceAccessToken<'_>,
         now: i64,
     ) -> Result<DevicePairingRedeemResult, StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;

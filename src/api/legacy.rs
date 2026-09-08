@@ -100,6 +100,7 @@ use crate::{
     auth::users::{UserRecord, UserStore, UserStoreError, UserUpdate},
     auth::{
         admin_api_key::AdminApiKeyService,
+        device_pairings::DevicePairingService,
         emby::{EmbyAuthService, EmbyDeviceInfo},
         sessions::WebAuthService,
     },
@@ -113,7 +114,7 @@ use crate::{
         logs::{LogDateRange, LogExport, LogExportError, export_logs},
         resources::ResourceMetrics,
     },
-    security::LoginRateLimiter,
+    security::{DevicePairingRateLimiter, LoginRateLimiter},
     storage::{
         DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, PersonListOptions,
         PersonSort, StorageError, StoredPlaybackSession, WebPlaybackEventClaim,
@@ -160,6 +161,7 @@ pub struct AppState {
     setup: Option<SetupService>,
     auth: Option<WebAuthService>,
     emby_auth: Option<EmbyAuthService>,
+    device_pairings: Option<DevicePairingService>,
     admin_api_key: Option<AdminApiKeyService>,
     libraries: Option<LibraryService>,
     catalog: Option<CatalogService>,
@@ -200,6 +202,7 @@ pub struct AppState {
     resources: ResourceMetrics,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
+    device_pairing_rate_limiter: DevicePairingRateLimiter,
 }
 
 impl AppState {
@@ -363,6 +366,7 @@ impl AppState {
             setup: Some(setup),
             auth: Some(auth),
             emby_auth: Some(emby_auth),
+            device_pairings: Some(DevicePairingService::new(database.clone())),
             admin_api_key: Some(AdminApiKeyService::new(
                 config_dir.clone(),
                 database.clone(),
@@ -419,6 +423,7 @@ impl AppState {
             resources,
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
+            device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
         }
     }
 

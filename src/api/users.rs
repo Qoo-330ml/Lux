@@ -1,5 +1,14 @@
 use super::*;
 
+use crate::auth::device_pairings::{DevicePairingError, PrismDeviceInfo};
+use crate::{
+    auth::sessions::AuthenticatedSession,
+    security::{
+        DEVICE_PAIRING_CREATE_LIMIT, DEVICE_PAIRING_REDEEM_LIMIT,
+        DEVICE_PAIRING_RETRY_AFTER_SECONDS,
+    },
+};
+
 pub(super) async fn live() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
@@ -656,6 +665,317 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
     .into_response()
 }
 
+pub(super) async fn auth_create_device_pairing(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let client_ip =
+        request_client_ip(&headers, &state.remote_access).unwrap_or_else(|| "local".to_owned());
+    let rate_key = format!("create:{}:{client_ip}", session.user.id);
+    if !state
+        .device_pairing_rate_limiter
+        .try_acquire(&rate_key, DEVICE_PAIRING_CREATE_LIMIT)
+        .await
+    {
+        return rate_limited_response(&headers);
+    }
+    let Some(service) = state.device_pairings.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service.create(&session.user.id.to_string()).await {
+        Ok(pairing) => (
+            StatusCode::CREATED,
+            [("Cache-Control", "no-store")],
+            Json(json!({
+                "pairingId": pairing.pairing_id,
+                "secret": pairing.secret,
+                "expiresAt": pairing.expires_at,
+            })),
+        )
+            .into_response(),
+        Err(_) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "设备配对暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+pub(super) async fn auth_cancel_device_pairing(
+    headers: HeaderMap,
+    Path(pairing_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    if uuid::Uuid::parse_str(&pairing_id).is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "配对 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(service) = state.device_pairings.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match service
+        .cancel(&session.user.id.to_string(), &pairing_id)
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::DevicePairingNotFound,
+            "设备配对不存在",
+        )
+        .into_response(),
+        Err(_) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "设备配对暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct DevicePairingRedeemRequest {
+    secret: String,
+    device_id: String,
+    device_name: String,
+    platform: String,
+    version: String,
+}
+
+pub(super) async fn redeem_device_pairing(
+    headers: HeaderMap,
+    Path(pairing_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<DevicePairingRedeemRequest>,
+) -> Response {
+    let client_ip =
+        request_client_ip(&headers, &state.remote_access).unwrap_or_else(|| "local".to_owned());
+    if !state
+        .device_pairing_rate_limiter
+        .try_acquire(&format!("redeem:{client_ip}"), DEVICE_PAIRING_REDEEM_LIMIT)
+        .await
+    {
+        return rate_limited_response(&headers);
+    }
+    if uuid::Uuid::parse_str(&pairing_id).is_err()
+        || bounded_non_empty(&request.secret, 128).is_none()
+        || bounded_non_empty(&request.device_id, 128).is_none()
+        || bounded_non_empty(&request.device_name, 128).is_none()
+        || bounded_non_empty(&request.platform, 64).is_none()
+        || bounded_non_empty(&request.version, 64).is_none()
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "设备配对请求无效",
+        )
+        .into_response();
+    }
+    let Some(service) = state.device_pairings.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let device = PrismDeviceInfo {
+        device_id: request.device_id.trim(),
+        device_name: request.device_name.trim(),
+        platform: request.platform.trim(),
+        version: request.version.trim(),
+    };
+    match service
+        .redeem(&pairing_id, request.secret.trim(), &device)
+        .await
+    {
+        Ok(redemption) => (
+            StatusCode::OK,
+            [("Cache-Control", "no-store")],
+            Json(json!({
+                "accessToken": redemption.access_token,
+                "userId": redemption.user_id,
+                "serverId": state.server_id,
+            })),
+        )
+            .into_response(),
+        Err(error) => device_pairing_error(&headers, error),
+    }
+}
+
+async fn require_web_session_csrf(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<AuthenticatedSession, Response> {
+    let Some(auth) = state.auth.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response());
+    };
+    let Some(session_token) = request_cookie(headers, "lux_session") else {
+        return Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要登录",
+        )
+        .into_response());
+    };
+    let session = match auth.resolve(&session_token).await {
+        Ok(Some(session)) => session,
+        Ok(None) => {
+            return Err(api_error(
+                headers,
+                StatusCode::UNAUTHORIZED,
+                lux::ApiErrorCode::AuthenticationRequired,
+                "需要登录",
+            )
+            .into_response());
+        }
+        Err(_) => {
+            return Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证暂时不可用",
+            )
+            .into_response());
+        }
+    };
+    if state.remote_access.is_remote(
+        header_str(headers, "x-lux-peer-ip"),
+        header_str(headers, "x-forwarded-for"),
+    ) && !session.user.can_remote_access
+    {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "当前账户不允许远程访问",
+        )
+        .into_response());
+    }
+    let Some(csrf_token) = headers
+        .get("x-csrf-token")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::CsrfFailed,
+            "CSRF 校验失败",
+        )
+        .into_response());
+    };
+    if !auth.verify_csrf(&session, csrf_token) {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::CsrfFailed,
+            "CSRF 校验失败",
+        )
+        .into_response());
+    }
+    Ok(session)
+}
+
+fn bounded_non_empty(value: &str, max_bytes: usize) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= max_bytes).then_some(value)
+}
+
+fn rate_limited_response(headers: &HeaderMap) -> Response {
+    let (status, body) = api_error(
+        headers,
+        StatusCode::TOO_MANY_REQUESTS,
+        lux::ApiErrorCode::RateLimited,
+        "请求过于频繁，请稍后重试",
+    );
+    Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .header(
+            "Retry-After",
+            DEVICE_PAIRING_RETRY_AFTER_SECONDS.to_string(),
+        )
+        .body(Body::from(
+            serde_json::to_vec(&body.0).unwrap_or_else(|_| b"{\"error\":{}}".to_vec()),
+        ))
+        .unwrap_or_else(|_| StatusCode::TOO_MANY_REQUESTS.into_response())
+}
+
+fn device_pairing_error(headers: &HeaderMap, error: DevicePairingError) -> Response {
+    let (status, code, message) = match error {
+        DevicePairingError::NotFound => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::DevicePairingNotFound,
+            "设备配对不存在",
+        ),
+        DevicePairingError::InvalidSecret => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::DevicePairingInvalidSecret,
+            "设备配对密钥无效",
+        ),
+        DevicePairingError::Expired => (
+            StatusCode::GONE,
+            lux::ApiErrorCode::DevicePairingExpired,
+            "设备配对已过期",
+        ),
+        DevicePairingError::Cancelled => (
+            StatusCode::GONE,
+            lux::ApiErrorCode::DevicePairingCancelled,
+            "设备配对已取消",
+        ),
+        DevicePairingError::Consumed => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::DevicePairingConsumed,
+            "设备配对已使用",
+        ),
+        DevicePairingError::Storage(_) | DevicePairingError::TokenGeneration(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "设备配对暂时不可用",
+        ),
+    };
+    api_error(headers, status, code, message).into_response()
+}
+
 pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
@@ -1243,6 +1563,18 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/api/v1/auth/login", post(users::auth_login))
         .route("/api/v1/auth/logout", post(users::auth_logout))
         .route("/api/v1/auth/me", get(users::auth_me))
+        .route(
+            "/api/v1/auth/device-pairings",
+            post(users::auth_create_device_pairing),
+        )
+        .route(
+            "/api/v1/auth/device-pairings/{pairing_id}",
+            delete(users::auth_cancel_device_pairing),
+        )
+        .route(
+            "/api/v1/device-pairings/{pairing_id}/redeem",
+            post(users::redeem_device_pairing).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .route(
             "/api/v1/auth/settings",
             get(users::auth_settings).patch(users::auth_update_settings),
