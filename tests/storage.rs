@@ -201,7 +201,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 116);
+    assert_eq!(database.schema_version().await?, 117);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -221,7 +221,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 116);
+    assert_eq!(second_database.schema_version().await?, 117);
     second_database.close().await;
     Ok(())
 }
@@ -250,6 +250,31 @@ async fn filesystem_entry_path_keeps_only_the_unique_index()
     .fetch_one(database.pool())
     .await?;
     assert!(filesystem_schema.contains("UNIQUE (library_root_id, relative_path)"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn redundant_child_indexes_are_removed_after_migration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    let redundant_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'idx_item_images_item_id',
+             'idx_media_streams_source_id',
+             'idx_person_credits_item',
+             'idx_person_credits_person'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(redundant_indexes, 0);
     Ok(())
 }
 
@@ -293,7 +318,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 116);
+    assert_eq!(database.schema_version().await?, 117);
     Ok(())
 }
 
@@ -331,7 +356,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 116);
+    assert_eq!(database.schema_version().await?, 117);
     database.close().await;
     Ok(())
 }
@@ -458,7 +483,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 116);
+    assert_eq!(database.schema_version().await?, 117);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -640,7 +665,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 116);
+    assert_eq!(database.schema_version().await?, 117);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

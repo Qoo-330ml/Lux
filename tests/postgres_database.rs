@@ -111,7 +111,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 116);
+    assert_eq!(database.schema_version().await?, 117);
     let has_password_type: String = sqlx::query_scalar(
         "SELECT data_type
          FROM information_schema.columns
@@ -147,6 +147,20 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert!(scan_job_index_definition.contains("(library_id, job_type)"));
+    let redundant_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname IN (
+               'idx_item_images_item_id',
+               'idx_media_streams_source_id',
+               'idx_person_credits_item',
+               'idx_person_credits_person'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(redundant_indexes, 0);
 
     let setup = SetupService::new(database.clone())?;
     setup
