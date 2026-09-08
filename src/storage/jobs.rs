@@ -16,7 +16,10 @@ const SIDECAR_DIRECTORY_TARGET_QUERY: &str = "INSERT INTO scan_job_targets (
      ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET
          change_kind = 'SIDECAR', metadata_state = 'PENDING', error = NULL,
          updated_at = unixepoch()
-     WHERE scan_job_targets.change_kind <> 'REMOVED'";
+     WHERE scan_job_targets.change_kind <> 'REMOVED'
+       AND (scan_job_targets.change_kind <> 'SIDECAR'
+            OR scan_job_targets.metadata_state <> 'PENDING'
+            OR scan_job_targets.error IS NOT NULL)";
 
 fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {
     directories.sort();
@@ -945,7 +948,7 @@ impl Database {
         media_files: &[String],
     ) -> Result<(), StorageError> {
         for (entry_type, paths) in [("DIRECTORY", child_directories), ("FILE", media_files)] {
-            for chunk in paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            for chunk in paths.chunks(SCAN_DML_CHUNK_SIZE) {
                 if chunk.is_empty() {
                     continue;
                 }
@@ -1068,7 +1071,7 @@ impl Database {
                 .push(entry.relative_path.as_str());
         }
         for (library_root_id, paths) in entries_by_root {
-            for chunk in paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            for chunk in paths.chunks(SCAN_DML_CHUNK_SIZE) {
                 let placeholders = std::iter::repeat_n("?", chunk.len())
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -1190,7 +1193,7 @@ impl Database {
         if relative_paths.is_empty() {
             return Ok(());
         }
-        for paths in relative_paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        for paths in relative_paths.chunks(SCAN_DML_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", paths.len())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1303,7 +1306,10 @@ impl Database {
                  ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET
                      change_kind = 'SIDECAR', metadata_state = 'PENDING', error = NULL,
                      updated_at = unixepoch()
-                 WHERE scan_job_targets.change_kind <> 'REMOVED'",
+                 WHERE scan_job_targets.change_kind <> 'REMOVED'
+                   AND (scan_job_targets.change_kind <> 'SIDECAR'
+                        OR scan_job_targets.metadata_state <> 'PENDING'
+                        OR scan_job_targets.error IS NOT NULL)",
             )
             .bind(job_id)
             .bind(library_root_id)
@@ -1352,7 +1358,7 @@ impl Database {
         if relative_paths.is_empty() {
             return Ok(());
         }
-        for paths in relative_paths.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        for paths in relative_paths.chunks(SCAN_DML_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", paths.len())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1613,7 +1619,7 @@ impl Database {
         item_ids: &[String],
     ) -> Result<HashSet<String>, StorageError> {
         let mut pending = HashSet::new();
-        for chunk in item_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        for chunk in item_ids.chunks(SCAN_DML_CHUNK_SIZE) {
             if chunk.is_empty() {
                 continue;
             }
@@ -1670,14 +1676,15 @@ impl Database {
                 ));
             }
         };
-        for chunk in target_ids.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        for chunk in target_ids.chunks(SCAN_DML_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
                 "UPDATE scan_job_targets
                  SET {column} = ?, updated_at = unixepoch()
-                 WHERE job_id = ? AND target_type = ? AND target_id IN ({placeholders})"
+                 WHERE job_id = ? AND target_type = ? AND target_id IN ({placeholders})
+                   AND {column} <> ?"
             );
             let mut statement = self
                 .query(sqlx::AssertSqlSafe(query))
@@ -1687,6 +1694,7 @@ impl Database {
             for target_id in chunk {
                 statement = statement.bind(target_id);
             }
+            statement = statement.bind(state);
             statement
                 .execute(&self.pool)
                 .await
@@ -1779,7 +1787,10 @@ impl Database {
                  metadata_state = CASE WHEN metadata_state = 'FAILED' THEN 'PENDING' ELSE metadata_state END,
                  thumbnail_state = CASE WHEN thumbnail_state = 'FAILED' THEN 'PENDING' ELSE thumbnail_state END,
                  updated_at = unixepoch()
-             WHERE job_id = ?",
+             WHERE job_id = ?
+               AND (probe_state = 'FAILED'
+                    OR metadata_state = 'FAILED'
+                    OR thumbnail_state = 'FAILED')",
         )
         .bind(job_id)
         .execute(&self.pool)

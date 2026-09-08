@@ -357,6 +357,34 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
     .await
     .expect("local metadata target state");
     assert_eq!(state, "PENDING");
+
+    sqlx::query(
+        "UPDATE scan_job_targets
+         SET updated_at = 1
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await
+    .expect("set stable sidecar timestamp");
+    database
+        .record_scan_job_sidecar_targets(
+            &job.id,
+            &root_id,
+            &["Example Movie (2020)/poster.jpg".to_owned()],
+        )
+        .await
+        .expect("repeat unchanged sidecar target");
+    let updated_at: i64 = sqlx::query_scalar(
+        "SELECT updated_at
+         FROM scan_job_targets
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("unchanged sidecar target timestamp");
+    assert_eq!(updated_at, 1);
 }
 
 #[tokio::test]
@@ -3519,6 +3547,109 @@ async fn scan_job_status_counts_are_aggregated_in_storage() {
             failed: 1,
         }
     );
+}
+
+#[tokio::test]
+async fn reconciliation_entries_use_scan_safe_batches() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Scan batches", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("media root path"))
+        .await
+        .expect("library root")
+        .root;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await
+        .expect("scan job");
+    database
+        .clear_reconciliation_scan_entries(&job.id)
+        .await
+        .expect("clear root entry");
+
+    let paths = (0..1_025)
+        .map(|index| format!("Movie {index:04}.mkv"))
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    database
+        .append_reconciliation_directory_entries(&job.id, &root.id.to_string(), &[], &paths)
+        .await
+        .expect("append reconciliation entries");
+
+    assert_eq!(database.query_count(), 6);
+    let stored: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = ? AND entry_type = 'FILE'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("stored reconciliation entries");
+    assert_eq!(stored, 1_025);
+}
+
+#[tokio::test]
+async fn marking_an_unchanged_scan_stage_does_not_touch_the_row() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Scan stage", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('unchanged-stage-job', ?, 'INCREMENTAL_SCAN', 'COMPLETED', 'generation')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("scan job");
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind,
+             metadata_state, updated_at
+         ) VALUES ('unchanged-stage-job', 'ITEM', 'unchanged-target', 'item', 'NEW',
+                   'DONE', 1)",
+    )
+    .execute(database.pool())
+    .await
+    .expect("scan target");
+
+    database
+        .mark_scan_job_target_stage(
+            "unchanged-stage-job",
+            "ITEM",
+            &["unchanged-target".to_owned()],
+            "METADATA",
+            "DONE",
+        )
+        .await
+        .expect("mark unchanged stage");
+    let updated_at: i64 = sqlx::query_scalar(
+        "SELECT updated_at FROM scan_job_targets WHERE target_id = 'unchanged-target'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("unchanged target timestamp");
+    assert_eq!(updated_at, 1);
 }
 
 #[tokio::test]
