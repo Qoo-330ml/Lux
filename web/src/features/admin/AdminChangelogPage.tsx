@@ -16,7 +16,7 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.3.9",
-    date: "2026-09-07",
+    date: "2026-09-08",
     sections: [
       { kind: "added", items: [
         "新增按任务类型聚合的执行计划管理：同一任务类型可以配置多个 Cron 计划并绑定多个媒体库，管理员可在管理台创建、编辑和立即执行计划。",
