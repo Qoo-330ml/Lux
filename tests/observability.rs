@@ -51,6 +51,7 @@ mod unix {
         drop(probe_listener);
         let mut child = Command::new(env!("CARGO_BIN_EXE_luxd"))
             .env("LUX_HTTP_ADDR", address.to_string())
+            .env("LUX_DISCOVERY_BIND_ADDR", "127.0.0.1:0")
             .env("LUX_CONFIG_DIR", &config_dir)
             .env("RUST_LOG", "luxd=debug,tower_http=debug")
             .stdin(Stdio::null())
@@ -190,6 +191,7 @@ mod unix {
         drop(probe_listener);
         let mut child = Command::new(env!("CARGO_BIN_EXE_luxd"))
             .env("LUX_HTTP_ADDR", address.to_string())
+            .env("LUX_DISCOVERY_BIND_ADDR", "127.0.0.1:0")
             .env("LUX_CONFIG_DIR", &config_dir)
             .env("RUST_LOG", "luxd=debug,tower_http=debug")
             .stdin(Stdio::null())
