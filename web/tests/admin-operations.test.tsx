@@ -99,6 +99,54 @@ describe("AdminOperationsPage", () => {
     });
   });
 
+  it("does not show an empty default library plan as a duplicate executable task", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
+      plans: [
+        {
+          id: "plan-default",
+          taskType: "RECONCILIATION_SCAN",
+          name: "全量校验媒体库",
+          schedule: "0 3 * * 0",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: true,
+          libraries: [],
+          libraryCount: 0,
+        },
+        {
+          id: "plan-weekly",
+          taskType: "RECONCILIATION_SCAN",
+          name: "周日校验",
+          schedule: "0 3 * * 0",
+          isEnabled: true,
+          sourceType: "SYSTEM",
+          scopeType: "LIBRARY",
+          isDefault: false,
+          libraries: [{ id: "library-1", name: "电影库" }],
+          libraryCount: 1,
+        },
+      ],
+      total: 2,
+      page: 1,
+      pageSize: 50,
+    });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("周日校验"));
+    });
+
+    expect(container.querySelectorAll(".lux-registered-plan-row")).toHaveLength(1);
+    expect(container.textContent).not.toContain("0 个媒体库");
+    expect(container.textContent).toContain("1 个执行计划");
+    expect(container.querySelector(".lux-operations-summary .lux-operations-stat strong")?.textContent).toBe("1");
+  });
+
   it("edits a plan cron with a tag-style dropdown that hides selected libraries", async () => {
     vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
     vi.spyOn(api, "adminScheduledTaskPlans").mockResolvedValue({
