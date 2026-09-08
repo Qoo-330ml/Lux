@@ -5798,6 +5798,38 @@ cue 和 Worker。
 
 依赖：LUX-105、LUX-154、LUX-189。
 
+#### LUX-246：跨数据库扫描写入与索引维护优化
+
+针对扫描期间 PostgreSQL 的写入、WAL 和索引维护压力，在不改变 Lux 现有扫描并发配置的前提下，优化扫描中间数据的批量写入、删除和重复状态写入，
+并清理已经确认不被查询或唯一约束需要的冗余索引。所有改动必须同时适用于 SQLite 和 PostgreSQL，继续使用统一的 storage 抽象，
+不得引入 PostgreSQL 专属 SQL 或把整个媒体库放入单个长事务。
+
+本任务明确不调整 `LUX_SCAN_CONCURRENCY`、媒体库 `scanConcurrency`、数据库连接池上限或其他并发档位；并发控制仍由现有配置和资源调度逻辑负责。
+
+验收：
+
+- [ ] SQLite/PostgreSQL 迁移均删除经过查询与约束核对的冗余索引；空库初始化和已有数据库升级均可完成，不能误删唯一约束或仍被查询使用的索引。
+- [ ] `scan_job_targets`、`reconciliation_scan_entries` 等扫描中间数据的批量 DML 使用有界且跨数据库安全的批次，SQLite 不超过参数限制，PostgreSQL 不产生不必要的大事务；扫描语义、取消、重试和幂等行为保持不变。
+- [ ] 扫描状态和中间数据在值未变化时不重复执行可避免的写入、删除或索引维护；失败恢复仍能保留需要重试的数据。
+- [ ] 增加覆盖迁移、批量边界、SQLite 参数安全和 PostgreSQL 兼容性的测试，并以代表性扫描数据记录优化前后的写入/WAL 或查询执行证据；不以单机 ARM64 结果外推 NAS/x86_64 性能。
+- [ ] 不修改扫描并发环境变量语义，不改变 Lux API、数据库公共模型或 SQLite/PostgreSQL 的数据一致性语义。
+
+验证：
+
+- `cargo test --locked --test storage --test scanner --test scanning_jobs`
+- `cargo test --locked --test postgres_database`（需要可用 PostgreSQL 测试环境）
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `uname -m`，并记录本机 ARM64 结果不外推 NAS/x86_64 性能。
+
+依赖：LUX-232、LUX-244。
+
+明确不做：
+
+- 不降低或重写 `LUX_SCAN_CONCURRENCY`、媒体库 `scanConcurrency` 或数据库连接并发配置。
+- 不执行 `VACUUM FULL`、在线重建全库索引或其他长时间独占数据库的操作。
+- 不连接或直接修改用户线上 FNOS 数据库；优化通过 Lux 迁移和 storage 实现交付。
+
 ## 26. 风险与缓解
 
 | 风险 | 影响 | 缓解 |
