@@ -18,14 +18,10 @@ test("admin console uses the account settings page rhythm", () => {
   assert.match(headingRule, /margin-bottom:\s*28px/);
 });
 
-test("dashboard panels use separators instead of card chrome", () => {
-  const panelRule = stylesheet.match(/\.lux-admin-panel\s*\{([^}]*)\}/)?.[1] ?? "";
-  const panelGridRule = stylesheet.match(/\.lux-admin-dashboard-grid\s*\{([^}]*)\}/)?.[1] ?? "";
-
-  assert.match(panelRule, /border:\s*0/);
-  assert.match(panelRule, /border-radius:\s*0/);
-  assert.match(panelRule, /background:\s*transparent/);
-  assert.match(panelGridRule, /border-bottom:\s*1px\s+solid\s+var\(--lux-line-soft\)/);
+test("dashboard omits redundant status and quick-link panel styles", () => {
+  assert.doesNotMatch(stylesheet, /\.lux-admin-dashboard-grid\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.lux-admin-check-list\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.lux-admin-quick-links\s*\{/);
 });
 
 test("dashboard overview uses modern bento box grid rhythm", () => {

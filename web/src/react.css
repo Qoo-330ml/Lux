@@ -780,7 +780,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-admin-page-heading:not(:has(> .lux-button, > .lux-admin-plugin-heading-actions)) { height: 0; margin-bottom: 0; }
 .lux-admin-page-heading h1 { margin: 10px 0 8px; color: #fff; font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.075em; }
 .lux-admin-page-heading p { margin: 0; color: var(--lux-muted); }
-.lux-admin-dashboard-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(310px, .95fr); gap: 0; margin-top: 28px; border-bottom: 1px solid var(--lux-line-soft); }
 .lux-admin-panel { min-width: 0; padding: var(--lux-panel-padding); border: 0; border-radius: 0; background: transparent; }
 .lux-admin-panel + .lux-admin-panel { border-left: 1px solid var(--lux-line-soft); }
 .lux-admin-panel-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 23px; }
@@ -789,20 +788,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-status-pill { padding: 6px 10px; border-radius: 999px; font-size: .7rem; }
 .lux-status-pill.is-ok { color: #a5e4bd; background: rgba(96, 194, 132, .13); }
 .lux-status-pill.is-warn { color: #f3c788; background: rgba(226, 163, 75, .13); }
-.lux-admin-check-list { display: grid; gap: 3px; }
-.lux-admin-check { display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 10px; padding: 11px 0; border-bottom: 1px solid var(--lux-line-soft); color: rgba(255,255,255,.82); font-size: .84rem; }
-.lux-admin-check small { color: var(--lux-subtle); font-size: .75rem; }
-.lux-check-icon { display: grid; place-items: center; }
-.lux-check-icon.is-ok { color: #9bdcb3; }
-.lux-check-icon.is-warn { color: #f3c788; }
-.lux-admin-meta-row { display: flex; flex-wrap: wrap; gap: 15px; margin-top: 17px; color: var(--lux-subtle); font-size: .72rem; }
-.lux-admin-quick-links { display: grid; gap: 7px; }
-.lux-admin-quick-links a { display: flex; align-items: center; gap: 11px; padding: 12px; border: 1px solid transparent; border-radius: 10px; color: var(--lux-muted); transition: background .2s ease, border-color .2s ease, color .2s ease; }
-.lux-admin-quick-links a:hover { border-color: var(--lux-line-soft); color: #fff; background: rgba(255,255,255,.06); }
-.lux-admin-quick-links a > svg, .lux-quick-icon { flex: 0 0 auto; color: var(--lux-subtle); }
-.lux-admin-quick-links strong, .lux-admin-quick-links small { display: block; }
-.lux-admin-quick-links strong { color: inherit; font-size: .84rem; font-weight: 600; }
-.lux-admin-quick-links small { margin-top: 4px; color: var(--lux-subtle); font-size: .7rem; }
 .lux-admin-page-state { display: grid; place-items: center; align-content: center; min-height: 65vh; color: var(--lux-muted); text-align: center; }
 .lux-admin-page-state h1 { margin: 12px 0 8px; color: #fff; }
 .lux-admin-page-state p { max-width: 48ch; line-height: 1.6; }
@@ -1803,7 +1788,6 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-registered-task-row { position: relative; grid-template-columns: 38px minmax(0, 1fr); }
   .lux-registered-task-row:not(.is-editing) .lux-registered-task-heading { padding-right: 148px; }
   .lux-registered-task-actions { position: absolute; top: 17px; right: 15px; }
-  .lux-admin-dashboard-grid { grid-template-columns: 1fr; }
   .lux-admin-server-identity { grid-template-columns: auto minmax(0, 1fr); }
   .lux-admin-server-form { grid-column: 1 / -1; }
 }
@@ -2528,13 +2512,6 @@ html[data-lux-theme="light"] .lux-bento-media-subcard { background: rgba(28, 28,
 html[data-lux-theme="light"] .lux-bento-progress-track { background: rgba(28, 28, 34, .1); }
 html[data-lux-theme="light"] .lux-status-pill.is-ok { color: #247b4b; background: rgba(36,123,75,.12); }
 html[data-lux-theme="light"] .lux-status-pill.is-warn { color: #9a5f13; background: rgba(154,95,19,.12); }
-html[data-lux-theme="light"] .lux-admin-check { border-color: var(--lux-line-soft); color: var(--lux-text); }
-html[data-lux-theme="light"] .lux-admin-check small { color: var(--lux-subtle); }
-html[data-lux-theme="light"] .lux-check-icon.is-ok { color: #247b4b; }
-html[data-lux-theme="light"] .lux-check-icon.is-warn { color: #9a5f13; }
-html[data-lux-theme="light"] .lux-admin-quick-links a:hover { border-color: var(--lux-line-soft); color: var(--lux-text); background: rgba(28,28,34,.06); }
-html[data-lux-theme="light"] .lux-admin-quick-links a > svg, html[data-lux-theme="light"] .lux-quick-icon { color: var(--lux-subtle); }
-html[data-lux-theme="light"] .lux-admin-quick-links small { color: var(--lux-subtle); }
 html[data-lux-theme="light"] .lux-admin-page-state h1 { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-emby-connection-result strong,
 html[data-lux-theme="light"] .lux-emby-job-summary strong,

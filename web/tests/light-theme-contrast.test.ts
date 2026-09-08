@@ -34,7 +34,6 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-admin-page-heading h1")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-admin-panel")).toContain("background:");
     expect(lightThemeRule(".lux-admin-panel-heading h2")).toContain("color: var(--lux-text)");
-    expect(lightThemeRule(".lux-admin-check")).toContain("color: var(--lux-text)");
   });
 
   it("keeps auxiliary admin states readable in light mode", () => {
