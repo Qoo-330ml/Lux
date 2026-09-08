@@ -5967,16 +5967,26 @@ session + CSRF，且不能取消其他用户的票据。
 
 验收：
 
-- [ ] 从空 SQLite 和已有 SQLite 数据库升级到 0119；PostgreSQL 迁移保持相同表、字段和约束。
-- [ ] 未登录、缺少/错误 CSRF 或仅使用共享 API Key 不能创建/取消票据。
-- [ ] 创建返回 5 分钟有效的票据和一次性 secret，数据库只保存 secret 哈希。
-- [ ] 错误 secret、过期、取消、已消费和不存在票据分别返回上面定义的错误码；设备字段越界被拒绝。
-- [ ] 两个并发兑换请求至多一个成功，成功者获得可调用 Emby API 的 AccessToken，另一个得到已消费错误。
-- [ ] 兑换事务失败时票据和 AccessToken 一起回滚；取消权限按创建用户隔离。
-- [ ] 创建和兑换限流可验证，限流响应不包含 secret、token 或完整 URI。
-- [ ] 运行 `cargo test --locked --test device_pairings`、`cargo test --locked --lib security`、
+- [x] 从空 SQLite 和已有 SQLite 数据库升级到 0119；PostgreSQL 迁移保持相同表、字段和约束。
+- [x] 未登录、缺少/错误 CSRF 或仅使用共享 API Key 不能创建/取消票据。
+- [x] 创建返回 5 分钟有效的票据和一次性 secret，数据库只保存 secret 哈希。
+- [x] 错误 secret、过期、取消、已消费和不存在票据分别返回上面定义的错误码；设备字段越界被拒绝。
+- [x] 两个并发兑换请求至多一个成功，成功者获得可调用 Emby API 的 AccessToken，另一个得到已消费错误。
+- [x] 兑换事务失败时票据和 AccessToken 一起回滚；取消权限按创建用户隔离。
+- [x] 创建和兑换限流可验证，限流响应不包含 secret、token 或完整 URI。
+- [x] 运行 `cargo test --locked --test device_pairings`、`cargo test --locked --lib security`、
   `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`，
   并在可用 PostgreSQL 环境运行对应迁移/并发测试。
+
+验证记录（2026-09-09，`uname -m=arm64`）：`cargo test --locked --test device_pairings`
+（8 passed）、`cargo test --locked --lib security`（3 passed）、`cargo build --locked`、
+`cargo test --locked --all-targets`（所有目标通过；库测试 437 passed、4 ignored）、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`
+和 `git diff --check` 均通过。测试期间发现观测子进程并行启动会争用 LUX-247 的默认 UDP
+`7359`，已让观测测试使用 `127.0.0.1:0` 的临时发现端口；生产默认监听地址未改变。
+PostgreSQL 集成测试目标已编译，但本机没有可用 PostgreSQL 实例，4 个测试保持 ignored，
+因此真实 PostgreSQL 迁移/并发证据仍待可用环境复测。本机 ARM64 结果不外推 Windows、NAS
+或 x86_64 性能。
 
 依赖：LUX-247。
 
