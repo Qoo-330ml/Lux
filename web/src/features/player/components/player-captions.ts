@@ -66,7 +66,7 @@ export function playerCaptionOptions(
           : "native-inband"
         : remoteRuntimeCandidate
           ? "runtime-overlay"
-        : stream.isExternal && format === "vtt" && nativeTracksSupported
+          : stream.isExternal && format === "vtt" && nativeTracksSupported && !isRemoteHttpSource(source)
           ? "native"
           : "overlay";
       const unavailableReason = remoteRuntimeCandidate || runtimeTrack
@@ -167,6 +167,7 @@ function captionUnavailableReason(
     if (source?.sourceKind === "STRM_URL") return "浏览器未暴露远程内嵌字幕";
     return "浏览器未暴露内嵌字幕";
   }
+  if (isRemoteHttpSource(source)) return "远程外挂字幕没有可直连地址";
   return undefined;
 }
 
@@ -206,6 +207,10 @@ function isHttpUrl(value: string | null | undefined) {
   } catch {
     return false;
   }
+}
+
+function isRemoteHttpSource(source: MediaSource | undefined) {
+  return source?.sourceKind === "STRM_URL" && isHttpUrl(source.externalUrl);
 }
 
 function isMatroskaContainer(value: string | null | undefined) {

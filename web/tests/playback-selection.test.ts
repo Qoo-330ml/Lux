@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { canUseClientMkvCaptionPipeline, canUseRemoteMkvCaptionSidecar, hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, remoteMatroskaRangeUrl, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { canUseClientMkvCaptionPipeline, canUseRemoteMkvCaptionSidecar, hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 
 describe("playback selection", () => {
   const source = {
@@ -51,27 +51,18 @@ describe("playback selection", () => {
     expect(hasClientMkvCandidate(webm)).toBe(true);
   });
 
-  it("uses the signed same-origin Range Relay for remote Matroska native playback", () => {
-    const rangeUrl = "/api/v1/playback/sessions/session-1/range?expires=1900000000&signature=test";
-    expect(remoteMatroskaRangeUrl({
+  it("recognizes only HTTP(S) URL STRM sources as browser-direct media", () => {
+    expect(isRemoteHttpStrmSource({
       ...source,
       sourceKind: "STRM_URL",
       externalUrl: "https://media.example.test/video.mkv",
-      container: "matroska,webm",
-    }, rangeUrl)).toBe(rangeUrl);
-    expect(remoteMatroskaRangeUrl({
+    })).toBe(true);
+    expect(isRemoteHttpStrmSource({
       ...source,
       sourceKind: "STRM_URL",
-      externalUrl: "https://media.example.test/video.mp4",
-      container: "mp4",
-    }, rangeUrl)).toBeNull();
-    expect(remoteMatroskaRangeUrl({ ...source, container: "matroska" }, rangeUrl)).toBeNull();
-    expect(remoteMatroskaRangeUrl({
-      ...source,
-      sourceKind: "STRM_URL",
-      externalUrl: "https://media.example.test/video.mkv",
-      container: "matroska",
-    }, null)).toBeNull();
+      externalUrl: "/CloudNAS/video.mkv",
+    })).toBe(false);
+    expect(isRemoteHttpStrmSource({ ...source, sourceKind: "LOCAL_FILE" })).toBe(false);
   });
 
   it("accepts an MKV when a supported AAC track follows DTS and E-AC-3 tracks", () => {
@@ -148,6 +139,18 @@ describe("playback selection", () => {
 
     expect(hasClientMkvHevcRuntime()).toBe(true);
     expect(await shouldUseClientMkv(mkv, video)).toBe(true);
+  });
+
+  it("keeps native Matroska playback as the first path when the browser accepts it", async () => {
+    const mkv = { ...source, container: "mkv", streams: [
+      { index: 0, type: "VIDEO", codec: "H264" },
+      { index: 1, type: "AUDIO", codec: "AAC" },
+    ] };
+    vi.stubGlobal("MediaSource", { isTypeSupported: () => true });
+    const video = document.createElement("video");
+    vi.spyOn(video, "canPlayType").mockReturnValue("probably");
+
+    expect(await shouldUseClientMkv(mkv, video)).toBe(false);
   });
 
   it("keeps the client MKV pipeline for captions when native MKV playback is available", async () => {

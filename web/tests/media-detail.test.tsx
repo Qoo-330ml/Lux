@@ -976,7 +976,7 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/api/v1/playback/sessions/web-source-hdr/direct?expires=1900000000&signature=test");
   });
 
-  it("passes a strm source through the Lux direct endpoint", async () => {
+  it("passes a remote strm source directly to the browser", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",
       title: "示例电影",
@@ -1010,7 +1010,7 @@ describe("MediaDetailPage series hierarchy", () => {
     });
 
     expect(container.querySelector<HTMLVideoElement>("video")?.getAttribute("src"))
-      .toBe("/api/v1/playback/sessions/web-source-strm/direct?expires=1900000000&signature=test");
+      .toBe("https://example.invalid/video.mkv");
   });
 
   it("shows classified Lux guidance when the browser cannot play the source", async () => {

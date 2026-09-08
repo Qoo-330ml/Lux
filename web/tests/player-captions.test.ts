@@ -100,6 +100,22 @@ describe("LuxPlayer caption selection", () => {
     expect(overlayCaptionSource("item", "remote-strm", options[0])).toBeNull();
   });
 
+  it("does not create a Lux subtitle URL for remote external subtitle metadata", () => {
+    const options = playerCaptionOptions({
+      id: "remote-strm",
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mp4",
+      streams: [{ index: 2, type: "SUBTITLE", codec: "vtt", title: "远程外挂", isExternal: true }],
+    }, true);
+
+    expect(options[0]).toEqual(expect.objectContaining({
+      available: false,
+      unavailableReason: "远程外挂字幕没有可直连地址",
+    }));
+    expect(nativeCaptionTrack("item", "remote-strm", options[0])).toBeNull();
+    expect(overlayCaptionSource("item", "remote-strm", options[0])).toBeNull();
+  });
+
   it("offers remote Matroska text captions through the opt-in client pipeline", () => {
     const options = playerCaptionOptions({
       id: "remote-mkv",

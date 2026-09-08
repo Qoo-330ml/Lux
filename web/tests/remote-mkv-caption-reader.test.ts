@@ -90,7 +90,7 @@ describe("remote Matroska caption sidecar", () => {
     vi.stubGlobal("fetch", fetchMock);
     const cues: Array<{ trackId: string; text: string }> = [];
     const reader = new RemoteMkvCaptionReader({
-      source: "/api/v1/playback/sessions/test/range",
+      source: "https://media.example.test/video.mkv",
       selection: { id: "2", name: "中文", language: "zh-cn", format: "srt", ordinal: 0 },
       currentTime: () => 0,
       onCue: (cue) => cues.push({ trackId: cue.trackId, text: cue.text }),
@@ -101,6 +101,11 @@ describe("remote Matroska caption sidecar", () => {
 
     expect(cues).toEqual([{ trackId: "2", text: "你好" }]);
     expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls.map((call) => String(call[0]))).toEqual([
+      "https://media.example.test/video.mkv",
+      "https://media.example.test/video.mkv",
+      "https://media.example.test/video.mkv",
+    ]);
     expect(fetchMock.mock.calls.map((call) => new Headers(call[1]?.headers).get("Range"))).toEqual([
       "bytes=0-1048575",
       `bytes=${fixture.cuesOffset}-${fixture.source.byteLength - 1}`,

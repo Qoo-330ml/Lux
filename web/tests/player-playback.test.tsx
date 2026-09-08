@@ -355,7 +355,7 @@ describe("PlayerPage playback synchronization", () => {
       .toBe("/api/v1/playback/sessions/web-source-proxy/direct?expires=1900000000&signature=test");
   });
 
-  it("uses the Lux direct endpoint for a remote HTTP(S) STRM URL", async () => {
+  it("uses the original remote HTTP(S) STRM URL without a Lux media fallback", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-remote-strm",
       title: "远程直连测试",
@@ -398,8 +398,13 @@ describe("PlayerPage playback synchronization", () => {
 
     const video = container.querySelector<HTMLVideoElement>("video");
     expect(video?.getAttribute("src"))
-      .toBe("/api/v1/playback/sessions/web-source-remote-strm/direct?expires=1900000000&signature=test");
+      .toBe("https://media.example.test/302?pickcode=fixture");
     expect(video?.getAttribute("crossorigin")).toBeNull();
+
+    await act(async () => video?.dispatchEvent(new Event("error")));
+    expect(video?.getAttribute("src"))
+      .toBe("https://media.example.test/302?pickcode=fixture");
+    expect(api.createWebPlaybackSession).toHaveBeenCalledTimes(1);
   });
 
   it("stops the old session before creating a selected replacement source", async () => {
