@@ -161,6 +161,9 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector(".lux-admin-overview-device")).toBeNull();
     expect(overview?.querySelectorAll(".lux-admin-overview-info-icon")).toHaveLength(0);
     expect(overview?.textContent).toContain("存储空间");
+    expect(container.querySelector(".lux-admin-dashboard-grid")).toBeNull();
+    expect(container.textContent).not.toContain("运行状态");
+    expect(container.textContent).not.toContain("管理入口");
     expect(container.querySelector('[role="dialog"]')).toBeNull();
     expect(container.querySelector(".lux-admin-stat-grid")).toBeNull();
     expect(container.querySelectorAll(".lux-admin-stat")).toHaveLength(0);
@@ -288,7 +291,7 @@ describe("AdminDashboardPage", () => {
     expect(container.textContent).not.toContain("未设置容器上限");
   });
 
-  it("labels PostgreSQL without displaying SQLite journal details", async () => {
+  it("does not expose database implementation details on the dashboard", async () => {
     const postgresDashboard: AdminDashboard = {
       ...dashboard,
       health: {
@@ -313,9 +316,9 @@ describe("AdminDashboardPage", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-card")).not.toBeNull());
     });
-    const metadata = container.querySelector(".lux-admin-meta-row")?.textContent ?? "";
-    expect(metadata).toContain("POSTGRESQL");
-    expect(metadata).not.toContain("SQLite");
+    expect(container.querySelector(".lux-admin-meta-row")).toBeNull();
+    expect(container.textContent).not.toContain("POSTGRESQL");
+    expect(container.textContent).not.toContain("SQLite");
   });
 
   it("shows a movie kind once instead of repeating it across card metadata", async () => {

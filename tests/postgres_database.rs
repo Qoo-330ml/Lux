@@ -111,7 +111,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 117);
+    assert_eq!(database.schema_version().await?, 118);
     let has_password_type: String = sqlx::query_scalar(
         "SELECT data_type
          FROM information_schema.columns
@@ -161,6 +161,59 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(redundant_indexes, 0);
+
+    let reconciliation_index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_reconciliation_scan_entries_pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(reconciliation_index_count, 0);
+
+    let reconciliation_primary_key: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid)
+         FROM pg_constraint
+         WHERE conrelid = 'reconciliation_scan_entries'::regclass
+           AND contype = 'p'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        reconciliation_primary_key.contains("(job_id, entry_type, library_root_id, relative_path)")
+    );
+
+    let scan_target_index_predicates: Vec<String> = sqlx::query_scalar(
+        "SELECT indexdef
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname IN (
+               'idx_scan_job_targets_probe',
+               'idx_scan_job_targets_metadata',
+               'idx_scan_job_targets_thumbnail'
+           )
+         ORDER BY indexname",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(scan_target_index_predicates.len(), 3);
+    for indexdef in scan_target_index_predicates {
+        assert!(
+            indexdef.contains("IN ('PENDING', 'FAILED')"),
+            "unexpected index: {indexdef}"
+        );
+    }
+
+    let external_stream_index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_media_streams_external_path'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(external_stream_index_count, 0);
 
     let setup = SetupService::new(database.clone())?;
     setup

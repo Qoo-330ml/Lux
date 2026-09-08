@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, CheckCircle2, Clock3, Cpu, Database, HardDrive, ListChecks, MemoryStick, Pencil, Server, Settings2, Users, X } from "lucide-react";
+import { Clock3, Cpu, Database, MemoryStick, Pencil, Server, Users, X } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { AdminDashboardActivity } from "./AdminDashboardActivity";
@@ -72,12 +72,6 @@ export function AdminDashboardPage() {
   const recentPlaybackActivity = activity
     .filter((event) => event.eventType !== "AUTH_LOGIN")
     .slice(0, 10);
-  const checks = [
-    { label: "数据库", ok: health.database.writable, detail: health.database.writable ? "可读写" : "不可写" },
-    { label: "配置目录", ok: health.config.available && health.config.writable, detail: health.config.writable ? "可读写" : "不可写或不可用" },
-    { label: "ffprobe", ok: health.ffprobe.available, detail: health.ffprobe.available ? "已就绪" : "未找到" },
-  ];
-
   return (
     <div className="lux-admin-page lux-admin-dashboard-page">
       <header className="lux-admin-page-heading">
@@ -249,26 +243,9 @@ export function AdminDashboardPage() {
         <AdminDashboardActivity events={recentPlaybackActivity} />
       </section>
 
-      <div className="lux-admin-dashboard-grid">
-        <section className="lux-admin-panel">
-          <div className="lux-admin-panel-heading"><div><h2>运行状态</h2></div><span className={status ? "lux-status-pill is-ok" : "lux-status-pill is-warn"}>{status ? "正常" : "降级"}</span></div>
-          <div className="lux-admin-check-list">{checks.map((check) => <div className="lux-admin-check" key={check.label}><span className={check.ok ? "lux-check-icon is-ok" : "lux-check-icon is-warn"}>{check.ok ? <CheckCircle2 size={17} /> : <AlertTriangle size={17} />}</span><span>{check.label}</span><small>{check.detail}</small></div>)}</div>
-          <div className="lux-admin-meta-row"><span>Schema {health.schemaVersion}</span><span>{health.database.backend === "SQLITE" ? `SQLite ${health.database.journalMode.toUpperCase()}` : health.database.backend}</span></div>
-        </section>
-        <section className="lux-admin-panel">
-          <div className="lux-admin-panel-heading"><div><h2>管理入口</h2></div><HardDrive size={20} className="lux-admin-panel-icon" /></div>
-          <div className="lux-admin-quick-links">
-            <Link to="/admin/libraries"><Database size={17} /><span><strong>媒体库管理</strong><small>路径、扫描与计划</small></span></Link>
-            <Link to="/admin/users"><ListChecks size={17} /><span><strong>用户与权限</strong><small>访问权限和设备策略</small></span></Link>
-            <Link to="/admin/settings"><SettingsIcon /><span><strong>服务器设置</strong><small>播放和系统行为</small></span></Link>
-          </div>
-        </section>
-      </div>
     </div>
   );
 }
-
-function SettingsIcon() { return <span className="lux-quick-icon"><Settings2 size={17} /></span>; }
 
 function OverviewInfo({ label, value, className = "", icon }: { label: string; value?: string; className?: string; icon?: ReactNode }) {
   return <div className={`lux-admin-overview-info ${className}`.trim()} data-overview-value={label}><span>{icon}<small>{label}：</small><strong aria-label={value ? undefined : `${label}数据未提供`}>{value ?? ""}</strong></span></div>;

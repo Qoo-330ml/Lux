@@ -201,7 +201,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 117);
+    assert_eq!(database.schema_version().await?, 118);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -221,7 +221,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 117);
+    assert_eq!(second_database.schema_version().await?, 118);
     second_database.close().await;
     Ok(())
 }
@@ -279,6 +279,193 @@ async fn redundant_child_indexes_are_removed_after_migration()
 }
 
 #[tokio::test]
+async fn scan_indexes_keep_only_required_rows_and_lookup_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    let reconciliation_schema: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master
+         WHERE type = 'table' AND name = 'reconciliation_scan_entries'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        reconciliation_schema
+            .contains("PRIMARY KEY (job_id, entry_type, library_root_id, relative_path)")
+    );
+
+    let wide_reconciliation_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_reconciliation_scan_entries_pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(wide_reconciliation_index, 0);
+
+    let scan_target_indexes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT name, sql FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'idx_scan_job_targets_probe',
+             'idx_scan_job_targets_metadata',
+             'idx_scan_job_targets_thumbnail'
+         )
+         ORDER BY name",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(scan_target_indexes.len(), 3);
+    for (_, sql) in scan_target_indexes {
+        assert!(
+            sql.replace(' ', "").contains("IN('PENDING','FAILED')"),
+            "unexpected index: {sql}"
+        );
+    }
+
+    let external_stream_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_media_streams_external_path'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(external_stream_index, 0);
+    assert_eq!(database.schema_version().await?, 118);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_index_compaction_preserves_existing_rows_during_upgrade()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?;
+        if version.is_some_and(|version| version <= 117) {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing filename")?),
+            )?;
+        }
+    }
+
+    let database_path = temp_dir.path().join("upgrade.db");
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('migration-library', 'Migration', 'MOVIE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('migration-root', 'migration-library', '/media', '/media', 1, 1)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('migration-job', 'migration-library', 'RECONCILE_LIBRARY', 'RUNNING', 'generation-1')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+             job_id, library_root_id, relative_path, entry_type, created_at
+         ) VALUES
+             ('migration-job', 'migration-root', '', 'DIRECTORY', 101),
+             ('migration-job', 'migration-root', 'movie.mkv', 'FILE', 102)",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind,
+             probe_state, metadata_state, thumbnail_state
+         ) VALUES
+             ('migration-job', 'ITEM', 'target-pending', 'item-pending', 'NEW',
+              'SKIPPED', 'PENDING', 'PENDING'),
+             ('migration-job', 'ITEM', 'target-done', 'item-done', 'CHANGED',
+              'SKIPPED', 'DONE', 'DONE')",
+    )
+    .execute(&pool)
+    .await?;
+
+    fs::copy(
+        source_dir.join("0118_scan_index_compaction.sql"),
+        migration_dir.join("0118_scan_index_compaction.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&pool)
+        .await?;
+
+    let entries: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT job_id, library_root_id, relative_path, created_at
+         FROM reconciliation_scan_entries
+         ORDER BY entry_type, relative_path",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        entries,
+        vec![
+            (
+                "migration-job".to_owned(),
+                "migration-root".to_owned(),
+                "".to_owned(),
+                101,
+            ),
+            (
+                "migration-job".to_owned(),
+                "migration-root".to_owned(),
+                "movie.mkv".to_owned(),
+                102,
+            ),
+        ]
+    );
+
+    let target_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(target_count, 2);
+    let foreign_key_violations: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_check")
+            .fetch_one(&pool)
+            .await?;
+    assert_eq!(foreign_key_violations, 0);
+    let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(foreign_keys, 1);
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn recommendation_query_indexes_are_created_from_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -318,7 +505,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 117);
+    assert_eq!(database.schema_version().await?, 118);
     Ok(())
 }
 
@@ -356,7 +543,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 117);
+    assert_eq!(database.schema_version().await?, 118);
     database.close().await;
     Ok(())
 }
@@ -483,7 +670,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 117);
+    assert_eq!(database.schema_version().await?, 118);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -665,7 +852,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 117);
+    assert_eq!(database.schema_version().await?, 118);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

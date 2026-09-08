@@ -1109,6 +1109,128 @@ async fn admin_task_activity_includes_scan_postprocessing() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn admin_task_activity_includes_current_media_title_for_chapter_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, database) = start_server(config).await?;
+    let client = reqwest::Client::new();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let (cookies, _csrf) = login(&client, &base_url, "admin", "correct password").await?;
+
+    let library = LibraryService::new(database.clone())
+        .create_library("Series", LibraryKind::Series, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status, identity_key
+         ) VALUES ('activity-series', ?, 'SERIES', '动漫', '动漫', 'LOCAL_CONFIRMED', 'activity:series')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number,
+             title, sort_title, identification_status, identity_key
+         ) VALUES (
+             'activity-season', ?, 'SEASON', 'activity-series', 'activity-series', 1,
+             'Season 01', 'season 01', 'LOCAL_CONFIRMED', 'activity:season'
+         )",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+             title, sort_title, identification_status, identity_key
+         ) VALUES (
+             'activity-episode', ?, 'EPISODE', 'activity-season', 'activity-series', 1, 8,
+             '第八集', '第八集', 'LOCAL_CONFIRMED', 'activity:episode'
+         )",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind)
+         VALUES ('activity-source', 'activity-episode', 'LOCAL_FILE')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO chapter_detection_jobs (
+             id, library_id, plugin_id, status, concurrency,
+             intro_window_seconds, credits_window_seconds, match_threshold, total_count
+         ) VALUES ('activity-chapter-job', ?, 'activity.plugin', 'RUNNING', 1, 30, 60, 0.8, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO chapter_detection_job_items (
+             job_id, source_id, item_id, season_id, source_fingerprint, status
+         ) VALUES ('activity-chapter-job', 'activity-source', 'activity-episode', 'activity-season', ?, 'RUNNING')",
+    )
+    .bind(Vec::<u8>::new())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO danmaku_match_jobs (
+             id, library_id, status, concurrency, total_count
+         ) VALUES ('activity-danmaku-job', ?, 'RUNNING', 1, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO danmaku_match_job_items (id, job_id, media_source_id, status)
+         VALUES ('activity-danmaku-item', 'activity-danmaku-job', 'activity-source', 'RUNNING')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let activity = client
+        .get(format!("{base_url}/api/v1/admin/task-activity"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(activity.status(), reqwest::StatusCode::OK);
+    let activities = activity.json::<Value>().await?["activities"]
+        .as_array()
+        .cloned()
+        .ok_or("missing activities")?;
+    let chapter = activities
+        .iter()
+        .find(|activity| activity["id"] == "activity-chapter-job")
+        .ok_or("chapter activity missing")?;
+    assert_eq!(chapter["currentItem"], "动漫 · S01E08 · 第八集");
+    let danmaku = activities
+        .iter()
+        .find(|activity| activity["id"] == "activity-danmaku-job")
+        .ok_or("danmaku activity missing")?;
+    assert_eq!(danmaku["currentItem"], "动漫 · S01E08 · 第八集");
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_list_and_update_library_schedules_from_operations_page()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

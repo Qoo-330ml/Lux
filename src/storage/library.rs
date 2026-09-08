@@ -1399,11 +1399,21 @@ impl Database {
             "SYSTEM"
         };
         let plan_id = if let Some(old_plan_id) = old_plan_id.as_ref() {
-            let plan_state: Option<(i64, i64)> = self
+            let plan_state: Option<(
+                i64,
+                i64,
+                Option<String>,
+                i64,
+                String,
+                String,
+                Option<String>,
+            )> = self
                 .query_as(
                     "SELECT p.is_default,
                             (SELECT COUNT(*) FROM scheduled_task_plan_libraries l
                              WHERE l.plan_id = p.id)
+                            , p.cron_or_interval, p.is_enabled,
+                            p.resource_limit_json, p.source_type, p.plugin_id
                      FROM scheduled_task_plans p WHERE p.id = ?",
                 )
                 .bind(old_plan_id)
@@ -1413,12 +1423,28 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            if plan_state
-                .is_some_and(|(is_default, member_count)| is_default != 0 || member_count > 1)
-            {
-                Uuid::now_v7().to_string()
-            } else {
-                old_plan_id.clone()
+            match plan_state {
+                Some((
+                    is_default,
+                    member_count,
+                    current_schedule,
+                    current_enabled,
+                    current_resource_limit,
+                    current_source_type,
+                    current_plugin_id,
+                )) => {
+                    let configuration_unchanged = current_schedule.as_deref() == schedule
+                        && current_enabled == database_flag(schedule.is_some())
+                        && current_resource_limit == resource_limit_json
+                        && current_source_type == source_type
+                        && current_plugin_id.as_deref() == plugin_id;
+                    if configuration_unchanged || (is_default == 0 && member_count <= 1) {
+                        old_plan_id.clone()
+                    } else {
+                        Uuid::now_v7().to_string()
+                    }
+                }
+                None => Uuid::now_v7().to_string(),
             }
         } else {
             Uuid::now_v7().to_string()
@@ -2794,6 +2820,60 @@ mod scheduled_task_plan_mirror_tests {
             .await
             .expect("test database should connect");
         (temp_dir, database)
+    }
+
+    #[tokio::test]
+    async fn saving_shared_library_schedule_reuses_unchanged_plan() {
+        let (_temp_dir, database) = test_database().await;
+        let libraries = LibraryService::new(database.clone());
+        let first = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("first library should be created");
+        libraries
+            .create_library("More Movies", LibraryKind::Movie, false)
+            .await
+            .expect("second library should be created");
+
+        libraries
+            .update_settings(
+                first.id,
+                crate::application::libraries::LibrarySettingsPatch {
+                    reconciliation_schedule: Some(Some("0 3 * * 0".to_owned())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("unchanged library schedule should be saved");
+
+        let plan_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plans
+             WHERE task_type = 'RECONCILIATION_SCAN'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("reconciliation plan count should be queryable");
+        assert_eq!(plan_count, 1);
+
+        libraries
+            .update_settings(
+                first.id,
+                crate::application::libraries::LibrarySettingsPatch {
+                    reconciliation_schedule: Some(Some("0 3 * * *".to_owned())),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("changed library schedule should be saved");
+
+        let split_plan_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM scheduled_task_plans
+             WHERE task_type = 'RECONCILIATION_SCAN'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("split reconciliation plan count should be queryable");
+        assert_eq!(split_plan_count, 2);
     }
 
     #[tokio::test]

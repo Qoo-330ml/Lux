@@ -295,7 +295,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
       : preferredLanguageField?.options?.[0]?.value ?? "zh-CN";
     const fallback = Array.isArray(values.fallbackLanguages)
       ? values.fallbackLanguages.filter((value): value is string => typeof value === "string")
-      : ["zh-SG", "zh-HK", "zh-TW"];
+      : ["zh-TW"];
     const configuredApiBaseUrl = typeof values.apiBaseUrl === "string"
       ? values.apiBaseUrl
       : typeof apiBaseUrlField?.defaultValue === "string"

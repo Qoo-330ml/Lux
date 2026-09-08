@@ -260,7 +260,12 @@ export function AdminOperationsPage() {
     })),
   ].sort(compareOperationsJobs);
   const registeredTasks = tasks.data?.scheduledTasks ?? [];
-  const registeredPlans = taskPlans.data?.plans ?? [];
+  const allRegisteredPlans = taskPlans.data?.plans ?? [];
+  const registeredPlans = allRegisteredPlans.filter((plan) => !isEmptyDefaultLibraryPlan(plan));
+  const hiddenPlanCount = allRegisteredPlans.length - registeredPlans.length;
+  const registeredPlanTotal = taskPlans.data?.total == null
+    ? registeredPlans.length
+    : Math.max(registeredPlans.length, taskPlans.data.total - hiddenPlanCount);
   const logItems = useMemo(() => {
     const query = logSearch.trim().toLowerCase();
     return (logs.data?.events ?? []).filter((log) => {
@@ -321,14 +326,14 @@ export function AdminOperationsPage() {
       {logs.error ? <p className="lux-error-copy" role="alert">系统日志加载失败：{logs.error.message}</p> : null}
 
       <section className="lux-operations-summary" aria-label="任务概览">
-        <OperationsStat label="已注册任务" value={usingPlans ? taskPlans.data?.total ?? registeredPlans.length : tasks.data?.total ?? registeredTasks.length} detail="系统与插件提供" icon={<ClipboardList size={18} />} />
+        <OperationsStat label="已注册任务" value={usingPlans ? registeredPlanTotal : tasks.data?.total ?? registeredTasks.length} detail="系统与插件提供" icon={<ClipboardList size={18} />} />
         <OperationsStat label="已启用" value={enabledCount} detail="已配置执行计划" icon={<CheckCircle2 size={18} />} />
         <OperationsStat label="正在运行" value={runningCount} detail="实时运行记录" icon={<RefreshCw size={18} />} />
         <OperationsStat label="失败记录" value={failedCount} detail="需要关注" icon={<AlertTriangle size={18} />} tone={failedCount ? "warn" : "default"} />
       </section>
 
       <nav className="lux-operations-tabs" aria-label="任务与日志分区" role="tablist">
-        <OperationsTabButton active={tab === "registered"} onClick={() => setTab("registered")} label="已注册任务" count={usingPlans ? taskPlans.data?.total ?? registeredPlans.length : tasks.data?.total ?? 0} />
+        <OperationsTabButton active={tab === "registered"} onClick={() => setTab("registered")} label="已注册任务" count={usingPlans ? registeredPlanTotal : tasks.data?.total ?? 0} />
         <OperationsTabButton active={tab === "runs"} onClick={() => setTab("runs")} label="运行记录" count={jobItems.length} />
         <OperationsTabButton active={tab === "logs"} onClick={() => setTab("logs")} label="系统日志" count={logItems.length} />
       </nav>
@@ -339,7 +344,7 @@ export function AdminOperationsPage() {
           libraries={libraries.data?.libraries ?? []}
           page={taskPlanPage}
           pageSize={taskPlans.data?.pageSize ?? 50}
-          total={taskPlans.data?.total ?? registeredPlans.length}
+          total={registeredPlanTotal}
           search={taskPlanSearch}
           onSearchChange={(value) => { setTaskPlanSearch(value); setTaskPlanPage(1); }}
           onPageChange={setTaskPlanPage}
@@ -589,6 +594,11 @@ const SCHEDULE_TASK_TYPE_OPTIONS: Array<[string, string]> = [
 
 function taskGroupLabel(taskType: string) {
   return SCHEDULE_TASK_TYPE_OPTIONS.find(([value]) => value === taskType)?.[1] ?? taskLabel(taskType);
+}
+
+function isEmptyDefaultLibraryPlan(plan: AdminScheduledTaskPlan) {
+  const libraryCount = plan.libraries?.length ?? plan.libraryCount ?? 0;
+  return plan.scopeType === "LIBRARY" && plan.isDefault === true && libraryCount === 0;
 }
 
 function PlanLibraryPicker({ libraries, selectedIds, onChange }: { libraries: AdminLibrary[]; selectedIds: string[]; onChange: (ids: string[]) => void }) {

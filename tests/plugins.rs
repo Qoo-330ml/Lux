@@ -103,9 +103,8 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
                 "defaultValue": "zh-CN",
                 "options": [
                     {"value": "zh-CN", "label": "简体中文"},
-                    {"value": "zh-SG", "label": "zh-SG"},
-                    {"value": "zh-HK", "label": "zh-HK"},
-                    {"value": "zh-TW", "label": "zh-TW"}
+                    {"value": "zh-TW", "label": "繁體中文"},
+                    {"value": "en-US", "label": "英语 (English)"}
                 ]
             }, {
                 "key": "languageFallbackEnabled",
@@ -123,9 +122,8 @@ async fn seed_local_tmdb_package(config_dir: &Path) -> Result<(), Box<dyn std::e
                 "sensitive": false,
                 "options": [
                     {"value": "zh-CN", "label": "简体中文"},
-                    {"value": "zh-SG", "label": "zh-SG"},
-                    {"value": "zh-HK", "label": "zh-HK"},
-                    {"value": "zh-TW", "label": "zh-TW"}
+                    {"value": "zh-TW", "label": "繁體中文"},
+                    {"value": "en-US", "label": "英语 (English)"}
                 ]
             }, {
                 "key": "alternateApiEnabled",
@@ -288,10 +286,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     );
     assert_eq!(config_field(tmdb, "fallbackLanguages")["multiple"], true);
     assert_eq!(tmdb["configValues"]["preferredLanguage"], "zh-CN");
-    assert_eq!(
-        tmdb["configValues"]["fallbackLanguages"],
-        json!(["zh-SG", "zh-HK", "zh-TW"])
-    );
+    assert_eq!(tmdb["configValues"]["fallbackLanguages"], json!(["zh-TW"]));
     assert_eq!(tmdb["configValues"]["alternateApiEnabled"], false);
     assert_eq!(tmdb["configValues"]["titleAliasReplacementEnabled"], false);
     assert_eq!(
@@ -660,7 +655,7 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
     assert_eq!(configured_body["plugin"]["configSource"], "PLUGIN_CONFIG");
     assert_eq!(
         configured_body["plugin"]["configValues"]["preferredLanguage"],
-        "zh-SG"
+        "zh-CN"
     );
     assert_eq!(
         configured_body["plugin"]["configValues"]["languageFallbackEnabled"],
@@ -672,7 +667,7 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
     );
     assert_eq!(
         configured_body["plugin"]["configValues"]["fallbackLanguages"],
-        json!(["zh-HK", "zh-TW"])
+        json!(["zh-TW"])
     );
     assert_eq!(
         configured_body["plugin"]["configValues"]["alternateApiEnabled"],

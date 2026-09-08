@@ -14,6 +14,20 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## LUX-144 TMDb 语言组与详情回退（2026-09-08）
+
+TMDb 语言配置由外置 `Lux-plugins` 的 `org.lux.tmdb` 提供 73 个 canonical 语言组；`zh-CN`/`zh-SG`、
+`zh-TW`/`zh-HK` 以及英语等地区变体不再作为重复选项暴露。宿主和插件都会把旧配置归一化为语言组，默认回退组为
+`zh-TW`，并自动移除与首选组重复的回退项。
+
+详情请求只携带一个首选 `language`，同时 append `translations`；回退开启时插件在本地按精确 locale、同语言组和配置顺序
+逐字段补空，关闭时不读取翻译回退。搜索仍只使用单个首选 locale，图片使用 `include_image_language` 并保留英文/无语言兜底，
+因此不会因为地区变体数量产生并发请求扇出。
+
+验证证据：Lux 主仓库 `cargo test --locked --test plugins`、`plugin_update_tests` 和 Web `plugin-library.test.ts` 通过；
+外置插件的 settings、TMDb client、插件 metadata 单元测试及发布 manifest 测试通过。该记录证明请求/配置行为，不替代 TMDb
+真实账号数据覆盖率或第三方客户端 UI 兼容性实测。
+
 ## Emby 媒体删除兼容合同
 
 Emby 兼容层提供 `DELETE /Items/{itemId}`。拥有服务器管理权限的 Emby token/API key 可删除媒体源；

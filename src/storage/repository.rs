@@ -1541,6 +1541,15 @@ pub(crate) struct StoredMetadataReidentifyItem {
     pub(crate) updated_at: i64,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct StoredJobActivityItem {
+    pub(crate) item_type: String,
+    pub(crate) season_number: Option<i64>,
+    pub(crate) episode_number: Option<i64>,
+    pub(crate) title: String,
+    pub(crate) series_title: Option<String>,
+}
+
 fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReidentifyJob {
     StoredMetadataReidentifyJob {
         id: row.get("id"),

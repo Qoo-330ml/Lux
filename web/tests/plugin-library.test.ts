@@ -310,7 +310,7 @@ describe("AdminPluginsPage plugin cards", () => {
         preferredLanguage: "zh-CN",
         languageFallbackEnabled: false,
         titleAliasReplacementEnabled: false,
-        fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
+        fallbackLanguages: ["zh-TW"],
         alternateApiEnabled: true,
         apiBaseUrlPreset: "official",
         apiBaseUrl: "https://api.themoviedb.org",
@@ -325,8 +325,8 @@ describe("AdminPluginsPage plugin cards", () => {
           sensitive: false,
           options: [
             { value: "zh-CN", label: "简体中文" },
-            { value: "zh-SG", label: "zh-SG" },
-            { value: "zh-HK", label: "zh-HK" },
+            { value: "zh-TW", label: "繁體中文" },
+            { value: "en-US", label: "英语 (English)" },
           ],
         },
         {
@@ -353,9 +353,9 @@ describe("AdminPluginsPage plugin cards", () => {
           sensitive: false,
           multiple: true,
           options: [
-            { value: "zh-SG", label: "zh-SG" },
-            { value: "zh-HK", label: "zh-HK" },
-            { value: "zh-TW", label: "zh-TW" },
+            { value: "zh-CN", label: "简体中文" },
+            { value: "zh-TW", label: "繁體中文" },
+            { value: "en-US", label: "英语 (English)" },
           ],
         },
         {
@@ -398,12 +398,12 @@ describe("AdminPluginsPage plugin cards", () => {
     const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
     const selects = Array.from(dialog?.querySelectorAll<HTMLButtonElement>("[role='combobox']") ?? []);
     expect(selects[0]?.textContent).toContain("简体中文");
-    expect(selects[1]?.textContent).toContain("3 项已选择");
+    expect(selects[1]?.textContent).toContain("繁體中文");
     expect(selects[2]?.textContent).toContain("https://api.themoviedb.org");
     await act(async () => selects[1]?.click());
     const fallbackListbox = document.querySelector<HTMLElement>("[role='listbox']");
     expect(fallbackListbox?.getAttribute("aria-multiselectable")).toBe("true");
-    expect([...fallbackListbox?.querySelectorAll<HTMLElement>("[role='option'][aria-selected='true']") ?? []].map((option) => option.textContent?.trim())).toEqual(["zh-SG", "zh-HK", "zh-TW"]);
+    expect([...fallbackListbox?.querySelectorAll<HTMLElement>("[role='option'][aria-selected='true']") ?? []].map((option) => option.textContent?.trim())).toEqual(["繁體中文"]);
     await act(async () => selects[1]?.click());
     expect(dialog?.textContent).toContain("标题别名替换");
     expect(dialog?.textContent).toContain("当tmdb语言检索不到中文名称时，尝试使用中文别名替换");
@@ -425,7 +425,7 @@ describe("AdminPluginsPage plugin cards", () => {
       preferredLanguage: "zh-CN",
       languageFallbackEnabled: false,
       titleAliasReplacementEnabled: false,
-      fallbackLanguages: ["zh-SG", "zh-HK", "zh-TW"],
+      fallbackLanguages: ["zh-TW"],
       alternateApiEnabled: true,
       apiBaseUrlPreset: "custom",
       apiBaseUrl: "https://tmdb.internal.example",

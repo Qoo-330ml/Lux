@@ -60,6 +60,7 @@ pub const IP_HIOFD_PLUGIN_ID: &str = "org.lux.ip-hiofd";
 pub const IP138_PLUGIN_ID: &str = "org.lux.qoo-ip138";
 pub const DANMAKU_PLUGIN_ID: &str = "org.lux.danmaku";
 pub const EMBY_MIGRATION_PLUGIN_ID: &str = "org.lux.emby-migration";
+const TMDB_PLUGIN_ID: &str = "org.lux.tmdb";
 const CONFIG_SOURCE_NONE: &str = "NONE";
 const CONFIG_SOURCE_PLUGIN: &str = "PLUGIN_CONFIG";
 const PLUGIN_CONFIG_DIR: &str = "plugin-config";
@@ -2076,12 +2077,88 @@ fn normalize_plugin_config(plugin_id: &str, mut values: Map<String, Value>) -> M
     values
 }
 
+fn normalize_tmdb_language_values(values: &mut Map<String, Value>, fields: &[PluginConfigField]) {
+    let options = fields
+        .iter()
+        .find(|field| field.key == "preferredLanguage")
+        .or_else(|| fields.iter().find(|field| field.key == "fallbackLanguages"))
+        .map(|field| field.options.as_slice())
+        .unwrap_or(&[]);
+    if options.is_empty() {
+        return;
+    }
+    if let Some(Value::String(value)) = values.get_mut("preferredLanguage") {
+        let current = value.clone();
+        if let Some(canonical) = canonical_tmdb_language_value(&current, options) {
+            *value = canonical;
+        }
+    }
+    let preferred_language = values
+        .get("preferredLanguage")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    if let Some(Value::Array(values_array)) = values.get_mut("fallbackLanguages") {
+        let mut seen = HashSet::new();
+        let normalized = values_array
+            .drain(..)
+            .map(|value| {
+                if let Some(language) = value.as_str()
+                    && let Some(canonical) = canonical_tmdb_language_value(language, options)
+                {
+                    return Value::String(canonical);
+                }
+                value
+            })
+            .filter(|value| {
+                value.as_str().is_none_or(|language| {
+                    preferred_language.as_deref() != Some(language)
+                        && seen.insert(language.to_owned())
+                })
+            })
+            .collect();
+        *values_array = normalized;
+    }
+}
+
+fn canonical_tmdb_language_value(language: &str, options: &[PluginConfigOption]) -> Option<String> {
+    let language = language.trim();
+    if let Some(option) = options.iter().find(|option| option.value == language) {
+        return Some(option.value.clone());
+    }
+    let (language_code, region) = language.split_once('-')?;
+    let canonical_code = if language_code.eq_ignore_ascii_case("zh") {
+        match region {
+            "CN" | "SG" => "zh-CN",
+            "HK" | "TW" => "zh-TW",
+            _ => return None,
+        }
+    } else {
+        options
+            .iter()
+            .find(|option| {
+                option
+                    .value
+                    .split_once('-')
+                    .is_some_and(|(code, _)| code.eq_ignore_ascii_case(language_code))
+            })?
+            .value
+            .as_str()
+    };
+    options
+        .iter()
+        .find(|option| option.value == canonical_code)
+        .map(|option| option.value.clone())
+}
+
 fn normalize_plugin_config_for_fields(
     plugin_id: &str,
     fields: &[PluginConfigField],
     values: Map<String, Value>,
 ) -> Map<String, Value> {
     let mut values = normalize_plugin_config(plugin_id, values);
+    if plugin_id == TMDB_PLUGIN_ID {
+        normalize_tmdb_language_values(&mut values, fields);
+    }
     if plugin_id != DANMAKU_PLUGIN_ID {
         return values;
     }
@@ -2889,7 +2966,11 @@ impl From<StorageError> for PluginServiceError {
 
 #[cfg(test)]
 mod plugin_update_tests {
+    use serde_json::{Map, json};
+
     use super::super::plugin_store::is_newer_version;
+    use super::{TMDB_PLUGIN_ID, normalize_plugin_config_for_fields};
+    use crate::application::plugin_protocol::{PluginConfigField, PluginConfigOption};
 
     #[test]
     fn compares_numeric_plugin_versions_without_lexical_ordering() {
@@ -2906,6 +2987,46 @@ mod plugin_update_tests {
         assert!(!is_newer_version("1.0.0+build.2", "1.0.0+build.1"));
         assert!(!is_newer_version("build-b", "build-a"));
         assert!(!is_newer_version("1.0.1", "01.0.0"));
+    }
+
+    #[test]
+    fn normalizes_legacy_tmdb_regional_languages_to_language_groups() {
+        let language_options: Vec<PluginConfigOption> = [
+            ("zh-CN", "简体中文"),
+            ("zh-TW", "繁體中文"),
+            ("en-US", "英语 (English)"),
+        ]
+        .into_iter()
+        .map(|(value, label)| PluginConfigOption {
+            value: value.to_owned(),
+            label: label.to_owned(),
+        })
+        .collect();
+        let fields = vec![
+            PluginConfigField {
+                key: "preferredLanguage".to_owned(),
+                options: language_options.clone(),
+                ..PluginConfigField::default()
+            },
+            PluginConfigField {
+                key: "fallbackLanguages".to_owned(),
+                options: language_options,
+                multiple: true,
+                ..PluginConfigField::default()
+            },
+        ];
+        let values = Map::from_iter([
+            ("preferredLanguage".to_owned(), json!("en-GB")),
+            (
+                "fallbackLanguages".to_owned(),
+                json!(["zh-SG", "zh-HK", "en-AU"]),
+            ),
+        ]);
+
+        let normalized = normalize_plugin_config_for_fields(TMDB_PLUGIN_ID, &fields, values);
+
+        assert_eq!(normalized["preferredLanguage"], "en-US");
+        assert_eq!(normalized["fallbackLanguages"], json!(["zh-CN", "zh-TW"]));
     }
 }
 
