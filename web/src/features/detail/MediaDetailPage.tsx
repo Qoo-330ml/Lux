@@ -8,7 +8,7 @@ import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
 import { MediaCast } from "./MediaCast";
 import { MediaNfoPanel } from "./MediaNfoPanel";
-import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, runtimeLabel } from "../home/media";
+import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media";
 import { MediaActionMenu } from "../media/MediaActionMenu";
 import { MediaImageEditor } from "../media/MediaImageEditor";
 import { MediaIdentifier } from "../media/MediaIdentifier";
@@ -119,8 +119,11 @@ export function MediaDetailPage() {
   const media = item.data;
   const logo = itemImages.data?.images?.find((image) => image.imageType.toUpperCase() === "LOGO");
   const logoUrl = logo?.url ?? imageUrl(media, "logo");
-  const backdrop = imageUrl(media, "fanart") ?? imageUrl(media);
-  const poster = imageUrl(media);
+  const seriesImageFallback = isSeason ? seriesContext.data : undefined;
+  const backdrop = imageUrl(media, "fanart")
+    ?? imageUrl(media)
+    ?? (seriesImageFallback ? imageUrl(seriesImageFallback, "fanart") ?? imageUrl(seriesImageFallback) : undefined);
+  const poster = posterUrlWithFallback(media, seriesImageFallback);
   const detailKind = isSeries ? "series" : isSeason ? "season" : isEpisode ? "episode" : "movie";
   const detailTitle = isSeries || (!isSeason && !isEpisode)
     ? mediaTitle(media)
@@ -348,6 +351,7 @@ export function MediaDetailPage() {
             {isSeries ? (
               <SeriesChildren
                 seasons={seasons.data?.items ?? []}
+                series={media}
               />
             ) : null}
             {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
@@ -603,8 +607,10 @@ function providerId(providerIds: Record<string, string> | null | undefined, prov
 
 function SeriesChildren({
   seasons,
+  series,
 }: {
   seasons: MediaItem[];
+  series: MediaItem;
 }) {
   return (
     <section className="lux-series-children" aria-labelledby="series-children-heading">
@@ -613,21 +619,24 @@ function SeriesChildren({
         <span>{seasons.length} 个季度</span>
       </div>
       <div className="lux-season-rail" role="list" aria-label="播出季">
-        {seasons.map((season) => (
-          <Link
-            className="lux-season-card"
-            key={season.id}
-            role="listitem"
-            to={`/items/${season.id}`}
-          >
-            <span className="lux-season-card-art">
-              {imageUrl(season) ? <img src={imageUrl(season)} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span className="lux-season-card-placeholder">{mediaTitle(season)}</span>}
-              <Rating value={season.rating} placement="card" />
-              <EpisodeCount item={season} />
-            </span>
-            <strong>{mediaTitle(season)}</strong>
-          </Link>
-        ))}
+        {seasons.map((season) => {
+          const poster = posterUrlWithFallback(season, series);
+          return (
+            <Link
+              className="lux-season-card"
+              key={season.id}
+              role="listitem"
+              to={`/items/${season.id}`}
+            >
+              <span className="lux-season-card-art">
+                {poster ? <img src={poster} alt={`${mediaTitle(season)} 海报`} loading="lazy" /> : <span className="lux-season-card-placeholder">{mediaTitle(season)}</span>}
+                <Rating value={season.rating} placement="card" />
+                <EpisodeCount item={season} />
+              </span>
+              <strong>{mediaTitle(season)}</strong>
+            </Link>
+          );
+        })}
       </div>
     </section>
   );

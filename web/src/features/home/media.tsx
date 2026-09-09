@@ -58,6 +58,11 @@ export function imageUrl(item: MediaItem, type: "poster" | "fanart" | "thumb" | 
   return tag ? `${path}?tag=${encodeURIComponent(tag)}` : path;
 }
 
+export function posterUrlWithFallback(item: MediaItem, series?: MediaItem) {
+  return imageUrl(item)
+    ?? (item.itemType === "SEASON" && series?.itemType === "SERIES" ? imageUrl(series) : undefined);
+}
+
 export function runtimeLabel(ticks?: number | null) {
   if (!ticks) return undefined;
   const minutes = Math.round(ticks / 10_000_000 / 60);
