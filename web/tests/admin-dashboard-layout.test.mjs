@@ -53,6 +53,7 @@ test("dashboard overview uses modern bento box grid rhythm", () => {
   assert.match(bentoCardRule, /background:\s*rgba\(255,\s*255,\s*255,\s*(?:0)?\.008\)/);
   assert.match(bentoCardRule, /box-shadow:/);
   assert.match(bentoHeroRule, /grid-column:\s*span 4/);
+  assert.match(bentoHeroRule, /min-height:\s*128px/);
   assert.match(heroRuntimeRule, /white-space:\s*nowrap/);
   assert.doesNotMatch(stylesheet, /\.lux-bento-hero-icon\s*\{/);
   assert.doesNotMatch(stylesheet, /\.lux-bento-hero-footer\s*\{/);

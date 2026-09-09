@@ -998,7 +998,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-bento-card-hero {
   grid-column: span 4;
-  min-height: 154px;
+  min-height: 128px;
   padding: 16px;
   background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 5%, transparent) 0%, transparent 72%),
               rgba(255, 255, 255, .008);
