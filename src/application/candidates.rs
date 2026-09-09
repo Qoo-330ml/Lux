@@ -513,6 +513,10 @@ impl MetadataCandidateService {
                 .unwrap_or_else(|| query.to_owned());
             let mut capability_results = Vec::new();
             let mut capability_failures = Vec::new();
+            let image_original_language = details
+                .as_ref()
+                .and_then(|value| value.original_language.clone())
+                .or_else(|| result.original_language.clone());
             let (images, credits, external_ids, trailers, images_response) = if let Some(bundle) =
                 bundle
             {
@@ -550,16 +554,14 @@ impl MetadataCandidateService {
                 let (images_response, credits_result, external_ids_result, trailers_result) = tokio::join!(
                     async {
                         if plan.needs_images {
-                            scraper
-                                .images_generic(
-                                    crate::application::scraper::ScraperImageRequest::new(
-                                        item_type,
-                                        provider_id.clone(),
-                                        "zh-CN",
-                                    ),
-                                )
-                                .await
-                                .ok()
+                            let mut image_request =
+                                crate::application::scraper::ScraperImageRequest::new(
+                                    item_type,
+                                    provider_id.clone(),
+                                    "zh-CN",
+                                );
+                            image_request.original_language = image_original_language.clone();
+                            scraper.images_generic(image_request).await.ok()
                         } else {
                             None
                         }
@@ -1036,6 +1038,10 @@ impl MetadataCandidateService {
             let images_response = if plan.needs_images {
                 let mut image_request =
                     ScraperImageRequest::new(item_type, &parent.provider_id, "zh-CN");
+                image_request.original_language = current
+                    .original_language
+                    .clone()
+                    .or_else(|| metadata.original_language.clone());
                 image_request.season_number = Some(season_number);
                 image_request.episode_number = episode_number;
                 scraper.images_generic(image_request).await.ok()

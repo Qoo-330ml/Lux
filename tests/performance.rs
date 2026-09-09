@@ -575,6 +575,7 @@ impl MetadataBenchmarkScraper {
                 url: format!("{}/poster-{provider_id}", self.image_base_url),
                 ..ScraperImage::default()
             }],
+            ..ScraperImagesResponse::default()
         }
     }
 }

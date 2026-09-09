@@ -2384,6 +2384,7 @@ pub(crate) struct StoredStrmMediaSource {
 #[derive(Debug)]
 pub(crate) struct StoredImageIdentity {
     pub(crate) item_type: String,
+    pub(crate) original_language: Option<String>,
     pub(crate) provider_name: Option<String>,
     pub(crate) provider_id: Option<String>,
     pub(crate) season_number: Option<i64>,
