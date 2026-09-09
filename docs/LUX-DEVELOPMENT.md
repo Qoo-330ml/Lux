@@ -231,6 +231,9 @@ Lux 的核心价值不是功能数量，而是：
   `writeToMetadata` 时，同时写入 /config/metadata/library/<shard>/<item-id>/。匹配选择时按所属
   媒体库启用的图片类型逐项处理：海报、徽标、缩略图等单图类型只在没有更高优先级本地图片时写入；背景图允许多张，主来源和补充来源的图片按 URL 去重并按优先级追加。扫描发现的媒体目录图片仍按本地优先
   规则登记和提供。
+- 季条目没有自己的海报时，Lux Web 可以临时展示父剧集海报作为视觉回退；该回退不创建季的
+  `item_images` 记录、不写回季目录，也不改变季自身图片的来源。季自身海报后来补全后，必须优先
+  展示真实季海报。
 
 首版不阻塞但数据模型需预留：
 
@@ -2099,6 +2102,7 @@ services:
 | LUX-247 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/discovery.rs、src/main.rs、compose.yaml、docs/DEPLOYMENT.md；Emby 兼容局域网发现 |
 | LUX-248 | docs/LUX-DEVELOPMENT.md、docs/decisions/041-device-pairing.md、migrations/0119_device_pairings.sql、migrations-postgres/0119_device_pairings.sql、src/auth/device_pairings.rs、src/security.rs、src/storage/device_pairings.rs、src/storage/catalog.rs、src/storage/repository.rs、src/storage/users.rs、src/storage/mod.rs、src/auth/emby.rs、src/auth/mod.rs、src/api/legacy.rs、src/api/routes.rs、src/api/users.rs、tests/device_pairings.rs、tests/admin_health.rs、tests/danmaku.rs、tests/ready_version.rs、tests/scanner.rs、tests/storage.rs；Lux Prism 一次性设备配对 |
 | LUX-249 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/application/scraper.rs、src/application/images.rs、src/application/candidates.rs、src/storage/media.rs、src/storage/repository.rs、web/src/features/admin/AdminPluginsPage.tsx、web/tests/plugin-library.test.ts；TMDb 原语言文字与图片模式 |
+| LUX-250 | docs/LUX-DEVELOPMENT.md、web/src/features/home/media.tsx、web/src/features/detail/MediaDetailPage.tsx、web/tests/home-media.test.tsx、web/tests/media-detail.test.tsx；季海报缺失时回退父剧海报 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6024,6 +6028,31 @@ PostgreSQL 集成测试目标已编译，但本机没有可用 PostgreSQL 实例
 
 - 不将“原语言”伪装成新的 TMDb canonical locale，也不为搜索候选逐项追加详情请求。
 - 不改变 TMDb Provider ID、metadata RPC 方法名称或数据库 schema。
+
+#### LUX-250：季海报缺失时回退父剧海报
+
+范围：当季条目没有自己的 `POSTER` 图片时，Lux Web 在已知父剧集上下文的页面中展示父剧集海报；
+季条目自身的海报始终优先。回退仅属于展示层，不复制或登记图片，不改变图片编辑、元数据写回和
+图片来源记录。后续元数据补全得到季海报后，页面刷新即可切换到真实季海报。
+
+验收：
+
+- [ ] 剧集详情的季卡片没有季海报时显示父剧集海报。
+- [ ] 季详情没有季海报时显示父剧集海报；季详情已有自己的海报时继续显示季海报。
+- [ ] 回退不调用季图片端点、不创建或修改图片记录，且不影响电影、剧集和单集图片选择。
+- [ ] 前端单测覆盖季海报缺失、真实季海报优先和父剧上下文缺失三种情况。
+
+验证：
+
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-060、LUX-061、LUX-100。
+
+明确不做：
+
+- 不把父剧海报复制到季目录或写入 `/config/metadata/library`。
+- 不修改 TMDb 插件、数据库 schema、Emby 图片 DTO 或图片来源优先级。
 
 ## 26. 风险与缓解
 
