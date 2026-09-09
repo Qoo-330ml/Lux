@@ -828,14 +828,7 @@ impl Database {
         if files.is_empty() {
             return Ok(0);
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let mut folder_cache = self
             .prefetch_movie_folders_in_transaction(&mut transaction, library_root_id, files)
             .await?;
@@ -1082,14 +1075,7 @@ impl Database {
         if files.is_empty() {
             return Ok(0);
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
 
         for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
             let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())

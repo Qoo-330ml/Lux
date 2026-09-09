@@ -2852,7 +2852,7 @@ impl ScanJobService {
         }
         let _scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
         let report = self
-            .run_batch_with_failure_handling(job_id, batch_size)
+            .run_batch_with_failure_handling(job_id, batch_size, false)
             .await?;
         if report.processed > 0
             && let Some(home) = &self.home
@@ -2867,8 +2867,12 @@ impl ScanJobService {
         &self,
         job_id: &str,
         batch_size: usize,
+        stream_files_during_discovery: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
-        match self.run_batch_unlocked(job_id, batch_size).await {
+        match self
+            .run_batch_unlocked(job_id, batch_size, stream_files_during_discovery)
+            .await
+        {
             Ok(report) => Ok(report),
             Err(error) => {
                 self.fail_unhandled_scan_job(job_id, &error).await?;
@@ -2881,6 +2885,7 @@ impl ScanJobService {
         &self,
         job_id: &str,
         batch_size: usize,
+        stream_files_during_discovery: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let Some(job) = self.database.find_scan_job(job_id).await? else {
             if self.cancellation_requested_in_memory(job_id) {
@@ -2942,10 +2947,15 @@ impl ScanJobService {
 
         if !job.discovery_completed {
             return self
-                .run_reconciliation_discovery_batch(&job, batch_size, &cancellation)
+                .run_reconciliation_discovery_batch(
+                    &job,
+                    batch_size,
+                    &cancellation,
+                    stream_files_during_discovery,
+                )
                 .await;
         }
-        self.run_reconciliation_file_batch(&job, batch_size, &cancellation)
+        self.run_reconciliation_file_batch(&job, batch_size, &cancellation, true)
             .await
     }
 
@@ -3061,6 +3071,7 @@ impl ScanJobService {
         job: &StoredScanJob,
         batch_size: usize,
         cancellation: &AtomicBool,
+        stream_files_during_discovery: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let limit = i64::try_from(batch_size.min(DISCOVERY_BATCH_SIZE)).unwrap_or(i64::MAX);
         let directories = self
@@ -3182,6 +3193,11 @@ impl ScanJobService {
             )
             .await;
         }
+        if stream_files_during_discovery {
+            return self
+                .run_reconciliation_file_batch(job, batch_size, cancellation, remaining.is_empty())
+                .await;
+        }
         Ok(ScanBatchReport {
             status: "RUNNING".to_owned(),
             processed: 0,
@@ -3195,6 +3211,7 @@ impl ScanJobService {
         job: &StoredScanJob,
         batch_size: usize,
         cancellation: &AtomicBool,
+        discovery_completed: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let roots = self.database.list_library_roots(&job.library_id).await?;
         let library = self.database.find_library(&job.library_id).await?;
@@ -3223,13 +3240,25 @@ impl ScanJobService {
             &job.id,
             batch.last().map(|entry| entry.relative_path.as_str()),
             if batch.is_empty() {
-                "FINALIZING"
+                if discovery_completed {
+                    "FINALIZING"
+                } else {
+                    "DISCOVERY"
+                }
             } else {
                 "INDEXING"
             },
         )
         .await?;
         if batch.is_empty() {
+            if !discovery_completed {
+                return Ok(ScanBatchReport {
+                    status: "RUNNING".to_owned(),
+                    processed: 0,
+                    created_items: 0,
+                    completed: false,
+                });
+            }
             let mut removed_count = 0_usize;
             for root in &roots {
                 if !root.is_available {
@@ -4466,6 +4495,12 @@ impl ScanJobService {
             fs::metadata(&media_path).await.ok()
         };
         if metadata.is_none() {
+            if is_supported_sidecar_file(&media_path) {
+                let sidecar_paths = [path.relative_path.clone()];
+                self.database
+                    .record_scan_job_sidecar_targets(&job.id, &root.id, &sidecar_paths)
+                    .await?;
+            }
             self.database
                 .mark_filesystem_entry_missing_by_path(&root.id, &path.relative_path)
                 .await?;
@@ -4509,6 +4544,12 @@ impl ScanJobService {
                 &mut classification_cache,
             )
             .await
+        } else if is_supported_sidecar_file(&media_path) {
+            let sidecar_paths = [path.relative_path.clone()];
+            self.database
+                .record_scan_job_sidecar_targets(&job.id, &root.id, &sidecar_paths)
+                .await?;
+            Ok(0)
         } else {
             Ok(0)
         }
@@ -4554,6 +4595,15 @@ impl ScanJobService {
             },
             _ => return Err(ScannerError::LibraryNotFound),
         };
+        let relative_path = file
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        self.database
+            .record_scan_job_targets(&job.id, &root.id, &[relative_path], "CHANGED")
+            .await?;
         Ok(report.created_items)
     }
 
@@ -4600,9 +4650,7 @@ impl ScanJobService {
                         continue;
                     }
                 };
-                if matches!(job.status.as_str(), "FAILED" | "CANCELLED")
-                    || (job.status == "COMPLETED" && job.scan_phase == "IDLE")
-                {
+                if matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
                     return;
                 }
                 let pending = match database
@@ -4620,8 +4668,8 @@ impl ScanJobService {
                     }
                 };
                 if pending {
-                    match enricher.enrich_scan_job(&scan_job_id).await {
-                        Ok(report) if report.items_processed > 0 => {
+                    match enricher.enrich_one_scan_job_target(&scan_job_id).await {
+                        Ok(Some(report)) if report.items_processed > 0 => {
                             if let Some(home) = &home {
                                 home.invalidate();
                                 user_events.publish(UserEventScope::Home);
@@ -4731,17 +4779,12 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
-        let full_scan = self
-            .database
-            .find_scan_job(job_id)
-            .await?
-            .is_some_and(|job| job.job_type == "RECONCILE_LIBRARY");
         let mut scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
-        let mut local_metadata_worker = full_scan.then(|| self.start_local_metadata_worker(job_id));
+        let mut local_metadata_worker = Some(self.start_local_metadata_worker(job_id));
         let mut created_items = 0_usize;
         loop {
             let report = match self
-                .run_batch_with_failure_handling(job_id, batch_size)
+                .run_batch_with_failure_handling(job_id, batch_size, true)
                 .await
             {
                 Ok(report) => report,
@@ -4783,9 +4826,25 @@ impl ScanJobService {
                     return Ok(());
                 }
                 if incremental {
+                    if let Err(error) = self.wait_for_local_metadata(job_id).await {
+                        Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+                        return Err(error);
+                    }
                     Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    self.run_metadata_after_incremental_scan(job_id).await?;
+                    for target_type in ["SOURCE", "ITEM"] {
+                        self.database
+                            .skip_pending_scan_job_target_stage(job_id, target_type, "PROBE")
+                            .await?;
+                    }
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
+                        .await?;
+                    for target_type in ["SOURCE", "ITEM"] {
+                        self.database
+                            .skip_pending_scan_job_target_stage(job_id, target_type, "THUMBNAIL")
+                            .await?;
+                    }
+                    self.database
+                        .clear_completed_scan_job_targets(job_id)
                         .await?;
                     let strm_probe_scheduled = if completed_job.auto_metadata_match {
                         if let Some(metadata) = metadata {
@@ -5340,53 +5399,6 @@ impl ScanJobService {
                         r#"{{"elapsedMs":{},"itemsPerSecond":0}}"#,
                         started.elapsed().as_millis()
                     ),
-                )
-                .await;
-            }
-        }
-        Ok(())
-    }
-
-    async fn run_metadata_after_incremental_scan(&self, job_id: &str) -> Result<(), ScanJobError> {
-        if self.database.find_scan_job(job_id).await?.is_none() {
-            return Ok(());
-        }
-        let enricher = MetadataEnricher::new(self.database.clone());
-        let enricher = match self.people.clone() {
-            Some(people) => enricher.with_people(people),
-            None => enricher,
-        };
-        let enricher = match self.local_nfo.clone() {
-            Some(local_nfo) => enricher.with_nfo_store(local_nfo),
-            None => enricher,
-        };
-        match enricher.enrich_incremental_scan(job_id).await {
-            Ok(report) => {
-                let details = format!(
-                    r#"{{"nfoLoaded":{},"nfoFailed":{},"nfoSkipped":{},"imagesFound":{}}}"#,
-                    report.nfo_loaded, report.nfo_failed, report.nfo_skipped, report.images_found,
-                );
-                self.record_event(
-                    job_id,
-                    "INFO",
-                    "METADATA_COMPLETED",
-                    "局部扫描本地元数据处理完成",
-                    &details,
-                )
-                .await;
-            }
-            Err(error) => {
-                tracing::warn!(
-                    job_id,
-                    %error,
-                    "incremental scan local metadata enrichment failed"
-                );
-                self.record_event(
-                    job_id,
-                    "ERROR",
-                    "METADATA_FAILED",
-                    "局部扫描本地元数据处理失败",
-                    "{}",
                 )
                 .await;
             }

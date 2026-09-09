@@ -630,23 +630,44 @@ impl MetadataEnricher {
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         loop {
-            let sources = self
-                .database
-                .list_scan_job_target_movie_items_page(
-                    scan_job_id,
-                    LIBRARY_SOURCE_PAGE_SIZE as i64,
-                    0,
-                )
+            let batch = self
+                .enrich_scan_job_batch(scan_job_id, LIBRARY_SOURCE_PAGE_SIZE)
                 .await?;
-            if sources.is_empty() {
+            if batch.items_processed == 0 {
                 break;
             }
-            let item_ids = sources
+            report.merge(batch);
+        }
+        Ok(report)
+    }
+
+    pub async fn enrich_one_scan_job_target(
+        &self,
+        scan_job_id: &str,
+    ) -> Result<Option<MetadataReport>, MetadataError> {
+        let report = self.enrich_scan_job_batch(scan_job_id, 1).await?;
+        Ok((report.items_processed > 0).then_some(report))
+    }
+
+    async fn enrich_scan_job_batch(
+        &self,
+        scan_job_id: &str,
+        limit: usize,
+    ) -> Result<MetadataReport, MetadataError> {
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut report = MetadataReport::default();
+        let movie_sources = self
+            .database
+            .list_scan_job_target_movie_items_page(scan_job_id, limit, 0)
+            .await?;
+        if !movie_sources.is_empty() {
+            let item_ids = movie_sources
                 .iter()
                 .map(|source| source.item_id.clone())
                 .collect::<Vec<_>>();
             let mut batch_report = MetadataReport::default();
-            self.enrich_movie_sources(sources, &mut batch_report).await;
+            self.enrich_movie_sources(movie_sources, &mut batch_report)
+                .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
             report.merge(batch_report);
             self.database
@@ -671,76 +692,56 @@ impl MetadataEnricher {
                     "DONE",
                 )
                 .await?;
+            return Ok(report);
         }
 
-        let mut last_series_id = None;
-        let mut last_season_id = None;
-        let mut last_episode_id = None;
-        let mut directory_cache = DirectoryPathCache::default();
-        loop {
-            let sources = self
-                .database
-                .list_scan_job_target_series_items_page(
-                    scan_job_id,
-                    LIBRARY_SOURCE_PAGE_SIZE as i64,
-                    0,
-                )
-                .await?;
-            if sources.is_empty() {
-                break;
-            }
-            let item_ids = sources
-                .iter()
-                .map(|source| source.episode_id.clone())
-                .collect::<Vec<_>>();
-            let mut batch_report = MetadataReport::default();
-            if let Err(error) = self
-                .enrich_series_sources(
-                    sources,
-                    &mut batch_report,
-                    last_series_id.as_mut(),
-                    last_season_id.as_mut(),
-                    last_episode_id.as_mut(),
-                    &mut directory_cache,
-                )
-                .await
-            {
-                self.database
-                    .mark_scan_job_target_stage(
-                        scan_job_id,
-                        "ITEM",
-                        &item_ids,
-                        "METADATA",
-                        "FAILED",
-                    )
-                    .await?;
-                return Err(error);
-            }
-            let failed_item_ids = batch_report.failed_item_ids.clone();
-            report.merge(batch_report);
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &failed_item_ids,
-                    "METADATA",
-                    "FAILED",
-                )
-                .await?;
-            let completed_item_ids = item_ids
-                .into_iter()
-                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
-                .collect::<Vec<_>>();
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &completed_item_ids,
-                    "METADATA",
-                    "DONE",
-                )
-                .await?;
+        let series_sources = self
+            .database
+            .list_scan_job_target_series_items_page(scan_job_id, limit, 0)
+            .await?;
+        if series_sources.is_empty() {
+            return Ok(report);
         }
+        let item_ids = series_sources
+            .iter()
+            .map(|source| source.episode_id.clone())
+            .collect::<Vec<_>>();
+        let mut batch_report = MetadataReport::default();
+        let mut directory_cache = DirectoryPathCache::default();
+        if let Err(error) = self
+            .enrich_series_sources(
+                series_sources,
+                &mut batch_report,
+                None,
+                None,
+                None,
+                &mut directory_cache,
+            )
+            .await
+        {
+            self.database
+                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "METADATA", "FAILED")
+                .await?;
+            return Err(error);
+        }
+        let failed_item_ids = batch_report.failed_item_ids.clone();
+        report.merge(batch_report);
+        self.database
+            .mark_scan_job_target_stage(scan_job_id, "ITEM", &failed_item_ids, "METADATA", "FAILED")
+            .await?;
+        let completed_item_ids = item_ids
+            .into_iter()
+            .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+            .collect::<Vec<_>>();
+        self.database
+            .mark_scan_job_target_stage(
+                scan_job_id,
+                "ITEM",
+                &completed_item_ids,
+                "METADATA",
+                "DONE",
+            )
+            .await?;
         Ok(report)
     }
 
