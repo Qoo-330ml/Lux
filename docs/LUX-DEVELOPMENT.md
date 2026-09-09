@@ -1250,11 +1250,13 @@ locked local value
 
 空字符串不应覆盖有效值。TMDb 语言回退按选定语言组顺序逐字段补全，而不是整条记录一次性切换语言；详情使用一次 `append_to_response=translations`，回退开关关闭时忽略翻译载荷，首选语言已获得的字段不会被覆盖。
 
+TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使用 TMDb `original_title`/`original_name`，简介、tagline、网站和季/集文字从同一次详情响应的 `translations` 中选择 `original_language` 对应语言；对应翻译缺失时保留首选语言结果。启用时跳过中文标题别名替换。原语言图片按原语言、无语言、英语的顺序优先，已有详情图片在本地筛选，不因该选项重复请求详情。季/集的原语言继承父剧；插件可为冷缓存的父剧补一次详情请求，并在进程内缓存结果。
+
 ### 13.3 刮削器客户端
 
 - TMDb 外置插件的客户端同时兼容 v3 API Key 和历史 v4 Read Access Token。管理员通过 TMDb 插件详情配置自己的 API Key。
 - TMDb 插件自行决定默认凭据、管理员 API Key 和历史 token 的优先级；Lux 不内置、不解析这些凭据，也不在自身 API 或日志中返回它们。
-- TMDb 插件配置包括首选语言组、语言回退开关和有序回退语言组列表，由宿主保存于 `/config/plugin-config/org.lux.tmdb.json` 并通过 `LUX_PLUGIN_CONFIG_PATH` 传给外置插件；宿主和插件都会将旧的地区 locale 归一化为 canonical 语言组，敏感字段仍不可返回。
+- TMDb 插件配置包括首选语言组、语言回退开关、有序回退语言组列表和默认关闭的原语言开关，由宿主保存于 `/config/plugin-config/org.lux.tmdb.json` 并通过 `LUX_PLUGIN_CONFIG_PATH` 传给外置插件；宿主和插件都会将旧的地区 locale 归一化为 canonical 语言组，敏感字段仍不可返回。
 - 主进程的元数据匹配、候选搜索、图片候选和合集请求统一通过媒体库有序刮削器协议；主进程不得直接访问第三方元数据 API。主刮削器先处理全部请求能力，备用刮削器按能力逐项接管主来源空、无效、不支持或重试失败的项目；补充刮削器只对已确认条目继续补全和合并内容，不重新决定媒体身份。
 - 插件内部使用统一 HTTP client、超时、16 并发配额、每秒 32 次请求限流、重试和 User-Agent。
 - 插件 stdin/stdout RPC 支持有界多路复用；响应按 request ID 分发并允许乱序返回，插件进程故障或超时会结束其全部 pending 请求。
@@ -2096,6 +2098,7 @@ services:
 | LUX-245 | web/src/features/player/playback-selection.ts、web/src/features/player/PlayerPage.tsx、web/src/features/player/remote-mkv-caption-reader.ts、web/tests/；远程 STRM 浏览器直连与客户端解码 fallback |
 | LUX-247 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/discovery.rs、src/main.rs、compose.yaml、docs/DEPLOYMENT.md；Emby 兼容局域网发现 |
 | LUX-248 | docs/LUX-DEVELOPMENT.md、docs/decisions/041-device-pairing.md、migrations/0119_device_pairings.sql、migrations-postgres/0119_device_pairings.sql、src/auth/device_pairings.rs、src/security.rs、src/storage/device_pairings.rs、src/storage/catalog.rs、src/storage/repository.rs、src/storage/users.rs、src/storage/mod.rs、src/auth/emby.rs、src/auth/mod.rs、src/api/legacy.rs、src/api/routes.rs、src/api/users.rs、tests/device_pairings.rs、tests/admin_health.rs、tests/danmaku.rs、tests/ready_version.rs、tests/scanner.rs、tests/storage.rs；Lux Prism 一次性设备配对 |
+| LUX-249 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/application/scraper.rs、src/application/images.rs、src/application/candidates.rs、src/storage/media.rs、src/storage/repository.rs、web/src/features/admin/AdminPluginsPage.tsx、web/tests/plugin-library.test.ts；TMDb 原语言文字与图片模式 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -5995,6 +5998,32 @@ PostgreSQL 集成测试目标已编译，但本机没有可用 PostgreSQL 实例
 - 不支持 Emby 的二维码配对，不在 Prism 或服务器保存相机画面。
 - 不改变现有 Web session 或普通 Emby 登录合同，不引入离线写队列。
 - 不在本任务实现 Prism 客户端、二维码渲染组件、摄像头权限或系统凭据库存储。
+
+#### LUX-249：TMDb 原语言文字与图片模式
+
+范围：为外置 `org.lux.tmdb` 增加默认关闭的 `originalLanguageEnabled` 配置。启用后，电影和剧集标题使用 TMDb 原标题，其他文字字段优先使用 `original_language` 对应的翻译；季/集继承父剧原语言。电影、剧集详情响应中已经包含的图片按原语言、无语言、英语优先；独立图片请求仍只发一次上游请求，在需要时请求全语言并本地筛选。宿主通过可选的 `originalLanguage` 图片请求提示传递已持久化的原语言，不改变现有插件的默认行为，也不增加数据库迁移。
+
+验收：
+
+- [ ] TMDb manifest 和 Web 管理页暴露默认关闭的“原语言”开关，旧配置读取后保持关闭且可保存/恢复。
+- [ ] 启用后电影、剧集的标题、简介等文字字段按原语言优先，缺失时回退首选语言；中文标题别名替换不覆盖原语言标题。
+- [ ] 启用后详情图片和独立图片候选按原语言、无语言、英语排序；季/集文字和图片使用父剧原语言。
+- [ ] 电影/剧集详情复用已有 `translations` 和 `images` 载荷；独立图片查询最多一次请求，季/集冷缓存最多补一次父剧详情请求。
+- [ ] 未启用时现有语言、图片筛选、请求字段和插件 RPC 行为保持不变；不新增数据库迁移。
+
+验证：
+
+- 外置 `Lux-plugins`：`cargo test --locked --lib`、`cargo test --locked --bin lux-plugin-tmdb`
+- Lux 主仓库：`cargo test --locked --test scraper`、`cargo test --locked --test image_api`、`cargo test --locked --test plugins`
+- Web：`pnpm --dir web test`、`pnpm --dir web build`
+- `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-144、LUX-195。
+
+明确不做：
+
+- 不将“原语言”伪装成新的 TMDb canonical locale，也不为搜索候选逐项追加详情请求。
+- 不改变 TMDb Provider ID、metadata RPC 方法名称或数据库 schema。
 
 ## 26. 风险与缓解
 

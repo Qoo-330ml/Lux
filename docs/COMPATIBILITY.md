@@ -36,6 +36,13 @@ TMDb 语言配置由外置 `Lux-plugins` 的 `org.lux.tmdb` 提供 73 个 canoni
 外置插件的 settings、TMDb client、插件 metadata 单元测试及发布 manifest 测试通过。该记录证明请求/配置行为，不替代 TMDb
 真实账号数据覆盖率或第三方客户端 UI 兼容性实测。
 
+## LUX-249 TMDb 原语言模式（2026-09-09）
+
+TMDb 插件的 `originalLanguageEnabled` 默认关闭。启用后，电影/剧集标题优先使用 TMDb 原标题，其他文字字段从同一详情
+响应的 `translations` 中选择原语言，图片按原语言、无语言、英语优先；缺少原语言翻译时回退当前首选语言。详情已携带的
+`images` 不重复请求，独立图片候选最多一次上游请求；季/集在插件冷缓存时最多补一次父剧详情来获得原语言。该记录只证明
+插件配置和请求策略，不宣称所有 TMDb 资源都提供完整的原语言翻译或图片覆盖。
+
 ## Emby 媒体删除兼容合同
 
 Emby 兼容层提供 `DELETE /Items/{itemId}`。拥有服务器管理权限的 Emby token/API key 可删除媒体源；
