@@ -1,6 +1,12 @@
 use luxd::{
-    application::libraries::LibraryService, application::scanner::ScanJobService, config::Config,
-    library::LibraryKind, storage::Database,
+    application::{
+        libraries::LibraryService,
+        scanner::{IncrementalScanChange, ScanJobService},
+        watch::ChangeKind,
+    },
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
 };
 
 #[tokio::test]
@@ -114,6 +120,55 @@ async fn incremental_movie_scan_indexes_local_images() -> Result<(), Box<dyn std
     assert_eq!(images[0].0, "FANART");
     assert_eq!(images[1].0, "POSTER");
     assert!(images.iter().all(|(_, path)| path.ends_with(".jpg")));
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_sidecar_change_replaces_local_image() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Sidecar Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Sidecar.Movie.2024.mkv"), b"movie").await?;
+    tokio::fs::write(movie_dir.join("poster.jpg"), b"old-poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    tokio::fs::remove_file(movie_dir.join("poster.jpg")).await?;
+    tokio::fs::write(movie_dir.join("poster.webp"), b"new-poster").await?;
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root.id.to_string(),
+                relative_path: "Sidecar Movie (2024)/poster.webp".to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&incremental.id, 100, None).await?;
+
+    let poster_path: String =
+        sqlx::query_scalar("SELECT local_path FROM item_images WHERE image_type = 'POSTER'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(poster_path.ends_with("poster.webp"));
     Ok(())
 }
 

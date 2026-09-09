@@ -985,14 +985,7 @@ impl Database {
         &self,
         job_id: &str,
     ) -> Result<i64, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let total_count: i64 = self
             .query_scalar(
                 "SELECT COUNT(*) FROM reconciliation_scan_entries
@@ -4448,14 +4441,7 @@ impl Database {
             return Ok(false);
         }
 
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let max_function = self.scalar_max_function();
         let query = format!(
             "INSERT INTO user_item_state (

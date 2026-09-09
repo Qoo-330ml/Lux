@@ -781,14 +781,7 @@ impl Database {
         if parent_is_current {
             return Ok(());
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let parent_folder_id = self
             .ensure_movie_parent_folder_in_transaction(
                 &mut transaction,
@@ -1673,14 +1666,7 @@ impl Database {
         season_identity: &str,
         episode_identity: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let hierarchy = self
             .query_as::<(String, String, String)>(
                 "SELECT episode.id, season.id, series.id

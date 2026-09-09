@@ -46,6 +46,7 @@ async fn full_scan_indexes_discovered_file_before_directory_discovery_finishes()
             b"fixture",
         )
         .await?;
+        tokio::fs::write(directory.join("poster.jpg"), b"poster").await?;
     }
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
@@ -57,18 +58,47 @@ async fn full_scan_indexes_discovered_file_before_directory_discovery_finishes()
     let worker = tokio::spawn(async move { jobs.run_to_completion(&job_id, 1, None).await });
     let observed = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let visible_items: i64 = sqlx::query_scalar(
+            let visible_items: i64 = match sqlx::query_scalar(
                 "SELECT COUNT(*) FROM media_items
                  WHERE item_type = 'MOVIE' AND has_available_source = 1 AND removed_at IS NULL",
             )
             .fetch_one(database.pool())
-            .await?;
+            .await
+            {
+                Ok(count) => count,
+                Err(error) if error.to_string().contains("database is locked") => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
             let discovery_completed: i64 =
-                sqlx::query_scalar("SELECT discovery_completed FROM scan_jobs WHERE id = ?")
+                match sqlx::query_scalar("SELECT discovery_completed FROM scan_jobs WHERE id = ?")
                     .bind(&job.id)
                     .fetch_one(database.pool())
-                    .await?;
-            if visible_items > 0 && discovery_completed == 0 {
+                    .await
+                {
+                    Ok(completed) => completed,
+                    Err(error) if error.to_string().contains("database is locked") => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+            let image_count: i64 = match sqlx::query_scalar(
+                "SELECT COUNT(*) FROM item_images WHERE image_type = 'POSTER'",
+            )
+            .fetch_one(database.pool())
+            .await
+            {
+                Ok(count) => count,
+                Err(error) if error.to_string().contains("database is locked") => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if visible_items > 0 && image_count > 0 && discovery_completed == 0 {
                 break Ok::<(), Box<dyn std::error::Error>>(());
             }
             tokio::time::sleep(Duration::from_millis(5)).await;

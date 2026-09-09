@@ -3785,25 +3785,25 @@ impl ScanJobService {
                 };
                 created_items = created_items.saturating_add(inserted);
             }
+            if let Some(paths) = new_paths_by_root.get(&root.id) {
+                self.database
+                    .record_scan_job_targets(&job.id, &root.id, paths, "NEW")
+                    .await?;
+            }
+            if let Some(paths) = changed_paths_by_root.get(&root.id) {
+                self.database
+                    .record_scan_job_targets(&job.id, &root.id, paths, "CHANGED")
+                    .await?;
+            }
+            if let Some(paths) = changed_sidecar_paths_by_root.get(&root.id) {
+                self.database
+                    .record_scan_job_sidecar_targets(&job.id, &root.id, paths)
+                    .await?;
+            }
         }
         self.database
             .mark_filesystem_entries_seen_batch(&quick_seen_entry_ids, &job.generation)
             .await?;
-        for (root_id, paths) in new_paths_by_root {
-            self.database
-                .record_scan_job_targets(&job.id, &root_id, &paths, "NEW")
-                .await?;
-        }
-        for (root_id, paths) in changed_paths_by_root {
-            self.database
-                .record_scan_job_targets(&job.id, &root_id, &paths, "CHANGED")
-                .await?;
-        }
-        for (root_id, paths) in changed_sidecar_paths_by_root {
-            self.database
-                .record_scan_job_sidecar_targets(&job.id, &root_id, &paths)
-                .await?;
-        }
         self.finish_reconciliation_file_batch(
             job,
             completed_entries,
@@ -4133,46 +4133,45 @@ impl ScanJobService {
         }
 
         for root in roots {
-            let Some(files) = prepared_files.get(&root.id) else {
-                continue;
-            };
-            let inserted = match self
-                .database
-                .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
-                .await
-            {
-                Ok(inserted) => inserted,
-                Err(error) => {
-                    let completed = completed_entries
-                        .iter()
-                        .map(|(_, entry)| entry.clone())
-                        .collect::<Vec<_>>();
-                    return self
-                        .fail_reconciliation_job(job, error.into(), &completed, next_count)
-                        .await;
-                }
-            };
-            created_items = created_items.saturating_add(inserted);
+            if let Some(files) = prepared_files.get(&root.id) {
+                let inserted = match self
+                    .database
+                    .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
+                    .await
+                {
+                    Ok(inserted) => inserted,
+                    Err(error) => {
+                        let completed = completed_entries
+                            .iter()
+                            .map(|(_, entry)| entry.clone())
+                            .collect::<Vec<_>>();
+                        return self
+                            .fail_reconciliation_job(job, error.into(), &completed, next_count)
+                            .await;
+                    }
+                };
+                created_items = created_items.saturating_add(inserted);
+            }
+            if let Some(paths) = new_paths_by_root.get(&root.id) {
+                self.database
+                    .record_scan_job_targets(&job.id, &root.id, paths, "NEW")
+                    .await?;
+            }
+            if let Some(paths) = changed_paths_by_root.get(&root.id) {
+                self.database
+                    .record_scan_job_targets(&job.id, &root.id, paths, "CHANGED")
+                    .await?;
+            }
+            if let Some(paths) = changed_sidecar_paths_by_root.get(&root.id) {
+                self.database
+                    .record_scan_job_sidecar_targets(&job.id, &root.id, paths)
+                    .await?;
+            }
         }
 
         self.database
             .mark_filesystem_entries_seen_batch(&quick_seen_entry_ids, &job.generation)
             .await?;
-        for (root_id, paths) in new_paths_by_root {
-            self.database
-                .record_scan_job_targets(&job.id, &root_id, &paths, "NEW")
-                .await?;
-        }
-        for (root_id, paths) in changed_paths_by_root {
-            self.database
-                .record_scan_job_targets(&job.id, &root_id, &paths, "CHANGED")
-                .await?;
-        }
-        for (root_id, paths) in changed_sidecar_paths_by_root {
-            self.database
-                .record_scan_job_sidecar_targets(&job.id, &root_id, &paths)
-                .await?;
-        }
 
         completed_entries.sort_by_key(|(index, _)| *index);
         let completed_entries = completed_entries
