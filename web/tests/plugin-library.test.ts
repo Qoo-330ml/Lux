@@ -310,6 +310,7 @@ describe("AdminPluginsPage plugin cards", () => {
         preferredLanguage: "zh-CN",
         languageFallbackEnabled: false,
         titleAliasReplacementEnabled: false,
+        originalLanguageEnabled: false,
         fallbackLanguages: ["zh-TW"],
         alternateApiEnabled: true,
         apiBaseUrlPreset: "official",
@@ -344,6 +345,14 @@ describe("AdminPluginsPage plugin cards", () => {
           required: false,
           sensitive: false,
           description: "当tmdb语言检索不到中文名称时，尝试使用中文别名替换",
+        },
+        {
+          key: "originalLanguageEnabled",
+          label: "原语言",
+          type: "toggle",
+          required: false,
+          sensitive: false,
+          description: "按 TMDb 资源原语言优先刮削文字、海报和背景图。",
         },
         {
           key: "fallbackLanguages",
@@ -407,7 +416,8 @@ describe("AdminPluginsPage plugin cards", () => {
     await act(async () => selects[1]?.click());
     expect(dialog?.textContent).toContain("标题别名替换");
     expect(dialog?.textContent).toContain("当tmdb语言检索不到中文名称时，尝试使用中文别名替换");
-    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(3);
+    expect(dialog?.textContent).toContain("原语言");
+    expect(dialog?.querySelectorAll('input[type="checkbox"]')).toHaveLength(4);
 
     await act(async () => selects[2]?.click());
     await act(async () => document.querySelector<HTMLButtonElement>("[role=option][data-value='custom']")?.click());
@@ -425,6 +435,7 @@ describe("AdminPluginsPage plugin cards", () => {
       preferredLanguage: "zh-CN",
       languageFallbackEnabled: false,
       titleAliasReplacementEnabled: false,
+      originalLanguageEnabled: false,
       fallbackLanguages: ["zh-TW"],
       alternateApiEnabled: true,
       apiBaseUrlPreset: "custom",
