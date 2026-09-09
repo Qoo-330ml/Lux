@@ -29,8 +29,7 @@ test("dashboard overview uses modern bento box grid rhythm", () => {
   const bentoGridRule = stylesheet.match(/\.lux-bento-grid\s*\{([^}]*)\}/)?.[1] ?? "";
   const bentoCardRule = stylesheet.match(/\.lux-bento-card\s*\{([^}]*)\}/)?.[1] ?? "";
   const bentoHeroRule = stylesheet.match(/\.lux-bento-card-hero\s*\{([^}]*)\}/)?.[1] ?? "";
-  const mediaClusterRule = stylesheet.match(/\.lux-bento-card-media\s*\{([^}]*)\}/)?.[1] ?? "";
-  const mediaSubcardRule = stylesheet.match(/\.lux-bento-media-subcard\s*\{([^}]*)\}/)?.[1] ?? "";
+  const mediaCountRule = stylesheet.match(/\.lux-bento-card-media-count\s*\{([^}]*)\}/)?.[1] ?? "";
   const bentoIconTileRule = stylesheet.match(/\.lux-bento-icon-tile\s*\{([^}]*)\}/)?.[1] ?? "";
   const bentoValueRule = stylesheet.match(/\.lux-bento-metric-body\s+strong\s*\{([^}]*)\}/)?.[1] ?? "";
   const bentoStorageRule = stylesheet.match(/\.lux-bento-icon-tile\.is-storage\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -53,10 +52,10 @@ test("dashboard overview uses modern bento box grid rhythm", () => {
   assert.match(bentoCardRule, /background:\s*rgba\(255,\s*255,\s*255,\s*(?:0)?\.008\)/);
   assert.match(bentoCardRule, /box-shadow:/);
   assert.match(bentoHeroRule, /grid-column:\s*span 4/);
-  assert.match(mediaClusterRule, /background:\s*transparent/);
-  assert.match(mediaClusterRule, /border:\s*0/);
-  assert.match(mediaSubcardRule, /background:\s*rgba\(255,\s*255,\s*255,\s*0\.008\)/);
-  assert.match(mediaSubcardRule, /border-radius:\s*12px/);
+  assert.match(mediaCountRule, /grid-column:\s*span 1/);
+  assert.match(mediaCountRule, /min-height:\s*116px/);
+  assert.doesNotMatch(stylesheet, /\.lux-bento-card-media\s*\{/);
+  assert.doesNotMatch(stylesheet, /\.lux-bento-media-subcard\s*\{/);
   assert.match(bentoIconTileRule, /display:\s*grid/);
   assert.match(bentoIconTileRule, /border-radius:\s*8px/);
   assert.match(bentoValueRule, /color:\s*var\(--lux-overview-value\)/);

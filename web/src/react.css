@@ -1048,18 +1048,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   border-top: 1px solid var(--lux-overview-line);
 }
 
-.lux-bento-card-media {
-  grid-column: span 2;
-  min-height: 154px;
-  padding: 16px;
-  border: 0;
-  border-radius: 0;
-  background: transparent;
-  box-shadow: none;
-  backdrop-filter: none;
-  -webkit-backdrop-filter: none;
-}
-
 .lux-bento-card-header {
   display: flex;
   align-items: center;
@@ -1075,39 +1063,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   color: var(--lux-overview-muted);
   font-size: .72rem;
   font-weight: 600;
-}
-
-.lux-bento-card-meta {
-  color: var(--lux-subtle);
-  font-size: 0.72rem;
-  font-family: ui-monospace, monospace;
-}
-
-.lux-bento-media-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 8px;
-  margin-bottom: 8px;
-}
-
-.lux-bento-media-subcard {
-  display: grid;
-  min-width: 0;
-  gap: 5px;
-  padding: 8px 10px;
-  border: 1px solid var(--lux-line-soft);
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.008);
-}
-
-.lux-bento-media-subcard strong {
-  font-size: 1.18rem;
-  font-weight: 700;
-  font-family: ui-monospace, monospace;
-  color: var(--lux-overview-value);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .lux-bento-card-users {
@@ -1127,6 +1082,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-bento-card-storage {
   grid-column: span 2;
+  min-height: 116px;
+}
+
+.lux-bento-card-media-count {
+  grid-column: span 1;
   min-height: 116px;
 }
 
@@ -1195,20 +1155,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   font-family: ui-monospace, monospace;
 }
 
-.lux-bento-card-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-width: 0;
-  color: var(--lux-overview-muted);
-  font-size: 0.72rem;
-}
-
-.lux-bento-card-media .lux-bento-card-footer {
-  padding-top: 8px;
-  border-top: 1px solid var(--lux-line-soft);
-}
-
 .lux-bento-icon-tile {
   display: grid;
   place-items: center;
@@ -1239,24 +1185,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 }
 .lux-bento-icon-tile svg { display: block; }
 
-.lux-bento-link {
-  color: var(--lux-accent);
-  font-weight: 550;
-  transition: color 0.15s ease;
-}
-
-.lux-bento-link:hover {
-  text-decoration: underline;
-}
-
 @media (max-width: 1024px) {
   .lux-bento-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .lux-bento-card-hero {
-    grid-column: span 2;
-  }
-  .lux-bento-card-media {
     grid-column: span 2;
   }
   .lux-bento-card-users {
@@ -1278,7 +1211,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
     grid-template-columns: 1fr;
   }
   .lux-bento-card-hero,
-  .lux-bento-card-media,
   .lux-bento-card-users,
   .lux-bento-card-cpu,
   .lux-bento-card-mem,
@@ -2499,16 +2431,11 @@ html[data-lux-theme="light"] .lux-bento-card-hero {
   background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 5%, transparent) 0%, transparent 72%),
               rgba(28, 28, 34, .012);
 }
-html[data-lux-theme="light"] .lux-bento-card-media {
-  background: transparent;
-  box-shadow: none;
-}
 html[data-lux-theme="light"] .lux-bento-hero-icon,
 html[data-lux-theme="light"] .lux-bento-icon-tile,
 html[data-lux-theme="light"] .lux-bento-version > span {
   background: rgba(28, 28, 34, .045);
 }
-html[data-lux-theme="light"] .lux-bento-media-subcard { background: rgba(28, 28, 34, .012); }
 html[data-lux-theme="light"] .lux-bento-progress-track { background: rgba(28, 28, 34, .1); }
 html[data-lux-theme="light"] .lux-status-pill.is-ok { color: #247b4b; background: rgba(36,123,75,.12); }
 html[data-lux-theme="light"] .lux-status-pill.is-warn { color: #9a5f13; background: rgba(154,95,19,.12); }

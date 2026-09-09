@@ -150,6 +150,12 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector(".lux-bento-version strong")?.textContent).toBe("v0.2.7");
     expect(overview?.querySelectorAll(".lux-bento-icon-tile")).toHaveLength(4);
     expect(overview?.querySelector(".lux-bento-icon-tile.is-storage")).not.toBeNull();
+    const mediaCountCards = [...overview?.querySelectorAll(".lux-bento-card-media-count") ?? []];
+    expect(mediaCountCards).toHaveLength(2);
+    expect(mediaCountCards.map((card) => card.textContent?.trim())).toEqual(["电影数量42", "剧集数量7"]);
+    expect(overview?.querySelector(".lux-bento-card-media")).toBeNull();
+    expect(overview?.textContent).not.toContain("元数据已就绪");
+    expect(overview?.textContent).not.toContain("进入媒体库");
     expect(overview?.querySelector(".lux-bento-card-users .lux-bento-card-footer")).toBeNull();
     expect(overview?.querySelector(".lux-bento-card-cpu .lux-bento-card-footer")).toBeNull();
     expect(overview?.querySelector(".lux-bento-card-mem .lux-bento-card-footer")).toBeNull();
