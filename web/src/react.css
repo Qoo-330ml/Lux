@@ -1008,6 +1008,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
   gap: 12px;
   margin-bottom: 8px;
 }
@@ -1019,15 +1020,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   flex-wrap: wrap;
 }
 
-.lux-bento-hero-icon {
-  display: grid;
-  place-items: center;
-  width: 36px;
-  height: 36px;
-  border: 1px solid var(--lux-line-soft);
-  border-radius: 9px;
+.lux-bento-hero-runtime {
+  flex: 0 0 auto;
   color: var(--lux-overview-icon);
-  background: rgba(255, 255, 255, 0.03);
+  white-space: nowrap;
 }
 
 .lux-bento-card-hero .lux-admin-overview-identity {
@@ -1038,14 +1034,6 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
   font-size: clamp(1.15rem, 2vw, 1.35rem);
   font-weight: 700;
   letter-spacing: -.04em;
-}
-
-.lux-bento-hero-footer {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding-top: 10px;
-  border-top: 1px solid var(--lux-overview-line);
 }
 
 .lux-bento-card-header {
@@ -2431,7 +2419,6 @@ html[data-lux-theme="light"] .lux-bento-card-hero {
   background: radial-gradient(100% 120% at 0% 0%, color-mix(in srgb, var(--lux-accent) 5%, transparent) 0%, transparent 72%),
               rgba(28, 28, 34, .012);
 }
-html[data-lux-theme="light"] .lux-bento-hero-icon,
 html[data-lux-theme="light"] .lux-bento-icon-tile,
 html[data-lux-theme="light"] .lux-bento-version > span {
   background: rgba(28, 28, 34, .045);

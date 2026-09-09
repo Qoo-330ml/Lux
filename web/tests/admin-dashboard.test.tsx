@@ -144,6 +144,9 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector('[data-overview-value="运行时长"] strong')?.textContent).toBe("1天 1时 1分 1秒");
     expect(overview?.querySelector('[data-overview-value="版本"]')?.textContent).toBe("版本：v0.2.7");
     expect(overview?.querySelector('[data-overview-value="运行时长"]')?.textContent).toBe("运行时长：1天 1时 1分 1秒");
+    expect(overview?.querySelector(".lux-bento-hero-runtime[data-overview-value=\"运行时长\"]")).not.toBeNull();
+    expect(overview?.querySelector(".lux-bento-hero-icon")).toBeNull();
+    expect(overview?.querySelector(".lux-bento-hero-footer")).toBeNull();
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-icon")).toHaveLength(0);
     expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "0.8 / 2.0 核", "1.0 GiB", "10.0 GiB / 100.0 GiB"]);

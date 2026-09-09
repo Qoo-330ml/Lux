@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Clock3, Cpu, Database, MemoryStick, Pencil, Server, Users, X } from "lucide-react";
+import { Clock3, Cpu, Database, MemoryStick, Pencil, Users, X } from "lucide-react";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { AdminDashboardActivity } from "./AdminDashboardActivity";
 import { AdminDashboardNowPlaying } from "./AdminDashboardNowPlaying";
@@ -89,9 +89,12 @@ export function AdminDashboardPage() {
                 </div>
                 <OverviewInfo className="lux-bento-version" label="版本" value={`v${server.version}`} />
               </div>
-              <div className="lux-bento-hero-icon" aria-hidden="true">
-                <Server size={20} />
-              </div>
+              <OverviewInfo
+                className="lux-bento-hero-runtime"
+                icon={<Clock3 className="lux-bento-inline-icon" size={14} strokeWidth={1.8} />}
+                label="运行时长"
+                value={formatRuntime(health.runtime.seconds)}
+              />
             </div>
 
             <div className="lux-admin-overview-identity">
@@ -107,10 +110,6 @@ export function AdminDashboardPage() {
                   <Pencil size={18} />
                 </button>
               </div>
-            </div>
-
-            <div className="lux-bento-hero-footer">
-              <OverviewInfo icon={<Clock3 className="lux-bento-inline-icon" size={14} strokeWidth={1.8} />} label="运行时长" value={formatRuntime(health.runtime.seconds)} />
             </div>
           </div>
 
