@@ -15,6 +15,19 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.0",
+    date: "2026-09-09",
+    sections: [
+      { kind: "added", items: [
+        "新增季度海报回退：季度没有独立海报时，详情页和剧集季度卡片会使用所属剧集海报。",
+      ] },
+      { kind: "changed", items: [
+        "改善季度浏览时的图片连续性和内容识别度。",
+        "优化管理台 Dashboard Hero 卡片高度，减少首屏空间占用。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.12",
     date: "2026-09-09",
     sections: [
