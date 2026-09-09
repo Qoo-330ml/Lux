@@ -156,10 +156,10 @@ impl HomeService {
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = entry.value.lock().await;
-            if let Some(cached) = cached.as_ref() {
-                if cached.generation != generation
-                    || cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL
-                {
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
+            {
+                if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
                     self.schedule_refresh();
                 }
                 return Ok(cached.snapshot.clone());
@@ -170,17 +170,17 @@ impl HomeService {
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = entry.value.lock().await;
-            if let Some(cached) = cached.as_ref() {
-                if cached.generation != generation
-                    || cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL
-                {
+            if let Some(cached) = cached.as_ref()
+                && cached.generation == generation
+            {
+                if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
                     self.schedule_refresh();
                 }
                 return Ok(cached.snapshot.clone());
             }
         }
 
-        let snapshot = Arc::new(self.build_snapshot(principal, &library_ids).await?);
+        let snapshot = Arc::new(self.build_snapshot(principal, &library_ids, true).await?);
         *entry.value.lock().await = Some(CachedSnapshot {
             generation,
             refreshed_at: Instant::now(),
@@ -294,7 +294,7 @@ impl HomeService {
             drop(cached);
             let notified = self.inner.invalidation_notify.notified();
             let result = tokio::select! {
-                result = self.build_snapshot(entry.principal, &entry.library_ids) => Some(result),
+                result = self.build_snapshot(entry.principal, &entry.library_ids, false) => Some(result),
                 _ = notified => None,
             };
             match result {
@@ -317,8 +317,13 @@ impl HomeService {
         &self,
         principal: AccessPrincipal,
         accessible_library_ids: &[String],
+        require_fresh_shared: bool,
     ) -> Result<HomeSnapshot, HomeError> {
-        let shared = self.shared_snapshot().await?;
+        let shared = if require_fresh_shared {
+            self.refresh_shared_snapshot().await?
+        } else {
+            self.shared_snapshot().await?
+        };
         let user_id = principal.user_id.to_string();
         let (continue_watching, recently_added, recommended, views) = tokio::try_join!(
             async {
@@ -460,5 +465,33 @@ mod tests {
 
         assert!(std::ptr::eq(first.as_ref(), reused.as_ref()));
         assert!(!std::ptr::eq(first.as_ref(), isolated.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn invalidation_rebuilds_user_home_snapshot_before_returning_it() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+        let principal = AccessPrincipal::new(UserId::new(), false);
+
+        let first = home
+            .snapshot(principal, Vec::new())
+            .await
+            .expect("first user snapshot");
+        home.invalidate();
+        let refreshed = home
+            .snapshot(principal, Vec::new())
+            .await
+            .expect("invalidated user snapshot");
+
+        assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
     }
 }

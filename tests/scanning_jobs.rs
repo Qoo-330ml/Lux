@@ -25,6 +25,139 @@ use luxd::{
 use tokio::sync::Semaphore;
 
 #[tokio::test]
+async fn full_scan_indexes_discovered_file_before_directory_discovery_finishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for index in 0..64 {
+        let directory = root.join(format!("Movie {index:03} (2024)"));
+        tokio::fs::create_dir_all(&directory).await?;
+        tokio::fs::write(
+            directory.join(format!("Movie.{index:03}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+        tokio::fs::write(directory.join("poster.jpg"), b"poster").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let job_id = job.id.clone();
+    let worker = tokio::spawn(async move { jobs.run_to_completion(&job_id, 1, None).await });
+    let observed = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let visible_items: i64 = match sqlx::query_scalar(
+                "SELECT COUNT(*) FROM media_items
+                 WHERE item_type = 'MOVIE' AND has_available_source = 1 AND removed_at IS NULL",
+            )
+            .fetch_one(database.pool())
+            .await
+            {
+                Ok(count) => count,
+                Err(error) if error.to_string().contains("database is locked") => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let discovery_completed: i64 =
+                match sqlx::query_scalar("SELECT discovery_completed FROM scan_jobs WHERE id = ?")
+                    .bind(&job.id)
+                    .fetch_one(database.pool())
+                    .await
+                {
+                    Ok(completed) => completed,
+                    Err(error) if error.to_string().contains("database is locked") => {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+            let image_count: i64 = match sqlx::query_scalar(
+                "SELECT COUNT(*) FROM item_images WHERE image_type = 'POSTER'",
+            )
+            .fetch_one(database.pool())
+            .await
+            {
+                Ok(count) => count,
+                Err(error) if error.to_string().contains("database is locked") => {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if visible_items > 0 && image_count > 0 && discovery_completed == 0 {
+                break Ok::<(), Box<dyn std::error::Error>>(());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    observed?;
+    worker.await??;
+    Ok(())
+}
+
+#[tokio::test]
+async fn incremental_scan_registers_local_metadata_target_after_each_file()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let relative_path = "Incremental.Movie.2024.mkv";
+    tokio::fs::write(root.join(relative_path), b"fixture").await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: relative_path.to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    let report = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(report.processed, 1);
+
+    let target: (i64, String) = sqlx::query_as(
+        "SELECT COUNT(*), metadata_state FROM scan_job_targets
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(target, (1, "PENDING".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_persists_batches_and_manual_rerun_can_continue()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

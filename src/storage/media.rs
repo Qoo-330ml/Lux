@@ -781,14 +781,7 @@ impl Database {
         if parent_is_current {
             return Ok(());
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let parent_folder_id = self
             .ensure_movie_parent_folder_in_transaction(
                 &mut transaction,
@@ -828,14 +821,7 @@ impl Database {
         if files.is_empty() {
             return Ok(0);
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let mut folder_cache = self
             .prefetch_movie_folders_in_transaction(&mut transaction, library_root_id, files)
             .await?;
@@ -1082,14 +1068,7 @@ impl Database {
         if files.is_empty() {
             return Ok(0);
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
 
         for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
             let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
@@ -1687,14 +1666,7 @@ impl Database {
         season_identity: &str,
         episode_identity: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
         let hierarchy = self
             .query_as::<(String, String, String)>(
                 "SELECT episode.id, season.id, series.id

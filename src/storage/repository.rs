@@ -314,6 +314,20 @@ impl Database {
         })
     }
 
+    pub(crate) async fn begin_scan_write_transaction(
+        &self,
+    ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        let transaction = if self.backend == DatabaseBackend::Sqlite {
+            self.pool.begin_with("BEGIN IMMEDIATE").await
+        } else {
+            self.pool.begin().await
+        };
+        transaction.map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub async fn test_configuration(
         configuration: &DatabaseConfiguration,
     ) -> Result<(), StorageError> {
