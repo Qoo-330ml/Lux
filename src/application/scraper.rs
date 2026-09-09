@@ -410,6 +410,8 @@ pub struct ScraperImageRequest {
     pub provider_id: String,
     pub language: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub original_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub season_number: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub episode_number: Option<i32>,
@@ -425,6 +427,7 @@ impl ScraperImageRequest {
             item_type,
             provider_id: provider_id.into(),
             language: language.into(),
+            original_language: None,
             season_number: None,
             episode_number: None,
         }
@@ -871,6 +874,8 @@ pub struct ScraperMetadataItem {
 pub struct ScraperImagesResponse {
     #[serde(default)]
     pub images: Vec<ScraperImage>,
+    #[serde(default, rename = "originalLanguageMode")]
+    pub original_language_mode: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -1318,7 +1323,13 @@ pub fn decode_images_response(value: Value) -> Result<ScraperImagesResponse, Scr
         .ok_or_else(|| ScraperError::InvalidResponse("scraper response lacks images".to_owned()))?;
     let images = serde_json::from_value(images)
         .map_err(|error| ScraperError::InvalidResponse(error.to_string()))?;
-    Ok(ScraperImagesResponse { images })
+    Ok(ScraperImagesResponse {
+        images,
+        original_language_mode: value
+            .get("originalLanguageMode")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
 }
 
 pub fn decode_credits_response(value: Value) -> Result<ScraperCreditsResponse, ScraperError> {

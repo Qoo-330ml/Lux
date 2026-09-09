@@ -467,7 +467,10 @@ fn map_images(value: &Value) -> ScraperImagesResponse {
     append_images(&mut images, value, "stills", "Backdrop");
     append_images(&mut images, value, "logos", "Logo");
     append_images(&mut images, value, "profiles", "Profile");
-    ScraperImagesResponse { images }
+    ScraperImagesResponse {
+        images,
+        ..ScraperImagesResponse::default()
+    }
 }
 
 fn append_images(target: &mut Vec<ScraperImage>, value: &Value, key: &str, image_type: &str) {

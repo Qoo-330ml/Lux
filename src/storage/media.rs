@@ -1889,7 +1889,8 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredImageIdentity>, StorageError> {
         self.query(
-            "SELECT mi.item_type, mi.provider_ids_json,
+            "SELECT mi.item_type, mi.original_language AS item_original_language, mi.provider_ids_json,
+                    series.original_language AS series_original_language,
                     series.provider_ids_json AS series_provider_ids_json,
                     COALESCE(series.metadata_scraper_id, l.scraper_id) AS series_scraper_id,
                     mi.season_number, mi.episode_number,
@@ -1914,6 +1915,9 @@ impl Database {
                 );
                 StoredImageIdentity {
                     item_type: row.get("item_type"),
+                    original_language: row
+                        .get::<Option<String>, _>("item_original_language")
+                        .or_else(|| row.get("series_original_language")),
                     provider_name: provider.as_ref().map(|(name, _)| name.clone()),
                     provider_id: provider.map(|(_, id)| id),
                     season_number: row.get("season_number"),

@@ -63,6 +63,27 @@ fn generic_scraper_requests_use_provider_neutral_fields() {
             "language": "zh-CN"
         })
     );
+
+    let images_response = decode_images_response(json!({
+        "images": [],
+        "originalLanguageMode": true
+    }))
+    .expect("image response should decode");
+    assert!(images_response.original_language_mode);
+
+    let mut original_language_images =
+        ScraperImageRequest::new(ScraperItemType::Movie, "tmdb-123", "zh-CN");
+    original_language_images.original_language = Some("en".to_owned());
+    assert_eq!(
+        serde_json::to_value(original_language_images)
+            .expect("original-language image request should serialize"),
+        json!({
+            "itemType": "Movie",
+            "providerId": "tmdb-123",
+            "language": "zh-CN",
+            "originalLanguage": "en"
+        })
+    );
 }
 
 #[test]

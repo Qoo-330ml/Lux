@@ -1193,6 +1193,7 @@ impl ImageCandidateService {
         };
         let scraper = self.provider_for_item(item_id).await?;
         let mut image_request = ScraperImageRequest::new(item_type, provider_id, language);
+        image_request.original_language = identity.original_language.clone();
         image_request.season_number = identity
             .season_number
             .map(|value| i32::try_from(value).map_err(|_| ImageCandidateError::InvalidItem))
@@ -1201,11 +1202,12 @@ impl ImageCandidateService {
             .episode_number
             .map(|value| i32::try_from(value).map_err(|_| ImageCandidateError::InvalidItem))
             .transpose()?;
-        let images = scraper
+        let image_response = scraper
             .images_generic(image_request)
             .await
-            .map_err(ImageCandidateError::Scraper)?
-            .images;
+            .map_err(ImageCandidateError::Scraper)?;
+        let original_language_mode = image_response.original_language_mode;
+        let images = image_response.images;
         let requested_language = language.split('-').next().filter(|value| !value.is_empty());
         Ok(images
             .into_iter()
@@ -1220,11 +1222,13 @@ impl ImageCandidateService {
                 })
             })
             .filter(|(_, image)| {
-                requested_language.is_none()
-                    || image
-                        .language
-                        .as_deref()
-                        .is_some_and(|value| Some(value) == requested_language)
+                image_language_matches(
+                    image.language.as_deref(),
+                    requested_language,
+                    original_language_mode
+                        .then_some(identity.original_language.as_deref())
+                        .flatten(),
+                )
             })
             .map(|(index, image)| {
                 let provider_name = image
@@ -1267,6 +1271,26 @@ impl ImageCandidateService {
                     .unwrap_or_else(|| self.scraper.clone())
             })
     }
+}
+
+fn image_language_matches(
+    image_language: Option<&str>,
+    requested_language: Option<&str>,
+    original_language: Option<&str>,
+) -> bool {
+    let Some(requested_language) = requested_language else {
+        return true;
+    };
+    if image_language.is_some_and(|value| value == requested_language) {
+        return true;
+    }
+    let Some(original_language) = original_language else {
+        return false;
+    };
+    image_language.is_none()
+        || image_language.is_some_and(|value| {
+            value.eq_ignore_ascii_case(original_language) || value.eq_ignore_ascii_case("en")
+        })
 }
 
 fn matches_image_type(image: &ScraperImage, image_type: &str) -> bool {
@@ -2251,8 +2275,8 @@ mod tests {
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImageWriteError,
         canonical_image_stems, global_image_download_permits, global_image_write_permits,
         image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
-        image_download_retry_delay, image_lookup_stems, is_allowed_scraper_image_url,
-        retryable_image_status,
+        image_download_retry_delay, image_language_matches, image_lookup_stems,
+        is_allowed_scraper_image_url, retryable_image_status,
     };
 
     #[test]
@@ -2334,6 +2358,14 @@ mod tests {
         assert!(!is_allowed_scraper_image_url(
             "http://img.douban.example/poster.jpg"
         ));
+    }
+
+    #[test]
+    fn original_language_image_filter_keeps_original_fallbacks() {
+        assert!(image_language_matches(Some("en"), Some("zh"), Some("en")));
+        assert!(image_language_matches(None, Some("zh"), Some("en")));
+        assert!(image_language_matches(Some("en"), Some("zh"), Some("ja")));
+        assert!(!image_language_matches(Some("fr"), Some("zh"), Some("en")));
     }
 
     #[test]

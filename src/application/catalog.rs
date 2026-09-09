@@ -1460,7 +1460,7 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                     item_type: row.item_type.clone(),
                     parent_id: row.parent_id.clone(),
                     series_id: row.series_id.clone(),
-                    series_name: None,
+                    series_name: row.series_name.clone(),
                     season_number: row.season_number,
                     episode_number: row.episode_number,
                     title: row.title.clone(),

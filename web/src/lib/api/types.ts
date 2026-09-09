@@ -190,6 +190,7 @@ export type MediaItem = {
   nfo?: MediaNfoDetails | null;
   parentId?: string | null;
   seriesId?: string | null;
+  seriesName?: string | null;
   indexNumber?: number | null;
   parentIndexNumber?: number | null;
   metadataPending?: boolean;

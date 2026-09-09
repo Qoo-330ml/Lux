@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.3.11",
+    date: "2026-09-09",
+    sections: [
+      { kind: "added", items: [
+        "TMDb 插件新增默认关闭的“原语言”模式；启用后电影和剧集优先使用原语言标题、文字和图片，并在缺少对应翻译时回退到首选语言。",
+        "继续观看中的剧集分集卡片现在显示剧集名称，便于区分同名或仅显示集标题的播放记录。",
+      ] },
+      { kind: "changed", items: [
+        "原语言图片请求携带媒体原语言提示，在本地按原语言、无语言和英语顺序筛选详情图片及独立图片候选。",
+        "Lux 媒体目录接口为分集补充 seriesName 字段，供 Web 和其他客户端展示所属剧集。",
+      ] },
+    ],
+  },
+  {
     version: "0.3.10",
     date: "2026-09-08",
     sections: [

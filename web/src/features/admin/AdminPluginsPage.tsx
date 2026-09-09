@@ -143,6 +143,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const [preferredLanguage, setPreferredLanguage] = useState("zh-CN");
   const [languageFallbackEnabled, setLanguageFallbackEnabled] = useState(false);
   const [titleAliasReplacementEnabled, setTitleAliasReplacementEnabled] = useState(false);
+  const [originalLanguageEnabled, setOriginalLanguageEnabled] = useState(false);
   const [fallbackLanguages, setFallbackLanguages] = useState<string[]>(["zh-SG", "zh-HK", "zh-TW"]);
   const [alternateApiEnabled, setAlternateApiEnabled] = useState(false);
   const [apiBaseUrlChoice, setApiBaseUrlChoice] = useState("official");
@@ -173,6 +174,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
   const preferredLanguageField = plugin.configFields.find((field) => field.key === "preferredLanguage");
   const fallbackEnabledField = plugin.configFields.find((field) => field.key === "languageFallbackEnabled");
   const titleAliasReplacementField = plugin.configFields.find((field) => field.key === "titleAliasReplacementEnabled");
+  const originalLanguageField = plugin.configFields.find((field) => field.key === "originalLanguageEnabled");
   const fallbackLanguagesField = plugin.configFields.find((field) => field.key === "fallbackLanguages");
   const alternateApiField = plugin.configFields.find((field) => field.key === "alternateApiEnabled");
   const apiBaseUrlField = plugin.configFields.find((field) => field.key === "apiBaseUrl");
@@ -231,6 +233,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           preferredLanguage,
           languageFallbackEnabled,
           titleAliasReplacementEnabled,
+          originalLanguageEnabled,
           fallbackLanguages,
           alternateApiEnabled,
           ...(apiBaseUrlPresetField?.key === "apiBaseUrlPreset"
@@ -313,6 +316,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setPreferredLanguage(preferred);
     setLanguageFallbackEnabled(values.languageFallbackEnabled === true);
     setTitleAliasReplacementEnabled(values.titleAliasReplacementEnabled === true);
+    setOriginalLanguageEnabled(values.originalLanguageEnabled === true);
     setFallbackLanguages(fallback);
     setAlternateApiEnabled(values.alternateApiEnabled === true);
     setApiBaseUrlChoice(selectedApiOption?.value ?? customApiBaseUrlOption);
@@ -347,7 +351,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
     setApiKeyDirty(false);
     setDanmakuProviderBaseUrl("");
     setDanmakuProviderBaseUrlDirty(false);
-  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, overwriteField?.defaultValue, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
+  }, [apiBaseUrlField?.defaultValue, apiBaseUrlPresetField?.options, concurrencyField?.defaultValue, creditsWindowField?.defaultValue, customApiBaseUrlOption, existingInfoPolicyField?.defaultValue, introWindowField?.defaultValue, matchThresholdField?.defaultValue, open, originalLanguageField?.defaultValue, overwriteField?.defaultValue, plugin.configValues, preferredLanguageField?.options, scheduleField?.defaultValue, thumbnailPositionPercentField?.defaultValue, titleAliasReplacementField?.defaultValue]);
 
   return (
     <article className="lux-admin-panel lux-admin-plugin-card">
@@ -417,6 +421,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
                 {configField ? <label htmlFor={"plugin-config-" + plugin.id + "-api-key"}>{configField.label}<input id={"plugin-config-" + plugin.id + "-api-key"} type="password" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); }} placeholder="留空使用插件默认凭据" autoComplete="new-password" /></label> : null}
                 {preferredLanguageField ? <label htmlFor={"plugin-config-" + plugin.id + "-preferred-language"}>{preferredLanguageField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-preferred-language"} value={preferredLanguage} options={preferredLanguageField.options ?? []} onChange={setPreferredLanguage} aria-label={preferredLanguageField.label} /></label> : null}
                 {titleAliasReplacementField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={titleAliasReplacementEnabled} onChange={(event) => setTitleAliasReplacementEnabled(event.target.checked)} /> <span><strong>{titleAliasReplacementField.label}</strong><small>{titleAliasReplacementField.description}</small></span></label> : null}
+                {originalLanguageField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={originalLanguageEnabled} onChange={(event) => setOriginalLanguageEnabled(event.target.checked)} /> <span><strong>{originalLanguageField.label}</strong><small>{originalLanguageField.description}</small></span></label> : null}
                 {fallbackEnabledField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={languageFallbackEnabled} onChange={(event) => setLanguageFallbackEnabled(event.target.checked)} /> <span><strong>{fallbackEnabledField.label}</strong><small>{fallbackEnabledField.description}</small></span></label> : null}
                 {fallbackLanguagesField ? <label htmlFor={"plugin-config-" + plugin.id + "-fallback-languages"}>{fallbackLanguagesField.label}<LuxSelect id={"plugin-config-" + plugin.id + "-fallback-languages"} multiple value={fallbackLanguages} options={fallbackLanguagesField.options ?? []} onChange={setFallbackLanguages} aria-label={fallbackLanguagesField.label} /><small>{fallbackLanguagesField.description}</small></label> : null}
                 {alternateApiField ? <label className="lux-admin-plugin-toggle"><input type="checkbox" checked={alternateApiEnabled} onChange={(event) => setAlternateApiEnabled(event.target.checked)} /> <span><strong>{alternateApiField.label}</strong><small>{alternateApiField.description}</small></span></label> : null}
