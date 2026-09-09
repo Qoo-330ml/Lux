@@ -101,6 +101,51 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-episode-list")).toBeNull();
   });
 
+  it("uses the series poster for season cards without their own poster", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "series-1",
+      title: "示例剧集",
+      itemType: "SERIES",
+      imageTags: { poster: "series-poster" },
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
+      items: options?.itemType === "SEASON"
+        ? [{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8 }]
+        : [],
+      total: 1,
+      page: 1,
+      pageSize: 60,
+    }));
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/series-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-season-card img")?.getAttribute("src"))
+      .toBe("/api/v1/items/series-1/images/poster?tag=series-poster");
+  });
+
   it("starts the first unplayed playable episode from a series detail", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "series-1",
@@ -485,6 +530,54 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-season-episode-row strong")?.textContent).toBe("S03E01 · 第一集");
     expect(container.querySelector(".lux-season-episode-thumb img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-1/images/fanart?tag=episode-fanart");
+  });
+
+  it("uses the series poster on a season detail without a season poster", async () => {
+    vi.spyOn(api, "item").mockImplementation(async (itemId) => itemId === "season-1"
+      ? {
+        id: "season-1",
+        title: "第一季",
+        itemType: "SEASON",
+        parentId: "series-1",
+        seriesId: "series-1",
+        parentIndexNumber: 1,
+        mediaSources: [],
+      }
+      : {
+        id: "series-1",
+        title: "示例剧集",
+        itemType: "SERIES",
+        imageTags: { poster: "series-poster" },
+        mediaSources: [],
+      });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    vi.spyOn(api, "children").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 60 });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/season-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-detail-poster > img")?.getAttribute("src"))
+      .toBe("/api/v1/items/series-1/images/poster?tag=series-poster");
   });
 
   it("provides a portrait poster for episode detail while keeping the desktop hero", async () => {
