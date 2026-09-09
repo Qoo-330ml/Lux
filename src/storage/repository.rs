@@ -1608,6 +1608,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) item_type: String,
     pub(crate) parent_id: Option<String>,
     pub(crate) series_id: Option<String>,
+    pub(crate) series_name: Option<String>,
     pub(crate) season_number: Option<i64>,
     pub(crate) episode_number: Option<i64>,
     pub(crate) title: String,

@@ -220,7 +220,9 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
   const image = imageUrl(item, "fanart") ?? imageUrl(item);
   const progress = playbackProgress(item);
   const remaining = remainingRuntimeLabel(item);
-  const subtitle = mediaTypeLabel(item.itemType);
+  const subtitle = item.itemType === "EPISODE" && item.seriesName
+    ? item.seriesName
+    : mediaTypeLabel(item.itemType);
   return (
     <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={`继续播放 ${mediaTitle(item)}`}>
       <div className="lux-media-art">

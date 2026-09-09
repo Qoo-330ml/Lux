@@ -56,6 +56,29 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector(".lux-continue-remaining")?.textContent).toBe("还剩 4m");
   });
 
+  it("shows the series name below an episode resume title", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const episode = {
+      id: "episode-2",
+      title: "第二集",
+      itemType: "EPISODE" as const,
+      seriesName: "示例剧集",
+    };
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <ContinueWatchingRail items={[episode]} />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.querySelector(".lux-continue-copy strong")?.textContent).toBe("第二集");
+    expect(container.querySelector(".lux-continue-copy small")?.textContent).toBe("示例剧集");
+  });
+
   it("shows latest media ratings as numeric TMDb-blue pills", () => {
     container = document.createElement("div");
     document.body.append(container);

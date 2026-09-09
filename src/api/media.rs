@@ -2942,6 +2942,7 @@ pub(super) fn lux_catalog_item_json(item: &CatalogItem) -> Value {
         "providerIds": item.provider_ids,
         "parentId": item.parent_id,
         "seriesId": item.series_id,
+        "seriesName": item.series_name,
         "parentIndexNumber": item.season_number,
         "indexNumber": item.episode_number,
         "seasonCount": item.season_count,

@@ -883,6 +883,17 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         3
     );
 
+    sqlx::query("UPDATE media_sources SET duration_ticks = 10000000000 WHERE id = ?")
+        .bind(&episode_source_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE user_item_state SET position_ticks = 2000000000 WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&episode_id)
+    .execute(database.pool())
+    .await?;
     let web_home = client
         .get(format!("{base_url}/api/v1/home"))
         .header(COOKIE, &web_cookie)
@@ -890,6 +901,11 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .await?;
     assert_eq!(web_home.status(), reqwest::StatusCode::OK);
     let web_home_body = web_home.json::<Value>().await?;
+    assert_eq!(web_home_body["continueWatchingTotal"], 1);
+    assert_eq!(
+        web_home_body["continueWatching"][0]["seriesName"],
+        "Example Show"
+    );
     assert_eq!(
         web_home_body["libraries"][0]["latest"][0]["episodeCount"],
         3
