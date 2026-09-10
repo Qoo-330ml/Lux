@@ -200,7 +200,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-hero-meta span + span::before { margin-right: 10px; color: rgba(255,255,255,.35); content: "·"; }
 .lux-hero-copy p { display: -webkit-box; max-width: 690px; margin: 0; overflow: hidden; color: rgba(255,255,255,.68); font-size: 1.02rem; line-height: 1.65; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; }
 .lux-hero-action-row { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; width: calc(100vw - clamp(24px, 7.4vw, 150px) - 48px); gap: 13px; margin-top: 25px; }
-.lux-hero-actions { display: flex; flex-wrap: wrap; gap: 13px; }
+.lux-hero-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 13px; }
+.lux-hero-actions > img, .lux-hero-actions > .lux-theme-logo { display: none; }
 .lux-hero-carousel-controls { display: flex; align-items: center; gap: 13px; margin-top: 0; margin-left: auto; }
 .lux-hero-carousel-arrow { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--lux-line); border-radius: 50%; color: #fff; background: rgba(0,0,0,.28); backdrop-filter: blur(12px); transition: background .2s ease, border-color .2s ease, transform .2s var(--lux-ease); }
 .lux-hero-carousel-arrow:hover { border-color: rgba(255,255,255,.42); background: rgba(255,255,255,.12); transform: translateY(-1px); }

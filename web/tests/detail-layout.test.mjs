@@ -22,6 +22,20 @@ test("detail actions leave space below the overview", () => {
   assert.match(actionRule, /margin-top:\s*24px/);
 });
 
+test("detail actions center controls instead of stretching around tall artwork", () => {
+  const source = readFileSync(new URL("../src/features/detail/MediaDetailPage.tsx", import.meta.url), "utf8");
+  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const actionRule = stylesheet.match(/^\.lux-hero-actions\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const artworkRule = stylesheet.match(/^\.lux-hero-actions\s*>\s*img,\s*\.lux-hero-actions\s*>\s*\.lux-theme-logo\s*\{([^}]*)\}/m)?.[1] ?? "";
+  const actionsStart = source.indexOf('className="lux-hero-actions"');
+  const actionsEnd = source.indexOf("{actionError", actionsStart);
+  const actions = actionsStart >= 0 && actionsEnd > actionsStart ? source.slice(actionsStart, actionsEnd) : "";
+
+  assert.match(actionRule, /align-items:\s*center/);
+  assert.match(artworkRule, /display:\s*none/);
+  assert.doesNotMatch(actions, /<img|LuxLogo|lux-detail-logo/);
+});
+
 test("mobile detail hero keeps the immersive poster compact", () => {
   const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
