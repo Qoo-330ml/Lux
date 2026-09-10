@@ -33,6 +33,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     let schema_version = database.schema_version().await?;
     info!(schema_version, "database migrations applied");
+    match luxd::application::image_repairs::repair_episode_image_path_conflicts(&database).await {
+        Ok(report) if report.repaired > 0 || report.skipped > 0 => {
+            info!(
+                repaired = report.repaired,
+                skipped = report.skipped,
+                "episode image path repair completed"
+            );
+        }
+        Ok(_) => {}
+        Err(error) => error!(%error, "episode image path repair failed"),
+    }
     match database.run_database_lifecycle_cleanup().await {
         Ok(Some(report)) => {
             info!(

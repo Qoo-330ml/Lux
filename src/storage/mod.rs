@@ -33,7 +33,7 @@ pub(crate) use repository::{
     StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding,
     StoredEmbyMigrationUserLink, StoredEpisodeIdentityCandidate, StoredExternalSubtitle,
     StoredFilesystemEntry, StoredImageIdentity, StoredItemImage, StoredItemImageCandidate,
-    StoredItemScanPath, StoredItemSourceLocator, StoredJobActivityItem, StoredLibrary,
+    StoredItemImagePathConflict, StoredItemScanPath, StoredItemSourceLocator, StoredJobActivityItem, StoredLibrary,
     StoredLibraryCoverJob, StoredLibraryIdentity, StoredLibraryPoster, StoredLibraryRoot,
     StoredLibraryScraper, StoredMediaChapter, StoredMediaItem, StoredMediaItemKind,
     StoredMediaMetadata, StoredMediaSourcePath, StoredMetadataCandidate,

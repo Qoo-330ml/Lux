@@ -12,7 +12,10 @@ use tokio::{fs, process::Command, sync::Semaphore, task::JoinSet, time::timeout}
 use uuid::Uuid;
 
 use crate::{
-    application::images::{read_image_dimensions_from_bytes, write_image_atomically},
+    application::images::{
+        acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
+        image_path_is_owned_by_type, read_image_dimensions_from_bytes, write_image_atomically,
+    },
     domain::ids::LibraryId,
     storage::{Database, ItemImageMetadata, StorageError, StoredThumbnailSource},
 };
@@ -228,11 +231,22 @@ impl ThumbnailService {
         &self,
         source: &StoredThumbnailSource,
     ) -> Result<ThumbnailOutcome, ThumbnailFileError> {
-        let (source_path, target_path, root_path) = resolve_media_paths(source).await?;
+        let (source_path, _target_path, root_path) = resolve_media_paths(source).await?;
+        let _image_write_lock = acquire_image_write_lock(&source.item_id).await;
+        let indexed_images = self
+            .database
+            .list_item_images(&source.item_id)
+            .await
+            .map_err(ThumbnailFileError::Storage)?;
+
+        let target_path = first_available_thumbnail_path(&source_path, &indexed_images)
+            .ok_or(ThumbnailFileError::TargetUnavailable)?;
 
         if let Some(existing) = source.thumbnail_path.as_deref() {
             let existing_path = PathBuf::from(existing);
-            if usable_image_path(&existing_path, &root_path).await? {
+            let owned_by_episode_fanart =
+                image_path_is_owned_by_type(&indexed_images, "FANART", &existing_path);
+            if !owned_by_episode_fanart && usable_image_path(&existing_path, &root_path).await? {
                 return Ok(ThumbnailOutcome::Reused);
             }
         }
@@ -401,12 +415,8 @@ async fn resolve_media_paths(
     if !parent.starts_with(&root_path) {
         return Err(ThumbnailFileError::OutsideRoot);
     }
-    let stem = source_path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .ok_or(ThumbnailFileError::InvalidSourcePath)?;
-    let target_path = parent.join(format!("{stem}-thumb.jpg"));
+    let target_path =
+        canonical_thumbnail_path(&source_path).ok_or(ThumbnailFileError::InvalidSourcePath)?;
     Ok((source_path, target_path, root_path))
 }
 

@@ -10,6 +10,7 @@ use axum::extract::Path as AxumPath;
 use axum::{Router, body::Body, http::StatusCode, response::Response, routing::get};
 use luxd::{
     application::{
+        image_repairs::repair_episode_image_path_conflicts,
         images::{ImageDownloadConfig, ImageWriteError, ImageWriteService, write_image_atomically},
         libraries::LibraryService,
         metadata_paths::library_item_directory,
@@ -728,18 +729,14 @@ async fn episode_images_use_distinct_paths_and_ignore_season_artwork()
         .ok_or("second episode image was incorrectly treated as present")?;
 
     assert_ne!(first.path, second.path);
-    assert!(
-        first
-            .path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().contains("Example.Show.S01E01-thumb"))
-    );
-    assert!(
-        second
-            .path
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().contains("Example.Show.S01E02-thumb"))
-    );
+    assert!(first.path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .contains("Example.Show.S01E01-fanart")
+    }));
+    assert!(second.path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .contains("Example.Show.S01E02-fanart")
+    }));
     assert_eq!(tokio::fs::read(&first.path).await?, PNG_1X1);
     assert_eq!(tokio::fs::read(&second.path).await?, expected_second_image);
 
@@ -750,9 +747,161 @@ async fn episode_images_use_distinct_paths_and_ignore_season_artwork()
     .await?;
     assert_eq!(indexed.len(), 2);
     assert_ne!(indexed[0].1, indexed[1].1);
-    assert!(indexed.iter().all(|(_, path)| path.contains("-thumb.png")));
+    assert!(indexed.iter().all(|(_, path)| path.contains("-fanart.png")));
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn missing_episode_fanart_does_not_reuse_indexed_thumbnail()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, episodes, season_dir) = prepared_episodes().await?;
+    let thumbnail_path = season_dir.join("Example.Show.S01E01-thumb.jpg");
+    let thumbnail_bytes = b"existing-thumbnail";
+    tokio::fs::write(&thumbnail_path, thumbnail_bytes).await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'THUMB', 0, ?, ?, 'thumbnail', 'STRM_FFMPEG')",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&episodes[0])
+    .bind(thumbnail_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(thumbnail_bytes.len())?)
+    .execute(database.pool())
+    .await?;
+
+    let app = Router::new().route(
+        "/fanart",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/jpeg")
+                .body(Body::from(vec![0xff, 0xd8, 0xff, 0xd9]))
+                .expect("fanart response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::new(database.clone())?;
+
+    let report = service
+        .download_item_image_if_missing(&episodes[0], "FANART", &format!("http://{address}/fanart"))
+        .await?
+        .ok_or("indexed thumbnail was incorrectly treated as episode fanart")?;
+
+    assert_ne!(report.path, thumbnail_path);
+    assert!(report.path.file_name().is_some_and(|name| {
+        name.to_string_lossy()
+            .contains("Example.Show.S01E01-fanart")
+    }));
+    assert_eq!(tokio::fs::read(&thumbnail_path).await?, thumbnail_bytes);
+    let fanart: (i64, String) = sqlx::query_as(
+        "SELECT image_index, local_path
+         FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&episodes[0])
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(fanart.0, 0);
+    assert_eq!(fanart.1, report.path.to_string_lossy());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn episode_fanart_migration_compacts_sparse_indexes() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (database, episodes, root) = prepared_episodes().await?;
+    for image_index in [1_i64, 3_i64] {
+        sqlx::query(
+            "INSERT INTO item_images (
+                id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+             ) VALUES (?, ?, 'FANART', ?, ?, 4, 'fanart', 'TMDB')",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&episodes[0])
+        .bind(image_index)
+        .bind(
+            root.join(format!("fanart-{image_index}.jpg"))
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query("DELETE FROM _sqlx_migrations WHERE version = 121")
+        .execute(database.pool())
+        .await?;
+    drop(database);
+
+    let library_root = root
+        .parent()
+        .and_then(|path| path.parent())
+        .ok_or("episode directory has no library root")?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: library_root.join("config"),
+    };
+    let migrated = Database::connect(&config).await?;
+    let indexes: Vec<i64> = sqlx::query_scalar(
+        "SELECT image_index
+         FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART'
+         ORDER BY image_index",
+    )
+    .bind(&episodes[0])
+    .fetch_all(migrated.pool())
+    .await?;
+    assert_eq!(indexes, vec![0, 1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn repairs_existing_episode_fanart_thumbnail_path_conflict()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (database, episodes, season_dir) = prepared_episodes().await?;
+    let shared_path = season_dir.join("Example.Show.S01E01-thumb1.jpg");
+    let bytes = b"\xff\xd8shared-image\xff\xd9";
+    tokio::fs::write(&shared_path, bytes).await?;
+    for (image_type, image_index) in [("FANART", 1_i64), ("THUMB", 0_i64)] {
+        sqlx::query(
+            "INSERT INTO item_images (
+                id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+             ) VALUES (?, ?, ?, ?, ?, ?, 'shared', 'TEST')",
+        )
+        .bind(uuid::Uuid::now_v7().to_string())
+        .bind(&episodes[0])
+        .bind(image_type)
+        .bind(image_index)
+        .bind(shared_path.to_string_lossy().as_ref())
+        .bind(i64::try_from(bytes.len())?)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let report = repair_episode_image_path_conflicts(&database).await?;
+
+    assert_eq!(report.repaired, 1);
+    assert_eq!(report.skipped, 0);
+    let thumbnail_path = season_dir.join("Example.Show.S01E01-thumbnail.jpg");
+    assert_eq!(tokio::fs::read(&thumbnail_path).await?, bytes);
+    let indexed: Vec<(String, String)> = sqlx::query_as(
+        "SELECT image_type, local_path
+         FROM item_images
+         WHERE item_id = ? AND image_type IN ('FANART', 'THUMB')
+         ORDER BY image_type",
+    )
+    .bind(&episodes[0])
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(indexed[0].0, "FANART");
+    assert_eq!(indexed[0].1, shared_path.to_string_lossy());
+    assert_eq!(indexed[1].0, "THUMB");
+    assert_eq!(indexed[1].1, thumbnail_path.to_string_lossy());
     Ok(())
 }
 

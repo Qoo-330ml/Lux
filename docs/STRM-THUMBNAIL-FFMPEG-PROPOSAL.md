@@ -7,7 +7,7 @@
 在现有 org.lux.strm-media-info 插件中增加 STRM 缩略图补全能力，同时保持媒体信息提取和缩略图补全两个功能彼此独立：
 
 - mediaInfoEnabled：使用 ffprobe 提取并保存媒体信息 JSON。
-- thumbnailEnabled：使用 ffmpeg 从外部媒体地址截图，并保存为 STRM 的 *-thumb.jpg；同一文件同时登记为 `POSTER` 和 `THUMB`。
+- thumbnailEnabled：使用 ffmpeg 从外部媒体地址截图，并保存为 STRM 的 `*-thumbnail.jpg`；同一文件同时登记为 `POSTER` 和 `THUMB`。
 
 两个开关都由插件配置控制，缩略图开关默认关闭。缩略图功能只处理 .strm 媒体源，不改变本地视频缩略图任务。
 
@@ -32,7 +32,7 @@ STRM 的外部媒体地址沿用扫描阶段已经登记到 media_sources.extern
 
 ### 3.2 只开启缩略图
 
-1. 后台任务检查同目录 *-thumb.jpg 以及数据库登记的缩略图是否有效。
+1. 后台任务检查数据库登记的缩略图以及同目录 `*-thumbnail.jpg` 是否有效；已登记的历史 `*-thumb.jpg` 仍可读取。
 2. 缺失时调用一次轻量 ffprobe，只获取视频时长。
 3. 按 duration × thumbnailPositionPercent% 计算截图时间点，默认 30%。
 4. 调用一次 ffmpeg，从该时间点输出一张 JPEG。
@@ -136,7 +136,7 @@ STRM 任务记录两个开关和 `thumbnailPositionPercent` 的快照，确保�
 - 已有有效缩略图时跳过 ffmpeg。
 - 外部地址覆盖私网地址、域名、路径和普通字符串时不被地址类型拦截。
 - ffprobe、ffmpeg 超时或输出无效时任务失败且不留下临时文件。
-- 生成的 JPEG 正确写入 *-thumb.jpg，并以同一 local_path 登记两条 `item_images` 记录：`POSTER` 和 `THUMB`。
+- 生成的 JPEG 正确写入 `*-thumbnail.jpg`，并以同一 local_path 登记两条 `item_images` 记录：`POSTER` 和 `THUMB`；历史 `*-thumb.jpg` 只作为读取兼容，不再作为新写入目标。
 
 ### 验证命令
 

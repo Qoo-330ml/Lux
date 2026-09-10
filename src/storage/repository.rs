@@ -1906,6 +1906,14 @@ pub(crate) struct StoredItemImage {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredItemImagePathConflict {
+    pub(crate) id: String,
+    pub(crate) item_id: String,
+    pub(crate) image_type: String,
+    pub(crate) local_path: String,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredCatalogImageTag {
     pub(crate) id: String,
     pub(crate) image_type: String,

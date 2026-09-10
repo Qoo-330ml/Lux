@@ -3426,16 +3426,16 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试；服务重启时取消遗留的
 PENDING/RUNNING 状态，管理员主动重试后继续使用持久化游标。探测结果保存到 `media_sources`/`media_streams`，旁车写回使用同目录
 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。缩略图只针对 STRM，使用同目录
-`*-thumb.jpg`；截图前先用 `ffprobe` 获取 duration，再调用 `ffmpeg` 在 `thumbnailPositionPercent` 指定的百分比位置输出一张受限尺寸的
+`*-thumbnail.jpg`；截图前先用 `ffprobe` 获取 duration，再调用 `ffmpeg` 在 `thumbnailPositionPercent` 指定的百分比位置输出一张受限尺寸的
 JPEG，并将该文件同时登记为 `POSTER` 和 `THUMB`。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生库；截图只补全缺少有效主图的 STRM，不
-覆盖已有有效缩略图。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
+覆盖已有有效缩略图。历史 `*-thumb.jpg` 仅作读取兼容。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
 
 STRM 截图采用“本地/在线主图优先、视频截图兜底”的顺序：数据库按媒体条目持久化
 `poster_fallback_required` 标记。新增 STRM 没有本地 `POSTER` 或 `THUMB` 时设置该标记为 true；
 媒体库未配置刮削器、所选刮削器没有候选、候选没有可用主图时，都保留该标记。发现本地
 `POSTER`/`THUMB` 或刮削器成功写入任一主图时清除该标记。STRM 截图阶段只处理该标记为 true
 且没有有效 `THUMB` 的 STRM 来源，不要求先找到在线条目。FFmpeg 截图成功后写入同目录
-`*-thumb.jpg`，并用同一文件同时登记 `POSTER` 和 `THUMB`，来源为 `STRM_FFMPEG`。后续刮削器
+`*-thumbnail.jpg`，并用同一文件同时登记 `POSTER` 和 `THUMB`，来源为 `STRM_FFMPEG`；历史 `*-thumb.jpg` 仍可通过数据库登记路径读取。后续刮削器
 获得真实海报或缩略图时可以按图片类型替换对应兜底记录；删除其中一个记录时不能删除仍被另一
 记录引用的共享文件。
 
@@ -3465,8 +3465,8 @@ STRM 来源的后台探测任务；这条事件驱动路径不替代全局计划
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启会取消 PENDING/RUNNING 任务且不自动领取新源；失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
-- [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 `thumbnailPositionPercent` 指定的位置生成同目录 `*-thumb.jpg`，默认位置为 30%，已有有效缩略图不会被覆盖。
-- [ ] STRM 截图遵循本地/在线主图优先顺序：没有刮削器、刮削器无候选或候选没有主图时持久化 `poster_fallback_required`；ffmpeg 不要求在线匹配成功，只消费该标记和缺失图条件；截图成功后将同一文件登记为 `POSTER` 与 `THUMB` 并清除标记，后续刮削器获得图片时可按类型替换 `STRM_FFMPEG` 兜底图。
+- [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 `thumbnailPositionPercent` 指定的位置生成同目录 `*-thumbnail.jpg`，默认位置为 30%，已有有效缩略图不会被覆盖，历史 `*-thumb.jpg` 仍可读取。
+- [ ] STRM 截图遵循本地/在线主图优先顺序：没有刮削器、刮削器无候选或候选没有主图时持久化 `poster_fallback_required`；ffmpeg 不要求在线匹配成功，只消费该标记和缺失图条件；截图成功后将同一 `*-thumbnail.jpg` 文件登记为 `POSTER` 与 `THUMB` 并清除标记，后续刮削器获得图片时可按类型替换 `STRM_FFMPEG` 兜底图。
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后保留调度配置但取消遗留作业实例。
 - [ ] 实时增量扫描完成后，所选媒体库中新入库或发生变化的 `.strm` 来源自动创建定向 STRM 探测任务；定向任务只处理本次增量扫描影响的来源，并支持取消和失败重试。
 - [ ] 定向 STRM 探测与全局定时探测共用并发、插件配置和任务持久化边界；定时任务仍保留并继续负责全库补漏，两个任务不能并发占用同一媒体库。
