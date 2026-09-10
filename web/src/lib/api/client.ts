@@ -33,6 +33,7 @@ import type {
   AdminUser,
   AdminMetadataCandidate,
   AdminMetadataBatchConfirmation,
+  AdminItemMergeResult,
   AdminMetadataReidentifyStart,
   AdminPlugin,
   AdminPluginStore,
@@ -1245,6 +1246,13 @@ export class LuxApiClient {
     return this.request<AdminMetadataBatchConfirmation>("/api/v1/admin/metadata/confirm", {
       method: "POST",
       body: JSON.stringify({ itemIds }),
+    });
+  }
+
+  mergeAdminItems(input: { itemIds: string[]; primaryItemId: string }) {
+    return this.request<AdminItemMergeResult>("/api/v1/admin/items/merge", {
+      method: "POST",
+      body: JSON.stringify(input),
     });
   }
 

@@ -167,6 +167,13 @@ pub(crate) struct MetadataBatchConfirmationRequest {
     pub(crate) item_ids: Vec<String>,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ItemMergeRequest {
+    pub(crate) item_ids: Vec<String>,
+    pub(crate) primary_item_id: String,
+}
+
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MetadataReidentifyListQuery {
@@ -6217,6 +6224,94 @@ pub(crate) async fn admin_confirm_metadata(
         "confirmedCount": confirmed_count,
         "failedCount": failed_item_ids.len(),
         "failedItemIds": failed_item_ids,
+    }))
+    .into_response()
+}
+
+pub(crate) async fn admin_merge_items(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<ItemMergeRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if !(2..=100).contains(&request.item_ids.len()) {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "合并条目数量必须在 2 到 100 之间",
+        )
+        .into_response();
+    }
+    if request
+        .item_ids
+        .iter()
+        .any(|item_id| item_id.parse::<crate::domain::ids::ItemId>().is_err())
+        || request
+            .primary_item_id
+            .parse::<crate::domain::ids::ItemId>()
+            .is_err()
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    if request.item_ids.iter().collect::<HashSet<_>>().len() != request.item_ids.len() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "待合并条目不能重复",
+        )
+        .into_response();
+    }
+    let Some(service) = state.item_merge.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = match service
+        .merge(&request.primary_item_id, &request.item_ids)
+        .await
+    {
+        Ok(result) => result,
+        Err(StorageError::Conflict(message)) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                &message,
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if let Some(home) = state.home.as_ref() {
+        home.invalidate();
+    } else if let Some(catalog) = state.catalog.as_ref() {
+        catalog.invalidate_library_pages();
+    }
+    record_audit_event(
+        &state,
+        &headers,
+        "MEDIA_ITEMS_MERGED",
+        Some("media_items"),
+        Some(&result.primary_item_id),
+        &json!({
+            "libraryId": result.library_id,
+            "itemType": result.item_type,
+            "mergedItemIds": result.merged_item_ids,
+        })
+        .to_string(),
+    )
+    .await;
+    Json(json!({
+        "primaryItemId": result.primary_item_id,
+        "mergedItemIds": result.merged_item_ids,
     }))
     .into_response()
 }

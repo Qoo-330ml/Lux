@@ -35,6 +35,16 @@ pub(super) async fn remove_sqlite_title_year_unique(
             path: path.to_path_buf(),
             source,
         })?;
+        sqlx::query(
+            "CREATE INDEX IF NOT EXISTS idx_media_items_merged_into
+             ON media_items(merged_into_item_id)",
+        )
+        .execute(&mut *connection)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.to_path_buf(),
+            source,
+        })?;
         return Ok(());
     }
 
@@ -96,6 +106,7 @@ pub(super) async fn remove_sqlite_title_year_unique(
                 original_language TEXT,
                 has_available_source INTEGER NOT NULL DEFAULT 0 CHECK (has_available_source IN (0, 1)),
                 poster_fallback_required INTEGER NOT NULL DEFAULT 0 CHECK (poster_fallback_required IN (0, 1)),
+                merged_into_item_id TEXT REFERENCES media_items(id) ON DELETE SET NULL,
                 nfo_metadata_json TEXT,
                 nfo_metadata_fingerprint BLOB
             )",
@@ -107,6 +118,7 @@ pub(super) async fn remove_sqlite_title_year_unique(
                 metadata_fingerprint, identity_key, rating, rating_source, metadata_scraper_id,
                 last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
+                merged_into_item_id,
                 nfo_metadata_json, nfo_metadata_fingerprint
              )
              SELECT
@@ -117,6 +129,7 @@ pub(super) async fn remove_sqlite_title_year_unique(
                 metadata_fingerprint, identity_key, rating, rating_source, metadata_scraper_id,
                 last_air_date, status,
                 original_language, has_available_source, poster_fallback_required,
+                merged_into_item_id,
                 nfo_metadata_json, nfo_metadata_fingerprint
              FROM media_items",
             "DROP TABLE media_items",
@@ -135,6 +148,8 @@ pub(super) async fn remove_sqlite_title_year_unique(
             "CREATE INDEX idx_media_items_people_visible
              ON media_items(library_id, id)
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_merged_into
+             ON media_items(merged_into_item_id)",
             "CREATE INDEX idx_media_items_migration_title
              ON media_items(item_type, sort_title, production_year, library_id, id)
              WHERE removed_at IS NULL",

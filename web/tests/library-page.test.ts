@@ -597,4 +597,68 @@ describe("LibraryPage infinite scroll", () => {
     await vi.waitFor(() => expect(confirm).toHaveBeenCalledWith(["pending-1"]));
     expect(container.textContent).toContain("1 项确认失败");
   });
+
+  it("lets the administrator choose a primary item when merging selected versions", async () => {
+    vi.spyOn(api, "libraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影", kind: "MOVIE" }],
+    });
+    vi.spyOn(api, "libraryItems").mockResolvedValue({
+      items: [
+        { id: "movie-1", title: "电影主版本", itemType: "MOVIE" },
+        { id: "movie-2", title: "电影 4K", itemType: "MOVIE" },
+      ],
+      page: 1,
+      pageSize: 24,
+      total: 2,
+    });
+    const merge = vi.spyOn(api, "mergeAdminItems").mockResolvedValue({
+      primaryItemId: "movie-2",
+      mergedItemIds: ["movie-1"],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          MemoryRouter,
+          { initialEntries: ["/libraries/library-1"] },
+          createElement(
+            Routes,
+            null,
+            createElement(Route, { path: "/libraries/:libraryId", element: createElement(LibraryPage) }),
+          ),
+        ),
+      ));
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(2));
+    });
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[aria-label='开启媒体库多选']")?.click();
+    });
+    await act(async () => {
+      await vi.waitFor(() => expect(container?.querySelectorAll<HTMLInputElement>(".lux-media-selection-checkbox")).toHaveLength(2));
+      container?.querySelectorAll<HTMLInputElement>(".lux-media-selection-checkbox").forEach((checkbox) => checkbox.click());
+    });
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[data-action='merge-items']")?.click();
+    });
+    expect(container?.textContent).toContain("选择主条目");
+    const primaryRadio = container?.querySelector<HTMLInputElement>("input[aria-label='将 电影 4K 设为主条目']");
+    expect(primaryRadio).not.toBeNull();
+    await act(async () => primaryRadio?.click());
+    await act(async () => {
+      container?.querySelector<HTMLButtonElement>("button[data-action='confirm-merge-items']")?.click();
+    });
+    await vi.waitFor(() => expect(merge).toHaveBeenCalledWith({
+      itemIds: ["movie-1", "movie-2"],
+      primaryItemId: "movie-2",
+    }));
+    expect(container?.textContent).toContain("已合并 1 个其他版本");
+  });
 });

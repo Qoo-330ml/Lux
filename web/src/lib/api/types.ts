@@ -251,6 +251,11 @@ export type AdminMetadataBatchConfirmation = {
   failedItemIds: string[];
 };
 
+export type AdminItemMergeResult = {
+  primaryItemId: string;
+  mergedItemIds: string[];
+};
+
 export type PlaybackState = {
   isFavorite?: boolean;
   isPlayed?: boolean;

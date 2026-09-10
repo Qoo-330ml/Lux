@@ -676,6 +676,168 @@ async fn targeted_movie_scan_batches_files_across_directory_batches()
 }
 
 #[tokio::test]
+async fn movie_rescan_keeps_merged_title_variants_on_the_primary_item()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let primary_dir = root.join("Primary");
+    let secondary_dir = root.join("Alternate");
+    tokio::fs::create_dir_all(&primary_dir).await?;
+    tokio::fs::create_dir_all(&secondary_dir).await?;
+    tokio::fs::write(primary_dir.join("Primary.Movie.2020.mkv"), b"primary").await?;
+    tokio::fs::write(secondary_dir.join("Alternate.Movie.2020.mkv"), b"alternate").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_movie_library(library.id).await?;
+
+    let primary_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND title = 'Primary Movie'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let secondary_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND title = 'Alternate Movie'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET merged_into_item_id = ? WHERE id = ?")
+        .bind(&primary_id)
+        .bind(&secondary_id)
+        .execute(database.pool())
+        .await?;
+    tokio::fs::write(
+        secondary_dir.join("Alternate.Movie.2020.4K.mkv"),
+        b"alternate-4k",
+    )
+    .await?;
+
+    let report = scanner
+        .scan_movie_directory(library.id, &secondary_dir)
+        .await?;
+    assert_eq!(report.created_items, 0);
+    assert_eq!(report.created_sources, 1);
+    assert_eq!(report.changed_files, 0);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = ?",)
+            .bind(&primary_id)
+            .fetch_one(database.pool())
+            .await?,
+        2
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = ?",)
+            .bind(&secondary_id)
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    let new_source_item_id: String = sqlx::query_scalar(
+        "SELECT ms.item_id
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Alternate/Alternate.Movie.2020.4K.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(new_source_item_id, primary_id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn series_rescan_routes_new_episodes_to_the_primary_series_after_merge()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Shows");
+    let primary_dir = root.join("Primary Show").join("Season 01");
+    let secondary_dir = root.join("Secondary Show").join("Season 01");
+    tokio::fs::create_dir_all(&primary_dir).await?;
+    tokio::fs::create_dir_all(&secondary_dir).await?;
+    tokio::fs::write(primary_dir.join("Primary.Show.S01E01.mkv"), b"primary").await?;
+    tokio::fs::write(
+        secondary_dir.join("Secondary.Show.S01E01.mkv"),
+        b"secondary",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Mixed, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_mixed_library(library.id).await?;
+
+    let primary_series: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SERIES' AND title = 'Primary Show'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let secondary_series: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SERIES' AND title = 'Secondary Show'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let primary_season: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SEASON' AND series_id = ?",
+    )
+    .bind(&primary_series)
+    .fetch_one(database.pool())
+    .await?;
+    let secondary_season: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'SEASON' AND series_id = ?",
+    )
+    .bind(&secondary_series)
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET merged_into_item_id = ? WHERE id = ?")
+        .bind(&primary_series)
+        .bind(&secondary_series)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET merged_into_item_id = ? WHERE id = ?")
+        .bind(&primary_season)
+        .bind(&secondary_season)
+        .execute(database.pool())
+        .await?;
+    tokio::fs::write(
+        secondary_dir.join("Secondary.Show.S01E02.mkv"),
+        b"secondary-new-episode",
+    )
+    .await?;
+
+    let report = scanner.scan_mixed_library(library.id).await?;
+    assert_eq!(report.created_items, 1);
+    let new_episode: (String, String) = sqlx::query_as(
+        "SELECT parent_id, series_id
+         FROM media_items
+         WHERE item_type = 'EPISODE' AND episode_number = 2",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(new_episode, (primary_season, primary_series));
+    Ok(())
+}
+
+#[tokio::test]
 async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;
@@ -684,7 +846,7 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 119);
+    assert_eq!(database.schema_version().await?, 121);
     let tables: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
          WHERE type = 'table' AND name IN ('filesystem_entries', 'media_items', 'media_sources', 'media_streams')

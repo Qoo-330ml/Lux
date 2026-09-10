@@ -18,6 +18,7 @@ pub mod identification;
 pub mod image_repairs;
 pub mod images;
 pub mod ip_location;
+pub mod item_merge;
 pub mod libraries;
 pub mod library_covers;
 pub mod media_matching;

@@ -2103,6 +2103,7 @@ services:
 | LUX-248 | docs/LUX-DEVELOPMENT.md、docs/decisions/041-device-pairing.md、migrations/0119_device_pairings.sql、migrations-postgres/0119_device_pairings.sql、src/auth/device_pairings.rs、src/security.rs、src/storage/device_pairings.rs、src/storage/catalog.rs、src/storage/repository.rs、src/storage/users.rs、src/storage/mod.rs、src/auth/emby.rs、src/auth/mod.rs、src/api/legacy.rs、src/api/routes.rs、src/api/users.rs、tests/device_pairings.rs、tests/admin_health.rs、tests/danmaku.rs、tests/ready_version.rs、tests/scanner.rs、tests/storage.rs；Lux Prism 一次性设备配对 |
 | LUX-249 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/application/scraper.rs、src/application/images.rs、src/application/candidates.rs、src/storage/media.rs、src/storage/repository.rs、web/src/features/admin/AdminPluginsPage.tsx、web/tests/plugin-library.test.ts；TMDb 原语言文字与图片模式 |
 | LUX-250 | docs/LUX-DEVELOPMENT.md、web/src/features/home/media.tsx、web/src/features/detail/MediaDetailPage.tsx、web/tests/home-media.test.tsx、web/tests/media-detail.test.tsx；季海报缺失时回退父剧海报 |
+| LUX-251 | docs/LUX-DEVELOPMENT.md、docs/LUX-251-PLAN.md、migrations/0120_manual_item_merges.sql、migrations-postgres/0120_manual_item_merges.sql、src/storage/media_merge.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/catalog.rs、src/application/item_merge.rs、src/application/mod.rs、src/application/scanner.rs、src/api/legacy.rs、src/api/admin.rs、src/api/admin_handlers.rs、web/src/features/library/LibraryPage.tsx、web/src/lib/api/client.ts、web/src/lib/api/types.ts、tests/item_merge.rs、web/tests/library-page.test.ts；管理员手动合并媒体条目为多版本 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2819,6 +2820,22 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 验证：4K/1080p/edition fixtures。
 
 依赖：LUX-071、LUX-052。
+
+#### LUX-251：管理员手动合并多版本
+
+描述：在媒体库已有多选模式中，管理员可以选择同一媒体库内两个或更多同类型的电影或剧集，明确指定一个主条目，将其余条目并入主条目作为其他媒体版本。合并不删除媒体文件；被合并条目从目录隐藏，后续扫描仍归入主条目。
+
+验收：
+
+- 电影的媒体源、播放进度、收藏和已看状态合并到主条目；主条目原有默认媒体源优先，所有源仍可选择和播放。
+- 剧集按季度号和集号合并匹配的层级；主剧集中不存在的季度或分集重新挂到主剧集，媒体源和状态不丢失。
+- 只允许同一启用媒体库、同一 `MOVIE`/`SERIES` 根类型且未被合并的条目；操作事务化、管理员鉴权并受 CSRF 保护。
+- 目录、首页、搜索和后续扫描不再显示或重新生成被合并的根条目；审计事件不包含路径、URL 或凭据。
+- Web 多选工具栏提供合并入口，要求明确选择主条目并提供成功、失败和加载状态。
+
+验证：电影/剧集合并 API 集成测试、扫描重扫回归测试、Web 多选流程测试。
+
+依赖：LUX-083、LUX-106。
 
 #### LUX-084：TMDb 自动合集
 

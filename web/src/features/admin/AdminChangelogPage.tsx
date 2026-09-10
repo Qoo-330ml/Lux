@@ -15,6 +15,23 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.1",
+    date: "2026-09-10",
+    sections: [
+      { kind: "added", items: [
+        "管理员可在媒体库多选模式中将同一媒体库内的电影或剧集合并为多版本，并明确选择主条目。",
+        "合并电影或剧集时保留媒体文件、媒体源、播放进度、收藏和已看状态；剧集的季度与分集会按编号归并，未匹配项会挂接到主剧集。",
+      ] },
+      { kind: "fixed", items: [
+        "修复分集 FANART 与 FFmpeg 缩略图可能共用 *-thumb.jpg 路径的问题；新 FANART 和缩略图使用独立路径，历史文件仍可读取。",
+        "启动时修复已有的分集图片路径冲突，并压缩稀疏 FANART 索引，确保默认图片入口稳定指向首张剧照。",
+      ] },
+      { kind: "changed", items: [
+        "被合并的根条目从目录、首页和搜索结果隐藏，后续扫描会继续将新增媒体源归入主条目。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.0",
     date: "2026-09-09",
     sections: [

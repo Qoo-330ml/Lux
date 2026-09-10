@@ -31,6 +31,9 @@ mod jobs;
 mod library;
 #[path = "media.rs"]
 mod media;
+#[path = "media_merge.rs"]
+mod media_merge;
+pub(crate) use media_merge::StoredMediaMerge;
 #[path = "metadata.rs"]
 mod metadata;
 #[path = "migration.rs"]
@@ -2168,7 +2171,8 @@ pub(crate) fn movie_parent_folder_identity(
     (!directory_key.is_empty()).then(|| format!("folder:{library_root_id}:{directory_key}"))
 }
 
-const CATALOG_VISIBLE_PREDICATE: &str = " AND (
+const CATALOG_VISIBLE_PREDICATE: &str = " AND mi.merged_into_item_id IS NULL
+ AND (
     mi.has_available_source = 1
     OR (
         mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET', 'FOLDER')
@@ -2176,6 +2180,7 @@ const CATALOG_VISIBLE_PREDICATE: &str = " AND (
             SELECT 1
             FROM media_items visible_child
             WHERE visible_child.removed_at IS NULL
+              AND visible_child.merged_into_item_id IS NULL
               AND visible_child.has_available_source = 1
               AND (visible_child.parent_id = mi.id OR visible_child.series_id = mi.id)
         )
@@ -2188,6 +2193,7 @@ const CATALOG_VISIBLE_PREDICATE: &str = " AND (
               ON visible_child.id = visible_collection_item.item_id
             WHERE visible_collection.item_id = mi.id
               AND visible_child.removed_at IS NULL
+              AND visible_child.merged_into_item_id IS NULL
               AND visible_child.has_available_source = 1
         )
     )
