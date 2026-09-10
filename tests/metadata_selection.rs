@@ -1365,6 +1365,86 @@ async fn series_and_season_selection_writes_to_their_media_directories()
 }
 
 #[tokio::test]
+async fn episode_selection_downloads_fanart_when_ffmpeg_thumbnail_is_indexed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture().await?;
+    let episode_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+            .fetch_one(fixture.database.pool())
+            .await?;
+    let thumbnail_path = fixture.season_dir.join("Example.Show.S01E01-thumb.jpg");
+    let thumbnail_bytes = b"existing-ffmpeg-thumbnail";
+    tokio::fs::write(&thumbnail_path, thumbnail_bytes).await?;
+    let existing_fanart_path = fixture.season_dir.join("Example.Show.S01E01-thumb1.jpg");
+    let existing_fanart_bytes = b"existing-fanart-variant";
+    tokio::fs::write(&existing_fanart_path, existing_fanart_bytes).await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'THUMB', 0, ?, ?, 'thumbnail', 'STRM_FFMPEG')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&episode_id)
+    .bind(thumbnail_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(thumbnail_bytes.len())?)
+    .execute(fixture.database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'FANART', 1, ?, ?, 'fanart', 'TMDB')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&episode_id)
+    .bind(existing_fanart_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(existing_fanart_bytes.len())?)
+    .execute(fixture.database.pool())
+    .await?;
+    configure_image_strategy(&fixture.database, &episode_id).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &episode_id,
+        json!({
+            "title": "Online Episode",
+            "images": { "FANART": [format!("{image_url}/fanart")] }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::new(fixture.database.clone())?,
+    );
+
+    let report = selection
+        .select(
+            &episode_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await?;
+
+    assert_eq!(report.image_types, vec!["FANART"]);
+    assert_eq!(tokio::fs::read(&thumbnail_path).await?, thumbnail_bytes);
+    let fanart_path: String = sqlx::query_scalar(
+        "SELECT local_path
+         FROM item_images
+         WHERE item_id = ? AND image_type = 'FANART' AND image_index = 0",
+    )
+    .bind(&episode_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert!(fanart_path.contains("Example.Show.S01E01-fanart"));
+    assert_eq!(
+        tokio::fs::read(fanart_path).await?,
+        b"RIFF\x04\x00\x00\x00WEBP"
+    );
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_series_fixture().await?;
     let tmdb_app = Router::new().fallback(any(|request: Request<Body>| async move {

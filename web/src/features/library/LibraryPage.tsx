@@ -5,7 +5,7 @@ import { LuxSelect } from "../../components/LuxSelect";
 import { api, type LibrarySortBy, type LibrarySortOrder } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { Library } from "../../lib/api/types";
-import { MediaCard } from "../home/media";
+import { MediaCard, mediaTitle } from "../home/media";
 
 const LIBRARY_SORT_STORAGE_KEY = "lux.library.sort";
 const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
@@ -105,6 +105,9 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const [selectionMode, setSelectionMode] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
   const [confirmNotice, setConfirmNotice] = useState<string>();
+  const [mergeOpen, setMergeOpen] = useState(false);
+  const [mergePrimaryId, setMergePrimaryId] = useState<string>();
+  const mergeCloseButtonRef = useRef<HTMLButtonElement | null>(null);
   const sortPreference = sortState.libraryId === libraryId ? sortState.preference : readLibrarySortPreference(libraryId);
   const { sortBy, sortOrder } = sortPreference;
   const libraries = useQuery({ queryKey: queryKeys.libraries, queryFn: () => api.libraries() });
@@ -125,11 +128,32 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
     },
   });
+  const mergeItems = useMutation({
+    mutationFn: () => {
+      if (!mergePrimaryId) throw new Error("请选择主条目");
+      return api.mergeAdminItems({ itemIds: [...selectedIds], primaryItemId: mergePrimaryId });
+    },
+    onSuccess: (result) => {
+      setConfirmNotice(`已合并 ${result.mergedItemIds.length} 个其他版本。`);
+      setMergeOpen(false);
+      setMergePrimaryId(undefined);
+      setSelectedIds(new Set());
+      setSelectionMode(false);
+      void queryClient.invalidateQueries({ queryKey: ["library", libraryId] });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
+    },
+  });
 
   useEffect(() => {
     setSelectedIds(new Set());
     setSelectionMode(false);
+    setMergeOpen(false);
+    setMergePrimaryId(undefined);
   }, [libraryId, metadataStatus, sortBy, sortOrder]);
+
+  useEffect(() => {
+    if (mergeOpen) mergeCloseButtonRef.current?.focus();
+  }, [mergeOpen]);
 
   useEffect(() => {
     if (typeof document === "undefined") return;
@@ -195,6 +219,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     { value: "PENDING", label: "待确认" },
   ] as const;
   const selectedItems = loadedItems.filter((item) => selectedIds.has(item.id));
+  const canMergeSelectedItems = selectedItems.length >= 2 && selectedItems.length === selectedIds.size;
   const allSelectedPending = selectedIds.size > 0
     && selectedItems.length === selectedIds.size
     && selectedItems.every((item) => item.metadataPending === true);
@@ -234,11 +259,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
             setSelectionMode((value) => !value);
             setSelectedIds(new Set());
             setConfirmNotice(undefined);
+            setMergeOpen(false);
+            setMergePrimaryId(undefined);
           }}
         >
           {selectionMode ? "退出多选" : "多选"}
         </button>
         {selectionMode && selectedIds.size > 0 ? <span>{`已选 ${selectedIds.size} 项`}</span> : null}
+        {canMergeSelectedItems ? <button className="lux-button lux-button-primary" type="button" data-action="merge-items" disabled={mergeItems.isPending} onClick={() => { mergeItems.reset(); setMergePrimaryId(selectedItems[0]?.id); setMergeOpen(true); }}>{mergeItems.isPending ? "合并中…" : "合并为其他版本"}</button> : null}
         {allSelectedPending ? <button className="lux-button lux-button-primary" type="button" data-action="batch-confirm-metadata" disabled={confirmMetadata.isPending} onClick={() => confirmMetadata.mutate()}>{confirmMetadata.isPending ? "确认中…" : "批量确认"}</button> : null}
         {confirmNotice ? <span className="lux-muted-copy" role="status">{confirmNotice}</span> : null}
         {confirmMetadata.error ? <span className="lux-error-copy" role="alert">{confirmMetadata.error.message}</span> : null}
@@ -251,6 +279,52 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       <div className="lux-poster-grid">
         {loadedItems.map((item) => <MediaCard item={item} key={item.id} metadataAttention={showMetadataPending && Boolean(item.metadataPending)} detailSearch={metadataStatus === "PENDING" ? "?metadataStatus=pending" : undefined} selectionMode={selectionMode} selected={selectedIds.has(item.id)} onSelectionChange={(selected) => setSelectedIds((current) => { const next = new Set(current); if (selected) next.add(item.id); else next.delete(item.id); return next; })} />)}
       </div>
+      {mergeOpen ? (
+        <div className="lux-library-dialog-backdrop" role="presentation">
+          <section
+            className="lux-library-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="lux-merge-items-title"
+            onKeyDown={(event) => {
+              if (event.key === "Escape") {
+                setMergeOpen(false);
+                mergeItems.reset();
+              }
+            }}
+          >
+            <div className="lux-library-dialog-header">
+              <div><span className="lux-eyebrow">媒体库操作</span><h2 id="lux-merge-items-title">选择主条目</h2></div>
+              <button ref={mergeCloseButtonRef} className="lux-library-dialog-close" type="button" aria-label="关闭合并对话框" onClick={() => { setMergeOpen(false); mergeItems.reset(); }}>×</button>
+            </div>
+            <div className="lux-library-dialog-scroll">
+              <p className="lux-muted-copy">主条目会保留为目录入口，其余条目将作为它的其他版本。媒体文件不会被删除。</p>
+              <div className="lux-library-dialog-section">
+                <div className="lux-library-dialog-root-list">
+                  {selectedItems.map((item) => (
+                    <label className="lux-library-dialog-root-row" key={item.id}>
+                      <span>{mediaTitle(item)}</span>
+                      <input
+                        type="radio"
+                        name="merge-primary-item"
+                        value={item.id}
+                        aria-label={`将 ${mediaTitle(item)} 设为主条目`}
+                        checked={mergePrimaryId === item.id}
+                        onChange={() => setMergePrimaryId(item.id)}
+                      />
+                    </label>
+                  ))}
+                </div>
+              </div>
+              {mergeItems.error ? <p className="lux-error-copy" role="alert">合并失败：{mergeItems.error.message}</p> : null}
+              <div className="lux-library-dialog-actions">
+                <button className="lux-button lux-button-secondary" type="button" onClick={() => { setMergeOpen(false); mergeItems.reset(); }}>取消</button>
+                <button className="lux-button lux-button-primary" type="button" data-action="confirm-merge-items" disabled={!mergePrimaryId || mergeItems.isPending} onClick={() => mergeItems.mutate()}>{mergeItems.isPending ? "合并中…" : "确认合并"}</button>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
       {!loadedItems.length ? <div className="lux-empty-card"><span>这个媒体库还没有内容。</span><Link to="/libraries">返回媒体库</Link></div> : null}
       <div ref={loadMoreRef} aria-hidden="true" />
       {pages.isFetchingNextPage ? <p className="lux-muted-copy" role="status">正在加载更多…</p> : null}

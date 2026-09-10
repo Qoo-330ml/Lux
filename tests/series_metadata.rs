@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use luxd::{
     application::{
+        image_repairs::repair_episode_image_path_conflicts,
         libraries::LibraryService,
         metadata::{MetadataEnricher, NfoMetadata},
         nfo::{LocalNfoMetadataStore, NfoWriteService},
@@ -12,6 +13,50 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
+use uuid::Uuid;
+
+async fn prepared_episode_with_legacy_image() -> Result<
+    (
+        tempfile::TempDir,
+        Database,
+        luxd::domain::ids::LibraryId,
+        std::path::PathBuf,
+        String,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let temp_dir = tempfile::tempdir()?;
+    let root = temp_dir.path().join("Shows");
+    let season_dir = root.join("Example Show (2024)").join("Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    tokio::fs::write(season_dir.join("Example.Show.S01E01.mkv"), b"episode").await?;
+    tokio::fs::write(
+        season_dir.join("Example.Show.S01E01-thumb.jpg"),
+        b"legacy-fanart",
+    )
+    .await?;
+    let season_dir = tokio::fs::canonicalize(&season_dir).await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let episode_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    Ok((temp_dir, database, library.id, season_dir, episode_id))
+}
 
 #[tokio::test]
 async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
@@ -232,5 +277,76 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
             .await?
             .contains("<title>改写单集</title>")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_does_not_claim_a_legacy_episode_fanart_path_as_thumbnail()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, season_dir, episode_id) =
+        prepared_episode_with_legacy_image().await?;
+    let legacy_path = season_dir.join("Example.Show.S01E01-thumb.jpg");
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, source
+         ) VALUES (?, ?, 'FANART', 0, ?, ?, 'TMDB')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&episode_id)
+    .bind(legacy_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(b"legacy-fanart".len())?)
+    .execute(database.pool())
+    .await?;
+
+    MetadataEnricher::new(database.clone())
+        .enrich_series_library(library_id)
+        .await?;
+
+    let thumbnail_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'THUMB'",
+    )
+    .bind(&episode_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(thumbnail_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_rescan_keeps_repaired_episode_thumbnail_on_its_canonical_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp_dir, database, library_id, season_dir, episode_id) =
+        prepared_episode_with_legacy_image().await?;
+    let legacy_path = season_dir.join("Example.Show.S01E01-thumb.jpg");
+    MetadataEnricher::new(database.clone())
+        .enrich_series_library(library_id)
+        .await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, source
+         ) VALUES (?, ?, 'FANART', 0, ?, ?, 'TMDB')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&episode_id)
+    .bind(legacy_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(b"legacy-fanart".len())?)
+    .execute(database.pool())
+    .await?;
+    let repair = repair_episode_image_path_conflicts(&database).await?;
+    assert_eq!(repair.repaired, 1);
+
+    let canonical_path = season_dir.join("Example.Show.S01E01-thumbnail.jpg");
+    let _ = MetadataEnricher::new(database.clone())
+        .enrich_series_library(library_id)
+        .await?;
+    let thumbnail_path: String = sqlx::query_scalar(
+        "SELECT local_path
+         FROM item_images
+         WHERE item_id = ? AND image_type = 'THUMB' AND image_index = 0",
+    )
+    .bind(&episode_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(thumbnail_path, canonical_path.to_string_lossy());
     Ok(())
 }

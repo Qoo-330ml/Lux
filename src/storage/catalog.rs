@@ -5368,6 +5368,99 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_item_image_path_conflicts(
+        &self,
+    ) -> Result<Vec<StoredItemImagePathConflict>, StorageError> {
+        self.query(
+            "SELECT ii.id, ii.item_id, ii.image_type, ii.local_path
+             FROM item_images ii
+             JOIN media_items mi ON mi.id = ii.item_id
+             WHERE mi.item_type = 'EPISODE'
+               AND ii.image_type IN ('FANART', 'THUMB')
+               AND EXISTS (
+                   SELECT 1
+                   FROM item_images other
+                   WHERE other.item_id = ii.item_id
+                     AND other.local_path = ii.local_path
+                     AND other.image_type IN ('FANART', 'THUMB')
+                     AND other.image_type <> ii.image_type
+               )
+             ORDER BY ii.item_id, ii.local_path, ii.image_type, ii.image_index, ii.id",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredItemImagePathConflict {
+                    id: row.get("id"),
+                    item_id: row.get("item_id"),
+                    image_type: row.get("image_type"),
+                    local_path: row.get("local_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn item_image_path_is_in_use(
+        &self,
+        item_id: &str,
+        local_path: &std::path::Path,
+        excluded_image_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar::<i64>(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1
+                 FROM item_images
+                 WHERE item_id = ? AND local_path = ? AND id <> ?
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(item_id)
+        .bind(local_path.to_string_lossy().as_ref())
+        .bind(excluded_image_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn update_item_image_local_path(
+        &self,
+        image_id: &str,
+        local_path: &std::path::Path,
+    ) -> Result<bool, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE item_images
+                 SET local_path = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(local_path.to_string_lossy().as_ref())
+            .bind(image_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub(crate) async fn find_primary_image_dimensions(
         &self,
         item_id: &str,

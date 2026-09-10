@@ -17,7 +17,10 @@ use uuid::Uuid;
 
 use crate::{
     application::{
-        images::{read_image_dimensions_from_bytes, write_image_atomically},
+        images::{
+            acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
+            read_image_dimensions_from_bytes, write_image_atomically,
+        },
         plugin_runtime::PluginRuntimeError,
         plugins::{
             MAX_STRM_THUMBNAIL_POSITION_PERCENT, MIN_STRM_THUMBNAIL_POSITION_PERCENT,
@@ -669,9 +672,13 @@ impl StrmProbeService {
                     .await?;
                 return Ok(1);
             }
-            let target = match safe_strm_thumbnail_target(&outcome.path, &outcome.root_path).await {
-                Some(path) => path,
-                None => {
+            let _image_write_lock = acquire_image_write_lock(&outcome.item_id).await;
+            let indexed_images = self.database.list_item_images(&outcome.item_id).await?;
+            let target = match first_available_thumbnail_path(&outcome.path, &indexed_images) {
+                Some(path) if safe_strm_thumbnail_target_path(&path, &outcome.root_path).await => {
+                    path
+                }
+                _ => {
                     self.database
                         .mark_media_probe_failed(
                             &outcome.source_id,
@@ -830,16 +837,27 @@ fn hex_sha256(bytes: &[u8]) -> String {
 }
 
 fn strm_thumbnail_path(path: &Path) -> Option<PathBuf> {
-    let stem = path.file_stem()?.to_str()?;
-    Some(path.with_file_name(format!("{stem}-thumb.jpg")))
+    canonical_thumbnail_path(path)
 }
 
 async fn safe_strm_thumbnail_target(media_path: &Path, root_path: &str) -> Option<PathBuf> {
     let target = strm_thumbnail_path(media_path)?;
-    let root = fs::canonicalize(root_path).await.ok()?;
-    let parent = target.parent()?;
-    let canonical_parent = fs::canonicalize(parent).await.ok()?;
-    canonical_parent.starts_with(root).then_some(target)
+    safe_strm_thumbnail_target_path(&target, root_path)
+        .await
+        .then_some(target)
+}
+
+async fn safe_strm_thumbnail_target_path(target: &Path, root_path: &str) -> bool {
+    let Ok(root) = fs::canonicalize(root_path).await else {
+        return false;
+    };
+    let Some(parent) = target.parent() else {
+        return false;
+    };
+    let Ok(canonical_parent) = fs::canonicalize(parent).await else {
+        return false;
+    };
+    canonical_parent.starts_with(root)
 }
 
 async fn usable_strm_thumbnail(
@@ -1013,6 +1031,14 @@ mod tests {
         assert!(!progress.should_check_cancel(start));
         progress.note_source_started();
         assert!(progress.should_check_cancel(start));
+    }
+
+    #[test]
+    fn generated_strm_thumbnail_uses_a_dedicated_suffix() {
+        assert_eq!(
+            strm_thumbnail_path(Path::new("/library/Example.S01E01.strm")),
+            Some(PathBuf::from("/library/Example.S01E01-thumbnail.jpg"))
+        );
     }
 }
 

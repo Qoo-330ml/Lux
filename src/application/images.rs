@@ -3,7 +3,7 @@ use std::{
     fmt,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, Weak},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
-    sync::Semaphore,
+    sync::{Mutex, OwnedMutexGuard, Semaphore},
     time::sleep,
 };
 use uuid::Uuid;
@@ -48,6 +48,7 @@ pub(crate) const MAX_IMAGE_VARIANTS: usize = 4;
 
 static IMAGE_GLOBAL_DOWNLOAD_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 static IMAGE_GLOBAL_WRITE_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static IMAGE_ITEM_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
 
 fn global_image_download_permits() -> Arc<Semaphore> {
     IMAGE_GLOBAL_DOWNLOAD_PERMITS
@@ -59,6 +60,56 @@ fn global_image_write_permits() -> Arc<Semaphore> {
     IMAGE_GLOBAL_WRITE_PERMITS
         .get_or_init(|| Arc::new(Semaphore::new(IMAGE_GLOBAL_CONCURRENCY)))
         .clone()
+}
+
+pub(crate) async fn acquire_image_write_lock(item_id: &str) -> OwnedMutexGuard<()> {
+    let locks = IMAGE_ITEM_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(item_id).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(item_id.to_owned(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
+
+pub(crate) fn canonical_thumbnail_path(path: &Path) -> Option<PathBuf> {
+    canonical_thumbnail_path_variant(path, 0)
+}
+
+pub(crate) fn canonical_thumbnail_path_variant(path: &Path, variant: usize) -> Option<PathBuf> {
+    let stem = path.file_stem()?.to_str()?;
+    let suffix = if variant == 0 {
+        "thumbnail".to_owned()
+    } else {
+        format!("thumbnail-{variant}")
+    };
+    Some(path.with_file_name(format!("{stem}-{suffix}.jpg")))
+}
+
+pub(crate) fn first_available_thumbnail_path(
+    media_path: &Path,
+    indexed_images: &[StoredItemImage],
+) -> Option<PathBuf> {
+    (0..1000).find_map(|variant| {
+        let candidate = canonical_thumbnail_path_variant(media_path, variant)?;
+        (!image_path_is_owned_by_type(indexed_images, "FANART", &candidate)).then_some(candidate)
+    })
+}
+
+pub(crate) fn image_path_is_owned_by_type(
+    indexed_images: &[StoredItemImage],
+    image_type: &str,
+    path: &Path,
+) -> bool {
+    indexed_images.iter().any(|image| {
+        image.image_type.eq_ignore_ascii_case(image_type) && Path::new(&image.local_path) == path
+    })
 }
 
 pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
@@ -585,6 +636,17 @@ impl ImageWriteService {
         image_type: &str,
         image_index: i64,
     ) -> Result<bool, ImageWriteError> {
+        let indexed_images = self.database.list_item_images(item_id).await?;
+        if let Some(indexed_image) = indexed_images.iter().find(|image| {
+            image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == image_index
+        }) {
+            if image_file_stamp(Path::new(&indexed_image.local_path))
+                .await?
+                .is_some()
+            {
+                return Ok(true);
+            }
+        }
         if let Some(config_dir) = self.config_dir.as_ref()
             && self
                 .metadata_image_exists_at_index(config_dir, item_id, image_type, image_index)
@@ -604,6 +666,15 @@ impl ImageWriteService {
         else {
             return Ok(false);
         };
+        if image_type.eq_ignore_ascii_case("FANART")
+            && let Some(episode_stem) = episode_stem.as_deref()
+            && is_legacy_episode_fanart_path(&path, episode_stem, image_index)
+        {
+            return Ok(false);
+        }
+        if image_path_is_owned_by_other_type(&indexed_images, image_type, &path).await? {
+            return Ok(false);
+        }
         image_file_stamp(&path).await.map(|_| true)
     }
 
@@ -659,7 +730,26 @@ impl ImageWriteService {
                     .ok_or_else(|| ImageWriteError::InvalidImageType((*image_type).to_owned()))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let indexed_images = self.database.list_item_images(item_id).await?;
         let mut found = BTreeSet::new();
+
+        for image_type in &image_types {
+            let mut indexed_exists = false;
+            for image in indexed_images.iter().filter(|image| {
+                image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == 0
+            }) {
+                if image_file_stamp(Path::new(&image.local_path))
+                    .await?
+                    .is_some()
+                {
+                    indexed_exists = true;
+                    break;
+                }
+            }
+            if indexed_exists {
+                found.insert((*image_type).to_owned());
+            }
+        }
 
         if let Some(config_dir) = self.config_dir.as_ref() {
             let root = metadata_root(config_dir);
@@ -672,6 +762,15 @@ impl ImageWriteService {
                 for image_index in 0..MAX_IMAGE_VARIANTS {
                     let stems = image_lookup_stems(image_type, None, None, image_index as i64)?;
                     if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
+                        && !found.contains(*image_type)
+                        && !is_legacy_episode_fanart_path_for_type(
+                            image_type,
+                            None,
+                            image_index as i64,
+                            &path,
+                        )
+                        && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
+                            .await?
                         && image_file_stamp(&path).await?.is_some()
                     {
                         found.insert((*image_type).to_owned());
@@ -695,6 +794,14 @@ impl ImageWriteService {
                     image_index as i64,
                 )?;
                 if let Some(path) = find_existing_image_path_in_paths(&paths, &stems)
+                    && !is_legacy_episode_fanart_path_for_type(
+                        image_type,
+                        episode_stem.as_deref(),
+                        image_index as i64,
+                        &path,
+                    )
+                    && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
+                        .await?
                     && image_file_stamp(&path).await?.is_some()
                 {
                     found.insert((*image_type).to_owned());
@@ -801,16 +908,26 @@ impl ImageWriteService {
         validate_image_payload(format, &body)?;
         drop(_download_permit);
 
+        let _image_write_lock = acquire_image_write_lock(item_id).await;
         let (root, directory, movie_stem, episode_stem) = self.writeback_paths(item_id).await?;
-        let target = image_target(
-            &directory,
+        let blocked_paths = self
+            .database
+            .list_item_images(item_id)
+            .await?
+            .into_iter()
+            .filter(|image| !image.image_type.eq_ignore_ascii_case(image_type))
+            .map(|image| PathBuf::from(image.local_path))
+            .collect::<Vec<_>>();
+        let target = image_target(ImageTargetRequest {
+            directory: &directory,
             image_type,
             format,
-            movie_stem.as_deref(),
-            episode_stem.as_deref(),
+            movie_stem: movie_stem.as_deref(),
+            episode_stem: episode_stem.as_deref(),
             image_index,
             reuse_existing_path,
-        )
+            blocked_paths: &blocked_paths,
+        })
         .await?;
         if !target.starts_with(&root) {
             return Err(ImageWriteError::PathOutsideRoot(target));
@@ -826,15 +943,16 @@ impl ImageWriteService {
             let canonical_metadata_root = fs::canonicalize(&metadata_root_path)
                 .await
                 .map_err(|source| image_io_error(&metadata_root_path, source))?;
-            let metadata_target = image_target(
-                &metadata_directory,
+            let metadata_target = image_target(ImageTargetRequest {
+                directory: &metadata_directory,
                 image_type,
                 format,
-                None,
-                None,
+                movie_stem: None,
+                episode_stem: None,
                 image_index,
-                true,
-            )
+                reuse_existing_path: true,
+                blocked_paths: &blocked_paths,
+            })
             .await?;
             if !metadata_target.starts_with(&canonical_metadata_root) {
                 return Err(ImageWriteError::PathOutsideRoot(metadata_target));
@@ -1418,22 +1536,57 @@ fn validate_image_payload(format: ImageFormat, body: &[u8]) -> Result<(), ImageW
     }
 }
 
-async fn image_target(
-    directory: &Path,
-    image_type: &str,
+struct ImageTargetRequest<'a> {
+    directory: &'a Path,
+    image_type: &'a str,
     format: ImageFormat,
-    movie_stem: Option<&str>,
-    episode_stem: Option<&str>,
+    movie_stem: Option<&'a str>,
+    episode_stem: Option<&'a str>,
     image_index: i64,
     reuse_existing_path: bool,
-) -> Result<PathBuf, ImageWriteError> {
-    let stems = image_lookup_stems(image_type, movie_stem, episode_stem, image_index)?;
+    blocked_paths: &'a [PathBuf],
+}
+
+async fn image_target(request: ImageTargetRequest<'_>) -> Result<PathBuf, ImageWriteError> {
+    let ImageTargetRequest {
+        directory,
+        image_type,
+        format,
+        movie_stem,
+        episode_stem,
+        image_index,
+        reuse_existing_path,
+        blocked_paths,
+    } = request;
+    let mut comparable_blocked_paths = Vec::with_capacity(blocked_paths.len());
+    for path in blocked_paths {
+        comparable_blocked_paths.push(canonical_path_for_comparison(path).await?);
+    }
+    let is_blocked = |path: &Path| {
+        comparable_blocked_paths
+            .iter()
+            .any(|blocked| image_paths_conflict(blocked, path))
+    };
+    let stems = if image_type.eq_ignore_ascii_case("FANART") && episode_stem.is_some() {
+        let (prefixed, generic) =
+            canonical_image_stems(image_type, movie_stem, episode_stem, image_index)?;
+        prefixed
+            .into_iter()
+            .chain(std::iter::once(generic))
+            .collect()
+    } else {
+        image_lookup_stems(image_type, movie_stem, episode_stem, image_index)?
+    };
     if reuse_existing_path {
-        if let Some(existing) = find_existing_image_path(directory, &stems, None).await? {
+        if let Some(existing) = find_existing_image_path(directory, &stems, None).await?
+            && !is_blocked(&existing)
+        {
             return Ok(existing);
         }
     }
-    if let Some(existing) = find_existing_image_path(directory, &stems, Some(format)).await? {
+    if let Some(existing) = find_existing_image_path(directory, &stems, Some(format)).await?
+        && !is_blocked(&existing)
+    {
         return Ok(existing);
     }
     let (prefixed_stem, generic_stem) =
@@ -1451,7 +1604,107 @@ async fn image_target(
     } else {
         generic_stem
     };
-    Ok(directory.join(format!("{target_stem}.{}", format.extension())))
+    let target = directory.join(format!("{target_stem}.{}", format.extension()));
+    if !is_blocked(&target) {
+        return Ok(target);
+    }
+
+    let Some(conflict_free_stem) = conflict_free_image_stem(image_type, episode_stem) else {
+        return Err(ImageWriteError::ConcurrentModification(target));
+    };
+    let conflict_free_stem = if image_index == 0 {
+        conflict_free_stem.to_owned()
+    } else {
+        format!("{conflict_free_stem}{image_index}")
+    };
+    let conflict_free_target =
+        directory.join(format!("{conflict_free_stem}.{}", format.extension()));
+    if is_blocked(&conflict_free_target) {
+        return Err(ImageWriteError::ConcurrentModification(
+            conflict_free_target,
+        ));
+    }
+    Ok(conflict_free_target)
+}
+
+fn conflict_free_image_stem(image_type: &str, episode_stem: Option<&str>) -> Option<String> {
+    let episode_stem = episode_stem?;
+    let suffix = match image_type {
+        "FANART" => "fanart",
+        "THUMB" => "thumbnail",
+        _ => return None,
+    };
+    Some(format!("{episode_stem}-{suffix}"))
+}
+
+async fn image_path_is_owned_by_other_type(
+    indexed_images: &[StoredItemImage],
+    image_type: &str,
+    path: &Path,
+) -> Result<bool, ImageWriteError> {
+    let comparable_path = canonical_path_for_comparison(path).await?;
+    for image in indexed_images {
+        if !image.image_type.eq_ignore_ascii_case(image_type)
+            && image_paths_conflict(
+                &canonical_path_for_comparison(Path::new(&image.local_path)).await?,
+                &comparable_path,
+            )
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+async fn canonical_path_for_comparison(path: &Path) -> Result<PathBuf, ImageWriteError> {
+    match fs::canonicalize(path).await {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(path.to_owned()),
+        Err(source) => Err(image_io_error(path, source)),
+    }
+}
+
+fn image_paths_conflict(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    left.parent() == right.parent()
+        && left.file_stem().is_some()
+        && left
+            .file_stem()
+            .zip(right.file_stem())
+            .is_some_and(|(left, right)| left.eq_ignore_ascii_case(right))
+}
+
+fn is_legacy_episode_fanart_path_for_type(
+    image_type: &str,
+    episode_stem: Option<&str>,
+    image_index: i64,
+    path: &Path,
+) -> bool {
+    image_type.eq_ignore_ascii_case("FANART")
+        && episode_stem.is_some_and(|episode_stem| {
+            is_legacy_episode_fanart_path(path, episode_stem, image_index)
+        })
+}
+
+fn is_legacy_episode_fanart_path(path: &Path, episode_stem: &str, image_index: i64) -> bool {
+    let Some(file_stem) = path.file_stem().and_then(|value| value.to_str()) else {
+        return false;
+    };
+    let legacy_stem = format!("{episode_stem}-thumb");
+    let legacy_indexed_stem = if image_index == 0 {
+        legacy_stem.clone()
+    } else {
+        format!("{legacy_stem}{image_index}")
+    };
+    let legacy_hyphenated_stem = if image_index == 0 {
+        legacy_stem
+    } else {
+        format!("{legacy_stem}-{image_index}")
+    };
+    file_stem.eq_ignore_ascii_case(&legacy_indexed_stem)
+        || file_stem.eq_ignore_ascii_case(&legacy_hyphenated_stem)
 }
 
 async fn find_image_path_at_index(
@@ -1545,8 +1798,26 @@ fn image_lookup_stems(
     }
     stems.push(canonical_generic.clone());
     stems.push(indexed_legacy_stem(&legacy_generic, image_index));
+    if image_type.eq_ignore_ascii_case("FANART") && episode_stem.is_some() {
+        if let Some(stem) = conflict_free_image_stem(image_type, episode_stem) {
+            stems.push(if image_index == 0 {
+                stem
+            } else {
+                format!("{stem}{image_index}")
+            });
+        }
+    }
     if image_index > 0 && image_type.eq_ignore_ascii_case("FANART") {
         stems.push(format!("{canonical_generic}-{image_index}"));
+    }
+    if image_type.eq_ignore_ascii_case("FANART")
+        && let Some(episode_stem) = episode_stem
+    {
+        let legacy_episode_stem = format!("{episode_stem}-thumb");
+        stems.push(indexed_legacy_stem(&legacy_episode_stem, image_index));
+        if image_index > 0 {
+            stems.push(format!("{legacy_episode_stem}{image_index}"));
+        }
     }
     Ok(stems)
 }
@@ -1597,11 +1868,6 @@ fn image_file_stems(
         "ART" => "art",
         "WALLPAPER" => "wallpaper",
         _ => return Err(ImageWriteError::InvalidImageType(image_type.to_owned())),
-    };
-    let image_stem = if episode_stem.is_some() && image_stem == "fanart" {
-        "thumb"
-    } else {
-        image_stem
     };
     let generic_stem = episode_stem
         .map(|episode_stem| format!("{episode_stem}-{image_stem}"))
@@ -2381,5 +2647,18 @@ mod tests {
         let lookup = image_lookup_stems("FANART", None, None, 1).expect("fanart type");
         assert!(lookup.iter().any(|stem| stem == "backdrop1"));
         assert!(lookup.iter().any(|stem| stem == "fanart-1"));
+    }
+
+    #[test]
+    fn episode_fanart_writes_to_a_distinct_name_and_reads_legacy_thumb_names() {
+        assert_eq!(
+            canonical_image_stems("FANART", None, Some("Example.S01E01"), 0).expect("fanart type"),
+            (None, "Example.S01E01-fanart".to_owned())
+        );
+        let lookup =
+            image_lookup_stems("FANART", None, Some("Example.S01E01"), 1).expect("fanart type");
+        assert!(lookup.iter().any(|stem| stem == "Example.S01E01-fanart1"));
+        assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb1"));
+        assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb-1"));
     }
 }

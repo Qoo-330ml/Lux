@@ -436,11 +436,18 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT id, sort_title, production_year, parent_id, provider_ids_json, removed_at
-                 FROM media_items
-                 WHERE library_id = ? AND item_type = 'MOVIE'
-                   AND sort_title IN ({placeholders})
-                 ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id"
+                "SELECT COALESCE(source_item.merged_into_item_id, source_item.id) AS id,
+                        source_item.sort_title, source_item.production_year,
+                        target_item.parent_id, target_item.provider_ids_json,
+                        target_item.removed_at
+                 FROM media_items source_item
+                 JOIN media_items target_item
+                   ON target_item.id = COALESCE(source_item.merged_into_item_id, source_item.id)
+                 WHERE source_item.library_id = ? AND source_item.item_type = 'MOVIE'
+                   AND source_item.sort_title IN ({placeholders})
+                 ORDER BY CASE WHEN source_item.merged_into_item_id IS NULL THEN 0 ELSE 1 END,
+                          CASE WHEN target_item.removed_at IS NULL THEN 0 ELSE 1 END,
+                          target_item.id"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
             for sort_title in chunk {
@@ -1510,11 +1517,12 @@ impl Database {
         let row = match production_year {
             Some(year) => {
                 self.query(
-                    "SELECT id
+                    "SELECT COALESCE(merged_into_item_id, id) AS id
                      FROM media_items
                      WHERE library_id = ? AND item_type = 'MOVIE'
                        AND sort_title = ? AND production_year = ?
-                     ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id
+                     ORDER BY CASE WHEN merged_into_item_id IS NULL THEN 0 ELSE 1 END,
+                              CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id
                      LIMIT 1",
                 )
                 .bind(library_id)
@@ -1525,11 +1533,12 @@ impl Database {
             }
             None => {
                 self.query(
-                    "SELECT id
+                    "SELECT COALESCE(merged_into_item_id, id) AS id
                      FROM media_items
                      WHERE library_id = ? AND item_type = 'MOVIE'
                        AND sort_title = ? AND production_year IS NULL
-                     ORDER BY CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id
+                     ORDER BY CASE WHEN merged_into_item_id IS NULL THEN 0 ELSE 1 END,
+                              CASE WHEN removed_at IS NULL THEN 0 ELSE 1 END, id
                      LIMIT 1",
                 )
                 .bind(library_id)
@@ -1589,15 +1598,21 @@ impl Database {
         &self,
         identity_key: &str,
     ) -> Result<Option<StoredMediaItem>, StorageError> {
-        self.query("SELECT id FROM media_items WHERE identity_key = ?")
-            .bind(identity_key)
-            .fetch_optional(&self.pool)
-            .await
-            .map(|row| row.map(stored_media_item))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.query(
+            "SELECT COALESCE(merged_into_item_id, id) AS id
+             FROM media_items
+             WHERE identity_key = ?
+             ORDER BY CASE WHEN merged_into_item_id IS NULL THEN 0 ELSE 1 END, id
+             LIMIT 1",
+        )
+        .bind(identity_key)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_media_item))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn adopt_media_item_identity(

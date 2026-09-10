@@ -4,12 +4,15 @@ use std::{fs, os::unix::fs::PermissionsExt, path::Path, time::Duration};
 
 use luxd::{
     application::{
-        libraries::LibraryService, scanner::ScanJobService, thumbnails::ThumbnailService,
+        libraries::LibraryService,
+        scanner::{LibraryScanner, ScanJobService},
+        thumbnails::ThumbnailService,
     },
     config::Config,
     library::LibraryKind,
     storage::Database,
 };
+use uuid::Uuid;
 
 fn config(root: &Path) -> Config {
     Config {
@@ -70,7 +73,7 @@ async fn scan_generates_local_thumbnail_but_never_strm_thumbnail()
     jobs.run_to_completion_with_metadata_and_thumbnails(&job.id, 100, None, None, Some(thumbnails))
         .await?;
 
-    assert!(movie_dir.join("Local.Movie.2024-thumb.jpg").is_file());
+    assert!(movie_dir.join("Local.Movie.2024-thumbnail.jpg").is_file());
     assert!(!movie_dir.join("Remote-thumb.jpg").exists());
     let image_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE image_type = 'THUMB'")
@@ -112,7 +115,7 @@ async fn existing_thumbnail_is_not_overwritten() -> Result<(), Box<dyn std::erro
         Some(thumbnails.clone()),
     )
     .await?;
-    let target = movie_dir.join("Local.Movie.2024-thumb.jpg");
+    let target = movie_dir.join("Local.Movie.2024-thumbnail.jpg");
     let original = fs::read(&target)?;
     let log_after_first_run = fs::read_to_string(&log)?;
 
@@ -171,6 +174,151 @@ async fn existing_series_episode_thumbnail_is_indexed_before_thumbnail_generatio
     .fetch_one(database.pool())
     .await?;
     assert_eq!(image_row, ("THUMB".to_owned(), "LOCAL".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn generated_episode_thumbnail_never_claims_episode_fanart_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season_dir = root.join("Example Show (2024)").join("Season 01");
+    fs::create_dir_all(&season_dir)?;
+    let episode_path = season_dir.join("Example.Show.S01E01.mkv");
+    let fanart_path = season_dir.join("Example.Show.S01E01-thumb.jpg");
+    fs::write(&episode_path, b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    fs::write(&fanart_path, b"\xff\xd8existing-fanart\xff\xd9")?;
+
+    let episode_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'FANART', 0, ?, ?, 'fanart', 'TMDB')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&episode_id)
+    .bind(fanart_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(b"\xff\xd8existing-fanart\xff\xd9".len())?)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'THUMB', 0, ?, ?, 'thumbnail', 'FFMPEG')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&episode_id)
+    .bind(fanart_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(b"\xff\xd8existing-fanart\xff\xd9".len())?)
+    .execute(database.pool())
+    .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fs::write(&log, "")?;
+    fake_ffmpeg(&fake, &log, 0)?;
+    let thumbnails = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5));
+
+    let report = thumbnails.generate_library(library.id).await?;
+
+    assert_eq!(
+        report.generated, 1,
+        "unexpected thumbnail report: {report:?}"
+    );
+    assert_eq!(fs::read(&fanart_path)?, b"\xff\xd8existing-fanart\xff\xd9");
+    let thumbnail_path = fs::canonicalize(&season_dir)?.join("Example.Show.S01E01-thumbnail.jpg");
+    assert_eq!(fs::read(&thumbnail_path)?, b"\xff\xd8lux-thumb\xff\xd9");
+    let indexed_thumbnail: (String, String) = sqlx::query_as(
+        "SELECT image_type, local_path
+         FROM item_images
+         WHERE item_id = ? AND image_type = 'THUMB' AND image_index = 0",
+    )
+    .bind(&episode_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_thumbnail.0, "THUMB");
+    assert_eq!(indexed_thumbnail.1, thumbnail_path.to_string_lossy());
+    Ok(())
+}
+
+#[tokio::test]
+async fn generated_episode_thumbnail_skips_a_canonical_path_owned_by_fanart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season_dir = root.join("Example Show (2024)").join("Season 01");
+    fs::create_dir_all(&season_dir)?;
+    let episode_path = season_dir.join("Example.Show.S01E01.mkv");
+    let fanart_path = season_dir.join("Example.Show.S01E01-thumbnail.jpg");
+    fs::write(&episode_path, b"video")?;
+    fs::write(&fanart_path, b"\xff\xd8existing-fanart\xff\xd9")?;
+    let fanart_path = fs::canonicalize(&fanart_path)?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+
+    let episode_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'FANART', 0, ?, ?, 'fanart', 'TMDB')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&episode_id)
+    .bind(fanart_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(b"\xff\xd8existing-fanart\xff\xd9".len())?)
+    .execute(database.pool())
+    .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fs::write(&log, "")?;
+    fake_ffmpeg(&fake, &log, 0)?;
+    let thumbnails = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5));
+
+    let report = thumbnails.generate_library(library.id).await?;
+
+    assert_eq!(
+        report.generated, 1,
+        "unexpected thumbnail report: {report:?}"
+    );
+    let thumbnail_path = fanart_path.with_file_name("Example.Show.S01E01-thumbnail-1.jpg");
+    assert_eq!(fs::read(&thumbnail_path)?, b"\xff\xd8lux-thumb\xff\xd9");
+    let indexed_thumbnail: String = sqlx::query_scalar(
+        "SELECT local_path
+         FROM item_images
+         WHERE item_id = ? AND image_type = 'THUMB' AND image_index = 0",
+    )
+    .bind(&episode_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_thumbnail, thumbnail_path.to_string_lossy());
+    assert_eq!(fs::read(&fanart_path)?, b"\xff\xd8existing-fanart\xff\xd9");
     Ok(())
 }
 

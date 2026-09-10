@@ -173,6 +173,7 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/metadata/confirm",
             post(admin_confirm_metadata),
         )
+        .route("/api/v1/admin/items/merge", post(admin_merge_items))
         .route(
             "/api/v1/admin/metadata/reidentify/{job_id}",
             get(admin_get_metadata_reidentify).post(admin_retry_metadata_reidentify),

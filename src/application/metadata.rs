@@ -1391,6 +1391,17 @@ impl MetadataEnricher {
         item_id: &str,
         images: Vec<LocalImage>,
     ) -> Result<usize, MetadataError> {
+        let indexed_images = self.database.list_item_images(item_id).await?;
+        let images = images
+            .into_iter()
+            .filter(|image| {
+                !(image.image_type == ImageType::Thumb
+                    && indexed_images.iter().any(|indexed| {
+                        indexed.image_type.eq_ignore_ascii_case("FANART")
+                            && Path::new(&indexed.local_path) == image.path
+                    }))
+            })
+            .collect::<Vec<_>>();
         let has_primary_artwork = images
             .iter()
             .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
@@ -1835,6 +1846,37 @@ fn find_series_images(paths: &[PathBuf], season_number: Option<i64>) -> Vec<Loca
     images
 }
 
+fn prefers_canonical_episode_thumbnail(
+    candidate: &Path,
+    existing: &Path,
+    episode_prefix: &str,
+) -> bool {
+    let candidate_suffix = candidate
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| {
+            value
+                .to_ascii_lowercase()
+                .strip_prefix(episode_prefix)
+                .map(str::to_owned)
+        });
+    let existing_suffix = existing
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .and_then(|value| {
+            value
+                .to_ascii_lowercase()
+                .strip_prefix(episode_prefix)
+                .map(str::to_owned)
+        });
+    candidate_suffix
+        .as_deref()
+        .is_some_and(|suffix| matches_indexed_stem(suffix, "thumbnail"))
+        && existing_suffix
+            .as_deref()
+            .is_some_and(|suffix| matches_indexed_stem(suffix, "thumb"))
+}
+
 fn find_episode_images(paths: &[PathBuf], media_path: &Path) -> Vec<LocalImage> {
     let Some(episode_stem) = media_path.file_stem().and_then(|value| value.to_str()) else {
         return Vec::new();
@@ -1893,12 +1935,18 @@ fn find_episode_images(paths: &[PathBuf], media_path: &Path) -> Vec<LocalImage> 
             value if matches_indexed_stem(value, "wallpaper") => ImageType::Wallpaper,
             _ => continue,
         };
-        if image_type != ImageType::Fanart
-            && images
-                .iter()
-                .any(|image: &LocalImage| image.image_type == image_type)
-        {
-            continue;
+        if image_type != ImageType::Fanart {
+            if let Some(existing) = images
+                .iter_mut()
+                .find(|image: &&mut LocalImage| image.image_type == image_type)
+            {
+                if image_type == ImageType::Thumb
+                    && prefers_canonical_episode_thumbnail(path, &existing.path, &prefix)
+                {
+                    existing.path = path.clone();
+                }
+                continue;
+            }
         }
         images.push(LocalImage {
             image_type,

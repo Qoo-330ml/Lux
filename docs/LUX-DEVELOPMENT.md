@@ -2103,6 +2103,7 @@ services:
 | LUX-248 | docs/LUX-DEVELOPMENT.md、docs/decisions/041-device-pairing.md、migrations/0119_device_pairings.sql、migrations-postgres/0119_device_pairings.sql、src/auth/device_pairings.rs、src/security.rs、src/storage/device_pairings.rs、src/storage/catalog.rs、src/storage/repository.rs、src/storage/users.rs、src/storage/mod.rs、src/auth/emby.rs、src/auth/mod.rs、src/api/legacy.rs、src/api/routes.rs、src/api/users.rs、tests/device_pairings.rs、tests/admin_health.rs、tests/danmaku.rs、tests/ready_version.rs、tests/scanner.rs、tests/storage.rs；Lux Prism 一次性设备配对 |
 | LUX-249 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/application/scraper.rs、src/application/images.rs、src/application/candidates.rs、src/storage/media.rs、src/storage/repository.rs、web/src/features/admin/AdminPluginsPage.tsx、web/tests/plugin-library.test.ts；TMDb 原语言文字与图片模式 |
 | LUX-250 | docs/LUX-DEVELOPMENT.md、web/src/features/home/media.tsx、web/src/features/detail/MediaDetailPage.tsx、web/tests/home-media.test.tsx、web/tests/media-detail.test.tsx；季海报缺失时回退父剧海报 |
+| LUX-251 | docs/LUX-DEVELOPMENT.md、docs/LUX-251-PLAN.md、migrations/0120_manual_item_merges.sql、migrations-postgres/0120_manual_item_merges.sql、src/storage/media_merge.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/catalog.rs、src/application/item_merge.rs、src/application/mod.rs、src/application/scanner.rs、src/api/legacy.rs、src/api/admin.rs、src/api/admin_handlers.rs、web/src/features/library/LibraryPage.tsx、web/src/lib/api/client.ts、web/src/lib/api/types.ts、tests/item_merge.rs、web/tests/library-page.test.ts；管理员手动合并媒体条目为多版本 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -2820,6 +2821,22 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 
 依赖：LUX-071、LUX-052。
 
+#### LUX-251：管理员手动合并多版本
+
+描述：在媒体库已有多选模式中，管理员可以选择同一媒体库内两个或更多同类型的电影或剧集，明确指定一个主条目，将其余条目并入主条目作为其他媒体版本。合并不删除媒体文件；被合并条目从目录隐藏，后续扫描仍归入主条目。
+
+验收：
+
+- 电影的媒体源、播放进度、收藏和已看状态合并到主条目；主条目原有默认媒体源优先，所有源仍可选择和播放。
+- 剧集按季度号和集号合并匹配的层级；主剧集中不存在的季度或分集重新挂到主剧集，媒体源和状态不丢失。
+- 只允许同一启用媒体库、同一 `MOVIE`/`SERIES` 根类型且未被合并的条目；操作事务化、管理员鉴权并受 CSRF 保护。
+- 目录、首页、搜索和后续扫描不再显示或重新生成被合并的根条目；审计事件不包含路径、URL 或凭据。
+- Web 多选工具栏提供合并入口，要求明确选择主条目并提供成功、失败和加载状态。
+
+验证：电影/剧集合并 API 集成测试、扫描重扫回归测试、Web 多选流程测试。
+
+依赖：LUX-083、LUX-106。
+
 #### LUX-084：TMDb 自动合集
 
 验收：
@@ -3426,16 +3443,16 @@ Lux 管理页动态填充 `media-libraries` 选项并保存插件配置。管理
 和媒体库 `probeConcurrency` 的较小值限制并发；任务支持分页列表、详情、取消、重试；服务重启时取消遗留的
 PENDING/RUNNING 状态，管理员主动重试后继续使用持久化游标。探测结果保存到 `media_sources`/`media_streams`，旁车写回使用同目录
 `*-mediainfo.json` 的 MediaInfoKeeper 兼容子集和临时文件原子替换。缩略图只针对 STRM，使用同目录
-`*-thumb.jpg`；截图前先用 `ffprobe` 获取 duration，再调用 `ffmpeg` 在 `thumbnailPositionPercent` 指定的百分比位置输出一张受限尺寸的
+`*-thumbnail.jpg`；截图前先用 `ffprobe` 获取 duration，再调用 `ffmpeg` 在 `thumbnailPositionPercent` 指定的百分比位置输出一张受限尺寸的
 JPEG，并将该文件同时登记为 `POSTER` 和 `THUMB`。媒体信息和缩略图是两步独立命令，不引入 FFmpeg 原生库；截图只补全缺少有效主图的 STRM，不
-覆盖已有有效缩略图。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
+覆盖已有有效缩略图。历史 `*-thumb.jpg` 仅作读取兼容。只开启缩略图时不保存完整媒体信息，但仍会执行轻量 duration 探测。
 
 STRM 截图采用“本地/在线主图优先、视频截图兜底”的顺序：数据库按媒体条目持久化
 `poster_fallback_required` 标记。新增 STRM 没有本地 `POSTER` 或 `THUMB` 时设置该标记为 true；
 媒体库未配置刮削器、所选刮削器没有候选、候选没有可用主图时，都保留该标记。发现本地
 `POSTER`/`THUMB` 或刮削器成功写入任一主图时清除该标记。STRM 截图阶段只处理该标记为 true
 且没有有效 `THUMB` 的 STRM 来源，不要求先找到在线条目。FFmpeg 截图成功后写入同目录
-`*-thumb.jpg`，并用同一文件同时登记 `POSTER` 和 `THUMB`，来源为 `STRM_FFMPEG`。后续刮削器
+`*-thumbnail.jpg`，并用同一文件同时登记 `POSTER` 和 `THUMB`，来源为 `STRM_FFMPEG`；历史 `*-thumb.jpg` 仍可通过数据库登记路径读取。后续刮削器
 获得真实海报或缩略图时可以按图片类型替换对应兜底记录；删除其中一个记录时不能删除仍被另一
 记录引用的共享文件。
 
@@ -3465,8 +3482,8 @@ STRM 来源的后台探测任务；这条事件驱动路径不替代全局计划
 - [ ] 同一时间的有效探测数不超过任务全局并发和媒体库 `probeConcurrency`；单个 URL 失败只影响对应源，任务可继续。
 - [ ] 服务重启会取消 PENDING/RUNNING 任务且不自动领取新源；失败或取消任务可以重试。
 - [ ] 成功结果写入媒体源和媒体流；`writeSidecars` 启用时写入兼容旁车，失败不会留下半个 JSON。
-- [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 `thumbnailPositionPercent` 指定的位置生成同目录 `*-thumb.jpg`，默认位置为 30%，已有有效缩略图不会被覆盖。
-- [ ] STRM 截图遵循本地/在线主图优先顺序：没有刮削器、刮削器无候选或候选没有主图时持久化 `poster_fallback_required`；ffmpeg 不要求在线匹配成功，只消费该标记和缺失图条件；截图成功后将同一文件登记为 `POSTER` 与 `THUMB` 并清除标记，后续刮削器获得图片时可按类型替换 `STRM_FFMPEG` 兜底图。
+- [ ] `mediaInfoEnabled` 和 `thumbnailEnabled` 可以独立生效；缩略图缺失时先由 ffprobe 获取 duration，再由 ffmpeg 在 `thumbnailPositionPercent` 指定的位置生成同目录 `*-thumbnail.jpg`，默认位置为 30%，已有有效缩略图不会被覆盖，历史 `*-thumb.jpg` 仍可读取。
+- [ ] STRM 截图遵循本地/在线主图优先顺序：没有刮削器、刮削器无候选或候选没有主图时持久化 `poster_fallback_required`；ffmpeg 不要求在线匹配成功，只消费该标记和缺失图条件；截图成功后将同一 `*-thumbnail.jpg` 文件登记为 `POSTER` 与 `THUMB` 并清除标记，后续刮削器获得图片时可按类型替换 `STRM_FFMPEG` 兜底图。
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后保留调度配置但取消遗留作业实例。
 - [ ] 实时增量扫描完成后，所选媒体库中新入库或发生变化的 `.strm` 来源自动创建定向 STRM 探测任务；定向任务只处理本次增量扫描影响的来源，并支持取消和失败重试。
 - [ ] 定向 STRM 探测与全局定时探测共用并发、插件配置和任务持久化边界；定时任务仍保留并继续负责全库补漏，两个任务不能并发占用同一媒体库。

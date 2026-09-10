@@ -173,7 +173,7 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
         service.get(&thumbnail_jobs[0].id).await?.status,
         "COMPLETED"
     );
-    let thumbnail_path = movie_dir.join("Plugin.Movie.2024-thumb.jpg");
+    let thumbnail_path = movie_dir.join("Plugin.Movie.2024-thumbnail.jpg");
     let thumbnail = fs::read(&thumbnail_path)?;
     assert_eq!(thumbnail, b"\xff\xd8\xfffake-thumb\xff\xd9");
     let images: Vec<(String, String, String, i64)> = sqlx::query_as(
