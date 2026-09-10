@@ -25,6 +25,7 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "fixed", items: [
         "修复分集 FANART 与 FFmpeg 缩略图可能共用 *-thumb.jpg 路径的问题；新 FANART 和缩略图使用独立路径，历史文件仍可读取。",
         "启动时修复已有的分集图片路径冲突，并压缩稀疏 FANART 索引，确保默认图片入口稳定指向首张剧照。",
+        "修复详情页 Hero 操作区被高海报或 Logo 撑高的问题；操作控件保持居中并隐藏重复的装饰图片。",
       ] },
       { kind: "changed", items: [
         "被合并的根条目从目录、首页和搜索结果隐藏，后续扫描会继续将新增媒体源归入主条目。",
