@@ -1,4 +1,4 @@
-use std::os::unix::fs::symlink;
+use std::os::unix::fs::{PermissionsExt, symlink};
 
 use luxd::{
     api::{AppState, app_with_state},
@@ -563,5 +563,279 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
 
     server.abort();
     assert!(!admin.id.to_string().is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_playback_info_negotiates_server_transcoding_and_cleans_hls()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(
+        root.join("Emby Transcode Movie 2026.mkv"),
+        b"not-a-real-video",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Emby Transcode Remote 2026.strm"),
+        "https://example.invalid/media/movie.mp4\n",
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let (item_id, source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Emby Transcode Movie 2026.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let emby_item_id = emby_public_id(&item_id);
+
+    let fake_ffmpeg = temp_dir.path().join("fake-ffmpeg");
+    tokio::fs::write(
+        &fake_ffmpeg,
+        "#!/bin/sh
+set -eu
+manifest=\"\"
+segment=\"\"
+while [ \"$#\" -gt 0 ]; do
+  case \"$1\" in
+    -hls_segment_filename) segment=\"$2\"; shift 2 ;;
+    *.m3u8) manifest=\"$1\"; shift ;;
+    *) shift ;;
+  esac
+done
+directory=$(dirname \"$manifest\")
+mkdir -p \"$directory\"
+printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' > \"$manifest\"
+printf init > \"$directory/init.mp4\"
+printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
+",
+    )
+    .await?;
+    let mut permissions = tokio::fs::metadata(&fake_ffmpeg).await?.permissions();
+    permissions.set_mode(0o700);
+    tokio::fs::set_permissions(&fake_ffmpeg, permissions).await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(
+        AppState::ready(config.clone(), database.clone(), setup, auth, emby_auth)
+            .with_hls_executable(fake_ffmpeg),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="PlaybackTest", Device="Mac", DeviceId="transcode-test", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+
+    let direct = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(direct.status(), reqwest::StatusCode::OK);
+    let direct_body = direct.json::<Value>().await?;
+    assert_eq!(direct_body["MediaSources"][0]["SupportsTranscoding"], false);
+    assert!(
+        direct_body["MediaSources"][0]
+            .get("TranscodingUrl")
+            .is_none()
+    );
+
+    let transcoding = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectPlay": false,
+            "EnableDirectStream": false,
+            "EnableTranscoding": true,
+            "AllowVideoStreamCopy": false,
+            "AllowAudioStreamCopy": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(transcoding.status(), reqwest::StatusCode::OK);
+    let body = transcoding.json::<Value>().await?;
+    assert_eq!(body["MediaSources"][0]["SupportsTranscoding"], true);
+    assert_eq!(body["MediaSources"][0]["TranscodingSubProtocol"], "hls");
+    assert_eq!(body["MediaSources"][0]["TranscodingContainer"], "mp4");
+    assert_eq!(body["MediaSources"][0]["TranscodingMimeType"], "video/mp4");
+    let transcoding_url = body["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .ok_or("missing transcoding URL")?;
+    assert!(transcoding_url.starts_with(&format!("/Videos/{emby_item_id}/master.m3u8?")));
+    assert!(!transcoding_url.contains(&token));
+    let play_session_id = body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing transcoding play session")?;
+    assert!(play_session_id.starts_with("lux-emby:"));
+    let session_id = play_session_id
+        .strip_prefix("lux-emby:")
+        .ok_or("invalid transcoding play session")?;
+
+    let manifest = client
+        .get(format!("{base_url}{transcoding_url}"))
+        .send()
+        .await?;
+    assert_eq!(manifest.status(), reqwest::StatusCode::OK);
+    let manifest = manifest.text().await?;
+    let init_url = manifest
+        .split("URI=\"")
+        .nth(1)
+        .and_then(|value| value.split('\"').next())
+        .ok_or("missing signed init URL")?;
+    let segment_url = manifest
+        .lines()
+        .find(|line| line.contains("/transcoding/") && line.contains(".m4s?"))
+        .ok_or("missing signed segment URL")?;
+    let init = client.get(format!("{base_url}{init_url}")).send().await?;
+    assert_eq!(init.status(), reqwest::StatusCode::OK);
+    assert_eq!(init.bytes().await?.as_ref(), b"init");
+    let segment = client
+        .get(format!("{base_url}{segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(segment.bytes().await?.as_ref(), b"segment");
+
+    let before_heartbeat: i64 =
+        sqlx::query_scalar("SELECT expires_at FROM web_playback_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_one(database.pool())
+            .await?;
+    let playing = client
+        .post(format!("{base_url}/Sessions/Playing"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": play_session_id,
+            "PositionTicks": 0
+        }))
+        .send()
+        .await?;
+    assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+    let after_heartbeat: i64 =
+        sqlx::query_scalar("SELECT expires_at FROM web_playback_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(after_heartbeat >= before_heartbeat);
+
+    let wrong_item = transcoding_url.replace(&format!("/Videos/{emby_item_id}/"), "/Videos/0/");
+    assert_eq!(
+        client
+            .get(format!("{base_url}{wrong_item}"))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+    let tampered = transcoding_url.replacen("luxPlaybackSignature=", "luxPlaybackSignature=x", 1);
+    assert_eq!(
+        client
+            .get(format!("{base_url}{tampered}"))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
+
+    let stopped = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": play_session_id,
+            "PositionTicks": 0
+        }))
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    assert!(
+        !config
+            .config_dir
+            .join("web-playback")
+            .join(session_id)
+            .exists()
+    );
+
+    let (strm_item_id, strm_source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Emby Transcode Remote 2026.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let strm_response = client
+        .post(format!(
+            "{base_url}/Items/{}/PlaybackInfo",
+            emby_public_id(&strm_item_id)
+        ))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": strm_source_id,
+            "EnableDirectPlay": false,
+            "EnableTranscoding": true
+        }))
+        .send()
+        .await?;
+    assert_eq!(strm_response.status(), reqwest::StatusCode::OK);
+    let strm_body = strm_response.json::<Value>().await?;
+    assert_eq!(strm_body["MediaSources"][0]["SupportsTranscoding"], false);
+    assert!(strm_body["MediaSources"][0].get("TranscodingUrl").is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS' AND state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+
+    server.abort();
     Ok(())
 }

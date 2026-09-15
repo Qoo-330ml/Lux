@@ -133,6 +133,11 @@ impl HlsManager {
         self.hardware_encoder.is_some()
     }
 
+    pub(crate) fn with_executable(mut self, executable: String) -> Self {
+        self.ffmpeg_executable = executable;
+        self
+    }
+
     pub(crate) async fn start(
         &self,
         session_id: &str,

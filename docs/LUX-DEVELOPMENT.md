@@ -6159,15 +6159,23 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
 
 验收：
 
-- [ ] 第三方 Emby `PlaybackInfo` POST 可以为本地媒体协商服务端转码，并实际取得 `master.m3u8`、init
+- [x] 第三方 Emby `PlaybackInfo` POST 可以为本地媒体协商服务端转码，并实际取得 `master.m3u8`、init
       segment 和 media segment；Direct Play 仍优先。
-- [ ] Emby 转码播放事件能够刷新会话并在 `Stopped` 后回收资源；无事件会被 TTL/孤儿清理回收。
-- [ ] `.strm`、无权限 source、错误用户、跨 source、过期/篡改签名和路径穿越均不会启动或泄露转码资源。
-- [ ] 现有 Web 播放、Emby 直放、ACL、Range、进度和媒体代理行为不回退。
+- [x] Emby 转码播放事件能够刷新会话并在 `Stopped` 后回收资源；无事件会被 TTL/孤儿清理回收。
+- [x] `.strm`、无权限 source、错误用户、跨 source、过期/篡改签名和路径穿越均不会启动或泄露转码资源。
+- [x] 现有 Web 播放、Emby 直放、ACL、Range、进度和媒体代理行为不回退。
 - [ ] Rust 窄测试、全量质量门和本机架构记录通过；真实第三方客户端的首帧、seek、暂停、停止和断线行为
       由部署后专项兼容性测试记录，不以服务端测试替代。
 
 验证：见 `docs/LUX-254-PLAN.md`；本机 `uname -m` 结果不外推 NAS/x86_64 性能或所有客户端兼容性。
+
+验证记录（2026-09-15）：`cargo build --locked`、`cargo test --locked --test playback`（3 个通过）、
+`cargo test --locked --lib playback`（38 个通过）和 `cargo fmt --all -- --check` 通过；转码集成测试使用
+fake FFmpeg 实际读取 master manifest、init 和 m4s 片段，并验证回调刷新、停止清理、ACL、签名和 `.strm`
+边界。`cargo test --locked --all-targets` 首次运行仅因既有 `tests/watch.rs` SQLite lock 偶发失败，单线程
+重跑通过；`cargo clippy --locked --all-targets --all-features -- -D warnings` 仍被既有
+`tests/item_merge.rs:32` 的 `clippy::too_many_arguments` 阻塞。`uname -m` 为 `arm64`。真实 FFmpeg 和
+VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停止及断线回收尚未在部署实例验证。
 
 依赖：LUX-198、LUX-199。
 

@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::application::playback::session::CreatedWebPlaybackSession;
 use crate::storage::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 
 pub(super) async fn emby_playback_info(
@@ -7,8 +8,13 @@ pub(super) async fn emby_playback_info(
     Path(item_id): Path<String>,
     raw_query: RawQuery,
     State(state): State<AppState>,
+    body: Bytes,
 ) -> Response {
     let query = emby_stream_query_from_raw(raw_query);
+    let request = match parse_emby_playback_info_request(&body) {
+        Ok(request) => request,
+        Err(status) => return status.into_response(),
+    };
     let standard_api_key =
         standard_emby_playback_api_key(&headers, query.api_key.as_deref(), &state).await;
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
@@ -42,6 +48,13 @@ pub(super) async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
+    if let Some(source_id) = request.media_source_id.as_deref() {
+        let Some(index) = sources.iter().position(|source| source.id == source_id) else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let source = sources.remove(index);
+        sources.insert(0, source);
+    }
     let strm_resolver_available = if sources
         .iter()
         .any(|source| emby_source_needs_strm_resolver(source))
@@ -56,8 +69,23 @@ pub(super) async fn emby_playback_info(
     } else {
         false
     };
+    let transcode_session = if request.requests_server_transcoding() {
+        let Some(source) = sources.first() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        match create_emby_transcoding_session(&state, &user, &item.id, source, &request).await {
+            Ok(session) => session,
+            Err(status) => return status.into_response(),
+        }
+    } else {
+        None
+    };
+    let play_session_id = transcode_session
+        .as_ref()
+        .map(|session| session.play_session_id.clone())
+        .unwrap_or_else(|| Uuid::now_v7().to_string());
     Json(json!({
-        "PlaySessionId": Uuid::now_v7().to_string(),
+        "PlaySessionId": play_session_id,
         "MediaSources": sources
             .into_iter()
             .map(|source| {
@@ -96,12 +124,148 @@ pub(super) async fn emby_playback_info(
                         "AddApiKeyToDirectStreamUrl".to_owned(),
                         json!(emby_source_needs_proxy_identity(source)),
                     );
+                    if transcode_session
+                        .as_ref()
+                        .is_some_and(|session| session.media_source_id == source.id)
+                        && let Some(session) = transcode_session.as_ref()
+                        && let Some(service) = state.web_playback.as_ref()
+                        && let Some(url) = emby_transcoding_url(
+                            service,
+                            &item.id,
+                            source,
+                            session,
+                        )
+                    {
+                        object.insert("SupportsTranscoding".to_owned(), json!(true));
+                        object.insert("TranscodingUrl".to_owned(), json!(url));
+                        object.insert("TranscodingSubProtocol".to_owned(), json!("hls"));
+                        object.insert("TranscodingContainer".to_owned(), json!("mp4"));
+                        object.insert("TranscodingMimeType".to_owned(), json!("video/mp4"));
+                    }
                 }
                 value
             })
             .collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct EmbyPlaybackInfoRequest {
+    #[serde(
+        rename = "MediaSourceId",
+        alias = "mediaSourceId",
+        alias = "media_source_id"
+    )]
+    media_source_id: Option<String>,
+    #[serde(rename = "EnableDirectPlay", alias = "enableDirectPlay")]
+    enable_direct_play: Option<bool>,
+    #[serde(rename = "EnableDirectStream", alias = "enableDirectStream")]
+    enable_direct_stream: Option<bool>,
+    #[serde(rename = "EnableTranscoding", alias = "enableTranscoding")]
+    enable_transcoding: Option<bool>,
+    #[serde(rename = "AllowVideoStreamCopy", alias = "allowVideoStreamCopy")]
+    allow_video_stream_copy: Option<bool>,
+    #[serde(rename = "AllowAudioStreamCopy", alias = "allowAudioStreamCopy")]
+    allow_audio_stream_copy: Option<bool>,
+}
+
+impl EmbyPlaybackInfoRequest {
+    fn requests_server_transcoding(&self) -> bool {
+        self.enable_transcoding == Some(true) && self.enable_direct_play == Some(false)
+    }
+
+    fn playback_capabilities(&self) -> PlaybackCapabilities {
+        let direct_stream = self.enable_direct_stream == Some(true);
+        PlaybackCapabilities {
+            direct_play: false,
+            hls: true,
+            video_copy_to_fmp4: direct_stream && self.allow_video_stream_copy == Some(true),
+            audio_copy_to_fmp4: direct_stream && self.allow_audio_stream_copy == Some(true),
+            hardware_transcode: true,
+            software_transcode: true,
+        }
+    }
+}
+
+fn parse_emby_playback_info_request(body: &Bytes) -> Result<EmbyPlaybackInfoRequest, StatusCode> {
+    if body.is_empty() || body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(EmbyPlaybackInfoRequest::default());
+    }
+    serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+async fn create_emby_transcoding_session(
+    state: &AppState,
+    user: &UserRecord,
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+    request: &EmbyPlaybackInfoRequest,
+) -> Result<Option<CreatedWebPlaybackSession>, StatusCode> {
+    if source.source_kind != "LOCAL_FILE" {
+        return Ok(None);
+    }
+    let Some(service) = state.web_playback.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let Some(access) = state.access.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let stored_source = match access
+        .authorized_playback_source(principal, item_id, Some(&source.id))
+        .await
+    {
+        Ok(Some(source)) => source,
+        Ok(None) => return Err(StatusCode::NOT_FOUND),
+        Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+    };
+    let user_id = user.id.to_string();
+    let created = service
+        .create(CreateWebPlaybackSession {
+            user_id: &user_id,
+            is_admin: user.is_admin,
+            item_id,
+            media_source_id: &source.id,
+            play_session_prefix: "lux-emby",
+            source_kind: PlaybackSourceKind::LocalFile,
+            capabilities: request.playback_capabilities(),
+        })
+        .await
+        .map_err(emby_playback_session_error_status)?;
+    let WebPlaybackPlan::ServerHls { tier } = created.plan else {
+        let _ = service.stop(&created.id, &user_id).await;
+        return Err(StatusCode::BAD_GATEWAY);
+    };
+    let input =
+        match canonical_local_media_path(&stored_source.root_path, &stored_source.relative_path)
+            .await
+        {
+            Ok(path) => path,
+            Err(LocalPathError::Missing) => {
+                let _ = service.stop(&created.id, &user_id).await;
+                return Err(StatusCode::NOT_FOUND);
+            }
+            Err(LocalPathError::Forbidden) => {
+                let _ = service.stop(&created.id, &user_id).await;
+                return Err(StatusCode::FORBIDDEN);
+            }
+        };
+    if service.start_hls(&created.id, tier, &input).await.is_err() {
+        let _ = service.stop(&created.id, &user_id).await;
+        return Err(StatusCode::BAD_GATEWAY);
+    }
+    Ok(Some(created))
+}
+
+fn emby_playback_session_error_status(error: WebPlaybackSessionError) -> StatusCode {
+    match error {
+        WebPlaybackSessionError::Invalid(_) => StatusCode::BAD_REQUEST,
+        WebPlaybackSessionError::NotFound => StatusCode::NOT_FOUND,
+        WebPlaybackSessionError::Expired | WebPlaybackSessionError::NotActive => StatusCode::GONE,
+        WebPlaybackSessionError::Hls(_) => StatusCode::BAD_GATEWAY,
+        WebPlaybackSessionError::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 async fn standard_emby_playback_api_key(
@@ -394,6 +558,7 @@ pub(super) async fn handle_emby_playback_event(
         .play_session_id
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| format!("{}:{device_id}", internal_item_id));
+    let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
     let user_id = user.id.to_string();
     let played_percent = match database.user_played_percent(&user_id).await {
         Ok(value) => value,
@@ -466,6 +631,24 @@ pub(super) async fn handle_emby_playback_event(
                 .is_err()
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if let Some(session_id) = emby_transcode_session_id
+                && let Some(service) = state.web_playback.as_ref()
+            {
+                let result = if state_name == "STOPPED" {
+                    service.stop(session_id, &user_id).await
+                } else {
+                    service.heartbeat(session_id, &user_id).await.map(|_| ())
+                };
+                if let Err(error) = result {
+                    tracing::warn!(
+                        event = "emby_transcoding_session_refresh_failed",
+                        session_id = %session_id,
+                        playback_state = state_name,
+                        error = %error,
+                        "failed to refresh Emby transcoding session"
+                    );
+                }
             }
             if let Some(event_type) = activity_event {
                 record_activity_event(
@@ -1028,6 +1211,243 @@ pub(super) fn web_playback_hls_url(
     ))
 }
 
+fn emby_transcoding_url(
+    service: &WebPlaybackSessionService,
+    item_id: &str,
+    source: &crate::application::catalog::CatalogSource,
+    session: &CreatedWebPlaybackSession,
+) -> Option<String> {
+    let signature = service.sign_resource(&session.id, "hls:index.m3u8", session.expires_at)?;
+    let public_item_id = emby_public_id(item_id);
+    Some(format!(
+        "/Videos/{public_item_id}/master.m3u8?MediaSourceId={}&PlaySessionId={}&luxPlaybackSessionId={}&luxPlaybackExpires={}&luxPlaybackSignature={}",
+        source.id,
+        percent_encode_filename(&session.play_session_id),
+        session.id,
+        signature.expires_at,
+        signature.signature,
+    ))
+}
+
+fn emby_transcoding_asset_url(
+    service: &WebPlaybackSessionService,
+    item_id: &str,
+    source_id: &str,
+    session_id: &str,
+    play_session_id: &str,
+    asset: &str,
+    expires_at: i64,
+) -> Option<String> {
+    let resource = format!("hls:{asset}");
+    let signature = service.sign_resource(session_id, &resource, expires_at)?;
+    Some(format!(
+        "/Videos/{}/transcoding/{session_id}/{asset}?MediaSourceId={source_id}&PlaySessionId={}&luxPlaybackExpires={}&luxPlaybackSignature={}",
+        emby_public_id(item_id),
+        percent_encode_filename(play_session_id),
+        signature.expires_at,
+        signature.signature,
+    ))
+}
+
+#[derive(Default)]
+struct EmbyTranscodingQuery {
+    media_source_id: Option<String>,
+    play_session_id: Option<String>,
+    playback_session_id: Option<String>,
+    expires: Option<i64>,
+    signature: Option<String>,
+}
+
+fn emby_transcoding_query_from_raw(raw_query: RawQuery) -> EmbyTranscodingQuery {
+    let mut query = EmbyTranscodingQuery::default();
+    let Some(raw_query) = raw_query.0 else {
+        return query;
+    };
+    for (name, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+        if query.media_source_id.is_none()
+            && (name.eq_ignore_ascii_case("MediaSourceId")
+                || name.eq_ignore_ascii_case("mediaSourceId"))
+        {
+            query.media_source_id = Some(value.into_owned());
+        } else if query.play_session_id.is_none()
+            && (name.eq_ignore_ascii_case("PlaySessionId")
+                || name.eq_ignore_ascii_case("playSessionId"))
+        {
+            query.play_session_id = Some(value.into_owned());
+        } else if query.playback_session_id.is_none()
+            && name.eq_ignore_ascii_case("luxPlaybackSessionId")
+        {
+            query.playback_session_id = Some(value.into_owned());
+        } else if query.expires.is_none() && name.eq_ignore_ascii_case("luxPlaybackExpires") {
+            query.expires = value.parse().ok();
+        } else if query.signature.is_none() && name.eq_ignore_ascii_case("luxPlaybackSignature") {
+            query.signature = Some(value.into_owned());
+        }
+    }
+    query
+}
+
+fn emby_transcoding_session_id(query: &EmbyTranscodingQuery) -> Option<&str> {
+    query
+        .playback_session_id
+        .as_deref()
+        .or_else(|| query.play_session_id.as_deref()?.strip_prefix("lux-emby:"))
+}
+
+fn emby_transcode_session_id_from_play_session(value: &str) -> Option<&str> {
+    value.strip_prefix("lux-emby:")
+}
+
+pub(super) async fn emby_transcoding_master(
+    headers: HeaderMap,
+    method: Method,
+    Path(item_id): Path<String>,
+    raw_query: RawQuery,
+    State(state): State<AppState>,
+) -> Response {
+    let query = emby_transcoding_query_from_raw(raw_query);
+    let Some(session_id) = emby_transcoding_session_id(&query) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let asset = "index.m3u8";
+    serve_emby_transcoding_asset(
+        &headers, method, &item_id, session_id, asset, &query, &state,
+    )
+    .await
+}
+
+pub(super) async fn emby_transcoding_asset(
+    headers: HeaderMap,
+    method: Method,
+    Path((item_id, session_id, asset)): Path<(String, String, String)>,
+    raw_query: RawQuery,
+    State(state): State<AppState>,
+) -> Response {
+    let query = emby_transcoding_query_from_raw(raw_query);
+    serve_emby_transcoding_asset(
+        &headers,
+        method,
+        &item_id,
+        &session_id,
+        &asset,
+        &query,
+        &state,
+    )
+    .await
+}
+
+async fn serve_emby_transcoding_asset(
+    _headers: &HeaderMap,
+    method: Method,
+    public_item_id: &str,
+    session_id: &str,
+    asset: &str,
+    query: &EmbyTranscodingQuery,
+    state: &AppState,
+) -> Response {
+    let Some(expires_at) = query.expires else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(signature) = query.signature.as_deref() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let resource = format!("hls:{asset}");
+    let session = match service
+        .authorize_resource(session_id, &resource, expires_at, signature)
+        .await
+    {
+        Ok(session) => session,
+        Err(error) => return emby_playback_session_error_status(error).into_response(),
+    };
+    if session.plan != "SERVER_HLS"
+        || emby_internal_id(public_item_id) != session.item_id
+        || query
+            .media_source_id
+            .as_deref()
+            .is_some_and(|source_id| session.media_source_id.as_deref() != Some(source_id))
+    {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    let Some(source_id) = session.media_source_id.as_deref() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if asset == "index.m3u8" {
+        let path = match service.wait_for_hls_manifest(session_id).await {
+            Ok(path) => path,
+            Err(error) => return emby_playback_session_error_status(error).into_response(),
+        };
+        let Ok(bytes) = fs::read(path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        let Ok(manifest) = String::from_utf8(bytes) else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
+            emby_transcoding_asset_url(
+                service,
+                &session.item_id,
+                source_id,
+                &session.id,
+                &session.play_session_id,
+                asset,
+                session.expires_at,
+            )
+        }) else {
+            return StatusCode::BAD_GATEWAY.into_response();
+        };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("Cache-Control", "private, no-store")
+            .header("Content-Type", "application/vnd.apple.mpegurl")
+            .header("Content-Length", manifest.len())
+            .body(if method == Method::HEAD {
+                Body::empty()
+            } else {
+                Body::from(manifest)
+            })
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let path = match service.hls_asset_path(session_id, asset).await {
+        Ok(path) => path,
+        Err(error) => return emby_playback_session_error_status(error).into_response(),
+    };
+    match service.hls_within_quota(session_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = service.stop(session_id, &session.user_id).await;
+            return StatusCode::INSUFFICIENT_STORAGE.into_response();
+        }
+        Err(error) => return emby_playback_session_error_status(error).into_response(),
+    }
+    let metadata = match fs::metadata(&path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    let content_type = if asset.ends_with(".m4s") || asset.ends_with(".mp4") {
+        "video/mp4"
+    } else {
+        "application/octet-stream"
+    };
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        let Ok(file) = fs::File::open(path).await else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        Body::from_stream(tokio_util::io::ReaderStream::new(file))
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Cache-Control", "private, no-store")
+        .header("Content-Type", content_type)
+        .header("Content-Length", metadata.len())
+        .body(body)
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
 async fn create_web_playback_session_json(
     headers: &HeaderMap,
     state: &AppState,
@@ -1050,6 +1470,7 @@ async fn create_web_playback_session_json(
             is_admin: user.is_admin,
             item_id,
             media_source_id: &source.source_id,
+            play_session_prefix: "lux-web",
             source_kind,
             capabilities,
         })
@@ -2018,5 +2439,62 @@ pub(super) async fn lux_set_played(
             StatusCode::NO_CONTENT.into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod emby_playback_tests {
+    use super::{EmbyPlaybackInfoRequest, parse_emby_playback_info_request};
+    use crate::application::playback::decision::{
+        PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier, choose_plan,
+    };
+    use axum::body::Bytes;
+
+    #[test]
+    fn playback_info_request_selects_copy_and_transcode_tiers() {
+        let remux = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "EnableDirectPlay": false,
+                "EnableDirectStream": true,
+                "EnableTranscoding": true,
+                "AllowVideoStreamCopy": true,
+                "AllowAudioStreamCopy": true
+            }"#,
+        ))
+        .expect("valid PlaybackInfo request");
+        assert_eq!(
+            choose_plan(PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: remux.playback_capabilities(),
+            }),
+            PlaybackPlan::ServerHls {
+                tier: ServerTier::Remux,
+            }
+        );
+
+        let audio_transcode = EmbyPlaybackInfoRequest {
+            enable_direct_play: Some(false),
+            enable_direct_stream: Some(true),
+            enable_transcoding: Some(true),
+            allow_video_stream_copy: Some(true),
+            allow_audio_stream_copy: Some(false),
+            ..EmbyPlaybackInfoRequest::default()
+        };
+        assert_eq!(
+            choose_plan(PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: audio_transcode.playback_capabilities(),
+            }),
+            PlaybackPlan::ServerHls {
+                tier: ServerTier::AudioTranscode,
+            }
+        );
+    }
+
+    #[test]
+    fn empty_playback_info_body_keeps_direct_play_compatibility() {
+        let request = parse_emby_playback_info_request(&Bytes::new())
+            .expect("empty PlaybackInfo body is valid");
+        assert!(!request.requests_server_transcoding());
     }
 }
