@@ -1340,8 +1340,9 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 
 - SupportsDirectPlay = true。
 - SupportsDirectStream 按首版实际播放入口实现返回 true；本地媒体在 Emby `PlaybackInfo`
-  POST 声明 `EnableTranscoding=true` 或 `forceTranscode=true` 时返回服务端转码能力，`.strm`
-  始终返回 `SupportsTranscoding=false`。
+  POST 声明 `EnableTranscoding=true` 且未启用直放、或同时声明直放/转码但由 `DeviceProfile` 判断直放
+  profile 不匹配且存在 HLS 转码 profile、或携带 `forceTranscode=true` 时返回服务端转码能力；顶层布尔值
+  全部省略时也按 `DeviceProfile` 协商，`.strm` 始终返回 `SupportsTranscoding=false`。
 - MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
@@ -6157,7 +6158,10 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
   `EnableDirectPlay`、`EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy` 和
   `AllowAudioStreamCopy` 的 `POST` 按客户端能力从 Direct、HLS Remux、音频转码、硬件转码和软件转码中
   选择最低成本可用档位；`EnableTranscoding=true` 且 `EnableDirectPlay` 未设置或为 `false` 时进入
-  转码，`forceTranscode=true` 查询参数可覆盖 `EnableDirectPlay=true`。GET 和空 body 的 POST 保持
+  转码。客户端同时声明直放和转码时，按 Emby `DeviceProfile.DirectPlayProfiles` 匹配本地媒体源的容器和
+  音视频 codec；直放 profile 不匹配且存在 HLS `TranscodingProfiles` 时进入转码。没有顶层布尔值时也按
+  此规则协商；HLS profile 限定 codec 时，只复制兼容的流，否则进入相应的音频或视频转码档位。
+  `forceTranscode=true` 查询参数可覆盖 `EnableDirectPlay=true`。GET 和空 body 的 POST 保持
   Direct Play 行为。
 - 本地媒体源在选择服务端转码时返回 `SupportsTranscoding=true`、`TranscodingUrl`、
   `TranscodingSubProtocol=hls`、`TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
@@ -6183,10 +6187,13 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
 验证：见 `docs/LUX-254-PLAN.md`；本机 `uname -m` 结果不外推 NAS/x86_64 性能或所有客户端兼容性。
 
 验证记录（2026-09-15）：`cargo build --locked`、`cargo test --locked --test playback`（3 个通过）、
-`cargo test --locked --lib playback`（41 个通过）和 `cargo fmt --all -- --check` 通过；转码集成测试使用
+`cargo test --locked --lib playback`（45 个通过）和 `cargo fmt --all -- --check` 通过；转码集成测试使用
 fake FFmpeg 实际读取 master manifest、init 和 m4s 片段，并验证回调刷新、停止清理、ACL、签名和 `.strm`
-边界，以及 `forceTranscode` POST 查询、GET 直放和省略 `EnableDirectPlay` 的兼容行为。`cargo test --locked --all-targets` 首次运行仅因既有 `tests/watch.rs` SQLite lock 偶发失败，单线程
-重跑通过；`cargo clippy --locked --all-targets --all-features -- -D warnings` 仍被既有
+边界，以及 `forceTranscode` POST 查询、GET 直放、省略 `EnableDirectPlay`、标准 Enable 标志组合、
+`DeviceProfile` 和不兼容 codec 不复制的兼容行为。`cargo test --locked --all-targets` 首次运行在并发运行时因既有
+`tests/libraries_api.rs` 的 SQLite 服务不可用偶发失败，单独运行该目标通过；随后完整重跑通过。
+播放目标的 `cargo clippy --locked --test playback --all-features -- -D warnings` 通过；全量
+`cargo clippy --locked --all-targets --all-features -- -D warnings` 仍被既有
 `tests/item_merge.rs:32` 的 `clippy::too_many_arguments` 阻塞。`uname -m` 为 `arm64`。真实 FFmpeg 和
 VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停止及断线回收尚未在部署实例验证。
 

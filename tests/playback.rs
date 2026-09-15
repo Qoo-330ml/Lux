@@ -689,6 +689,100 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         0
     );
 
+    let device_profile_transcoding = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectPlay": true,
+            "EnableDirectStream": true,
+            "EnableTranscoding": true,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Type": "Video"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Protocol": "hls",
+                    "Type": "Video"
+                }]
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(device_profile_transcoding.status(), reqwest::StatusCode::OK);
+    let device_profile_body = device_profile_transcoding.json::<Value>().await?;
+    assert_eq!(
+        device_profile_body["MediaSources"][0]["SupportsTranscoding"],
+        true
+    );
+    let device_profile_url = device_profile_body["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .ok_or("missing DeviceProfile transcoding URL")?;
+    assert!(device_profile_url.starts_with(&format!("/Videos/{emby_item_id}/master.m3u8?")));
+    let device_profile_play_session_id = device_profile_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing DeviceProfile play session")?
+        .to_owned();
+    let device_profile_stopped = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": device_profile_play_session_id
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        device_profile_stopped.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+
+    let get_with_device_profile = client
+        .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Type": "Video"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Protocol": "hls",
+                    "Type": "Video"
+                }]
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(get_with_device_profile.status(), reqwest::StatusCode::OK);
+    let get_with_device_profile_body = get_with_device_profile.json::<Value>().await?;
+    assert!(
+        get_with_device_profile_body["MediaSources"][0]
+            .get("TranscodingUrl")
+            .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS' AND state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+
     let get_with_force_transcoding = client
         .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .query(&[("api_key", token.as_str()), ("forceTranscode", "true")])

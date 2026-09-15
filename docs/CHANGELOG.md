@@ -18,6 +18,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 - 修复元数据刮削器失败时错误返回数据库不可用错误码的问题，改为正确报告插件不可用。
 - 修复插件配置提交清单未声明的 UI 字段，避免旧版或能力不同的插件收到不支持的配置项。
 - 修复 Emby 客户端仅发送 `EnableTranscoding=true`、省略 `EnableDirectPlay` 时未进入服务端转码的问题。
+- 兼容 Emby 客户端通过 `DeviceProfile` 声明直放和 HLS 转码能力，并在直放 profile 不匹配时协商服务端转码的 `PlaybackInfo` 请求。
 
 ### Changed
 
