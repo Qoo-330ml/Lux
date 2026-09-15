@@ -15,6 +15,19 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.2",
+    date: "2026-09-15",
+    sections: [
+      { kind: "added", items: [
+        "单季剧集详情页现在直接展示分集列表，减少进入季度层级的操作步骤。",
+        "分集列表和同季分集卡片的图片区域新增直接播放入口，并显示可访问的播放按钮。",
+      ] },
+      { kind: "changed", items: [
+        "分集浏览交互明确区分播放与查看详情：点击图片播放，点击标题或详情入口进入分集详情页。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.1",
     date: "2026-09-10",
     sections: [
