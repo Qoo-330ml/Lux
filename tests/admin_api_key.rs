@@ -442,13 +442,27 @@ async fn only_web_admins_can_manage_the_shared_key() -> Result<(), Box<dyn std::
         .to_owned();
     let viewer_virtual_folders = client
         .get(format!("http://{address}/Library/VirtualFolders"))
-        .header("X-Emby-Token", viewer_emby_token)
+        .header("X-Emby-Token", &viewer_emby_token)
         .send()
         .await?;
     assert_eq!(
         viewer_virtual_folders.status(),
         reqwest::StatusCode::FORBIDDEN
     );
+
+    let viewer_admin_health = client
+        .get(format!("http://{address}/api/v1/admin/health"))
+        .header("X-Lux-Token", &viewer_emby_token)
+        .send()
+        .await?;
+    assert_eq!(viewer_admin_health.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let viewer_api_key = client
+        .get(format!("http://{address}/api/v1/admin/api-key"))
+        .header("X-Lux-Token", &viewer_emby_token)
+        .send()
+        .await?;
+    assert_eq!(viewer_api_key.status(), reqwest::StatusCode::FORBIDDEN);
 
     let revoked = client
         .delete(format!("http://{address}/api/v1/admin/api-key"))

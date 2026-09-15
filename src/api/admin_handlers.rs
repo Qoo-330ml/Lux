@@ -3786,6 +3786,19 @@ pub(crate) async fn require_admin(
     state: &AppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
+    if users::lux_user_token_from_headers(headers).is_some()
+        && resolve_shared_admin_api_key(headers, state)
+            .await?
+            .is_none()
+    {
+        return Err(api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "客户端令牌不能调用管理员接口",
+        )
+        .into_response());
+    }
     let user = require_web_user(headers, state).await?;
     if !user.can_manage_server {
         return Err(api_error(
@@ -3796,7 +3809,7 @@ pub(crate) async fn require_admin(
         )
         .into_response());
     }
-    if require_csrf && lux_api_key_from_headers(headers).is_none() {
+    if require_csrf && !users::has_client_token(headers) {
         let Some(auth) = state.auth.as_ref() else {
             return Err(api_error(
                 headers,
@@ -3866,12 +3879,12 @@ pub(crate) async fn require_admin_web_session(
     state: &AppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
-    if lux_api_key_from_headers(headers).is_some() {
+    if users::has_client_token(headers) {
         return Err(api_error(
             headers,
             StatusCode::FORBIDDEN,
             lux::ApiErrorCode::PermissionDenied,
-            "API Key 不能管理 API Key",
+            "客户端令牌不能管理 API Key",
         )
         .into_response());
     }
@@ -7137,7 +7150,7 @@ pub(crate) fn metadata_candidate_error(
         MetadataCandidateError::Scraper(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
+            lux::ApiErrorCode::PluginUnavailable,
             "刮削器暂时不可用，请稍后重试",
         )
         .into_response(),

@@ -366,6 +366,18 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("/media/strm/video/每日更新");
   });
 
+  it("opens the edit dialog when the library cover is clicked", async () => {
+    await renderPage();
+
+    const coverButton = container.querySelector<HTMLButtonElement>("[aria-label='编辑 01每日更新 媒体库']");
+    expect(coverButton).toBeTruthy();
+
+    await act(async () => coverButton?.click());
+
+    expect(container.querySelector('[role="dialog"]')?.textContent).toContain("01每日更新");
+    expect(container.querySelector<HTMLInputElement>('[aria-label="01每日更新 媒体库名称"]')?.value).toBe("01每日更新");
+  });
+
   it("renders library cards in the current account's saved order", async () => {
     const seriesLibrary = { ...library, id: "library-2", name: "剧集库", kind: "SERIES" };
     vi.mocked(api.adminLibraries).mockResolvedValueOnce({ libraries: [library, seriesLibrary] });

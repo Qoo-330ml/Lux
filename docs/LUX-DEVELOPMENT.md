@@ -1537,11 +1537,17 @@ BaseItemDto 至少按场景提供：
 - logout 撤销当前设备令牌。
 - 401 表示令牌缺失、无效或撤销；403 表示用户已认证但无权限。
 
+Lux 自有 `/api/v1` 的媒体、搜索、首页、图片、播放和用户状态接口除 Web session 外，接受同一用户的
+Emby AccessToken：推荐使用 `X-Lux-Token`，并兼容 `X-Emby-Token`、`X-MediaBrowser-Token` 和
+`Authorization: Bearer`。令牌仍按用户执行媒体库 ACL；显式令牌请求不依赖 Cookie CSRF。`X-Lux-Api-Key`
+和 `api_key` 查询参数保留给 LUX-182 共享管理员 API Key，不授予普通用户管理员权限。
+
 ---
 
 ## 16. Lux 自有 API
 
-Web 和管理控制台使用 /api/v1，不直接依赖 Emby DTO。
+Web 和管理控制台使用 /api/v1，不直接依赖 Emby DTO；第三方 Lux 客户端可以使用用户级客户端令牌调用
+同一份 Lux JSON 合同。
 
 ### 16.1 初始化和认证
 
@@ -1643,7 +1649,7 @@ Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，�
 ### 17.3 管理页面
 
 - 仪表盘。
-- 媒体库列表和编辑。
+- 媒体库列表和编辑；媒体库卡片封面可单击直接打开编辑弹窗。
 - 全局策略：元数据、图像和字幕默认值，刮削模式，以及应用范围和存储预估。
 - 路径选择/输入、读写检测。
 - 扫描计划与元数据计划，明确分开。
@@ -2107,6 +2113,7 @@ services:
 | LUX-252 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；单季剧集详情直接展示单集列表 |
 | LUX-253 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/src/react.css、web/tests/media-detail.test.tsx；单集图片播放与文字详情入口 |
 | LUX-254 | docs/LUX-254-PLAN.md、src/application/playback/session.rs、src/api/playback.rs、src/api/emby.rs、src/api/legacy.rs、tests/playback.rs、docs/API.md、docs/COMPATIBILITY.md；Emby 客户端服务端转码 |
+| LUX-255 | docs/LUX-DEVELOPMENT.md、docs/API.md、docs/COMPATIBILITY.md、src/api/users.rs、src/api/admin_handlers.rs、tests/lux_api_auth.rs、tests/admin_api_key.rs；Lux 用户级客户端令牌与第三方首页 API |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3394,14 +3401,16 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 - 不改变 TMDb Provider ID、Emby DTO 或插件 RPC 方法名称。
 - 不把 TMDb 凭据放入非敏感配置、API 响应、日志或插件 RPC。
 
-#### LUX-145：后台本地视频缩略图任务
+#### LUX-145：后台本地视频封面与缩略图回退任务
 
-范围：将外部 `ffmpegthumb` 的视频首帧缩略图行为重写为 Lux 内置后台任务。媒体库扫描成功后，任务为缺少缩略图的本地视频来源生成 JPEG 并登记到 `item_images`；只处理 `LOCAL_FILE`，不读取、不探测、不访问 `.strm` 指向的远程视频。
+范围：将外部 `ffmpegthumb` 的视频截图行为重写为 Lux 内置后台回退任务。媒体库扫描成功后，任务为缺少有效主图的本地视频来源从同一画面生成独立的竖版 `POSTER` 和横版 `THUMB` JPEG 并登记到 `item_images`；只处理 `LOCAL_FILE`，不读取、不探测、不访问 `.strm` 指向的远程视频。截图结果来源优先级低于本地图片和在线刮削器图片。
 
 验收：
 
-- [x] 本地视频在扫描完成后的后台阶段生成缩略图，默认截取 `00:03:01`，并通过 `THUMB` 图片记录提供给现有图片接口。
-- [x] 同一逻辑媒体项优先使用默认本地来源；已有缩略图不被覆盖；缺少或失效的登记路径可以重建。
+- [x] 本地视频在扫描完成后的后台阶段从默认 `00:03:01` 画面生成独立的 `POSTER`（2:3）和 `THUMB`（16:9），分别通过现有图片接口提供。
+- [x] 同一逻辑媒体项优先使用默认本地来源；已有有效本地图片和刮削器图片不被截图覆盖；缺少或失效的登记路径可以重建。
+- [x] 截图使用低优先级 `FFMPEG` 回退来源：没有选择刮削器、刮削器没有返回对应图片或截图先完成时，保留截图；刮削器后来获得对应图片时可以替换截图回退图；截图不能替换已经存在的非回退图片。
+- [x] `POSTER` 和 `THUMB` 独立判断：刮削器只返回其中一种图片时，另一种可以单独由截图补全；两种图片不共享登记路径。
 - [x] `STRM_URL` 不进入候选查询或 ffmpeg 参数；纯 `.strm` 条目不会生成缩略图。
 - [x] ffmpeg 使用参数数组、路径根目录约束、原子输出和超时控制；单个文件失败不导致扫描任务失败。
 - [x] 扫描任务事件记录缩略图阶段的完成/失败计数；容器重启取消未完成任务后，下一次扫描仍可重试缺失项。
@@ -3417,7 +3426,7 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 
 明确不做：
 
-- 不实现独立缩略图 HTTP API、Web 配置页、转码、音频 WAV 提取、字幕抽取或 `.strm` 远程处理。
+- 不实现独立缩略图 HTTP API、Web 配置页、转码、音频 WAV 提取、字幕抽取或 `.strm` 远程处理；STRM 截图仍由 LUX-146 单独负责。
 
 ---
 
@@ -6183,6 +6192,30 @@ VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停
 
 - 不实现字幕转换/烧录、DRM、多码率自适应 HLS、`.strm` 服务端转码或第三方客户端专属私有协议。
 - 不改变现有 Web 播放 DTO、Emby 内部领域模型或数据库字段；没有数据库迁移需求。
+
+#### LUX-255：Lux 用户级客户端令牌与第三方首页 API
+
+范围：让 Lux 自有 `/api/v1` 的媒体、搜索、首页、图片、播放和用户状态接口接受用户级客户端令牌，
+并使第三方客户端可以直接调用已有的 `GET /api/v1/home`。不新增令牌数据库表；复用现有 Emby
+AccessToken 的生成、哈希存储、撤销和用户解析。
+
+验收：
+
+- [x] 新增推荐请求头 `X-Lux-Token: <accessToken>`，兼容 `X-Emby-Token`、`X-MediaBrowser-Token` 和
+      `Authorization: Bearer <accessToken>`。
+- [x] 无 Web Cookie 的有效用户令牌可调用 `/api/v1/home` 及 Lux 媒体查询；响应继续按当前用户执行
+      媒体库 ACL。
+- [x] 普通用户令牌不能调用管理员接口；LUX-182 共享管理员 API Key 的权限和 CSRF 豁免边界保持不变。
+- [x] 更新 Lux API、首页合同和兼容性文档；不宣称 VidHub、SenPlayer、Infuse 等真实客户端已完成验证。
+
+验证目标：`cargo test --locked --test lux_api_auth`、`cargo test --locked --all-targets`、`rustfmt --check`
+和 `git diff --check`。本轮全量 Rust 测试为 443 passed、4 ignored、0 failed，`rustfmt --check` 与
+`git diff --check` 也通过；该证据只覆盖 Lux 服务端协议，不代表第三方客户端已经完成真实客户端验证。
+
+明确不做：
+
+- 不新增普通用户 API Key 管理页面或细粒度 token scope。
+- 不改变 Emby 路由/DTO，不把用户令牌写入 URL、日志、审计事件或普通响应。
 
 ## 26. 风险与缓解
 

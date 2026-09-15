@@ -1492,9 +1492,10 @@ mod tests {
         filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
         is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
         is_emby_subtitle_path, is_emby_transcoding_path, is_emby_video_path, is_filmly_user_agent,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
-        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
-        record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
+        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_error,
+        metadata_candidate_failure_kind, normalize_strm_http_location, playback_client_label,
+        playback_identifier_prefix, record_activity_event, safe_trace_path,
+        secure_cookie_for_request, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -1505,7 +1506,7 @@ mod tests {
     use crate::library::LibraryKind;
     use crate::network::RemoteAccessPolicy;
     use crate::storage::{Database, StorageError};
-    use axum::http::{HeaderMap, HeaderValue, Uri};
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
     use serde_json::json;
     use std::time::Duration;
 
@@ -1625,6 +1626,22 @@ mod tests {
             assert_eq!(kind.as_str(), expected_label);
             assert!(!kind.as_str().contains("secret detail"));
         }
+    }
+
+    #[tokio::test]
+    async fn metadata_candidate_scraper_errors_use_plugin_error_code() {
+        let response = metadata_candidate_error(
+            &HeaderMap::new(),
+            MetadataCandidateError::Scraper(ScraperError::Provider("upstream failed".to_owned())),
+        );
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("metadata candidate error body should be readable");
+        let body: serde_json::Value =
+            serde_json::from_slice(&body).expect("metadata candidate error should be JSON");
+        assert_eq!(body["error"]["code"], "PLUGIN_UNAVAILABLE");
     }
 
     #[test]

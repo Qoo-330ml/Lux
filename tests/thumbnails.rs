@@ -73,14 +73,39 @@ async fn scan_generates_local_thumbnail_but_never_strm_thumbnail()
     jobs.run_to_completion_with_metadata_and_thumbnails(&job.id, 100, None, None, Some(thumbnails))
         .await?;
 
+    assert!(movie_dir.join("Local.Movie.2024-poster.jpg").is_file());
     assert!(movie_dir.join("Local.Movie.2024-thumbnail.jpg").is_file());
     assert!(!movie_dir.join("Remote-thumb.jpg").exists());
-    let image_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM item_images WHERE image_type = 'THUMB'")
-            .fetch_one(database.pool())
-            .await?;
-    assert_eq!(image_count, 1);
+    let canonical_movie_dir = fs::canonicalize(&movie_dir)?;
+    let image_rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT image_type, local_path
+         FROM item_images
+         ORDER BY image_type",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        image_rows,
+        vec![
+            (
+                "POSTER".to_owned(),
+                canonical_movie_dir
+                    .join("Local.Movie.2024-poster.jpg")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            (
+                "THUMB".to_owned(),
+                canonical_movie_dir
+                    .join("Local.Movie.2024-thumbnail.jpg")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        ]
+    );
     let ffmpeg_arguments = fs::read_to_string(log)?;
+    assert!(ffmpeg_arguments.contains("scale=600:900"));
+    assert!(ffmpeg_arguments.contains("scale=1280:720"));
     assert!(!ffmpeg_arguments.contains("Remote.strm"));
     Ok(())
 }
@@ -134,7 +159,63 @@ async fn existing_thumbnail_is_not_overwritten() -> Result<(), Box<dyn std::erro
 }
 
 #[tokio::test]
-async fn existing_series_episode_thumbnail_is_indexed_before_thumbnail_generation()
+async fn existing_scraper_poster_prevents_poster_fallback_but_allows_thumbnail_fallback()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Scraped Movie (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Scraped.Movie.2024.mkv"), b"video")?;
+    let poster_path = movie_dir.join("Scraped.Movie.2024-poster.jpg");
+    let poster_bytes = b"\xff\xd8scraper-poster\xff\xd9";
+    fs::write(&poster_path, poster_bytes)?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'POSTER', 0, ?, ?, 'scraper', 'TMDB')",
+    )
+    .bind(Uuid::now_v7().to_string())
+    .bind(&item_id)
+    .bind(poster_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(poster_bytes.len())?)
+    .execute(database.pool())
+    .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fs::write(&log, "")?;
+    fake_ffmpeg(&fake, &log, 0)?;
+    let thumbnails = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5));
+
+    let report = thumbnails.generate_library(library.id).await?;
+
+    assert_eq!(report.generated, 1);
+    assert_eq!(fs::read(&poster_path)?, poster_bytes);
+    let thumbnail_path = movie_dir.join("Scraped.Movie.2024-thumbnail.jpg");
+    assert_eq!(fs::read(&thumbnail_path)?, b"\xff\xd8lux-thumb\xff\xd9");
+    let ffmpeg_arguments = fs::read_to_string(log)?;
+    assert!(!ffmpeg_arguments.contains("scale=600:900"));
+    assert!(ffmpeg_arguments.contains("scale=1280:720"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn existing_series_episode_thumbnail_is_preserved_while_poster_is_generated()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let database = Database::connect(&config(temp_dir.path())).await?;
@@ -164,16 +245,30 @@ async fn existing_series_episode_thumbnail_is_indexed_before_thumbnail_generatio
     jobs.run_to_completion_with_metadata_and_thumbnails(&job.id, 100, None, None, Some(thumbnails))
         .await?;
 
-    assert_eq!(fs::read_to_string(log)?, "");
-    let image_row: (String, String) = sqlx::query_as(
+    let ffmpeg_arguments = fs::read_to_string(log)?;
+    assert!(ffmpeg_arguments.contains("scale=600:900"));
+    assert!(!ffmpeg_arguments.contains("scale=1280:720"));
+    let canonical_season_dir = fs::canonicalize(&season_dir)?;
+    assert_eq!(
+        fs::read(canonical_season_dir.join("Example.Show.S01E01-poster.jpg"))?,
+        b"\xff\xd8lux-thumb\xff\xd9"
+    );
+    let image_rows: Vec<(String, String)> = sqlx::query_as(
         "SELECT ii.image_type, ii.source
          FROM item_images ii
          JOIN media_items mi ON mi.id = ii.item_id
-         WHERE mi.item_type = 'EPISODE'",
+         WHERE mi.item_type = 'EPISODE'
+         ORDER BY ii.image_type",
     )
-    .fetch_one(database.pool())
+    .fetch_all(database.pool())
     .await?;
-    assert_eq!(image_row, ("THUMB".to_owned(), "LOCAL".to_owned()));
+    assert_eq!(
+        image_rows,
+        vec![
+            ("POSTER".to_owned(), "FFMPEG".to_owned()),
+            ("THUMB".to_owned(), "LOCAL".to_owned()),
+        ]
+    );
     Ok(())
 }
 
@@ -240,6 +335,8 @@ async fn generated_episode_thumbnail_never_claims_episode_fanart_path()
         "unexpected thumbnail report: {report:?}"
     );
     assert_eq!(fs::read(&fanart_path)?, b"\xff\xd8existing-fanart\xff\xd9");
+    let poster_path = fs::canonicalize(&season_dir)?.join("Example.Show.S01E01-poster.jpg");
+    assert_eq!(fs::read(&poster_path)?, b"\xff\xd8lux-thumb\xff\xd9");
     let thumbnail_path = fs::canonicalize(&season_dir)?.join("Example.Show.S01E01-thumbnail.jpg");
     assert_eq!(fs::read(&thumbnail_path)?, b"\xff\xd8lux-thumb\xff\xd9");
     let indexed_thumbnail: (String, String) = sqlx::query_as(
@@ -307,6 +404,8 @@ async fn generated_episode_thumbnail_skips_a_canonical_path_owned_by_fanart()
         report.generated, 1,
         "unexpected thumbnail report: {report:?}"
     );
+    let poster_path = fanart_path.with_file_name("Example.Show.S01E01-poster.jpg");
+    assert_eq!(fs::read(&poster_path)?, b"\xff\xd8lux-thumb\xff\xd9");
     let thumbnail_path = fanart_path.with_file_name("Example.Show.S01E01-thumbnail-1.jpg");
     assert_eq!(fs::read(&thumbnail_path)?, b"\xff\xd8lux-thumb\xff\xd9");
     let indexed_thumbnail: String = sqlx::query_scalar(

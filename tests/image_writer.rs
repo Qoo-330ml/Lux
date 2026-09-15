@@ -106,6 +106,58 @@ async fn downloads_missing_poster_and_fanart_and_refreshes_index()
 }
 
 #[tokio::test]
+async fn scraper_replaces_an_ffmpeg_fallback_image() -> Result<(), Box<dyn std::error::Error>> {
+    let (database, item_id, _root, movie_dir) = prepared_movie().await?;
+    let fallback_path = movie_dir.join("Image.Movie.2020-poster.jpg");
+    let fallback_bytes = b"\xff\xd8ffmpeg-fallback\xff\xd9";
+    tokio::fs::write(&fallback_path, fallback_bytes).await?;
+    sqlx::query(
+        "INSERT INTO item_images (
+            id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+         ) VALUES (?, ?, 'POSTER', 0, ?, ?, 'fallback', 'FFMPEG')",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(&item_id)
+    .bind(fallback_path.to_string_lossy().as_ref())
+    .bind(i64::try_from(fallback_bytes.len())?)
+    .execute(database.pool())
+    .await?;
+
+    let app = Router::new().route(
+        "/poster",
+        get(|| async {
+            Response::builder()
+                .header(CONTENT_TYPE, "image/png")
+                .body(Body::from(PNG_1X1.to_vec()))
+                .expect("test image response should be valid")
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let service = ImageWriteService::new(database.clone())?;
+
+    let report = service
+        .download_item_image_if_missing(&item_id, "poster", &format!("http://{address}/poster"))
+        .await?
+        .ok_or("FFMPEG fallback was incorrectly treated as a complete poster")?;
+
+    assert_eq!(report.image_type, "POSTER");
+    assert_eq!(tokio::fs::read(&fallback_path).await?, PNG_1X1);
+    let source: String = sqlx::query_scalar(
+        "SELECT source FROM item_images
+         WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source, "SCRAPER");
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn image_downloads_respect_the_global_concurrency_limit()
 -> Result<(), Box<dyn std::error::Error>> {
     let (database, item_id, _root, _movie_dir) = prepared_movie().await?;

@@ -332,25 +332,6 @@ impl ImageWriteService {
             .local_image_exists_at_index(item_id, normalized_type, image_index)
             .await?
         {
-            if image_index == 0
-                && normalized_type == "THUMB"
-                && self
-                    .database
-                    .find_item_image_source(item_id, "THUMB")
-                    .await?
-                    .is_some_and(|value| value.eq_ignore_ascii_case("STRM_FFMPEG"))
-            {
-                return self
-                    .download_item_image_attempt_at_index(
-                        item_id,
-                        normalized_type,
-                        image_url,
-                        source,
-                        image_index,
-                        true,
-                    )
-                    .await;
-            }
             return Ok(None);
         }
         self.download_item_image_attempt_at_index(
@@ -640,9 +621,11 @@ impl ImageWriteService {
         if let Some(indexed_image) = indexed_images.iter().find(|image| {
             image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == image_index
         }) {
-            if image_file_stamp(Path::new(&indexed_image.local_path))
-                .await?
-                .is_some()
+            let fallback = is_fallback_image_source(&indexed_image.source);
+            if !fallback
+                && image_file_stamp(Path::new(&indexed_image.local_path))
+                    .await?
+                    .is_some()
             {
                 return Ok(true);
             }
@@ -673,6 +656,9 @@ impl ImageWriteService {
             return Ok(false);
         }
         if image_path_is_owned_by_other_type(&indexed_images, image_type, &path).await? {
+            return Ok(false);
+        }
+        if indexed_image_path_is_fallback(&indexed_images, image_type, image_index, &path).await? {
             return Ok(false);
         }
         image_file_stamp(&path).await.map(|_| true)
@@ -738,9 +724,10 @@ impl ImageWriteService {
             for image in indexed_images.iter().filter(|image| {
                 image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == 0
             }) {
-                if image_file_stamp(Path::new(&image.local_path))
-                    .await?
-                    .is_some()
+                if !is_fallback_image_source(&image.source)
+                    && image_file_stamp(Path::new(&image.local_path))
+                        .await?
+                        .is_some()
                 {
                     indexed_exists = true;
                     break;
@@ -769,6 +756,13 @@ impl ImageWriteService {
                             image_index as i64,
                             &path,
                         )
+                        && !indexed_image_path_is_fallback(
+                            &indexed_images,
+                            image_type,
+                            image_index as i64,
+                            &path,
+                        )
+                        .await?
                         && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
                             .await?
                         && image_file_stamp(&path).await?.is_some()
@@ -800,6 +794,13 @@ impl ImageWriteService {
                         image_index as i64,
                         &path,
                     )
+                    && !indexed_image_path_is_fallback(
+                        &indexed_images,
+                        image_type,
+                        image_index as i64,
+                        &path,
+                    )
+                    .await?
                     && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
                         .await?
                     && image_file_stamp(&path).await?.is_some()
@@ -2318,6 +2319,31 @@ pub fn normalize_image_type(value: &str) -> Option<&'static str> {
         "wallpaper" => Some("WALLPAPER"),
         _ => None,
     }
+}
+
+pub(crate) fn is_fallback_image_source(source: &str) -> bool {
+    source.eq_ignore_ascii_case("FFMPEG")
+        || source.eq_ignore_ascii_case("FFMPEG_FALLBACK")
+        || source.eq_ignore_ascii_case("STRM_FFMPEG")
+}
+
+async fn indexed_image_path_is_fallback(
+    indexed_images: &[StoredItemImage],
+    image_type: &str,
+    image_index: i64,
+    path: &Path,
+) -> Result<bool, ImageWriteError> {
+    let comparable_path = canonical_path_for_comparison(path).await?;
+    for image in indexed_images {
+        if image.image_type.eq_ignore_ascii_case(image_type)
+            && image.image_index == image_index
+            && is_fallback_image_source(&image.source)
+            && canonical_path_for_comparison(Path::new(&image.local_path)).await? == comparable_path
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn content_type(path: &Path) -> Option<&'static str> {

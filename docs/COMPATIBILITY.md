@@ -14,6 +14,18 @@ Lux 主程序统一走 `ScraperPluginClient`，不再编译 TMDb client/adapter 
 
 本文档是目标客户端兼容性的唯一事实来源。未填入实测版本和证据前，不得宣称兼容。
 
+## Lux API 用户令牌与首页（2026-09-15）
+
+Lux 自有 API 的媒体、搜索、首页、图片、播放和用户状态接口接受用户级 Emby AccessToken。客户端可发送
+`X-Lux-Token`，也可兼容发送同一令牌的 `X-Emby-Token`、`X-MediaBrowser-Token` 或
+`Authorization: Bearer`。`GET /api/v1/home` 返回继续观看、推荐、可见媒体库和每库最新资源，并继续执行
+当前用户的媒体库 ACL；Web Cookie 和 LUX-182 共享管理员 API Key 的边界保持不变。
+
+自动化覆盖已加入 `tests/lux_api_auth.rs`，覆盖无凭证 401、`X-Lux-Token`、`X-Emby-Token` 和 Bearer
+调用 `/api/v1/home`/媒体库接口；本轮 `cargo test --locked --all-targets` 为 443 passed、4 ignored、0
+failed，`cargo fmt --all -- --check` 与 `git diff --check` 也通过。该证据只证明 Lux 服务端协议，不代表
+VidHub、SenPlayer、Infuse 或其他第三方客户端已经完成真实客户端兼容性验证。
+
 ## LUX-247 Emby 局域网发现（2026-09-09）
 
 Lux 服务端监听 UDP `7359`，对大小写不敏感的 `who is EmbyServer?` UTF-8/UTF-16LE 请求返回 Emby 兼容的

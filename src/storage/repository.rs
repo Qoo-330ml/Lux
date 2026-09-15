@@ -2395,7 +2395,6 @@ pub(crate) struct StoredThumbnailSource {
     pub(crate) item_id: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
-    pub(crate) thumbnail_path: Option<String>,
 }
 
 #[derive(Debug)]

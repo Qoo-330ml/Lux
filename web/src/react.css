@@ -1940,6 +1940,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-admin-library-cover-wrap { position: relative; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 9px 9px 0 0; background: #1b1b20; }
 .lux-admin-library-cover-wrap::after { position: absolute; inset: 0; z-index: 1; background: rgba(0,0,0,.42); content: ""; opacity: 0; transition: opacity .2s ease; pointer-events: none; }
 .lux-admin-library-card:hover .lux-admin-library-cover-wrap::after { opacity: 1; }
+.lux-admin-library-cover-trigger { position: absolute; inset: 0; z-index: 0; display: block; width: 100%; height: 100%; padding: 0; border: 0; color: inherit; background: transparent; text-align: inherit; cursor: pointer; }
+.lux-admin-library-cover-trigger:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: -2px; }
 .lux-admin-library-cover { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .35s var(--lux-ease), filter .2s ease; }
 .lux-admin-library-card:hover .lux-admin-library-cover { filter: saturate(.86); transform: scale(1.035); }
 .lux-admin-library-cover-placeholder { display: grid; place-items: center; width: 100%; height: 100%; color: rgba(255,255,255,.42); background: radial-gradient(circle at 50% 20%, rgba(107,107,118,.28), transparent 44%), linear-gradient(145deg, #27272c, #101013); }
