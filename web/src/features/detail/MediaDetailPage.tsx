@@ -65,6 +65,7 @@ export function MediaDetailPage() {
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
   const activeSeasonId = seasons.data?.items?.[0]?.id;
+  const singleSeason = seasons.data?.items?.length === 1 ? seasons.data.items[0] : undefined;
   const hierarchySeriesId = item.data && !isSeries
     ? item.data.seriesId ?? item.data.parentId ?? undefined
     : undefined;
@@ -349,10 +350,18 @@ export function MediaDetailPage() {
         <div className="lux-detail-sections">
           <div className="lux-detail-hierarchy">
             {isSeries ? (
-              <SeriesChildren
-                seasons={seasons.data?.items ?? []}
-                series={media}
-              />
+              singleSeason ? (
+                <SeasonEpisodes
+                  episodes={episodes.data?.items ?? []}
+                  seasonNumber={singleSeason.parentIndexNumber}
+                  episodesPending={episodes.isPending}
+                />
+              ) : (
+                <SeriesChildren
+                  seasons={seasons.data?.items ?? []}
+                  series={media}
+                />
+              )
             ) : null}
             {isSeason ? <SeasonEpisodes episodes={episodes.data?.items ?? []} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}
             {isEpisode ? <EpisodeRail episodes={episodes.data?.items ?? []} currentEpisodeId={media.id} seasonNumber={media.parentIndexNumber} episodesPending={episodes.isPending} /> : null}

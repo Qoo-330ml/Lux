@@ -2104,6 +2104,7 @@ services:
 | LUX-249 | docs/LUX-DEVELOPMENT.md、docs/COMPATIBILITY.md、src/application/scraper.rs、src/application/images.rs、src/application/candidates.rs、src/storage/media.rs、src/storage/repository.rs、web/src/features/admin/AdminPluginsPage.tsx、web/tests/plugin-library.test.ts；TMDb 原语言文字与图片模式 |
 | LUX-250 | docs/LUX-DEVELOPMENT.md、web/src/features/home/media.tsx、web/src/features/detail/MediaDetailPage.tsx、web/tests/home-media.test.tsx、web/tests/media-detail.test.tsx；季海报缺失时回退父剧海报 |
 | LUX-251 | docs/LUX-DEVELOPMENT.md、docs/LUX-251-PLAN.md、migrations/0120_manual_item_merges.sql、migrations-postgres/0120_manual_item_merges.sql、src/storage/media_merge.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/catalog.rs、src/application/item_merge.rs、src/application/mod.rs、src/application/scanner.rs、src/api/legacy.rs、src/api/admin.rs、src/api/admin_handlers.rs、web/src/features/library/LibraryPage.tsx、web/src/lib/api/client.ts、web/src/lib/api/types.ts、tests/item_merge.rs、web/tests/library-page.test.ts；管理员手动合并媒体条目为多版本 |
+| LUX-252 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；单季剧集详情直接展示单集列表 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6070,6 +6071,36 @@ PostgreSQL 集成测试目标已编译，但本机没有可用 PostgreSQL 实例
 
 - 不把父剧海报复制到季目录或写入 `/config/metadata/library`。
 - 不修改 TMDb 插件、数据库 schema、Emby 图片 DTO 或图片来源优先级。
+
+#### LUX-252：单季剧集详情直接展示单集列表
+
+范围：当剧集详情实际返回的季度数量为一时，剧集详情页直接展示该季度的单集列表，避免用户
+先进入只有一个季度的季度详情页；多季剧集继续展示季度卡片，季度详情页和单集详情页保持现有行为。
+该变化仅属于 Web 展示层，不修改 API、数据库或剧集/季度/单集领域关系。
+
+验收：
+
+- [x] 单季剧集详情不再显示季度卡片，而是在剧集详情下显示该季度的单集数量和单集列表。
+- [x] 单季剧集的单集仍可进入原有单集详情页，播放入口和下一集选择逻辑不变。
+- [x] 多季剧集继续显示季度卡片，不提前展开任一季度的单集列表。
+- [x] 季度详情页仍显示原有单集列表，空季度仍显示原有空状态。
+
+验证：
+
+- `pnpm --dir web test -- media-detail.test.tsx`
+- `pnpm --dir web build`
+- `git diff --check`
+
+验证记录（2026-09-15）：`pnpm --dir web test`（105 个 Node 测试、479 个 Vitest 测试通过）、
+`pnpm --dir web build`、`git diff --check` 通过；浏览器运行时检查因本机 CUA 浏览器提供方无法加载
+request-header policy 未执行。未修改 Rust 源码、API 或数据库。
+
+依赖：LUX-060、LUX-061、LUX-100。
+
+明确不做：
+
+- 不修改 `/api/v1/items/{id}/children` 的请求或响应合同。
+- 不将单集列表改为自动播放，也不改变多季剧集的浏览层级。
 
 ## 26. 风险与缓解
 

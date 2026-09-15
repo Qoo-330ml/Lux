@@ -43,7 +43,7 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.restoreAllMocks();
   });
 
-  it("shows portrait season cards on a series detail", async () => {
+  it("shows portrait season cards on a multi-season detail", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "series-1",
       title: "示例剧集",
@@ -55,9 +55,12 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
       items: options?.itemType === "SEASON"
-        ? [{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8, rating: 7.1, ratingSource: "TMDb", imageTags: { poster: "season-poster" } }]
-        : [{ id: "episode-1", title: "第一集", itemType: "EPISODE" }],
-      total: 1,
+        ? [
+          { id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8, rating: 7.1, ratingSource: "TMDb", imageTags: { poster: "season-poster" } },
+          { id: "season-2", title: "第二季", itemType: "SEASON", episodeCount: 6 },
+        ]
+        : [],
+      total: 2,
       page: 1,
       pageSize: 60,
     }));
@@ -88,6 +91,7 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-detail-copy .lux-eyebrow")).toBeNull();
     expect(container.querySelector(".lux-detail-poster .lux-rating")).toBeNull();
     expect(container.querySelector(".lux-season-rail")?.textContent).toContain("第一季");
+    expect(container.querySelectorAll(".lux-season-card")).toHaveLength(2);
     expect(container.querySelector(".lux-season-card img")?.getAttribute("src"))
       .toBe("/api/v1/items/season-1/images/poster?tag=season-poster");
     expect(container.querySelector(".lux-season-card .lux-rating")).not.toBeNull();
@@ -98,7 +102,62 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(queryClient.getQueryCache().find({ queryKey: queryKeys.itemImages("series-1") })?.options.refetchInterval)
       .toBe(queryRefreshIntervals.mediaSurface);
     expect(container.querySelector(".lux-season-tabs")).toBeNull();
-    expect(container.querySelector(".lux-episode-list")).toBeNull();
+    expect(container.querySelector(".lux-season-episode-list")).toBeNull();
+  });
+
+  it("shows the single season episodes directly on a series detail", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "series-1",
+      title: "单季剧集",
+      itemType: "SERIES",
+      mediaSources: [],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+    const children = vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => options?.itemType === "SEASON"
+      ? {
+        items: [{ id: "season-1", title: "第一季", itemType: "SEASON", parentIndexNumber: 1, episodeCount: 2 }],
+        total: 1,
+        page: 1,
+        pageSize: 60,
+      }
+      : {
+        items: [
+          { id: "episode-1", title: "第一集", itemType: "EPISODE", indexNumber: 1 },
+          { id: "episode-2", title: "第二集", itemType: "EPISODE", indexNumber: 2 },
+        ],
+        total: 2,
+        page: 1,
+        pageSize: 60,
+      });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/series-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector(".lux-season-rail")).toBeNull();
+    expect(container.querySelector(".lux-season-episodes")?.textContent).toContain("2 集");
+    expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(2);
+    expect(container.querySelector(".lux-season-episode-row")?.getAttribute("href")).toBe("/items/episode-1");
+    expect(children).toHaveBeenCalledWith("series-1", { itemType: "EPISODE", seasonId: "season-1" });
   });
 
   it("uses the series poster for season cards without their own poster", async () => {
@@ -112,9 +171,12 @@ describe("MediaDetailPage series hierarchy", () => {
     vi.spyOn(api, "playback").mockResolvedValue({});
     vi.spyOn(api, "children").mockImplementation(async (_itemId, options) => ({
       items: options?.itemType === "SEASON"
-        ? [{ id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8 }]
+        ? [
+          { id: "season-1", title: "第一季", itemType: "SEASON", episodeCount: 8 },
+          { id: "season-2", title: "第二季", itemType: "SEASON", episodeCount: 6 },
+        ]
         : [],
-      total: 1,
+      total: 2,
       page: 1,
       pageSize: 60,
     }));
