@@ -22,6 +22,19 @@ HTTP(S) 基地址；未设置时服务端按请求来源选择本机接口和 HT
 `tests/discovery.rs` 与 `discovery` 模块单测覆盖。该记录只证明 Lux 服务端协议，不宣称 Prism 或其他客户端已完成真实
 局域网发现；Docker 多网卡/广播验证和客户端以 `Id` 去重、并行探测两个地址的行为待 Prism 阶段验证。
 
+## LUX-254 Emby 客户端服务端转码（2026-09-15）
+
+Lux 现已把本地媒体的服务端 HLS 能力接入 Emby `PlaybackInfo` POST：当客户端明确发送
+`EnableDirectPlay=false`、`EnableTranscoding=true` 时，服务端按 `EnableDirectStream`、
+`AllowVideoStreamCopy` 和 `AllowAudioStreamCopy` 选择最低成本的 Remux、音频转码、硬件转码或软件转码，
+并返回带短期 HMAC 票据的 `TranscodingUrl`。HLS 清单通过标准 `master.m3u8` 入口返回，init 和 m4s
+片段使用同一转码会话的签名 URL；Emby 播放回调会刷新会话，`Stopped` 会回收 FFmpeg 和临时目录。
+
+`tests/playback.rs` 已覆盖 Direct Play 优先、本地转码 PlaybackInfo 协商、manifest/init/segment 实际读取、
+跨条目和篡改签名拒绝、播放回调刷新/停止清理，以及 `.strm` 不声明转码且不创建 HLS 会话。该自动化证据
+只证明服务端协议和资源边界；截至本记录，尚未用 VidHub、SenPlayer、Infuse 或其他第三方 Emby 客户端在
+部署实例上实测转码首帧、seek、暂停、停止和断线回收，不能据此宣称客户端已完成兼容。
+
 ## LUX-144 TMDb 语言组与详情回退（2026-09-08）
 
 TMDb 语言配置由外置 `Lux-plugins` 的 `org.lux.tmdb` 提供 73 个 canonical 语言组；`zh-CN`/`zh-SG`、

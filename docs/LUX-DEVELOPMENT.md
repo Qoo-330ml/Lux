@@ -2106,6 +2106,7 @@ services:
 | LUX-251 | docs/LUX-DEVELOPMENT.md、docs/LUX-251-PLAN.md、migrations/0120_manual_item_merges.sql、migrations-postgres/0120_manual_item_merges.sql、src/storage/media_merge.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/catalog.rs、src/application/item_merge.rs、src/application/mod.rs、src/application/scanner.rs、src/api/legacy.rs、src/api/admin.rs、src/api/admin_handlers.rs、web/src/features/library/LibraryPage.tsx、web/src/lib/api/client.ts、web/src/lib/api/types.ts、tests/item_merge.rs、web/tests/library-page.test.ts；管理员手动合并媒体条目为多版本 |
 | LUX-252 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；单季剧集详情直接展示单集列表 |
 | LUX-253 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/src/react.css、web/tests/media-detail.test.tsx；单集图片播放与文字详情入口 |
+| LUX-254 | docs/LUX-254-PLAN.md、src/application/playback/session.rs、src/api/playback.rs、src/api/emby.rs、src/api/legacy.rs、tests/playback.rs、docs/API.md、docs/COMPATIBILITY.md；Emby 客户端服务端转码 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6132,6 +6133,56 @@ request-header policy 未执行。未修改 Rust 源码、API 或数据库。
 
 - 不改变 `/watch/{itemId}` 播放页及其播放会话初始化逻辑。
 - 不将电影、剧集、季度或其他媒体卡片的图片点击行为一并改为播放。
+
+#### LUX-254：Emby 客户端服务端转码
+
+范围：把现有本地媒体服务端 HLS 能力接入 Emby 兼容 `PlaybackInfo` 协商，使第三方 Emby 客户端在
+无法直放时可以使用标准 `TranscodingUrl` 播放。Emby 路由只负责解析协议请求、执行 ACL 和映射 DTO；
+FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现有播放 application service 负责。
+
+兼容合同：
+
+- `GET /Items/{itemId}/PlaybackInfo` 和空 body 的 `POST` 保持现有 Direct Play 行为；带有明确
+  `EnableDirectPlay`、`EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy` 和
+  `AllowAudioStreamCopy` 的 `POST` 按客户端能力从 Direct、HLS Remux、音频转码、硬件转码和软件转码中
+  选择最低成本可用档位。
+- 本地媒体源在选择服务端转码时返回 `SupportsTranscoding=true`、`TranscodingUrl`、
+  `TranscodingSubProtocol=hls`、`TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
+  URL 指向标准 Emby `master.m3u8` 入口；清单中的初始化片段和媒体片段继续使用当前会话的短期签名 URL。
+- 转码会话复用 `web_playback_sessions`，其 `PlaySessionId` 可被 Emby `Sessions/Playing`、`Progress` 和
+  `Stopped` 回调关联；播放/暂停刷新 TTL，停止立即回收 FFmpeg 进程和临时目录。没有回调时仍由服务端
+  过期清理回收。
+- `.strm` 无论客户端是否声明转码能力，都不返回服务端转码 URL，不启动 FFmpeg，不生成 HLS 目录，也不
+  代理媒体字节。
+- 转码资源必须绑定当前用户、条目、媒体源、会话和签名有效期；错误用户、跨条目/媒体源、篡改或过期签名、
+  路径穿越和无权限请求均拒绝。Emby token 不写入转码 URL 或日志。
+
+验收：
+
+- [x] 第三方 Emby `PlaybackInfo` POST 可以为本地媒体协商服务端转码，并实际取得 `master.m3u8`、init
+      segment 和 media segment；Direct Play 仍优先。
+- [x] Emby 转码播放事件能够刷新会话并在 `Stopped` 后回收资源；无事件会被 TTL/孤儿清理回收。
+- [x] `.strm`、无权限 source、错误用户、跨 source、过期/篡改签名和路径穿越均不会启动或泄露转码资源。
+- [x] 现有 Web 播放、Emby 直放、ACL、Range、进度和媒体代理行为不回退。
+- [ ] Rust 窄测试、全量质量门和本机架构记录通过；真实第三方客户端的首帧、seek、暂停、停止和断线行为
+      由部署后专项兼容性测试记录，不以服务端测试替代。
+
+验证：见 `docs/LUX-254-PLAN.md`；本机 `uname -m` 结果不外推 NAS/x86_64 性能或所有客户端兼容性。
+
+验证记录（2026-09-15）：`cargo build --locked`、`cargo test --locked --test playback`（3 个通过）、
+`cargo test --locked --lib playback`（38 个通过）和 `cargo fmt --all -- --check` 通过；转码集成测试使用
+fake FFmpeg 实际读取 master manifest、init 和 m4s 片段，并验证回调刷新、停止清理、ACL、签名和 `.strm`
+边界。`cargo test --locked --all-targets` 首次运行仅因既有 `tests/watch.rs` SQLite lock 偶发失败，单线程
+重跑通过；`cargo clippy --locked --all-targets --all-features -- -D warnings` 仍被既有
+`tests/item_merge.rs:32` 的 `clippy::too_many_arguments` 阻塞。`uname -m` 为 `arm64`。真实 FFmpeg 和
+VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停止及断线回收尚未在部署实例验证。
+
+依赖：LUX-198、LUX-199。
+
+明确不做：
+
+- 不实现字幕转换/烧录、DRM、多码率自适应 HLS、`.strm` 服务端转码或第三方客户端专属私有协议。
+- 不改变现有 Web 播放 DTO、Emby 内部领域模型或数据库字段；没有数据库迁移需求。
 
 ## 26. 风险与缓解
 

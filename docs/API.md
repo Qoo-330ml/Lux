@@ -216,7 +216,8 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET|HEAD /Videos/{itemId}/{mediaSourceId}/stream`、`/stream.{container}`：读取指定媒体源；本地源返回文件流，HTTP `.strm` 源由 Lux 使用入站播放器 User-Agent、`Range: bytes=0-0` 请求原始地址并有限跟随重定向，最后返回 `307 Location`。若首个响应已经是媒体 `200/206`，Location 保持原始地址；如果上游返回 302，则 Location 为最终 CDN 地址。Lux 不代理媒体字节；路径型/其他 `.strm` 源按解析器结果返回 `307 Location`。
 - `GET|HEAD /Items/{itemId}/Download`：需要 `can_download` 和媒体库 ACL，返回所选单个媒体源的附件下载流；不打包同目录旁车文件。`mediaSourceId` 可选择源，`LOCAL_FILE` 直接读取库内文件，`STRM_URL` 读取 `.strm` 的首个非空 URL 后由 Lux 流式转发远程资源。
 - `GET|HEAD /api/v1/items/{itemId}/download`：Lux 下载端点，需要 Web session、`can_download` 和媒体库 ACL；返回所选单个媒体源，不打包 ZIP。`sourceId` 可选择源；本地源直接流式读取，`.strm` 读取首个非空远程 URL 并由 Lux 请求、流式转发该资源，不返回 `.strm` 文本。
-- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流、DirectPlay 能力和服务端生成的 `PlaySessionId`；支持 `MediaSourceId` 显式选择，支持 DirectPlay/DirectStream，不声明转码。每个媒体源可带 `Edition`/`Quality` 版本标签。
+- `GET|POST /Items/{itemId}/PlaybackInfo`：返回可访问媒体源、媒体流、DirectPlay 能力和服务端生成的 `PlaySessionId`；支持 `MediaSourceId` 显式选择，支持 DirectPlay/DirectStream。GET 或空 body 的 POST 保持 Direct Play 行为；带 `EnableDirectPlay`、`EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy` 和 `AllowAudioStreamCopy` 的 POST 会为选中的本地媒体源按最低成本选择服务端 HLS Remux、音频转码、硬件转码或软件转码，并返回 `SupportsTranscoding`、`TranscodingUrl`、`TranscodingSubProtocol=hls`、`TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。每个媒体源可带 `Edition`/`Quality` 版本标签；`.strm` 始终不声明服务端转码。
+- `GET|HEAD /Videos/{itemId}/master.m3u8`：读取 `PlaybackInfo` 返回的签名 Emby HLS 清单；清单中的 `/Videos/{itemId}/transcoding/{sessionId}/{asset}` 地址读取签名的 `init.mp4` 或 `.m4s` 片段。两类资源不要求 Web Cookie，仍绑定用户、条目、媒体源、转码会话和过期签名；也接受 `/emby`、小写 `/videos` 兼容前缀。
 - 本地媒体源的 `MediaSources.Container` 使用实际文件扩展名（例如 `mkv`、`mp4`），不暴露 ffprobe 的复合 `format_name`。`DirectStreamUrl` 通过 `MediaSourceId` 定位源；`stream.{container}` 的后缀仅作兼容性后缀，服务端仍按媒体源记录读取文件。
 - `.strm` 条目的 `Path` 和 `MediaSources.Path` 均返回旁车记录中的原始媒体目标，供外部 Emby 代理执行路径映射或 302 解析；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
 - `MediaStreams` 不返回 Matroska/MP4 中标记为 `attached_pic` 的封面附加图轨，避免客户端将封面误认为可播放视频轨。
@@ -225,7 +226,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 `.strm` 媒体源在 PlaybackInfo 中以 `Protocol=File`、`IsRemote=false` 返回；条目的 `Path` 和 `MediaSources.Path` 保留原始目标。对 HTTP(S) 和本地路径型 `.strm`，`MediaSources[].DirectStreamUrl` 使用当前服务的标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，同时携带标准 `UserId` 作为外部代理的身份关联提示；`UserId` 不承担授权。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，Lux 会仅对 URL/路径型 `.strm` 将本次标准 Emby token 作为 `api_key` 写入同一签名 URL，并将 `AddApiKeyToDirectStreamUrl` 设为 `true`；本地文件和 SMB/FTP 解析源不写入长期 token。Lux 仍要求短期票据。外部 Emby 代理从原始 `Path` 提取映射信息并执行 302 解析，客户端不会直接连接 `.strm` 中可能存在的内网 302 地址。播放器直接访问 Lux 入口时，URL 型 `.strm` 由 Lux 使用播放器 User-Agent 请求上游并有限返回 307，路径型 `.strm` 按本地文件规则处理；Lux 不代理媒体字节，PlaybackInfo 本身不访问上游。具有媒体库访问权限的客户端仍可能获得包含令牌的原始 `Path`，因此含 token 的兼容 URL 和原始目标都应避免进入公开日志。
 
 - `GET /Sessions`：返回当前用户的活动播放会话；管理员可查看全部活动会话。每个会话按 Emby 兼容字段返回 `Client`、`DeviceName`、`DeviceId`、`DeviceType`、`ApplicationVersion` 和 `RemoteEndPoint`；无法获得的值为 `null`。
-- `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`：幂等记录播放事件，并将位置单调写入用户状态；事件体中的设备/客户端字段优先，缺失时从上述认证头回填。
+- `POST /Sessions/Playing`、`/Sessions/Playing/Progress`、`/Sessions/Playing/Stopped`：幂等记录播放事件，并将位置单调写入用户状态；事件体中的设备/客户端字段优先，缺失时从上述认证头回填。由 `PlaybackInfo` 返回的 `lux-emby:` `PlaySessionId` 会同时刷新对应服务端 HLS 会话，`Stopped` 立即回收 FFmpeg 进程和临时目录。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放状态和该条目的活动会话状态。
 - `POST /api/v1/items/{itemId}/progress`：写入当前 Web 用户的播放开始、进度、暂停或停止事件；与 Emby 播放事件共用 `playback_sessions` 和 `user_item_state`。
 - `PUT /api/v1/items/{itemId}/favorite`：按请求体 `{ "favorite": true }` 设置当前 Web 用户的收藏状态。

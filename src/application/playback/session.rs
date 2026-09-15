@@ -68,6 +68,7 @@ pub struct CreateWebPlaybackSession<'a> {
     pub is_admin: bool,
     pub item_id: &'a str,
     pub media_source_id: &'a str,
+    pub play_session_prefix: &'a str,
     pub source_kind: PlaybackSourceKind,
     pub capabilities: PlaybackCapabilities,
 }
@@ -190,6 +191,13 @@ impl WebPlaybackSessionService {
         }
     }
 
+    pub(crate) fn with_hls_executable(mut self, executable: std::path::PathBuf) -> Self {
+        self.hls = self
+            .hls
+            .with_executable(executable.to_string_lossy().into_owned());
+        self
+    }
+
     pub(crate) async fn create(
         &self,
         input: CreateWebPlaybackSession<'_>,
@@ -208,7 +216,7 @@ impl WebPlaybackSessionService {
         }));
         let WebPlaybackPlan::Unsupported { .. } = plan else {
             let id = Uuid::now_v7().to_string();
-            let play_session_id = format!("lux-web:{id}");
+            let play_session_id = format!("{}:{id}", input.play_session_prefix);
             let now = unix_timestamp();
             let expires_at = now.saturating_add(WEB_PLAYBACK_SESSION_TTL_SECONDS);
             self.database

@@ -442,6 +442,14 @@ impl AppState {
         self
     }
 
+    #[doc(hidden)]
+    pub fn with_hls_executable(mut self, executable: PathBuf) -> Self {
+        self.web_playback = self
+            .web_playback
+            .map(|service| service.with_hls_executable(executable));
+        self
+    }
+
     pub fn with_scraper<T>(mut self, scraper: T) -> Self
     where
         T: Into<ScraperProvider>,
@@ -816,10 +824,33 @@ fn is_emby_legacy_strm_path(path: &str) -> bool {
         && segments.next().is_none()
 }
 
+fn is_emby_transcoding_path(path: &str) -> bool {
+    let path = emby_path_without_prefix(path);
+    let mut segments = path.split('/');
+    if !matches!(segments.next(), Some("Videos" | "videos"))
+        || segments.next().is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    match (
+        segments.next(),
+        segments.next(),
+        segments.next(),
+        segments.next(),
+    ) {
+        (Some("master.m3u8"), None, None, None) => true,
+        (Some("transcoding"), Some(session_id), Some(asset), None) => {
+            !session_id.is_empty() && !asset.is_empty()
+        }
+        _ => false,
+    }
+}
+
 fn is_registered_emby_video_path(path: &str) -> bool {
     emby_media_stream_item_id(path).is_some()
         || is_emby_subtitle_path(path)
         || is_emby_legacy_strm_path(path)
+        || is_emby_transcoding_path(path)
 }
 
 async fn reject_unmatched_emby_video_path(request: Request<Body>, next: Next) -> Response {
@@ -1460,7 +1491,7 @@ mod tests {
         emby_public_id, emby_single_id_lookup, emby_source_needs_strm_resolver,
         filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
         is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        is_emby_subtitle_path, is_emby_video_path, is_filmly_user_agent,
+        is_emby_subtitle_path, is_emby_transcoding_path, is_emby_video_path, is_filmly_user_agent,
         is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_failure_kind,
         normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
         record_activity_event, safe_trace_path, secure_cookie_for_request, validate_media_strategy,
@@ -1774,6 +1805,15 @@ mod tests {
         ));
         assert!(is_registered_emby_video_path(
             "/emby/videos/item-123/stream.mkv"
+        ));
+        assert!(is_emby_transcoding_path(
+            "/emby/Videos/item-123/master.m3u8"
+        ));
+        assert!(is_registered_emby_video_path(
+            "/Videos/item-123/transcoding/session-456/segment_000000.m4s"
+        ));
+        assert!(!is_registered_emby_video_path(
+            "/Videos/item-123/transcoding/session-456/../secret"
         ));
         assert!(is_emby_subtitle_path(
             "/emby/Videos/item-123/source-456/Subtitles/0/Stream"

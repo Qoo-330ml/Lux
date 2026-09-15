@@ -114,6 +114,14 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(emby_stream_with_source_and_container).head(emby_stream_with_source_and_container),
         )
         .route(
+            "/Videos/{item_id}/master.m3u8",
+            get(emby_transcoding_master).head(emby_transcoding_master),
+        )
+        .route(
+            "/Videos/{item_id}/transcoding/{session_id}/{asset}",
+            get(emby_transcoding_asset).head(emby_transcoding_asset),
+        )
+        .route(
             "/videos/{item_id}/stream",
             get(emby_stream).head(emby_stream),
         )
@@ -132,6 +140,14 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/videos/{item_id}/{media_source_id}/stream.{container}",
             get(emby_stream_with_source_and_container).head(emby_stream_with_source_and_container),
+        )
+        .route(
+            "/videos/{item_id}/master.m3u8",
+            get(emby_transcoding_master).head(emby_transcoding_master),
+        )
+        .route(
+            "/videos/{item_id}/transcoding/{session_id}/{asset}",
+            get(emby_transcoding_asset).head(emby_transcoding_asset),
         )
         .route(
             "/Items/{item_id}/PlaybackInfo",
