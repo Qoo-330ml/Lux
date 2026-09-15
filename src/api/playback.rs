@@ -10,6 +10,7 @@ pub(super) async fn emby_playback_info(
     State(state): State<AppState>,
     body: Bytes,
 ) -> Response {
+    let force_transcode = emby_force_transcode_from_raw(&raw_query);
     let query = emby_stream_query_from_raw(raw_query);
     let request = match parse_emby_playback_info_request(&body) {
         Ok(request) => request,
@@ -56,7 +57,7 @@ pub(super) async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
-    let transcode_requested = request.requests_server_transcoding();
+    let transcode_requested = request.requests_server_transcoding(force_transcode);
     if let Some(source) = sources.first() {
         tracing::info!(
             event = "emby_playback_negotiation",
@@ -70,6 +71,7 @@ pub(super) async fn emby_playback_info(
             enable_transcoding = ?request.enable_transcoding,
             allow_video_stream_copy = ?request.allow_video_stream_copy,
             allow_audio_stream_copy = ?request.allow_audio_stream_copy,
+            force_transcode,
             transcode_requested,
             "negotiated Emby playback source"
         );
@@ -114,7 +116,7 @@ pub(super) async fn emby_playback_info(
                     true,
                     strm_resolver_available,
                 );
-                if request.enable_transcoding == Some(true)
+                if (request.enable_transcoding == Some(true) || force_transcode)
                     && source.source_kind == "LOCAL_FILE"
                     && let Value::Object(object) = &mut value
                 {
@@ -199,8 +201,9 @@ struct EmbyPlaybackInfoRequest {
 }
 
 impl EmbyPlaybackInfoRequest {
-    fn requests_server_transcoding(&self) -> bool {
-        self.enable_transcoding == Some(true) && self.enable_direct_play != Some(true)
+    fn requests_server_transcoding(&self, force_transcode: bool) -> bool {
+        force_transcode
+            || (self.enable_transcoding == Some(true) && self.enable_direct_play != Some(true))
     }
 
     fn playback_capabilities(&self) -> PlaybackCapabilities {
@@ -221,6 +224,15 @@ fn parse_emby_playback_info_request(body: &Bytes) -> Result<EmbyPlaybackInfoRequ
         return Ok(EmbyPlaybackInfoRequest::default());
     }
     serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn emby_force_transcode_from_raw(raw_query: &RawQuery) -> bool {
+    raw_query.0.as_deref().is_some_and(|raw_query| {
+        url::form_urlencoded::parse(raw_query.as_bytes()).any(|(name, value)| {
+            name.eq_ignore_ascii_case("forceTranscode")
+                && (value == "1" || value.eq_ignore_ascii_case("true"))
+        })
+    })
 }
 
 async fn create_emby_transcoding_session(
@@ -2472,11 +2484,13 @@ pub(super) async fn lux_set_played(
 
 #[cfg(test)]
 mod emby_playback_tests {
-    use super::{EmbyPlaybackInfoRequest, parse_emby_playback_info_request};
+    use super::{
+        EmbyPlaybackInfoRequest, emby_force_transcode_from_raw, parse_emby_playback_info_request,
+    };
     use crate::application::playback::decision::{
         PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier, choose_plan,
     };
-    use axum::body::Bytes;
+    use axum::{body::Bytes, extract::RawQuery};
 
     #[test]
     fn playback_info_request_selects_copy_and_transcode_tiers() {
@@ -2523,7 +2537,7 @@ mod emby_playback_tests {
     fn empty_playback_info_body_keeps_direct_play_compatibility() {
         let request = parse_emby_playback_info_request(&Bytes::new())
             .expect("empty PlaybackInfo body is valid");
-        assert!(!request.requests_server_transcoding());
+        assert!(!request.requests_server_transcoding(false));
     }
 
     #[test]
@@ -2537,6 +2551,31 @@ mod emby_playback_tests {
             }"#,
         ))
         .expect("valid PlaybackInfo request");
-        assert!(request.requests_server_transcoding());
+        assert!(request.requests_server_transcoding(false));
+    }
+
+    #[test]
+    fn force_transcode_query_overrides_direct_play_request() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "EnableDirectPlay": true,
+                "EnableDirectStream": true
+            }"#,
+        ))
+        .expect("valid PlaybackInfo request");
+        assert!(request.requests_server_transcoding(true));
+    }
+
+    #[test]
+    fn force_transcode_query_only_accepts_true_values() {
+        assert!(emby_force_transcode_from_raw(&RawQuery(Some(
+            "forceTranscode=true".to_owned(),
+        ))));
+        assert!(emby_force_transcode_from_raw(&RawQuery(Some(
+            "ForceTranscode=1".to_owned(),
+        ))));
+        assert!(!emby_force_transcode_from_raw(&RawQuery(Some(
+            "forceTranscode=false".to_owned(),
+        ))));
     }
 }
