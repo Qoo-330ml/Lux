@@ -7150,7 +7150,7 @@ pub(crate) fn metadata_candidate_error(
         MetadataCandidateError::Scraper(_) => api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
+            lux::ApiErrorCode::PluginUnavailable,
             "刮削器暂时不可用，请稍后重试",
         )
         .into_response(),
