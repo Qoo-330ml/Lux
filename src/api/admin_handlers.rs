@@ -6494,33 +6494,7 @@ pub(crate) async fn admin_search_item_candidates(
         )
         .into_response();
     }
-    let Some(fallback_scraper) = state.scraper.as_ref().cloned() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "刮削器尚未配置",
-        )
-        .into_response();
-    };
-    let scraper = if let Some(resolver) = state.scraper_resolver.as_ref() {
-        match resolver.for_item(&item_id).await {
-            Ok(Some(scraper)) => ScraperProvider::from_scraper(scraper),
-            Ok(None) => fallback_scraper,
-            Err(error) => {
-                return api_error(
-                    &headers,
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    lux::ApiErrorCode::DatabaseUnavailable,
-                    &format!("刮削器不可用: {error}"),
-                )
-                .into_response();
-            }
-        }
-    } else {
-        fallback_scraper
-    };
-    let Some(candidates) = state.metadata_candidates.as_ref() else {
+    let Some(metadata_reidentify) = state.metadata_reidentify.as_ref() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -6529,8 +6503,8 @@ pub(crate) async fn admin_search_item_candidates(
         )
         .into_response();
     };
-    match candidates
-        .search_and_store(&item_id, &request.query, request.year, &scraper)
+    match metadata_reidentify
+        .search_item_candidates(&item_id, &request.query, request.year)
         .await
     {
         Ok(page) => {
