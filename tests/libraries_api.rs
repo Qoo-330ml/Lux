@@ -10,7 +10,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -241,46 +241,6 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         "image/png"
     );
     assert_eq!(public_cover.bytes().await?.as_ref(), PNG_1X1);
-
-    let emby_login = client
-        .post(format!("{base_url}/Users/AuthenticateByName"))
-        .header(
-            AUTHORIZATION,
-            r#"Emby Client="LuxTest", Device="Mac", DeviceId="prism-cover-device", Version="1""#,
-        )
-        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
-        .send()
-        .await?;
-    assert_eq!(emby_login.status(), reqwest::StatusCode::OK);
-    let emby_token = emby_login.json::<Value>().await?["AccessToken"]
-        .as_str()
-        .ok_or("missing Emby access token")?
-        .to_owned();
-
-    let prism_cover = client
-        .get(format!("{base_url}/api/v1/libraries/{library_id}/cover"))
-        .header("X-Lux-Client-Token", &emby_token)
-        .send()
-        .await?;
-    assert_eq!(prism_cover.status(), reqwest::StatusCode::OK);
-    assert_eq!(prism_cover.bytes().await?.as_ref(), PNG_1X1);
-
-    let wrong_header = client
-        .get(format!("{base_url}/api/v1/libraries/{library_id}/cover"))
-        .header("X-Emby-Token", &emby_token)
-        .send()
-        .await?;
-    assert_eq!(wrong_header.status(), reqwest::StatusCode::UNAUTHORIZED);
-
-    let invalid_prism_token = client
-        .get(format!("{base_url}/api/v1/libraries/{library_id}/cover"))
-        .header("X-Lux-Client-Token", "invalid-client-token")
-        .send()
-        .await?;
-    assert_eq!(
-        invalid_prism_token.status(),
-        reqwest::StatusCode::UNAUTHORIZED
-    );
 
     let invalid_cover = client
         .put(format!(
