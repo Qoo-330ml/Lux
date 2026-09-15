@@ -1557,7 +1557,6 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 
 - GET /api/v1/home
 - GET /api/v1/libraries
-- GET /api/v1/libraries/{id}/cover
 - GET /api/v1/libraries/{id}/items（支持 `metadataStatus=PENDING` 待确认筛选）
 - GET /api/v1/items/{id}
 - GET /api/v1/people
@@ -1569,10 +1568,6 @@ Web 使用 HttpOnly、Secure（HTTPS 下）、SameSite Cookie。改变状态的 
 - PUT /api/v1/items/{id}/favorite
 - GET /api/v1/people/{personId}
 - PUT /api/v1/people/{personId}/favorite
-
-媒体库封面读取保留 Web session 和共享 API Key 兼容行为；Lux Prism 使用
-`X-Lux-Client-Token` 携带 `AuthenticateByName` 返回的普通用户 AccessToken。该 Header 只在
-此封面接口上解析为用户令牌，并继续执行远程访问策略和媒体库 ACL，不作为共享管理员 API Key。
 
 Lux 自有列表优先使用游标分页。游标包含稳定排序键和 ID，并进行签名或不可伪造编码。
 
