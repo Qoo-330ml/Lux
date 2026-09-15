@@ -2105,6 +2105,7 @@ services:
 | LUX-250 | docs/LUX-DEVELOPMENT.md、web/src/features/home/media.tsx、web/src/features/detail/MediaDetailPage.tsx、web/tests/home-media.test.tsx、web/tests/media-detail.test.tsx；季海报缺失时回退父剧海报 |
 | LUX-251 | docs/LUX-DEVELOPMENT.md、docs/LUX-251-PLAN.md、migrations/0120_manual_item_merges.sql、migrations-postgres/0120_manual_item_merges.sql、src/storage/media_merge.rs、src/storage/repository.rs、src/storage/mod.rs、src/storage/catalog.rs、src/application/item_merge.rs、src/application/mod.rs、src/application/scanner.rs、src/api/legacy.rs、src/api/admin.rs、src/api/admin_handlers.rs、web/src/features/library/LibraryPage.tsx、web/src/lib/api/client.ts、web/src/lib/api/types.ts、tests/item_merge.rs、web/tests/library-page.test.ts；管理员手动合并媒体条目为多版本 |
 | LUX-252 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；单季剧集详情直接展示单集列表 |
+| LUX-253 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/src/react.css、web/tests/media-detail.test.tsx；单集图片播放与文字详情入口 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6101,6 +6102,32 @@ request-header policy 未执行。未修改 Rust 源码、API 或数据库。
 
 - 不修改 `/api/v1/items/{id}/children` 的请求或响应合同。
 - 不将单集列表改为自动播放，也不改变多季剧集的浏览层级。
+
+#### LUX-253：单集图片播放与文字详情入口
+
+范围：在季详情页的单集列表以及单集详情页的同季分集卡片中，将图片区域与文字区域拆分为两个入口。
+鼠标悬停在图片区域时显示居中的播放按钮；点击图片区域任意位置进入现有 `/watch/{itemId}` 播放页，
+点击单集标题、简介或“查看详情”文字进入现有 `/items/{itemId}` 详情页。该变化仅属于 Web 展示层，
+不修改播放会话、媒体源选择、API、数据库或单集层级关系。
+
+验收：
+
+- [ ] 季详情单集列表的图片区域提供可访问的播放链接，并在桌面悬停时显示居中的播放图标。
+- [ ] 季详情单集列表的标题、简介和详情文字继续进入单集详情页。
+- [ ] 单集详情页的同季分集卡片保持相同的图片播放、文字详情语义。
+- [ ] 前端测试覆盖两类入口的目标路径和播放按钮的可访问名称。
+
+验证：
+
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-100、LUX-231。
+
+明确不做：
+
+- 不改变 `/watch/{itemId}` 播放页及其播放会话初始化逻辑。
+- 不将电影、剧集、季度或其他媒体卡片的图片点击行为一并改为播放。
 
 ## 26. 风险与缓解
 
