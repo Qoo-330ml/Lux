@@ -2978,16 +2978,11 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
-                    ii.local_path AS thumbnail_path
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             LEFT JOIN item_images ii
-               ON ii.item_id = ms.item_id
-              AND ii.image_type = 'THUMB'
-              AND ii.image_index = 0
              WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
                AND fe.is_missing = 0
              ORDER BY ms.item_id, ms.is_default DESC, ms.id
@@ -3004,7 +2999,6 @@ impl Database {
                     item_id: row.get("item_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
-                    thumbnail_path: row.get("thumbnail_path"),
                 })
                 .collect()
         })
@@ -3021,16 +3015,11 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
-                    ii.local_path AS thumbnail_path
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             LEFT JOIN item_images ii
-               ON ii.item_id = ms.item_id
-              AND ii.image_type = 'THUMB'
-              AND ii.image_index = 0
              WHERE ms.source_kind = 'LOCAL_FILE'
                AND fe.is_missing = 0
                AND mi.removed_at IS NULL
@@ -3061,7 +3050,6 @@ impl Database {
                     item_id: row.get("item_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
-                    thumbnail_path: row.get("thumbnail_path"),
                 })
                 .collect()
         })
@@ -3078,8 +3066,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path,
-                    ii.local_path AS thumbnail_path
+            "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path
              FROM scan_job_targets t
              JOIN media_sources ms ON ms.id = (
                  SELECT preferred.id FROM media_sources preferred
@@ -3093,10 +3080,6 @@ impl Database {
              )
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
-             LEFT JOIN item_images ii
-               ON ii.item_id = t.item_id
-              AND ii.image_type = 'THUMB'
-              AND ii.image_index = 0
              WHERE t.job_id = ? AND t.target_type = 'ITEM'
                AND t.thumbnail_state = 'PENDING'
                AND fe.is_missing = 0
@@ -3114,7 +3097,6 @@ impl Database {
                     item_id: row.get("item_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
-                    thumbnail_path: row.get("thumbnail_path"),
                 })
                 .collect()
         })
@@ -5559,26 +5541,6 @@ impl Database {
             }
         }
         Ok(tags)
-    }
-
-    pub(crate) async fn find_item_image_source(
-        &self,
-        item_id: &str,
-        image_type: &str,
-    ) -> Result<Option<String>, StorageError> {
-        self.query_scalar(
-            "SELECT source
-             FROM item_images
-             WHERE item_id = ? AND image_type = ? AND image_index = 0",
-        )
-        .bind(item_id)
-        .bind(image_type)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
     }
 
     pub(crate) async fn item_image_path_is_shared(

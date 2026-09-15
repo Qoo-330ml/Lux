@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::{
     application::images::{
         acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
-        image_path_is_owned_by_type, read_image_dimensions_from_bytes, write_image_atomically,
+        is_fallback_image_source, read_image_dimensions_from_bytes, write_image_atomically,
     },
     domain::ids::LibraryId,
     storage::{Database, ItemImageMetadata, StorageError, StoredThumbnailSource},
@@ -22,6 +22,10 @@ use crate::{
 
 const DEFAULT_FRAME: &str = "00:03:01";
 const MAX_THUMBNAIL_BYTES: u64 = 50 * 1024 * 1024;
+const POSTER_FILTER: &str =
+    "scale=600:900:force_original_aspect_ratio=increase,crop=600:900,setsar=1";
+const THUMBNAIL_FILTER: &str =
+    "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1";
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
 const THUMBNAIL_WORKER_CONCURRENCY: usize = 4;
 const GLOBAL_FFMPEG_CONCURRENCY: usize = 4;
@@ -239,29 +243,63 @@ impl ThumbnailService {
             .await
             .map_err(ThumbnailFileError::Storage)?;
 
-        let target_path = first_available_thumbnail_path(&source_path, &indexed_images)
+        let poster_target = first_available_poster_path(&source_path, &indexed_images)
             .ok_or(ThumbnailFileError::TargetUnavailable)?;
-
-        if let Some(existing) = source.thumbnail_path.as_deref() {
-            let existing_path = PathBuf::from(existing);
-            let owned_by_episode_fanart =
-                image_path_is_owned_by_type(&indexed_images, "FANART", &existing_path);
-            if !owned_by_episode_fanart && usable_image_path(&existing_path, &root_path).await? {
-                return Ok(ThumbnailOutcome::Reused);
+        let thumbnail_target = first_available_thumbnail_path(&source_path, &indexed_images)
+            .ok_or(ThumbnailFileError::TargetUnavailable)?;
+        let mut generated = false;
+        for (image_type, target_path, filter) in [
+            ("POSTER", poster_target, POSTER_FILTER),
+            ("THUMB", thumbnail_target, THUMBNAIL_FILTER),
+        ] {
+            let availability =
+                indexed_image_availability(&indexed_images, image_type, &root_path).await?;
+            if self
+                .ensure_artwork(
+                    &source.item_id,
+                    image_type,
+                    &source_path,
+                    availability,
+                    &target_path,
+                    filter,
+                )
+                .await?
+                == ArtworkOutcome::Generated
+            {
+                generated = true;
             }
         }
+        Ok(if generated {
+            ThumbnailOutcome::Generated
+        } else {
+            ThumbnailOutcome::Reused
+        })
+    }
 
-        if existing_target(&target_path).await? {
-            self.register_image(&source.item_id, &target_path).await?;
-            return Ok(ThumbnailOutcome::Reused);
+    async fn ensure_artwork(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        source_path: &Path,
+        availability: ImageAvailability,
+        target_path: &Path,
+        filter: &str,
+    ) -> Result<ArtworkOutcome, ThumbnailFileError> {
+        if availability != ImageAvailability::Missing {
+            return Ok(ArtworkOutcome::Reused);
+        }
+        if existing_target(target_path).await? {
+            self.register_image(item_id, image_type, target_path)
+                .await?;
+            return Ok(ArtworkOutcome::Reused);
         }
 
         let temporary = target_path
             .parent()
             .unwrap_or(Path::new("."))
-            .join(format!(".lux-{}-thumbnail.tmp.jpg", Uuid::now_v7()));
+            .join(format!(".lux-{}-{image_type}.tmp.jpg", Uuid::now_v7()));
         let result = async {
-            self.run_ffmpeg(&source_path, &temporary).await?;
+            self.run_ffmpeg(source_path, &temporary, filter).await?;
             let metadata = fs::metadata(&temporary)
                 .await
                 .map_err(|error| ThumbnailFileError::io(&temporary, error))?;
@@ -277,20 +315,21 @@ impl ThumbnailService {
             if !is_jpeg(&bytes) {
                 return Err(ThumbnailFileError::InvalidOutput);
             }
-            write_image_atomically(&target_path, &bytes)
+            write_image_atomically(target_path, &bytes)
                 .await
                 .map_err(|error| ThumbnailFileError::Write(error.to_string()))?;
-            self.register_image(&source.item_id, &target_path).await
+            self.register_image(item_id, image_type, target_path).await
         }
         .await;
         let _ = fs::remove_file(&temporary).await;
-        result.map(|()| ThumbnailOutcome::Generated)
+        result.map(|()| ArtworkOutcome::Generated)
     }
 
     async fn run_ffmpeg(
         &self,
         source_path: &Path,
         output_path: &Path,
+        filter: &str,
     ) -> Result<(), ThumbnailFileError> {
         let _permit = self
             .ffmpeg_permits
@@ -310,7 +349,7 @@ impl ThumbnailService {
                 "-i",
             ])
             .arg(source_path)
-            .args(["-frames:v", "1", "-an", "-f", "image2"])
+            .args(["-vf", filter, "-frames:v", "1", "-an", "-f", "image2"])
             .arg(output_path)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -332,7 +371,12 @@ impl ThumbnailService {
         }
     }
 
-    async fn register_image(&self, item_id: &str, path: &Path) -> Result<(), ThumbnailFileError> {
+    async fn register_image(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        path: &Path,
+    ) -> Result<(), ThumbnailFileError> {
         let bytes = fs::read(path)
             .await
             .map_err(|error| ThumbnailFileError::io(path, error))?;
@@ -344,9 +388,10 @@ impl ThumbnailService {
             .collect::<String>();
         let dimensions = read_image_dimensions_from_bytes(&bytes).await;
         self.database
-            .upsert_item_image(
+            .upsert_item_image_at_index(
                 item_id,
-                "THUMB",
+                image_type,
+                0,
                 path,
                 ItemImageMetadata {
                     file_size,
@@ -361,6 +406,19 @@ impl ThumbnailService {
             .map(|_| ())
             .map_err(ThumbnailFileError::Storage)
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ArtworkOutcome {
+    Generated,
+    Reused,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ImageAvailability {
+    Missing,
+    Fallback,
+    Complete,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -420,6 +478,58 @@ async fn resolve_media_paths(
     Ok((source_path, target_path, root_path))
 }
 
+fn first_available_poster_path(
+    media_path: &Path,
+    indexed_images: &[crate::storage::StoredItemImage],
+) -> Option<PathBuf> {
+    let stem = media_path.file_stem()?.to_str()?;
+    (0..1000).find_map(|variant| {
+        let suffix = if variant == 0 {
+            "poster".to_owned()
+        } else {
+            format!("poster-{variant}")
+        };
+        let candidate = media_path.with_file_name(format!("{stem}-{suffix}.jpg"));
+        (!image_path_is_owned_by_other_type(indexed_images, "POSTER", &candidate))
+            .then_some(candidate)
+    })
+}
+
+fn image_path_is_owned_by_other_type(
+    indexed_images: &[crate::storage::StoredItemImage],
+    image_type: &str,
+    path: &Path,
+) -> bool {
+    indexed_images.iter().any(|image| {
+        !image.image_type.eq_ignore_ascii_case(image_type) && Path::new(&image.local_path) == path
+    })
+}
+
+async fn indexed_image_availability(
+    indexed_images: &[crate::storage::StoredItemImage],
+    image_type: &str,
+    root_path: &Path,
+) -> Result<ImageAvailability, ThumbnailFileError> {
+    let Some(image) = indexed_images
+        .iter()
+        .find(|image| image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == 0)
+    else {
+        return Ok(ImageAvailability::Missing);
+    };
+    let path = Path::new(&image.local_path);
+    if image_path_is_owned_by_other_type(indexed_images, image_type, path) {
+        return Ok(ImageAvailability::Missing);
+    }
+    if !usable_image_path(path, root_path).await? {
+        return Ok(ImageAvailability::Missing);
+    }
+    if is_fallback_image_source(&image.source) {
+        Ok(ImageAvailability::Fallback)
+    } else {
+        Ok(ImageAvailability::Complete)
+    }
+}
+
 fn safe_relative_path(path: &Path) -> bool {
     !path.is_absolute()
         && path.components().all(|component| {
@@ -458,13 +568,13 @@ async fn existing_target(path: &Path) -> Result<bool, ThumbnailFileError> {
         return Err(ThumbnailFileError::TargetUnavailable);
     }
     if metadata.len() == 0 || metadata.len() > MAX_THUMBNAIL_BYTES {
-        return Err(ThumbnailFileError::TargetUnavailable);
+        return Ok(false);
     }
     let bytes = fs::read(path)
         .await
         .map_err(|error| ThumbnailFileError::io(path, error))?;
     if !is_jpeg(&bytes) {
-        return Err(ThumbnailFileError::TargetUnavailable);
+        return Ok(false);
     }
     Ok(true)
 }
