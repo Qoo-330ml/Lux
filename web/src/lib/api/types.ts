@@ -69,6 +69,7 @@ export type ImageTags = Partial<Record<"poster" | "fanart" | "backdrop" | "thumb
 export type UserData = {
   isPlayed?: boolean;
   isFavorite?: boolean;
+  playCount?: number;
   positionTicks?: number;
   /** @deprecated Older Web clients used this name; prefer positionTicks. */
   playbackPositionTicks?: number;
@@ -129,6 +130,7 @@ export type MediaActor = {
   premiereDate?: string | null;
   productionYear?: number | null;
   taglines?: string[];
+  dateCreated?: number | null;
 };
 
 export type PersonDetail = MediaActor;
@@ -169,6 +171,7 @@ export type MediaItem = {
   libraryId?: string | null;
   title?: string | null;
   name?: string | null;
+  sortTitle?: string | null;
   originalTitle?: string | null;
   overview?: string | null;
   itemType?: "MOVIE" | "SERIES" | "SEASON" | "EPISODE" | "BOX_SET" | string;
@@ -236,6 +239,7 @@ export type HomeResponse = {
   continueWatching?: MediaItem[];
   continueWatchingTotal?: number;
   recentlyAdded?: MediaItem[];
+  recentlyAddedTotal?: number;
 };
 
 export type PageResponse<T> = {
@@ -257,8 +261,10 @@ export type AdminItemMergeResult = {
 };
 
 export type PlaybackState = {
+  itemId?: string;
   isFavorite?: boolean;
   isPlayed?: boolean;
+  playCount?: number;
   positionTicks?: number;
   durationTicks?: number;
   state?: "PLAYING" | "PAUSED";
