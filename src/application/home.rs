@@ -76,7 +76,14 @@ struct HomeCacheEntry {
 struct CachedSnapshot {
     generation: u64,
     refreshed_at: Instant,
-    snapshot: Arc<HomeSnapshot>,
+    snapshot: Arc<CachedHomeSnapshot>,
+}
+
+struct CachedHomeSnapshot {
+    recently_added: CatalogPage,
+    recommended: Vec<CatalogItem>,
+    latest_groups: Vec<(String, Vec<CatalogItem>)>,
+    views: Vec<LibraryView>,
 }
 
 struct HomeSharedSnapshot {
@@ -147,10 +154,32 @@ impl HomeService {
     ) -> Result<Arc<HomeSnapshot>, HomeError> {
         library_ids.sort_unstable();
         library_ids.dedup();
+        let cached = self.cached_snapshot(principal, &library_ids).await?;
+        let user_id = principal.user_id.to_string();
+        let continue_watching = self
+            .inner
+            .catalog
+            .list_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
+            .await
+            .map_err(HomeError::Catalog)?;
+        Ok(Arc::new(HomeSnapshot {
+            continue_watching,
+            recently_added: cached.recently_added.clone(),
+            recommended: cached.recommended.clone(),
+            latest_groups: cached.latest_groups.clone(),
+            views: cached.views.clone(),
+        }))
+    }
+
+    async fn cached_snapshot(
+        &self,
+        principal: AccessPrincipal,
+        library_ids: &[String],
+    ) -> Result<Arc<CachedHomeSnapshot>, HomeError> {
         let key = HomeCacheKey {
             user_id: principal.user_id.to_string(),
             is_admin: principal.is_admin,
-            library_ids: library_ids.clone(),
+            library_ids: library_ids.to_vec(),
         };
         let entry = self.entry(key, principal).await;
         let generation = self.inner.generation.load(Ordering::Acquire);
@@ -180,7 +209,10 @@ impl HomeService {
             }
         }
 
-        let snapshot = Arc::new(self.build_snapshot(principal, &library_ids, true).await?);
+        let snapshot = Arc::new(
+            self.build_cached_snapshot(principal, library_ids, true)
+                .await?,
+        );
         *entry.value.lock().await = Some(CachedSnapshot {
             generation,
             refreshed_at: Instant::now(),
@@ -294,7 +326,7 @@ impl HomeService {
             drop(cached);
             let notified = self.inner.invalidation_notify.notified();
             let result = tokio::select! {
-                result = self.build_snapshot(entry.principal, &entry.library_ids, false) => Some(result),
+                result = self.build_cached_snapshot(entry.principal, &entry.library_ids, false) => Some(result),
                 _ = notified => None,
             };
             match result {
@@ -313,26 +345,19 @@ impl HomeService {
         }
     }
 
-    async fn build_snapshot(
+    async fn build_cached_snapshot(
         &self,
         principal: AccessPrincipal,
         accessible_library_ids: &[String],
         require_fresh_shared: bool,
-    ) -> Result<HomeSnapshot, HomeError> {
+    ) -> Result<CachedHomeSnapshot, HomeError> {
         let shared = if require_fresh_shared {
             self.refresh_shared_snapshot().await?
         } else {
             self.shared_snapshot().await?
         };
         let user_id = principal.user_id.to_string();
-        let (continue_watching, recently_added, recommended, views) = tokio::try_join!(
-            async {
-                self.inner
-                    .catalog
-                    .list_continue_watching_for_library_ids(accessible_library_ids, &user_id, 0, 10)
-                    .await
-                    .map_err(HomeError::Catalog)
-            },
+        let (recently_added, recommended, views) = tokio::try_join!(
             async {
                 self.inner
                     .catalog
@@ -365,8 +390,7 @@ impl HomeService {
             .filter(|(library_id, _)| accessible_library_ids.contains(library_id))
             .cloned()
             .collect();
-        Ok(HomeSnapshot {
-            continue_watching,
+        Ok(CachedHomeSnapshot {
             recently_added,
             recommended,
             latest_groups,
@@ -403,10 +427,13 @@ mod tests {
             access::{AccessPrincipal, MediaAccessService},
             catalog::CatalogService,
             libraries::LibraryService,
+            scanner::LibraryScanner,
+            setup::SetupService,
         },
         config::Config,
         domain::ids::UserId,
-        storage::Database,
+        library::LibraryKind,
+        storage::{Database, NewPlaybackEvent},
     };
 
     #[tokio::test]
@@ -451,15 +478,15 @@ mod tests {
         let second_user = AccessPrincipal::new(UserId::new(), false);
 
         let first = home
-            .snapshot(first_user, Vec::new())
+            .cached_snapshot(first_user, &[])
             .await
             .expect("first user snapshot");
         let reused = home
-            .snapshot(first_user, Vec::new())
+            .cached_snapshot(first_user, &[])
             .await
             .expect("reused user snapshot");
         let isolated = home
-            .snapshot(second_user, Vec::new())
+            .cached_snapshot(second_user, &[])
             .await
             .expect("second user snapshot");
 
@@ -483,15 +510,116 @@ mod tests {
         let principal = AccessPrincipal::new(UserId::new(), false);
 
         let first = home
-            .snapshot(principal, Vec::new())
+            .cached_snapshot(principal, &[])
             .await
             .expect("first user snapshot");
         home.invalidate();
         let refreshed = home
-            .snapshot(principal, Vec::new())
+            .cached_snapshot(principal, &[])
             .await
             .expect("invalidated user snapshot");
 
         assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn continue_watching_is_read_fresh_on_cached_home_snapshot() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let setup = SetupService::new(database.clone()).expect("setup service");
+        let admin = setup
+            .complete("Admin", "Admin", "correct password")
+            .await
+            .expect("admin user");
+        let access = MediaAccessService::new(database.clone());
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await
+            .expect("movie library");
+        let root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&root).await.expect("movie root");
+        tokio::fs::write(root.join("Fresh Resume Movie 2024.mkv"), b"video")
+            .await
+            .expect("movie file");
+        libraries
+            .add_root(library.id, root.to_str().expect("utf8 movie root"))
+            .await
+            .expect("movie root registration");
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await
+            .expect("movie scan");
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE title = 'Fresh Resume Movie'")
+                .fetch_one(database.pool())
+                .await
+                .expect("scanned movie");
+        let source_id: String =
+            sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await
+                .expect("movie source");
+        sqlx::query("UPDATE media_sources SET duration_ticks = ? WHERE id = ?")
+            .bind(2_000_000_000_i64)
+            .bind(&source_id)
+            .execute(database.pool())
+            .await
+            .expect("movie duration");
+        sqlx::query(
+            "INSERT INTO server_settings (key, value) VALUES ('resume_min_ticks', '0')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(database.pool())
+        .await
+        .expect("resume minimum");
+
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access.clone()),
+            libraries,
+        );
+        let principal = AccessPrincipal::new(admin.id, true);
+        let library_ids = access
+            .accessible_library_ids(principal)
+            .await
+            .expect("accessible libraries");
+        let first = home
+            .snapshot(principal, library_ids.clone())
+            .await
+            .expect("initial home snapshot");
+        assert!(first.continue_watching.items.is_empty());
+
+        let user_id = admin.id.to_string();
+        database
+            .record_playback_event(NewPlaybackEvent {
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: Some(&source_id),
+                play_session_id: "fresh-home-test",
+                device_id: "test",
+                client: Some("test"),
+                device_name: Some("test"),
+                client_version: None,
+                device_type: Some("test"),
+                remote_ip: None,
+                state: "PLAYING",
+                position_ticks: 1_000_000_000,
+                duration_ticks: Some(2_000_000_000),
+                played_percent: 90,
+                is_paused: false,
+            })
+            .await
+            .expect("playback state");
+
+        let second = home
+            .snapshot(principal, library_ids)
+            .await
+            .expect("fresh home snapshot");
+        assert_eq!(second.continue_watching.items[0].id, item_id);
     }
 }
