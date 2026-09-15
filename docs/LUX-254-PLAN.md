@@ -9,8 +9,9 @@
 ## 设计假设
 
 1. Emby 客户端通过 `POST /Items/{itemId}/PlaybackInfo` 的 `PlaybackInfoRequest` 表达播放能力。
-2. `EnableDirectPlay=true` 时优先返回现有直放能力；明确要求转码且 `EnableDirectPlay=false` 时才创建
-   Lux 服务端 HLS 会话。
+2. `EnableDirectPlay=true` 时优先返回现有直放能力；POST 明确要求转码且
+   `EnableDirectPlay` 未设置或为 `false` 时创建 Lux 服务端 HLS 会话。POST 查询参数
+   `forceTranscode=true` 可覆盖直放请求，兼容把强制转码选项放在 URL 上的第三方客户端。
 3. HLS 输出继续使用现有 fMP4/CMAF 资产，Emby 对外声明 `TranscodingSubProtocol=hls`、
    `TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
 4. `.strm` 是 Direct-only；本任务不扩大它的服务端处理边界。
@@ -26,6 +27,8 @@
   - `MediaSourceId` 选择媒体源；query 参数仍可作为兼容回退。
   - 使用 `EnableDirectPlay`、`EnableDirectStream`、`EnableTranscoding`、
     `AllowVideoStreamCopy` 和 `AllowAudioStreamCopy` 选择最低成本档位。
+  - `forceTranscode=true` 作为 POST 查询参数时强制选择服务端转码，即使 body 中
+    `EnableDirectPlay=true`；GET 不因该参数创建转码会话。
   - 本地 source 返回 `SupportsTranscoding` 与带 HMAC 票据的 `TranscodingUrl`。
   - `.strm` source 保持 `SupportsTranscoding=false`，不返回 `TranscodingUrl`。
 
