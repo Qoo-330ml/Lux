@@ -674,7 +674,7 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .await?;
     assert_eq!(direct.status(), reqwest::StatusCode::OK);
     let direct_body = direct.json::<Value>().await?;
-    assert_eq!(direct_body["MediaSources"][0]["SupportsTranscoding"], false);
+    assert_eq!(direct_body["MediaSources"][0]["SupportsTranscoding"], true);
     assert!(
         direct_body["MediaSources"][0]
             .get("TranscodingUrl")

@@ -35,6 +35,7 @@ pub(super) async fn emby_playback_info(
         }
     };
     let mut sources = item.media_sources.iter().collect::<Vec<_>>();
+    let query_media_source_requested = query.media_source_id.is_some();
     sources.sort_by(|left, right| {
         right
             .is_default
@@ -55,6 +56,24 @@ pub(super) async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
+    let transcode_requested = request.requests_server_transcoding();
+    if let Some(source) = sources.first() {
+        tracing::info!(
+            event = "emby_playback_negotiation",
+            item_id_prefix = %playback_identifier_prefix(&item.id),
+            source_id_prefix = %playback_identifier_prefix(&source.id),
+            source_kind = %source.source_kind,
+            query_media_source_requested,
+            body_media_source_requested = request.media_source_id.is_some(),
+            enable_direct_play = ?request.enable_direct_play,
+            enable_direct_stream = ?request.enable_direct_stream,
+            enable_transcoding = ?request.enable_transcoding,
+            allow_video_stream_copy = ?request.allow_video_stream_copy,
+            allow_audio_stream_copy = ?request.allow_audio_stream_copy,
+            transcode_requested,
+            "negotiated Emby playback source"
+        );
+    }
     let strm_resolver_available = if sources
         .iter()
         .any(|source| emby_source_needs_strm_resolver(source))
@@ -69,7 +88,7 @@ pub(super) async fn emby_playback_info(
     } else {
         false
     };
-    let transcode_session = if request.requests_server_transcoding() {
+    let transcode_session = if transcode_requested {
         let Some(source) = sources.first() else {
             return StatusCode::NOT_FOUND.into_response();
         };
@@ -95,6 +114,15 @@ pub(super) async fn emby_playback_info(
                     true,
                     strm_resolver_available,
                 );
+                if request.enable_transcoding == Some(true)
+                    && source.source_kind == "LOCAL_FILE"
+                    && let Value::Object(object) = &mut value
+                {
+                    // Advertise the local source capability even when this
+                    // request still resolves to direct play. Clients can
+                    // then retry with their transcoding-only capabilities.
+                    object.insert("SupportsTranscoding".to_owned(), json!(true));
+                }
                 let has_direct_stream_url = value
                     .get("DirectStreamUrl")
                     .is_some_and(Value::is_string);
