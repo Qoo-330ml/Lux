@@ -567,6 +567,13 @@ async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserR
     users::require_web_user(headers, state).await
 }
 
+async fn require_lux_client_user(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<UserRecord, Response> {
+    users::require_lux_client_user(headers, state).await
+}
+
 async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
     users::require_web_csrf(headers, state).await
 }

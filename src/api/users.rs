@@ -1473,6 +1473,67 @@ pub(super) async fn require_web_user(
     }
 }
 
+pub(super) async fn require_lux_client_user(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<UserRecord, Response> {
+    let Some(token) = headers
+        .get("X-Lux-Client-Token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要有效的 Lux 客户端令牌",
+        )
+        .into_response());
+    };
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证服务尚未就绪",
+        )
+        .into_response());
+    };
+    match auth.resolve_token(token).await {
+        Ok(Some(user)) => {
+            if state.remote_access.is_remote(
+                header_str(headers, "x-lux-peer-ip"),
+                header_str(headers, "x-forwarded-for"),
+            ) && !user.can_remote_access
+            {
+                return Err(api_error(
+                    headers,
+                    StatusCode::FORBIDDEN,
+                    lux::ApiErrorCode::PermissionDenied,
+                    "当前账户不允许远程访问",
+                )
+                .into_response());
+            }
+            Ok(user)
+        }
+        Ok(None) => Err(api_error(
+            headers,
+            StatusCode::UNAUTHORIZED,
+            lux::ApiErrorCode::AuthenticationRequired,
+            "需要有效的 Lux 客户端令牌",
+        )
+        .into_response()),
+        Err(_) => Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证暂时不可用",
+        )
+        .into_response()),
+    }
+}
+
 pub(super) async fn require_web_csrf(
     headers: &HeaderMap,
     state: &AppState,

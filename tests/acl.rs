@@ -223,6 +223,19 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
         .as_str()
         .ok_or("missing viewer token")?
         .to_owned();
+    let allowed_lux_cover = client
+        .get(format!("{base_url}/api/v1/libraries/{}/cover", first.id))
+        .header("X-Lux-Client-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(allowed_lux_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(allowed_lux_cover.bytes().await?.as_ref(), PNG_1X1);
+    let denied_lux_cover = client
+        .get(format!("{base_url}/api/v1/libraries/{}/cover", second.id))
+        .header("X-Lux-Client-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(denied_lux_cover.status(), reqwest::StatusCode::NOT_FOUND);
     let allowed_emby_cover = client
         .get(format!("{base_url}/Items/{}/Images/Primary", first.id))
         .header("X-Emby-Token", &viewer_token)

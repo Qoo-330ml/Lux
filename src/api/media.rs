@@ -325,7 +325,11 @@ pub(super) async fn lux_library_cover(
     Path(library_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
-    let user = match require_web_user(&headers, &state).await {
+    let user = match if headers.contains_key("X-Lux-Client-Token") {
+        require_lux_client_user(&headers, &state).await
+    } else {
+        require_web_user(&headers, &state).await
+    } {
         Ok(user) => user,
         Err(response) => return response,
     };
