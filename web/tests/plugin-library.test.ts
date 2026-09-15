@@ -43,6 +43,87 @@ const configuredPlugin: AdminPlugin = {
   configSource: "PLUGIN_DEFAULT",
 };
 
+const tmdbManifestConfigFields: AdminPlugin["configFields"] = [
+  ...configuredPlugin.configFields,
+  {
+    key: "readAccessToken",
+    label: "TMDb Read Access Token",
+    type: "password",
+    required: false,
+    sensitive: true,
+  },
+  {
+    key: "preferredLanguage",
+    label: "首选语言",
+    type: "select",
+    required: false,
+    sensitive: false,
+    defaultValue: "zh-CN",
+    options: [
+      { value: "zh-CN", label: "简体中文" },
+      { value: "zh-TW", label: "繁體中文" },
+      { value: "en-US", label: "英语 (English)" },
+    ],
+  },
+  {
+    key: "languageFallbackEnabled",
+    label: "语言回退",
+    type: "toggle",
+    required: false,
+    sensitive: false,
+    defaultValue: false,
+  },
+  {
+    key: "fallbackLanguages",
+    label: "备选语言顺序",
+    type: "select",
+    required: false,
+    sensitive: false,
+    multiple: true,
+    options: [
+      { value: "zh-CN", label: "简体中文" },
+      { value: "zh-TW", label: "繁體中文" },
+      { value: "en-US", label: "英语 (English)" },
+    ],
+  },
+  {
+    key: "alternateApiEnabled",
+    label: "替代 API 地址",
+    type: "toggle",
+    required: false,
+    sensitive: false,
+    defaultValue: false,
+  },
+  {
+    key: "apiBaseUrlPreset",
+    label: "TMDb API 地址",
+    type: "select",
+    required: false,
+    sensitive: false,
+    options: [
+      { value: "official", label: "https://api.themoviedb.org" },
+      { value: "alternate", label: "https://api.tmdb.org" },
+      { value: "custom", label: "自定义" },
+    ],
+  },
+  {
+    key: "apiBaseUrl",
+    label: "自定义 TMDb API 地址",
+    type: "text",
+    required: false,
+    sensitive: false,
+    defaultValue: "https://api.themoviedb.org",
+  },
+  {
+    key: "titleAliasReplacementEnabled",
+    label: "标题别名替换",
+    type: "toggle",
+    required: false,
+    sensitive: false,
+    description: "当tmdb语言检索不到中文名称时，尝试使用中文别名替换",
+  },
+];
+
 let currentPlugin = configuredPlugin;
 
 describe("pluginCategoryLabel", () => {
@@ -441,6 +522,40 @@ describe("AdminPluginsPage plugin cards", () => {
       apiBaseUrlPreset: "custom",
       apiBaseUrl: "https://tmdb.internal.example",
     }));
+  });
+
+  it("does not submit UI-only TMDb settings absent from the plugin manifest", async () => {
+    currentPlugin = {
+      ...configuredPlugin,
+      configValues: {
+        preferredLanguage: "zh-CN",
+        languageFallbackEnabled: true,
+        titleAliasReplacementEnabled: true,
+        fallbackLanguages: ["zh-TW"],
+        alternateApiEnabled: false,
+        apiBaseUrlPreset: "official",
+        apiBaseUrl: "https://api.themoviedb.org",
+      },
+      configFields: tmdbManifestConfigFields,
+    };
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="配置 TMDb 元数据插件"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+    });
+
+    const payload = vi.mocked(api.updateAdminPluginConfig).mock.calls.at(-1)?.[1];
+    expect(payload).toMatchObject({
+      preferredLanguage: "zh-CN",
+      languageFallbackEnabled: true,
+      fallbackLanguages: ["zh-TW"],
+      alternateApiEnabled: false,
+    });
+    expect(payload).not.toHaveProperty("originalLanguageEnabled");
   });
 
   it("keeps the install action in the top-right corner for store items", async () => {
