@@ -689,6 +689,28 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         0
     );
 
+    let get_with_force_transcoding = client
+        .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("forceTranscode", "true"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(get_with_force_transcoding.status(), reqwest::StatusCode::OK);
+    let get_body = get_with_force_transcoding.json::<Value>().await?;
+    assert!(get_body["MediaSources"][0]
+        .get("TranscodingUrl")
+        .is_none());
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS' AND state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+
     let forced_transcoding = client
         .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .query(&[

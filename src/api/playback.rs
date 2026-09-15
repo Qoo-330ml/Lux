@@ -5,12 +5,13 @@ use crate::storage::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 
 pub(super) async fn emby_playback_info(
     headers: HeaderMap,
+    method: Method,
     Path(item_id): Path<String>,
     raw_query: RawQuery,
     State(state): State<AppState>,
     body: Bytes,
 ) -> Response {
-    let force_transcode = emby_force_transcode_from_raw(&raw_query);
+    let force_transcode = method == Method::POST && emby_force_transcode_from_raw(&raw_query);
     let query = emby_stream_query_from_raw(raw_query);
     let request = match parse_emby_playback_info_request(&body) {
         Ok(request) => request,
