@@ -233,7 +233,7 @@ function PluginCard({ plugin, installing, installedManagement, toggling, uninsta
           preferredLanguage,
           languageFallbackEnabled,
           titleAliasReplacementEnabled,
-          originalLanguageEnabled,
+          ...(originalLanguageField ? { originalLanguageEnabled } : {}),
           fallbackLanguages,
           alternateApiEnabled,
           ...(apiBaseUrlPresetField?.key === "apiBaseUrlPreset"

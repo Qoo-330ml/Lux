@@ -295,6 +295,85 @@ impl MetadataReidentifyService {
             .await
     }
 
+    pub(crate) async fn search_item_candidates(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let scrapers = self
+            .providers_for_item(item_id, false)
+            .await
+            .map_err(MetadataCandidateError::Scraper)?
+            .unwrap_or_default();
+        self.search_item_candidates_with_scrapers(item_id, query, year, &scrapers)
+            .await
+    }
+
+    async fn search_item_candidates_with_scrapers(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        scrapers: &[ResolvedScraper],
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        let mut last_page = None;
+        let mut last_scraper_error = None;
+        let mut last_attempt_failed = false;
+        let mut attempted = false;
+
+        for scraper in scrapers.iter().filter(|scraper| {
+            matches!(
+                scraper.role,
+                crate::library::LibraryScraperRole::Primary
+                    | crate::library::LibraryScraperRole::Backup
+                    | crate::library::LibraryScraperRole::Both
+            )
+        }) {
+            attempted = true;
+            match self
+                .candidates
+                .search_and_store(item_id, query, year, &scraper.provider)
+                .await
+            {
+                Ok(page) if !page.items.is_empty() => return Ok(page),
+                Ok(page) => {
+                    last_page = Some(page);
+                    last_attempt_failed = false;
+                }
+                Err(MetadataCandidateError::Scraper(error)) => {
+                    tracing::warn!(
+                        item_id,
+                        scraper_id = %scraper.scraper_id,
+                        "metadata candidate scraper failed; trying the next configured scraper"
+                    );
+                    last_scraper_error = Some(error);
+                    last_attempt_failed = true;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+
+        if !attempted {
+            return Err(MetadataCandidateError::Scraper(
+                ScraperError::UnsupportedCapability("metadata.search".to_owned()),
+            ));
+        }
+        if last_attempt_failed {
+            if let Some(error) = last_scraper_error {
+                return Err(MetadataCandidateError::Scraper(error));
+            }
+            return Err(MetadataCandidateError::Scraper(
+                ScraperError::UnsupportedCapability("metadata.search".to_owned()),
+            ));
+        }
+        last_page.ok_or_else(|| {
+            MetadataCandidateError::Scraper(ScraperError::UnsupportedCapability(
+                "metadata.search".to_owned(),
+            ))
+        })
+    }
+
     pub async fn enqueue_selected_actor_enrichment(
         &self,
         item_id: &str,
@@ -1452,6 +1531,7 @@ mod tests {
     struct RoleRecordingAdapter {
         provider_key: String,
         match_found: bool,
+        fail_search: bool,
         fail_get: bool,
         calls: Arc<Mutex<Vec<String>>>,
     }
@@ -1469,6 +1549,17 @@ mod tests {
             Self {
                 provider_key: provider_key.to_owned(),
                 match_found,
+                fail_search: false,
+                fail_get: false,
+                calls,
+            }
+        }
+
+        fn with_search_failure(provider_key: &str, calls: Arc<Mutex<Vec<String>>>) -> Self {
+            Self {
+                provider_key: provider_key.to_owned(),
+                match_found: true,
+                fail_search: true,
                 fail_get: false,
                 calls,
             }
@@ -1478,6 +1569,7 @@ mod tests {
             Self {
                 provider_key: provider_key.to_owned(),
                 match_found: true,
+                fail_search: false,
                 fail_get: true,
                 calls,
             }
@@ -1576,6 +1668,11 @@ mod tests {
             _request: ScraperSearchRequest,
         ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
             self.record("search");
+            if self.fail_search {
+                return Box::pin(std::future::ready(Err(ScraperError::Provider(
+                    "test scraper search failed".to_owned(),
+                ))));
+            }
             let response = if self.match_found {
                 self.search_response()
             } else {
@@ -1798,6 +1895,51 @@ mod tests {
             calls[first_backup_call..]
                 .iter()
                 .all(|call| call.starts_with("backup:"))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_tries_backup_after_primary_scraper_error()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, _config, database, item_id) = role_test_fixture().await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_search_failure("primary", Arc::clone(&calls));
+        let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
+        let service = super::MetadataReidentifyService::new(
+            database,
+            super::ScraperProvider::from_adapter(primary.clone()),
+        );
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(backup),
+            },
+        ];
+
+        let page = service
+            .search_item_candidates_with_scrapers(&item_id, "Example Movie", Some(2020), &scrapers)
+            .await?;
+
+        assert!(page.items.iter().any(|item| item.provider == "backup"));
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        let first_backup_call = calls
+            .iter()
+            .position(|call| call.starts_with("backup:"))
+            .ok_or("backup scraper was not called")?;
+        assert!(
+            calls[..first_backup_call]
+                .iter()
+                .all(|call| call.starts_with("primary:"))
         );
         Ok(())
     }
