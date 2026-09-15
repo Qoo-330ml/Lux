@@ -672,18 +672,21 @@ function SeasonEpisodes({ episodes, seasonNumber, episodesPending }: { episodes:
 function SeasonEpisodeRow({ episode, seasonNumber, fallbackNumber }: { episode: MediaItem; seasonNumber?: number | null; fallbackNumber: number }) {
   const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
   const number = episode.indexNumber ?? fallbackNumber;
+  const detailHref = `/items/${episode.id}`;
+  const watchHref = `/watch/${episode.id}`;
   return (
-    <Link className="lux-season-episode-row" role="listitem" to={`/items/${episode.id}`}>
-      <span className="lux-season-episode-thumb">
-        {image ? <img src={image} alt="" loading="lazy" /> : <span>{mediaTitle(episode)}</span>}
-      </span>
-      <span className="lux-season-episode-copy">
+    <article className="lux-season-episode-row" role="listitem">
+      <Link className="lux-season-episode-thumb lux-season-episode-play" to={watchHref} aria-label={`播放 ${mediaTitle(episode)}`}>
+        {image ? <img src={image} alt="" loading="lazy" /> : <span className="lux-season-episode-placeholder">{mediaTitle(episode)}</span>}
+        <span className="lux-season-episode-play-icon" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
+      </Link>
+      <Link className="lux-season-episode-copy" to={detailHref}>
         <strong>{episodeTitle(episode, seasonNumber, number)}</strong>
         {episode.productionYear ? <small>{episode.productionYear}</small> : null}
         {episode.overview ? <p>{episode.overview}</p> : null}
-      </span>
-      <span className="lux-season-episode-arrow" aria-hidden="true">查看详情 →</span>
-    </Link>
+      </Link>
+      <Link className="lux-season-episode-arrow" to={detailHref}>查看详情 →</Link>
+    </article>
   );
 }
 
@@ -709,13 +712,15 @@ function EpisodeRail({
       <div className="lux-episode-card-rail" role="list">
         {otherEpisodes.map((episode) => {
           const image = imageUrl(episode, "fanart") ?? imageUrl(episode);
+          const detailHref = `/items/${episode.id}`;
           return (
-            <Link className="lux-episode-card" role="listitem" key={episode.id} to={`/items/${episode.id}`}>
-              <span className="lux-episode-card-art">
-                {image ? <img src={image} alt="" loading="lazy" /> : <span>{mediaTitle(episode)}</span>}
-              </span>
-              <strong>{episodeTitle(episode, seasonNumber)}</strong>
-            </Link>
+            <article className="lux-episode-card" role="listitem" key={episode.id}>
+              <Link className="lux-episode-card-art lux-episode-card-play" to={`/watch/${episode.id}`} aria-label={`播放 ${mediaTitle(episode)}`}>
+                {image ? <img src={image} alt="" loading="lazy" /> : <span className="lux-episode-card-placeholder">{mediaTitle(episode)}</span>}
+                <span className="lux-episode-card-play-icon" aria-hidden="true"><Play size={22} fill="currentColor" /></span>
+              </Link>
+              <Link className="lux-episode-card-copy" to={detailHref}><strong>{episodeTitle(episode, seasonNumber)}</strong></Link>
+            </article>
           );
         })}
       </div>

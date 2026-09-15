@@ -569,11 +569,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-season-episode-list { display: grid; gap: 10px; margin-top: 22px; }
 .lux-season-episode-row { display: grid; grid-template-columns: 188px minmax(0, 1fr) auto; align-items: center; gap: 18px; min-width: 0; padding: 0 4px 10px 0; border-bottom: 1px solid var(--lux-line-soft); color: var(--lux-muted); transition: color .2s ease, border-color .2s ease; }
 .lux-season-episode-row:hover { border-color: rgba(255,255,255,.32); color: #fff; }
-.lux-season-episode-thumb { display: block; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 8px; background: #17171b; }
+.lux-season-episode-thumb { position: relative; display: block; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 8px; color: inherit; background: #17171b; text-decoration: none; }
 .lux-season-episode-thumb img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .25s var(--lux-ease); }
-.lux-season-episode-row:hover .lux-season-episode-thumb img { transform: scale(1.03); }
-.lux-season-episode-thumb > span { display: grid; place-items: center; height: 100%; padding: 10px; color: var(--lux-muted); font-size: .72rem; text-align: center; }
-.lux-season-episode-copy { min-width: 0; }
+.lux-season-episode-play:hover img, .lux-season-episode-play:focus-visible img { transform: scale(1.03); }
+.lux-season-episode-placeholder { display: grid; place-items: center; height: 100%; padding: 10px; color: var(--lux-muted); font-size: .72rem; text-align: center; }
+.lux-season-episode-play-icon { position: absolute; top: 50%; left: 50%; display: grid; place-items: center; width: 48px; height: 48px; padding: 0; border: 1px solid rgba(255,255,255,.58); border-radius: 50%; color: #111; background: rgba(255,255,255,.92); opacity: 0; transform: translate(-50%, -43%) scale(.82); transition: opacity .2s ease, transform .2s var(--lux-ease); }
+.lux-season-episode-play:hover .lux-season-episode-play-icon, .lux-season-episode-play:focus-visible .lux-season-episode-play-icon { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.lux-season-episode-copy { min-width: 0; color: inherit; text-decoration: none; }
 .lux-season-episode-copy strong, .lux-season-episode-copy small, .lux-season-episode-copy p { display: block; overflow: hidden; text-overflow: ellipsis; }
 .lux-season-episode-copy strong { color: inherit; font-size: .9rem; font-weight: 600; white-space: nowrap; }
 .lux-season-episode-copy small { margin-top: 5px; color: var(--lux-subtle); font-size: .72rem; }
@@ -582,10 +584,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-episode-card-rail { display: flex; gap: 16px; margin-top: 22px; padding: 0 2px 14px; overflow-x: auto; scrollbar-width: thin; }
 .lux-episode-card { display: grid; flex: 0 0 250px; gap: 9px; min-width: 0; color: var(--lux-muted); }
 .lux-episode-card:hover { color: #fff; }
-.lux-episode-card-art { display: block; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 8px; background: #17171b; }
+.lux-episode-card-art { position: relative; display: block; aspect-ratio: 16 / 9; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 8px; color: inherit; background: #17171b; text-decoration: none; }
 .lux-episode-card-art img { display: block; width: 100%; height: 100%; object-fit: cover; transition: transform .25s var(--lux-ease); }
-.lux-episode-card:hover .lux-episode-card-art img { transform: scale(1.03); }
-.lux-episode-card-art > span { display: grid; place-items: center; height: 100%; padding: 12px; color: var(--lux-muted); font-size: .72rem; text-align: center; }
+.lux-episode-card-play:hover img, .lux-episode-card-play:focus-visible img { transform: scale(1.03); }
+.lux-episode-card-placeholder { display: grid; place-items: center; height: 100%; padding: 12px; color: var(--lux-muted); font-size: .72rem; text-align: center; }
+.lux-episode-card-play-icon { position: absolute; top: 50%; left: 50%; display: grid; place-items: center; width: 48px; height: 48px; padding: 0; border: 1px solid rgba(255,255,255,.58); border-radius: 50%; color: #111; background: rgba(255,255,255,.92); opacity: 0; transform: translate(-50%, -43%) scale(.82); transition: opacity .2s ease, transform .2s var(--lux-ease); }
+.lux-episode-card-play:hover .lux-episode-card-play-icon, .lux-episode-card-play:focus-visible .lux-episode-card-play-icon { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.lux-episode-card-copy { color: inherit; text-decoration: none; }
 .lux-episode-card strong { overflow: hidden; color: inherit; font-size: .78rem; font-weight: 550; text-overflow: ellipsis; white-space: nowrap; }
 .lux-player-page { position: fixed; inset: 0; width: 100vw; height: 100vh; height: 100dvh; min-height: 100vh; min-height: 100dvh; padding: 0; background: #000; overflow: hidden; z-index: 100; user-select: none; display: flex; flex-direction: column; justify-content: space-between; }
 .lux-player-page.controls-hidden { cursor: none; }

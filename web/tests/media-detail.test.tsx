@@ -156,7 +156,8 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-season-rail")).toBeNull();
     expect(container.querySelector(".lux-season-episodes")?.textContent).toContain("2 集");
     expect(container.querySelectorAll(".lux-season-episode-row")).toHaveLength(2);
-    expect(container.querySelector(".lux-season-episode-row")?.getAttribute("href")).toBe("/items/episode-1");
+    expect(container.querySelector(".lux-season-episode-copy")?.getAttribute("href")).toBe("/items/episode-1");
+    expect(container.querySelector(".lux-season-episode-play")?.getAttribute("href")).toBe("/watch/episode-1");
     expect(children).toHaveBeenCalledWith("series-1", { itemType: "EPISODE", seasonId: "season-1" });
   });
 
@@ -592,6 +593,11 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-season-episode-row strong")?.textContent).toBe("S03E01 · 第一集");
     expect(container.querySelector(".lux-season-episode-thumb img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-1/images/fanart?tag=episode-fanart");
+    expect(container.querySelector(".lux-season-episode-play")?.getAttribute("href")).toBe("/watch/episode-1");
+    expect(container.querySelector(".lux-season-episode-play")?.getAttribute("aria-label")).toBe("播放 第一集");
+    expect(container.querySelector(".lux-season-episode-play-icon")).not.toBeNull();
+    expect(container.querySelector(".lux-season-episode-copy")?.getAttribute("href")).toBe("/items/episode-1");
+    expect(container.querySelector(".lux-season-episode-arrow")?.getAttribute("href")).toBe("/items/episode-1");
   });
 
   it("uses the series poster on a season detail without a season poster", async () => {
@@ -707,6 +713,10 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-episode-card strong")?.textContent).toBe("S03E02 · 第二集");
     expect(container.querySelector(".lux-episode-card img")?.getAttribute("src"))
       .toBe("/api/v1/items/episode-2/images/fanart?tag=episode-fanart-2");
+    expect(container.querySelector(".lux-episode-card-play")?.getAttribute("href")).toBe("/watch/episode-2");
+    expect(container.querySelector(".lux-episode-card-play")?.getAttribute("aria-label")).toBe("播放 第二集");
+    expect(container.querySelector(".lux-episode-card-play-icon")).not.toBeNull();
+    expect(container.querySelector(".lux-episode-card-copy")?.getAttribute("href")).toBe("/items/episode-2");
   });
 
   it("uses the server playback state for an icon-only watched indicator", async () => {
