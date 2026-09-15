@@ -172,7 +172,7 @@ struct EmbyPlaybackInfoRequest {
 
 impl EmbyPlaybackInfoRequest {
     fn requests_server_transcoding(&self) -> bool {
-        self.enable_transcoding == Some(true) && self.enable_direct_play == Some(false)
+        self.enable_transcoding == Some(true) && self.enable_direct_play != Some(true)
     }
 
     fn playback_capabilities(&self) -> PlaybackCapabilities {
@@ -2496,5 +2496,19 @@ mod emby_playback_tests {
         let request = parse_emby_playback_info_request(&Bytes::new())
             .expect("empty PlaybackInfo body is valid");
         assert!(!request.requests_server_transcoding());
+    }
+
+    #[test]
+    fn transcode_flag_without_direct_play_flag_requests_server_transcoding() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "EnableTranscoding": true,
+                "EnableDirectStream": false,
+                "AllowVideoStreamCopy": false,
+                "AllowAudioStreamCopy": false
+            }"#,
+        ))
+        .expect("valid PlaybackInfo request");
+        assert!(request.requests_server_transcoding());
     }
 }

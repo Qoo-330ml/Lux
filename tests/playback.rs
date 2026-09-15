@@ -686,7 +686,6 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .query(&[("api_key", token.as_str())])
         .json(&json!({
             "MediaSourceId": source_id,
-            "EnableDirectPlay": false,
             "EnableDirectStream": false,
             "EnableTranscoding": true,
             "AllowVideoStreamCopy": false,
