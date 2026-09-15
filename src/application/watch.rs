@@ -321,7 +321,8 @@ impl LibraryWatchService {
             }
         };
         while let Some(batch) = watcher.next_batch().await {
-            let changes = batch
+            let changes = filter_internal_image_changes(batch)
+                .await
                 .into_iter()
                 .filter_map(|change| {
                     let relative_path = change
@@ -377,6 +378,17 @@ impl LibraryWatchService {
             }
         }
     }
+}
+
+async fn filter_internal_image_changes(changes: Vec<FileChange>) -> Vec<FileChange> {
+    let mut filtered = Vec::with_capacity(changes.len());
+    for change in changes {
+        if crate::application::images::should_suppress_internal_image_write(&change.path).await {
+            continue;
+        }
+        filtered.push(change);
+    }
+    filtered
 }
 
 fn should_log_realtime_enqueue_error(error: &ScanJobError) -> bool {
@@ -633,5 +645,33 @@ mod tests {
         assert!(!should_log_realtime_enqueue_error(
             &crate::application::scanner::ScanJobError::AlreadyActive("job-1".to_owned())
         ));
+    }
+
+    #[tokio::test]
+    async fn internal_image_write_events_are_filtered_but_external_changes_remain() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let internal = root.path().join("poster.jpg");
+        let external = root.path().join("fanart.jpg");
+        crate::application::images::register_internal_image_write(&internal);
+
+        let filtered = filter_internal_image_changes(vec![
+            FileChange {
+                path: internal,
+                kind: ChangeKind::Modify,
+            },
+            FileChange {
+                path: external.clone(),
+                kind: ChangeKind::Create,
+            },
+        ])
+        .await;
+
+        assert_eq!(
+            filtered,
+            vec![FileChange {
+                path: external,
+                kind: ChangeKind::Create,
+            }]
+        );
     }
 }
