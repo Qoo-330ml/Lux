@@ -31,6 +31,20 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 
 当前阶段的 cookie 始终标记 `Secure`，部署时应使用 HTTPS；本机 HTTP 集成测试只验证协议和服务端行为，不代表浏览器会在不安全来源发送 Secure cookie。
 
+## Lux 客户端令牌
+
+需要当前用户 Web session 的 Lux 媒体、搜索、首页、图片、播放和用户状态接口，也接受用户级
+Emby AccessToken，因此第三方客户端不需要保存 Web Cookie：
+
+- `X-Lux-Token: <accessToken>`：Lux 客户端推荐使用的请求头。
+- `X-Emby-Token: <accessToken>` 或 `X-MediaBrowser-Token: <accessToken>`：兼容同一个用户令牌。
+- `Authorization: Bearer <accessToken>`：兼容 Bearer 客户端。
+
+AccessToken 通过 `POST /Users/AuthenticateByName` 获取，按用户执行媒体库 ACL 和远程访问策略；撤销
+Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求不需要 Cookie CSRF，因为浏览器不会自动
+附带这些请求头。`X-Lux-Api-Key` 和 `api_key` 查询参数仍只表示 LUX-182 的共享管理员 API Key，不能
+用来冒充普通用户。
+
 数据库连接池的 `maxConnections` 默认值为 SQLite 8、PostgreSQL 20；可通过进程环境变量
 `LUX_DB_MAX_CONNECTIONS` 在 1-100 范围内覆盖，未设置或为空时使用默认值。管理员健康接口的
 `database.pool.maxConnections` 返回当前生效值。
@@ -163,17 +177,17 @@ Lux 提供一个服务器级共享管理员 API Key，行为与 Emby API Key 兼
 
 ## 电影查询（LUX-034）
 
-Lux 电影查询要求有效 Web session：
+Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 
 - `GET /api/v1/libraries`：返回已启用媒体库的基本信息，不暴露服务器路径。
 - `GET /api/v1/libraries/{libraryId}/items?page=1&pageSize=50`：按稳定标题顺序分页返回条目；支持 `itemType`、`year`、`isPlayed`、`isFavorite`、`metadataStatus=PENDING`、`sortBy=Name|DateCreated|PremiereDate|CommunityRating` 和 `sortOrder=Ascending|Descending`（同时兼容下划线参数名），筛选、排序和分页在 SQLite 查询中完成；发行日期排序优先使用完整 `premiere_date`，缺少发行日期时回退到 `production_year`，两者都缺少的条目稳定排在最后；评分排序将无评分条目稳定放在有评分条目之后。`metadataStatus=PENDING` 返回仍有待确认候选的条目。
 - `GET /api/v1/favorites?page=1&pageSize=50`：返回当前用户跨可见媒体库的收藏条目，按最近添加倒序分页；服务端执行用户状态和媒体库 ACL。
 - `GET /api/v1/search?q=关键词&page=1&pageSize=50`：搜索标题、原标题和别名，结果执行媒体库 ACL。
-- `GET /api/v1/home`：返回当前用户继续观看、推荐和可见媒体库入口；每个媒体库入口包含最多 12 条该库最新资源，按 `media_items.added_at` 倒序。所有内容均执行媒体库 ACL；响应中的 `recentlyAdded` 字段保留用于旧客户端兼容，Lux Web 首页按媒体库分别展示最新资源。
+- `GET /api/v1/home`：返回当前用户继续观看、推荐和可见媒体库入口；每个媒体库入口包含最多 12 条该库最新资源，按 `media_items.added_at` 倒序。该接口可由 Lux Web 或携带用户级客户端令牌的第三方客户端调用。所有内容均执行媒体库 ACL；响应中的 `recentlyAdded` 字段保留用于旧客户端兼容，Lux Web 首页按媒体库分别展示最新资源。
 - `GET /api/v1/items/{itemId}/playback`：读取当前 Web 用户的播放位置、已看、收藏状态，以及该条目的活动播放状态（`state`、`isPaused`、`lastEventAt`）。
-- `POST /api/v1/items/{itemId}/progress`：写入播放事件，需要当前 Web session 和 CSRF。请求体为 `{ "positionTicks": 1200000000, "durationTicks": 7200000000, "state": "PLAYING" }`；`state` 可为 `PLAYING`、`PAUSED` 或 `STOPPED`，省略时兼容为 `PLAYING`。
-- `PUT /api/v1/items/{itemId}/favorite`：设置当前 Web 用户的收藏状态，需要当前 Web session 和 CSRF。
-- `PUT /api/v1/items/{itemId}/played`：设置当前 Web 用户的已看状态，请求体为 `{ "played": true }`，需要当前 Web session 和 CSRF。
+- `POST /api/v1/items/{itemId}/progress`：写入播放事件，需要当前 Web session 和 CSRF，或用户级客户端令牌。请求体为 `{ "positionTicks": 1200000000, "durationTicks": 7200000000, "state": "PLAYING" }`；`state` 可为 `PLAYING`、`PAUSED` 或 `STOPPED`，省略时兼容为 `PLAYING`。
+- `PUT /api/v1/items/{itemId}/favorite`：设置当前 Web 用户的收藏状态，需要当前 Web session 和 CSRF，或用户级客户端令牌。
+- `PUT /api/v1/items/{itemId}/played`：设置当前 Web 用户的已看状态，请求体为 `{ "played": true }`，需要当前 Web session 和 CSRF，或用户级客户端令牌。
 - `GET /api/v1/items/{itemId}`：返回电影详情、媒体源和已探测轨道。
 - `GET /api/v1/items/{itemId}`：返回媒体详情、媒体源和已探测轨道；若已完成在线刮削，还返回 `rating`（0-10）、`ratingSource`、`premiereDate`、`lastAirDate`、`status`、`originalLanguage`、`providerIds`、`seasonCount` 和 `episodeCount`。剧集统计字段使用当前可见且未移除的季度/单集计算。
 - `GET /api/v1/items/{itemId}/children?itemType=SEASON|EPISODE&seasonId=...`：Web 同源读取剧集季度/单集或合集成员，结果执行当前用户 ACL。媒体条目响应同时返回 `parentId`、`seriesId`、`parentIndexNumber`（季号）和 `indexNumber`（集号），用于保持剧集层级导航。

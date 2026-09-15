@@ -1395,14 +1395,14 @@ pub(super) async fn require_web_user(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<UserRecord, Response> {
-    if lux_api_key_from_headers(headers).is_some() {
-        let user = resolve_shared_admin_api_key(headers, state).await?;
+    if has_client_token(headers) {
+        let user = resolve_lux_client_user(headers, state).await?;
         let Some(user) = user else {
             return Err(api_error(
                 headers,
                 StatusCode::UNAUTHORIZED,
                 lux::ApiErrorCode::AuthenticationRequired,
-                "需要有效的 API Key",
+                "需要有效的客户端令牌",
             )
             .into_response());
         };
@@ -1477,18 +1477,9 @@ pub(super) async fn require_web_csrf(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<(), Response> {
-    if lux_api_key_from_headers(headers).is_some() {
-        let user = resolve_shared_admin_api_key(headers, state).await?;
-        if user.is_some() {
-            return Ok(());
-        }
-        return Err(api_error(
-            headers,
-            StatusCode::UNAUTHORIZED,
-            lux::ApiErrorCode::AuthenticationRequired,
-            "需要有效的 API Key",
-        )
-        .into_response());
+    if has_client_token(headers) {
+        require_web_user(headers, state).await.map(|_| ())?;
+        return Ok(());
     }
     let Some(auth) = state.auth.as_ref() else {
         return Err(api_error(
@@ -1551,6 +1542,66 @@ pub(super) async fn require_web_csrf(
         .into_response());
     }
     Ok(())
+}
+
+pub(super) fn has_client_token(headers: &HeaderMap) -> bool {
+    lux_api_key_from_headers(headers).is_some() || lux_user_token_from_headers(headers).is_some()
+}
+
+pub(super) fn lux_user_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    ["X-Lux-Token", "X-Emby-Token", "X-MediaBrowser-Token"]
+        .into_iter()
+        .find_map(|name| headers.get(name).and_then(|value| value.to_str().ok()))
+        .and_then(parse_lux_user_token)
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().strip_prefix("Bearer "))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned)
+        })
+}
+
+fn parse_lux_user_token(value: &str) -> Option<String> {
+    let value = value.trim();
+    let value = value.strip_prefix("Bearer ").unwrap_or(value).trim();
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+async fn resolve_lux_client_user(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<Option<UserRecord>, Response> {
+    if lux_api_key_from_headers(headers).is_some()
+        && let Some(user) = resolve_shared_admin_api_key(headers, state).await?
+    {
+        return Ok(Some(user));
+    }
+
+    let Some(token) = lux_user_token_from_headers(headers) else {
+        return Ok(None);
+    };
+    let Some(auth) = state.emby_auth.as_ref() else {
+        return Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证服务尚未就绪",
+        )
+        .into_response());
+    };
+    match auth.resolve_token(&token).await {
+        Ok(user) => Ok(user),
+        Err(_) => Err(api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "认证暂时不可用",
+        )
+        .into_response()),
+    }
 }
 
 pub(super) fn api_routes() -> Router<AppState> {

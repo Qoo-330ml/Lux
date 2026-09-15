@@ -1537,11 +1537,17 @@ BaseItemDto 至少按场景提供：
 - logout 撤销当前设备令牌。
 - 401 表示令牌缺失、无效或撤销；403 表示用户已认证但无权限。
 
+Lux 自有 `/api/v1` 的媒体、搜索、首页、图片、播放和用户状态接口除 Web session 外，接受同一用户的
+Emby AccessToken：推荐使用 `X-Lux-Token`，并兼容 `X-Emby-Token`、`X-MediaBrowser-Token` 和
+`Authorization: Bearer`。令牌仍按用户执行媒体库 ACL；显式令牌请求不依赖 Cookie CSRF。`X-Lux-Api-Key`
+和 `api_key` 查询参数保留给 LUX-182 共享管理员 API Key，不授予普通用户管理员权限。
+
 ---
 
 ## 16. Lux 自有 API
 
-Web 和管理控制台使用 /api/v1，不直接依赖 Emby DTO。
+Web 和管理控制台使用 /api/v1，不直接依赖 Emby DTO；第三方 Lux 客户端可以使用用户级客户端令牌调用
+同一份 Lux JSON 合同。
 
 ### 16.1 初始化和认证
 
@@ -2107,6 +2113,7 @@ services:
 | LUX-252 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/tests/media-detail.test.tsx；单季剧集详情直接展示单集列表 |
 | LUX-253 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/src/react.css、web/tests/media-detail.test.tsx；单集图片播放与文字详情入口 |
 | LUX-254 | docs/LUX-254-PLAN.md、src/application/playback/session.rs、src/api/playback.rs、src/api/emby.rs、src/api/legacy.rs、tests/playback.rs、docs/API.md、docs/COMPATIBILITY.md；Emby 客户端服务端转码 |
+| LUX-255 | docs/LUX-DEVELOPMENT.md、docs/API.md、docs/COMPATIBILITY.md、src/api/users.rs、src/api/admin_handlers.rs、tests/lux_api_auth.rs、tests/admin_api_key.rs；Lux 用户级客户端令牌与第三方首页 API |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6185,6 +6192,30 @@ VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停
 
 - 不实现字幕转换/烧录、DRM、多码率自适应 HLS、`.strm` 服务端转码或第三方客户端专属私有协议。
 - 不改变现有 Web 播放 DTO、Emby 内部领域模型或数据库字段；没有数据库迁移需求。
+
+#### LUX-255：Lux 用户级客户端令牌与第三方首页 API
+
+范围：让 Lux 自有 `/api/v1` 的媒体、搜索、首页、图片、播放和用户状态接口接受用户级客户端令牌，
+并使第三方客户端可以直接调用已有的 `GET /api/v1/home`。不新增令牌数据库表；复用现有 Emby
+AccessToken 的生成、哈希存储、撤销和用户解析。
+
+验收：
+
+- [x] 新增推荐请求头 `X-Lux-Token: <accessToken>`，兼容 `X-Emby-Token`、`X-MediaBrowser-Token` 和
+      `Authorization: Bearer <accessToken>`。
+- [x] 无 Web Cookie 的有效用户令牌可调用 `/api/v1/home` 及 Lux 媒体查询；响应继续按当前用户执行
+      媒体库 ACL。
+- [x] 普通用户令牌不能调用管理员接口；LUX-182 共享管理员 API Key 的权限和 CSRF 豁免边界保持不变。
+- [x] 更新 Lux API、首页合同和兼容性文档；不宣称 VidHub、SenPlayer、Infuse 等真实客户端已完成验证。
+
+验证目标：`cargo test --locked --test lux_api_auth`、`cargo test --locked --all-targets`、`rustfmt --check`
+和 `git diff --check`。本轮全量 Rust 测试为 443 passed、4 ignored、0 failed，`rustfmt --check` 与
+`git diff --check` 也通过；该证据只覆盖 Lux 服务端协议，不代表第三方客户端已经完成真实客户端验证。
+
+明确不做：
+
+- 不新增普通用户 API Key 管理页面或细粒度 token scope。
+- 不改变 Emby 路由/DTO，不把用户令牌写入 URL、日志、审计事件或普通响应。
 
 ## 26. 风险与缓解
 
