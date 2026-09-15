@@ -15,6 +15,24 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.3",
+    date: "2026-09-15",
+    sections: [
+      { kind: "added", items: [
+        "本地视频在缺少有效海报或缩略图时，可从同一画面生成独立的竖版 POSTER 和横版 THUMB 回退图片。",
+        "Lux 自有 API 支持用户级 Emby AccessToken；第三方客户端可通过 X-Lux-Token、兼容令牌请求头或 Bearer 调用首页、媒体、搜索、图片、播放和用户状态接口。",
+        "管理员可直接点击媒体库封面打开媒体库编辑器。",
+      ] },
+      { kind: "fixed", items: [
+        "修复元数据刮削器失败时错误返回数据库不可用错误码的问题，改为正确报告插件不可用。",
+      ] },
+      { kind: "changed", items: [
+        "调整本地图片、在线刮削图片和 FFmpeg 截图回退的优先级；已有本地或刮削器图片不会被截图覆盖，缺失的图片类型可独立补全。",
+        "客户端令牌请求继续执行用户媒体库 ACL，普通用户令牌不能调用管理员接口。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.2",
     date: "2026-09-15",
     sections: [
