@@ -23,6 +23,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 - 修复 Emby `MaxStreamingBitrate` 限制未参与 `PlaybackInfo` 协商的问题；已知源码率超限时选择服务端转码，未知码率不会因此误触发转码。
 - 修复 Emby 重复 `PlaybackInfo` 协商撞上单路软件 HLS 转码限制的问题；同一媒体源切换转码流时会先回收旧会话，避免客户端收到 502。
 - 修复转码 offer 中的 `VideoBitrate` 只写入 URL、未传入 FFmpeg 编码器的问题；现在硬件和软件视频转码都会应用目标视频码率。
+- 修复 Emby 实时 HLS 转码的进度条随已生成片段长度增长的问题；`PlaybackInfo` 现在在顶层和媒体源上返回完整 `RunTimeTicks`，并在源时长缺失时回退到媒体项时长。
 - 兼容 Emby 客户端通过 `DeviceProfile` 声明直放和 HLS 转码能力，并在直放 profile 不匹配时协商服务端转码的 `PlaybackInfo` 请求。
 - 对齐 Emby 服务端转码 offer：补齐标准设备、codec、码率、轨道和 HLS 分片参数；实际转码 offer 的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个 HLS 清单，同时保持不可直放能力位，兼容依赖前者选择媒体地址的客户端。
 - 修复 Lux 内部生成或写入图片后触发实时扫描的问题；外部图片更新仍可使内部写入抑制标记失效。

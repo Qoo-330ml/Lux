@@ -1346,6 +1346,8 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
   全部省略时也按 `DeviceProfile` 协商。源容器或 codec 缺失/待探测时视为未知，不因此自动认定直放不兼容；
   `.strm` 始终返回 `SupportsTranscoding=false`。
 - MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
+- `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，
+  缺失时回退到媒体项时长。HLS 清单仍保持可边转边播的动态 playlist，不通过提前写入 `ENDLIST` 冒充 VOD。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
 - `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。
@@ -6237,6 +6239,11 @@ H.264/AAC fMP4 HLS，但 Harbor 1.4.6 未请求 `TranscodingUrl`，而是在 `Di
 `git diff --check` 通过；`cargo test --locked --all-targets` 的 462 个库测试通过，但其中两个内嵌字幕测试在该次
 全量运行中超时；随后单独运行 `cargo test --locked --lib embedded_subtitle`（3 个通过）确认模块本身通过。全量
 Clippy 仍被未修改的 `src/api/legacy.rs:44` 未使用导入阻塞。FNOS 新镜像及 Harbor 真机首帧验证尚待部署。
+
+验证记录（2026-09-16 Harbor 进度时长兼容修复）：为避免 Harbor 将实时增长的 HLS 清单长度当作媒体总时长，
+`PlaybackInfo` 现在在顶层和每个媒体源返回 `RunTimeTicks`，并在 source 时长缺失时回退到媒体项时长；详情 DTO 的
+`RunTimeTicks` 与媒体源时长也使用同一回退规则。新增转码响应回归覆盖；`cargo test --locked --test playback`
+（3 个通过）通过，其他全量质量门和 FNOS/Harbor 真机复测待完成。
 
 依赖：LUX-198、LUX-199。
 

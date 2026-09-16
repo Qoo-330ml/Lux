@@ -63,6 +63,9 @@ pub(super) async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
+    let runtime_ticks = sources
+        .first()
+        .and_then(|source| super::emby_catalog::emby_source_runtime_ticks(&item, source));
     let transcode_requested = method == Method::POST
         && sources.first().is_some_and(|source| {
             request.requests_server_transcoding_for_source(force_transcode, source)
@@ -128,6 +131,9 @@ pub(super) async fn emby_playback_info(
         .unwrap_or_else(|| Uuid::now_v7().to_string());
     Json(json!({
         "PlaySessionId": play_session_id,
+        // Emby clients use this item-level duration when an HLS transcoding
+        // playlist is still growing and therefore cannot advertise ENDLIST.
+        "RunTimeTicks": runtime_ticks,
         "MediaSources": sources
             .into_iter()
             .map(|source| {
@@ -152,6 +158,12 @@ pub(super) async fn emby_playback_info(
                     || force_transcode
                     || source_transcode_session.is_some();
                 if let Value::Object(object) = &mut value {
+                    object.insert(
+                        "RunTimeTicks".to_owned(),
+                        super::emby_catalog::emby_source_runtime_ticks(&item, source)
+                            .map(Value::from)
+                            .unwrap_or(Value::Null),
+                    );
                     if source_can_transcode {
                         // Emby advertises the device's available transcoding
                         // profiles even when direct play wins this request.

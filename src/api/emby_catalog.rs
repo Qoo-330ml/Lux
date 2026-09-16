@@ -2751,9 +2751,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         .iter()
         .find(|source| source.is_default)
         .or_else(|| item.media_sources.first());
-    let runtime_ticks = item
-        .runtime_ticks
-        .or_else(|| default_source.and_then(|source| source.duration_ticks));
+    let runtime_ticks = emby_item_runtime_ticks(item);
     let played_percentage = user_state.and_then(|state| {
         if state.position_ticks <= 0 {
             return None;
@@ -3326,13 +3324,22 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 item.media_sources
                     .iter()
                     .map(|source| {
-                        emby_media_source_json_with_resolver_and_chapters(
+                        let mut value = emby_media_source_json_with_resolver_and_chapters(
                             &item.id,
                             source,
                             include_media_streams,
                             false,
                             emby_fields_include(fields, "Chapters"),
-                        )
+                        );
+                        if let Value::Object(object) = &mut value {
+                            object.insert(
+                                "RunTimeTicks".to_owned(),
+                                emby_source_runtime_ticks(item, source)
+                                    .map(Value::from)
+                                    .unwrap_or(Value::Null),
+                            );
+                        }
+                        value
                     })
                     .collect(),
             ),
@@ -3691,6 +3698,36 @@ pub(super) fn emby_media_source_json_with_resolver(
         strm_resolver_available,
         true,
     )
+}
+
+pub(super) fn emby_item_runtime_ticks(
+    item: &crate::application::catalog::CatalogItem,
+) -> Option<i64> {
+    item.runtime_ticks
+        .filter(|ticks| *ticks > 0)
+        .or_else(|| {
+            item.media_sources
+                .iter()
+                .find(|source| source.is_default)
+                .and_then(|source| source.duration_ticks)
+                .filter(|ticks| *ticks > 0)
+        })
+        .or_else(|| {
+            item.media_sources
+                .iter()
+                .find_map(|source| source.duration_ticks)
+                .filter(|ticks| *ticks > 0)
+        })
+}
+
+pub(super) fn emby_source_runtime_ticks(
+    item: &crate::application::catalog::CatalogItem,
+    source: &crate::application::catalog::CatalogSource,
+) -> Option<i64> {
+    source
+        .duration_ticks
+        .filter(|ticks| *ticks > 0)
+        .or_else(|| emby_item_runtime_ticks(item))
 }
 
 pub(super) fn emby_media_source_json_with_resolver_and_chapters(

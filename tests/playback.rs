@@ -608,6 +608,12 @@ async fn emby_playback_info_negotiates_server_transcoding_and_cleans_hls()
     )
     .fetch_one(database.pool())
     .await?;
+    let expected_runtime_ticks = 58_943_360_000_i64;
+    sqlx::query("UPDATE media_items SET runtime_ticks = ? WHERE id = ?")
+        .bind(expected_runtime_ticks)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
     let emby_item_id = emby_public_id(&item_id);
 
     let fake_ffmpeg = temp_dir.path().join("fake-ffmpeg");
@@ -840,6 +846,11 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
     assert_eq!(
         device_profile_body["MediaSources"][0]["SupportsDirectStream"],
         false
+    );
+    assert_eq!(device_profile_body["RunTimeTicks"], expected_runtime_ticks);
+    assert_eq!(
+        device_profile_body["MediaSources"][0]["RunTimeTicks"],
+        expected_runtime_ticks
     );
     assert_eq!(
         device_profile_body["MediaSources"][0]["DirectStreamUrl"],
