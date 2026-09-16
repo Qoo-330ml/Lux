@@ -39,6 +39,7 @@ HTTP(S) 基地址；未设置时服务端按请求来源选择本机接口和 HT
 Lux 现已把本地媒体的服务端 HLS 能力接入 Emby `PlaybackInfo` POST：当客户端明确发送
 `EnableTranscoding=true` 且 `EnableDirectPlay` 未设置或为 `false` 时，服务端按 `EnableDirectStream`、
 `AllowVideoStreamCopy` 和 `AllowAudioStreamCopy` 选择最低成本的 Remux、音频转码、硬件转码或软件转码。
+上述播放开关兼容放在 POST URL 查询参数中，`DeviceProfile` 可放在 JSON body；这是部分第三方客户端的实际请求形式。
 兼容 Emby 标准 `DeviceProfile` 时，Lux 会用 `DirectPlayProfiles` 匹配媒体源的容器/音视频编码；只有源媒体信息已知且
 确认直放 profile 不匹配、客户端允许转码并存在 HLS `TranscodingProfiles` 时，才选择服务端转码。容器/codec 信息缺失或
 仍待探测时按“未知”处理，不会仅因元数据不足而触发转码；顶层布尔值全部省略时也按此规则协商。

@@ -236,6 +236,7 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `.strm` 条目的 `Path` 和 `MediaSources.Path` 均返回旁车记录中的原始媒体目标，供外部 Emby 代理执行路径映射或 302 解析；`MediaStreams` 除基础轨道字段外，还返回旁车中的分辨率、画面比例、码率、色深、帧率、Profile、像素格式、声道布局和采样率等已验证字段。
 - `MediaStreams` 不返回 Matroska/MP4 中标记为 `attached_pic` 的封面附加图轨，避免客户端将封面误认为可播放视频轨。
 - `GET /Items/{collectionId}/Children`：返回按当前用户媒体库权限过滤的合集成员。
+- `PlaybackInfo` 的五个播放开关也兼容放在 POST URL 查询参数中；部分第三方客户端将开关放在查询参数、将 `DeviceProfile` 放在 JSON body。
 
 `.strm` 媒体源在 PlaybackInfo 中以 `Protocol=File`、`IsRemote=false` 返回；条目的 `Path` 和 `MediaSources.Path` 保留原始目标。对 HTTP(S) 和本地路径型 `.strm`，`MediaSources[].DirectStreamUrl` 使用当前服务的标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，同时携带标准 `UserId` 作为外部代理的身份关联提示；`UserId` 不承担授权。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，Lux 会仅对 URL/路径型 `.strm` 将本次标准 Emby token 作为 `api_key` 写入同一签名 URL，并将 `AddApiKeyToDirectStreamUrl` 设为 `true`；本地文件和 SMB/FTP 解析源不写入长期 token。Lux 仍要求短期票据。外部 Emby 代理从原始 `Path` 提取映射信息并执行 302 解析，客户端不会直接连接 `.strm` 中可能存在的内网 302 地址。播放器直接访问 Lux 入口时，URL 型 `.strm` 由 Lux 使用播放器 User-Agent 请求上游并有限返回 307，路径型 `.strm` 按本地文件规则处理；Lux 不代理媒体字节，PlaybackInfo 本身不访问上游。具有媒体库访问权限的客户端仍可能获得包含令牌的原始 `Path`，因此含 token 的兼容 URL 和原始目标都应避免进入公开日志。
 

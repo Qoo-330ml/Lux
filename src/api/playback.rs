@@ -12,11 +12,12 @@ pub(super) async fn emby_playback_info(
     body: Bytes,
 ) -> Response {
     let force_transcode = method == Method::POST && emby_force_transcode_from_raw(&raw_query);
-    let query = emby_stream_query_from_raw(raw_query);
-    let request = match parse_emby_playback_info_request(&body) {
+    let mut request = match parse_emby_playback_info_request(&body) {
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
+    request.apply_query_parameters(&raw_query);
+    let query = emby_stream_query_from_raw(raw_query);
     let standard_api_key =
         standard_emby_playback_api_key(&headers, query.api_key.as_deref(), &state).await;
     let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
@@ -235,6 +236,39 @@ struct EmbyPlaybackInfoRequest {
 }
 
 impl EmbyPlaybackInfoRequest {
+    fn apply_query_parameters(&mut self, raw_query: &RawQuery) {
+        let Some(raw_query) = raw_query.0.as_deref() else {
+            return;
+        };
+        for (name, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+            let value = match parse_emby_bool(value.as_ref()) {
+                Some(value) => value,
+                None => continue,
+            };
+            if name.eq_ignore_ascii_case("EnableDirectPlay")
+                || name.eq_ignore_ascii_case("enable_direct_play")
+            {
+                self.enable_direct_play = Some(value);
+            } else if name.eq_ignore_ascii_case("EnableDirectStream")
+                || name.eq_ignore_ascii_case("enable_direct_stream")
+            {
+                self.enable_direct_stream = Some(value);
+            } else if name.eq_ignore_ascii_case("EnableTranscoding")
+                || name.eq_ignore_ascii_case("enable_transcoding")
+            {
+                self.enable_transcoding = Some(value);
+            } else if name.eq_ignore_ascii_case("AllowVideoStreamCopy")
+                || name.eq_ignore_ascii_case("allow_video_stream_copy")
+            {
+                self.allow_video_stream_copy = Some(value);
+            } else if name.eq_ignore_ascii_case("AllowAudioStreamCopy")
+                || name.eq_ignore_ascii_case("allow_audio_stream_copy")
+            {
+                self.allow_audio_stream_copy = Some(value);
+            }
+        }
+    }
+
     fn requests_server_transcoding(&self, force_transcode: bool) -> bool {
         force_transcode
             || (self.enable_transcoding == Some(true) && self.enable_direct_play != Some(true))
@@ -501,11 +535,21 @@ fn parse_emby_playback_info_request(body: &Bytes) -> Result<EmbyPlaybackInfoRequ
     serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
 }
 
+fn parse_emby_bool(value: &str) -> Option<bool> {
+    match value.trim() {
+        "1" => Some(true),
+        "0" => Some(false),
+        value if value.eq_ignore_ascii_case("true") => Some(true),
+        value if value.eq_ignore_ascii_case("false") => Some(false),
+        _ => None,
+    }
+}
+
 fn emby_force_transcode_from_raw(raw_query: &RawQuery) -> bool {
     raw_query.0.as_deref().is_some_and(|raw_query| {
         url::form_urlencoded::parse(raw_query.as_bytes()).any(|(name, value)| {
             name.eq_ignore_ascii_case("forceTranscode")
-                && (value == "1" || value.eq_ignore_ascii_case("true"))
+                && parse_emby_bool(value.as_ref()) == Some(true)
         })
     })
 }
@@ -3127,5 +3171,45 @@ mod emby_playback_tests {
         assert!(!emby_force_transcode_from_raw(&RawQuery(Some(
             "forceTranscode=false".to_owned(),
         ))));
+    }
+
+    #[test]
+    fn playback_flags_are_read_from_standard_query_parameters() {
+        let mut request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [{
+                        "Container": "mp4",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Container": "mp4",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+        request.apply_query_parameters(&RawQuery(Some(
+            "EnableDirectPlay=false&EnableDirectStream=false&EnableTranscoding=true&AllowVideoStreamCopy=false&AllowAudioStreamCopy=false"
+                .to_owned(),
+        )));
+
+        let source = profile_source("mkv", "hevc", "aac");
+        assert!(request.requests_server_transcoding(false));
+        assert_eq!(
+            choose_plan(PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: request.playback_capabilities_for_source(Some(&source)),
+            }),
+            PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode,
+            }
+        );
     }
 }

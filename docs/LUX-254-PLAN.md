@@ -29,7 +29,8 @@
 ### PlaybackInfo
 
 - 接收 Emby 标准 `PlaybackInfoRequest` 的 `MediaSourceId`、`DeviceProfile`、`EnableDirectPlay`、
-  `EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy` 和 `AllowAudioStreamCopy` 等字段。
+  `EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy` 和 `AllowAudioStreamCopy` 等字段；
+  五个播放开关同时兼容放在 POST URL 查询参数中，`DeviceProfile` 通常位于 JSON body。
 - `GET` 或空 body `POST`：保持当前响应，不创建转码会话。
 - 明确要求服务端转码的 POST：
   - `MediaSourceId` 选择媒体源；query 参数仍可作为兼容回退。

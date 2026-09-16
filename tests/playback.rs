@@ -757,12 +757,16 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
 
     let device_profile_transcoding = client
         .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
-        .query(&[("api_key", token.as_str())])
+        .query(&[
+            ("api_key", token.as_str()),
+            ("EnableDirectPlay", "true"),
+            ("EnableDirectStream", "true"),
+            ("EnableTranscoding", "true"),
+            ("AllowVideoStreamCopy", "true"),
+            ("AllowAudioStreamCopy", "true"),
+        ])
         .json(&json!({
             "MediaSourceId": source_id,
-            "EnableDirectPlay": true,
-            "EnableDirectStream": true,
-            "EnableTranscoding": true,
             "DeviceProfile": {
                 "DirectPlayProfiles": [{
                     "Container": "mp4",
