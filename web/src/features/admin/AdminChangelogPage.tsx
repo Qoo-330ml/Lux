@@ -32,6 +32,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 Emby 转码 offer 已准备但仍保留直放入口的问题；实际选择服务端转码时关闭直放能力并返回可用的转码 URL，同时保留可转码能力供客户端重试。",
         "修复 Emby MaxStreamingBitrate 限制未参与 PlaybackInfo 协商的问题；已知源码率超限时选择服务端转码，未知码率不会因此误触发转码。",
         "兼容 Emby 客户端通过 DeviceProfile 声明直放和 HLS 转码能力，并在直放 profile 不匹配时协商服务端转码的 PlaybackInfo 请求。",
+        "对齐 Emby 服务端转码 offer：补齐标准设备、codec、码率、轨道和 HLS 分片参数，实际转码 offer 不再暴露竞争性的 DirectStreamUrl。",
         "修复 Lux 内部生成或写入图片后触发实时扫描的问题；外部图片更新仍可使内部写入抑制标记失效。",
         "媒体探测信息缺失时，不再将未知的容器或编解码信息误判为直放不兼容，避免意外协商服务端转码。",
         "修复实时增量扫描未及时探测新增或变化的本地媒体源的问题；未变化的媒体源和 .strm 不会交给普通 ffprobe。",
