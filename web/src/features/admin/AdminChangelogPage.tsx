@@ -31,6 +31,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "兼容 Emby 客户端通过 DeviceProfile 声明直放和 HLS 转码能力，并在直放 profile 不匹配时协商服务端转码的 PlaybackInfo 请求。",
         "修复 Lux 内部生成或写入图片后触发实时扫描的问题；外部图片更新仍可使内部写入抑制标记失效。",
         "媒体探测信息缺失时，不再将未知的容器或编解码信息误判为直放不兼容，避免意外协商服务端转码。",
+        "修复实时增量扫描未及时探测新增或变化的本地媒体源的问题；未变化的媒体源和 .strm 不会交给普通 ffprobe。",
       ] },
       { kind: "changed", items: [
         "调整本地图片、在线刮削图片和 FFmpeg 截图回退的优先级；已有本地或刮削器图片不会被截图覆盖，缺失的图片类型可独立补全。",
@@ -39,6 +40,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "扩展 Emby PlaybackInfo 协商兼容性：POST 的 forceTranscode=true 可覆盖直放请求，GET 不会因该参数创建转码会话；本地媒体正确声明服务端转码能力，.strm 仍保持直放限制。",
         "对齐 Lux Web API 类型定义，补充播放次数、排序标题、人物创建时间、首页最近添加总数及播放状态条目 ID 等字段。",
         "补充 Emby HLS 转码协商和资源请求诊断日志，以有限的资源类别、状态码和耗时帮助排查播放问题。",
+        "优化实时增量扫描流程，仅在后台处理本次任务登记的新增或变化本地 source，并保持 .strm 的定向插件探测边界。",
       ] },
     ],
   },
