@@ -29,6 +29,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复插件配置提交清单未声明的 UI 字段，避免旧版或能力不同的插件收到不支持的配置项。",
         "修复 Emby 客户端仅发送 EnableTranscoding=true、省略 EnableDirectPlay 时未进入服务端转码的问题。",
         "修复 Emby 客户端将 PlaybackInfo 播放开关放在 POST 查询参数、而将 DeviceProfile 放在 body 时未触发服务端转码的问题。",
+        "修复 Emby 转码 offer 已准备但仍保留直放入口的问题；实际选择服务端转码时关闭直放能力并返回可用的转码 URL，同时保留可转码能力供客户端重试。",
         "兼容 Emby 客户端通过 DeviceProfile 声明直放和 HLS 转码能力，并在直放 profile 不匹配时协商服务端转码的 PlaybackInfo 请求。",
         "修复 Lux 内部生成或写入图片后触发实时扫描的问题；外部图片更新仍可使内部写入抑制标记失效。",
         "媒体探测信息缺失时，不再将未知的容器或编解码信息误判为直放不兼容，避免意外协商服务端转码。",
