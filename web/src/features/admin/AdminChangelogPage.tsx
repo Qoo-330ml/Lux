@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.4",
+    date: "2026-09-16",
+    sections: [
+      { kind: "fixed", items: [
+        "修复 Emby 实时 HLS 转码的播放时长被动态清单片段长度误导的问题；PlaybackInfo 顶层和媒体源现在返回完整 RunTimeTicks，并在源时长缺失时回退到媒体项时长。",
+        "修复用户放弃播放或发送停止事件后旧 Emby 转码会话未及时释放的问题，及时停止 FFmpeg 并清理相关播放资源。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.3",
     date: "2026-09-16",
     sections: [
