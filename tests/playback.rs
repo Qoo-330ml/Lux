@@ -796,9 +796,19 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
 
     let device_profile_transcoding = client
         .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .header(
+            AUTHORIZATION,
+            format!(
+                r#"Emby Client="Harbor", Device="Desktop", DeviceId="harbor-device", Version="1", Token="{token}""#
+            ),
+        )
         .query(&[("api_key", token.as_str())])
         .json(&json!({
             "MediaSourceId": source_id,
+            "AudioStreamIndex": 1,
+            "SubtitleStreamIndex": -1,
+            "MaxAudioChannels": 2,
+            "StartTimeTicks": 1000,
             "DeviceProfile": {
                 "DirectPlayProfiles": [{
                     "Container": "mp4",
@@ -831,10 +841,40 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         device_profile_body["MediaSources"][0]["SupportsDirectStream"],
         false
     );
+    assert!(
+        device_profile_body["MediaSources"][0]["DirectStreamUrl"].is_null(),
+        "a transcoding offer must not expose a competing direct stream URL"
+    );
     let device_profile_url = device_profile_body["MediaSources"][0]["TranscodingUrl"]
         .as_str()
         .ok_or("missing DeviceProfile transcoding URL")?;
     assert!(device_profile_url.starts_with(&format!("/Videos/{emby_item_id}/master.m3u8?")));
+    for expected in [
+        "DeviceId=harbor-device",
+        "MediaSourceId=",
+        "PlaySessionId=lux-emby%3A",
+        "VideoCodec=h264",
+        "AudioCodec=aac",
+        "AudioStreamIndex=1",
+        "SubtitleStreamIndex=-1",
+        "TranscodingMaxAudioChannels=2",
+        "StartTimeTicks=1000",
+        "SegmentContainer=mp4",
+        "MinSegments=1",
+        "BreakOnNonKeyFrames=True",
+    ] {
+        assert!(
+            device_profile_url.contains(expected),
+            "missing standard Emby transcoding parameter {expected}: {device_profile_url}"
+        );
+    }
+    assert!(!device_profile_url.contains("api_key="));
+    let device_profile_manifest = client
+        .get(format!("{base_url}{device_profile_url}"))
+        .send()
+        .await?;
+    assert_eq!(device_profile_manifest.status(), reqwest::StatusCode::OK);
+    assert!(device_profile_manifest.text().await?.contains("#EXTM3U"));
     let device_profile_play_session_id = device_profile_body["PlaySessionId"]
         .as_str()
         .ok_or("missing DeviceProfile play session")?

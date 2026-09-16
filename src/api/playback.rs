@@ -1,6 +1,9 @@
 use super::*;
 
-use crate::application::playback::session::CreatedWebPlaybackSession;
+use crate::application::playback::{
+    decision::ServerTier,
+    session::{CreatedWebPlaybackSession, WebPlaybackPlan},
+};
 use crate::storage::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 
 pub(super) async fn emby_playback_info(
@@ -17,6 +20,7 @@ pub(super) async fn emby_playback_info(
         Err(status) => return status.into_response(),
     };
     request.apply_query_parameters(&raw_query);
+    let device_id = emby_playback_device_id(&headers, &raw_query);
     let query = emby_stream_query_from_raw(raw_query);
     let standard_api_key =
         standard_emby_playback_api_key(&headers, query.api_key.as_deref(), &state).await;
@@ -168,47 +172,59 @@ pub(super) async fn emby_playback_info(
                 let has_direct_stream_url = value
                     .get("DirectStreamUrl")
                     .is_some_and(Value::is_string);
-                if has_direct_stream_url
-                    && let Some(service) = state.web_playback.as_ref()
-                    && let Some(url) = emby_signed_direct_stream_url(
-                        service,
-                        &item.id,
-                        source,
-                        &user,
-                        if emby_source_needs_proxy_identity(source) {
-                            standard_api_key.as_deref()
-                        } else {
-                            None
-                        },
-                    )
-                    && let Value::Object(object) = &mut value
-                {
-                    object.insert("DirectStreamUrl".to_owned(), json!(url));
-                    // Third-party clients may send the media request through
-                    // an independent stack. External proxies use the
-                    // standard Emby token to identify the proxy user, while
-                    // Lux still requires the signed ticket. For URL/path STRM
-                    // sources the token is already embedded for clients that
-                    // ignore AddApiKeyToDirectStreamUrl.
-                    object.insert(
-                        "AddApiKeyToDirectStreamUrl".to_owned(),
-                        json!(emby_source_needs_proxy_identity(source)),
-                    );
-                    if source_transcode_session.is_some()
-                        && let Some(session) = transcode_session.as_ref()
+                let transcoding_url = source_transcode_session
+                    .as_ref()
+                    .and_then(|session| {
+                        state.web_playback.as_ref().and_then(|service| {
+                            emby_transcoding_url(
+                                service,
+                                &item.id,
+                                source,
+                                session,
+                                &request,
+                                &device_id,
+                            )
+                        })
+                    });
+                if let Value::Object(object) = &mut value {
+                    if source_transcode_session.is_none()
+                        && has_direct_stream_url
                         && let Some(service) = state.web_playback.as_ref()
-                        && let Some(url) = emby_transcoding_url(
+                        && let Some(url) = emby_signed_direct_stream_url(
                             service,
                             &item.id,
                             source,
-                            session,
+                            &user,
+                            if emby_source_needs_proxy_identity(source) {
+                                standard_api_key.as_deref()
+                            } else {
+                                None
+                            },
                         )
                     {
+                        object.insert("DirectStreamUrl".to_owned(), json!(url));
+                        // Third-party clients may send the media request through
+                        // an independent stack. External proxies use the
+                        // standard Emby token to identify the proxy user, while
+                        // Lux still requires the signed ticket. For URL/path STRM
+                        // sources the token is already embedded for clients that
+                        // ignore AddApiKeyToDirectStreamUrl.
+                        object.insert(
+                            "AddApiKeyToDirectStreamUrl".to_owned(),
+                            json!(emby_source_needs_proxy_identity(source)),
+                        );
+                    }
+                    if let Some(url) = transcoding_url {
                         object.insert("SupportsTranscoding".to_owned(), json!(true));
                         object.insert("TranscodingUrl".to_owned(), json!(url));
                         object.insert("TranscodingSubProtocol".to_owned(), json!("hls"));
                         object.insert("TranscodingContainer".to_owned(), json!("mp4"));
                         object.insert("TranscodingMimeType".to_owned(), json!("video/mp4"));
+                        // An Emby transcoding MediaSourceInfo does not expose
+                        // a competing direct URL. Native players otherwise may
+                        // select DirectStreamUrl before inspecting TranscodingUrl.
+                        object.insert("DirectStreamUrl".to_owned(), Value::Null);
+                        object.insert("AddApiKeyToDirectStreamUrl".to_owned(), json!(false));
                     }
                 }
                 if let Some(session) = transcode_session
@@ -265,6 +281,14 @@ struct EmbyPlaybackInfoRequest {
     allow_video_stream_copy: Option<bool>,
     #[serde(rename = "AllowAudioStreamCopy", alias = "allowAudioStreamCopy")]
     allow_audio_stream_copy: Option<bool>,
+    #[serde(rename = "AudioStreamIndex", alias = "audioStreamIndex")]
+    audio_stream_index: Option<i64>,
+    #[serde(rename = "SubtitleStreamIndex", alias = "subtitleStreamIndex")]
+    subtitle_stream_index: Option<i64>,
+    #[serde(rename = "MaxAudioChannels", alias = "maxAudioChannels")]
+    max_audio_channels: Option<i64>,
+    #[serde(rename = "StartTimeTicks", alias = "startTimeTicks")]
+    start_time_ticks: Option<i64>,
     #[serde(rename = "DeviceProfile", alias = "deviceProfile")]
     device_profile: Option<EmbyDeviceProfile>,
 }
@@ -439,6 +463,8 @@ struct EmbyPlaybackProfile {
     video_codec: Option<String>,
     #[serde(rename = "AudioCodec", alias = "audioCodec")]
     audio_codec: Option<String>,
+    #[serde(rename = "MaxAudioChannels", alias = "maxAudioChannels")]
+    max_audio_channels: Option<i64>,
     #[serde(rename = "Protocol", alias = "protocol")]
     protocol: Option<String>,
     #[serde(rename = "Type", alias = "type")]
@@ -1658,17 +1684,210 @@ fn emby_transcoding_url(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     session: &CreatedWebPlaybackSession,
+    request: &EmbyPlaybackInfoRequest,
+    device_id: &str,
 ) -> Option<String> {
     let signature = service.sign_resource(&session.id, "hls:index.m3u8", session.expires_at)?;
     let public_item_id = emby_public_id(item_id);
+    let tier = match &session.plan {
+        WebPlaybackPlan::ServerHls { tier } => *tier,
+        _ => ServerTier::SoftwareTranscode,
+    };
+    let hls_profile = request.device_profile.as_ref().and_then(|profile| {
+        profile.transcoding_profiles.iter().find(|profile| {
+            is_video_profile(profile.profile_type.as_deref()) && is_hls_profile(profile)
+        })
+    });
+    let video_codec = hls_profile
+        .and_then(|profile| first_profile_value(profile.video_codec.as_deref()))
+        .or_else(|| {
+            (tier != ServerTier::HardwareTranscode && tier != ServerTier::SoftwareTranscode)
+                .then(|| source_stream_codec(source, "VIDEO").map(str::to_owned))
+                .flatten()
+        })
+        .unwrap_or_else(|| "h264".to_owned());
+    let audio_codec = hls_profile
+        .and_then(|profile| first_profile_value(profile.audio_codec.as_deref()))
+        .or_else(|| {
+            (tier != ServerTier::AudioTranscode
+                && tier != ServerTier::HardwareTranscode
+                && tier != ServerTier::SoftwareTranscode)
+                .then(|| source_stream_codec(source, "AUDIO").map(str::to_owned))
+                .flatten()
+        })
+        .unwrap_or_else(|| "aac".to_owned());
+    let mut query = url::form_urlencoded::Serializer::new(String::new());
+    query.append_pair("DeviceId", device_id);
+    query.append_pair("MediaSourceId", &source.id);
+    query.append_pair("PlaySessionId", &session.play_session_id);
+    query.append_pair("VideoCodec", &video_codec);
+    query.append_pair("AudioCodec", &audio_codec);
+    if let Some(video_bitrate) = emby_transcoding_video_bitrate(source, request) {
+        query.append_pair("VideoBitrate", &video_bitrate.to_string());
+    }
+    if let Some(audio_bitrate) = emby_transcoding_audio_bitrate(source, tier) {
+        query.append_pair("AudioBitrate", &audio_bitrate.to_string());
+    }
+    let audio_stream_index = request
+        .audio_stream_index
+        .or_else(|| source_stream_index(source, "AUDIO"))
+        .unwrap_or(-1);
+    query.append_pair("AudioStreamIndex", &audio_stream_index.to_string());
+    if let Some(subtitle_stream_index) = request.subtitle_stream_index {
+        query.append_pair("SubtitleStreamIndex", &subtitle_stream_index.to_string());
+    }
+    if let Some(max_audio_channels) = request
+        .max_audio_channels
+        .or_else(|| hls_profile.and_then(|profile| profile.max_audio_channels))
+    {
+        query.append_pair(
+            "TranscodingMaxAudioChannels",
+            &max_audio_channels.to_string(),
+        );
+    }
+    if let Some(start_time_ticks) = request.start_time_ticks.filter(|ticks| *ticks > 0) {
+        query.append_pair("StartTimeTicks", &start_time_ticks.to_string());
+    }
+    query.append_pair("SegmentContainer", "mp4");
+    query.append_pair("MinSegments", "1");
+    query.append_pair("BreakOnNonKeyFrames", "True");
+    query.append_pair("TranscodeReasons", emby_transcode_reason(request, source));
+    query.append_pair("luxPlaybackSessionId", &session.id);
+    query.append_pair("luxPlaybackExpires", &signature.expires_at.to_string());
+    query.append_pair("luxPlaybackSignature", &signature.signature);
     Some(format!(
-        "/Videos/{public_item_id}/master.m3u8?MediaSourceId={}&PlaySessionId={}&luxPlaybackSessionId={}&luxPlaybackExpires={}&luxPlaybackSignature={}",
-        source.id,
-        percent_encode_filename(&session.play_session_id),
-        session.id,
-        signature.expires_at,
-        signature.signature,
+        "/Videos/{public_item_id}/master.m3u8?{}",
+        query.finish()
     ))
+}
+
+fn emby_playback_device_id(headers: &HeaderMap, raw_query: &RawQuery) -> String {
+    let query_device_id = raw_query.0.as_deref().and_then(|raw_query| {
+        url::form_urlencoded::parse(raw_query.as_bytes()).find_map(|(name, value)| {
+            name.eq_ignore_ascii_case("DeviceId")
+                .then(|| non_empty_device_id(value.as_ref()))
+                .flatten()
+        })
+    });
+    query_device_id
+        .or_else(|| {
+            ["X-Emby-Device-Id", "X-MediaBrowser-Device-Id"]
+                .into_iter()
+                .find_map(|name| {
+                    headers
+                        .get(name)
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(non_empty_device_id)
+                })
+        })
+        .or_else(|| non_empty_device_id(&emby_device_info_from_headers(headers).device_id))
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
+fn non_empty_device_id(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.chars().count() <= 128).then(|| value.to_owned())
+}
+
+fn non_empty_profile_value(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
+}
+
+fn first_profile_value(value: Option<&str>) -> Option<String> {
+    non_empty_profile_value(value)?
+        .split(',')
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn source_stream_codec<'a>(
+    source: &'a crate::application::catalog::CatalogSource,
+    stream_type: &str,
+) -> Option<&'a str> {
+    source
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type.eq_ignore_ascii_case(stream_type))
+        .and_then(|stream| non_empty_profile_value(stream.codec.as_deref()))
+}
+
+fn source_stream_index(
+    source: &crate::application::catalog::CatalogSource,
+    stream_type: &str,
+) -> Option<i64> {
+    source
+        .streams
+        .iter()
+        .find(|stream| stream.stream_type.eq_ignore_ascii_case(stream_type) && stream.is_default)
+        .or_else(|| {
+            source
+                .streams
+                .iter()
+                .find(|stream| stream.stream_type.eq_ignore_ascii_case(stream_type))
+        })
+        .map(|stream| stream.index)
+}
+
+fn stream_detail_i64(
+    stream: &crate::application::catalog::CatalogStream,
+    name: &str,
+) -> Option<i64> {
+    stream
+        .details
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| match value {
+            Value::Number(value) => value.as_i64(),
+            Value::String(value) => value.trim().parse::<i64>().ok(),
+            _ => None,
+        })
+        .filter(|value| *value > 0)
+}
+
+fn emby_transcoding_video_bitrate(
+    source: &crate::application::catalog::CatalogSource,
+    request: &EmbyPlaybackInfoRequest,
+) -> Option<i64> {
+    let bitrate = source.bitrate.filter(|value| *value > 0)?;
+    Some(
+        request
+            .effective_max_streaming_bitrate()
+            .filter(|value| *value > 0)
+            .map_or(bitrate, |limit| bitrate.min(limit)),
+    )
+}
+
+fn emby_transcoding_audio_bitrate(
+    source: &crate::application::catalog::CatalogSource,
+    tier: ServerTier,
+) -> Option<i64> {
+    if matches!(
+        tier,
+        ServerTier::AudioTranscode | ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    ) {
+        return Some(192_000);
+    }
+    source
+        .streams
+        .iter()
+        .filter(|stream| stream.stream_type.eq_ignore_ascii_case("AUDIO"))
+        .find_map(|stream| stream_detail_i64(stream, "BitRate"))
+}
+
+fn emby_transcode_reason(
+    request: &EmbyPlaybackInfoRequest,
+    source: &crate::application::catalog::CatalogSource,
+) -> &'static str {
+    if request.source_exceeds_streaming_bitrate(source) {
+        "ContainerBitrateExceedsLimit"
+    } else if request.device_profile.as_ref().is_some_and(|profile| {
+        profile.direct_play_compatibility(source) == EmbyProfileCompatibility::Incompatible
+    }) {
+        "ContainerNotSupported"
+    } else {
+        "DirectPlayError"
+    }
 }
 
 fn emby_hls_asset_kind(asset: &str) -> &'static str {

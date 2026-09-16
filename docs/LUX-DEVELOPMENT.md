@@ -6168,7 +6168,8 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
   Direct Play 行为。
 - 本地媒体源在选择服务端转码时返回 `SupportsTranscoding=true`、`TranscodingUrl`、
   `TranscodingSubProtocol=hls`、`TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
-  URL 指向标准 Emby `master.m3u8` 入口；清单中的初始化片段和媒体片段继续使用当前会话的短期签名 URL。
+  URL 指向标准 Emby `master.m3u8` 入口，并带有 `DeviceId`、输出 codec、码率、轨道索引和 fMP4 分片参数；
+  实际转码 offer 的 `DirectStreamUrl` 为 `null`，清单中的初始化片段和媒体片段继续使用当前会话的短期签名 URL。
 - 转码会话复用 `web_playback_sessions`，其 `PlaySessionId` 可被 Emby `Sessions/Playing`、`Progress` 和
   `Stopped` 回调关联；播放/暂停刷新 TTL，停止立即回收 FFmpeg 进程和临时目录。没有回调时仍由服务端
   过期清理回收。
@@ -6189,8 +6190,8 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
 
 验证：见 `docs/LUX-254-PLAN.md`；本机 `uname -m` 结果不外推 NAS/x86_64 性能或所有客户端兼容性。
 
-验证记录（2026-09-15）：`cargo build --locked`、`cargo test --locked --test playback`（3 个通过）、
-`cargo test --locked --lib playback`（45 个通过）和 `cargo fmt --all -- --check` 通过；转码集成测试使用
+验证记录（2026-09-16）：`cargo test --locked --test playback`（3 个通过）、
+`cargo test --locked --lib playback`（52 个通过）和 `cargo fmt --all -- --check` 通过；转码集成测试使用
 fake FFmpeg 实际读取 master manifest、init 和 m4s 片段，并验证回调刷新、停止清理、ACL、签名和 `.strm`
 边界，以及 `forceTranscode` POST 查询、GET 直放、省略 `EnableDirectPlay`、标准 Enable 标志组合、
 `DeviceProfile` 和不兼容 codec 不复制的兼容行为。`cargo test --locked --all-targets` 首次运行在并发运行时因既有

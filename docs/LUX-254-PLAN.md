@@ -21,6 +21,9 @@
    转码 profile 时选择服务端转码，码率未知时不因未知值触发转码。
 3. HLS 输出继续使用现有 fMP4/CMAF 资产，Emby 对外声明 `TranscodingSubProtocol=hls`、
    `TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
+   `TranscodingUrl` 同时返回 Emby 播放器通常使用的 `DeviceId`、输出 codec、码率、轨道索引、
+   `SegmentContainer=mp4`、`MinSegments`、`BreakOnNonKeyFrames` 和 `TranscodeReasons` 参数；实际转码 offer
+   的 `DirectStreamUrl` 为 `null`，避免客户端绕过转码入口。Lux 的短期 HMAC 参数作为额外安全约束保留。
 4. `.strm` 是 Direct-only；本任务不扩大它的服务端处理边界。
 5. 第三方客户端可能不发送 Web 心跳，因此 Emby 播放回调负责刷新转码会话，回调缺失时依靠现有 TTL
    和孤儿目录清理。
@@ -67,6 +70,8 @@
 
 - 每个资源签名绑定 session、asset 和过期时间；服务端额外检查 session 的 user/item/source/plan。
 - 资源请求不依赖 Web Cookie，也不把 API token 放入 `TranscodingUrl`。
+- 转码 URL 的标准 Emby 参数只描述本次会话的设备和转码选择；设备 ID 从请求 query、标准设备 ID 请求头或
+  Emby 鉴权头取得，缺失时使用 `unknown`，不把长期 API token 写入 URL。
 - 转码输入只允许 `canonical_local_media_path` 返回的本地普通文件；`.strm`、路径穿越和外部目标拒绝。
 - 不新增迁移、不修改 Web DTO、不实现服务器字幕转换、DRM 或自适应多码率。
 
