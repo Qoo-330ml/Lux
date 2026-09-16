@@ -16,7 +16,7 @@ type ChangelogRelease = {
 export const changelogReleases: ChangelogRelease[] = [
   {
     version: "0.4.3",
-    date: "2026-09-15",
+    date: "2026-09-16",
     sections: [
       { kind: "added", items: [
         "本地视频在缺少有效海报或缩略图时，可从同一画面生成独立的竖版 POSTER 和横版 THUMB 回退图片。",
@@ -30,6 +30,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 Emby 客户端仅发送 EnableTranscoding=true、省略 EnableDirectPlay 时未进入服务端转码的问题。",
         "兼容 Emby 客户端通过 DeviceProfile 声明直放和 HLS 转码能力，并在直放 profile 不匹配时协商服务端转码的 PlaybackInfo 请求。",
         "修复 Lux 内部生成或写入图片后触发实时扫描的问题；外部图片更新仍可使内部写入抑制标记失效。",
+        "媒体探测信息缺失时，不再将未知的容器或编解码信息误判为直放不兼容，避免意外协商服务端转码。",
       ] },
       { kind: "changed", items: [
         "调整本地图片、在线刮削图片和 FFmpeg 截图回退的优先级；已有本地或刮削器图片不会被截图覆盖，缺失的图片类型可独立补全。",
@@ -37,6 +38,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "首页继续观看内容改为每次请求实时读取，其他稳定首页内容继续使用缓存，播放进度变化可以更快反映在首页。",
         "扩展 Emby PlaybackInfo 协商兼容性：POST 的 forceTranscode=true 可覆盖直放请求，GET 不会因该参数创建转码会话；本地媒体正确声明服务端转码能力，.strm 仍保持直放限制。",
         "对齐 Lux Web API 类型定义，补充播放次数、排序标题、人物创建时间、首页最近添加总数及播放状态条目 ID 等字段。",
+        "补充 Emby HLS 转码协商和资源请求诊断日志，以有限的资源类别、状态码和耗时帮助排查播放问题。",
       ] },
     ],
   },
