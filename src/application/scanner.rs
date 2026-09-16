@@ -4830,11 +4830,7 @@ impl ScanJobService {
                         return Err(error);
                     }
                     Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
-                    for target_type in ["SOURCE", "ITEM"] {
-                        self.database
-                            .skip_pending_scan_job_target_stage(job_id, target_type, "PROBE")
-                            .await?;
-                    }
+                    self.run_probe_after_scan(job_id, probe).await?;
                     self.run_thumbnails_after_incremental_scan(job_id, thumbnails)
                         .await?;
                     for target_type in ["SOURCE", "ITEM"] {
@@ -5504,6 +5500,9 @@ impl ScanJobService {
                 );
                 self.record_event(job_id, "INFO", "PROBE_COMPLETED", "媒体探测完成", &details)
                     .await;
+                self.database
+                    .skip_pending_scan_job_target_stage(job_id, "SOURCE", "PROBE")
+                    .await?;
             }
             Err(error) => {
                 tracing::warn!(job_id, %error, "scan completed but media probe failed");

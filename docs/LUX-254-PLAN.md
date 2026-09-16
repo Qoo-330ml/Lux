@@ -21,6 +21,8 @@
 4. `.strm` 是 Direct-only；本任务不扩大它的服务端处理边界。
 5. 第三方客户端可能不发送 Web 心跳，因此 Emby 播放回调负责刷新转码会话，回调缺失时依靠现有 TTL
    和孤儿目录清理。
+6. 客户端 profile 协商依赖已知的本地媒体 codec；实时增量扫描必须在后台仅探测本次新建/变化的
+   `LOCAL_FILE` source，不能把待插件处理的 `.strm` source 交给普通 ffprobe，也不能退化为全库扫描。
 
 ## 接口合同
 
@@ -67,6 +69,8 @@
 - `src/api/emby.rs`：注册 Emby 转码路由。
 - `src/api/legacy.rs`：允许转码路径通过未匹配 Emby video path 防护。
 - `tests/playback.rs`：覆盖协商、真实 HLS 资产、ACL、签名、`.strm` 和回调清理。
+- `src/application/scanner.rs`、`src/storage/jobs.rs`、`tests/scanning_jobs.rs`：确保增量扫描只探测本任务
+  新建/变化的本地 source，并保留 `.strm` 的插件探测边界。
 - `docs/API.md`、`docs/COMPATIBILITY.md`：更新公共合同与验证状态。
 
 ## 验证命令

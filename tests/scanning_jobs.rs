@@ -2077,6 +2077,97 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
 
 #[cfg(unix)]
 #[tokio::test]
+async fn incremental_scan_probes_only_changed_local_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let changed_path = "Changed Movie (2024)/Changed.Movie.2024.mp4";
+    let unchanged_path = "Unchanged Movie (2023)/Unchanged.Movie.2023.mp4";
+    let strm_path = "Remote Movie (2022)/Remote.Movie.2022.strm";
+    tokio::fs::create_dir_all(root.join("Changed Movie (2024)")).await?;
+    tokio::fs::create_dir_all(root.join("Unchanged Movie (2023)")).await?;
+    tokio::fs::create_dir_all(root.join("Remote Movie (2022)")).await?;
+    tokio::fs::write(root.join(changed_path), b"fixture").await?;
+    tokio::fs::write(root.join(unchanged_path), b"fixture").await?;
+    tokio::fs::write(root.join(strm_path), "https://example.invalid/media.mkv\n").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial_scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial_scan.id, 100, None).await?;
+
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        r#"#!/bin/sh
+printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"}]}'
+"#,
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let incremental_scan = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            [changed_path, strm_path]
+                .into_iter()
+                .map(|relative_path| IncrementalScanChange {
+                    root_id: root_record.id.to_string(),
+                    relative_path: relative_path.to_owned(),
+                    kind: ChangeKind::Modify,
+                })
+                .collect(),
+        )
+        .await?;
+    let probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    jobs.run_to_completion(&incremental_scan.id, 100, Some(probe))
+        .await?;
+
+    let sources: Vec<(String, String)> = sqlx::query_as(
+        "SELECT fe.relative_path, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         ORDER BY fe.relative_path",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        sources,
+        vec![
+            (changed_path.to_owned(), "READY".to_owned()),
+            (strm_path.to_owned(), "PENDING".to_owned()),
+            (unchanged_path.to_owned(), "PENDING".to_owned()),
+        ]
+    );
+    let remaining_targets: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&incremental_scan.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_targets, 0);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn scan_postprocessing_persists_the_current_stage_while_ffprobe_runs()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};
