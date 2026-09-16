@@ -11,8 +11,10 @@
 1. Emby 客户端通过 `POST /Items/{itemId}/PlaybackInfo` 的 `PlaybackInfoRequest` 表达播放能力。
 2. `EnableDirectPlay=true` 时默认优先返回现有直放能力；POST 明确要求转码且
    `EnableDirectPlay` 未设置或为 `false` 时创建 Lux 服务端 HLS 会话。若客户端同时允许直放和转码，
-   则按标准 `DeviceProfile.DirectPlayProfiles` 匹配本地媒体源；直放 profile 不匹配且存在 HLS
-   `TranscodingProfiles` 时创建服务端 HLS 会话。没有顶层布尔值时同样按 `DeviceProfile` 协商。
+   则按标准 `DeviceProfile.DirectPlayProfiles` 匹配本地媒体源；只有容器和音视频 codec 信息已知且确认直放 profile
+   不匹配、同时存在 HLS `TranscodingProfiles` 时才创建服务端 HLS 会话。缺失/待探测元数据视为未知，不当作不匹配；
+   没有顶层布尔值时同样按 `DeviceProfile` 协商。明确设置 `EnableTranscoding=true` 并禁用直放或 `forceTranscode=true`
+   仍按客户端明确选择启动转码。
    POST 查询参数 `forceTranscode=true` 可覆盖直放请求，兼容把强制转码选项放在 URL 上的第三方客户端。
 3. HLS 输出继续使用现有 fMP4/CMAF 资产，Emby 对外声明 `TranscodingSubProtocol=hls`、
    `TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
@@ -35,7 +37,7 @@
     `EnableDirectPlay=true`；GET 不因该参数创建转码会话。
   - 客户端同时允许直放和转码，或未提供顶层 `Enable...` 布尔值时，使用
     `DeviceProfile.DirectPlayProfiles` 匹配媒体源的 `Container`、视频 codec 和音频 codec；直放 profile
-    不匹配且 `TranscodingProfiles` 声明 HLS 时选择服务端转码。
+    确认不匹配且 `TranscodingProfiles` 声明 HLS 时选择服务端转码；源容器/codec 缺失时不得将未知当作不匹配。
   - 本地 source 返回 `SupportsTranscoding` 与带 HMAC 票据的 `TranscodingUrl`。
   - `.strm` source 保持 `SupportsTranscoding=false`，不返回 `TranscodingUrl`。
 

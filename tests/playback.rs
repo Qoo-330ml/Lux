@@ -689,6 +689,72 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         0
     );
 
+    sqlx::query("DELETE FROM media_streams WHERE media_source_id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE media_sources SET probe_status = 'PENDING', probe_error = NULL WHERE id = ?",
+    )
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+    let unknown_stream_profile = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Container": "mkv",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Type": "Video"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Protocol": "hls",
+                    "Type": "Video"
+                }]
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(unknown_stream_profile.status(), reqwest::StatusCode::OK);
+    let unknown_stream_profile_body = unknown_stream_profile.json::<Value>().await?;
+    assert!(unknown_stream_profile_body["MediaSources"][0]["DirectStreamUrl"].is_string());
+    assert!(
+        unknown_stream_profile_body["MediaSources"][0]
+            .get("TranscodingUrl")
+            .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS' AND state = 'ACTIVE'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+
+    sqlx::query("UPDATE media_sources SET probe_status = 'READY', probe_error = NULL WHERE id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_streams
+         (id, media_source_id, stream_index, stream_type, codec, is_default)
+         VALUES (?, ?, 0, 'VIDEO', 'hevc', 1), (?, ?, 1, 'AUDIO', 'aac', 1)",
+    )
+    .bind(format!("{source_id}-video"))
+    .bind(&source_id)
+    .bind(format!("{source_id}-audio"))
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+
     let device_profile_transcoding = client
         .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .query(&[("api_key", token.as_str())])

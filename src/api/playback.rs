@@ -233,14 +233,18 @@ impl EmbyPlaybackInfoRequest {
                 return true;
             }
             return self.device_profile.as_ref().is_some_and(|profile| {
-                profile.supports_lux_hls() && !profile.supports_direct_play(source)
+                profile.supports_lux_hls()
+                    && profile.direct_play_compatibility(source)
+                        == EmbyProfileCompatibility::Incompatible
             });
         }
         if self.force_explicitly_selects_a_plan() {
             return false;
         }
         self.device_profile.as_ref().is_some_and(|profile| {
-            profile.supports_lux_hls() && !profile.supports_direct_play(source)
+            profile.supports_lux_hls()
+                && profile.direct_play_compatibility(source)
+                    == EmbyProfileCompatibility::Incompatible
         })
     }
 
@@ -301,6 +305,13 @@ struct EmbyPlaybackProfile {
     profile_type: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmbyProfileCompatibility {
+    Compatible,
+    Incompatible,
+    Unknown,
+}
+
 impl EmbyDeviceProfile {
     fn supports_lux_hls(&self) -> bool {
         self.transcoding_profiles.iter().any(|profile| {
@@ -308,7 +319,10 @@ impl EmbyDeviceProfile {
         })
     }
 
-    fn supports_direct_play(&self, source: &crate::application::catalog::CatalogSource) -> bool {
+    fn direct_play_compatibility(
+        &self,
+        source: &crate::application::catalog::CatalogSource,
+    ) -> EmbyProfileCompatibility {
         let video_codec = source
             .streams
             .iter()
@@ -319,12 +333,28 @@ impl EmbyDeviceProfile {
             .iter()
             .find(|stream| stream.stream_type.eq_ignore_ascii_case("AUDIO"))
             .and_then(|stream| stream.codec.as_deref());
-        self.direct_play_profiles.iter().any(|profile| {
-            is_video_profile(profile.profile_type.as_deref())
-                && profile_value_matches(profile.container.as_deref(), source.container.as_deref())
-                && codec_value_matches(profile.video_codec.as_deref(), video_codec)
-                && codec_value_matches(profile.audio_codec.as_deref(), audio_codec)
-        })
+        let mut has_unknown_profile = false;
+        for profile in &self.direct_play_profiles {
+            if !is_video_profile(profile.profile_type.as_deref()) {
+                continue;
+            }
+            match profile.direct_play_compatibility(
+                source.container.as_deref(),
+                video_codec,
+                audio_codec,
+            ) {
+                EmbyProfileCompatibility::Compatible => {
+                    return EmbyProfileCompatibility::Compatible;
+                }
+                EmbyProfileCompatibility::Unknown => has_unknown_profile = true,
+                EmbyProfileCompatibility::Incompatible => {}
+            }
+        }
+        if has_unknown_profile {
+            EmbyProfileCompatibility::Unknown
+        } else {
+            EmbyProfileCompatibility::Incompatible
+        }
     }
 
     fn supports_hls_video_copy(&self, source: &crate::application::catalog::CatalogSource) -> bool {
@@ -336,7 +366,8 @@ impl EmbyDeviceProfile {
         self.transcoding_profiles.iter().any(|profile| {
             is_video_profile(profile.profile_type.as_deref())
                 && is_hls_profile(profile)
-                && codec_value_matches(profile.video_codec.as_deref(), video_codec)
+                && codec_value_compatibility(profile.video_codec.as_deref(), video_codec)
+                    == EmbyProfileCompatibility::Compatible
         })
     }
 
@@ -349,8 +380,31 @@ impl EmbyDeviceProfile {
         self.transcoding_profiles.iter().any(|profile| {
             is_video_profile(profile.profile_type.as_deref())
                 && is_hls_profile(profile)
-                && codec_value_matches(profile.audio_codec.as_deref(), audio_codec)
+                && codec_value_compatibility(profile.audio_codec.as_deref(), audio_codec)
+                    == EmbyProfileCompatibility::Compatible
         })
+    }
+}
+
+impl EmbyPlaybackProfile {
+    fn direct_play_compatibility(
+        &self,
+        container: Option<&str>,
+        video_codec: Option<&str>,
+        audio_codec: Option<&str>,
+    ) -> EmbyProfileCompatibility {
+        let constraints = [
+            profile_value_compatibility(self.container.as_deref(), container, values_match),
+            codec_value_compatibility(self.video_codec.as_deref(), video_codec),
+            codec_value_compatibility(self.audio_codec.as_deref(), audio_codec),
+        ];
+        if constraints.contains(&EmbyProfileCompatibility::Incompatible) {
+            EmbyProfileCompatibility::Incompatible
+        } else if constraints.contains(&EmbyProfileCompatibility::Unknown) {
+            EmbyProfileCompatibility::Unknown
+        } else {
+            EmbyProfileCompatibility::Compatible
+        }
     }
 }
 
@@ -368,36 +422,44 @@ fn is_video_profile(profile_type: Option<&str>) -> bool {
     })
 }
 
-fn profile_value_matches(profile_value: Option<&str>, actual_value: Option<&str>) -> bool {
+fn profile_value_compatibility(
+    profile_value: Option<&str>,
+    actual_value: Option<&str>,
+    values_match: impl Fn(&str, &str) -> bool,
+) -> EmbyProfileCompatibility {
     let Some(profile_value) = profile_value
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return true;
-    };
-    actual_value.is_some_and(|actual_value| {
-        profile_value
-            .split(',')
-            .any(|candidate| candidate.trim().eq_ignore_ascii_case(actual_value.trim()))
-    })
-}
-
-fn codec_value_matches(profile_value: Option<&str>, actual_value: Option<&str>) -> bool {
-    let Some(profile_value) = profile_value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return true;
+        return EmbyProfileCompatibility::Compatible;
     };
     let Some(actual_value) = actual_value
         .map(str::trim)
         .filter(|value| !value.is_empty())
     else {
-        return false;
+        return EmbyProfileCompatibility::Unknown;
     };
-    profile_value
+    if profile_value
         .split(',')
-        .any(|candidate| normalize_emby_codec(candidate) == normalize_emby_codec(actual_value))
+        .any(|candidate| values_match(candidate.trim(), actual_value))
+    {
+        EmbyProfileCompatibility::Compatible
+    } else {
+        EmbyProfileCompatibility::Incompatible
+    }
+}
+
+fn codec_value_compatibility(
+    profile_value: Option<&str>,
+    actual_value: Option<&str>,
+) -> EmbyProfileCompatibility {
+    profile_value_compatibility(profile_value, actual_value, |candidate, actual| {
+        normalize_emby_codec(candidate) == normalize_emby_codec(actual)
+    })
+}
+
+fn values_match(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
 }
 
 fn normalize_emby_codec(value: &str) -> String {
@@ -2840,6 +2902,34 @@ mod emby_playback_tests {
         .expect("valid PlaybackInfo request");
         let source = profile_source("mkv", "hevc", "aac");
         assert!(request.requests_server_transcoding_for_source(false, &source));
+    }
+
+    #[test]
+    fn unknown_source_codecs_do_not_count_as_a_direct_play_mismatch() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [{
+                        "Container": "mkv",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Protocol": "hls",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid PlaybackInfo request");
+        let mut source = profile_source("mkv", "h264", "aac");
+        source.probe_status = "PENDING".to_owned();
+        source.streams.clear();
+
+        assert!(!request.requests_server_transcoding_for_source(false, &source));
     }
 
     #[test]
