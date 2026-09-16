@@ -66,7 +66,7 @@
 
 ### 播放回调
 
-- 转码 `PlaySessionId` 采用 Lux 可识别的前缀；`/Sessions/Playing` 与 `/Progress` 延长相应转码会话 TTL。
+- 转码 `PlaySessionId` 采用 Lux 可识别的前缀；`/Sessions/Playing` 与 `/Progress` 延长相应转码会话 TTL。播放回调的 `RunTimeTicks` 不覆盖服务端已探测到的媒体项/媒体源时长；只有服务端没有可用时长时，才使用客户端回调值作为兼容兜底，避免动态 HLS 清单长度成为会话总时长。
 - `/Stopped` 立即停止并清理该转码会话，同时保留现有 Emby 进度记录合同。
 
 ## 安全与边界

@@ -53,6 +53,10 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
+    sqlx::query("UPDATE media_sources SET duration_ticks = 1000 WHERE id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
     let emby_item_id = emby_public_id(&item_id);
 
     let auth = WebAuthService::new(database.clone())?;
@@ -92,9 +96,9 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let event = json!({
         "ItemId": emby_item_id,
         "MediaSourceId": source_id,
-        "PlaySessionId": "session-1",
+        "PlaySessionId": "lux-emby:session-1",
         "PositionTicks": 100,
-        "RunTimeTicks": 1000,
+        "RunTimeTicks": 5000,
     });
     let playing = client
         .post(&event_url)
@@ -135,9 +139,9 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
                 serde_json::to_vec(&json!({
                     "ItemId": high_item_id,
                     "MediaSourceId": high_source_id,
-                    "PlaySessionId": "session-1",
+                    "PlaySessionId": "lux-emby:session-1",
                     "PositionTicks": 900,
-                    "RunTimeTicks": 1000,
+                    "RunTimeTicks": 5000,
                 }))
                 .expect("playback progress fixture should serialize"),
             )
@@ -150,9 +154,9 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .json(&json!({
             "ItemId": event["ItemId"],
             "MediaSourceId": event["MediaSourceId"],
-            "PlaySessionId": "session-1",
+            "PlaySessionId": "lux-emby:session-1",
             "PositionTicks": 300,
-            "RunTimeTicks": 1000,
+            "RunTimeTicks": 5000,
         }))
         .send();
     let (high, low) = tokio::join!(high_request, low);
@@ -178,6 +182,35 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body[0]["ApplicationVersion"], "1");
     assert_eq!(sessions_body[0]["RemoteEndPoint"], "203.0.113.9");
 
+    sqlx::query("UPDATE playback_sessions SET duration_ticks = 5000 WHERE play_session_id = ?")
+        .bind("lux-emby:session-1")
+        .execute(database.pool())
+        .await?;
+    let sessions_after_legacy_duration = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let legacy_duration_session = sessions_after_legacy_duration
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["PlaySessionId"] == "lux-emby:session-1")
+        })
+        .ok_or("missing session with legacy duration")?;
+    assert_eq!(legacy_duration_session["RunTimeTicks"], 1000);
+    assert_eq!(
+        legacy_duration_session["NowPlayingItem"]["RunTimeTicks"],
+        1000
+    );
+
+    sqlx::query("UPDATE media_sources SET duration_ticks = NULL WHERE id = ?")
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
     sqlx::query("UPDATE media_items SET runtime_ticks = ? WHERE id = ?")
         .bind(8_000_i64)
         .bind(&item_id)
@@ -230,7 +263,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
          SET last_event_at = unixepoch() - 3600
          WHERE play_session_id = ?",
     )
-    .bind("session-1")
+    .bind("lux-emby:session-1")
     .execute(database.pool())
     .await?;
     let stale_sessions = client
@@ -253,7 +286,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
          SET last_event_at = unixepoch() - 120
          WHERE play_session_id = ?",
     )
-    .bind("session-1")
+    .bind("lux-emby:session-1")
     .execute(database.pool())
     .await?;
     let sessions_with_explicit_window = client
@@ -281,7 +314,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .body(serde_json::to_vec(&json!({
             "ItemId": event["ItemId"],
             "MediaSourceId": event["MediaSourceId"],
-            "PlaySessionId": "session-1",
+            "PlaySessionId": "lux-emby:session-1",
             "PositionTicks": 900,
         }))?)
         .send()
@@ -292,7 +325,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .header("X-Emby-Token", &token)
         .json(&json!({
             "ItemId": event["ItemId"],
-            "PlaySessionId": "session-1",
+            "PlaySessionId": "lux-emby:session-1",
             "PositionTicks": 800,
         }))
         .send()

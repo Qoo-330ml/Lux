@@ -1059,22 +1059,25 @@ pub(super) async fn handle_emby_playback_event(
         Ok(session) => session,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let duration_ticks = if let Some(duration_ticks) = request.duration_ticks {
-        Some(duration_ticks)
-    } else if let Some(duration_ticks) = previous_session
-        .as_ref()
-        .and_then(|session| session.duration_ticks)
-    {
-        Some(duration_ticks)
-    } else {
-        emby_playback_event_duration_ticks(
-            &state,
-            AccessPrincipal::new(user.id, user.is_admin),
-            &internal_item_id,
-            media_source_id,
-        )
-        .await
-    };
+    // A client playing a growing HLS playlist may report the currently
+    // available playlist length here. Prefer Lux's known source/item runtime
+    // so that callbacks cannot replace the canonical duration with that
+    // partial value. Fall back to the client only when the catalog has no
+    // usable runtime at all.
+    let duration_ticks = emby_playback_event_duration_ticks(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+        &internal_item_id,
+        media_source_id,
+    )
+    .await
+    .or_else(|| request.duration_ticks.filter(|duration| *duration > 0))
+    .or_else(|| {
+        previous_session
+            .as_ref()
+            .and_then(|session| session.duration_ticks)
+            .filter(|duration| *duration > 0)
+    });
     let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
     let occurred_at = current_unix_timestamp();
     let webhook_event = webhook_event_type_for_playback(
@@ -1368,10 +1371,10 @@ pub(super) async fn emby_sessions(
         Ok(sessions) => sessions,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let catalog_items = if sessions
-        .iter()
-        .any(|session| session.duration_ticks.is_none_or(|ticks| ticks <= 0))
-    {
+    let catalog_items = if sessions.iter().any(|session| {
+        session.duration_ticks.is_none_or(|ticks| ticks <= 0)
+            || session.play_session_id.starts_with("lux-emby:")
+    }) {
         let item_ids = sessions
             .iter()
             .map(|session| session.item_id.clone())
@@ -1463,28 +1466,20 @@ fn session_runtime_ticks(
     session: &crate::storage::StoredPlaybackSession,
     catalog_item: Option<&CatalogItem>,
 ) -> i64 {
-    session
-        .duration_ticks
-        .filter(|ticks| *ticks > 0)
-        .or_else(|| {
-            catalog_item.and_then(|item| {
-                item.runtime_ticks
-                    .filter(|ticks| *ticks > 0)
-                    .or_else(|| {
-                        item.media_sources
-                            .iter()
-                            .find(|source| source.is_default)
-                            .and_then(|source| source.duration_ticks)
-                            .filter(|ticks| *ticks > 0)
-                    })
-                    .or_else(|| {
-                        item.media_sources
-                            .iter()
-                            .find_map(|source| source.duration_ticks)
-                            .filter(|ticks| *ticks > 0)
-                    })
+    let catalog_runtime = catalog_item.and_then(|item| {
+        session
+            .media_source_id
+            .as_deref()
+            .and_then(|source_id| {
+                item.media_sources
+                    .iter()
+                    .find(|source| source.id == source_id)
             })
-        })
+            .and_then(|source| super::emby_catalog::emby_source_runtime_ticks(item, source))
+            .or_else(|| super::emby_catalog::emby_item_runtime_ticks(item))
+    });
+    catalog_runtime
+        .or_else(|| session.duration_ticks.filter(|ticks| *ticks > 0))
         .unwrap_or_default()
 }
 
