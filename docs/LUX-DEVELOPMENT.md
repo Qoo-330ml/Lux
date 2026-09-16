@@ -6222,6 +6222,11 @@ VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停
 （13 个通过）、播放目标 Clippy、格式检查和 `git diff --check` 通过。全量 Clippy 仍被未修改的
 `tests/item_merge.rs:32` 参数过多 lint 阻塞；本机 `uname -m` 为 `arm64`。FNOS 新镜像及真实第三方客户端播放尚待部署后验证。
 
+验证记录（2026-09-16 Emby 码率协商修复）：根据 FNOS 最新请求仍未进入转码、而本地源已探测为约 13.9 Mbps 的证据，
+新增 `MaxStreamingBitrate` 顶层/`DeviceProfile` 解析及码率超限回归；码率超过客户端限制时不再复制视频流，改选硬件或软件
+视频转码，并输出诊断字段 `source_bitrate`、`max_streaming_bitrate` 和 `source_bitrate_exceeds_limit`。`cargo test --locked --lib
+emby_playback_tests`（14 个通过）、格式检查和 `git diff --check` 通过；FNOS 新镜像及真实第三方客户端仍需部署后验证。
+
 依赖：LUX-198、LUX-199。
 
 明确不做：

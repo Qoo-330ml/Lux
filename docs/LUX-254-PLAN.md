@@ -17,6 +17,8 @@
    仍按客户端明确选择启动转码。
    POST 查询参数 `forceTranscode=true` 可覆盖直放请求，兼容把强制转码选项放在 URL 上的第三方客户端。
    Emby 对省略的播放开关按启用处理，因此只提交 `DeviceProfile` 的客户端也能完成标准协商。
+   `MaxStreamingBitrate`（顶层或 `DeviceProfile` 内）也参与协商；当本地 source 的已知码率超过该限制且声明了 HLS
+   转码 profile 时选择服务端转码，码率未知时不因未知值触发转码。
 3. HLS 输出继续使用现有 fMP4/CMAF 资产，Emby 对外声明 `TranscodingSubProtocol=hls`、
    `TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
 4. `.strm` 是 Direct-only；本任务不扩大它的服务端处理边界。
@@ -32,6 +34,7 @@
 - 接收 Emby 标准 `PlaybackInfoRequest` 的 `MediaSourceId`、`DeviceProfile`、`EnableDirectPlay`、
   `EnableDirectStream`、`EnableTranscoding`、`AllowVideoStreamCopy` 和 `AllowAudioStreamCopy` 等字段；
   五个播放开关同时兼容放在 POST URL 查询参数中，`DeviceProfile` 通常位于 JSON body。
+  同时接收 `MaxStreamingBitrate`，并兼容其放在 POST URL 查询参数中。
 - `GET` 或空 body `POST`：保持当前响应，不创建转码会话。
 - 明确要求服务端转码的 POST：
   - `MediaSourceId` 选择媒体源；query 参数仍可作为兼容回退。
@@ -42,6 +45,7 @@
   - 客户端同时允许直放和转码，或未提供顶层 `Enable...` 布尔值时，使用
     `DeviceProfile.DirectPlayProfiles` 匹配媒体源的 `Container`、视频 codec 和音频 codec；直放 profile
     确认不匹配且 `TranscodingProfiles` 声明 HLS 时选择服务端转码；源容器/codec 缺失时不得将未知当作不匹配。
+    如果 `MaxStreamingBitrate` 已知且小于源媒体码率，也选择服务端转码；源码率未知时不因码率限制自动转码。
   - 本地 source 在 HLS `TranscodingProfiles` 可用时返回 `SupportsTranscoding=true`，即使本次仍选择
     Direct Play；实际选择服务端转码时返回带 HMAC 票据的 `TranscodingUrl`，并将
     `SupportsDirectPlay`/`SupportsDirectStream` 置为 `false`，避免客户端绕过该 URL。

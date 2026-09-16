@@ -81,6 +81,13 @@ pub(super) async fn emby_playback_info(
                 .device_profile
                 .as_ref()
                 .is_some_and(EmbyDeviceProfile::supports_lux_hls),
+            direct_play_compatibility = ?request
+                .device_profile
+                .as_ref()
+                .map(|profile| profile.direct_play_compatibility(source)),
+            source_bitrate = ?source.bitrate,
+            max_streaming_bitrate = ?request.effective_max_streaming_bitrate(),
+            source_bitrate_exceeds_limit = request.source_exceeds_streaming_bitrate(source),
             force_transcode,
             transcode_requested,
             "negotiated Emby playback source"
@@ -242,6 +249,12 @@ struct EmbyPlaybackInfoRequest {
         alias = "media_source_id"
     )]
     media_source_id: Option<String>,
+    #[serde(
+        rename = "MaxStreamingBitrate",
+        alias = "maxStreamingBitrate",
+        alias = "max_streaming_bitrate"
+    )]
+    max_streaming_bitrate: Option<i64>,
     #[serde(rename = "EnableDirectPlay", alias = "enableDirectPlay")]
     enable_direct_play: Option<bool>,
     #[serde(rename = "EnableDirectStream", alias = "enableDirectStream")]
@@ -262,6 +275,14 @@ impl EmbyPlaybackInfoRequest {
             return;
         };
         for (name, value) in url::form_urlencoded::parse(raw_query.as_bytes()) {
+            if name.eq_ignore_ascii_case("MaxStreamingBitrate")
+                || name.eq_ignore_ascii_case("max_streaming_bitrate")
+            {
+                if let Ok(value) = value.parse::<i64>() {
+                    self.max_streaming_bitrate = Some(value);
+                }
+                continue;
+            }
             let value = match parse_emby_bool(value.as_ref()) {
                 Some(value) => value,
                 None => continue,
@@ -312,18 +333,47 @@ impl EmbyPlaybackInfoRequest {
             }
             return self.device_profile.as_ref().is_some_and(|profile| {
                 profile.supports_lux_hls()
-                    && profile.direct_play_compatibility(source)
-                        == EmbyProfileCompatibility::Incompatible
+                    && self.source_requires_server_transcoding(profile, source)
             });
         }
         if self.force_explicitly_selects_a_plan() {
             return false;
         }
         self.device_profile.as_ref().is_some_and(|profile| {
-            profile.supports_lux_hls()
-                && profile.direct_play_compatibility(source)
-                    == EmbyProfileCompatibility::Incompatible
+            profile.supports_lux_hls() && self.source_requires_server_transcoding(profile, source)
         })
+    }
+
+    fn source_requires_server_transcoding(
+        &self,
+        profile: &EmbyDeviceProfile,
+        source: &crate::application::catalog::CatalogSource,
+    ) -> bool {
+        profile.direct_play_compatibility(source) == EmbyProfileCompatibility::Incompatible
+            || self.source_exceeds_streaming_bitrate(source)
+    }
+
+    fn effective_max_streaming_bitrate(&self) -> Option<i64> {
+        self.max_streaming_bitrate.or_else(|| {
+            self.device_profile
+                .as_ref()
+                .and_then(|profile| profile.max_streaming_bitrate)
+        })
+    }
+
+    fn source_exceeds_streaming_bitrate(
+        &self,
+        source: &crate::application::catalog::CatalogSource,
+    ) -> bool {
+        let Some(limit) = self
+            .effective_max_streaming_bitrate()
+            .filter(|limit| *limit > 0)
+        else {
+            return false;
+        };
+        source
+            .bitrate
+            .is_some_and(|bitrate| bitrate > 0 && bitrate > limit)
     }
 
     fn force_explicitly_selects_a_plan(&self) -> bool {
@@ -351,10 +401,15 @@ impl EmbyPlaybackInfoRequest {
                 )
             })
             .unwrap_or((true, true));
+        let video_bitrate_exceeds_limit =
+            source.is_some_and(|source| self.source_exceeds_streaming_bitrate(source));
         PlaybackCapabilities {
             direct_play: false,
             hls: true,
-            video_copy_to_fmp4: direct_stream && allow_video_stream_copy && video_copy_allowed,
+            video_copy_to_fmp4: direct_stream
+                && allow_video_stream_copy
+                && video_copy_allowed
+                && !video_bitrate_exceeds_limit,
             audio_copy_to_fmp4: direct_stream && allow_audio_stream_copy && audio_copy_allowed,
             hardware_transcode: true,
             software_transcode: true,
@@ -364,6 +419,12 @@ impl EmbyPlaybackInfoRequest {
 
 #[derive(Debug, Default, Deserialize)]
 struct EmbyDeviceProfile {
+    #[serde(
+        rename = "MaxStreamingBitrate",
+        alias = "maxStreamingBitrate",
+        alias = "max_streaming_bitrate"
+    )]
+    max_streaming_bitrate: Option<i64>,
     #[serde(default, rename = "DirectPlayProfiles", alias = "directPlayProfiles")]
     direct_play_profiles: Vec<EmbyPlaybackProfile>,
     #[serde(default, rename = "TranscodingProfiles", alias = "transcodingProfiles")]
@@ -3204,6 +3265,99 @@ mod emby_playback_tests {
                 tier: ServerTier::AudioTranscode,
             }
         );
+    }
+
+    #[test]
+    fn device_profile_only_request_respects_streaming_bitrate_limit() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "MaxStreamingBitrate": 8000000,
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [{
+                        "Container": "mkv",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Container": "mp4",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+        let mut source = profile_source("mkv", "h264", "aac");
+        source.bitrate = Some(13_912_978);
+
+        assert!(request.requests_server_transcoding_for_source(false, &source));
+        assert_eq!(
+            choose_plan(PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: request.playback_capabilities_for_source(Some(&source)),
+            }),
+            PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode,
+            }
+        );
+    }
+
+    #[test]
+    fn device_profile_streaming_bitrate_limit_is_used_as_fallback() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "MaxStreamingBitrate": 8000000,
+                    "DirectPlayProfiles": [{
+                        "Container": "mkv",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Container": "mp4",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+        let mut source = profile_source("mkv", "h264", "aac");
+        source.bitrate = Some(13_912_978);
+
+        assert!(request.requests_server_transcoding_for_source(false, &source));
+    }
+
+    #[test]
+    fn max_streaming_bitrate_query_parameter_is_read() {
+        let mut request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [{
+                        "Container": "mkv",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+        request.apply_query_parameters(&RawQuery(Some("MaxStreamingBitrate=8000000".to_owned())));
+        let mut source = profile_source("mkv", "h264", "aac");
+        source.bitrate = Some(13_912_978);
+
+        assert!(request.requests_server_transcoding_for_source(false, &source));
     }
 
     #[test]
