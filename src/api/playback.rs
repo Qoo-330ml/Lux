@@ -182,6 +182,29 @@ pub(super) async fn emby_playback_info(
                         object.insert("TranscodingMimeType".to_owned(), json!("video/mp4"));
                     }
                 }
+                if let Some(session) = transcode_session
+                    .as_ref()
+                    .filter(|session| session.media_source_id == source.id)
+                {
+                    tracing::info!(
+                        event = "emby_transcoding_offer",
+                        item_id_prefix = %playback_identifier_prefix(&item.id),
+                        source_id_prefix = %playback_identifier_prefix(&source.id),
+                        session_id_prefix = %playback_identifier_prefix(&session.id),
+                        transcoding_url_present = value
+                            .get("TranscodingUrl")
+                            .is_some_and(|value| value.is_string()),
+                        supports_direct_play = value
+                            .get("SupportsDirectPlay")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                        supports_direct_stream = value
+                            .get("SupportsDirectStream")
+                            .and_then(|value| value.as_bool())
+                            .unwrap_or(false),
+                        "prepared Emby transcoding offer"
+                    );
+                }
                 value
             })
             .collect::<Vec<_>>(),
@@ -1521,6 +1544,56 @@ fn emby_transcoding_url(
     ))
 }
 
+fn emby_hls_asset_kind(asset: &str) -> &'static str {
+    match asset {
+        "index.m3u8" => "manifest",
+        "init.mp4" => "initialization",
+        value if value.starts_with("segment_") && value.ends_with(".m4s") => "segment",
+        _ => "other",
+    }
+}
+
+fn record_emby_hls_asset_response(
+    method: &Method,
+    public_item_id: &str,
+    session_id: Option<&str>,
+    asset: &str,
+    status: StatusCode,
+    duration_ms: u128,
+) {
+    let asset_kind = emby_hls_asset_kind(asset);
+    if asset_kind != "manifest" && status.is_success() {
+        return;
+    }
+    let session_id_prefix = session_id
+        .map(playback_identifier_prefix)
+        .unwrap_or_else(|| "missing".to_owned());
+    let duration_ms = u64::try_from(duration_ms).unwrap_or(u64::MAX);
+    if status.is_success() {
+        tracing::info!(
+            event = "emby_hls_asset_request",
+            method = %method,
+            item_id_prefix = %playback_identifier_prefix(public_item_id),
+            session_id_prefix = %session_id_prefix,
+            asset_kind,
+            status_code = status.as_u16(),
+            duration_ms,
+            "served Emby HLS asset"
+        );
+    } else {
+        tracing::warn!(
+            event = "emby_hls_asset_request",
+            method = %method,
+            item_id_prefix = %playback_identifier_prefix(public_item_id),
+            session_id_prefix = %session_id_prefix,
+            asset_kind,
+            status_code = status.as_u16(),
+            duration_ms,
+            "Emby HLS asset request failed"
+        );
+    }
+}
+
 fn emby_transcoding_asset_url(
     service: &WebPlaybackSessionService,
     item_id: &str,
@@ -1597,15 +1670,33 @@ pub(super) async fn emby_transcoding_master(
     raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let started = std::time::Instant::now();
     let query = emby_transcoding_query_from_raw(raw_query);
-    let Some(session_id) = emby_transcoding_session_id(&query) else {
-        return StatusCode::UNAUTHORIZED.into_response();
+    let session_id = emby_transcoding_session_id(&query);
+    let method_for_log = method.clone();
+    let response = if let Some(session_id) = session_id {
+        serve_emby_transcoding_asset(
+            &headers,
+            method,
+            &item_id,
+            session_id,
+            "index.m3u8",
+            &query,
+            &state,
+        )
+        .await
+    } else {
+        StatusCode::UNAUTHORIZED.into_response()
     };
-    let asset = "index.m3u8";
-    serve_emby_transcoding_asset(
-        &headers, method, &item_id, session_id, asset, &query, &state,
-    )
-    .await
+    record_emby_hls_asset_response(
+        &method_for_log,
+        &item_id,
+        session_id,
+        "index.m3u8",
+        response.status(),
+        started.elapsed().as_millis(),
+    );
+    response
 }
 
 pub(super) async fn emby_transcoding_asset(
@@ -1615,8 +1706,10 @@ pub(super) async fn emby_transcoding_asset(
     raw_query: RawQuery,
     State(state): State<AppState>,
 ) -> Response {
+    let started = std::time::Instant::now();
     let query = emby_transcoding_query_from_raw(raw_query);
-    serve_emby_transcoding_asset(
+    let method_for_log = method.clone();
+    let response = serve_emby_transcoding_asset(
         &headers,
         method,
         &item_id,
@@ -1625,7 +1718,16 @@ pub(super) async fn emby_transcoding_asset(
         &query,
         &state,
     )
-    .await
+    .await;
+    record_emby_hls_asset_response(
+        &method_for_log,
+        &item_id,
+        Some(&session_id),
+        &asset,
+        response.status(),
+        started.elapsed().as_millis(),
+    );
+    response
 }
 
 async fn serve_emby_transcoding_asset(
@@ -2737,7 +2839,8 @@ pub(super) async fn lux_set_played(
 #[cfg(test)]
 mod emby_playback_tests {
     use super::{
-        EmbyPlaybackInfoRequest, emby_force_transcode_from_raw, parse_emby_playback_info_request,
+        EmbyPlaybackInfoRequest, emby_force_transcode_from_raw, emby_hls_asset_kind,
+        parse_emby_playback_info_request,
     };
     use crate::application::catalog::{CatalogSource, CatalogStream};
     use crate::application::playback::decision::{
@@ -2785,6 +2888,14 @@ mod emby_playback_tests {
             ],
             chapters: Vec::new(),
         }
+    }
+
+    #[test]
+    fn emby_hls_asset_kind_uses_bounded_categories() {
+        assert_eq!(emby_hls_asset_kind("index.m3u8"), "manifest");
+        assert_eq!(emby_hls_asset_kind("init.mp4"), "initialization");
+        assert_eq!(emby_hls_asset_kind("segment_000001.m4s"), "segment");
+        assert_eq!(emby_hls_asset_kind("unexpected.bin"), "other");
     }
 
     #[test]
