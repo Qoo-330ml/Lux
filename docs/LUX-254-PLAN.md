@@ -23,7 +23,8 @@
    `TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
    `TranscodingUrl` 同时返回 Emby 播放器通常使用的 `DeviceId`、输出 codec、码率、轨道索引、
    `SegmentContainer=mp4`、`MinSegments`、`BreakOnNonKeyFrames` 和 `TranscodeReasons` 参数；实际转码 offer
-   的 `DirectStreamUrl` 为 `null`，避免客户端绕过转码入口。Lux 的短期 HMAC 参数作为额外安全约束保留。
+   的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，兼容依赖 `DirectStreamUrl` 的客户端；
+   `SupportsDirectPlay`/`SupportsDirectStream` 仍为 `false`，不会将该 offer 误报为直放。Lux 的短期 HMAC 参数作为额外安全约束保留。
 4. `.strm` 是 Direct-only；本任务不扩大它的服务端处理边界。
 5. 第三方客户端可能不发送 Web 心跳，因此 Emby 播放回调负责刷新转码会话，回调缺失时依靠现有 TTL
    和孤儿目录清理。

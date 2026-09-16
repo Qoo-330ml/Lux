@@ -220,10 +220,11 @@ pub(super) async fn emby_playback_info(
                         object.insert("TranscodingSubProtocol".to_owned(), json!("hls"));
                         object.insert("TranscodingContainer".to_owned(), json!("mp4"));
                         object.insert("TranscodingMimeType".to_owned(), json!("video/mp4"));
-                        // An Emby transcoding MediaSourceInfo does not expose
-                        // a competing direct URL. Native players otherwise may
-                        // select DirectStreamUrl before inspecting TranscodingUrl.
-                        object.insert("DirectStreamUrl".to_owned(), Value::Null);
+                        // Emby keeps DirectStreamUrl and TranscodingUrl pointed
+                        // at the same HLS manifest during transcoding. Harbor
+                        // follows DirectStreamUrl, even when the capability bit
+                        // says direct stream is unavailable.
+                        object.insert("DirectStreamUrl".to_owned(), json!(url.clone()));
                         object.insert("AddApiKeyToDirectStreamUrl".to_owned(), json!(false));
                     }
                 }

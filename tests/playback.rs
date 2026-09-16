@@ -841,9 +841,10 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         device_profile_body["MediaSources"][0]["SupportsDirectStream"],
         false
     );
-    assert!(
-        device_profile_body["MediaSources"][0]["DirectStreamUrl"].is_null(),
-        "a transcoding offer must not expose a competing direct stream URL"
+    assert_eq!(
+        device_profile_body["MediaSources"][0]["DirectStreamUrl"],
+        device_profile_body["MediaSources"][0]["TranscodingUrl"],
+        "Emby keeps DirectStreamUrl aligned with the HLS transcoding URL"
     );
     let device_profile_url = device_profile_body["MediaSources"][0]["TranscodingUrl"]
         .as_str()

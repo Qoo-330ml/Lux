@@ -6169,7 +6169,8 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
 - 本地媒体源在选择服务端转码时返回 `SupportsTranscoding=true`、`TranscodingUrl`、
   `TranscodingSubProtocol=hls`、`TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
   URL 指向标准 Emby `master.m3u8` 入口，并带有 `DeviceId`、输出 codec、码率、轨道索引和 fMP4 分片参数；
-  实际转码 offer 的 `DirectStreamUrl` 为 `null`，清单中的初始化片段和媒体片段继续使用当前会话的短期签名 URL。
+  实际转码 offer 的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，同时保持
+  `SupportsDirectPlay`/`SupportsDirectStream` 为 `false`；清单中的初始化片段和媒体片段继续使用当前会话的短期签名 URL。
 - 转码会话复用 `web_playback_sessions`，其 `PlaySessionId` 可被 Emby `Sessions/Playing`、`Progress` 和
   `Stopped` 回调关联；播放/暂停刷新 TTL，停止立即回收 FFmpeg 进程和临时目录。没有回调时仍由服务端
   过期清理回收。
@@ -6227,6 +6228,15 @@ VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停
 新增 `MaxStreamingBitrate` 顶层/`DeviceProfile` 解析及码率超限回归；码率超过客户端限制时不再复制视频流，改选硬件或软件
 视频转码，并输出诊断字段 `source_bitrate`、`max_streaming_bitrate` 和 `source_bitrate_exceeds_limit`。`cargo test --locked --lib
 emby_playback_tests`（14 个通过）、格式检查和 `git diff --check` 通过；FNOS 新镜像及真实第三方客户端仍需部署后验证。
+
+验证记录（2026-09-16 Harbor 转码入口兼容修复）：FNOS 日志确认 Harbor 已拿到转码 offer，Lux 也已启动本地
+H.264/AAC fMP4 HLS，但 Harbor 1.4.6 未请求 `TranscodingUrl`，而是在 `DirectStreamUrl` 为 `null` 时回退到直放路径，
+因此没有产生 HLS manifest 请求。对照 Emby 的实际转码响应后，转码 offer 现让 `DirectStreamUrl` 与 `TranscodingUrl`
+共同指向同一个签名 `master.m3u8`，并继续将两个直放能力位设为 `false`。`cargo build --locked`、
+`cargo test --locked --test playback`（3 个通过）、`cargo test --locked --lib playback`（54 个通过）、格式检查和
+`git diff --check` 通过；`cargo test --locked --all-targets` 的 462 个库测试通过，但其中两个内嵌字幕测试在该次
+全量运行中超时；随后单独运行 `cargo test --locked --lib embedded_subtitle`（3 个通过）确认模块本身通过。全量
+Clippy 仍被未修改的 `src/api/legacy.rs:44` 未使用导入阻塞。FNOS 新镜像及 Harbor 真机首帧验证尚待部署。
 
 依赖：LUX-198、LUX-199。
 
