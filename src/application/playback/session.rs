@@ -150,6 +150,7 @@ pub struct WebPlaybackSessionService {
     database: Database,
     signer: Arc<ResourceSigner>,
     hls: HlsManager,
+    emby_start_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl WebPlaybackSessionService {
@@ -188,6 +189,7 @@ impl WebPlaybackSessionService {
             database,
             signer: Arc::new(ResourceSigner::random()),
             hls,
+            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -253,6 +255,55 @@ impl WebPlaybackSessionService {
             plan,
             expires_at: unix_timestamp(),
         })
+    }
+
+    pub(crate) async fn create_and_start_emby_hls(
+        &self,
+        input: CreateWebPlaybackSession<'_>,
+        media_path: &std::path::Path,
+        video_bitrate: Option<i64>,
+    ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
+        let _start_guard = self.emby_start_lock.lock().await;
+        let user_id = input.user_id.to_owned();
+        let item_id = input.item_id.to_owned();
+        let media_source_id = input.media_source_id.to_owned();
+        let created = self.create(input).await?;
+        let WebPlaybackPlan::ServerHls { tier } = created.plan else {
+            return Ok(created);
+        };
+
+        let active_sessions = match self
+            .database
+            .find_active_web_playback_sessions_for_source(
+                &user_id,
+                &item_id,
+                &media_source_id,
+                "lux-emby",
+            )
+            .await
+        {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                let _ = self.stop(&created.id, &user_id).await;
+                return Err(error.into());
+            }
+        };
+        for session in active_sessions {
+            if session.id != created.id {
+                if let Err(error) = self.stop(&session.id, &user_id).await {
+                    let _ = self.stop(&created.id, &user_id).await;
+                    return Err(error);
+                }
+            }
+        }
+        if let Err(error) = self
+            .start_hls(&created.id, tier, media_path, video_bitrate)
+            .await
+        {
+            let _ = self.stop(&created.id, &user_id).await;
+            return Err(error);
+        }
+        Ok(created)
     }
 
     pub(crate) fn sign_resource(
@@ -332,8 +383,11 @@ impl WebPlaybackSessionService {
         session_id: &str,
         tier: ServerTier,
         input: &std::path::Path,
+        video_bitrate: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
-        self.hls.start(session_id, tier, input).await?;
+        self.hls
+            .start(session_id, tier, input, video_bitrate)
+            .await?;
         let directory = self.hls.session_directory(session_id).await?;
         let now = unix_timestamp();
         if !self
@@ -528,9 +582,12 @@ mod tests {
         application::{
             libraries::LibraryService,
             playback::{
-                decision::{PlaybackCapabilities, ServerTier},
+                decision::{PlaybackCapabilities, PlaybackSourceKind, ServerTier},
                 hls::HlsManager,
-                session::{WebPlaybackEvent, WebPlaybackSessionService},
+                session::{
+                    CreateWebPlaybackSession, WebPlaybackEvent, WebPlaybackPlan,
+                    WebPlaybackSessionService,
+                },
             },
             setup::SetupService,
         },
@@ -650,6 +707,7 @@ mod tests {
                 config.config_dir.clone(),
                 script.to_string_lossy().into_owned(),
             ),
+            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         let user_id = user.id.to_string();
         service
@@ -669,7 +727,7 @@ mod tests {
             })
             .await?;
         service
-            .start_hls("session-1", ServerTier::Remux, Path::new("input.mkv"))
+            .start_hls("session-1", ServerTier::Remux, Path::new("input.mkv"), None)
             .await?;
         service.wait_for_hls_manifest("session-1").await?;
 
@@ -687,6 +745,144 @@ mod tests {
 
         assert_eq!(claim, WebPlaybackEventClaim::Accepted);
         assert!(!config.config_dir.join("web-playback/session-1").exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn emby_hls_start_replaces_an_active_session_for_the_same_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8098".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        let source_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind)
+             VALUES (?, ?, 'LOCAL_FILE')",
+        )
+        .bind(&source_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+        let script = temp_dir.path().join("fake-ffmpeg");
+        tokio::fs::write(
+            &script,
+            r##"#!/bin/sh
+set -eu
+manifest=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    *.m3u8) manifest="$1" ;;
+  esac
+  shift
+done
+directory=$(dirname "$manifest")
+mkdir -p "$directory"
+printf '#EXTM3U\n' > "$manifest"
+while :; do sleep 1; done
+"##,
+        )
+        .await?;
+        let mut permissions = tokio::fs::metadata(&script).await?.permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&script, permissions).await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(
+                config.config_dir.clone(),
+                script.to_string_lossy().into_owned(),
+            ),
+            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let user_id = user.id.to_string();
+        let capabilities = PlaybackCapabilities {
+            direct_play: false,
+            hls: true,
+            video_copy_to_fmp4: false,
+            audio_copy_to_fmp4: false,
+            hardware_transcode: false,
+            software_transcode: true,
+        };
+        let first = service
+            .create_and_start_emby_hls(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-emby",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities,
+                },
+                Path::new("input.mkv"),
+                Some(1_000_000),
+            )
+            .await?;
+        assert!(matches!(
+            first.plan,
+            WebPlaybackPlan::ServerHls {
+                tier: ServerTier::SoftwareTranscode
+            }
+        ));
+        service.wait_for_hls_manifest(&first.id).await?;
+
+        let second = service
+            .create_and_start_emby_hls(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-emby",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities,
+                },
+                Path::new("input.mkv"),
+                Some(2_000_000),
+            )
+            .await?;
+        service.wait_for_hls_manifest(&second.id).await?;
+
+        let first_stored = database
+            .find_web_playback_session(&first.id)
+            .await?
+            .expect("first session");
+        let second_stored = database
+            .find_web_playback_session(&second.id)
+            .await?
+            .expect("second session");
+        assert_eq!(first_stored.state, "STOPPED");
+        assert_eq!(second_stored.state, "ACTIVE");
+        assert!(
+            !config
+                .config_dir
+                .join("web-playback")
+                .join(&first.id)
+                .exists()
+        );
+
+        service.stop(&second.id, &user_id).await?;
         Ok(())
     }
 }

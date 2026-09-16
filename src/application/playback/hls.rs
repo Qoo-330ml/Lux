@@ -143,6 +143,7 @@ impl HlsManager {
         session_id: &str,
         tier: ServerTier,
         input: &Path,
+        video_bitrate: Option<i64>,
     ) -> Result<(), HlsError> {
         let permit = self.acquire_permit(tier).await?;
         fs::create_dir_all(&self.base_directory)
@@ -153,7 +154,13 @@ impl HlsManager {
         }
         let directory = self.base_directory.join(session_id);
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
-        let args = ffmpeg_args(input, &directory, tier, self.hardware_encoder.as_deref())?;
+        let args = ffmpeg_args(
+            input,
+            &directory,
+            tier,
+            self.hardware_encoder.as_deref(),
+            video_bitrate,
+        )?;
         let mut command = Command::new(&self.ffmpeg_executable);
         command
             .args(args)
@@ -385,6 +392,7 @@ fn ffmpeg_args(
     directory: &Path,
     tier: ServerTier,
     hardware_encoder: Option<&str>,
+    video_bitrate: Option<i64>,
 ) -> Result<Vec<String>, HlsError> {
     if tier == ServerTier::Direct {
         return Err(HlsError::InvalidAsset);
@@ -448,6 +456,13 @@ fn ffmpeg_args(
             ]);
         }
         ServerTier::Direct => unreachable!(),
+    }
+    if matches!(
+        tier,
+        ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    ) && let Some(video_bitrate) = video_bitrate.filter(|value| *value > 0)
+    {
+        args.extend(["-b:v".to_owned(), video_bitrate.to_string()]);
     }
     args.extend([
         "-f".to_owned(),
@@ -541,6 +556,7 @@ mod tests {
             Path::new("/config/web-playback/session"),
             ServerTier::Remux,
             None,
+            None,
         )
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
@@ -562,10 +578,25 @@ mod tests {
             Path::new("session"),
             ServerTier::SoftwareTranscode,
             None,
+            None,
         )
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:a", "aac"]));
+    }
+
+    #[test]
+    fn video_transcoding_arguments_apply_requested_video_bitrate() {
+        let args = ffmpeg_args(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::SoftwareTranscode,
+            None,
+            Some(1_000_000),
+        )
+        .unwrap();
+
+        assert!(args.windows(2).any(|pair| pair == ["-b:v", "1000000"]));
     }
 
     #[test]
@@ -607,7 +638,7 @@ mod tests {
             script.to_string_lossy().into_owned(),
         );
         manager
-            .start("session-1", ServerTier::Remux, Path::new("input.mkv"))
+            .start("session-1", ServerTier::Remux, Path::new("input.mkv"), None)
             .await
             .unwrap();
         let manifest = manager.wait_for_manifest("session-1").await.unwrap();
@@ -651,7 +682,12 @@ mod tests {
         );
 
         manager
-            .start("process-group", ServerTier::Remux, Path::new("input.mkv"))
+            .start(
+                "process-group",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+            )
             .await
             .unwrap();
         manager.wait_for_manifest("process-group").await.unwrap();
@@ -677,7 +713,7 @@ mod tests {
         );
 
         let error = manager
-            .start("low-space", ServerTier::Remux, Path::new("input.mkv"))
+            .start("low-space", ServerTier::Remux, Path::new("input.mkv"), None)
             .await
             .unwrap_err();
 

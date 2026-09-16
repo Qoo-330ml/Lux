@@ -689,38 +689,32 @@ async fn create_emby_transcoding_session(
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     let user_id = user.id.to_string();
-    let created = service
-        .create(CreateWebPlaybackSession {
-            user_id: &user_id,
-            is_admin: user.is_admin,
-            item_id,
-            media_source_id: &source.id,
-            play_session_prefix: "lux-emby",
-            source_kind: PlaybackSourceKind::LocalFile,
-            capabilities: request.playback_capabilities_for_source(Some(source)),
-        })
-        .await
-        .map_err(emby_playback_session_error_status)?;
-    let WebPlaybackPlan::ServerHls { tier } = created.plan else {
-        let _ = service.stop(&created.id, &user_id).await;
-        return Err(StatusCode::BAD_GATEWAY);
-    };
     let input =
         match canonical_local_media_path(&stored_source.root_path, &stored_source.relative_path)
             .await
         {
             Ok(path) => path,
-            Err(LocalPathError::Missing) => {
-                let _ = service.stop(&created.id, &user_id).await;
-                return Err(StatusCode::NOT_FOUND);
-            }
-            Err(LocalPathError::Forbidden) => {
-                let _ = service.stop(&created.id, &user_id).await;
-                return Err(StatusCode::FORBIDDEN);
-            }
+            Err(LocalPathError::Missing) => return Err(StatusCode::NOT_FOUND),
+            Err(LocalPathError::Forbidden) => return Err(StatusCode::FORBIDDEN),
         };
-    if service.start_hls(&created.id, tier, &input).await.is_err() {
-        let _ = service.stop(&created.id, &user_id).await;
+    let video_bitrate = emby_transcoding_video_bitrate(source, request);
+    let created = service
+        .create_and_start_emby_hls(
+            CreateWebPlaybackSession {
+                user_id: &user_id,
+                is_admin: user.is_admin,
+                item_id,
+                media_source_id: &source.id,
+                play_session_prefix: "lux-emby",
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: request.playback_capabilities_for_source(Some(source)),
+            },
+            &input,
+            video_bitrate,
+        )
+        .await
+        .map_err(emby_playback_session_error_status)?;
+    if !matches!(created.plan, WebPlaybackPlan::ServerHls { .. }) {
         return Err(StatusCode::BAD_GATEWAY);
     }
     Ok(Some(created))
@@ -2233,7 +2227,7 @@ async fn create_web_playback_session_json(
                 return Err(StatusCode::FORBIDDEN.into_response());
             }
         };
-        if let Err(error) = service.start_hls(&created.id, *tier, &input).await {
+        if let Err(error) = service.start_hls(&created.id, *tier, &input, None).await {
             let _ = service.stop(&created.id, &user.id.to_string()).await;
             return Err(web_playback_error(headers, error));
         }

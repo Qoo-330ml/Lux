@@ -440,6 +440,36 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_active_web_playback_sessions_for_source(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        media_source_id: &str,
+        play_session_prefix: &str,
+    ) -> Result<Vec<StoredWebPlaybackSession>, StorageError> {
+        let play_session_pattern = format!("{play_session_prefix}:%");
+        self.query(
+            "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                    tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                    last_sequence, created_at, updated_at
+             FROM web_playback_sessions
+             WHERE user_id = ? AND item_id = ? AND media_source_id = ?
+               AND state = 'ACTIVE' AND play_session_id LIKE ?
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(user_id)
+        .bind(item_id)
+        .bind(media_source_id)
+        .bind(play_session_pattern)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn take_expired_web_playback_sessions(
         &self,
         now: i64,
