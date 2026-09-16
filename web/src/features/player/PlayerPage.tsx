@@ -580,17 +580,15 @@ export function PlayerPage() {
   useEffect(() => {
     const handlePageHide = () => {
       const sessionId = playbackSessionIdRef.current;
-      void Promise.resolve(reportPlayback("STOPPED", true, true, undefined, sessionId)).finally(() => {
-        void stopActiveSession(sessionId, true);
-      });
+      void reportPlayback("STOPPED", true, true, undefined, sessionId);
+      void stopActiveSession(sessionId, true);
     };
     window.addEventListener("pagehide", handlePageHide);
     return () => {
       window.removeEventListener("pagehide", handlePageHide);
       const sessionId = playbackSessionIdRef.current;
-      void Promise.resolve(reportPlayback("STOPPED", true, false, lastVideoRef.current, sessionId)).finally(() => {
-        void stopActiveSession(sessionId);
-      });
+      void reportPlayback("STOPPED", true, false, lastVideoRef.current, sessionId);
+      void stopActiveSession(sessionId);
     };
   }, [reportPlayback, stopActiveSession]);
 
@@ -724,9 +722,8 @@ export function PlayerPage() {
           }
           setPlaying(false);
           const sessionId = playbackSessionIdRef.current;
-          void Promise.resolve(reportPlayback("STOPPED", true, false, initialEngine.element, sessionId)).finally(() => {
-            void stopActiveSession(sessionId);
-          });
+          void reportPlayback("STOPPED", true, false, initialEngine.element, sessionId);
+          void stopActiveSession(sessionId);
           break;
         }
         case "ERROR":

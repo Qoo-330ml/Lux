@@ -228,6 +228,14 @@ describe("PlayerPage playback synchronization", () => {
   });
 
   it("reports stopped when the player route is unmounted", async () => {
+    let releaseStopped: (() => void) | undefined;
+    const stoppedRequest = new Promise<{ accepted: boolean; duplicate: boolean; stale: boolean }>((resolve) => {
+      releaseStopped = () => resolve({ accepted: true, duplicate: false, stale: false });
+    });
+    vi.mocked(api.webPlaybackEvent).mockImplementation(async (_sessionId, input) => {
+      if (input.state === "STOPPED") return stoppedRequest;
+      return { accepted: true, duplicate: false, stale: false };
+    });
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-2",
       title: "离开播放器测试",
@@ -273,6 +281,8 @@ describe("PlayerPage playback synchronization", () => {
       root = undefined;
     });
 
+    expect(api.stopWebPlaybackSession).toHaveBeenCalledWith("web-source-2", false);
+
     expect(api.webPlaybackEvent).toHaveBeenNthCalledWith(
       1,
       "web-source-2",
@@ -294,6 +304,7 @@ describe("PlayerPage playback synchronization", () => {
       false,
     );
     expect(api.stopWebPlaybackSession).toHaveBeenCalledWith("web-source-2", false);
+    releaseStopped?.();
   });
 
   it("uses the Emby proxy URL for path STRM and falls back to signed Lux direct play", async () => {

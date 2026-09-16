@@ -1035,6 +1035,19 @@ pub(super) async fn handle_emby_playback_event(
         .unwrap_or_else(|| format!("{}:{device_id}", internal_item_id));
     let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
     let user_id = user.id.to_string();
+    if state_name == "STOPPED"
+        && let Some(session_id) = emby_transcode_session_id
+        && let Some(service) = state.web_playback.as_ref()
+        && let Err(error) = service.stop(session_id, &user_id).await
+    {
+        tracing::warn!(
+            event = "emby_transcoding_session_stop_failed",
+            session_id = %session_id,
+            playback_state = state_name,
+            error = %error,
+            "failed to stop Emby transcoding session"
+        );
+    }
     let played_percent = match database.user_played_percent(&user_id).await {
         Ok(value) => value,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1107,15 +1120,11 @@ pub(super) async fn handle_emby_playback_event(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            if let Some(session_id) = emby_transcode_session_id
+            if state_name != "STOPPED"
+                && let Some(session_id) = emby_transcode_session_id
                 && let Some(service) = state.web_playback.as_ref()
             {
-                let result = if state_name == "STOPPED" {
-                    service.stop(session_id, &user_id).await
-                } else {
-                    service.heartbeat(session_id, &user_id).await.map(|_| ())
-                };
-                if let Err(error) = result {
+                if let Err(error) = service.heartbeat(session_id, &user_id).await {
                     tracing::warn!(
                         event = "emby_transcoding_session_refresh_failed",
                         session_id = %session_id,

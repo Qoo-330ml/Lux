@@ -516,6 +516,55 @@ impl Database {
         Ok(expired)
     }
 
+    pub(crate) async fn take_inactive_web_playback_sessions(
+        &self,
+        now: i64,
+        inactive_after_seconds: i64,
+    ) -> Result<Vec<StoredWebPlaybackSession>, StorageError> {
+        let cutoff = now.saturating_sub(inactive_after_seconds.max(0));
+        let rows = self
+            .query(
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                        last_sequence, created_at, updated_at
+                 FROM web_playback_sessions
+                 WHERE state = 'ACTIVE' AND plan = 'SERVER_HLS' AND last_heartbeat_at < ?
+                 ORDER BY last_heartbeat_at ASC, id ASC
+                 LIMIT 128",
+            )
+            .bind(cutoff)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut inactive = Vec::with_capacity(rows.len());
+        for row in rows {
+            let session = stored_web_playback_session(row);
+            let updated = self
+                .query(
+                    "UPDATE web_playback_sessions
+                     SET state = 'STOPPED', updated_at = ?
+                     WHERE id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'
+                       AND last_heartbeat_at < ?",
+                )
+                .bind(now)
+                .bind(&session.id)
+                .bind(cutoff)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if updated.rows_affected() == 1 {
+                inactive.push(session);
+            }
+        }
+        Ok(inactive)
+    }
+
     pub(crate) async fn set_web_playback_temp_dir(
         &self,
         session_id: &str,
@@ -638,12 +687,16 @@ impl Database {
             .query(
                 "UPDATE web_playback_sessions
                  SET state = CASE WHEN ? = 'STOPPED' THEN 'STOPPED' ELSE state END,
-                     last_sequence = ?, updated_at = ?
+                     last_sequence = ?,
+                     last_heartbeat_at = CASE WHEN ? = 'STOPPED' THEN last_heartbeat_at ELSE ? END,
+                     updated_at = ?
                  WHERE id = ? AND user_id = ? AND state = 'ACTIVE'
                    AND expires_at >= ? AND last_sequence < ?",
             )
             .bind(event.state)
             .bind(event.sequence)
+            .bind(event.state)
+            .bind(event.now)
             .bind(event.now)
             .bind(event.session_id)
             .bind(event.user_id)

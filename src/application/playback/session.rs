@@ -27,6 +27,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
 pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 12 * 60 * 60;
 const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+const WEB_PLAYBACK_STALE_AFTER_SECONDS: i64 = 90;
 const EMBY_DIRECT_STREAM_SESSION_ID: &str = "emby-direct-stream";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -166,6 +167,15 @@ impl WebPlaybackSessionService {
             loop {
                 interval.tick().await;
                 let now = unix_timestamp();
+                match database_cleanup
+                    .take_inactive_web_playback_sessions(now, WEB_PLAYBACK_STALE_AFTER_SECONDS)
+                    .await
+                {
+                    Ok(sessions) => stop_hls_sessions(&cleanup, sessions).await,
+                    Err(error) => {
+                        tracing::warn!(%error, "failed to reap inactive Web HLS sessions")
+                    }
+                }
                 let sessions = match database_cleanup
                     .take_expired_web_playback_sessions(now)
                     .await
@@ -176,13 +186,7 @@ impl WebPlaybackSessionService {
                         continue;
                     }
                 };
-                for session in sessions {
-                    if session.plan == "SERVER_HLS"
-                        && let Err(error) = cleanup.stop(&session.id).await
-                    {
-                        tracing::warn!(session_id = %session.id, %error, "failed to clean expired Web HLS session");
-                    }
-                }
+                stop_hls_sessions(&cleanup, sessions).await;
             }
         });
         Self {
@@ -489,8 +493,10 @@ impl WebPlaybackSessionService {
             .database
             .find_web_playback_session(event.session_id)
             .await?;
-        if claim == WebPlaybackEventClaim::Accepted
-            && event.state == "STOPPED"
+        if matches!(
+            claim,
+            WebPlaybackEventClaim::Accepted | WebPlaybackEventClaim::Duplicate
+        ) && event.state == "STOPPED"
             && let Err(error) = self.hls.stop(event.session_id).await
         {
             tracing::warn!(
@@ -500,6 +506,16 @@ impl WebPlaybackSessionService {
             );
         }
         Ok((claim, session))
+    }
+}
+
+async fn stop_hls_sessions(hls: &HlsManager, sessions: Vec<StoredWebPlaybackSession>) {
+    for session in sessions {
+        if session.plan == "SERVER_HLS"
+            && let Err(error) = hls.stop(&session.id).await
+        {
+            tracing::warn!(session_id = %session.id, %error, "failed to clean Web HLS session");
+        }
     }
 }
 
