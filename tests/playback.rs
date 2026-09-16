@@ -689,6 +689,45 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         0
     );
 
+    let profile_direct = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{
+                    "Container": "mkv",
+                    "VideoCodec": "h264,hevc",
+                    "AudioCodec": "aac",
+                    "Type": "Video"
+                }],
+                "TranscodingProfiles": [{
+                    "Container": "mp4",
+                    "VideoCodec": "h264",
+                    "AudioCodec": "aac",
+                    "Protocol": "hls",
+                    "Type": "Video"
+                }]
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(profile_direct.status(), reqwest::StatusCode::OK);
+    let profile_direct_body = profile_direct.json::<Value>().await?;
+    assert_eq!(
+        profile_direct_body["MediaSources"][0]["SupportsDirectPlay"],
+        true
+    );
+    assert_eq!(
+        profile_direct_body["MediaSources"][0]["SupportsTranscoding"],
+        true
+    );
+    assert!(
+        profile_direct_body["MediaSources"][0]
+            .get("TranscodingUrl")
+            .is_none()
+    );
+
     sqlx::query("DELETE FROM media_streams WHERE media_source_id = ?")
         .bind(&source_id)
         .execute(database.pool())
@@ -757,14 +796,7 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
 
     let device_profile_transcoding = client
         .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
-        .query(&[
-            ("api_key", token.as_str()),
-            ("EnableDirectPlay", "true"),
-            ("EnableDirectStream", "true"),
-            ("EnableTranscoding", "true"),
-            ("AllowVideoStreamCopy", "true"),
-            ("AllowAudioStreamCopy", "true"),
-        ])
+        .query(&[("api_key", token.as_str())])
         .json(&json!({
             "MediaSourceId": source_id,
             "DeviceProfile": {
@@ -790,6 +822,14 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
     assert_eq!(
         device_profile_body["MediaSources"][0]["SupportsTranscoding"],
         true
+    );
+    assert_eq!(
+        device_profile_body["MediaSources"][0]["SupportsDirectPlay"],
+        false
+    );
+    assert_eq!(
+        device_profile_body["MediaSources"][0]["SupportsDirectStream"],
+        false
     );
     let device_profile_url = device_profile_body["MediaSources"][0]["TranscodingUrl"]
         .as_str()

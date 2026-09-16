@@ -16,6 +16,7 @@
    没有顶层布尔值时同样按 `DeviceProfile` 协商。明确设置 `EnableTranscoding=true` 并禁用直放或 `forceTranscode=true`
    仍按客户端明确选择启动转码。
    POST 查询参数 `forceTranscode=true` 可覆盖直放请求，兼容把强制转码选项放在 URL 上的第三方客户端。
+   Emby 对省略的播放开关按启用处理，因此只提交 `DeviceProfile` 的客户端也能完成标准协商。
 3. HLS 输出继续使用现有 fMP4/CMAF 资产，Emby 对外声明 `TranscodingSubProtocol=hls`、
    `TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
 4. `.strm` 是 Direct-only；本任务不扩大它的服务端处理边界。
@@ -41,7 +42,9 @@
   - 客户端同时允许直放和转码，或未提供顶层 `Enable...` 布尔值时，使用
     `DeviceProfile.DirectPlayProfiles` 匹配媒体源的 `Container`、视频 codec 和音频 codec；直放 profile
     确认不匹配且 `TranscodingProfiles` 声明 HLS 时选择服务端转码；源容器/codec 缺失时不得将未知当作不匹配。
-  - 本地 source 返回 `SupportsTranscoding` 与带 HMAC 票据的 `TranscodingUrl`。
+  - 本地 source 在 HLS `TranscodingProfiles` 可用时返回 `SupportsTranscoding=true`，即使本次仍选择
+    Direct Play；实际选择服务端转码时返回带 HMAC 票据的 `TranscodingUrl`，并将
+    `SupportsDirectPlay`/`SupportsDirectStream` 置为 `false`，避免客户端绕过该 URL。
   - `.strm` source 保持 `SupportsTranscoding=false`，不返回 `TranscodingUrl`。
 
 ### 转码资源

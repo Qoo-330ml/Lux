@@ -6215,6 +6215,13 @@ VidHub、SenPlayer、Infuse 等第三方客户端的首帧、seek、暂停、停
 `git diff --check` 通过。全量 Clippy 仍被未修改的 `tests/item_merge.rs:32` 参数过多 lint 阻塞；`uname -m` 为
 `arm64`。FNOS 未部署本修复，现有线上 PENDING source 仍需在部署后重新触发针对性扫描验证。
 
+验证记录（2026-09-16 Emby 转码 offer 修复）：新增只提交 `DeviceProfile` 的 POST 回归，确认省略播放开关按启用
+处理、HLS profile 会公开 `SupportsTranscoding=true`，并确认实际返回 `TranscodingUrl` 时关闭 Direct Play/Direct Stream
+能力。`cargo build --locked`、`cargo test --locked --all-targets`（459 个通过、4 个需本地 PostgreSQL 的测试忽略，
+所有启用的集成目标通过）、`cargo test --locked --test playback`（3 个通过）、`cargo test --locked --lib emby_playback_tests`
+（13 个通过）、播放目标 Clippy、格式检查和 `git diff --check` 通过。全量 Clippy 仍被未修改的
+`tests/item_merge.rs:32` 参数过多 lint 阻塞；本机 `uname -m` 为 `arm64`。FNOS 新镜像及真实第三方客户端播放尚待部署后验证。
+
 依赖：LUX-198、LUX-199。
 
 明确不做：

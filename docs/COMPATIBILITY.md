@@ -42,7 +42,9 @@ Lux 现已把本地媒体的服务端 HLS 能力接入 Emby `PlaybackInfo` POST�
 上述播放开关兼容放在 POST URL 查询参数中，`DeviceProfile` 可放在 JSON body；这是部分第三方客户端的实际请求形式。
 兼容 Emby 标准 `DeviceProfile` 时，Lux 会用 `DirectPlayProfiles` 匹配媒体源的容器/音视频编码；只有源媒体信息已知且
 确认直放 profile 不匹配、客户端允许转码并存在 HLS `TranscodingProfiles` 时，才选择服务端转码。容器/codec 信息缺失或
-仍待探测时按“未知”处理，不会仅因元数据不足而触发转码；顶层布尔值全部省略时也按此规则协商。
+仍待探测时按“未知”处理，不会仅因元数据不足而触发转码；顶层布尔值全部省略时也按此规则协商，并按 Emby 约定将
+省略的开关视为启用。存在 HLS 转码 profile 的本地 source 会公开 `SupportsTranscoding=true`；实际返回
+`TranscodingUrl` 时同时将 `SupportsDirectPlay` 和 `SupportsDirectStream` 置为 `false`，避免客户端选择直放 URL。
 HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则升级到视频或音频转码档位。
 服务端返回带短期 HMAC 票据的 `TranscodingUrl`。POST 查询参数 `forceTranscode=true` 可覆盖 `EnableDirectPlay=true`；GET
 不因该参数创建转码会话。HLS 清单通过标准 `master.m3u8` 入口返回，init 和 m4s 片段使用同一转码会话的

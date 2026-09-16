@@ -126,14 +126,37 @@ pub(super) async fn emby_playback_info(
                     true,
                     strm_resolver_available,
                 );
-                if (request.enable_transcoding == Some(true) || force_transcode)
-                    && source.source_kind == "LOCAL_FILE"
-                    && let Value::Object(object) = &mut value
-                {
-                    // Advertise the local source capability even when this
-                    // request still resolves to direct play. Clients can
-                    // then retry with their transcoding-only capabilities.
-                    object.insert("SupportsTranscoding".to_owned(), json!(true));
+                let source_transcode_session = transcode_session
+                    .as_ref()
+                    .filter(|session| session.media_source_id == source.id);
+                let source_can_transcode = source.source_kind == "LOCAL_FILE"
+                    && (source_transcode_session.is_some()
+                        || request.enable_transcoding != Some(false)
+                            && (request.enable_transcoding == Some(true)
+                                || request
+                                    .device_profile
+                                    .as_ref()
+                                    .is_some_and(EmbyDeviceProfile::supports_lux_hls)));
+                let direct_play_disabled = request.enable_direct_play == Some(false)
+                    || force_transcode
+                    || source_transcode_session.is_some();
+                if let Value::Object(object) = &mut value {
+                    if source_can_transcode {
+                        // Emby advertises the device's available transcoding
+                        // profiles even when direct play wins this request.
+                        // Clients need this capability bit to offer a
+                        // transcoding fallback on a later request.
+                        object.insert("SupportsTranscoding".to_owned(), json!(true));
+                    }
+                    if direct_play_disabled {
+                        // A transcoding offer must not leave the original
+                        // direct-play capability set, otherwise many Emby
+                        // clients ignore TranscodingUrl and open DirectStreamUrl.
+                        object.insert("SupportsDirectPlay".to_owned(), json!(false));
+                        if source_transcode_session.is_some() {
+                            object.insert("SupportsDirectStream".to_owned(), json!(false));
+                        }
+                    }
                 }
                 let has_direct_stream_url = value
                     .get("DirectStreamUrl")
@@ -164,9 +187,7 @@ pub(super) async fn emby_playback_info(
                         "AddApiKeyToDirectStreamUrl".to_owned(),
                         json!(emby_source_needs_proxy_identity(source)),
                     );
-                    if transcode_session
-                        .as_ref()
-                        .is_some_and(|session| session.media_source_id == source.id)
+                    if source_transcode_session.is_some()
                         && let Some(session) = transcode_session.as_ref()
                         && let Some(service) = state.web_playback.as_ref()
                         && let Some(url) = emby_transcoding_url(
@@ -313,7 +334,12 @@ impl EmbyPlaybackInfoRequest {
         &self,
         source: Option<&crate::application::catalog::CatalogSource>,
     ) -> PlaybackCapabilities {
-        let direct_stream = self.enable_direct_stream == Some(true);
+        // Emby treats omitted playback switches as enabled for POST
+        // PlaybackInfo requests. This matters for clients that send only a
+        // DeviceProfile in the body.
+        let direct_stream = self.enable_direct_stream.unwrap_or(true);
+        let allow_video_stream_copy = self.allow_video_stream_copy.unwrap_or(true);
+        let allow_audio_stream_copy = self.allow_audio_stream_copy.unwrap_or(true);
         let (video_copy_allowed, audio_copy_allowed) = self
             .device_profile
             .as_ref()
@@ -328,12 +354,8 @@ impl EmbyPlaybackInfoRequest {
         PlaybackCapabilities {
             direct_play: false,
             hls: true,
-            video_copy_to_fmp4: direct_stream
-                && self.allow_video_stream_copy == Some(true)
-                && video_copy_allowed,
-            audio_copy_to_fmp4: direct_stream
-                && self.allow_audio_stream_copy == Some(true)
-                && audio_copy_allowed,
+            video_copy_to_fmp4: direct_stream && allow_video_stream_copy && video_copy_allowed,
+            audio_copy_to_fmp4: direct_stream && allow_audio_stream_copy && audio_copy_allowed,
             hardware_transcode: true,
             software_transcode: true,
         }
@@ -3146,6 +3168,42 @@ mod emby_playback_tests {
         .expect("valid DeviceProfile request");
         let source = profile_source("mkv", "hevc", "aac");
         assert!(!request.requests_server_transcoding_for_source(false, &source));
+    }
+
+    #[test]
+    fn device_profile_only_request_transcodes_unsupported_audio_with_default_flags() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [{
+                        "Container": "mkv",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Container": "mp4",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+        let source = profile_source("mkv", "h264", "dts");
+
+        assert!(request.requests_server_transcoding_for_source(false, &source));
+        assert_eq!(
+            choose_plan(PlaybackDecisionInput {
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: request.playback_capabilities_for_source(Some(&source)),
+            }),
+            PlaybackPlan::ServerHls {
+                tier: ServerTier::AudioTranscode,
+            }
+        );
     }
 
     #[test]
