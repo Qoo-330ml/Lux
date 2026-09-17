@@ -507,7 +507,7 @@ Lux 的核心价值不是功能数量，而是：
 
 默认仍推荐内置 SQLite，因为 Lux 首版是单实例、前台高读、后台短批量写入的 NAS 服务，60,000 级媒体条目在合理容量内。外部 PostgreSQL 面向需要更高并发写入、集中数据库管理或已有 PostgreSQL 基础设施的部署。
 
-数据库选择只发生在首次初始化、创建第一个用户之前。当前版本不支持已初始化实例在线切换后端，也不自动执行 SQLite 到 PostgreSQL 的数据迁移；后续如需迁移，必须提供显式导出、导入和回滚流程。
+数据库选择只发生在首次初始化、创建第一个用户之前。选择 PostgreSQL 并测试成功后，Web 初始化页提供一次性的“重启 Lux”操作；Lux 在同一容器内优雅关闭并重新执行服务进程，启动时运行 PostgreSQL migrations，再继续管理员初始化。当前版本不支持已初始化实例在线切换后端，也不自动执行 SQLite 到 PostgreSQL 的数据迁移；后续如需迁移，必须提供显式导出、导入和回滚流程。
 
 限制：
 
@@ -2121,6 +2121,7 @@ services:
 | LUX-253 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/src/react.css、web/tests/media-detail.test.tsx；单集图片播放与文字详情入口 |
 | LUX-254 | docs/LUX-254-PLAN.md、src/application/playback/session.rs、src/api/playback.rs、src/api/emby.rs、src/api/legacy.rs、tests/playback.rs、docs/API.md、docs/COMPATIBILITY.md；Emby 客户端服务端转码 |
 | LUX-255 | docs/LUX-DEVELOPMENT.md、docs/API.md、docs/COMPATIBILITY.md、src/api/users.rs、src/api/admin_handlers.rs、tests/lux_api_auth.rs、tests/admin_api_key.rs；Lux 用户级客户端令牌与第三方首页 API |
+| LUX-256 | docs/LUX-DEVELOPMENT.md、src/application/thumbnail_policy.rs、src/application/thumbnails.rs、src/application/candidates.rs、src/application/strm_probe.rs、src/storage/、src/api/admin_handlers.rs、web/src/features/admin/AdminLibrariesPage.tsx、web/src/lib/api/types.ts、web/src/react.css、tests/、web/tests/；媒体库缩略图刮削模式与截图优先级 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6275,6 +6276,41 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 - 不新增普通用户 API Key 管理页面或细粒度 token scope。
 - 不改变 Emby 路由/DTO，不把用户令牌写入 URL、日志、审计事件或普通响应。
+
+#### LUX-256：媒体库缩略图刮削模式与截图优先级
+
+范围：在全局媒体库策略和单个媒体库覆盖策略中新增 `images.thumbnailScrapingMode`，使用
+`NONE`（不刮削）、`SCREENSHOT_FIRST`（截图优先）和 `SCRAPER_FIRST`（刮削器优先）三个值，默认
+`SCRAPER_FIRST` 以保持已有媒体库行为。该策略同时约束 `POSTER` 与 `THUMB` 两类自动缩略图，
+不新增数据库列，继续复用现有媒体策略 JSON。
+
+验收：
+
+- [ ] 管理页使用分段控制器展示三种模式；全局策略和自定义媒体库策略都可以读取、编辑并保存该值。
+- [ ] `NONE` 不发起 `POSTER`/`THUMB` 在线刮削，也不生成本地视频或 STRM 视频截图；不删除已有登记图片，
+      手工本地图片仍保持最高优先级。
+- [ ] `SCREENSHOT_FIRST` 同时允许元数据刮削和截图生成；成功的 `FFMPEG`/`STRM_FFMPEG` 截图优先于
+      刮削器图片，缺少截图时回退到刮削器图片；`POSTER` 与 `THUMB` 独立判断。
+- [ ] `SCRAPER_FIRST` 保持现有行为：刮削器图片优先，截图只补全缺失图片；刮削器后来获得图片时可以
+      替换截图回退图。
+- [ ] STRM 信息提取插件的 `thumbnailEnabled` 仍受插件配置控制，但媒体库为 `NONE` 时宿主不得为该库
+      请求或登记缩略图；媒体信息提取不受该缩略图策略影响。
+- [ ] API 对未知模式返回校验错误；旧策略 JSON 缺少该字段时按 `SCRAPER_FIRST` 兼容解析。
+
+验证：
+
+- `cargo test --locked --test thumbnails --test strm_probe --test libraries_api`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-145、LUX-146、LUX-144。
+
+明确不做：
+
+- 不删除、迁移或重生成已有图片资产，不改变现有图片 API、Emby DTO 或插件 RPC 方法名称。
+- 不把缩略图策略扩展为转码、代理或其他媒体库扫描策略；本任务只改变 `POSTER`/`THUMB` 自动来源选择。
 
 ## 26. 风险与缓解
 
