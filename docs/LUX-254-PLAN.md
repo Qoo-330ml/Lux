@@ -55,7 +55,7 @@
     `SupportsDirectPlay`/`SupportsDirectStream` 置为 `false`，避免客户端绕过该 URL。
   - `.strm` source 保持 `SupportsTranscoding=false`，不返回 `TranscodingUrl`。
 - `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，缺失时回退到媒体项时长。
-  HLS 清单仍保持可边转边播的动态 playlist，不通过提前写入 `ENDLIST` 冒充 VOD。
+  HLS 清单声明 `#EXT-X-PLAYLIST-TYPE:VOD` 并保留 `hls_list_size=0`，但仍保持可边转边播的动态 playlist，转码完成前不提前写入 `ENDLIST`。
 
 ### 转码资源
 
