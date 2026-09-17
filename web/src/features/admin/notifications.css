@@ -38,6 +38,7 @@
 .lux-notification-delivery > div { display: grid; gap: 3px; min-width: 0; }
 .lux-notification-delivery strong { color: var(--lux-text); font-size: .84rem; }
 .lux-notification-delivery span, .lux-notification-delivery small { color: var(--lux-muted); font-size: .74rem; }
+.lux-notification-delivery-content { margin: 2px 0 1px; overflow-wrap: anywhere; color: var(--lux-text); font-size: .82rem; line-height: 1.5; white-space: pre-wrap; }
 .lux-notification-delivery small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lux-admin-state { display: grid; place-items: center; gap: 10px; min-height: 240px; color: var(--lux-muted); text-align: center; }
 .lux-admin-state p { margin: 0; }

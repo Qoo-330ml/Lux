@@ -64,6 +64,8 @@ pub struct WebhookDeliveryView {
     pub destination_id: String,
     pub destination_name: String,
     pub event_type: String,
+    pub title: Option<String>,
+    pub content: Option<String>,
     pub status: String,
     pub attempt_count: i64,
     pub next_attempt_at: i64,
@@ -1501,12 +1503,15 @@ async fn validate_provider(
 }
 
 fn delivery_view(delivery: StoredNotificationDelivery) -> WebhookDeliveryView {
+    let (title, content) = delivery_display_fields(&delivery.payload_json);
     WebhookDeliveryView {
         id: delivery.id,
         event_id: delivery.event_id,
         destination_id: delivery.destination_id,
         destination_name: delivery.destination_name,
         event_type: delivery.event_type,
+        title,
+        content,
         status: delivery.status,
         attempt_count: delivery.attempt_count,
         next_attempt_at: delivery.next_attempt_at,
@@ -1516,6 +1521,21 @@ fn delivery_view(delivery: StoredNotificationDelivery) -> WebhookDeliveryView {
         created_at: delivery.created_at,
         updated_at: delivery.updated_at,
     }
+}
+
+fn delivery_display_fields(payload_json: &str) -> (Option<String>, Option<String>) {
+    let Ok(Value::Object(payload)) = serde_json::from_str(payload_json) else {
+        return (None, None);
+    };
+    (
+        bounded_display_string(payload.get("title")),
+        bounded_display_string(payload.get("content")),
+    )
+}
+
+fn bounded_display_string(value: Option<&Value>) -> Option<String> {
+    let value = value.and_then(Value::as_str)?.trim();
+    (!value.is_empty()).then(|| value.chars().take(4096).collect())
 }
 
 async fn read_secret_map(path: &Path) -> Result<BTreeMap<String, String>, WebhookError> {

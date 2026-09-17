@@ -93,6 +93,8 @@ describe("AdminNotificationsPage", () => {
         nextAttemptAt: 1_700_000_200,
         lastHttpStatus: 500,
         lastError: "upstream failed",
+        title: "扫描完成",
+        content: "扫描已完成\n媒体库：library-1",
         deliveredAt: null,
         createdAt: 1_700_000_000,
         updatedAt: 1_700_000_200,
@@ -195,7 +197,7 @@ describe("AdminNotificationsPage", () => {
     expect(container.querySelector(".lux-notification-form")).toBeNull();
   });
 
-  it("shows destinations, delivery failures, and retry action", async () => {
+  it("shows destinations, notification content, delivery failures, and retry action", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root.render(createElement(
@@ -212,6 +214,8 @@ describe("AdminNotificationsPage", () => {
     expect(container.textContent).toContain("通知");
     expect(container.textContent).toContain("本地接收器");
     expect(container.textContent).toContain("发送失败");
+    expect(container.textContent).toContain("扫描已完成");
+    expect(container.textContent).toContain("媒体库：library-1");
     expect(container.querySelector('input[name="event-MEDIA_ADDED"]')).toBeTruthy();
     expect(container.querySelector('select[name="notification-provider"]')).toBeTruthy();
     expect(container.querySelector('input[name="notification-config-url"]')).toBeTruthy();
