@@ -22,6 +22,7 @@ use crate::{
             ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
             provider_key_from_plugin_id,
         },
+        thumbnail_policy::ThumbnailScrapingMode,
     },
     observability::resources::ResourceMetrics,
     storage::{
@@ -1929,7 +1930,13 @@ impl MetadataSelectionService {
             .collect::<BTreeSet<_>>();
         let image_attempt_identities = image_attempt_identities(current);
         let image_types = image_policy.enabled_types().collect::<Vec<_>>();
-        let local_image_types = self.images.local_image_types(item_id, &image_types).await?;
+        let local_image_types = if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
+            self.images
+                .local_image_types_including_fallback(item_id, &image_types)
+                .await?
+        } else {
+            self.images.local_image_types(item_id, &image_types).await?
+        };
         let mut images_missing = false;
         for image_type in image_types {
             if local_image_types.contains(image_type) {
@@ -2249,9 +2256,18 @@ impl MetadataSelectionService {
                 options.supplemental,
             )
             .await?;
+        let screenshot_fallback_types =
+            if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
+                self.images
+                    .fallback_image_types(item_id, &["POSTER", "THUMB"])
+                    .await?
+            } else {
+                BTreeSet::new()
+            };
         let has_primary_artwork = image_types
             .iter()
             .any(|image_type| matches!(*image_type, "POSTER" | "THUMB"))
+            || !screenshot_fallback_types.is_empty()
             || self.images.has_local_image(item_id, "POSTER").await?
             || self.images.has_local_image(item_id, "THUMB").await?;
         // An empty credits response means the provider did not supply cast data;
@@ -2355,16 +2371,27 @@ impl MetadataSelectionService {
         supplemental: bool,
     ) -> Result<Vec<&'static str>, MetadataSelectionError> {
         let mut specs = Vec::new();
+        let screenshot_fallback_types =
+            if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
+                self.images
+                    .fallback_image_types(item_id, &["POSTER", "THUMB"])
+                    .await?
+            } else {
+                BTreeSet::new()
+            };
         macro_rules! add_spec {
             ($image_type:expr, $urls:expr) => {
                 let urls = $urls;
-                if !urls.is_empty() {
+                if !urls.is_empty() && !screenshot_fallback_types.contains($image_type) {
                     specs.push(($image_type, urls, 0_i64));
                 }
             };
         }
         if payload.typed_images_present {
             for image_type in image_policy.enabled_types() {
+                if screenshot_fallback_types.contains(image_type) {
+                    continue;
+                }
                 if let Some(urls) = payload.images.get(image_type).cloned() {
                     if image_type == "FANART" && supplemental {
                         let urls = self
@@ -2980,6 +3007,7 @@ pub(crate) struct ImageSelectionPolicy {
     thumbnail: bool,
     disc: bool,
     wallpaper: bool,
+    thumbnail_scraping_mode: ThumbnailScrapingMode,
 }
 
 impl ImageSelectionPolicy {
@@ -2992,10 +3020,17 @@ impl ImageSelectionPolicy {
 
     fn enabled_types(self) -> impl Iterator<Item = &'static str> {
         [
-            (self.poster, "POSTER"),
+            (
+                self.poster && !matches!(self.thumbnail_scraping_mode, ThumbnailScrapingMode::None),
+                "POSTER",
+            ),
             (true, "FANART"),
             (self.logo, "LOGO"),
-            (self.thumbnail, "THUMB"),
+            (
+                self.thumbnail
+                    && !matches!(self.thumbnail_scraping_mode, ThumbnailScrapingMode::None),
+                "THUMB",
+            ),
             (self.banner, "BANNER"),
             (self.disc, "DISC"),
             (self.artwork, "ART"),
@@ -3023,6 +3058,8 @@ struct StoredImageStrategy {
     disc: bool,
     #[serde(default)]
     wallpaper: bool,
+    #[serde(default)]
+    thumbnail_scraping_mode: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -3041,6 +3078,7 @@ fn default_image_selection_policy() -> ImageSelectionPolicy {
         poster: true,
         logo: true,
         thumbnail: true,
+        thumbnail_scraping_mode: ThumbnailScrapingMode::ScraperFirst,
         ..ImageSelectionPolicy::default()
     }
 }
@@ -3055,6 +3093,9 @@ fn parse_image_selection_policy(value: &str) -> Option<ImageSelectionPolicy> {
         thumbnail: strategy.images.thumbnail,
         disc: strategy.images.disc,
         wallpaper: strategy.images.wallpaper,
+        thumbnail_scraping_mode: ThumbnailScrapingMode::parse(
+            strategy.images.thumbnail_scraping_mode.as_deref(),
+        ),
     })
 }
 
@@ -3529,7 +3570,7 @@ mod tests {
         ACTOR_METADATA_FETCH_CONCURRENCY, candidate_actors, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_match_score,
-        metadata_request_plan,
+        metadata_request_plan, parse_image_selection_policy,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3658,6 +3699,20 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert!(enabled_types.contains(&"FANART"));
+    }
+
+    #[test]
+    fn none_thumbnail_mode_removes_only_poster_and_thumb_from_scraper_types() {
+        let policy = parse_image_selection_policy(
+            r#"{"images":{"thumbnailScrapingMode":"NONE","poster":true,"thumbnail":true,"logo":true}}"#,
+        )
+        .expect("strategy JSON is valid");
+        let enabled_types = policy.enabled_types().collect::<Vec<_>>();
+
+        assert!(!enabled_types.contains(&"POSTER"));
+        assert!(!enabled_types.contains(&"THUMB"));
+        assert!(enabled_types.contains(&"FANART"));
+        assert!(enabled_types.contains(&"LOGO"));
     }
 
     #[test]

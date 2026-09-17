@@ -12,9 +12,15 @@ use tokio::{fs, process::Command, sync::Semaphore, task::JoinSet, time::timeout}
 use uuid::Uuid;
 
 use crate::{
-    application::images::{
-        acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
-        is_fallback_image_source, read_image_dimensions_from_bytes, write_image_atomically,
+    application::{
+        images::{
+            acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
+            is_fallback_image_source, read_image_dimensions_from_bytes, write_image_atomically,
+        },
+        thumbnail_policy::ThumbnailScrapingMode,
+    },
+    config::{
+        DEFAULT_FFMPEG_CONCURRENCY, MAX_FFMPEG_CONCURRENCY, ffmpeg_concurrency_override_from_env,
     },
     domain::ids::LibraryId,
     storage::{Database, ItemImageMetadata, StorageError, StoredThumbnailSource},
@@ -28,13 +34,24 @@ const THUMBNAIL_FILTER: &str =
     "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,setsar=1";
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
 const THUMBNAIL_WORKER_CONCURRENCY: usize = 4;
-const GLOBAL_FFMPEG_CONCURRENCY: usize = 4;
+const GLOBAL_FFMPEG_CONCURRENCY: usize = MAX_FFMPEG_CONCURRENCY as usize;
 static GLOBAL_FFMPEG_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn global_ffmpeg_permits() -> Arc<Semaphore> {
     GLOBAL_FFMPEG_PERMITS
-        .get_or_init(|| Arc::new(Semaphore::new(GLOBAL_FFMPEG_CONCURRENCY)))
+        .get_or_init(|| Arc::new(Semaphore::new(configured_ffmpeg_concurrency())))
         .clone()
+}
+
+fn configured_ffmpeg_concurrency() -> usize {
+    match ffmpeg_concurrency_override_from_env() {
+        Ok(Some(value)) => usize::try_from(value).unwrap_or(GLOBAL_FFMPEG_CONCURRENCY),
+        Ok(None) => DEFAULT_FFMPEG_CONCURRENCY as usize,
+        Err(error) => {
+            tracing::warn!(%error, "invalid ffmpeg concurrency; using the safe default bound");
+            DEFAULT_FFMPEG_CONCURRENCY as usize
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -69,6 +86,7 @@ impl ThumbnailService {
     ) -> Result<ThumbnailReport, ThumbnailError> {
         let mut seen_items = HashSet::new();
         let mut report = ThumbnailReport::default();
+        let global_strategy = self.database.media_strategy_settings().await?;
         let library_id = library_id.to_string();
         let mut offset = 0_i64;
         loop {
@@ -81,8 +99,13 @@ impl ThumbnailService {
                 )
                 .await?;
             let last_page = candidates.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            self.generate_sources(candidates, &mut seen_items, &mut report)
-                .await;
+            self.generate_sources(
+                candidates,
+                global_strategy.as_deref(),
+                &mut seen_items,
+                &mut report,
+            )
+            .await;
             if last_page {
                 break;
             }
@@ -97,6 +120,7 @@ impl ThumbnailService {
     ) -> Result<ThumbnailReport, ThumbnailError> {
         let mut seen_items = HashSet::new();
         let mut report = ThumbnailReport::default();
+        let global_strategy = self.database.media_strategy_settings().await?;
         let mut offset = 0_i64;
         loop {
             let candidates = self
@@ -108,8 +132,13 @@ impl ThumbnailService {
                 )
                 .await?;
             let last_page = candidates.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            self.generate_sources(candidates, &mut seen_items, &mut report)
-                .await;
+            self.generate_sources(
+                candidates,
+                global_strategy.as_deref(),
+                &mut seen_items,
+                &mut report,
+            )
+            .await;
             if last_page {
                 break;
             }
@@ -123,6 +152,7 @@ impl ThumbnailService {
         scan_job_id: &str,
     ) -> Result<ThumbnailReport, ThumbnailError> {
         let mut report = ThumbnailReport::default();
+        let global_strategy = self.database.media_strategy_settings().await?;
         loop {
             let candidates = self
                 .database
@@ -140,8 +170,13 @@ impl ThumbnailService {
                 .map(|candidate| candidate.item_id.clone())
                 .collect::<Vec<_>>();
             let mut seen_items = HashSet::new();
-            self.generate_sources(candidates, &mut seen_items, &mut report)
-                .await;
+            self.generate_sources(
+                candidates,
+                global_strategy.as_deref(),
+                &mut seen_items,
+                &mut report,
+            )
+            .await;
             let failed_item_ids = report.failed_item_ids.clone();
             self.database
                 .mark_scan_job_target_stage(
@@ -172,12 +207,21 @@ impl ThumbnailService {
     async fn generate_sources(
         &self,
         candidates: Vec<StoredThumbnailSource>,
+        global_strategy: Option<&str>,
         seen_items: &mut HashSet<String>,
         report: &mut ThumbnailReport,
     ) {
         let mut pending = JoinSet::new();
         for candidate in candidates {
             if !seen_items.insert(candidate.item_id.clone()) {
+                continue;
+            }
+            let mode = ThumbnailScrapingMode::from_strategy_json(
+                candidate.library_media_strategy_json.as_deref(),
+                global_strategy,
+            );
+            if !mode.allows_screenshots() {
+                report.skipped_policy += 1;
                 continue;
             }
             if is_strm_path(&candidate.relative_path) {
@@ -191,7 +235,7 @@ impl ThumbnailService {
             let service = self.clone();
             pending.spawn(async move {
                 let item_id = candidate.item_id.clone();
-                let result = service.generate_for_source(&candidate).await;
+                let result = service.generate_for_source(&candidate, mode).await;
                 (item_id, result)
             });
         }
@@ -234,6 +278,7 @@ impl ThumbnailService {
     async fn generate_for_source(
         &self,
         source: &StoredThumbnailSource,
+        mode: ThumbnailScrapingMode,
     ) -> Result<ThumbnailOutcome, ThumbnailFileError> {
         let (source_path, _target_path, root_path) = resolve_media_paths(source).await?;
         let _image_write_lock = acquire_image_write_lock(&source.item_id).await;
@@ -247,22 +292,66 @@ impl ThumbnailService {
             .ok_or(ThumbnailFileError::TargetUnavailable)?;
         let thumbnail_target = first_available_thumbnail_path(&source_path, &indexed_images)
             .ok_or(ThumbnailFileError::TargetUnavailable)?;
+        let poster_availability =
+            indexed_image_availability(&indexed_images, "POSTER", &root_path).await?;
+        let thumbnail_availability =
+            indexed_image_availability(&indexed_images, "THUMB", &root_path).await?;
+        let poster_plan = self
+            .plan_artwork(
+                "POSTER",
+                poster_target,
+                POSTER_FILTER,
+                poster_availability,
+                mode,
+            )
+            .await?;
+        let thumbnail_plan = self
+            .plan_artwork(
+                "THUMB",
+                thumbnail_target,
+                THUMBNAIL_FILTER,
+                thumbnail_availability,
+                mode,
+            )
+            .await?;
+
+        if poster_availability == ImageAvailability::Missing
+            && thumbnail_availability == ImageAvailability::Missing
+            && poster_plan.action == ArtworkAction::Generate
+            && thumbnail_plan.action == ArtworkAction::Generate
+        {
+            return match self
+                .generate_pair(&source.item_id, &source_path, &poster_plan, &thumbnail_plan)
+                .await
+            {
+                Ok(()) => Ok(ThumbnailOutcome::Generated),
+                Err(PairGenerationError::Process(ThumbnailFileError::Exit(_))) => {
+                    tracing::debug!(item_id = %source.item_id, "falling back to single-output ffmpeg");
+                    let poster_outcome = self
+                        .execute_artwork_plan(&source.item_id, &source_path, &poster_plan)
+                        .await?;
+                    let thumbnail_outcome = self
+                        .execute_artwork_plan(&source.item_id, &source_path, &thumbnail_plan)
+                        .await?;
+                    Ok(
+                        if poster_outcome == ArtworkOutcome::Generated
+                            || thumbnail_outcome == ArtworkOutcome::Generated
+                        {
+                            ThumbnailOutcome::Generated
+                        } else {
+                            ThumbnailOutcome::Reused
+                        },
+                    )
+                }
+                Err(PairGenerationError::Process(error)) => Err(error),
+                Err(PairGenerationError::Output(error)) => Err(error),
+            };
+        }
+
         let mut generated = false;
-        for (image_type, target_path, filter) in [
-            ("POSTER", poster_target, POSTER_FILTER),
-            ("THUMB", thumbnail_target, THUMBNAIL_FILTER),
-        ] {
-            let availability =
-                indexed_image_availability(&indexed_images, image_type, &root_path).await?;
+        for plan in [poster_plan, thumbnail_plan] {
             if self
-                .ensure_artwork(
-                    &source.item_id,
-                    image_type,
-                    &source_path,
-                    availability,
-                    &target_path,
-                    filter,
-                )
+                .execute_artwork_plan(&source.item_id, &source_path, &plan)
                 .await?
                 == ArtworkOutcome::Generated
             {
@@ -276,53 +365,138 @@ impl ThumbnailService {
         })
     }
 
-    async fn ensure_artwork(
+    async fn plan_artwork(
+        &self,
+        image_type: &'static str,
+        target_path: PathBuf,
+        filter: &'static str,
+        availability: ImageAvailability,
+        mode: ThumbnailScrapingMode,
+    ) -> Result<ArtworkPlan, ThumbnailFileError> {
+        let should_generate = matches!(availability, ImageAvailability::Missing)
+            || (mode.prefers_screenshots() && matches!(availability, ImageAvailability::Scraper));
+        if !should_generate {
+            return Ok(ArtworkPlan {
+                image_type,
+                target_path,
+                filter,
+                action: ArtworkAction::Keep,
+            });
+        }
+        let action = if matches!(availability, ImageAvailability::Missing) {
+            match existing_target_bytes(&target_path).await? {
+                Some(bytes) => ArtworkAction::RegisterExisting { bytes },
+                None => ArtworkAction::Generate,
+            }
+        } else {
+            ArtworkAction::Generate
+        };
+        Ok(ArtworkPlan {
+            image_type,
+            target_path,
+            filter,
+            action,
+        })
+    }
+
+    async fn execute_artwork_plan(
         &self,
         item_id: &str,
-        image_type: &str,
         source_path: &Path,
-        availability: ImageAvailability,
-        target_path: &Path,
-        filter: &str,
+        plan: &ArtworkPlan,
     ) -> Result<ArtworkOutcome, ThumbnailFileError> {
-        if availability != ImageAvailability::Missing {
+        if plan.action == ArtworkAction::Keep {
             return Ok(ArtworkOutcome::Reused);
         }
-        if existing_target(target_path).await? {
-            self.register_image(item_id, image_type, target_path)
+        if let ArtworkAction::RegisterExisting { bytes } = &plan.action {
+            self.register_image(item_id, plan.image_type, &plan.target_path, bytes)
                 .await?;
             return Ok(ArtworkOutcome::Reused);
         }
+        self.generate_single(item_id, source_path, plan).await?;
+        Ok(ArtworkOutcome::Generated)
+    }
 
-        let temporary = target_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .join(format!(".lux-{}-{image_type}.tmp.jpg", Uuid::now_v7()));
+    async fn generate_single(
+        &self,
+        item_id: &str,
+        source_path: &Path,
+        plan: &ArtworkPlan,
+    ) -> Result<(), ThumbnailFileError> {
+        let temporary = temporary_artwork_path(&plan.target_path, plan.image_type);
         let result = async {
-            self.run_ffmpeg(source_path, &temporary, filter).await?;
-            let metadata = fs::metadata(&temporary)
+            self.run_ffmpeg(source_path, &temporary, plan.filter)
+                .await?;
+            let bytes = read_validated_output(&temporary).await?;
+            self.write_and_register(item_id, plan.image_type, &plan.target_path, &bytes)
                 .await
-                .map_err(|error| ThumbnailFileError::io(&temporary, error))?;
-            if !metadata.is_file() || metadata.len() == 0 {
-                return Err(ThumbnailFileError::InvalidOutput);
-            }
-            if metadata.len() > MAX_THUMBNAIL_BYTES {
-                return Err(ThumbnailFileError::OutputTooLarge);
-            }
-            let bytes = fs::read(&temporary)
-                .await
-                .map_err(|error| ThumbnailFileError::io(&temporary, error))?;
-            if !is_jpeg(&bytes) {
-                return Err(ThumbnailFileError::InvalidOutput);
-            }
-            write_image_atomically(target_path, &bytes)
-                .await
-                .map_err(|error| ThumbnailFileError::Write(error.to_string()))?;
-            self.register_image(item_id, image_type, target_path).await
         }
         .await;
         let _ = fs::remove_file(&temporary).await;
-        result.map(|()| ArtworkOutcome::Generated)
+        result
+    }
+
+    async fn generate_pair(
+        &self,
+        item_id: &str,
+        source_path: &Path,
+        poster: &ArtworkPlan,
+        thumbnail: &ArtworkPlan,
+    ) -> Result<(), PairGenerationError> {
+        let poster_temporary = temporary_artwork_path(&poster.target_path, poster.image_type);
+        let thumbnail_temporary =
+            temporary_artwork_path(&thumbnail.target_path, thumbnail.image_type);
+        let result = async {
+            self.run_ffmpeg_pair(
+                source_path,
+                &poster_temporary,
+                &thumbnail_temporary,
+                poster.filter,
+                thumbnail.filter,
+            )
+            .await
+            .map_err(PairGenerationError::Process)?;
+            let poster_bytes = read_validated_output(&poster_temporary)
+                .await
+                .map_err(PairGenerationError::Output)?;
+            let thumbnail_bytes = read_validated_output(&thumbnail_temporary)
+                .await
+                .map_err(PairGenerationError::Output)?;
+            self.write_and_register(
+                item_id,
+                poster.image_type,
+                &poster.target_path,
+                &poster_bytes,
+            )
+            .await
+            .map_err(PairGenerationError::Output)?;
+            self.write_and_register(
+                item_id,
+                thumbnail.image_type,
+                &thumbnail.target_path,
+                &thumbnail_bytes,
+            )
+            .await
+            .map_err(PairGenerationError::Output)
+        }
+        .await;
+        let _ = fs::remove_file(&poster_temporary).await;
+        let _ = fs::remove_file(&thumbnail_temporary).await;
+        result
+    }
+
+    async fn write_and_register(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        target_path: &Path,
+        bytes: &[u8],
+    ) -> Result<(), ThumbnailFileError> {
+        write_image_atomically(target_path, bytes)
+            .await
+            .map_err(|error| ThumbnailFileError::Write(error.to_string()))?;
+        self.register_image(item_id, image_type, target_path, bytes)
+            .await
     }
 
     async fn run_ffmpeg(
@@ -371,22 +545,75 @@ impl ThumbnailService {
         }
     }
 
+    async fn run_ffmpeg_pair(
+        &self,
+        source_path: &Path,
+        poster_output: &Path,
+        thumbnail_output: &Path,
+        poster_filter: &str,
+        thumbnail_filter: &str,
+    ) -> Result<(), ThumbnailFileError> {
+        let _permit = self
+            .ffmpeg_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ThumbnailFileError::FfmpegLimit)?;
+        let filter_complex = format!(
+            "[0:v:0]split=2[poster_source][thumbnail_source];[poster_source]{poster_filter}[poster];[thumbnail_source]{thumbnail_filter}[thumbnail]"
+        );
+        let mut child = Command::new(&self.ffmpeg_binary)
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-ss",
+                DEFAULT_FRAME,
+                "-i",
+            ])
+            .arg(source_path)
+            .args(["-filter_complex", &filter_complex, "-map", "[poster]"])
+            .args(["-frames:v", "1", "-an", "-f", "image2"])
+            .arg(poster_output)
+            .args(["-map", "[thumbnail]"])
+            .args(["-frames:v", "1", "-an", "-f", "image2"])
+            .arg(thumbnail_output)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(ThumbnailFileError::ProcessIo)?;
+        let status = match timeout(self.timeout, child.wait()).await {
+            Ok(result) => result.map_err(ThumbnailFileError::ProcessIo)?,
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                return Err(ThumbnailFileError::Timeout);
+            }
+        };
+        if status.success() {
+            Ok(())
+        } else {
+            Err(ThumbnailFileError::Exit(status.code()))
+        }
+    }
+
     async fn register_image(
         &self,
         item_id: &str,
         image_type: &str,
         path: &Path,
+        bytes: &[u8],
     ) -> Result<(), ThumbnailFileError> {
-        let bytes = fs::read(path)
-            .await
-            .map_err(|error| ThumbnailFileError::io(path, error))?;
         let file_size =
             i64::try_from(bytes.len()).map_err(|_| ThumbnailFileError::OutputTooLarge)?;
-        let content_tag = Sha256::digest(&bytes)
+        let content_tag = Sha256::digest(bytes)
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect::<String>();
-        let dimensions = read_image_dimensions_from_bytes(&bytes).await;
+        let dimensions = read_image_dimensions_from_bytes(bytes).await;
         self.database
             .upsert_item_image_at_index(
                 item_id,
@@ -408,6 +635,59 @@ impl ThumbnailService {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ArtworkAction {
+    Keep,
+    RegisterExisting { bytes: Vec<u8> },
+    Generate,
+}
+
+struct ArtworkPlan {
+    image_type: &'static str,
+    target_path: PathBuf,
+    filter: &'static str,
+    action: ArtworkAction,
+}
+
+#[derive(Debug)]
+enum PairGenerationError {
+    Process(ThumbnailFileError),
+    Output(ThumbnailFileError),
+}
+
+fn temporary_artwork_path(target_path: &Path, image_type: &str) -> PathBuf {
+    target_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join(format!(".lux-{}-{image_type}.tmp.jpg", Uuid::now_v7()))
+}
+
+async fn read_validated_output(path: &Path) -> Result<Vec<u8>, ThumbnailFileError> {
+    let metadata = fs::symlink_metadata(path)
+        .await
+        .map_err(|error| ThumbnailFileError::io(path, error))?;
+    if !metadata.is_file() {
+        return Err(ThumbnailFileError::InvalidOutput);
+    }
+    if metadata.len() == 0 {
+        return Err(ThumbnailFileError::InvalidOutput);
+    }
+    if metadata.len() > MAX_THUMBNAIL_BYTES {
+        return Err(ThumbnailFileError::OutputTooLarge);
+    }
+    let bytes = fs::read(path)
+        .await
+        .map_err(|error| ThumbnailFileError::io(path, error))?;
+    let byte_length = u64::try_from(bytes.len()).map_err(|_| ThumbnailFileError::OutputTooLarge)?;
+    if byte_length > MAX_THUMBNAIL_BYTES {
+        return Err(ThumbnailFileError::OutputTooLarge);
+    }
+    if bytes.is_empty() || !is_jpeg(&bytes) {
+        return Err(ThumbnailFileError::InvalidOutput);
+    }
+    Ok(bytes)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ArtworkOutcome {
     Generated,
@@ -418,7 +698,8 @@ enum ArtworkOutcome {
 enum ImageAvailability {
     Missing,
     Fallback,
-    Complete,
+    Local,
+    Scraper,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -428,6 +709,7 @@ pub struct ThumbnailReport {
     pub reused: usize,
     pub failed: usize,
     pub skipped_strm: usize,
+    pub skipped_policy: usize,
     pub(crate) failed_item_ids: Vec<String>,
 }
 
@@ -525,8 +807,10 @@ async fn indexed_image_availability(
     }
     if is_fallback_image_source(&image.source) {
         Ok(ImageAvailability::Fallback)
+    } else if image.source.eq_ignore_ascii_case("LOCAL") {
+        Ok(ImageAvailability::Local)
     } else {
-        Ok(ImageAvailability::Complete)
+        Ok(ImageAvailability::Scraper)
     }
 }
 
@@ -558,25 +842,28 @@ async fn usable_image_path(path: &Path, root_path: &Path) -> Result<bool, Thumbn
     Ok(canonical.starts_with(root_path))
 }
 
-async fn existing_target(path: &Path) -> Result<bool, ThumbnailFileError> {
+async fn existing_target_bytes(path: &Path) -> Result<Option<Vec<u8>>, ThumbnailFileError> {
     let metadata = match fs::symlink_metadata(path).await {
         Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(ThumbnailFileError::io(path, error)),
     };
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(ThumbnailFileError::TargetUnavailable);
     }
     if metadata.len() == 0 || metadata.len() > MAX_THUMBNAIL_BYTES {
-        return Ok(false);
+        return Ok(None);
     }
     let bytes = fs::read(path)
         .await
         .map_err(|error| ThumbnailFileError::io(path, error))?;
-    if !is_jpeg(&bytes) {
-        return Ok(false);
+    if u64::try_from(bytes.len()).map_or(true, |length| length > MAX_THUMBNAIL_BYTES) {
+        return Ok(None);
     }
-    Ok(true)
+    if !is_jpeg(&bytes) {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
 }
 
 fn is_jpeg(bytes: &[u8]) -> bool {

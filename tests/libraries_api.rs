@@ -881,6 +881,7 @@ async fn admin_can_update_independent_library_schedules_without_restart()
             "banner": false,
             "logo": true,
             "thumbnail": false,
+            "thumbnailScrapingMode": "SCREENSHOT_FIRST",
             "disc": true,
             "wallpaper": false,
             "writeToMetadata": true,
@@ -918,6 +919,10 @@ async fn admin_can_update_independent_library_schedules_without_restart()
     assert_eq!(
         strategy_body["library"]["mediaStrategy"]["images"]["writeToMetadata"],
         true
+    );
+    assert_eq!(
+        strategy_body["library"]["mediaStrategy"]["images"]["thumbnailScrapingMode"],
+        "SCREENSHOT_FIRST"
     );
 
     let listed = client

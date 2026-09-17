@@ -94,7 +94,7 @@ async fn new_libraries_preserve_realtime_watch_setting() -> Result<(), Box<dyn s
         .await?;
 
     assert!(!library.realtime_watch_enabled);
-    assert_eq!(library.scan_concurrency, 32);
+    assert_eq!(library.scan_concurrency, 16);
     assert_eq!(library.probe_concurrency, 256);
     let updated = service
         .update_settings(

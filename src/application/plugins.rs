@@ -2425,7 +2425,7 @@ fn validate_config_values(
             continue;
         };
         match field.input_type.as_str() {
-            "text" | "password" => {
+            "text" | "textarea" | "password" => {
                 let Some(value) = value.as_str() else {
                     return Err(PluginServiceError::InvalidConfig);
                 };

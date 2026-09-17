@@ -27,12 +27,13 @@ fn fake_ffmpeg(
     exit_code: i32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let command = if exit_code == 0 {
-        "printf '\\377\\330lux-thumb\\377\\331' > \"$output\"".to_owned()
+        "for argument in \"$@\"; do case \"$argument\" in *.jpg) printf '\\377\\330lux-thumb\\377\\331' > \"$argument\";; esac; done".to_owned()
     } else {
         format!("exit {exit_code}")
     };
     let script = format!(
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" >> '{}'\noutput=''\nfor argument in \"$@\"; do output=\"$argument\"; done\n{}\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' -- >> '{}'\nprintf '%s\\n' \"$@\" >> '{}'\n{}\n",
+        log_path.display(),
         log_path.display(),
         command
     );
@@ -41,6 +42,164 @@ fn fake_ffmpeg(
     permissions.set_mode(0o755);
     fs::set_permissions(path, permissions)?;
     Ok(())
+}
+
+fn fake_ffmpeg_rejecting_multi_output(
+    path: &Path,
+    log_path: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' -- >> '{}'\nprintf '%s\\n' \"$@\" >> '{}'\nfor argument in \"$@\"; do\n  if [ \"$argument\" = '-filter_complex' ]; then exit 42; fi\ndone\nfor argument in \"$@\"; do case \"$argument\" in *.jpg) printf '\\377\\330lux-thumb\\377\\331' > \"$argument\";; esac; done\n",
+        log_path.display(),
+        log_path.display(),
+    );
+    fs::write(path, script)?;
+    let mut permissions = fs::metadata(path)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions)?;
+    Ok(())
+}
+
+fn ffmpeg_invocation_count(log: &str) -> usize {
+    log.lines().filter(|line| *line == "--").count()
+}
+
+#[tokio::test]
+async fn missing_poster_and_thumbnail_use_one_ffmpeg_invocation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Dual Output (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Dual.Output.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&scan.id, 100, None).await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fake_ffmpeg(&fake, &log, 0)?;
+    let thumbnails = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5));
+    let report = thumbnails.generate_library(library.id).await?;
+
+    assert_eq!(report.generated, 1);
+    assert!(movie_dir.join("Dual.Output.2024-poster.jpg").is_file());
+    assert!(movie_dir.join("Dual.Output.2024-thumbnail.jpg").is_file());
+    let image_rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT image_type, source FROM item_images ORDER BY image_type")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        image_rows,
+        vec![
+            ("POSTER".to_owned(), "FFMPEG".to_owned()),
+            ("THUMB".to_owned(), "FFMPEG".to_owned()),
+        ]
+    );
+    let log = fs::read_to_string(log)?;
+    assert_eq!(ffmpeg_invocation_count(&log), 1, "ffmpeg log:\n{log}");
+    assert!(log.contains("-filter_complex"), "ffmpeg log:\n{log}");
+    assert!(log.contains("scale=600:900"), "ffmpeg log:\n{log}");
+    assert!(log.contains("scale=1280:720"), "ffmpeg log:\n{log}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn unsupported_dual_output_falls_back_to_two_single_outputs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Fallback (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Fallback.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&scan.id, 100, None).await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fake_ffmpeg_rejecting_multi_output(&fake, &log)?;
+    let thumbnails = ThumbnailService::with_runner(database, fake, Duration::from_secs(5));
+    let report = thumbnails.generate_library(library.id).await?;
+
+    assert_eq!(report.generated, 1);
+    assert!(movie_dir.join("Fallback.2024-poster.jpg").is_file());
+    assert!(movie_dir.join("Fallback.2024-thumbnail.jpg").is_file());
+    let log = fs::read_to_string(log)?;
+    assert_eq!(ffmpeg_invocation_count(&log), 3, "ffmpeg log:\n{log}");
+    assert!(log.contains("-filter_complex"), "ffmpeg log:\n{log}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_dual_output_cleans_temporary_and_final_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Broken Dual (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Broken.Dual.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&scan.id, 100, None).await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' -- >> '{}'\nprintf '%s\\n' \"$@\" >> '{}'\nfor argument in \"$@\"; do case \"$argument\" in *-POSTER.tmp.jpg) printf '\\377\\330lux-thumb\\377\\331' > \"$argument\";; esac; done\nexit 0\n",
+        log_path_placeholder(),
+        log_path_placeholder(),
+    );
+    let script = script.replace(log_path_placeholder(), &log.to_string_lossy());
+    fs::write(&fake, script)?;
+    let mut permissions = fs::metadata(&fake)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake, permissions)?;
+    let thumbnails = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5));
+    let report = thumbnails.generate_library(library.id).await?;
+
+    assert_eq!(report.generated, 0);
+    assert_eq!(report.failed, 1);
+    assert!(!movie_dir.join("Broken.Dual.2024-poster.jpg").exists());
+    assert!(!movie_dir.join("Broken.Dual.2024-thumbnail.jpg").exists());
+    let temporary_count = fs::read_dir(&movie_dir)?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with(".lux-"))
+        .count();
+    assert_eq!(temporary_count, 0);
+    let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(image_count, 0);
+    Ok(())
+}
+
+fn log_path_placeholder() -> &'static str {
+    "__LUX_THUMBNAIL_LOG_PATH__"
 }
 
 #[tokio::test]
@@ -104,9 +263,126 @@ async fn scan_generates_local_thumbnail_but_never_strm_thumbnail()
         ]
     );
     let ffmpeg_arguments = fs::read_to_string(log)?;
+    assert_eq!(ffmpeg_invocation_count(&ffmpeg_arguments), 1);
     assert!(ffmpeg_arguments.contains("scale=600:900"));
     assert!(ffmpeg_arguments.contains("scale=1280:720"));
     assert!(!ffmpeg_arguments.contains("Remote.strm"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn none_mode_skips_local_thumbnail_generation_without_removing_existing_assets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("No Thumbnails (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("No.Thumbnails.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(r#"{"images":{"thumbnailScrapingMode":"NONE"}}"#)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fake_ffmpeg(&fake, &log, 0)?;
+    let report = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5))
+        .generate_library(library.id)
+        .await?;
+
+    assert_eq!(report.considered, 0);
+    assert_eq!(report.skipped_policy, 1);
+    assert!(!movie_dir.join("No.Thumbnails.2024-poster.jpg").exists());
+    assert!(!movie_dir.join("No.Thumbnails.2024-thumbnail.jpg").exists());
+    let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(image_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn screenshot_first_replaces_scraper_poster_and_thumbnail_independently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Screenshot First (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    let media_path = movie_dir.join("Screenshot.First.2024.mkv");
+    fs::write(&media_path, b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let poster_path = movie_dir.join("Screenshot.First.2024-poster.jpg");
+    let thumbnail_path = movie_dir.join("Screenshot.First.2024-thumbnail.jpg");
+    let scraper_bytes = b"\xFF\xD8scraper\xFF\xD9";
+    fs::write(&poster_path, scraper_bytes)?;
+    fs::write(&thumbnail_path, scraper_bytes)?;
+    for (image_type, path) in [("POSTER", &poster_path), ("THUMB", &thumbnail_path)] {
+        sqlx::query(
+            "INSERT INTO item_images (
+                id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+             ) VALUES (?, ?, ?, 0, ?, ?, 'scraper', 'TMDB')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&item_id)
+        .bind(image_type)
+        .bind(path.to_string_lossy().as_ref())
+        .bind(i64::try_from(scraper_bytes.len())?)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(r#"{"images":{"thumbnailScrapingMode":"SCREENSHOT_FIRST"}}"#)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fake_ffmpeg(&fake, &log, 0)?;
+    let report = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5))
+        .generate_library(library.id)
+        .await?;
+
+    assert_eq!(report.generated, 1);
+    assert_eq!(fs::read(&poster_path)?, b"\xFF\xD8lux-thumb\xFF\xD9");
+    assert_eq!(fs::read(&thumbnail_path)?, b"\xFF\xD8lux-thumb\xFF\xD9");
+    let image_sources: Vec<(String, String)> =
+        sqlx::query_as("SELECT image_type, source FROM item_images ORDER BY image_type")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        image_sources,
+        vec![
+            ("POSTER".to_owned(), "FFMPEG".to_owned()),
+            ("THUMB".to_owned(), "FFMPEG".to_owned()),
+        ]
+    );
     Ok(())
 }
 
@@ -502,9 +778,11 @@ while ! mkdir "$state_dir/lock" 2>/dev/null; do sleep 0.001; done
 current=$(cat "$state_dir/current")
 printf '%s' "$((current - 1))" > "$state_dir/current"
 rmdir "$state_dir/lock"
-output=''
-for argument in "$@"; do output="$argument"; done
-printf '\377\330lux-thumb\377\331' > "$output"
+for argument in "$@"; do
+  case "$argument" in
+    *.jpg) printf '\377\330lux-thumb\377\331' > "$argument" ;;
+  esac
+done
 "#;
     fs::write(&fake, script)?;
     let mut permissions = fs::metadata(&fake)?.permissions();
@@ -524,6 +802,10 @@ printf '\377\330lux-thumb\377\331' > "$output"
     assert!(
         maximum >= 2,
         "expected overlapping ffmpeg processes, saw {maximum}"
+    );
+    assert!(
+        maximum <= 4,
+        "thumbnail ffmpeg peak exceeded the default bound"
     );
     Ok(())
 }

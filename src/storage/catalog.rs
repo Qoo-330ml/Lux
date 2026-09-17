@@ -2978,9 +2978,11 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+                    l.media_strategy_json AS library_media_strategy_json
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
+             JOIN libraries l ON l.id = mi.library_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE mi.library_id = ? AND ms.source_kind = 'LOCAL_FILE'
@@ -2999,6 +3001,7 @@ impl Database {
                     item_id: row.get("item_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
+                    library_media_strategy_json: row.get("library_media_strategy_json"),
                 })
                 .collect()
         })
@@ -3015,9 +3018,11 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+                    l.media_strategy_json AS library_media_strategy_json
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
+             JOIN libraries l ON l.id = mi.library_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              JOIN library_roots lr ON lr.id = fe.library_root_id
              WHERE ms.source_kind = 'LOCAL_FILE'
@@ -3050,6 +3055,7 @@ impl Database {
                     item_id: row.get("item_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
+                    library_media_strategy_json: row.get("library_media_strategy_json"),
                 })
                 .collect()
         })
@@ -3066,8 +3072,11 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path
+            "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path,
+                    l.media_strategy_json AS library_media_strategy_json
              FROM scan_job_targets t
+             JOIN media_items mi ON mi.id = t.item_id
+             JOIN libraries l ON l.id = mi.library_id
              JOIN media_sources ms ON ms.id = (
                  SELECT preferred.id FROM media_sources preferred
                  JOIN filesystem_entries preferred_fe
@@ -3097,6 +3106,7 @@ impl Database {
                     item_id: row.get("item_id"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
+                    library_media_strategy_json: row.get("library_media_strategy_json"),
                 })
                 .collect()
         })
@@ -3123,6 +3133,19 @@ impl Database {
                             OR ms.bitrate IS NOT NULL
                             OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
                         THEN 1 ELSE 0 END AS has_media_info,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'POSTER'
+                        ) AND EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'THUMB'
+                        ) THEN 1 ELSE 0 END AS has_strm_thumbnail,
                         lr.canonical_path AS root_path, fe.relative_path,
                         ii.local_path AS thumbnail_path
                  FROM media_sources ms
@@ -3153,6 +3176,19 @@ impl Database {
                             OR ms.bitrate IS NOT NULL
                             OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
                         THEN 1 ELSE 0 END AS has_media_info,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'POSTER'
+                        ) AND EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'THUMB'
+                        ) THEN 1 ELSE 0 END AS has_strm_thumbnail,
                         lr.canonical_path AS root_path, fe.relative_path,
                         ii.local_path AS thumbnail_path
                  FROM media_sources ms
@@ -3183,6 +3219,7 @@ impl Database {
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     thumbnail_path: row.get("thumbnail_path"),
+                    has_strm_thumbnail: row.get::<i64, _>("has_strm_thumbnail") != 0,
                 })
                 .collect()
         })
@@ -3230,6 +3267,19 @@ impl Database {
                             OR ms.bitrate IS NOT NULL
                             OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
                         THEN 1 ELSE 0 END AS has_media_info,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'POSTER'
+                        ) AND EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'THUMB'
+                        ) THEN 1 ELSE 0 END AS has_strm_thumbnail,
                         lr.canonical_path AS root_path, fe.relative_path,
                         ii.local_path AS thumbnail_path
                  FROM media_sources ms
@@ -3272,6 +3322,19 @@ impl Database {
                             OR ms.bitrate IS NOT NULL
                             OR (ms.container IS NOT NULL AND lower(ms.container) <> 'strm')
                         THEN 1 ELSE 0 END AS has_media_info,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'POSTER'
+                        ) AND EXISTS (
+                            SELECT 1 FROM item_images screenshot
+                            WHERE screenshot.item_id = ms.item_id
+                              AND screenshot.image_index = 0
+                              AND screenshot.source = 'STRM_FFMPEG'
+                              AND screenshot.image_type = 'THUMB'
+                        ) THEN 1 ELSE 0 END AS has_strm_thumbnail,
                         lr.canonical_path AS root_path, fe.relative_path,
                         ii.local_path AS thumbnail_path
                  FROM media_sources ms
@@ -3314,6 +3377,7 @@ impl Database {
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     thumbnail_path: row.get("thumbnail_path"),
+                    has_strm_thumbnail: row.get::<i64, _>("has_strm_thumbnail") != 0,
                 })
                 .collect()
         })

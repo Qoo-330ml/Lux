@@ -2,6 +2,7 @@
 
 use luxd::{
     api::{AppState, app_with_state},
+    application::restart::{RestartHandle, ShutdownReason},
     application::{settings::read_network_proxy_url, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -68,6 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
+    let (control_tx, control_rx) = watch::channel(ShutdownReason::Running);
     let mut app_state = AppState::ready_with_proxy(
         config.clone(),
         database.clone(),
@@ -75,7 +77,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         auth,
         emby_auth,
         read_network_proxy_url(&config.config_dir),
-    );
+    )
+    .with_restart_handle(RestartHandle::new(control_tx.clone()));
     if explicit_database_configuration.is_none() && !legacy_sqlite_database {
         app_state = app_state.require_database_selection();
     }
@@ -116,11 +119,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal(shutdown_tx.clone()))
+    .with_graceful_shutdown(shutdown_signal(
+        control_rx,
+        control_tx.clone(),
+        shutdown_tx.clone(),
+    ))
     .await;
     let _ = shutdown_tx.send(true);
     let _ = discovery_task.await;
     serve_result?;
+    let shutdown_reason = *control_tx.borrow();
 
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
@@ -133,10 +141,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(error) => error!(%error, "failed to cancel unfinished background jobs before shutdown"),
     }
     database.close().await;
+    if shutdown_reason == ShutdownReason::Restart {
+        info!("restarting lux process");
+        restart_process()?;
+    }
     Ok(())
 }
 
-async fn shutdown_signal(shutdown: watch::Sender<bool>) {
+async fn shutdown_signal(
+    mut control_rx: watch::Receiver<ShutdownReason>,
+    control_tx: watch::Sender<ShutdownReason>,
+    shutdown: watch::Sender<bool>,
+) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
             error!(%error, "failed to install Ctrl-C handler");
@@ -155,13 +171,49 @@ async fn shutdown_signal(shutdown: watch::Sender<bool>) {
         };
 
         tokio::select! {
-            _ = ctrl_c => {}
-            _ = terminate => {}
+            _ = ctrl_c => {
+                let _ = control_tx.send(ShutdownReason::Shutdown);
+            }
+            _ = terminate => {
+                let _ = control_tx.send(ShutdownReason::Shutdown);
+            }
+            changed = control_rx.changed() => {
+                if changed.is_err() {
+                    let _ = control_tx.send(ShutdownReason::Shutdown);
+                }
+            }
         }
     }
 
     #[cfg(not(unix))]
-    ctrl_c.await;
+    {
+        tokio::select! {
+            _ = ctrl_c => {
+                let _ = control_tx.send(ShutdownReason::Shutdown);
+            }
+            changed = control_rx.changed() => {
+                if changed.is_err() {
+                    let _ = control_tx.send(ShutdownReason::Shutdown);
+                }
+            }
+        }
+    }
 
     let _ = shutdown.send(true);
+}
+
+#[cfg(unix)]
+fn restart_process() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::os::unix::process::CommandExt;
+
+    let executable = std::env::current_exe()?;
+    let error = std::process::Command::new(executable)
+        .args(std::env::args_os().skip(1))
+        .exec();
+    Err(error.into())
+}
+
+#[cfg(not(unix))]
+fn restart_process() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Err("在线重启当前平台的 Lux 进程不可用".into())
 }

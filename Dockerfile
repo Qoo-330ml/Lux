@@ -57,6 +57,9 @@ COPY --chmod=0755 docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 ENV LUX_HTTP_ADDR=0.0.0.0:8097 \
     LUX_CONFIG_DIR=/config \
     LUX_WEB_DIR=/usr/local/share/lux/web \
+    LUX_SCAN_CONCURRENCY=8 \
+    LUX_PROBE_CONCURRENCY=8 \
+    LUX_FFMPEG_CONCURRENCY=2 \
     MALLOC_ARENA_MAX=2 \
     RUST_LOG=luxd=info,tower_http=info \
     TZ=UTC

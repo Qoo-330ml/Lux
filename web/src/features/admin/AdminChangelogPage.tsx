@@ -15,6 +15,25 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.5",
+    date: "2026-09-17",
+    sections: [
+      { kind: "added", items: [
+        "首次设置 PostgreSQL 后，管理员可直接在引导页面点击“重启 Lux”；服务会优雅重启并在数据库迁移完成后继续管理员初始化。",
+        "媒体库策略新增缩略图刮削方式，可选择不刮削、截图优先或刮削器优先，并兼容已有媒体库配置。",
+      ] },
+      { kind: "fixed", items: [
+        "修复失败或孤立的 HLS 转码会话未及时清理的问题；manifest 等待失败、播放停止或客户端中断后会回收对应 FFmpeg 资源。",
+        "修复扫描过程中重复更新媒体可用性状态的问题，并增强 reconciliation 工作项的批量提交、状态持久化和失败恢复，减少重试时的重复处理。",
+      ] },
+      { kind: "changed", items: [
+        "将扫描、媒体技术信息探测和缩略图/FFmpeg 阶段拆分为独立并发控制，Docker 默认提供 LUX_SCAN_CONCURRENCY、LUX_PROBE_CONCURRENCY 和 LUX_FFMPEG_CONCURRENCY 配置。",
+        "通知器管理支持插件声明的 URL 模板和 Body 模板字段，管理员可在管理台直接编辑多行请求模板。",
+        "Docker 部署默认以 root 运行，挂载 NAS 目录时无需额外的 PUID/PGID 交接或递归修改所有权。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.4",
     date: "2026-09-16",
     sections: [

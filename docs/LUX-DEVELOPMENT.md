@@ -507,7 +507,7 @@ Lux 的核心价值不是功能数量，而是：
 
 默认仍推荐内置 SQLite，因为 Lux 首版是单实例、前台高读、后台短批量写入的 NAS 服务，60,000 级媒体条目在合理容量内。外部 PostgreSQL 面向需要更高并发写入、集中数据库管理或已有 PostgreSQL 基础设施的部署。
 
-数据库选择只发生在首次初始化、创建第一个用户之前。当前版本不支持已初始化实例在线切换后端，也不自动执行 SQLite 到 PostgreSQL 的数据迁移；后续如需迁移，必须提供显式导出、导入和回滚流程。
+数据库选择只发生在首次初始化、创建第一个用户之前。选择 PostgreSQL 并测试成功后，Web 初始化页提供一次性的“重启 Lux”操作；Lux 在同一容器内优雅关闭并重新执行服务进程，启动时运行 PostgreSQL migrations，再继续管理员初始化。当前版本不支持已初始化实例在线切换后端，也不自动执行 SQLite 到 PostgreSQL 的数据迁移；后续如需迁移，必须提供显式导出、导入和回滚流程。
 
 限制：
 
@@ -516,14 +516,13 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 32 路；Docker 可通过 `LUX_SCAN_CONCURRENCY` 在 1-1024 范围内设置全局覆盖值，设置后优先于媒体库保存的 `scanConcurrency`。未设置环境变量时，新建媒体库默认 32 路，媒体库的 `scanConcurrency` 可通过管理 API 单独覆盖同一范围；实际后台 worker 数仍会根据 CPU、内存和存储延迟动态降级，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 16 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=8`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 16 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
 - 生产镜像为多阶段构建。
 - 运行时包含 luxd、Web 静态资源、Jellyfin `jellyfin-ffmpeg7` v7.1.4-3 和必要 CA 证书；不安装普通 Debian `ffmpeg`。
-- 非 root 用户运行。
-- 支持 PUID/PGID 或文档化的 UID/GID 映射，使容器能读写媒体目录。
+- 以 root 用户运行，使 bind-mounted NAS 目录无需 PUID/PGID 交接或递归修改所有权即可读写。
 - /config 为可写持久化卷。
 - 媒体目录必须按需求以读写方式挂载，因为 Lux 要回写 NFO 和默认图片；媒体目录中的本地资源仍需可读。
   元数据策略可选择额外将 Lux 管理的 NFO 和图片写入 /config/metadata/library。
@@ -1835,7 +1834,9 @@ services:
     environment:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
-      LUX_SCAN_CONCURRENCY: "32"
+      LUX_SCAN_CONCURRENCY: "8"
+      LUX_PROBE_CONCURRENCY: "8"
+      LUX_FFMPEG_CONCURRENCY: "2"
       RUST_LOG: "lux=info,tower_http=info"
       TZ: "Asia/Shanghai"
     volumes:
@@ -2121,6 +2122,7 @@ services:
 | LUX-253 | docs/LUX-DEVELOPMENT.md、web/src/features/detail/MediaDetailPage.tsx、web/src/react.css、web/tests/media-detail.test.tsx；单集图片播放与文字详情入口 |
 | LUX-254 | docs/LUX-254-PLAN.md、src/application/playback/session.rs、src/api/playback.rs、src/api/emby.rs、src/api/legacy.rs、tests/playback.rs、docs/API.md、docs/COMPATIBILITY.md；Emby 客户端服务端转码 |
 | LUX-255 | docs/LUX-DEVELOPMENT.md、docs/API.md、docs/COMPATIBILITY.md、src/api/users.rs、src/api/admin_handlers.rs、tests/lux_api_auth.rs、tests/admin_api_key.rs；Lux 用户级客户端令牌与第三方首页 API |
+| LUX-256 | docs/LUX-DEVELOPMENT.md、src/application/thumbnail_policy.rs、src/application/thumbnails.rs、src/application/candidates.rs、src/application/strm_probe.rs、src/storage/、src/api/admin_handlers.rs、web/src/features/admin/AdminLibrariesPage.tsx、web/src/lib/api/types.ts、web/src/react.css、tests/、web/tests/；媒体库缩略图刮削模式与截图优先级 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6275,6 +6277,41 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 - 不新增普通用户 API Key 管理页面或细粒度 token scope。
 - 不改变 Emby 路由/DTO，不把用户令牌写入 URL、日志、审计事件或普通响应。
+
+#### LUX-256：媒体库缩略图刮削模式与截图优先级
+
+范围：在全局媒体库策略和单个媒体库覆盖策略中新增 `images.thumbnailScrapingMode`，使用
+`NONE`（不刮削）、`SCREENSHOT_FIRST`（截图优先）和 `SCRAPER_FIRST`（刮削器优先）三个值，默认
+`SCRAPER_FIRST` 以保持已有媒体库行为。该策略同时约束 `POSTER` 与 `THUMB` 两类自动缩略图，
+不新增数据库列，继续复用现有媒体策略 JSON。
+
+验收：
+
+- [ ] 管理页使用分段控制器展示三种模式；全局策略和自定义媒体库策略都可以读取、编辑并保存该值。
+- [ ] `NONE` 不发起 `POSTER`/`THUMB` 在线刮削，也不生成本地视频或 STRM 视频截图；不删除已有登记图片，
+      手工本地图片仍保持最高优先级。
+- [ ] `SCREENSHOT_FIRST` 同时允许元数据刮削和截图生成；成功的 `FFMPEG`/`STRM_FFMPEG` 截图优先于
+      刮削器图片，缺少截图时回退到刮削器图片；`POSTER` 与 `THUMB` 独立判断。
+- [ ] `SCRAPER_FIRST` 保持现有行为：刮削器图片优先，截图只补全缺失图片；刮削器后来获得图片时可以
+      替换截图回退图。
+- [ ] STRM 信息提取插件的 `thumbnailEnabled` 仍受插件配置控制，但媒体库为 `NONE` 时宿主不得为该库
+      请求或登记缩略图；媒体信息提取不受该缩略图策略影响。
+- [ ] API 对未知模式返回校验错误；旧策略 JSON 缺少该字段时按 `SCRAPER_FIRST` 兼容解析。
+
+验证：
+
+- `cargo test --locked --test thumbnails --test strm_probe --test libraries_api`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test`
+- `pnpm --dir web build`
+
+依赖：LUX-145、LUX-146、LUX-144。
+
+明确不做：
+
+- 不删除、迁移或重生成已有图片资产，不改变现有图片 API、Emby DTO 或插件 RPC 方法名称。
+- 不把缩略图策略扩展为转码、代理或其他媒体库扫描策略；本任务只改变 `POSTER`/`THUMB` 自动来源选择。
 
 ## 26. 风险与缓解
 

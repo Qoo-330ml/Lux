@@ -1,5 +1,6 @@
 use luxd::{
     api::{AppState, app_with_state},
+    application::restart::{RestartHandle, ShutdownReason},
     application::setup::SetupService,
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
@@ -7,24 +8,32 @@ use luxd::{
 };
 use reqwest::StatusCode;
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch};
 
 async fn test_server(
     config: Config,
-) -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
-{
+) -> Result<
+    (
+        String,
+        tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        watch::Receiver<ShutdownReason>,
+    ),
+    Box<dyn std::error::Error>,
+> {
     let database = Database::connect(&config).await?;
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
+    let (restart_sender, restart_receiver) = watch::channel(ShutdownReason::Running);
     let app = app_with_state(
         AppState::ready(config.clone(), database.clone(), setup, auth, emby_auth)
+            .with_restart_handle(RestartHandle::new(restart_sender))
             .require_database_selection(),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    Ok((format!("http://{address}"), server))
+    Ok((format!("http://{address}"), server, restart_receiver))
 }
 
 #[tokio::test]
@@ -35,7 +44,7 @@ async fn setup_selects_sqlite_before_creating_the_first_admin()
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
-    let (base_url, server) = test_server(config.clone()).await?;
+    let (base_url, server, _) = test_server(config.clone()).await?;
     let client = reqwest::Client::new();
 
     let status: Value = client
@@ -77,6 +86,53 @@ async fn setup_selects_sqlite_before_creating_the_first_admin()
         probe_after_setup.json::<Value>().await?["error"]["code"],
         "SETUP_ALREADY_COMPLETED"
     );
+
+    let restart_after_setup = client
+        .post(format!("{base_url}/api/v1/setup/database/restart"))
+        .send()
+        .await?;
+    assert_eq!(restart_after_setup.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        restart_after_setup.json::<Value>().await?["error"]["code"],
+        "SETUP_ALREADY_COMPLETED"
+    );
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_can_request_restart_after_selecting_a_different_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (base_url, server, restart_receiver) = test_server(config.clone()).await?;
+    let client = reqwest::Client::new();
+
+    tokio::fs::write(
+        config.config_dir.join("database.json"),
+        serde_json::to_vec(&json!({
+            "backend": "POSTGRES",
+            "host": "127.0.0.1",
+            "port": 5432,
+            "database": "lux",
+            "username": "lux",
+            "password": "test-only-password",
+            "sslMode": "disable"
+        }))?,
+    )
+    .await?;
+
+    let response = client
+        .post(format!("{base_url}/api/v1/setup/database/restart"))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(response.json::<Value>().await?["restarting"], true);
+    assert_eq!(*restart_receiver.borrow(), ShutdownReason::Restart);
+
     server.abort();
     Ok(())
 }
@@ -89,7 +145,7 @@ async fn setup_rejects_invalid_postgres_configuration_without_persisting_it()
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
-    let (base_url, server) = test_server(config.clone()).await?;
+    let (base_url, server, _) = test_server(config.clone()).await?;
     let client = reqwest::Client::new();
 
     let response = client
@@ -121,7 +177,7 @@ async fn setup_requires_database_selection_before_admin_creation()
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
-    let (base_url, server) = test_server(config).await?;
+    let (base_url, server, _) = test_server(config).await?;
     let client = reqwest::Client::new();
 
     let response = client

@@ -471,6 +471,8 @@ pub(crate) struct MediaImageStrategySettings {
     pub(crate) banner: bool,
     pub(crate) logo: bool,
     pub(crate) thumbnail: bool,
+    #[serde(default = "default_thumbnail_scraping_mode")]
+    pub(crate) thumbnail_scraping_mode: String,
     #[serde(default)]
     pub(crate) disc: bool,
     #[serde(default)]
@@ -506,6 +508,8 @@ impl Default for MediaStrategySettings {
                 banner: false,
                 logo: true,
                 thumbnail: true,
+                thumbnail_scraping_mode:
+                    crate::application::thumbnail_policy::DEFAULT_THUMBNAIL_SCRAPING_MODE.to_owned(),
                 disc: false,
                 wallpaper: false,
                 write_to_metadata: false,
@@ -528,6 +532,10 @@ pub(crate) fn default_metadata_refresh_mode() -> String {
 
 pub(crate) fn default_show_metadata_pending() -> bool {
     true
+}
+
+pub(crate) fn default_thumbnail_scraping_mode() -> String {
+    crate::application::thumbnail_policy::DEFAULT_THUMBNAIL_SCRAPING_MODE.to_owned()
 }
 
 pub(crate) async fn read_media_strategy_settings(
@@ -585,6 +593,10 @@ pub(crate) fn validate_media_strategy(settings: &MediaStrategySettings) -> bool 
             .as_deref()
             .map(valid_plugin_id)
             .unwrap_or(true)
+        && matches!(
+            settings.images.thumbnail_scraping_mode.as_str(),
+            "NONE" | "SCREENSHOT_FIRST" | "SCRAPER_FIRST"
+        )
         && (0..=20).contains(&settings.images.max_backdrop_count)
         && (0..=8192).contains(&settings.images.min_download_width)
         && (1..=8).contains(&settings.subtitles.languages.len())

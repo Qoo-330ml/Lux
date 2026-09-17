@@ -237,6 +237,7 @@ pub(super) async fn remove_sqlite_title_year_unique(
              END",
             "CREATE TRIGGER trg_filesystem_entries_availability_update
              AFTER UPDATE OF is_missing ON filesystem_entries
+             WHEN OLD.is_missing <> NEW.is_missing
              BEGIN
                  UPDATE media_items
                  SET has_available_source = EXISTS (

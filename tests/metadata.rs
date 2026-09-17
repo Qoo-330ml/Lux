@@ -8,12 +8,77 @@ use luxd::{
         metadata_paths::people_directory,
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
-        scanner::LibraryScanner,
+        scanner::{LibraryScanner, ScanJobService},
     },
     config::Config,
     library::LibraryKind,
     storage::Database,
 };
+
+#[tokio::test]
+async fn scan_job_metadata_microbatch_isolates_a_broken_series_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let good_episode = root
+        .join("Good Show")
+        .join("Season 01")
+        .join("Good.Show.S01E01.mkv");
+    let broken_episode = root
+        .join("Broken Show")
+        .join("Season 01")
+        .join("Broken.Show.S01E01.mkv");
+    tokio::fs::create_dir_all(good_episode.parent().ok_or("missing good parent")?).await?;
+    tokio::fs::create_dir_all(broken_episode.parent().ok_or("missing broken parent")?).await?;
+    tokio::fs::write(&good_episode, b"good episode").await?;
+    tokio::fs::write(&broken_episode, b"broken episode").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&job.id, 100).await?.completed {
+            break;
+        }
+    }
+
+    sqlx::query(
+        "UPDATE filesystem_entries
+         SET relative_path = 'Missing Show/Season 01/Missing.Show.S01E01.mkv'
+         WHERE relative_path = 'Broken Show/Season 01/Broken.Show.S01E01.mkv'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_scan_job_targets(&job.id, 8)
+        .await?;
+    assert_eq!(report.items_processed, 2);
+
+    let states: Vec<String> = sqlx::query_scalar(
+        "SELECT targets.metadata_state
+         FROM scan_job_targets targets
+         WHERE targets.job_id = ? AND targets.target_type = 'ITEM'
+         ORDER BY targets.target_id",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(states.iter().filter(|state| *state == "DONE").count(), 1);
+    assert_eq!(states.iter().filter(|state| *state == "FAILED").count(), 1);
+    Ok(())
+}
 
 #[test]
 fn metadata_merge_table_preserves_local_and_locked_values() {

@@ -1111,7 +1111,6 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .json(&json!({
             "ItemId": emby_item_id,
             "MediaSourceId": source_id,
-            "PlaySessionId": play_session_id,
             "PositionTicks": 0
         }))
         .send()

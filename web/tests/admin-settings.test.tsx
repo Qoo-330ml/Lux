@@ -25,6 +25,7 @@ const settings = {
       banner: false,
       logo: true,
       thumbnail: true,
+      thumbnailScrapingMode: "SCRAPER_FIRST",
       disc: false,
       wallpaper: false,
       writeToMetadata: false,

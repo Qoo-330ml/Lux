@@ -16,7 +16,7 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::MetadataExt;
 use tokio::{
     fs,
-    sync::{OwnedSemaphorePermit, Semaphore, watch},
+    sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
     task::{JoinHandle, JoinSet},
 };
 use uuid::Uuid;
@@ -48,8 +48,8 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, FilesystemEntryMove, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem,
-        NewMediaItem, NewMediaSource, NewMovieFile, NewScanJobEvent, StorageError,
-        StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
+        NewMediaItem, NewMediaSource, NewMovieFile, NewScanJobEvent, ReconciliationBatchCommit,
+        StorageError, StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
         movie_parent_folder_identity,
     },
@@ -58,19 +58,28 @@ use crate::{
 const FILE_BATCH_SIZE: usize = 500;
 pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 100;
 const DISCOVERY_BATCH_SIZE: usize = 16;
-const FILE_PREPARATION_CONCURRENCY: usize = 8;
 const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
 const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
-const LOCAL_METADATA_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const MISSING_ENTRY_BATCH_SIZE: usize = 500;
+const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
+const LOCAL_METADATA_BATCH_SIZE: usize = 16;
 
 #[derive(Clone)]
 pub struct LibraryScanner {
     database: Database,
+    scan_concurrency: usize,
 }
 
 impl LibraryScanner {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        let scan_concurrency =
+            usize::try_from(scan_concurrency_from_env().unwrap_or(DEFAULT_SCAN_CONCURRENCY))
+                .unwrap_or(1)
+                .max(1);
+        Self {
+            database,
+            scan_concurrency,
+        }
     }
 
     pub async fn repair_legacy_identity_keys(&self) -> Result<usize, ScannerError> {
@@ -174,83 +183,17 @@ impl LibraryScanner {
                     .await?;
             }
             let mut walker = FileBatchWalker::new(&root_path);
-            let mut seen_entry_ids = Vec::with_capacity(FILE_BATCH_SIZE);
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
-                let relative_paths = files
-                    .iter()
-                    .map(|path| {
-                        path.strip_prefix(&root_path)
-                            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
-                            .to_str()
-                            .map(str::to_owned)
-                            .ok_or(ScannerError::NonUtf8Path)
-                    })
-                    .collect::<Result<Vec<_>, ScannerError>>()?;
-                let existing_entries = self
-                    .database
-                    .list_filesystem_entries_for_paths(&root.id, &relative_paths)
-                    .await?;
-                let mut pending_new_files = Vec::with_capacity(FILE_BATCH_SIZE);
-                let mut new_paths = Vec::new();
-                let quick_results = self
-                    .scan_movie_files_if_unchanged(&root.id, &root_path, &files, &existing_entries)
-                    .await?;
-                for (path, quick_result) in files.into_iter().zip(quick_results) {
-                    if let Some((entry_id, quick_report)) = quick_result {
-                        seen_entry_ids.push(entry_id);
-                        report.merge(quick_report);
-                    } else {
-                        let relative_path = path
-                            .strip_prefix(&root_path)
-                            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
-                            .to_str()
-                            .ok_or(ScannerError::NonUtf8Path)?;
-                        if !existing_entries.contains_key(relative_path) {
-                            new_paths.push(path);
-                        } else {
-                            report.merge(
-                                self.scan_movie_file(
-                                    &library_id_text,
-                                    &root,
-                                    &root_path,
-                                    &path,
-                                    &generation,
-                                )
-                                .await?,
-                            );
-                        }
-                    }
-                }
-                for file in self
-                    .prepare_new_movie_files(&root_path, &new_paths)
-                    .await?
-                    .into_iter()
-                    .flatten()
-                {
-                    pending_new_files.push(file);
-                    if pending_new_files.len() == FILE_BATCH_SIZE {
-                        self.flush_new_movie_files(
-                            &library_id_text,
-                            &root,
-                            &generation,
-                            &mut pending_new_files,
-                            &mut report,
-                        )
-                        .await?;
-                    }
-                }
-                self.flush_new_movie_files(
-                    &library_id_text,
-                    &root,
-                    &generation,
-                    &mut pending_new_files,
-                    &mut report,
-                )
-                .await?;
-                self.database
-                    .mark_filesystem_entries_seen_batch(&seen_entry_ids, &generation)
-                    .await?;
-                seen_entry_ids.clear();
+                report.merge(
+                    self.scan_movie_file_batch(
+                        &library_id_text,
+                        &root,
+                        &root_path,
+                        &files,
+                        &generation,
+                    )
+                    .await?,
+                );
             }
             report.marked_missing += usize::try_from(
                 self.database
@@ -316,7 +259,13 @@ impl LibraryScanner {
                 let mut seen_entry_ids = Vec::with_capacity(files.len());
                 let mut new_paths = Vec::new();
                 let quick_results = self
-                    .scan_episode_files_if_unchanged(&root, &root_path, &files, &existing_entries)
+                    .scan_episode_files_if_unchanged(
+                        &root,
+                        &root_path,
+                        &files,
+                        &existing_entries,
+                        self.scan_concurrency,
+                    )
                     .await?;
                 for (path, quick_result) in files.into_iter().zip(quick_results) {
                     if let Some((entry_id, quick_report, provider_update)) = quick_result {
@@ -596,7 +545,11 @@ impl LibraryScanner {
                     report.merge(result);
                 }
                 let new_movie_files = self
-                    .prepare_new_movie_files(&root_path, &new_movie_paths)
+                    .prepare_new_movie_files_with_concurrency(
+                        &root_path,
+                        &new_movie_paths,
+                        self.scan_concurrency,
+                    )
                     .await?
                     .into_iter()
                     .flatten()
@@ -616,7 +569,12 @@ impl LibraryScanner {
                     report.created_sources += file_count;
                 }
                 let new_episode_files = self
-                    .prepare_new_episode_files(&root, &root_path, &new_episode_paths)
+                    .prepare_new_episode_files_with_concurrency(
+                        &root,
+                        &root_path,
+                        &new_episode_paths,
+                        self.scan_concurrency,
+                    )
                     .await?
                     .into_iter()
                     .flatten()
@@ -1382,11 +1340,18 @@ impl LibraryScanner {
             .list_filesystem_entries_for_paths(&root.id, &relative_paths)
             .await?;
         let quick_results = self
-            .scan_movie_files_if_unchanged(&root.id, root_path, files, &existing_entries)
+            .scan_movie_files_if_unchanged(
+                &root.id,
+                root_path,
+                files,
+                &existing_entries,
+                self.scan_concurrency,
+            )
             .await?;
         let mut report = ScanReport::default();
         let mut seen_entry_ids = Vec::with_capacity(files.len());
         let mut new_paths = Vec::new();
+        let mut changed_paths = Vec::new();
         for (path, quick_result) in files.iter().zip(quick_results) {
             if let Some((entry_id, quick_report)) = quick_result {
                 seen_entry_ids.push(entry_id);
@@ -1402,10 +1367,20 @@ impl LibraryScanner {
                 new_paths.push(path.clone());
                 continue;
             }
-            report.merge(
-                self.scan_movie_file(library_id_text, root, root_path, path, generation)
-                    .await?,
-            );
+            changed_paths.push(path.clone());
+        }
+        for changed_report in self
+            .scan_movie_files_with_concurrency(
+                library_id_text,
+                root,
+                root_path,
+                &changed_paths,
+                generation,
+                self.scan_concurrency,
+            )
+            .await?
+        {
+            report.merge(changed_report);
         }
 
         let mut pending_new_files = Vec::with_capacity(new_paths.len());
@@ -1439,6 +1414,67 @@ impl LibraryScanner {
             .mark_filesystem_entries_seen_batch(&seen_entry_ids, generation)
             .await?;
         Ok(report)
+    }
+
+    async fn scan_movie_files_with_concurrency(
+        &self,
+        library_id_text: &str,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        paths: &[PathBuf],
+        generation: &str,
+        configured_concurrency: usize,
+    ) -> Result<Vec<ScanReport>, ScannerError> {
+        if paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        let concurrency = configured_concurrency.max(1);
+        // A regular movie scan can repair an old item's identity and reassign
+        // one of its sources. Files with the same parsed movie identity must
+        // therefore stay in input order; otherwise two source variants can
+        // both observe the pre-repair rows and create duplicate logical items.
+        // Different identities remain eligible for concurrent processing.
+        let mut grouped_paths = Vec::<Vec<(usize, PathBuf)>>::new();
+        let mut group_indexes = HashMap::<String, usize>::new();
+        for (index, path) in paths.iter().cloned().enumerate() {
+            let group_key = reconciliation_regular_group_key(
+                &root.id,
+                &path,
+                MixedClassification::Movie,
+                index,
+            );
+            let group_index = *group_indexes.entry(group_key).or_insert_with(|| {
+                grouped_paths.push(Vec::new());
+                grouped_paths.len() - 1
+            });
+            grouped_paths[group_index].push((index, path));
+        }
+        let mut tasks: JoinSet<ReconciliationRegularGroupTask> = JoinSet::new();
+        let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
+        for group in grouped_paths {
+            while tasks.len() >= concurrency {
+                collect_reconciliation_regular_group_task(&mut tasks, &mut results).await?;
+            }
+            let scanner = self.clone();
+            let library_id_text = library_id_text.to_owned();
+            let root = root.clone();
+            let root_path = root_path.to_owned();
+            let generation = generation.to_owned();
+            tasks.spawn(async move {
+                let mut reports = Vec::with_capacity(group.len());
+                for (index, path) in group {
+                    let report = scanner
+                        .scan_movie_file(&library_id_text, &root, &root_path, &path, &generation)
+                        .await?;
+                    reports.push((index, report));
+                }
+                Ok(reports)
+            });
+        }
+        while !tasks.is_empty() {
+            collect_reconciliation_regular_group_task(&mut tasks, &mut results).await?;
+        }
+        Ok(results.into_iter().flatten().collect())
     }
 
     async fn scan_movie_file_if_unchanged(
@@ -1505,9 +1541,11 @@ impl LibraryScanner {
         root_path: &Path,
         paths: &[PathBuf],
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
+        configured_concurrency: usize,
     ) -> Result<Vec<Option<(String, ScanReport)>>, ScannerError> {
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         let mut tasks: JoinSet<MovieFingerprintTask> = JoinSet::new();
+        let concurrency = configured_concurrency.clamp(1, FINGERPRINT_CHECK_CONCURRENCY);
         for (index, path) in paths.iter().enumerate() {
             let relative_path = path
                 .strip_prefix(root_path)
@@ -1517,7 +1555,7 @@ impl LibraryScanner {
             let Some(existing_entry) = existing_entries.get(relative_path).cloned() else {
                 continue;
             };
-            while tasks.len() >= FINGERPRINT_CHECK_CONCURRENCY {
+            while tasks.len() >= concurrency {
                 collect_movie_fingerprint_task(&mut tasks, &mut results).await?;
             }
             let scanner = self.clone();
@@ -1660,9 +1698,11 @@ impl LibraryScanner {
         root_path: &Path,
         paths: &[PathBuf],
         existing_entries: &HashMap<String, StoredFilesystemEntry>,
+        configured_concurrency: usize,
     ) -> Result<Vec<EpisodeQuickResult>, ScannerError> {
         let mut results = (0..paths.len()).map(|_| None).collect::<Vec<_>>();
         let mut tasks: JoinSet<EpisodeFingerprintTask> = JoinSet::new();
+        let concurrency = configured_concurrency.clamp(1, FINGERPRINT_CHECK_CONCURRENCY);
         for (index, path) in paths.iter().enumerate() {
             let relative_path = path
                 .strip_prefix(root_path)
@@ -1679,7 +1719,7 @@ impl LibraryScanner {
             {
                 continue;
             }
-            while tasks.len() >= FINGERPRINT_CHECK_CONCURRENCY {
+            while tasks.len() >= concurrency {
                 collect_episode_fingerprint_task(&mut tasks, &mut results).await?;
             }
             let scanner = self.clone();
@@ -2065,7 +2105,7 @@ impl LibraryScanner {
             root,
             root_path,
             paths,
-            FILE_PREPARATION_CONCURRENCY,
+            self.scan_concurrency,
         )
         .await
     }
@@ -2109,12 +2149,8 @@ impl LibraryScanner {
         root_path: &Path,
         paths: &[PathBuf],
     ) -> Result<Vec<Option<NewMovieFile>>, ScannerError> {
-        self.prepare_new_movie_files_with_concurrency(
-            root_path,
-            paths,
-            FILE_PREPARATION_CONCURRENCY,
-        )
-        .await
+        self.prepare_new_movie_files_with_concurrency(root_path, paths, self.scan_concurrency)
+            .await
     }
 
     async fn prepare_new_movie_files_with_concurrency(
@@ -2448,11 +2484,14 @@ pub struct ScanJobService {
     default_scan_concurrency: usize,
     scan_concurrency_override: Option<usize>,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 struct LocalMetadataWorkerHandle {
     stop: watch::Sender<bool>,
     task: JoinHandle<()>,
+    job_id: String,
+    notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2486,6 +2525,7 @@ impl ScanJobService {
                 .flatten()
                 .and_then(|value| usize::try_from(value).ok()),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
+            metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -2869,6 +2909,7 @@ impl ScanJobService {
         batch_size: usize,
         stream_files_during_discovery: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
+        let batch_size = batch_size.min(BACKGROUND_SCAN_BATCH_SIZE);
         match self
             .run_batch_unlocked(job_id, batch_size, stream_files_during_discovery)
             .await
@@ -3273,34 +3314,65 @@ impl ScanJobService {
                         .await?;
                     continue;
                 }
-                let missing_paths = self
-                    .database
-                    .list_unseen_filesystem_entry_paths(&root.id, &job.generation)
-                    .await?;
-                let removed_media_paths = missing_paths
-                    .iter()
-                    .filter(|path| is_supported_movie_file(Path::new(path)))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let removed_sidecar_paths = missing_paths
-                    .iter()
-                    .filter(|path| is_supported_sidecar_file(Path::new(path)))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                self.database
-                    .record_scan_job_removed_targets(&job.id, &root.id, &removed_media_paths)
-                    .await?;
-                self.database
-                    .record_scan_job_sidecar_targets(&job.id, &root.id, &removed_sidecar_paths)
-                    .await?;
-                removed_count = removed_count.saturating_add(
-                    usize::try_from(
-                        self.database
-                            .mark_missing_filesystem_entries(&root.id, &job.generation)
-                            .await?,
-                    )
-                    .unwrap_or(usize::MAX),
-                );
+                let mut after_relative_path = None;
+                loop {
+                    let missing_paths = self
+                        .database
+                        .list_unseen_filesystem_entry_paths_page(
+                            &root.id,
+                            &job.generation,
+                            after_relative_path.as_deref(),
+                            i64::try_from(MISSING_ENTRY_BATCH_SIZE).unwrap_or(i64::MAX),
+                        )
+                        .await?;
+                    let Some(last_path) = missing_paths.last().cloned() else {
+                        break;
+                    };
+                    let mut confirmed_missing_paths = Vec::with_capacity(missing_paths.len());
+                    for relative_path in &missing_paths {
+                        let path = Path::new(&root.canonical_path).join(relative_path);
+                        match fs::metadata(&path).await {
+                            Ok(metadata) if metadata.is_file() => {}
+                            Ok(_) => confirmed_missing_paths.push(relative_path.clone()),
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                confirmed_missing_paths.push(relative_path.clone());
+                            }
+                            Err(_) => {
+                                // An inaccessible path is unknown, not proof that the media
+                                // was deleted. Leave it for a later reconciliation attempt.
+                            }
+                        }
+                    }
+                    let removed_media_paths = confirmed_missing_paths
+                        .iter()
+                        .filter(|path| is_supported_movie_file(Path::new(path)))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    let removed_sidecar_paths = confirmed_missing_paths
+                        .iter()
+                        .filter(|path| is_supported_sidecar_file(Path::new(path)))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    if !confirmed_missing_paths.is_empty() {
+                        removed_count = removed_count.saturating_add(
+                            usize::try_from(
+                                self.database
+                                    .finalize_reconciliation_root_page(
+                                        &job.id,
+                                        &root.id,
+                                        &job.generation,
+                                        &confirmed_missing_paths,
+                                        &removed_media_paths,
+                                        &removed_sidecar_paths,
+                                    )
+                                    .await?,
+                            )
+                            .unwrap_or(usize::MAX),
+                        );
+                    }
+                    after_relative_path = Some(last_path);
+                }
+                self.database.refresh_removed_media_items(&root.id).await?;
                 self.database
                     .update_root_scan_cursor(&root.id, None)
                     .await?;
@@ -3347,6 +3419,7 @@ impl ScanJobService {
                     &batch,
                     scan_concurrency,
                     cancellation,
+                    discovery_completed,
                 )
                 .await;
         }
@@ -3363,7 +3436,7 @@ impl ScanJobService {
         let mut changed_sidecar_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut new_works_by_root = HashMap::<String, Vec<ReconciliationScanWork>>::new();
         let mut root_has_existing_index = HashMap::<String, bool>::new();
-        let mut quick_seen_entry_ids = Vec::<String>::new();
+        let mut quick_seen_entry_ids = HashMap::<String, Vec<String>>::new();
         let mut regular_works = Vec::<ReconciliationRegularWork>::new();
         let mut classification_cache = MixedClassificationCache::default();
         for entry in &batch {
@@ -3464,13 +3537,31 @@ impl ScanJobService {
                         &job.generation,
                     )
                     .await?;
-                if changed {
+                let target_needs_recovery = existing_entries
+                    .get(&entry.relative_path)
+                    .is_some_and(|existing| existing.last_seen_generation == job.generation);
+                if changed || target_needs_recovery {
                     changed_sidecar_paths_by_root
                         .entry(root.id.clone())
                         .or_default()
                         .push(entry.relative_path.clone());
+                    // Persist the sidecar target before acknowledging the
+                    // reconciliation entry. If the later batch commit fails,
+                    // the retry still has an explicit metadata target even
+                    // though the sidecar fingerprint is now up to date.
+                    self.database
+                        .record_scan_job_sidecar_targets(
+                            &job.id,
+                            &root.id,
+                            std::slice::from_ref(&entry.relative_path),
+                        )
+                        .await?;
+                    self.notify_local_metadata_worker(&job.id);
                 } else {
-                    quick_seen_entry_ids.push(entry_id);
+                    quick_seen_entry_ids
+                        .entry(root.id.clone())
+                        .or_default()
+                        .push(entry_id);
                 }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
@@ -3482,7 +3573,19 @@ impl ScanJobService {
                 .get(&root.id)
                 .ok_or_else(|| ScannerError::LibraryNotFound)?;
             if let Some((entry_id, quick_report)) = quick_results[entry_index].take() {
-                quick_seen_entry_ids.push(entry_id);
+                quick_seen_entry_ids
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry_id);
+                if existing_entries
+                    .get(&entry.relative_path)
+                    .is_some_and(|existing| existing.last_seen_generation == job.generation)
+                {
+                    changed_paths_by_root
+                        .entry(root.id.clone())
+                        .or_default()
+                        .push(entry.relative_path.clone());
+                }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
                 created_items = created_items.saturating_add(quick_report.created_items);
@@ -3566,6 +3669,7 @@ impl ScanJobService {
                 .push(entry.relative_path.clone());
 
             regular_works.push(ReconciliationRegularWork {
+                index: regular_works.len(),
                 entry: entry.clone(),
                 root: root.clone(),
                 path,
@@ -3745,72 +3849,48 @@ impl ScanJobService {
             return self.cancel_running_job(&job.id).await;
         }
         for root in roots {
-            if let Some(files) = prepared_movie_files.get(&root.id) {
-                let inserted = match self
-                    .database
-                    .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
-                    .await
-                {
-                    Ok(inserted) => inserted,
-                    Err(error) => {
-                        return self
-                            .fail_reconciliation_job(
-                                job,
-                                error.into(),
-                                &completed_entries,
-                                next_count,
-                            )
-                            .await;
-                    }
-                };
-                created_items = created_items.saturating_add(inserted);
-            }
-            if let Some(files) = prepared_episode_files.get(&root.id) {
-                let inserted = match self
-                    .database
-                    .insert_episode_files_batch(&job.library_id, &root.id, &job.generation, files)
-                    .await
-                {
-                    Ok(inserted) => inserted,
-                    Err(error) => {
-                        return self
-                            .fail_reconciliation_job(
-                                job,
-                                error.into(),
-                                &completed_entries,
-                                next_count,
-                            )
-                            .await;
-                    }
-                };
-                created_items = created_items.saturating_add(inserted);
-            }
-            if let Some(paths) = new_paths_by_root.get(&root.id) {
-                self.database
-                    .record_scan_job_targets(&job.id, &root.id, paths, "NEW")
-                    .await?;
-            }
-            if let Some(paths) = changed_paths_by_root.get(&root.id) {
-                self.database
-                    .record_scan_job_targets(&job.id, &root.id, paths, "CHANGED")
-                    .await?;
-            }
-            if let Some(paths) = changed_sidecar_paths_by_root.get(&root.id) {
-                self.database
-                    .record_scan_job_sidecar_targets(&job.id, &root.id, paths)
-                    .await?;
-            }
+            let root_entries = completed_entries
+                .iter()
+                .filter(|entry| entry.library_root_id == root.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let batch = ReconciliationBatchCommit {
+                job_id: &job.id,
+                library_id: &job.library_id,
+                library_root_id: &root.id,
+                generation: &job.generation,
+                discovery_completed,
+                entries: &root_entries,
+                movie_files: prepared_movie_files
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                episode_files: prepared_episode_files
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                seen_entry_ids: quick_seen_entry_ids
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                new_paths: new_paths_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                changed_paths: changed_paths_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                sidecar_paths: changed_sidecar_paths_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+            };
+            let (confirmed, inserted) = self.commit_reconciliation_root_batch(&batch).await?;
+            processed = processed.saturating_sub(root_entries.len());
+            processed = processed.saturating_add(confirmed);
+            created_items = created_items.saturating_add(inserted);
         }
-        self.database
-            .mark_filesystem_entries_seen_batch(&quick_seen_entry_ids, &job.generation)
-            .await?;
-        self.finish_reconciliation_file_batch(
+        self.record_reconciliation_batch_event(
             job,
-            completed_entries,
             processed,
             created_items,
             next_count,
-            Some(concurrency),
+            concurrency,
         )
         .await
     }
@@ -3869,6 +3949,7 @@ impl ScanJobService {
         batch: &[StoredReconciliationScanEntry],
         configured_concurrency: i64,
         cancellation: &AtomicBool,
+        discovery_completed: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let mut processed = 0_usize;
         let mut next_count = job.processed_count;
@@ -3881,7 +3962,7 @@ impl ScanJobService {
         let mut changed_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut new_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut changed_sidecar_paths_by_root = HashMap::<String, Vec<String>>::new();
-        let mut quick_seen_entry_ids = Vec::<String>::new();
+        let mut quick_seen_entry_ids = HashMap::<String, Vec<String>>::new();
         let mut new_files = Vec::<(
             usize,
             String,
@@ -3889,6 +3970,7 @@ impl ScanJobService {
             PathBuf,
             StoredReconciliationScanEntry,
         )>::new();
+        let mut regular_works = Vec::<ReconciliationRegularWork>::new();
 
         for entry in batch {
             if roots.iter().any(|root| root.id == entry.library_root_id) {
@@ -3996,13 +4078,27 @@ impl ScanJobService {
                         &job.generation,
                     )
                     .await?;
-                if changed {
+                let target_needs_recovery = existing_entries
+                    .get(&entry.relative_path)
+                    .is_some_and(|existing| existing.last_seen_generation == job.generation);
+                if changed || target_needs_recovery {
                     changed_sidecar_paths_by_root
                         .entry(root.id.clone())
                         .or_default()
                         .push(entry.relative_path.clone());
+                    self.database
+                        .record_scan_job_sidecar_targets(
+                            &job.id,
+                            &root.id,
+                            std::slice::from_ref(&entry.relative_path),
+                        )
+                        .await?;
+                    self.notify_local_metadata_worker(&job.id);
                 } else {
-                    quick_seen_entry_ids.push(entry_id);
+                    quick_seen_entry_ids
+                        .entry(root.id.clone())
+                        .or_default()
+                        .push(entry_id);
                 }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
@@ -4014,7 +4110,19 @@ impl ScanJobService {
                 .get(&root.id)
                 .ok_or_else(|| ScannerError::LibraryNotFound)?;
             if let Some((entry_id, quick_report)) = quick_results[index].take() {
-                quick_seen_entry_ids.push(entry_id);
+                quick_seen_entry_ids
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry_id);
+                if existing_entries
+                    .get(&entry.relative_path)
+                    .is_some_and(|existing| existing.last_seen_generation == job.generation)
+                {
+                    changed_paths_by_root
+                        .entry(root.id.clone())
+                        .or_default()
+                        .push(entry.relative_path.clone());
+                }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
                 completed_entries.push((index, entry.clone()));
@@ -4026,28 +4134,13 @@ impl ScanJobService {
                     .entry(root.id.clone())
                     .or_default()
                     .push(entry.relative_path.clone());
-                if let Err(error) = self
-                    .scanner
-                    .scan_movie_file(
-                        &job.library_id,
-                        root,
-                        Path::new(&root.canonical_path),
-                        &path,
-                        &job.generation,
-                    )
-                    .await
-                {
-                    let completed = completed_entries
-                        .iter()
-                        .map(|(_, entry)| entry.clone())
-                        .collect::<Vec<_>>();
-                    return self
-                        .fail_reconciliation_job(job, error, &completed, next_count)
-                        .await;
-                }
-                next_count = next_count.saturating_add(1);
-                processed = processed.saturating_add(1);
-                completed_entries.push((index, entry.clone()));
+                regular_works.push(ReconciliationRegularWork {
+                    index,
+                    entry: entry.clone(),
+                    root: root.clone(),
+                    path,
+                    classification: MixedClassification::Movie,
+                });
                 continue;
             }
 
@@ -4062,6 +4155,119 @@ impl ScanJobService {
                 path,
                 entry.clone(),
             ));
+        }
+
+        let mut grouped_regular_works = Vec::<Vec<(usize, ReconciliationRegularWork)>>::new();
+        let mut regular_group_indexes = HashMap::<String, usize>::new();
+        for (regular_index, work) in regular_works.iter().cloned().enumerate() {
+            let group_key = reconciliation_regular_group_key(
+                &work.root.id,
+                &work.path,
+                work.classification,
+                work.index,
+            );
+            let group_index = *regular_group_indexes.entry(group_key).or_insert_with(|| {
+                grouped_regular_works.push(Vec::new());
+                grouped_regular_works.len() - 1
+            });
+            grouped_regular_works[group_index].push((regular_index, work));
+        }
+        let mut regular_tasks: JoinSet<ReconciliationRegularGroupTask> = JoinSet::new();
+        let mut regular_results = (0..regular_works.len()).map(|_| None).collect::<Vec<_>>();
+        for group in grouped_regular_works {
+            if cancellation.load(Ordering::Acquire) {
+                regular_tasks.abort_all();
+                return self.cancel_running_job(&job.id).await;
+            }
+            while regular_tasks.len() >= concurrency {
+                if let Err(error) = collect_reconciliation_regular_group_task(
+                    &mut regular_tasks,
+                    &mut regular_results,
+                )
+                .await
+                {
+                    let completed = completed_entries
+                        .iter()
+                        .map(|(_, entry)| entry.clone())
+                        .collect::<Vec<_>>();
+                    return self
+                        .fail_reconciliation_job(job, error, &completed, next_count)
+                        .await;
+                }
+            }
+            let scanner = self.scanner.clone();
+            let library_id = job.library_id.clone();
+            let generation = job.generation.clone();
+            regular_tasks.spawn(async move {
+                let mut reports = Vec::with_capacity(group.len());
+                for (regular_index, work) in group {
+                    let root = work.root;
+                    let path = work.path;
+                    let report = match work.classification {
+                        MixedClassification::Movie => {
+                            scanner
+                                .scan_movie_file(
+                                    &library_id,
+                                    &root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                        }
+                        MixedClassification::Episode => {
+                            scanner
+                                .scan_episode_file(
+                                    &library_id,
+                                    &root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                        }
+                        MixedClassification::Unresolved => {
+                            scanner
+                                .scan_unresolved_file(
+                                    &library_id,
+                                    &root,
+                                    Path::new(&root.canonical_path),
+                                    &path,
+                                    &generation,
+                                )
+                                .await?
+                        }
+                    };
+                    reports.push((regular_index, report));
+                }
+                Ok(reports)
+            });
+        }
+        while !regular_tasks.is_empty() {
+            if let Err(error) =
+                collect_reconciliation_regular_group_task(&mut regular_tasks, &mut regular_results)
+                    .await
+            {
+                let completed = completed_entries
+                    .iter()
+                    .map(|(_, entry)| entry.clone())
+                    .collect::<Vec<_>>();
+                return self
+                    .fail_reconciliation_job(job, error, &completed, next_count)
+                    .await;
+            }
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return self.cancel_running_job(&job.id).await;
+        }
+        for (work, report) in regular_works
+            .into_iter()
+            .zip(regular_results.into_iter().flatten())
+        {
+            created_items = created_items.saturating_add(report.created_items);
+            next_count = next_count.saturating_add(1);
+            processed = processed.saturating_add(1);
+            completed_entries.push((work.index, work.entry));
         }
 
         let mut preparation_tasks: JoinSet<MoviePreparationTask> = JoinSet::new();
@@ -4132,81 +4338,74 @@ impl ScanJobService {
             completed_entries.push((index, entry));
         }
 
-        for root in roots {
-            if let Some(files) = prepared_files.get(&root.id) {
-                let inserted = match self
-                    .database
-                    .insert_movie_files_batch(&job.library_id, &root.id, &job.generation, files)
-                    .await
-                {
-                    Ok(inserted) => inserted,
-                    Err(error) => {
-                        let completed = completed_entries
-                            .iter()
-                            .map(|(_, entry)| entry.clone())
-                            .collect::<Vec<_>>();
-                        return self
-                            .fail_reconciliation_job(job, error.into(), &completed, next_count)
-                            .await;
-                    }
-                };
-                created_items = created_items.saturating_add(inserted);
-            }
-            if let Some(paths) = new_paths_by_root.get(&root.id) {
-                self.database
-                    .record_scan_job_targets(&job.id, &root.id, paths, "NEW")
-                    .await?;
-            }
-            if let Some(paths) = changed_paths_by_root.get(&root.id) {
-                self.database
-                    .record_scan_job_targets(&job.id, &root.id, paths, "CHANGED")
-                    .await?;
-            }
-            if let Some(paths) = changed_sidecar_paths_by_root.get(&root.id) {
-                self.database
-                    .record_scan_job_sidecar_targets(&job.id, &root.id, paths)
-                    .await?;
-            }
-        }
-
-        self.database
-            .mark_filesystem_entries_seen_batch(&quick_seen_entry_ids, &job.generation)
-            .await?;
-
         completed_entries.sort_by_key(|(index, _)| *index);
         let completed_entries = completed_entries
             .into_iter()
             .map(|(_, entry)| entry)
-            .collect();
-        self.finish_reconciliation_file_batch(
+            .collect::<Vec<_>>();
+        for root in roots {
+            let root_entries = completed_entries
+                .iter()
+                .filter(|entry| entry.library_root_id == root.id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let batch = ReconciliationBatchCommit {
+                job_id: &job.id,
+                library_id: &job.library_id,
+                library_root_id: &root.id,
+                generation: &job.generation,
+                discovery_completed,
+                entries: &root_entries,
+                movie_files: prepared_files.get(&root.id).map_or(&[][..], Vec::as_slice),
+                episode_files: &[],
+                seen_entry_ids: quick_seen_entry_ids
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                new_paths: new_paths_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                changed_paths: changed_paths_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                sidecar_paths: changed_sidecar_paths_by_root
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+            };
+            let (confirmed, inserted) = self.commit_reconciliation_root_batch(&batch).await?;
+            processed = processed.saturating_sub(root_entries.len());
+            processed = processed.saturating_add(confirmed);
+            created_items = created_items.saturating_add(inserted);
+        }
+        self.record_reconciliation_batch_event(
             job,
-            completed_entries,
             processed,
             created_items,
             next_count,
-            Some(concurrency),
+            concurrency,
         )
         .await
     }
 
-    async fn finish_reconciliation_file_batch(
+    async fn commit_reconciliation_root_batch(
+        &self,
+        batch: &ReconciliationBatchCommit<'_>,
+    ) -> Result<(usize, usize), ScanJobError> {
+        let result = self.database.commit_reconciliation_batch(batch).await?;
+        self.notify_local_metadata_worker(batch.job_id);
+        Ok((result.confirmed_entries, result.created_items))
+    }
+
+    async fn record_reconciliation_batch_event(
         &self,
         job: &StoredScanJob,
-        completed_entries: Vec<StoredReconciliationScanEntry>,
         processed: usize,
         created_items: usize,
         next_count: i64,
-        effective_concurrency: Option<usize>,
+        concurrency: usize,
     ) -> Result<ScanBatchReport, ScanJobError> {
-        self.database
-            .complete_reconciliation_files(&job.id, &completed_entries, next_count)
-            .await?;
-        let batch_details = match effective_concurrency {
-            Some(concurrency) => format!(
-                r#"{{"processed":{processed},"total":{next_count},"concurrency":{concurrency}}}"#
-            ),
-            None => format!(r#"{{"processed":{processed},"total":{next_count}}}"#),
-        };
+        let batch_details = format!(
+            r#"{{"processed":{processed},"total":{next_count},"concurrency":{concurrency}}}"#
+        );
         self.record_event(
             &job.id,
             "INFO",
@@ -4233,15 +4432,10 @@ impl ScanJobService {
         &self,
         job: &StoredScanJob,
         error: ScannerError,
-        completed_entries: &[StoredReconciliationScanEntry],
-        next_count: i64,
+        _completed_entries: &[StoredReconciliationScanEntry],
+        _next_count: i64,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let error_code = error.code();
-        if !completed_entries.is_empty() {
-            self.database
-                .complete_reconciliation_files(&job.id, completed_entries, next_count)
-                .await?;
-        }
         self.database
             .finish_scan_job(&job.id, "FAILED", Some(&error.to_string()))
             .await?;
@@ -4499,6 +4693,7 @@ impl ScanJobService {
                 self.database
                     .record_scan_job_sidecar_targets(&job.id, &root.id, &sidecar_paths)
                     .await?;
+                self.notify_local_metadata_worker(&job.id);
             }
             self.database
                 .mark_filesystem_entry_missing_by_path(&root.id, &path.relative_path)
@@ -4516,17 +4711,22 @@ impl ScanJobService {
                     if cancellation.load(Ordering::Acquire) {
                         return Ok(created_items);
                     }
-                    created_items = created_items.saturating_add(
-                        self.process_incremental_file(
-                            library_kind,
-                            job,
-                            root,
-                            root_path,
-                            &file,
-                            &mut classification_cache,
-                        )
-                        .await?,
-                    );
+                    if is_supported_sidecar_file(&file) {
+                        self.process_incremental_sidecar_file(job, root, root_path, &file)
+                            .await?;
+                    } else {
+                        created_items = created_items.saturating_add(
+                            self.process_incremental_file(
+                                library_kind,
+                                job,
+                                root,
+                                root_path,
+                                &file,
+                                &mut classification_cache,
+                            )
+                            .await?,
+                        );
+                    }
                 }
             }
             Ok(created_items)
@@ -4544,9 +4744,7 @@ impl ScanJobService {
             )
             .await
         } else if is_supported_sidecar_file(&media_path) {
-            let sidecar_paths = [path.relative_path.clone()];
-            self.database
-                .record_scan_job_sidecar_targets(&job.id, &root.id, &sidecar_paths)
+            self.process_incremental_sidecar_file(job, root, root_path, &media_path)
                 .await?;
             Ok(0)
         } else {
@@ -4563,6 +4761,11 @@ impl ScanJobService {
         file: &Path,
         classification_cache: &mut MixedClassificationCache,
     ) -> Result<usize, ScannerError> {
+        if is_supported_sidecar_file(file) {
+            self.process_incremental_sidecar_file(job, root, root_path, file)
+                .await?;
+            return Ok(0);
+        }
         let generation = &job.generation;
         let report = match library_kind {
             "MOVIE" => {
@@ -4600,10 +4803,48 @@ impl ScanJobService {
             .to_str()
             .ok_or(ScannerError::NonUtf8Path)?
             .to_owned();
-        self.database
-            .record_scan_job_targets(&job.id, &root.id, &[relative_path], "CHANGED")
-            .await?;
+        if report.skipped_files == 0
+            || report.changed_files > 0
+            || report.created_items > 0
+            || report.created_sources > 0
+        {
+            self.database
+                .record_scan_job_targets(&job.id, &root.id, &[relative_path], "CHANGED")
+                .await?;
+            self.notify_local_metadata_worker(&job.id);
+        }
         Ok(report.created_items)
+    }
+
+    async fn process_incremental_sidecar_file(
+        &self,
+        job: &StoredScanJob,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+    ) -> Result<(), ScannerError> {
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let relative_paths = [relative_path.clone()];
+        let existing_entries = self
+            .database
+            .list_filesystem_entries_for_paths(&root.id, &relative_paths)
+            .await?;
+        let (_, changed) = self
+            .scanner
+            .scan_sidecar_file(root, root_path, path, &existing_entries, &job.generation)
+            .await?;
+        if changed {
+            self.database
+                .record_scan_job_sidecar_targets(&job.id, &root.id, &relative_paths)
+                .await?;
+            self.notify_local_metadata_worker(&job.id);
+        }
+        Ok(())
     }
 
     fn start_local_metadata_worker(&self, scan_job_id: &str) -> LocalMetadataWorkerHandle {
@@ -4614,6 +4855,12 @@ impl ScanJobService {
         let home = self.home.clone();
         let user_events = self.user_events.clone();
         let scan_job_id = scan_job_id.to_owned();
+        let notifications = Arc::clone(&self.metadata_notifications);
+        let notify = Arc::new(Notify::new());
+        if let Ok(mut registry) = notifications.lock() {
+            registry.insert(scan_job_id.clone(), Arc::clone(&notify));
+        }
+        let worker_job_id = scan_job_id.clone();
         let task = tokio::spawn(async move {
             let enricher = MetadataEnricher::new(database.clone());
             let enricher = match people {
@@ -4629,12 +4876,13 @@ impl ScanJobService {
                 if *stop_receiver.borrow() {
                     return;
                 }
-                let job = match database.find_scan_job(&scan_job_id).await {
+                let notified = notify.notified();
+                let job = match database.find_scan_job(&worker_job_id).await {
                     Ok(Some(job)) => job,
                     Ok(None) => return,
                     Err(error) => {
                         tracing::warn!(
-                            scan_job_id = %scan_job_id,
+                            scan_job_id = %worker_job_id,
                             %error,
                             "local metadata worker could not load scan job; retrying"
                         );
@@ -4644,7 +4892,7 @@ impl ScanJobService {
                                     return;
                                 }
                             }
-                            _ = tokio::time::sleep(LOCAL_METADATA_POLL_INTERVAL) => {}
+                            _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                         }
                         continue;
                     }
@@ -4653,13 +4901,13 @@ impl ScanJobService {
                     return;
                 }
                 let pending = match database
-                    .has_pending_scan_job_metadata_targets(&scan_job_id)
+                    .has_pending_scan_job_metadata_targets(&worker_job_id)
                     .await
                 {
                     Ok(pending) => pending,
                     Err(error) => {
                         tracing::warn!(
-                            scan_job_id = %scan_job_id,
+                            scan_job_id = %worker_job_id,
                             %error,
                             "local metadata worker could not check pending targets"
                         );
@@ -4667,47 +4915,58 @@ impl ScanJobService {
                     }
                 };
                 if pending {
-                    match enricher.enrich_one_scan_job_target(&scan_job_id).await {
-                        Ok(Some(report)) if report.items_processed > 0 => {
+                    match enricher
+                        .enrich_scan_job_targets(&worker_job_id, LOCAL_METADATA_BATCH_SIZE)
+                        .await
+                    {
+                        Ok(report) if report.items_processed > 0 => {
                             if let Some(home) = &home {
                                 home.invalidate();
                                 user_events.publish(UserEventScope::Home);
                             }
+                            notify.notify_waiters();
                         }
                         Ok(_) => {
+                            // A pending target with no locally readable source
+                            // cannot make progress. Mark it retryable so the
+                            // completion waiter cannot spin forever; a later
+                            // retry can reset FAILED targets after the source
+                            // becomes available.
                             if let Err(error) = database
                                 .mark_pending_scan_job_metadata_targets_failed(
-                                    &scan_job_id,
+                                    &worker_job_id,
                                     "local metadata source unavailable",
                                 )
                                 .await
                             {
                                 tracing::warn!(
-                                    scan_job_id = %scan_job_id,
+                                    scan_job_id = %worker_job_id,
                                     %error,
                                     "local metadata worker could not finish unavailable targets"
                                 );
                             }
+                            notify.notify_waiters();
                         }
                         Err(error) => {
                             tracing::warn!(
-                                scan_job_id = %scan_job_id,
+                                scan_job_id = %worker_job_id,
                                 %error,
                                 "local metadata worker failed; pending targets marked for retry"
                             );
                             if let Err(mark_error) = database
                                 .mark_pending_scan_job_metadata_targets_failed(
-                                    &scan_job_id,
+                                    &worker_job_id,
                                     &error.to_string(),
                                 )
                                 .await
                             {
                                 tracing::warn!(
-                                    scan_job_id = %scan_job_id,
+                                    scan_job_id = %worker_job_id,
                                     %mark_error,
                                     "local metadata worker could not mark failed targets"
                                 );
                             }
+                            notify.notify_waiters();
                         }
                     }
                     continue;
@@ -4718,20 +4977,47 @@ impl ScanJobService {
                             return;
                         }
                     }
-                    _ = tokio::time::sleep(LOCAL_METADATA_POLL_INTERVAL) => {}
+                    _ = notified => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
                 }
             }
         });
-        LocalMetadataWorkerHandle { stop, task }
+        LocalMetadataWorkerHandle {
+            stop,
+            task,
+            job_id: scan_job_id,
+            notifications,
+        }
+    }
+
+    fn notify_local_metadata_worker(&self, scan_job_id: &str) {
+        if let Ok(registry) = self.metadata_notifications.lock()
+            && let Some(notify) = registry.get(scan_job_id)
+        {
+            notify.notify_one();
+        }
     }
 
     async fn wait_for_local_metadata(&self, scan_job_id: &str) -> Result<(), ScanJobError> {
+        let notify = self
+            .metadata_notifications
+            .lock()
+            .ok()
+            .and_then(|registry| registry.get(scan_job_id).cloned());
         while self
             .database
             .has_pending_scan_job_metadata_targets(scan_job_id)
             .await?
         {
-            tokio::time::sleep(LOCAL_METADATA_POLL_INTERVAL).await;
+            if let Some(notify) = &notify {
+                let notified = notify.notified();
+                tokio::select! {
+                    _ = notified => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                }
+            } else {
+                tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+            }
         }
         Ok(())
     }
@@ -4742,6 +5028,9 @@ impl ScanJobService {
         };
         let _ = worker.stop.send(true);
         let _ = worker.task.await;
+        if let Ok(mut notifications) = worker.notifications.lock() {
+            notifications.remove(&worker.job_id);
+        }
     }
 
     pub async fn run_to_completion(
@@ -5062,15 +5351,19 @@ impl ScanJobService {
         let started = Instant::now();
         match thumbnails.generate_scan_job(job_id).await {
             Ok(report) if report.failed == 0 => {
-                let items = report.considered.saturating_add(report.skipped_strm);
+                let items = report
+                    .considered
+                    .saturating_add(report.skipped_strm)
+                    .saturating_add(report.skipped_policy);
                 let elapsed_ms = started.elapsed().as_millis();
                 let details = format!(
-                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"skippedPolicy":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
                     report.considered,
                     report.generated,
                     report.reused,
                     report.failed,
                     report.skipped_strm,
+                    report.skipped_policy,
                     elapsed_ms,
                     throughput_per_second(items, elapsed_ms),
                 );
@@ -5084,15 +5377,19 @@ impl ScanJobService {
                 .await;
             }
             Ok(report) => {
-                let items = report.considered.saturating_add(report.skipped_strm);
+                let items = report
+                    .considered
+                    .saturating_add(report.skipped_strm)
+                    .saturating_add(report.skipped_policy);
                 let elapsed_ms = started.elapsed().as_millis();
                 let details = format!(
-                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"skippedPolicy":{},"elapsedMs":{},"itemsPerSecond":{}}}"#,
                     report.considered,
                     report.generated,
                     report.reused,
                     report.failed,
                     report.skipped_strm,
+                    report.skipped_policy,
                     elapsed_ms,
                     throughput_per_second(items, elapsed_ms),
                 );
@@ -5415,12 +5712,13 @@ impl ScanJobService {
         match thumbnails.generate_incremental_scan(job_id).await {
             Ok(report) if report.failed == 0 => {
                 let details = format!(
-                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"skippedPolicy":{}}}"#,
                     report.considered,
                     report.generated,
                     report.reused,
                     report.failed,
                     report.skipped_strm,
+                    report.skipped_policy,
                 );
                 self.record_event(
                     job_id,
@@ -5433,12 +5731,13 @@ impl ScanJobService {
             }
             Ok(report) => {
                 let details = format!(
-                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{}}}"#,
+                    r#"{{"considered":{},"generated":{},"reused":{},"failed":{},"skippedStrm":{},"skippedPolicy":{}}}"#,
                     report.considered,
                     report.generated,
                     report.reused,
                     report.failed,
                     report.skipped_strm,
+                    report.skipped_policy,
                 );
                 self.record_event(
                     job_id,
@@ -5648,6 +5947,42 @@ type EpisodeQuickResult = Option<(String, ScanReport, Option<(String, String)>)>
 type EpisodeFingerprintTask = Result<(usize, EpisodeQuickResult), ScannerError>;
 type ReconciliationFingerprintTask = Result<(usize, Option<(String, ScanReport)>), ScannerError>;
 type ReconciliationRegularTask = Result<(usize, ScanReport), ScannerError>;
+type ReconciliationRegularGroupTask = Result<Vec<(usize, ScanReport)>, ScannerError>;
+
+fn reconciliation_regular_group_key(
+    root_id: &str,
+    path: &Path,
+    classification: MixedClassification,
+    fallback_index: usize,
+) -> String {
+    let parsed_key = match classification {
+        MixedClassification::Movie => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_movie_filename)
+            .map(|parsed| {
+                format!(
+                    "movie:{}:{:?}:{:?}",
+                    parsed.sort_title, parsed.production_year, parsed.provider_ids
+                )
+            }),
+        MixedClassification::Episode => path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(parse_episode_filename)
+            .map(|parsed| {
+                format!(
+                    "episode:{}:{:?}:{:?}:{:?}",
+                    parsed.sort_title, parsed.production_year, parsed.season, parsed.episode
+                )
+            }),
+        MixedClassification::Unresolved => None,
+    };
+    parsed_key.map_or_else(
+        || format!("path:{root_id}:{fallback_index}"),
+        |key| format!("{root_id}:{key}"),
+    )
+}
 
 async fn collect_movie_fingerprint_task(
     tasks: &mut JoinSet<MovieFingerprintTask>,
@@ -5745,6 +6080,33 @@ async fn collect_reconciliation_regular_task(
     };
     if let Some(slot) = results.get_mut(index) {
         *slot = Some(result);
+    }
+    Ok(())
+}
+
+async fn collect_reconciliation_regular_group_task(
+    tasks: &mut JoinSet<ReconciliationRegularGroupTask>,
+    results: &mut [Option<ScanReport>],
+) -> Result<(), ScannerError> {
+    let reports = match tasks.join_next().await {
+        Some(Ok(result)) => result?,
+        Some(Err(error)) => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-group-task>"),
+                source: std::io::Error::other(error.to_string()),
+            });
+        }
+        None => {
+            return Err(ScannerError::Io {
+                path: PathBuf::from("<reconciliation-regular-group-task>"),
+                source: std::io::Error::other("reconciliation regular group task set is empty"),
+            });
+        }
+    };
+    for (index, report) in reports {
+        if let Some(slot) = results.get_mut(index) {
+            *slot = Some(report);
+        }
     }
     Ok(())
 }
@@ -6092,7 +6454,9 @@ struct ReconciliationScanWork {
     classification: MixedClassification,
 }
 
+#[derive(Clone)]
 struct ReconciliationRegularWork {
+    index: usize,
     entry: StoredReconciliationScanEntry,
     root: StoredLibraryRoot,
     path: PathBuf,

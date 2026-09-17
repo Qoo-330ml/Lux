@@ -26,6 +26,9 @@ use crate::{
 };
 
 const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
+pub const DEFAULT_SCAN_JOB_METADATA_BATCH_SIZE: usize = 16;
+const MIN_SCAN_JOB_METADATA_BATCH_SIZE: usize = 8;
+const MAX_SCAN_JOB_METADATA_BATCH_SIZE: usize = 32;
 const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -694,28 +697,15 @@ impl MetadataEnricher {
                 .map(|source| source.episode_id.clone())
                 .collect::<Vec<_>>();
             let mut batch_report = MetadataReport::default();
-            if let Err(error) = self
-                .enrich_series_sources(
-                    sources,
-                    &mut batch_report,
-                    last_series_id.as_mut(),
-                    last_season_id.as_mut(),
-                    last_episode_id.as_mut(),
-                    &mut directory_cache,
-                )
-                .await
-            {
-                self.database
-                    .mark_scan_job_target_stage(
-                        scan_job_id,
-                        "ITEM",
-                        &item_ids,
-                        "METADATA",
-                        "FAILED",
-                    )
-                    .await?;
-                return Err(error);
-            }
+            self.enrich_series_scan_job_sources(
+                sources,
+                &mut batch_report,
+                last_series_id.as_mut(),
+                last_season_id.as_mut(),
+                last_episode_id.as_mut(),
+                &mut directory_cache,
+            )
+            .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
             report.merge(batch_report);
             self.database
@@ -750,6 +740,23 @@ impl MetadataEnricher {
     ) -> Result<Option<MetadataReport>, MetadataError> {
         let report = self.enrich_scan_job_batch(scan_job_id, 1).await?;
         Ok((report.items_processed > 0).then_some(report))
+    }
+
+    pub async fn enrich_scan_job_targets(
+        &self,
+        scan_job_id: &str,
+        batch_size: usize,
+    ) -> Result<MetadataReport, MetadataError> {
+        // The target queries use offset 0 because successful targets move out of
+        // the PENDING set when they are marked DONE or FAILED below.
+        self.enrich_scan_job_batch(
+            scan_job_id,
+            batch_size.clamp(
+                MIN_SCAN_JOB_METADATA_BATCH_SIZE,
+                MAX_SCAN_JOB_METADATA_BATCH_SIZE,
+            ),
+        )
+        .await
     }
 
     async fn enrich_scan_job_batch(
@@ -811,22 +818,15 @@ impl MetadataEnricher {
             .collect::<Vec<_>>();
         let mut batch_report = MetadataReport::default();
         let mut directory_cache = DirectoryPathCache::default();
-        if let Err(error) = self
-            .enrich_series_sources(
-                series_sources,
-                &mut batch_report,
-                None,
-                None,
-                None,
-                &mut directory_cache,
-            )
-            .await
-        {
-            self.database
-                .mark_scan_job_target_stage(scan_job_id, "ITEM", &item_ids, "METADATA", "FAILED")
-                .await?;
-            return Err(error);
-        }
+        self.enrich_series_scan_job_sources(
+            series_sources,
+            &mut batch_report,
+            None,
+            None,
+            None,
+            &mut directory_cache,
+        )
+        .await;
         let failed_item_ids = batch_report.failed_item_ids.clone();
         report.merge(batch_report);
         self.database
@@ -846,6 +846,47 @@ impl MetadataEnricher {
             )
             .await?;
         Ok(report)
+    }
+
+    async fn enrich_series_scan_job_sources(
+        &self,
+        sources: Vec<StoredSeriesMetadataSource>,
+        report: &mut MetadataReport,
+        last_series_id: Option<&mut String>,
+        last_season_id: Option<&mut String>,
+        last_episode_id: Option<&mut String>,
+        directory_cache: &mut DirectoryPathCache,
+    ) {
+        let mut last_series_id = last_series_id;
+        let mut last_season_id = last_season_id;
+        let mut last_episode_id = last_episode_id;
+        for source in sources {
+            // Keep the directory/image fast path shared across the batch, but
+            // invoke the fallible series operation one target at a time. A
+            // directory or image error must not turn unrelated episodes into
+            // FAILED targets.
+            let item_id = source.episode_id.clone();
+            let mut item_report = MetadataReport::default();
+            let result = self
+                .enrich_series_sources(
+                    vec![source],
+                    &mut item_report,
+                    last_series_id.as_deref_mut(),
+                    last_season_id.as_deref_mut(),
+                    last_episode_id.as_deref_mut(),
+                    directory_cache,
+                )
+                .await;
+            if let Err(error) = result {
+                tracing::warn!(
+                    item_id = %item_id,
+                    %error,
+                    "local series metadata failed; continuing with remaining targets"
+                );
+                item_report.mark_item_failed(&item_id);
+            }
+            report.merge(item_report);
+        }
     }
 
     pub async fn enrich_movie_library(

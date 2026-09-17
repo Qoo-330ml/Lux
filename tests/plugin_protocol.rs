@@ -4,10 +4,10 @@ use luxd::application::plugin_protocol::{
     ChapterLookupRpcEpisode, ChapterLookupRpcRequest, DANMAKU_MATCH_CAPABILITY,
     DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult, DanmakuMatchStatus,
     IP_LOCATION_CAPABILITY, IpLocationRpcResult, MediaProbeRpcResult, PLUGIN_API_VERSION,
-    PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_FORMAT_VERSION,
-    PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION,
-    PLUGIN_TYPE_STRM_RESOLVER, PluginManifest, PluginRequest, STRM_RESOLVE_CAPABILITY,
-    StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+    PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
+    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU,
+    PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, PluginManifest, PluginRequest,
+    STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
 };
 use serde_json::json;
 
@@ -49,6 +49,32 @@ fn accepts_a_versioned_process_plugin_manifest() {
     assert_eq!(manifest.provider_key.as_deref(), Some("imdb"));
     assert_eq!(manifest.aliases, vec!["legacy-imdb"]);
     assert_eq!(manifest.runtime.kind, "process");
+}
+
+#[test]
+fn accepts_a_multiline_notification_config_field() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.webhook",
+        "name": "Webhook notifier",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "notification",
+        "category": PLUGIN_CATEGORY_NOTIFICATION,
+        "capabilities": ["notification.send"],
+        "configFields": [{
+            "key": "bodyTemplate",
+            "label": "Body template",
+            "type": "textarea",
+            "required": false
+        }],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect("textarea config field should validate");
+
+    assert_eq!(manifest.config_fields[0].input_type, "textarea");
 }
 
 #[test]

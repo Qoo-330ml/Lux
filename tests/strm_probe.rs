@@ -13,6 +13,7 @@ use luxd::{
     storage::Database,
 };
 use serde_json::json;
+use uuid::Uuid;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -196,6 +197,61 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
     assert_eq!(images[0].3, i64::try_from(thumbnail.len())?);
     assert_eq!(images[1].3, i64::try_from(thumbnail.len())?);
 
+    let item_id: String = sqlx::query_scalar("SELECT item_id FROM media_sources")
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM item_images")
+        .execute(database.pool())
+        .await?;
+    let poster_path = movie_dir.join("Plugin.Movie.2024-poster.jpg");
+    let scraper_thumbnail = b"\xFF\xD8scraper\xFF\xD9";
+    tokio::fs::write(&poster_path, scraper_thumbnail).await?;
+    tokio::fs::write(&thumbnail_path, scraper_thumbnail).await?;
+    for (image_type, path) in [("POSTER", &poster_path), ("THUMB", &thumbnail_path)] {
+        sqlx::query(
+            "INSERT INTO item_images (
+                id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+             ) VALUES (?, ?, ?, 0, ?, ?, 'scraper', 'TMDB')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&item_id)
+        .bind(image_type)
+        .bind(path.to_string_lossy().as_ref())
+        .bind(i64::try_from(scraper_thumbnail.len())?)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(r#"{"images":{"thumbnailScrapingMode":"SCREENSHOT_FIRST"}}"#)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let screenshot_first_jobs = service
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: false,
+                thumbnail_enabled: true,
+                thumbnail_position_percent: 50,
+            },
+        )
+        .await?;
+    service.run(&screenshot_first_jobs[0].id).await?;
+    assert_eq!(
+        tokio::fs::read(&thumbnail_path).await?,
+        b"\xFF\xD8\xFFfake-thumb\xFF\xD9"
+    );
+    let screenshot_first_source: String = sqlx::query_scalar(
+        "SELECT source FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(screenshot_first_source, "STRM_FFMPEG");
+
     fs::write(&fake_ffmpeg, "#!/bin/sh\nexit 9\n")?;
     let skip_thumbnail_jobs = service
         .create_jobs(
@@ -215,6 +271,41 @@ printf '%s' '{"format":{"format_name":"matroska","size":"1234","duration":"12.5"
         fs::read(&thumbnail_path)?,
         b"\xff\xd8\xfffake-thumb\xff\xd9"
     );
+
+    tokio::fs::remove_file(&thumbnail_path).await?;
+    sqlx::query("DELETE FROM item_images")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(r#"{"images":{"thumbnailScrapingMode":"NONE"}}"#)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET poster_fallback_required = 1")
+        .execute(database.pool())
+        .await?;
+    let disabled_thumbnail_jobs = service
+        .create_jobs(
+            &[library.id],
+            StrmProbeOptions {
+                concurrency: 2,
+                include_ready: false,
+                write_sidecars: false,
+                media_info_enabled: false,
+                thumbnail_enabled: true,
+                thumbnail_position_percent: 50,
+            },
+        )
+        .await?;
+    service.run(&disabled_thumbnail_jobs[0].id).await?;
+    assert_eq!(
+        service.get(&disabled_thumbnail_jobs[0].id).await?.status,
+        "COMPLETED"
+    );
+    let disabled_image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(disabled_image_count, 0);
 
     fs::write(&fake_ffprobe, "#!/bin/sh\nexit 9\n")?;
     let skip_jobs = service

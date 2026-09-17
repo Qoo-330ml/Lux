@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fmt,
     path::{Component, Path, PathBuf},
     process::Stdio,
@@ -10,10 +10,16 @@ use std::{
 use quick_xml::{events::Event, reader::Reader};
 use serde_json::Value;
 use tokio::{
-    fs, io::AsyncWriteExt, process::Command, sync::Semaphore, task::JoinSet, time::timeout,
+    fs,
+    io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
+    process::{Child, Command},
+    sync::{Mutex as AsyncMutex, OnceCell, Semaphore},
+    task::JoinSet,
+    time::timeout,
 };
 
 use crate::{
+    config::{MAX_PROBE_CONCURRENCY, probe_concurrency_override_from_env},
     domain::{ids::LibraryId, time::duration_to_ticks},
     observability::resources::ResourceMetrics,
     storage::{Database, MediaProbeUpdate, MediaStreamUpdate, StorageError, StoredMediaSourcePath},
@@ -27,6 +33,14 @@ const LIBRARY_SOURCE_PAGE_SIZE: usize = 500;
 pub(crate) const DEFAULT_PROBE_CONCURRENCY: usize = 256;
 pub(crate) const MAX_EFFECTIVE_PROBE_CONCURRENCY: usize = 512;
 static GLOBAL_PROBE_SLOTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn process_probe_hard_cap() -> Result<usize, String> {
+    match probe_concurrency_override_from_env().map_err(|error| error.to_string())? {
+        Some(value) => usize::try_from(value)
+            .map_err(|_| format!("LUX_PROBE_CONCURRENCY '{value}' is not supported")),
+        None => Ok(MAX_PROBE_CONCURRENCY as usize),
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaProbeResult {
@@ -679,7 +693,7 @@ impl FfprobeRunner {
     }
 
     pub async fn probe_path(&self, path: &Path) -> Result<MediaProbeResult, ProbeError> {
-        let child = Command::new(&self.binary)
+        let mut child = Command::new(&self.binary)
             .args([
                 "-v",
                 "error",
@@ -694,10 +708,17 @@ impl FfprobeRunner {
             .kill_on_drop(true)
             .spawn()
             .map_err(ProbeError::Io)?;
-        let output = timeout(self.timeout, child.wait_with_output())
-            .await
-            .map_err(|_| ProbeError::Timeout)?
-            .map_err(ProbeError::Io)?;
+        let output = match timeout(self.timeout, collect_process_output(&mut child)).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                terminate_child(&mut child).await;
+                return Err(error);
+            }
+            Err(_) => {
+                terminate_child(&mut child).await;
+                return Err(ProbeError::Timeout);
+            }
+        };
         if !output.status.success() {
             return Err(ProbeError::Exit {
                 code: output.status.code(),
@@ -764,12 +785,83 @@ fn truncate(bytes: &[u8]) -> String {
     text.trim().to_owned()
 }
 
+async fn read_limited<R>(mut reader: R, max_bytes: usize) -> Result<Vec<u8>, ProbeError>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let count = reader.read(&mut buffer).await.map_err(ProbeError::Io)?;
+        if count == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(count) > max_bytes {
+            return Err(ProbeError::OutputTooLarge);
+        }
+        bytes.extend_from_slice(&buffer[..count]);
+    }
+}
+
+struct CollectedProcessOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+async fn collect_process_output(child: &mut Child) -> Result<CollectedProcessOutput, ProbeError> {
+    let stdout = child.stdout.take().ok_or_else(|| {
+        ProbeError::Io(std::io::Error::other("ffprobe stdout pipe is unavailable"))
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| {
+        ProbeError::Io(std::io::Error::other("ffprobe stderr pipe is unavailable"))
+    })?;
+    let mut stdout_future = Box::pin(read_limited(stdout, MAX_OUTPUT_BYTES));
+    let mut stderr_future = Box::pin(read_limited(stderr, MAX_ERROR_BYTES));
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    while stdout_result.is_none() || stderr_result.is_none() {
+        tokio::select! {
+            result = &mut stdout_future, if stdout_result.is_none() => {
+                match result {
+                    Ok(bytes) => stdout_result = Some(Ok(bytes)),
+                    Err(error) => return Err(error),
+                }
+            }
+            result = &mut stderr_future, if stderr_result.is_none() => {
+                match result {
+                    Ok(bytes) => stderr_result = Some(Ok(bytes)),
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+    }
+    let stdout = stdout_result.ok_or_else(|| {
+        ProbeError::Io(std::io::Error::other("ffprobe stdout read did not finish"))
+    })??;
+    let stderr = stderr_result.ok_or_else(|| {
+        ProbeError::Io(std::io::Error::other("ffprobe stderr read did not finish"))
+    })??;
+    let status = child.wait().await.map_err(ProbeError::Io)?;
+    Ok(CollectedProcessOutput {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+async fn terminate_child(child: &mut Child) {
+    let _ = child.start_kill();
+    let _ = timeout(Duration::from_secs(1), child.wait()).await;
+}
+
 #[derive(Clone)]
 pub struct MediaProbeService {
     database: Database,
     runner: FfprobeRunner,
     resources: ResourceMetrics,
     global_slots: Arc<Semaphore>,
+    process_hard_cap: Result<usize, String>,
 }
 
 type ProbeTaskResult = (
@@ -777,6 +869,27 @@ type ProbeTaskResult = (
     PathBuf,
     Result<Option<MediaProbeResult>, ProbeError>,
 );
+
+#[derive(Default)]
+struct SubtitleDirectoryCache {
+    directories: AsyncMutex<HashMap<PathBuf, Arc<OnceCell<Vec<PathBuf>>>>>,
+}
+
+impl SubtitleDirectoryCache {
+    async fn paths_for(&self, directory: &Path) -> Vec<PathBuf> {
+        let cell = {
+            let mut directories = self.directories.lock().await;
+            directories
+                .entry(directory.to_path_buf())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let directory = directory.to_owned();
+        cell.get_or_init(|| async move { enumerate_external_subtitle_paths(&directory).await })
+            .await
+            .clone()
+    }
+}
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum ProbeTargetState {
@@ -797,14 +910,19 @@ impl ProbeTargetState {
 
 impl MediaProbeService {
     pub fn new(database: Database, runner: FfprobeRunner) -> Self {
+        let process_hard_cap = process_probe_hard_cap();
+        let global_slot_count = process_hard_cap
+            .as_ref()
+            .copied()
+            .unwrap_or(MAX_EFFECTIVE_PROBE_CONCURRENCY);
         Self {
             database,
             runner,
             resources: ResourceMetrics::new(),
             global_slots: Arc::clone(
-                GLOBAL_PROBE_SLOTS
-                    .get_or_init(|| Arc::new(Semaphore::new(MAX_EFFECTIVE_PROBE_CONCURRENCY))),
+                GLOBAL_PROBE_SLOTS.get_or_init(|| Arc::new(Semaphore::new(global_slot_count))),
             ),
+            process_hard_cap,
         }
     }
 
@@ -820,6 +938,7 @@ impl MediaProbeService {
         let mut report = ProbeReport::default();
         let library_id = library_id.to_string();
         let configured = self.configured_concurrency(&library_id).await?;
+        let subtitle_cache = Arc::new(SubtitleDirectoryCache::default());
         let mut offset = 0_i64;
         loop {
             let sources = self
@@ -831,9 +950,14 @@ impl MediaProbeService {
                 )
                 .await?;
             let last_page = sources.len() < LIBRARY_SOURCE_PAGE_SIZE;
-            let concurrency = self.effective_concurrency(configured).await;
-            self.probe_source_page(sources, concurrency, &mut report)
-                .await?;
+            let concurrency = self.effective_concurrency(configured).await?;
+            self.probe_source_page(
+                sources,
+                concurrency,
+                &mut report,
+                Arc::clone(&subtitle_cache),
+            )
+            .await?;
             if last_page {
                 break;
             }
@@ -848,6 +972,7 @@ impl MediaProbeService {
         library_id: &str,
     ) -> Result<ProbeReport, ProbeServiceError> {
         let configured = self.configured_concurrency(library_id).await?;
+        let subtitle_cache = Arc::new(SubtitleDirectoryCache::default());
         let mut report = ProbeReport::default();
         loop {
             let sources = self
@@ -857,9 +982,14 @@ impl MediaProbeService {
             if sources.is_empty() {
                 break;
             }
-            let concurrency = self.effective_concurrency(configured).await;
+            let concurrency = self.effective_concurrency(configured).await?;
             let states = self
-                .probe_source_page(sources, concurrency, &mut report)
+                .probe_source_page(
+                    sources,
+                    concurrency,
+                    &mut report,
+                    Arc::clone(&subtitle_cache),
+                )
                 .await?;
             for state in [
                 ProbeTargetState::Done,
@@ -886,6 +1016,8 @@ impl MediaProbeService {
     }
 
     async fn configured_concurrency(&self, library_id: &str) -> Result<usize, ProbeServiceError> {
+        // This is the persisted library/request setting. It intentionally
+        // remains separate from the process hard cap and runtime backpressure.
         Ok(self
             .database
             .find_library(library_id)
@@ -895,11 +1027,18 @@ impl MediaProbeService {
             .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY))
     }
 
-    async fn effective_concurrency(&self, configured: usize) -> usize {
-        self.resources
-            .probe_concurrency(configured, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+    async fn effective_concurrency(&self, configured: usize) -> Result<usize, ProbeServiceError> {
+        // This is the actual stage limit used by JoinSet and the global
+        // semaphore for this process.
+        let hard_cap = self
+            .process_hard_cap
+            .as_ref()
+            .map_err(|error| ProbeServiceError::Worker(error.clone()))?;
+        Ok(self
+            .resources
+            .probe_concurrency(configured, *hard_cap)
             .await
-            .clamp(1, MAX_EFFECTIVE_PROBE_CONCURRENCY)
+            .clamp(1, *hard_cap))
     }
 
     async fn probe_source_page(
@@ -907,6 +1046,7 @@ impl MediaProbeService {
         sources: Vec<StoredMediaSourcePath>,
         concurrency: usize,
         report: &mut ProbeReport,
+        subtitle_cache: Arc<SubtitleDirectoryCache>,
     ) -> Result<Vec<(String, ProbeTargetState)>, ProbeServiceError> {
         let mut states = Vec::new();
         let mut inputs = Vec::with_capacity(sources.len());
@@ -924,7 +1064,10 @@ impl MediaProbeService {
         let mut pending = JoinSet::<ProbeTaskResult>::new();
         for (source, path) in inputs {
             while pending.len() >= concurrency {
-                states.push(self.collect_probe_task(&mut pending, report).await?);
+                states.push(
+                    self.collect_probe_task(&mut pending, report, subtitle_cache.as_ref())
+                        .await?,
+                );
             }
             let service = self.clone();
             pending.spawn(async move {
@@ -933,7 +1076,10 @@ impl MediaProbeService {
             });
         }
         while !pending.is_empty() {
-            states.push(self.collect_probe_task(&mut pending, report).await?);
+            states.push(
+                self.collect_probe_task(&mut pending, report, subtitle_cache.as_ref())
+                    .await?,
+            );
         }
         Ok(states)
     }
@@ -942,6 +1088,7 @@ impl MediaProbeService {
         &self,
         pending: &mut JoinSet<ProbeTaskResult>,
         report: &mut ProbeReport,
+        subtitle_cache: &SubtitleDirectoryCache,
     ) -> Result<(String, ProbeTargetState), ProbeServiceError> {
         let task = pending
             .join_next()
@@ -949,7 +1096,7 @@ impl MediaProbeService {
             .ok_or_else(|| ProbeServiceError::Worker("probe task set was empty".to_owned()))?
             .map_err(|error| ProbeServiceError::Worker(error.to_string()))?;
         let state = self
-            .persist_probe_attempt(&task.0, &task.1, task.2, report)
+            .persist_probe_attempt(&task.0, &task.1, task.2, report, subtitle_cache)
             .await?;
         Ok((task.0.source_id.clone(), state))
     }
@@ -960,6 +1107,7 @@ impl MediaProbeService {
         path: &Path,
         result: Result<Option<MediaProbeResult>, ProbeError>,
         report: &mut ProbeReport,
+        subtitle_cache: &SubtitleDirectoryCache,
     ) -> Result<ProbeTargetState, ProbeServiceError> {
         match result {
             Ok(Some(result)) => {
@@ -991,7 +1139,8 @@ impl MediaProbeService {
                         is_forced: stream.is_forced,
                     })
                     .collect::<Vec<_>>();
-                let external_subtitles = discover_external_subtitles(path, &source.root_path).await;
+                let external_subtitles =
+                    discover_external_subtitles(path, &source.root_path, subtitle_cache).await;
                 let next_stream_index = result
                     .streams
                     .iter()
@@ -1196,13 +1345,7 @@ struct ExternalSubtitle {
     is_forced: bool,
 }
 
-async fn discover_external_subtitles(media_path: &Path, root_path: &str) -> Vec<ExternalSubtitle> {
-    let Some(directory) = media_path.parent() else {
-        return Vec::new();
-    };
-    let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) else {
-        return Vec::new();
-    };
+async fn enumerate_external_subtitle_paths(directory: &Path) -> Vec<PathBuf> {
     let Ok(mut entries) = fs::read_dir(directory).await else {
         return Vec::new();
     };
@@ -1224,18 +1367,33 @@ async fn discover_external_subtitles(media_path: &Path, root_path: &str) -> Vec<
                     "srt" | "ass" | "ssa" | "vtt" | "sub" | "sup"
                 )
             });
-        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
-            continue;
-        };
-        if supported && (stem == media_stem || stem.starts_with(&format!("{media_stem}."))) {
+        if supported {
             paths.push(path);
         }
     }
     paths.sort();
     paths
+}
+
+async fn discover_external_subtitles(
+    media_path: &Path,
+    root_path: &str,
+    cache: &SubtitleDirectoryCache,
+) -> Vec<ExternalSubtitle> {
+    let Some(directory) = media_path.parent() else {
+        return Vec::new();
+    };
+    let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) else {
+        return Vec::new();
+    };
+    let paths = cache.paths_for(directory).await;
+    paths
         .into_iter()
         .filter_map(|path| {
             let stem = path.file_stem()?.to_str()?;
+            if stem != media_stem && !stem.starts_with(&format!("{media_stem}.")) {
+                return None;
+            }
             let suffix = stem.strip_prefix(media_stem).unwrap_or_default();
             let tokens = suffix
                 .trim_start_matches('.')
@@ -1329,5 +1487,30 @@ impl std::error::Error for ProbeServiceError {
 impl From<StorageError> for ProbeServiceError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SubtitleDirectoryCache;
+
+    #[tokio::test]
+    async fn subtitle_directory_cache_reuses_one_listing_for_an_operation() {
+        let temporary = tempfile::tempdir().expect("temporary directory");
+        let first = temporary.path().join("Movie.en.srt");
+        let second = temporary.path().join("Movie.zh.srt");
+        tokio::fs::write(&first, b"first")
+            .await
+            .expect("first subtitle");
+
+        let cache = SubtitleDirectoryCache::default();
+        let initial = cache.paths_for(temporary.path()).await;
+        tokio::fs::write(&second, b"second")
+            .await
+            .expect("second subtitle");
+        let reused = cache.paths_for(temporary.path()).await;
+
+        assert_eq!(initial, vec![first]);
+        assert_eq!(reused, initial);
     }
 }
