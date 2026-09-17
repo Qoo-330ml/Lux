@@ -17,6 +17,7 @@ use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet, time::sleep};
 use url::{Host, Url};
 
 use crate::application::{
+    notification_template,
     plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus},
     plugins::PluginService,
 };
@@ -1201,6 +1202,8 @@ fn build_event_payload(
     data.insert("eventType".to_owned(), json!(event_type.as_str()));
     data.insert("occurredAt".to_owned(), json!(occurred_at));
     data.insert("serverId".to_owned(), json!(server_id));
+    let display_fields = notification_template::render(event_type.as_str(), occurred_at, &data);
+    data.extend(display_fields);
     Ok(Value::Object(data))
 }
 
@@ -1736,6 +1739,8 @@ mod tests {
                 "itemId": "item-1",
                 "itemTitle": "示例电影",
                 "userName": "alice",
+                "positionTicks": 4_000,
+                "durationTicks": 10_000,
                 "container": "mkv",
                 "size": 7_690_000_000_i64,
                 "bitrate": 4_980_000_i64,
@@ -1757,6 +1762,14 @@ mod tests {
         assert_eq!(payload["overview"], "Amid nerves, crushes and big reveals.");
         assert_eq!(payload["remoteIp"], "122.96.10.20");
         assert_eq!(payload["resumed"], true);
+        assert_eq!(payload["source"], "lux");
+        assert_eq!(payload["title"], "alice停止播放 示例电影");
+        assert_eq!(
+            payload["content"],
+            "●●●●●●●●○○○○○○○○○○○○40.00%\nMKV · 直接串流\n大小：7.69GB · 4.98Mbps\nIP：122.96.10.20\n简介：Amid nerves, crushes and big reveals."
+        );
+        assert_eq!(payload["body"], payload["content"]);
+        assert_eq!(payload["timestamp"], "2023-11-14T22:13:20Z");
         assert!(payload.get("path").is_none());
         assert!(payload.get("externalUrl").is_none());
     }
@@ -1819,6 +1832,13 @@ mod tests {
         assert_eq!(envelope["eventType"], "MEDIA_ADDED");
         assert_eq!(envelope["data"]["libraryId"], "library-1");
         assert_eq!(envelope["data"]["addedCount"], 2);
+        assert_eq!(envelope["data"]["source"], "lux");
+        assert_eq!(envelope["data"]["title"], "媒体新增");
+        assert_eq!(
+            envelope["data"]["content"],
+            "新增媒体：2 个\n媒体库：library-1"
+        );
+        assert_eq!(envelope["data"]["body"], envelope["data"]["content"]);
         assert!(envelope["data"].get("eventId").is_none());
     }
 

@@ -398,7 +398,15 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
     "eventType": "MEDIA_ADDED",
     "occurredAt": 1700000000,
     "serverId": "server-1",
-    "data": {"libraryId": "library-1", "addedCount": 1}
+    "data": {
+      "libraryId": "library-1",
+      "addedCount": 1,
+      "source": "lux",
+      "title": "媒体新增",
+      "content": "新增媒体：1 个\n媒体库：library-1",
+      "body": "新增媒体：1 个\n媒体库：library-1",
+      "timestamp": "2023-11-14T22:13:20Z"
+    }
   },
   "target": {
     "url": "https://example.com/lux-hook",
@@ -423,10 +431,11 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
 读取其他插件或服务器 Secret。Webhook、Telegram、企业微信等平台的 payload 和认证逻辑属于各自插件，不应
 写入通知核心。
 
-`org.lux.webhook` 的 provider-specific 配置支持 `url` 和可选 `bodyTemplate`。URL 模板使用 `{title}`、
-`{content}` 等变量并进行 URL 编码；Body 模板是 JSON，使用 `{{title}}`、`{{content}}`、`{{body}}`、
-`{{timestamp}}` 和 `{{eventType}}` 等可读字段。模板只影响该插件的外发格式，不改变 Lux 原生事件合同或
-事件白名单。
+Lux 核心在事件进入投递队列前统一生成 `source`、`title`、`content`、`body` 和 ISO `timestamp`，并将它们
+放入 `event.data`。播放事件的进度条、播放方式、设备、大小、码率、远程 IP 和简介等展示文本也由 Lux 核心
+生成；通知插件不得重新生成或覆盖这些字段。`org.lux.webhook` 的 `url` 配置可以引用 `{title}`、`{content}`
+等核心字段并进行 URL 编码，但这只影响目标地址，不改变通知正文。插件可以根据目标平台增加外层字段映射，
+但必须保留 Lux 提供的统一通知内容。
 
 ## 错误码
 

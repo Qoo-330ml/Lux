@@ -141,6 +141,12 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
     assert_eq!(started["userName"], "Admin");
     assert_eq!(started["playMethod"], "DirectPlay");
     assert_eq!(started["resumed"], false);
+    assert_eq!(started["source"], "lux");
+    assert_eq!(started["title"], "Admin开始播放 Playback Hook Movie");
+    assert_eq!(started["body"], started["content"]);
+    assert!(started["content"].as_str().is_some_and(|value| {
+        value.contains("直接播放") && value.contains("设备：PlaybackHookTest · Mac")
+    }));
     assert!(started.get("userId").is_none());
 
     let paused = client
