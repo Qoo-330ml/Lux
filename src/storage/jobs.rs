@@ -1825,7 +1825,6 @@ impl Database {
              WHERE t.job_id = ? AND t.target_type = 'SOURCE'
                AND t.probe_state = 'PENDING'
                AND ms.probe_status = 'PENDING'
-               AND ms.source_kind = 'LOCAL_FILE'
                AND fe.is_missing = 0
              ORDER BY t.target_id
              LIMIT ? OFFSET ?",
