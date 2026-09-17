@@ -42,7 +42,7 @@ Lux的出现是为了解决Emby在面临大库时遇到的内存占用过大、�
 `LUX_DB_MAX_CONNECTIONS` 为当前 Lux 进程覆盖两种后端的连接数，允许范围为 1-100；SQLite
 增加连接不会突破单写者限制，NAS 上应结合前台 p95、写锁和内存观察后再调整。
 
-本地文件索引默认使用 32 路 worker。Docker 可通过 `LUX_SCAN_CONCURRENCY` 设置全局并发（1-1024），设置后优先于媒体库保存的 `scanConcurrency`；未设置时，新建媒体库默认 32 路，已有媒体库仍可在管理 API 中用 `scanConcurrency` 单独覆盖。实际并发仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
+本地文件索引默认使用 16 路 worker。Docker Compose 默认注入 `LUX_SCAN_CONCURRENCY=8`；也可通过该变量设置全局并发（1-1024），设置后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置时，新建媒体库默认 16 路，已有媒体库仍可在管理 API 中用 `scanConcurrency` 单独覆盖。实际并发仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
 
 ## 快速开始
 
@@ -56,8 +56,8 @@ services:
     image: pdzhou/lux:latest
     container_name: lux
     environment:
-      # Optional: set LUX_SCAN_CONCURRENCY in .env to increase scan workers (1-1024).
-      LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY-}
+      # Defaults to 8; set LUX_SCAN_CONCURRENCY in .env to change it (1-1024).
+      LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY:-8}
     ports:
       - "8097:8097"
     volumes:
@@ -72,7 +72,9 @@ services:
 LUX_SCAN_CONCURRENCY=1024
 ```
 
-支持范围为 `1-1024`；未设置时默认使用 32 路。实际后台 worker 数仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
+支持范围为 `1-1024`；Compose 未设置时默认使用 8 路，非容器部署未设置时默认使用 16 路。实际后台 worker 数仍会根据容器 CPU、内存和存储延迟自动降级，SQLite 入库保持单写者。
+
+修改 Compose 中的并发值后请执行 `docker compose up -d --force-recreate lux`；单纯重启旧容器不会更新环境变量。
 
 打开 <http://localhost:8097/>，按引导完成数据库选择和第一个管理员创建。
 
