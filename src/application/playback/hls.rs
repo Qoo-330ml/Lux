@@ -469,8 +469,6 @@ fn ffmpeg_args(
         "hls".to_owned(),
         "-hls_time".to_owned(),
         "4".to_owned(),
-        "-hls_playlist_type".to_owned(),
-        "vod".to_owned(),
         "-hls_list_size".to_owned(),
         "0".to_owned(),
         "-hls_segment_type".to_owned(),
@@ -568,7 +566,8 @@ mod tests {
                 .any(|pair| pair == ["-hls_segment_type", "fmp4"])
         );
         assert!(
-            args.windows(2)
+            !args
+                .windows(2)
                 .any(|pair| pair == ["-hls_playlist_type", "vod"])
         );
         assert!(
