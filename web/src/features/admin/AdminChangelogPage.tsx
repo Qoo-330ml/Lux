@@ -21,6 +21,7 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "fixed", items: [
         "修复 Emby 实时 HLS 转码的播放时长被动态清单片段长度误导的问题；PlaybackInfo 顶层和媒体源现在返回完整 RunTimeTicks，并在源时长缺失时回退到媒体项时长。",
         "修复 Emby 播放回调携带动态 HLS 当前清单时长时覆盖服务端完整媒体时长的问题。",
+        "对齐 Emby/Jellyfin 常见的 HLS 转码清单声明，增加 #EXT-X-PLAYLIST-TYPE:VOD，同时保持转码过程中的增量分片和完成前不写入 ENDLIST。",
         "修复用户放弃播放或发送停止事件后旧 Emby 转码会话未及时释放的问题，及时停止 FFmpeg 并清理相关播放资源。",
       ] },
     ],
