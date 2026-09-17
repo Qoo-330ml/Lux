@@ -409,7 +409,13 @@ impl WebPlaybackSessionService {
         &self,
         session_id: &str,
     ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
-        Ok(self.hls.wait_for_manifest(session_id).await?)
+        match self.hls.wait_for_manifest(session_id).await {
+            Ok(path) => Ok(path),
+            Err(error) => {
+                self.stop_failed_hls_session(session_id).await;
+                Err(error.into())
+            }
+        }
     }
 
     pub(crate) async fn hls_asset_path(
@@ -454,6 +460,28 @@ impl WebPlaybackSessionService {
         self.database
             .stop_web_playback_session(session_id, user_id, "STOPPED", now)
             .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn stop_active_emby_sessions_for_source(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        media_source_id: &str,
+    ) -> Result<(), WebPlaybackSessionError> {
+        let _start_guard = self.emby_start_lock.lock().await;
+        let sessions = self
+            .database
+            .find_active_web_playback_sessions_for_source(
+                user_id,
+                item_id,
+                media_source_id,
+                "lux-emby",
+            )
+            .await?;
+        for session in sessions {
+            self.stop(&session.id, user_id).await?;
+        }
         Ok(())
     }
 
@@ -506,6 +534,45 @@ impl WebPlaybackSessionService {
             );
         }
         Ok((claim, session))
+    }
+
+    async fn stop_failed_hls_session(&self, session_id: &str) {
+        if let Err(error) = self.hls.stop(session_id).await {
+            tracing::warn!(
+                event = "web_hls_failed_session_cleanup",
+                session_id = %session_id,
+                %error,
+                "failed to stop HLS process after manifest failure"
+            );
+        }
+        let session = match self.database.find_web_playback_session(session_id).await {
+            Ok(session) => session,
+            Err(error) => {
+                tracing::warn!(
+                    event = "web_hls_failed_session_cleanup",
+                    session_id = %session_id,
+                    %error,
+                    "failed to load HLS session after manifest failure"
+                );
+                return;
+            }
+        };
+        let Some(session) = session else {
+            return;
+        };
+        let now = unix_timestamp();
+        if let Err(error) = self
+            .database
+            .stop_web_playback_session(session_id, &session.user_id, "FAILED", now)
+            .await
+        {
+            tracing::warn!(
+                event = "web_hls_failed_session_cleanup",
+                session_id = %session_id,
+                %error,
+                "failed to mark HLS session after manifest failure"
+            );
+        }
     }
 }
 
@@ -766,6 +833,85 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn failed_hls_manifest_stops_session_and_removes_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let user_id = user.id.to_string();
+        let now = unix_timestamp();
+        service
+            .database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "failed-manifest",
+                user_id: &user_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-emby:failed-manifest",
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: true,
+                expires_at: now + 900,
+                now,
+            })
+            .await?;
+        service
+            .start_hls(
+                "failed-manifest",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+            )
+            .await?;
+
+        assert!(
+            service
+                .wait_for_hls_manifest("failed-manifest")
+                .await
+                .is_err()
+        );
+        let stored = database
+            .find_web_playback_session("failed-manifest")
+            .await?
+            .ok_or("missing failed manifest session")?;
+        assert_eq!(stored.state, "FAILED");
+        assert!(
+            !config
+                .config_dir
+                .join("web-playback/failed-manifest")
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn emby_hls_start_replaces_an_active_session_for_the_same_source()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
@@ -898,7 +1044,21 @@ while :; do sleep 1; done
                 .exists()
         );
 
-        service.stop(&second.id, &user_id).await?;
+        service
+            .stop_active_emby_sessions_for_source(&user_id, &item_id, &source_id)
+            .await?;
+        let second_stopped = database
+            .find_web_playback_session(&second.id)
+            .await?
+            .expect("second session after fallback stop");
+        assert_eq!(second_stopped.state, "STOPPED");
+        assert!(
+            !config
+                .config_dir
+                .join("web-playback")
+                .join(&second.id)
+                .exists()
+        );
         Ok(())
     }
 }

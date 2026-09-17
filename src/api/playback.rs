@@ -1036,17 +1036,26 @@ pub(super) async fn handle_emby_playback_event(
     let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
     let user_id = user.id.to_string();
     if state_name == "STOPPED"
-        && let Some(session_id) = emby_transcode_session_id
         && let Some(service) = state.web_playback.as_ref()
-        && let Err(error) = service.stop(session_id, &user_id).await
     {
-        tracing::warn!(
-            event = "emby_transcoding_session_stop_failed",
-            session_id = %session_id,
-            playback_state = state_name,
-            error = %error,
-            "failed to stop Emby transcoding session"
-        );
+        let result = if let Some(session_id) = emby_transcode_session_id {
+            service.stop(session_id, &user_id).await
+        } else if let Some(media_source_id) = media_source_id {
+            service
+                .stop_active_emby_sessions_for_source(&user_id, &internal_item_id, media_source_id)
+                .await
+        } else {
+            Ok(())
+        };
+        if let Err(error) = result {
+            tracing::warn!(
+                event = "emby_transcoding_session_stop_failed",
+                item_id_prefix = %item_id_prefix,
+                playback_state = state_name,
+                error = %error,
+                "failed to stop Emby transcoding session"
+            );
+        }
     }
     let played_percent = match database.user_played_percent(&user_id).await {
         Ok(value) => value,
