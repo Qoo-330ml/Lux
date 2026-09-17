@@ -423,6 +423,11 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
 读取其他插件或服务器 Secret。Webhook、Telegram、企业微信等平台的 payload 和认证逻辑属于各自插件，不应
 写入通知核心。
 
+`org.lux.webhook` 的 provider-specific 配置支持 `url` 和可选 `bodyTemplate`。URL 模板使用 `{title}`、
+`{content}` 等变量并进行 URL 编码；Body 模板是 JSON，使用 `{{title}}`、`{{content}}`、`{{body}}`、
+`{{timestamp}}` 和 `{{eventType}}` 等可读字段。模板只影响该插件的外发格式，不改变 Lux 原生事件合同或
+事件白名单。
+
 ## 错误码
 
 ```text

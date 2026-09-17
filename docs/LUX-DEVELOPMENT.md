@@ -4388,7 +4388,8 @@ adapter；不声称完整兼容 Emby Webhooks 插件的全部 payload/template �
 
 事件包括 `MEDIA_ADDED`、`MEDIA_REMOVED`、`SCAN_COMPLETED`、`SCAN_FAILED`、`METADATA_UPDATED`、
 `JOB_FAILED`、`PLAYBACK_STARTED`、`PLAYBACK_PAUSED`、`PLAYBACK_PROGRESS`、`PLAYBACK_STOPPED`。事件不包含
-本地绝对路径、`.strm` 原始目标、令牌、完整外部 URL 或不必要的用户隐私字段。
+本地绝对路径、`.strm` 原始目标、令牌或完整外部 URL。播放事件只携带有长度上限的用户显示名和展示所需媒体信息；
+远程 IP 仅在停止播放事件中携带，不包含用户 ID。
 
 验收：
 

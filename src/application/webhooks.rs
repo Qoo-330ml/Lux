@@ -1332,14 +1332,17 @@ fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
             )
         }
         "test" => matches!(event_type, WebhookEventType::JobFailed),
-        "mediaSourceId" | "playSessionId" | "state" | "positionTicks" | "durationTicks"
-        | "isPaused" | "client" | "deviceName" | "deviceType" | "clientVersion" => matches!(
+        "itemTitle" | "userName" | "container" | "size" | "bitrate" | "overview" | "playMethod"
+        | "resumed" | "mediaSourceId" | "playSessionId" | "state" | "positionTicks"
+        | "durationTicks" | "isPaused" | "client" | "deviceName" | "deviceType"
+        | "clientVersion" => matches!(
             event_type,
             WebhookEventType::PlaybackStarted
                 | WebhookEventType::PlaybackPaused
                 | WebhookEventType::PlaybackProgress
                 | WebhookEventType::PlaybackStopped
         ),
+        "remoteIp" => matches!(event_type, WebhookEventType::PlaybackStopped),
         _ => false,
     }
 }
@@ -1720,6 +1723,55 @@ mod tests {
         assert_eq!(payload["client"], "VidHub");
         assert!(payload.get("userId").is_none());
         assert!(payload.get("path").is_none());
+    }
+
+    #[test]
+    fn playback_display_fields_are_whitelisted_without_exposing_paths() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-playback-display",
+            WebhookEventType::PlaybackStopped,
+            1_700_000_000,
+            json!({
+                "itemId": "item-1",
+                "itemTitle": "示例电影",
+                "userName": "alice",
+                "container": "mkv",
+                "size": 7_690_000_000_i64,
+                "bitrate": 4_980_000_i64,
+                "playMethod": "DirectStream",
+                "overview": "Amid nerves, crushes and big reveals.",
+                "remoteIp": "122.96.10.20",
+                "resumed": true,
+                "path": "/private/movie.mkv",
+                "externalUrl": "https://user:password@example.test/movie"
+            }),
+        )
+        .expect("playback display payload should be accepted");
+        assert_eq!(payload["itemTitle"], "示例电影");
+        assert_eq!(payload["userName"], "alice");
+        assert_eq!(payload["container"], "mkv");
+        assert_eq!(payload["size"], 7_690_000_000_i64);
+        assert_eq!(payload["bitrate"], 4_980_000_i64);
+        assert_eq!(payload["playMethod"], "DirectStream");
+        assert_eq!(payload["overview"], "Amid nerves, crushes and big reveals.");
+        assert_eq!(payload["remoteIp"], "122.96.10.20");
+        assert_eq!(payload["resumed"], true);
+        assert!(payload.get("path").is_none());
+        assert!(payload.get("externalUrl").is_none());
+    }
+
+    #[test]
+    fn playback_remote_ip_is_only_allowed_for_stop_events() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-playback-start",
+            WebhookEventType::PlaybackStarted,
+            1_700_000_000,
+            json!({"itemId": "item-1", "remoteIp": "122.96.10.20"}),
+        )
+        .expect("playback payload should be accepted");
+        assert!(payload.get("remoteIp").is_none());
     }
 
     #[test]

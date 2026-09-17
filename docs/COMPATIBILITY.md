@@ -503,7 +503,8 @@ Emby 官方源码中的 `SqliteUserDataRepository` 只持久化 `played`、`play
 Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`），用于发送媒体、扫描、元数据、后台任务
 和播放事件。请求使用 `X-Lux-Event-Id`、时间戳和 HMAC-SHA256 签名，投递为至少一次语义，接收方应按
 `eventId` 幂等。Webhook 目标可以选择 Lux 原生或 Emby 风格的有限 DTO payload；两者均经过字段白名单和脱敏
-处理。该功能不是 Emby Webhooks 插件的完整兼容实现，不支持未列入测试合同的模板变量、插件事件或行为。
+处理。核心内置 Webhook 不解析模板；已安装的 `org.lux.webhook` 通知器额外支持其 manifest 声明的
+URL/Body 模板和可读通知字段，但这仍不是 Emby Webhooks 插件的完整兼容实现。
 
 当前只提供 Webhook 渠道；Telegram、企业微信和 Email 尚未实现。
 
