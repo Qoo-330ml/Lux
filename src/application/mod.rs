@@ -28,6 +28,7 @@ pub mod metadata_paths;
 pub(crate) mod metadata_writeback;
 pub mod network_diagnostics;
 pub mod nfo;
+pub(crate) mod notification_template;
 pub mod people;
 pub mod playback;
 pub mod plugin_compat;

@@ -2560,6 +2560,86 @@ printf '%s' '{"format":{"format_name":"mp4","duration":"30","bit_rate":"128000"}
 
 #[cfg(unix)]
 #[tokio::test]
+async fn full_scan_imports_existing_strm_media_info_sidecar_without_ffprobe()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Remote Movie (2022)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(
+        movie_dir.join("Remote.Movie.2022.strm"),
+        "https://example.invalid/media.mkv\n",
+    )
+    .await?;
+    tokio::fs::write(
+        movie_dir.join("Remote.Movie.2022-mediainfo.json"),
+        br#"[{"MediaSourceInfo":{"Container":"mp4","RunTimeTicks":300000000,"Bitrate":128000,"MediaStreams":[{"Index":0,"Type":"Video","Codec":"h264"}]}}]"#,
+    )
+    .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let fake_ffprobe = temp_dir.path().join("fake-ffprobe");
+    fs::write(
+        &fake_ffprobe,
+        "#!/bin/sh\nprintf '%s' 'ffprobe must not run' >&2\nexit 1\n",
+    )?;
+    let mut permissions = fs::metadata(&fake_ffprobe)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&fake_ffprobe, permissions)?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let probe = MediaProbeService::new(
+        database.clone(),
+        FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
+    );
+    jobs.run_to_completion(&job.id, 100, Some(probe)).await?;
+
+    let source: (String, Option<i64>, Option<i64>, String) = sqlx::query_as(
+        "SELECT ms.container, ms.duration_ticks, ms.bitrate, ms.probe_status
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        source,
+        (
+            "mp4".to_owned(),
+            Some(300000000),
+            Some(128000),
+            "READY".to_owned()
+        )
+    );
+
+    let stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_streams
+         JOIN media_sources ON media_sources.id = media_streams.media_source_id
+         JOIN filesystem_entries fe ON fe.id = media_sources.filesystem_entry_id
+         WHERE fe.relative_path = 'Remote Movie (2022)/Remote.Movie.2022.strm'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stream_count, 1);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn scan_postprocessing_persists_the_current_stage_while_ffprobe_runs()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{fs, os::unix::fs::PermissionsExt};

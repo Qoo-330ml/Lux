@@ -118,6 +118,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
         "PlaySessionId": "playback-hook-session",
         "PositionTicks": 100,
         "RunTimeTicks": 10_000,
+        "PlayMethod": "DirectPlay",
         "Client": "PlaybackHookTest",
         "DeviceName": "Mac",
         "DeviceId": "playback-hook-device",
@@ -136,7 +137,55 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
         serde_json::from_slice(&receiver.recv().await.ok_or("missing started event")?)?;
     assert_eq!(started["eventType"], "PLAYBACK_STARTED");
     assert_eq!(started["itemId"], emby_item_id);
+    assert_eq!(started["itemTitle"], "Playback Hook Movie");
+    assert_eq!(started["userName"], "Admin");
+    assert_eq!(started["playMethod"], "DirectPlay");
+    assert_eq!(started["resumed"], false);
+    assert_eq!(started["source"], "lux");
+    assert_eq!(started["title"], "Admin开始播放 Playback Hook Movie");
+    assert_eq!(started["body"], started["content"]);
+    assert!(started["content"].as_str().is_some_and(|value| {
+        value.contains("直接播放") && value.contains("设备：PlaybackHookTest · Mac")
+    }));
     assert!(started.get("userId").is_none());
+
+    let paused = client
+        .post(format!("{base_url}/Sessions/Playing/Progress"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": common["ItemId"],
+            "PlaySessionId": common["PlaySessionId"],
+            "PositionTicks": 1_000,
+            "RunTimeTicks": 10_000,
+            "IsPaused": true,
+            "PlayMethod": "DirectPlay"
+        }))
+        .send()
+        .await?;
+    assert_eq!(paused.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
+    let paused_event: Value =
+        serde_json::from_slice(&receiver.recv().await.ok_or("missing paused event")?)?;
+    assert_eq!(paused_event["eventType"], "PLAYBACK_PAUSED");
+
+    let resumed = client
+        .post(format!("{base_url}/Sessions/Playing/Progress"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": common["ItemId"],
+            "PlaySessionId": common["PlaySessionId"],
+            "PositionTicks": 1_725,
+            "RunTimeTicks": 10_000,
+            "PlayMethod": "DirectPlay"
+        }))
+        .send()
+        .await?;
+    assert_eq!(resumed.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
+    let resumed_event: Value =
+        serde_json::from_slice(&receiver.recv().await.ok_or("missing resumed event")?)?;
+    assert_eq!(resumed_event["eventType"], "PLAYBACK_STARTED");
+    assert_eq!(resumed_event["resumed"], true);
 
     sqlx::query(
         "UPDATE playback_sessions SET last_event_at = last_event_at - 31
@@ -151,7 +200,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
         .json(&json!({
             "ItemId": common["ItemId"],
             "PlaySessionId": common["PlaySessionId"],
-            "PositionTicks": 500,
+            "PositionTicks": 2_500,
             "RunTimeTicks": 10_000,
             "Client": "PlaybackHookTest",
             "DeviceId": "playback-hook-device"
@@ -163,7 +212,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
     let progress_event: Value =
         serde_json::from_slice(&receiver.recv().await.ok_or("missing progress event")?)?;
     assert_eq!(progress_event["eventType"], "PLAYBACK_PROGRESS");
-    assert_eq!(progress_event["positionTicks"], 500);
+    assert_eq!(progress_event["positionTicks"], 2_500);
 
     let repeated = client
         .post(format!("{base_url}/Sessions/Playing/Progress"))
@@ -171,7 +220,7 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
         .json(&json!({
             "ItemId": common["ItemId"],
             "PlaySessionId": common["PlaySessionId"],
-            "PositionTicks": 600,
+            "PositionTicks": 2_600,
             "RunTimeTicks": 10_000
         }))
         .send()
@@ -203,6 +252,8 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
     assert_eq!(
         event_types,
         vec![
+            WebhookEventType::PlaybackStarted.as_str().to_owned(),
+            WebhookEventType::PlaybackPaused.as_str().to_owned(),
             WebhookEventType::PlaybackStarted.as_str().to_owned(),
             WebhookEventType::PlaybackProgress.as_str().to_owned(),
             WebhookEventType::PlaybackStopped.as_str().to_owned(),

@@ -816,6 +816,8 @@ pub(super) struct PlaybackEventRequest {
     client_version: Option<String>,
     #[serde(rename = "DeviceType", alias = "deviceType")]
     device_type: Option<String>,
+    #[serde(rename = "PlayMethod", alias = "playMethod")]
+    play_method: Option<String>,
 }
 
 fn parse_emby_playback_event(body: &Bytes) -> Result<PlaybackEventRequest, StatusCode> {
@@ -1088,6 +1090,7 @@ pub(super) async fn handle_emby_playback_event(
             .filter(|duration| *duration > 0)
     });
     let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
+    let resumed = playback_resumed(previous_session.as_ref(), state_name);
     let occurred_at = current_unix_timestamp();
     let webhook_event = webhook_event_type_for_playback(
         activity_event,
@@ -1180,6 +1183,15 @@ pub(super) async fn handle_emby_playback_event(
                     device_name,
                     device_type,
                     client_version,
+                    &user.display_name,
+                    AccessPrincipal::new(user.id, user.is_admin),
+                    request.play_method.as_deref(),
+                    if event_type_is_stopped(event_type) {
+                        activity_remote_ip
+                    } else {
+                        None
+                    },
+                    resumed,
                 )
                 .await;
             }
@@ -1295,6 +1307,90 @@ pub(super) fn webhook_event_type_for_playback(
     }
 }
 
+pub(super) fn playback_resumed(previous: Option<&StoredPlaybackSession>, state_name: &str) -> bool {
+    state_name == "PLAYING" && previous.is_some_and(|session| session.state == "PAUSED")
+}
+
+fn event_type_is_stopped(event_type: WebhookEventType) -> bool {
+    event_type == WebhookEventType::PlaybackStopped
+}
+
+#[derive(Clone, Debug, Default)]
+struct PlaybackNotificationContext {
+    item_title: Option<String>,
+    container: Option<String>,
+    size: Option<i64>,
+    bitrate: Option<i64>,
+    overview: Option<String>,
+    play_method: Option<String>,
+}
+
+async fn playback_notification_context(
+    state: &AppState,
+    principal: AccessPrincipal,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    requested_play_method: Option<&str>,
+) -> PlaybackNotificationContext {
+    let Some(catalog) = state.catalog.as_ref() else {
+        return PlaybackNotificationContext {
+            play_method: requested_play_method.map(normalize_play_method),
+            ..PlaybackNotificationContext::default()
+        };
+    };
+    let item = match catalog.find_item(principal, item_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) | Err(_) => {
+            return PlaybackNotificationContext {
+                play_method: requested_play_method.map(normalize_play_method),
+                ..PlaybackNotificationContext::default()
+            };
+        }
+    };
+    let source = media_source_id
+        .and_then(|source_id| {
+            item.media_sources
+                .iter()
+                .find(|source| source.id == source_id)
+        })
+        .or_else(|| item.media_sources.iter().find(|source| source.is_default))
+        .or_else(|| item.media_sources.first());
+    let play_method = requested_play_method
+        .map(normalize_play_method)
+        .or_else(|| source.map(|source| default_play_method(&source.source_kind).to_owned()));
+    PlaybackNotificationContext {
+        item_title: bounded_playback_text(Some(&item.title)),
+        container: source.and_then(|source| bounded_playback_text(source.container.as_deref())),
+        size: source.and_then(|source| source.size.filter(|value| *value >= 0)),
+        bitrate: source.and_then(|source| source.bitrate.filter(|value| *value >= 0)),
+        overview: bounded_playback_overview(item.overview.as_deref()),
+        play_method,
+    }
+}
+
+fn normalize_play_method(value: &str) -> String {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "directplay" | "direct_play" => "DirectPlay".to_owned(),
+        "directstream" | "direct_stream" => "DirectStream".to_owned(),
+        "remux" => "Remux".to_owned(),
+        "transcode" | "transcoding" => "Transcode".to_owned(),
+        _ => bounded_playback_text(Some(value)).unwrap_or_else(|| "DirectPlay".to_owned()),
+    }
+}
+
+fn default_play_method(source_kind: &str) -> &'static str {
+    if source_kind.eq_ignore_ascii_case("STRM_URL") {
+        "DirectStream"
+    } else {
+        "DirectPlay"
+    }
+}
+
+fn bounded_playback_overview(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    (!value.is_empty() && value.chars().count() <= 512).then(|| value.to_owned())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_playback_webhook(
     state: &AppState,
@@ -1311,22 +1407,44 @@ pub(super) async fn publish_playback_webhook(
     device_name: Option<&str>,
     device_type: Option<&str>,
     client_version: Option<&str>,
+    user_name: &str,
+    principal: AccessPrincipal,
+    requested_play_method: Option<&str>,
+    remote_ip: Option<&str>,
+    resumed: bool,
 ) {
     let Some(webhooks) = state.webhooks.as_ref() else {
         return;
     };
     let dedupe_key = format!(
-        "playback:{play_session_id}:{}:{occurred_at}",
-        event_type.as_str()
+        "playback:{play_session_id}:{}:{occurred_at}:{position_ticks}",
+        event_type.as_str(),
     );
+    let context = playback_notification_context(
+        state,
+        principal,
+        item_id,
+        media_source_id,
+        requested_play_method,
+    )
+    .await;
     let data = json!({
         "itemId": emby_public_id(item_id),
+        "itemTitle": context.item_title,
+        "userName": bounded_playback_text(Some(user_name)),
         "mediaSourceId": media_source_id,
         "playSessionId": play_session_id,
         "state": state_name,
         "positionTicks": position_ticks,
         "durationTicks": duration_ticks,
         "isPaused": is_paused,
+        "container": context.container,
+        "size": context.size,
+        "bitrate": context.bitrate,
+        "overview": context.overview,
+        "playMethod": context.play_method,
+        "remoteIp": remote_ip.map(str::to_owned),
+        "resumed": resumed,
         "client": bounded_playback_text(client),
         "deviceName": bounded_playback_text(device_name),
         "deviceType": bounded_playback_text(device_type),
@@ -2840,6 +2958,8 @@ pub(super) struct LuxProgressRequest {
     duration_ticks: Option<i64>,
     #[serde(default)]
     state: LuxPlaybackState,
+    #[serde(default)]
+    play_method: Option<String>,
 }
 
 pub(super) async fn lux_post_progress(
@@ -2884,6 +3004,7 @@ pub(super) async fn lux_post_progress(
     };
     let activity_event =
         playback_activity_event_type(previous_session.as_ref(), playback_state.as_str());
+    let resumed = playback_resumed(previous_session.as_ref(), playback_state.as_str());
     let occurred_at = current_unix_timestamp();
     let webhook_event = webhook_event_type_for_playback(
         activity_event,
@@ -2964,6 +3085,15 @@ pub(super) async fn lux_post_progress(
                     Some("Web"),
                     Some("Web"),
                     None,
+                    &user.display_name,
+                    AccessPrincipal::new(user.id, user.is_admin),
+                    request.play_method.as_deref(),
+                    if event_type_is_stopped(event_type) {
+                        activity_remote_ip
+                    } else {
+                        None
+                    },
+                    resumed,
                 )
                 .await;
             }
@@ -3206,7 +3336,7 @@ pub(super) async fn lux_set_played(
 mod emby_playback_tests {
     use super::{
         EmbyPlaybackInfoRequest, emby_force_transcode_from_raw, emby_hls_asset_kind,
-        parse_emby_playback_info_request,
+        parse_emby_playback_info_request, playback_resumed,
     };
     use crate::application::catalog::{CatalogSource, CatalogStream};
     use crate::application::playback::decision::{
@@ -3310,6 +3440,33 @@ mod emby_playback_tests {
         let request = parse_emby_playback_info_request(&Bytes::new())
             .expect("empty PlaybackInfo body is valid");
         assert!(!request.requests_server_transcoding(false));
+    }
+
+    #[test]
+    fn playing_after_pause_is_reported_as_resume() {
+        let previous = crate::storage::StoredPlaybackSession {
+            id: "session".to_owned(),
+            user_id: "user".to_owned(),
+            item_id: "item".to_owned(),
+            media_source_id: None,
+            play_session_id: "play".to_owned(),
+            device_id: "device".to_owned(),
+            client: None,
+            device_name: None,
+            client_version: None,
+            device_type: None,
+            remote_ip: None,
+            state: "PAUSED".to_owned(),
+            position_ticks: 100,
+            duration_ticks: Some(1_000),
+            is_paused: true,
+            started_at: 1,
+            last_event_at: 1,
+        };
+
+        assert!(playback_resumed(Some(&previous), "PLAYING"));
+        assert!(!playback_resumed(Some(&previous), "PAUSED"));
+        assert!(!playback_resumed(None, "PLAYING"));
     }
 
     #[test]

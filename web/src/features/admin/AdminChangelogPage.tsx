@@ -15,6 +15,19 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.6",
+    date: "2026-09-18",
+    sections: [
+      { kind: "added", items: [
+        "Lux 核心统一生成通知事件的 source、title、content、body 和 ISO timestamp 字段，内置 Webhook 与通知器插件使用一致的可读内容。",
+        "播放通知补充媒体标题、用户、容器、大小、码率、播放方式、设备和恢复播放等展示信息，并在停止事件中提供远程 IP 与简介，同时继续过滤本地路径和外部地址。",
+      ] },
+      { kind: "fixed", items: [
+        "修复全量扫描无法为已有 URL .strm 媒体读取 *-mediainfo.json 旁车文件的问题；现在可直接导入容器、时长、码率和媒体流信息，无需调用 ffprobe。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.5",
     date: "2026-09-17",
     sections: [
