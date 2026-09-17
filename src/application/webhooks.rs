@@ -967,14 +967,38 @@ pub fn validate_webhook_url(
     value: &str,
     allow_private_network: bool,
 ) -> Result<Url, WebhookUrlError> {
+    validate_webhook_url_with_query_policy(value, allow_private_network, false, true)
+}
+
+fn validate_provider_target_url(
+    value: &str,
+    allow_private_network: bool,
+) -> Result<Url, WebhookUrlError> {
+    validate_webhook_url_with_query_policy(value, allow_private_network, true, false)
+}
+
+fn validate_webhook_url_with_query_policy(
+    value: &str,
+    allow_private_network: bool,
+    allow_query: bool,
+    strict_metadata: bool,
+) -> Result<Url, WebhookUrlError> {
     let url = Url::parse(value.trim()).map_err(|_| WebhookUrlError::Invalid)?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(WebhookUrlError::Scheme);
     }
-    if url.username() != "" || url.password().is_some() {
+    if strict_metadata && (url.username() != "" || url.password().is_some()) {
         return Err(WebhookUrlError::Credentials);
     }
-    if url.query().is_some() || url.fragment().is_some() {
+    if strict_metadata
+        && (url.fragment().is_some()
+            || (!allow_query && url.query().is_some())
+            || url.query_pairs().any(|(key, _)| {
+                ["secret", "token", "password", "apikey", "api_key"]
+                    .iter()
+                    .any(|sensitive| key.to_ascii_lowercase().contains(sensitive))
+            }))
+    {
         return Err(WebhookUrlError::QueryOrFragment);
     }
     let Some(host) = url.host_str() else {
@@ -1444,7 +1468,12 @@ fn validate_optional_provider_url(
     if value.is_empty() {
         return Ok(None);
     }
-    validate_destination(value, allow_private_network).map(Some)
+    if value.len() > MAX_URL_LENGTH {
+        return Err(WebhookError::Invalid("webhook URL is too long".to_owned()));
+    }
+    validate_provider_target_url(value, allow_private_network)
+        .map(Some)
+        .map_err(|error| WebhookError::Invalid(error.to_string()))
 }
 
 async fn validate_provider(
@@ -1583,6 +1612,7 @@ mod tests {
         WebhookEventType, WebhookPayloadFormat, build_event_payload,
         build_event_payload_for_format, is_retryable_http_status, parse_retry_after,
         plugin_event_from_payload, provider_config_json, retry_delay,
+        validate_optional_provider_url,
     };
     use reqwest::StatusCode;
     use serde_json::json;
@@ -1745,5 +1775,30 @@ mod tests {
         assert!(provider_config_json(&json!({"chatId": "chat-1"})).is_ok());
         assert!(provider_config_json(&json!({"botToken": "secret"})).is_err());
         assert!(provider_config_json(&json!(["not-an-object"])).is_err());
+    }
+
+    #[test]
+    fn external_provider_target_accepts_safe_query_parameters() {
+        let url = validate_optional_provider_url(
+            "http://192.168.10.50:5401/api/service/notify?route_id=route_of0j&title={title}&content={content}",
+            true,
+        )
+        .expect("provider target URL should validate")
+        .expect("non-empty provider target URL should be retained");
+        assert_eq!(url.host_str(), Some("192.168.10.50"));
+        assert!(url.query().is_some());
+
+        let unrestricted_url = validate_optional_provider_url(
+            "http://user:pass@192.168.10.50:5401/notify?token=secret#fragment",
+            true,
+        )
+        .expect("provider target URL metadata should be accepted")
+        .expect("non-empty provider target URL should be retained");
+        assert_eq!(unrestricted_url.username(), "user");
+        assert_eq!(unrestricted_url.password(), Some("pass"));
+        assert_eq!(unrestricted_url.fragment(), Some("fragment"));
+        assert!(
+            validate_optional_provider_url("http://192.168.10.50:5401/notify", false,).is_err()
+        );
     }
 }

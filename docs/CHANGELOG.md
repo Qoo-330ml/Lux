@@ -20,6 +20,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 - 将扫描、媒体技术信息探测和缩略图/FFmpeg 阶段拆分为独立并发控制，Docker 默认提供 `LUX_SCAN_CONCURRENCY`、`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 配置。
 - 通知器管理支持插件声明的 URL 模板和 Body 模板字段，管理员可在管理台直接编辑多行请求模板。
+- 放宽通知器插件目标地址的兼容性，允许保留第三方服务所需的查询参数、认证信息和片段；核心 Webhook 地址仍执行严格的安全校验。
 - Docker 部署默认以 root 运行，挂载 NAS 目录时无需额外的 PUID/PGID 交接或递归修改所有权。
 
 ## [0.4.4] - 2026-09-16
