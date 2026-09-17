@@ -829,12 +829,42 @@ impl Database {
             return Ok(0);
         }
         let mut transaction = self.begin_scan_write_transaction().await?;
+        let inserted = self
+            .insert_movie_files_batch_in_transaction(
+                &mut transaction,
+                library_id,
+                library_root_id,
+                generation,
+                files,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(inserted)
+    }
+
+    pub(crate) async fn insert_movie_files_batch_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewMovieFile],
+    ) -> Result<usize, StorageError> {
+        if files.is_empty() {
+            return Ok(0);
+        }
         let mut folder_cache = self
-            .prefetch_movie_folders_in_transaction(&mut transaction, library_root_id, files)
+            .prefetch_movie_folders_in_transaction(&mut *transaction, library_root_id, files)
             .await?;
         let mut touched_folders = HashSet::new();
         let mut movie_cache = self
-            .prefetch_movie_items_in_transaction(&mut transaction, library_id, files)
+            .prefetch_movie_items_in_transaction(&mut *transaction, library_id, files)
             .await?;
         let existing_movie_items = movie_cache
             .values()
@@ -869,7 +899,7 @@ impl Database {
                     .bind(generation);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -885,7 +915,7 @@ impl Database {
         for (index, file) in files.iter().enumerate() {
             let parent_folder_id = self
                 .ensure_movie_parent_folder_cached(
-                    &mut transaction,
+                    &mut *transaction,
                     library_id,
                     library_root_id,
                     &file.relative_path,
@@ -948,7 +978,7 @@ impl Database {
                     .bind(file.provider_ids_json.as_deref());
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -965,7 +995,7 @@ impl Database {
                         .is_some_and(|item| item.parent_id.as_deref() != parent_id.as_deref())
             })
             .collect::<Vec<_>>();
-        self.update_movie_parents_in_batches(&mut transaction, &parent_updates)
+        self.update_movie_parents_in_batches(&mut *transaction, &parent_updates)
             .await?;
 
         let provider_updates = provider_updates
@@ -980,7 +1010,7 @@ impl Database {
                     })
             })
             .collect::<Vec<_>>();
-        self.update_movie_provider_ids_in_batches(&mut transaction, &provider_updates)
+        self.update_movie_provider_ids_in_batches(&mut *transaction, &provider_updates)
             .await?;
 
         for chunk in source_rows.chunks(BATCH_INSERT_CHUNK_SIZE) {
@@ -1012,7 +1042,7 @@ impl Database {
                     .bind(database_flag(*is_new_item));
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1025,7 +1055,7 @@ impl Database {
                 .map(|(index, _, _)| files[*index].filesystem_entry_id.clone())
                 .collect::<Vec<_>>();
             self.restore_media_items_for_filesystem_entries(
-                &mut transaction,
+                &mut *transaction,
                 &filesystem_entry_ids,
             )
             .await?;
@@ -1048,20 +1078,13 @@ impl Database {
                    )",
             )
             .bind(item_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         Ok(new_items.len())
     }
 
@@ -1076,6 +1099,36 @@ impl Database {
             return Ok(0);
         }
         let mut transaction = self.begin_scan_write_transaction().await?;
+        let inserted = self
+            .insert_episode_files_batch_in_transaction(
+                &mut transaction,
+                library_id,
+                library_root_id,
+                generation,
+                files,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(inserted)
+    }
+
+    pub(crate) async fn insert_episode_files_batch_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewEpisodeFile],
+    ) -> Result<usize, StorageError> {
+        if files.is_empty() {
+            return Ok(0);
+        }
 
         for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
             let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
@@ -1100,7 +1153,7 @@ impl Database {
                     .bind(generation);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1131,23 +1184,26 @@ impl Database {
         }
         let series_keys = series_rows.keys().cloned().collect::<Vec<_>>();
         let (mut series_ids, series_removed_ids) = self
-            .list_hierarchy_ids_in_transaction(&mut transaction, &series_keys)
+            .list_hierarchy_ids_in_transaction(&mut *transaction, &series_keys)
             .await?;
         let missing_series = series_rows
             .values()
             .filter(|row| !series_ids.contains_key(&row.identity_key))
             .collect::<Vec<_>>();
-        self.insert_hierarchy_rows_in_transaction(&mut transaction, missing_series.iter().copied())
-            .await?;
+        self.insert_hierarchy_rows_in_transaction(
+            &mut *transaction,
+            missing_series.iter().copied(),
+        )
+        .await?;
         self.revive_hierarchy_rows_in_transaction(
-            &mut transaction,
+            &mut *transaction,
             series_rows.values(),
             &series_ids,
             &series_removed_ids,
         )
         .await?;
         series_ids = self
-            .list_hierarchy_ids_in_transaction(&mut transaction, &series_keys)
+            .list_hierarchy_ids_in_transaction(&mut *transaction, &series_keys)
             .await?
             .0;
 
@@ -1189,26 +1245,26 @@ impl Database {
         }
         let season_keys = season_rows.keys().cloned().collect::<Vec<_>>();
         let (mut season_ids, season_removed_ids) = self
-            .list_hierarchy_ids_in_transaction(&mut transaction, &season_keys)
+            .list_hierarchy_ids_in_transaction(&mut *transaction, &season_keys)
             .await?;
         let missing_seasons = season_rows
             .values()
             .filter(|row| !season_ids.contains_key(&row.identity_key))
             .collect::<Vec<_>>();
         self.insert_hierarchy_rows_in_transaction(
-            &mut transaction,
+            &mut *transaction,
             missing_seasons.iter().copied(),
         )
         .await?;
         self.revive_hierarchy_rows_in_transaction(
-            &mut transaction,
+            &mut *transaction,
             season_rows.values(),
             &season_ids,
             &season_removed_ids,
         )
         .await?;
         season_ids = self
-            .list_hierarchy_ids_in_transaction(&mut transaction, &season_keys)
+            .list_hierarchy_ids_in_transaction(&mut *transaction, &season_keys)
             .await?
             .0;
 
@@ -1241,7 +1297,7 @@ impl Database {
         }
         let episode_keys = episode_rows.keys().cloned().collect::<Vec<_>>();
         let (episode_ids, episode_removed_ids) = self
-            .list_hierarchy_ids_in_transaction(&mut transaction, &episode_keys)
+            .list_hierarchy_ids_in_transaction(&mut *transaction, &episode_keys)
             .await?;
         let missing_episodes = episode_rows
             .values()
@@ -1252,19 +1308,19 @@ impl Database {
             .map(|row| row.identity_key.clone())
             .collect::<HashSet<_>>();
         self.insert_hierarchy_rows_in_transaction(
-            &mut transaction,
+            &mut *transaction,
             missing_episodes.iter().copied(),
         )
         .await?;
         self.revive_hierarchy_rows_in_transaction(
-            &mut transaction,
+            &mut *transaction,
             episode_rows.values(),
             &episode_ids,
             &episode_removed_ids,
         )
         .await?;
         let episode_ids = self
-            .list_hierarchy_ids_in_transaction(&mut transaction, &episode_keys)
+            .list_hierarchy_ids_in_transaction(&mut *transaction, &episode_keys)
             .await?
             .0;
 
@@ -1302,7 +1358,7 @@ impl Database {
                     .bind(database_flag(is_default));
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1335,7 +1391,7 @@ impl Database {
                 statement = statement.bind(item_id);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1343,13 +1399,6 @@ impl Database {
                 })?;
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         Ok(missing_series.len() + missing_seasons.len() + missing_episodes.len())
     }
 

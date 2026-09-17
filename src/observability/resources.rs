@@ -17,6 +17,8 @@ const PROBE_RECOVERY_COOLDOWN: Duration = Duration::from_secs(30);
 const METADATA_METRIC_SAMPLE_CAPACITY: usize = 128;
 const METADATA_GLOBAL_HARD_CAP: usize = 16;
 const METADATA_P95_SEVERE_MS: u64 = 1_000;
+const PROBE_IO_CONCURRENCY_MULTIPLIER: usize = 32;
+const PROBE_STARTUP_CONCURRENCY_CAP: usize = 16;
 
 #[derive(Clone)]
 pub struct ResourceMetrics {
@@ -196,6 +198,9 @@ impl ResourceMetrics {
             cpu_snapshot(Arc::clone(&self.cpu_sample)),
             memory_snapshot(),
         );
+        // `configured` is the library/requested limit. The returned value is
+        // the current effective limit after the process hard cap and resource
+        // backpressure have been applied.
         let target = recommended_probe_concurrency(
             configured,
             available_parallelism,
@@ -763,8 +768,21 @@ pub fn recommended_probe_concurrency(
         .max(1);
     // ffprobe spends a meaningful amount of time waiting on media storage, so
     // it gets an I/O-oriented cap instead of reserving one worker per CPU.
-    let io_cap = container_parallelism.saturating_mul(32).clamp(1, hard_cap);
-    let base = configured.min(io_cap);
+    let io_cap = container_parallelism
+        .saturating_mul(PROBE_IO_CONCURRENCY_MULTIPLIER)
+        .clamp(1, hard_cap);
+    // The first cgroup sample has no delta and therefore no CPU percentage.
+    // Start at a small, CPU-relative stage cap and let the stabilizer grow it
+    // after a healthy sample. This prevents a fresh process from immediately
+    // launching CPU*32 probes.
+    let startup_cap = container_parallelism
+        .saturating_mul(2)
+        .clamp(1, PROBE_STARTUP_CONCURRENCY_CAP);
+    let base = configured.min(io_cap).min(if cpu_usage_percent.is_none() {
+        startup_cap
+    } else {
+        hard_cap
+    });
     let severe_pressure = cpu_usage_percent.is_some_and(|value| value >= 90.0)
         || container_memory_usage_percent.is_some_and(|value| value >= 95.0)
         || home_p95_ms.is_some_and(|value| value >= 2_000);
@@ -927,31 +945,47 @@ mod tests {
     #[test]
     fn probe_concurrency_uses_io_parallelism_before_backing_off() {
         assert_eq!(
-            recommended_probe_concurrency(256, 4, None, None, None, None, 512),
+            recommended_probe_concurrency(256, 4, None, None, None, Some(0.0), 512),
             128
         );
         assert_eq!(
-            recommended_probe_concurrency(512, 4, None, None, None, None, 512),
+            recommended_probe_concurrency(512, 4, None, None, None, Some(0.0), 512),
             128
         );
         assert_eq!(
-            recommended_probe_concurrency(512, 8, None, None, None, None, 512),
+            recommended_probe_concurrency(512, 8, None, None, None, Some(0.0), 512),
             256
         );
         assert_eq!(
-            recommended_probe_concurrency(512, 16, None, None, None, None, 512),
+            recommended_probe_concurrency(512, 16, None, None, None, Some(0.0), 512),
             512
+        );
+    }
+
+    #[test]
+    fn probe_concurrency_starts_conservatively_without_a_cpu_sample() {
+        assert_eq!(
+            recommended_probe_concurrency(512, 4, None, None, None, None, 512),
+            8
+        );
+        assert_eq!(
+            recommended_probe_concurrency(512, 16, None, None, None, None, 512),
+            16
+        );
+        assert_eq!(
+            recommended_probe_concurrency(512, 4, None, Some(1.5), None, None, 512),
+            4
         );
     }
 
     #[test]
     fn probe_concurrency_backs_off_for_cpu_memory_and_frontend_pressure() {
         assert_eq!(
-            recommended_probe_concurrency(512, 4, Some(1_000), None, None, None, 512),
+            recommended_probe_concurrency(512, 4, Some(1_000), None, None, Some(0.0), 512),
             64
         );
         assert_eq!(
-            recommended_probe_concurrency(512, 4, None, None, Some(90.0), None, 512),
+            recommended_probe_concurrency(512, 4, None, None, Some(90.0), Some(0.0), 512),
             64
         );
         assert_eq!(

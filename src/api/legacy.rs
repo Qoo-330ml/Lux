@@ -41,7 +41,7 @@ use crate::{
     application::playback::decision::{PlaybackCapabilities, PlaybackSourceKind},
     application::playback::session::{
         CreateWebPlaybackSession, EMBY_DIRECT_STREAM_TTL_SECONDS, WebPlaybackEvent,
-        WebPlaybackPlan, WebPlaybackSessionError, WebPlaybackSessionService,
+        WebPlaybackSessionError, WebPlaybackSessionService,
     },
     application::playback::{ByteRange, RangeError, parse_single_range},
     application::probe::{FfprobeRunner, MediaProbeService},
@@ -83,6 +83,7 @@ use crate::{
         people::{PeopleError, PeopleService, PersonMetadataUpdate},
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
+        restart::RestartHandle,
         scanner::{ScanJob, ScanJobError, ScanJobService},
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
@@ -157,6 +158,7 @@ pub struct AppState {
     config_dir: Option<PathBuf>,
     database_setup: Option<DatabaseSetupService>,
     database_selection_required: bool,
+    restart_handle: Option<RestartHandle>,
     server_id: String,
     filmly_image_compat_mode: FilmlyImageCompatMode,
     setup: Option<SetupService>,
@@ -363,6 +365,7 @@ impl AppState {
             config_dir: Some(config_dir.clone()),
             database_setup,
             database_selection_required: false,
+            restart_handle: None,
             server_id,
             filmly_image_compat_mode,
             setup: Some(setup),
@@ -428,6 +431,12 @@ impl AppState {
             login_rate_limiter: LoginRateLimiter::default(),
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
         }
+    }
+
+    #[doc(hidden)]
+    pub fn with_restart_handle(mut self, restart_handle: RestartHandle) -> Self {
+        self.restart_handle = Some(restart_handle);
+        self
     }
 
     #[doc(hidden)]

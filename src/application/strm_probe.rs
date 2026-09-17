@@ -28,6 +28,7 @@ use crate::{
         },
         probe::{safe_media_path, write_media_info_sidecar},
         strm_probe_policy::validate_remote_media_url,
+        thumbnail_policy::ThumbnailScrapingMode,
     },
     domain::ids::LibraryId,
     observability::resources::ResourceMetrics,
@@ -54,6 +55,15 @@ pub struct StrmProbeOptions {
     pub media_info_enabled: bool,
     pub thumbnail_enabled: bool,
     pub thumbnail_position_percent: i64,
+}
+
+#[derive(Clone, Copy)]
+struct ProbeSourceOptions {
+    include_ready: bool,
+    media_info_enabled: bool,
+    thumbnail_enabled: bool,
+    thumbnail_position_percent: i64,
+    thumbnail_mode: ThumbnailScrapingMode,
 }
 
 #[derive(Clone)]
@@ -149,6 +159,16 @@ impl StrmProbeService {
             .find_library(&library_id_text)
             .await?
             .ok_or(StrmProbeError::LibraryNotFound)?;
+        let global_strategy = self.database.media_strategy_settings().await?;
+        let thumbnail_mode = ThumbnailScrapingMode::from_strategy_json(
+            library.media_strategy_json.as_deref(),
+            global_strategy.as_deref(),
+        );
+        if !settings.media_info_enabled
+            && (!settings.thumbnail_enabled || !thumbnail_mode.allows_screenshots())
+        {
+            return Ok(None);
+        }
         if !library.is_enabled {
             return Ok(None);
         }
@@ -342,6 +362,11 @@ impl StrmProbeService {
             .find_library(&job.library_id)
             .await?
             .ok_or(StrmProbeError::LibraryNotFound)?;
+        let global_strategy = self.database.media_strategy_settings().await?;
+        let thumbnail_mode = ThumbnailScrapingMode::from_strategy_json(
+            library.media_strategy_json.as_deref(),
+            global_strategy.as_deref(),
+        );
         let per_library = match usize::try_from(library.probe_concurrency) {
             Ok(value) => value.clamp(1, MAX_CONCURRENCY as usize),
             Err(_) => 1,
@@ -418,22 +443,15 @@ impl StrmProbeService {
                 }
                 let service = self.clone();
                 let semaphore = operation_semaphore.clone();
-                let include_ready = job.include_ready;
-                let media_info_enabled = job.media_info_enabled;
-                let thumbnail_enabled = job.thumbnail_enabled;
-                let thumbnail_position_percent = job.thumbnail_position_percent;
-                pending.spawn(async move {
-                    service
-                        .probe_source(
-                            source,
-                            semaphore,
-                            include_ready,
-                            media_info_enabled,
-                            thumbnail_enabled,
-                            thumbnail_position_percent,
-                        )
-                        .await
-                });
+                let options = ProbeSourceOptions {
+                    include_ready: job.include_ready,
+                    media_info_enabled: job.media_info_enabled,
+                    thumbnail_enabled: job.thumbnail_enabled,
+                    thumbnail_position_percent: job.thumbnail_position_percent,
+                    thumbnail_mode,
+                };
+                pending
+                    .spawn(async move { service.probe_source(source, semaphore, options).await });
             }
             if cancelled {
                 break;
@@ -496,10 +514,7 @@ impl StrmProbeService {
         &self,
         source: StoredStrmMediaSource,
         semaphore: Arc<Semaphore>,
-        include_ready: bool,
-        media_info_enabled: bool,
-        thumbnail_enabled: bool,
-        thumbnail_position_percent: i64,
+        options: ProbeSourceOptions,
     ) -> SourceOutcome {
         let path = match safe_media_path(&source.root_path, &source.relative_path) {
             Ok(path) => path,
@@ -507,7 +522,10 @@ impl StrmProbeService {
                 return SourceOutcome::failed(&source.source_id, "FAILED", error.to_string());
             }
         };
-        let media_info_needed = media_info_enabled && (include_ready || !source.has_media_info);
+        let media_info_needed =
+            options.media_info_enabled && (options.include_ready || !source.has_media_info);
+        let thumbnail_enabled =
+            options.thumbnail_enabled && options.thumbnail_mode.allows_screenshots();
         if thumbnail_enabled
             && safe_strm_thumbnail_target(&path, &source.root_path)
                 .await
@@ -520,10 +538,25 @@ impl StrmProbeService {
             );
         }
         let thumbnail_needed = thumbnail_enabled
-            && source.poster_fallback_required
-            && usable_strm_thumbnail(&path, &source.root_path, source.thumbnail_path.as_deref())
-                .await
-                .is_none();
+            && if options.thumbnail_mode.prefers_screenshots() {
+                !(source.has_strm_thumbnail
+                    && usable_strm_thumbnail(
+                        &path,
+                        &source.root_path,
+                        source.thumbnail_path.as_deref(),
+                    )
+                    .await
+                    .is_some())
+            } else {
+                source.poster_fallback_required
+                    && usable_strm_thumbnail(
+                        &path,
+                        &source.root_path,
+                        source.thumbnail_path.as_deref(),
+                    )
+                    .await
+                    .is_none()
+            };
         if !media_info_needed && !thumbnail_needed {
             return SourceOutcome::skipped(source.source_id);
         }
@@ -557,7 +590,7 @@ impl StrmProbeService {
                 &url,
                 media_info_needed,
                 thumbnail_needed,
-                thumbnail_position_percent,
+                options.thumbnail_position_percent,
             )
             .await;
         drop(permit);

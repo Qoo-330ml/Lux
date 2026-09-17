@@ -209,6 +209,19 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it("requests a Lux process restart after database setup", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ restarting: true }), { status: 202 }),
+    );
+
+    await expect(new LuxApiClient().restartSetupDatabase()).resolves.toEqual({ restarting: true });
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/v1/setup/database/restart",
+      expect.objectContaining({ method: "POST", credentials: "same-origin" }),
+    );
+  });
+
   it("turns the Lux error envelope into a typed error", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(

@@ -1,25 +1,6 @@
 use super::*;
 
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
-const SIDECAR_DIRECTORY_TARGET_QUERY: &str = "INSERT INTO scan_job_targets (
-         job_id, target_type, target_id, item_id, change_kind,
-         probe_state, metadata_state, thumbnail_state
-     )
-     SELECT ?, 'ITEM', ms.item_id, ms.item_id, 'SIDECAR',
-            'SKIPPED', 'PENDING', 'PENDING'
-     FROM media_sources ms
-     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
-     WHERE fe.library_root_id = ? AND fe.is_missing = 0
-       AND fe.relative_path >= ? || '/'
-       AND fe.relative_path < ? || '0'
-     GROUP BY ms.item_id
-     ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET
-         change_kind = 'SIDECAR', metadata_state = 'PENDING', error = NULL,
-         updated_at = unixepoch()
-     WHERE scan_job_targets.change_kind <> 'REMOVED'
-       AND (scan_job_targets.change_kind <> 'SIDECAR'
-            OR scan_job_targets.metadata_state <> 'PENDING'
-            OR scan_job_targets.error IS NOT NULL)";
 
 fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {
     directories.sort();
@@ -41,6 +22,32 @@ fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {
         }
     }
     retained
+}
+
+fn sidecar_target_query(values: &str) -> String {
+    format!(
+        "WITH sidecar_directories(directory) AS (VALUES {values})
+         INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind,
+             probe_state, metadata_state, thumbnail_state
+         )
+         SELECT ?, 'ITEM', ms.item_id, ms.item_id, 'SIDECAR',
+                'SKIPPED', 'PENDING', 'PENDING'
+         FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         CROSS JOIN sidecar_directories sd
+         WHERE fe.library_root_id = ? AND fe.is_missing = 0
+           AND fe.relative_path >= sd.directory || '/'
+           AND fe.relative_path < sd.directory || '0'
+         GROUP BY ms.item_id
+         ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET
+             change_kind = 'SIDECAR', metadata_state = 'PENDING', error = NULL,
+             updated_at = unixepoch()
+         WHERE scan_job_targets.change_kind <> 'REMOVED'
+           AND (scan_job_targets.change_kind <> 'SIDECAR'
+                OR scan_job_targets.metadata_state <> 'PENDING'
+                OR scan_job_targets.error IS NOT NULL)"
+    )
 }
 
 impl Database {
@@ -605,18 +612,24 @@ impl Database {
         })
     }
 
-    pub(crate) async fn list_unseen_filesystem_entry_paths(
+    pub(crate) async fn list_unseen_filesystem_entry_paths_page(
         &self,
         library_root_id: &str,
         generation: &str,
+        after_relative_path: Option<&str>,
+        limit: i64,
     ) -> Result<Vec<String>, StorageError> {
         self.query_scalar(
             "SELECT relative_path FROM filesystem_entries
              WHERE library_root_id = ? AND last_seen_generation != ? AND is_missing = 0
-             ORDER BY relative_path",
+               AND relative_path > ?
+             ORDER BY relative_path
+             LIMIT ?",
         )
         .bind(library_root_id)
         .bind(generation)
+        .bind(after_relative_path.unwrap_or_default())
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .fetch_all(&self.pool)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -837,7 +850,7 @@ impl Database {
         self.query(
             "SELECT library_root_id, relative_path
              FROM reconciliation_scan_entries
-             WHERE job_id = ? AND entry_type = ?
+             WHERE job_id = ? AND entry_type = ? AND status = 'PENDING'
              ORDER BY library_root_id, relative_path
              LIMIT ?",
         )
@@ -986,7 +999,7 @@ impl Database {
         job_id: &str,
     ) -> Result<i64, StorageError> {
         let mut transaction = self.begin_scan_write_transaction().await?;
-        let total_count: i64 = self
+        let discovered_file_count: i64 = self
             .query_scalar(
                 "SELECT COUNT(*) FROM reconciliation_scan_entries
              WHERE job_id = ? AND entry_type = 'FILE'",
@@ -998,6 +1011,16 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let processed_count: i64 = self
+            .query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let total_count = discovered_file_count.max(processed_count);
         self.query(
             "UPDATE scan_jobs
              SET discovery_completed = 1, total_count = ?, updated_at = unixepoch()
@@ -1028,9 +1051,15 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
-             SET total_count = ?, updated_at = unixepoch()
+             SET total_count = CASE
+                     WHEN total_count < processed_count THEN processed_count
+                     WHEN total_count < ? THEN ?
+                     ELSE total_count
+                 END,
+                 updated_at = unixepoch()
              WHERE id = ? AND status = 'RUNNING' AND discovery_completed = 0",
         )
+        .bind(discovered_count)
         .bind(discovered_count)
         .bind(job_id)
         .execute(&self.pool)
@@ -1040,77 +1069,6 @@ impl Database {
             path: self.path.clone(),
             source,
         })
-    }
-
-    pub(crate) async fn complete_reconciliation_files(
-        &self,
-        job_id: &str,
-        entries: &[StoredReconciliationScanEntry],
-        processed_count: i64,
-    ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut entries_by_root = HashMap::<&str, Vec<&str>>::new();
-        for entry in entries {
-            entries_by_root
-                .entry(entry.library_root_id.as_str())
-                .or_default()
-                .push(entry.relative_path.as_str());
-        }
-        for (library_root_id, paths) in entries_by_root {
-            for chunk in paths.chunks(SCAN_DML_CHUNK_SIZE) {
-                let placeholders = std::iter::repeat_n("?", chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let query = format!(
-                    "DELETE FROM reconciliation_scan_entries
-                     WHERE job_id = ? AND library_root_id = ?
-                       AND entry_type = 'FILE'
-                       AND relative_path IN ({placeholders})"
-                );
-                let mut statement = self
-                    .query(sqlx::AssertSqlSafe(query))
-                    .bind(job_id)
-                    .bind(library_root_id);
-                for path in chunk {
-                    statement = statement.bind(path);
-                }
-                statement
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-            }
-        }
-        self.query(
-            "UPDATE scan_jobs
-             SET cursor = ?, processed_count = ?, updated_at = unixepoch()
-             WHERE id = ? AND status = 'RUNNING'",
-        )
-        .bind(entries.last().map(|entry| entry.relative_path.as_str()))
-        .bind(processed_count)
-        .bind(job_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
     }
 
     pub(crate) async fn discard_reconciliation_root_entries(
@@ -1129,7 +1087,8 @@ impl Database {
         let file_count: i64 = self
             .query_scalar(
                 "SELECT COUNT(*) FROM reconciliation_scan_entries
-             WHERE job_id = ? AND library_root_id = ? AND entry_type = 'FILE'",
+             WHERE job_id = ? AND library_root_id = ?
+               AND entry_type = 'FILE' AND status = 'PENDING'",
             )
             .bind(job_id)
             .bind(library_root_id)
@@ -1186,6 +1145,35 @@ impl Database {
         if relative_paths.is_empty() {
             return Ok(());
         }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.record_scan_job_targets_in_transaction(
+            &mut transaction,
+            job_id,
+            library_root_id,
+            relative_paths,
+            change_kind,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    async fn record_scan_job_targets_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        library_root_id: &str,
+        relative_paths: &[String],
+        change_kind: &str,
+    ) -> Result<(), StorageError> {
+        if relative_paths.is_empty() {
+            return Ok(());
+        }
         for paths in relative_paths.chunks(SCAN_DML_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", paths.len())
                 .collect::<Vec<_>>()
@@ -1212,7 +1200,7 @@ impl Database {
                 source_statement = source_statement.bind(path);
             }
             source_statement
-                .execute(&self.pool)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1241,7 +1229,7 @@ impl Database {
                 item_statement = item_statement.bind(path);
             }
             item_statement
-                .execute(&self.pool)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1276,14 +1264,30 @@ impl Database {
         if directories.is_empty() {
             return Ok(());
         }
-        let mut transaction = self
-            .pool
-            .begin()
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.record_scan_job_sidecar_targets_in_transaction(
+            &mut transaction,
+            job_id,
+            library_root_id,
+            &directories,
+        )
+        .await?;
+        transaction
+            .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })?;
+            })
+    }
+
+    async fn record_scan_job_sidecar_targets_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        library_root_id: &str,
+        directories: &[String],
+    ) -> Result<(), StorageError> {
         if directories.iter().any(|directory| directory == ".") {
             self.query(
                 "INSERT INTO scan_job_targets (
@@ -1306,44 +1310,357 @@ impl Database {
             )
             .bind(job_id)
             .bind(library_root_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-            return transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                });
+            return Ok(());
         }
-        for directory in directories {
-            self.query(SIDECAR_DIRECTORY_TARGET_QUERY)
+        for directory_chunk in directories.chunks(SCAN_DML_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?)", directory_chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = sidecar_target_query(&values);
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for directory in directory_chunk {
+                statement = statement.bind(directory);
+            }
+            statement
                 .bind(job_id)
                 .bind(library_root_id)
-                .bind(&directory)
-                .bind(&directory)
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
         }
+        Ok(())
+    }
+
+    /// Commits one reconciliation batch atomically.
+    ///
+    /// The batch is scoped to one library root. The caller must prepare all
+    /// filesystem data before this call; all database changes are committed
+    /// together or rolled back together. The returned counts describe
+    /// `(confirmed_entries, created_items)`.
+    pub(crate) async fn commit_reconciliation_batch(
+        &self,
+        batch: &ReconciliationBatchCommit<'_>,
+    ) -> Result<ReconciliationBatchCommitResult, StorageError> {
+        self.commit_reconciliation_batch_in_transaction(batch).await
+    }
+
+    async fn commit_reconciliation_batch_in_transaction(
+        &self,
+        batch: &ReconciliationBatchCommit<'_>,
+    ) -> Result<ReconciliationBatchCommitResult, StorageError> {
+        if batch
+            .entries
+            .iter()
+            .any(|entry| entry.library_root_id != batch.library_root_id)
+        {
+            return Err(StorageError::Conflict(
+                "reconciliation batch cannot span library roots".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let job_status: Option<String> = self
+            .query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+            .bind(batch.job_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if job_status.as_deref() != Some("RUNNING") {
+            return Err(StorageError::Conflict(
+                "reconciliation batch requires a running scan job".to_owned(),
+            ));
+        }
+
+        let pending_paths = self
+            .list_pending_reconciliation_paths_in_transaction(&mut transaction, batch)
+            .await?;
+        let movie_files = batch
+            .movie_files
+            .iter()
+            .filter(|file| pending_paths.contains(&file.relative_path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let episode_files = batch
+            .episode_files
+            .iter()
+            .filter(|file| pending_paths.contains(&file.relative_path))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut created_items = 0_usize;
+        created_items = created_items.saturating_add(
+            self.insert_movie_files_batch_in_transaction(
+                &mut transaction,
+                batch.library_id,
+                batch.library_root_id,
+                batch.generation,
+                &movie_files,
+            )
+            .await?,
+        );
+        created_items = created_items.saturating_add(
+            self.insert_episode_files_batch_in_transaction(
+                &mut transaction,
+                batch.library_id,
+                batch.library_root_id,
+                batch.generation,
+                &episode_files,
+            )
+            .await?,
+        );
+
+        self.record_scan_job_targets_in_transaction(
+            &mut transaction,
+            batch.job_id,
+            batch.library_root_id,
+            batch.new_paths,
+            "NEW",
+        )
+        .await?;
+        self.record_scan_job_targets_in_transaction(
+            &mut transaction,
+            batch.job_id,
+            batch.library_root_id,
+            batch.changed_paths,
+            "CHANGED",
+        )
+        .await?;
+        let sidecar_directories = prune_sidecar_directories(
+            batch
+                .sidecar_paths
+                .iter()
+                .filter_map(|path| {
+                    Path::new(path)
+                        .parent()
+                        .and_then(|parent| parent.to_str())
+                        .map(|parent| {
+                            if parent.is_empty() {
+                                ".".to_owned()
+                            } else {
+                                parent.to_owned()
+                            }
+                        })
+                })
+                .collect(),
+        );
+        self.record_scan_job_sidecar_targets_in_transaction(
+            &mut transaction,
+            batch.job_id,
+            batch.library_root_id,
+            &sidecar_directories,
+        )
+        .await?;
+        self.mark_filesystem_entries_seen_batch_in_transaction(
+            &mut transaction,
+            batch.seen_entry_ids,
+            batch.generation,
+        )
+        .await?;
+
+        let confirmed_entries = self
+            .confirm_reconciliation_entries_in_transaction(&mut transaction, batch)
+            .await?;
+        let confirmed_count = i64::try_from(confirmed_entries).map_err(|_| {
+            StorageError::Conflict("reconciliation batch confirmation count overflow".to_owned())
+        })?;
+        let observed_total: Option<i64> = if batch.discovery_completed {
+            None
+        } else {
+            Some(
+                self.query_scalar(
+                    "SELECT COUNT(*) FROM reconciliation_scan_entries
+                     WHERE job_id = ? AND entry_type = 'FILE'",
+                )
+                .bind(batch.job_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?,
+            )
+        };
+        let update_sql = if batch.discovery_completed {
+            "UPDATE scan_jobs
+             SET cursor = CASE WHEN ? > 0 THEN ? ELSE cursor END,
+                 processed_count = processed_count + ?,
+                 total_count = CASE
+                     WHEN total_count < processed_count + ?
+                         THEN processed_count + ?
+                     ELSE total_count
+                 END,
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'"
+        } else {
+            "UPDATE scan_jobs
+             SET cursor = CASE WHEN ? > 0 THEN ? ELSE cursor END,
+                 processed_count = processed_count + ?,
+                 total_count = CASE
+                     WHEN total_count < processed_count + ?
+                         THEN processed_count + ?
+                     WHEN total_count < ? THEN ?
+                     ELSE total_count
+                 END,
+                 updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING'"
+        };
+        let mut update = self
+            .query(sqlx::AssertSqlSafe(update_sql))
+            .bind(confirmed_count)
+            .bind(
+                batch
+                    .entries
+                    .last()
+                    .map(|entry| entry.relative_path.as_str()),
+            )
+            .bind(confirmed_count)
+            .bind(confirmed_count)
+            .bind(confirmed_count);
+        if let Some(observed_total) = observed_total {
+            update = update.bind(observed_total).bind(observed_total);
+        }
+        let result = update
+            .bind(batch.job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if result.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "reconciliation scan job stopped during batch commit".to_owned(),
+            ));
+        }
+
         transaction
             .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        Ok(ReconciliationBatchCommitResult {
+            confirmed_entries,
+            created_items,
+        })
     }
 
-    pub(crate) async fn record_scan_job_removed_targets(
+    async fn confirm_reconciliation_entries_in_transaction(
         &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        batch: &ReconciliationBatchCommit<'_>,
+    ) -> Result<usize, StorageError> {
+        let paths = batch
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect::<Vec<_>>();
+        let mut confirmed = 0_u64;
+        for chunk in paths.chunks(SCAN_DML_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE reconciliation_scan_entries
+                 SET status = 'DONE'
+                 WHERE job_id = ? AND library_root_id = ?
+                   AND entry_type = 'FILE' AND status = 'PENDING'
+                   AND relative_path IN ({placeholders})"
+            );
+            let mut statement = self
+                .query(sqlx::AssertSqlSafe(query))
+                .bind(batch.job_id)
+                .bind(batch.library_root_id);
+            for path in chunk {
+                statement = statement.bind(path);
+            }
+            confirmed = confirmed.saturating_add(
+                statement
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .rows_affected(),
+            );
+        }
+        usize::try_from(confirmed).map_err(|_| {
+            StorageError::Conflict("reconciliation confirmation count overflow".to_owned())
+        })
+    }
+
+    async fn list_pending_reconciliation_paths_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        batch: &ReconciliationBatchCommit<'_>,
+    ) -> Result<HashSet<String>, StorageError> {
+        let paths = batch
+            .entries
+            .iter()
+            .map(|entry| entry.relative_path.as_str())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let mut pending = HashSet::new();
+        for chunk in paths.chunks(SCAN_DML_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT relative_path
+                 FROM reconciliation_scan_entries
+                 WHERE job_id = ? AND library_root_id = ?
+                   AND entry_type = 'FILE' AND status = 'PENDING'
+                   AND relative_path IN ({placeholders})"
+            );
+            let mut statement = self
+                .query(sqlx::AssertSqlSafe(query))
+                .bind(batch.job_id)
+                .bind(batch.library_root_id);
+            for path in chunk {
+                statement = statement.bind(path);
+            }
+            let rows = statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            for row in rows {
+                let path = row
+                    .try_get::<String, _>("relative_path")
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                pending.insert(path);
+            }
+        }
+        Ok(pending)
+    }
+
+    async fn record_scan_job_removed_targets_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
         job_id: &str,
         library_root_id: &str,
         relative_paths: &[String],
@@ -1376,7 +1693,7 @@ impl Database {
                 source_statement = source_statement.bind(path);
             }
             source_statement
-                .execute(&self.pool)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1404,7 +1721,7 @@ impl Database {
                 item_statement = item_statement.bind(path);
             }
             item_statement
-                .execute(&self.pool)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -1412,6 +1729,84 @@ impl Database {
                 })?;
         }
         Ok(())
+    }
+
+    pub(crate) async fn finalize_reconciliation_root_page(
+        &self,
+        job_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        missing_paths: &[String],
+        removed_media_paths: &[String],
+        removed_sidecar_paths: &[String],
+    ) -> Result<u64, StorageError> {
+        if missing_paths.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.record_scan_job_removed_targets_in_transaction(
+            &mut transaction,
+            job_id,
+            library_root_id,
+            removed_media_paths,
+        )
+        .await?;
+        let sidecar_directories = prune_sidecar_directories(
+            removed_sidecar_paths
+                .iter()
+                .filter_map(|path| {
+                    Path::new(path)
+                        .parent()
+                        .and_then(|parent| parent.to_str())
+                        .map(|parent| {
+                            if parent.is_empty() {
+                                ".".to_owned()
+                            } else {
+                                parent.to_owned()
+                            }
+                        })
+                })
+                .collect(),
+        );
+        self.record_scan_job_sidecar_targets_in_transaction(
+            &mut transaction,
+            job_id,
+            library_root_id,
+            &sidecar_directories,
+        )
+        .await?;
+        let missing_entries = self
+            .mark_missing_filesystem_entry_paths_in_transaction(
+                &mut transaction,
+                library_root_id,
+                generation,
+                missing_paths,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(missing_entries)
+    }
+
+    pub(crate) async fn refresh_removed_media_items(
+        &self,
+        library_root_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.refresh_removed_media_items_in_transaction(&mut transaction, library_root_id)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_scan_job_target_sources_page(
@@ -1816,7 +2211,8 @@ impl Database {
     ) -> Result<bool, StorageError> {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
-                 SELECT 1 FROM reconciliation_scan_entries WHERE job_id = ?
+                 SELECT 1 FROM reconciliation_scan_entries
+                 WHERE job_id = ? AND status = 'PENDING'
              ) THEN 1 ELSE 0 END",
         )
         .bind(job_id)
@@ -3795,7 +4191,7 @@ impl Database {
         relative_path: &str,
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         self.query(
-            "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id,
+            "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation, ms.item_id,
                     CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                         AS parent_identity_key,
                     item.item_type AS item_type,
@@ -3834,7 +4230,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id,
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation, ms.item_id,
                         CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                             AS parent_identity_key,
                         item.item_type AS item_type,
@@ -3896,7 +4292,7 @@ impl Database {
     ) -> Result<Option<StoredFilesystemEntry>, StorageError> {
         let rows = self
             .query(
-                "SELECT fe.id, fe.relative_path, fe.fingerprint, ms.item_id,
+                "SELECT fe.id, fe.relative_path, fe.fingerprint, fe.last_seen_generation, ms.item_id,
                         CASE WHEN parent.removed_at IS NULL THEN parent.identity_key END
                             AS parent_identity_key,
                         item.item_type AS item_type,
@@ -4030,14 +4426,31 @@ impl Database {
         if entry_ids.is_empty() {
             return Ok(());
         }
-        let mut transaction = self
-            .pool
-            .begin()
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.mark_filesystem_entries_seen_batch_in_transaction(
+            &mut transaction,
+            entry_ids,
+            last_seen_generation,
+        )
+        .await?;
+        transaction
+            .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })?;
+            })
+    }
+
+    async fn mark_filesystem_entries_seen_batch_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        entry_ids: &[String],
+        last_seen_generation: &str,
+    ) -> Result<(), StorageError> {
+        if entry_ids.is_empty() {
+            return Ok(());
+        }
         for chunk in entry_ids.chunks(500) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -4054,22 +4467,16 @@ impl Database {
                 statement = statement.bind(entry_id);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            self.restore_media_items_for_filesystem_entries(&mut transaction, chunk)
+            self.restore_media_items_for_filesystem_entries(transaction, chunk)
                 .await?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        Ok(())
     }
 
     pub(crate) async fn update_filesystem_entry(
@@ -4166,35 +4573,30 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "UPDATE media_items
-                 SET removed_at = NULL
-                 WHERE id IN (
+                "WITH source_items(item_id) AS (
                      SELECT item_id
                      FROM media_sources
                      WHERE filesystem_entry_id IN ({placeholders})
+                 ),
+                 items_to_restore(item_id) AS (
+                     SELECT item_id FROM source_items
                      UNION
                      SELECT parent_id
                      FROM media_items
-                     WHERE id IN (
-                         SELECT item_id
-                         FROM media_sources
-                         WHERE filesystem_entry_id IN ({placeholders})
-                     )
+                     WHERE id IN (SELECT item_id FROM source_items)
                      UNION
                      SELECT series_id
                      FROM media_items
-                     WHERE id IN (
-                         SELECT item_id
-                         FROM media_sources
-                         WHERE filesystem_entry_id IN ({placeholders})
-                     )
-                 )"
+                     WHERE id IN (SELECT item_id FROM source_items)
+                 )
+                 UPDATE media_items
+                 SET removed_at = NULL
+                 WHERE removed_at IS NOT NULL
+                   AND id IN (SELECT item_id FROM items_to_restore)"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for _ in 0..3 {
-                for entry_id in chunk {
-                    statement = statement.bind(entry_id);
-                }
+            for entry_id in chunk {
+                statement = statement.bind(entry_id);
             }
             statement
                 .execute(&mut **transaction)
@@ -4212,14 +4614,30 @@ impl Database {
         library_root_id: &str,
         generation: &str,
     ) -> Result<u64, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let missing_entries = self
+            .mark_missing_filesystem_entries_in_transaction(
+                &mut transaction,
+                library_root_id,
+                generation,
+            )
+            .await?;
+        transaction
+            .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
+        Ok(missing_entries)
+    }
+
+    async fn mark_missing_filesystem_entries_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_root_id: &str,
+        generation: &str,
+    ) -> Result<u64, StorageError> {
         let missing_entries = self
             .query(
                 "UPDATE filesystem_entries
@@ -4228,17 +4646,67 @@ impl Database {
             )
             .bind(library_root_id)
             .bind(generation)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?
             .rows_affected();
+        self.refresh_removed_media_items_in_transaction(transaction, library_root_id)
+            .await?;
+        Ok(missing_entries)
+    }
+
+    async fn mark_missing_filesystem_entry_paths_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_root_id: &str,
+        generation: &str,
+        relative_paths: &[String],
+    ) -> Result<u64, StorageError> {
+        let mut missing_entries = 0_u64;
+        for paths in relative_paths.chunks(SCAN_DML_CHUNK_SIZE) {
+            if paths.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE filesystem_entries
+                 SET is_missing = 1, updated_at = unixepoch()
+                 WHERE library_root_id = ? AND last_seen_generation != ? AND is_missing = 0
+                   AND relative_path IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            statement = statement.bind(library_root_id).bind(generation);
+            for path in paths {
+                statement = statement.bind(path);
+            }
+            missing_entries = missing_entries.saturating_add(
+                statement
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .rows_affected(),
+            );
+        }
+        Ok(missing_entries)
+    }
+
+    async fn refresh_removed_media_items_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_root_id: &str,
+    ) -> Result<(), StorageError> {
         let library_id = self
             .query_scalar::<String>("SELECT library_id FROM library_roots WHERE id = ?")
             .bind(library_root_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -4266,7 +4734,7 @@ impl Database {
                    )",
             )
             .bind(&library_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -4291,7 +4759,7 @@ impl Database {
                 )
                 .bind(&library_id)
                 .bind(item_type)
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -4299,14 +4767,7 @@ impl Database {
                 })?;
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(missing_entries)
+        Ok(())
     }
 
     pub(crate) async fn restore_media_item(&self, item_id: &str) -> Result<(), StorageError> {
@@ -4606,13 +5067,14 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::{SIDECAR_DIRECTORY_TARGET_QUERY, prune_sidecar_directories};
+    use super::{prune_sidecar_directories, sidecar_target_query};
 
     #[test]
     fn sidecar_target_query_uses_indexable_directory_ranges() {
-        assert!(SIDECAR_DIRECTORY_TARGET_QUERY.contains("fe.relative_path >= ? || '/'"));
-        assert!(SIDECAR_DIRECTORY_TARGET_QUERY.contains("fe.relative_path < ? || '0'"));
-        assert!(!SIDECAR_DIRECTORY_TARGET_QUERY.contains("substr("));
+        let query = sidecar_target_query("(?)");
+        assert!(query.contains("fe.relative_path >= sd.directory || '/'"));
+        assert!(query.contains("fe.relative_path < sd.directory || '0'"));
+        assert!(!query.contains("substr("));
     }
 
     #[test]

@@ -103,6 +103,7 @@ describe("AdminLibrariesPage library cards", () => {
           banner: false,
           logo: true,
           thumbnail: true,
+          thumbnailScrapingMode: "SCRAPER_FIRST",
           disc: false,
           wallpaper: false,
           writeToMetadata: false,
@@ -850,6 +851,57 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("锁定的 NFO 字段不会被替换");
   });
 
+  it("renders the thumbnail scraping segmented control and saves screenshot-first", async () => {
+    const updateSettings = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: {
+        metadataLanguage: "zh-CN",
+        imageLanguage: "zh-CN",
+        region: "CN",
+        scraperId: null,
+        applyScope: "NEW_CONTENT",
+        images: {
+          poster: true,
+          artwork: false,
+          banner: false,
+          logo: true,
+          thumbnail: true,
+          thumbnailScrapingMode: "SCREENSHOT_FIRST",
+          disc: false,
+          wallpaper: false,
+          writeToMetadata: false,
+          maxBackdropCount: 1,
+          minDownloadWidth: 1280,
+        },
+        subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
+      },
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+    const group = container.querySelector<HTMLElement>("[role='radiogroup'][aria-label='缩略图刮削方式']");
+    expect(group?.textContent).toContain("不刮削");
+    expect(group?.textContent).toContain("截图优先");
+    expect(group?.textContent).toContain("刮削器优先");
+    await act(async () => group?.querySelector<HTMLInputElement>("input[value='SCREENSHOT_FIRST']")?.click());
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("保存全局策略"))
+        ?.click();
+    });
+
+    expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      mediaStrategy: expect.objectContaining({
+        images: expect.objectContaining({ thumbnailScrapingMode: "SCREENSHOT_FIRST" }),
+      }),
+    }));
+  });
+
   it("starts a global refresh using the selected mode", async () => {
     const refresh = vi.spyOn(api, "startLibraryMetadataRefresh").mockResolvedValue({
       totalCount: 1,
@@ -885,7 +937,7 @@ describe("AdminLibrariesPage library cards", () => {
         region: "CN",
         scraperId: null,
         applyScope: "NEW_CONTENT",
-        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
+        images: { poster: true, artwork: true, banner: false, logo: true, thumbnail: true, thumbnailScrapingMode: "SCRAPER_FIRST", disc: false, wallpaper: false, writeToMetadata: false, maxBackdropCount: 1, minDownloadWidth: 1280 },
         subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
       },
     });
@@ -933,6 +985,8 @@ describe("AdminLibrariesPage library cards", () => {
 
     const customMode = container.querySelectorAll<HTMLInputElement>(".lux-library-override-modes input")[1];
     await act(async () => customMode?.click());
+    const thumbnailMode = container.querySelector<HTMLElement>("[role='radiogroup'][aria-label='缩略图刮削方式']");
+    await act(async () => thumbnailMode?.querySelector<HTMLInputElement>("input[value='NONE']")?.click());
     await act(async () => {
       [...container.querySelectorAll<HTMLButtonElement>(".lux-library-override-actions button")]
         .find((button) => button.textContent?.includes("保存策略"))
@@ -941,7 +995,7 @@ describe("AdminLibrariesPage library cards", () => {
 
     expect(updateLibrary).toHaveBeenCalledWith("library-1", expect.objectContaining({
       mediaStrategy: expect.objectContaining({
-        images: expect.objectContaining({ poster: true }),
+        images: expect.objectContaining({ thumbnailScrapingMode: "NONE" }),
       }),
     }));
   });

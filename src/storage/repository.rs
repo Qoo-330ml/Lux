@@ -63,6 +63,7 @@ pub(crate) use emby_migration::{
 
 use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 
+// Keep the embedded migrator source coupled to newly added migration files.
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!();
 static POSTGRES_MIGRATOR: Migrator = sqlx::migrate!("./migrations-postgres");
 
@@ -1058,6 +1059,34 @@ pub(crate) struct StoredReconciliationScanEntry {
     pub(crate) relative_path: String,
 }
 
+/// Prepared data for one bounded reconciliation commit.
+///
+/// Filesystem work and parsing happen before this value is built. The storage
+/// layer is responsible for making the media/index, target, seen-entry and
+/// reconciliation checkpoint changes one transaction. `entries` must contain
+/// FILE work items for `library_root_id`; a later scanner integration can call
+/// this once per root and bounded batch.
+pub(crate) struct ReconciliationBatchCommit<'a> {
+    pub(crate) job_id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) generation: &'a str,
+    pub(crate) discovery_completed: bool,
+    pub(crate) entries: &'a [StoredReconciliationScanEntry],
+    pub(crate) movie_files: &'a [NewMovieFile],
+    pub(crate) episode_files: &'a [NewEpisodeFile],
+    pub(crate) seen_entry_ids: &'a [String],
+    pub(crate) new_paths: &'a [String],
+    pub(crate) changed_paths: &'a [String],
+    pub(crate) sidecar_paths: &'a [String],
+}
+
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) struct ReconciliationBatchCommitResult {
+    pub(crate) confirmed_entries: usize,
+    pub(crate) created_items: usize,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredStrmProbeJob {
     pub(crate) id: String,
@@ -1228,6 +1257,7 @@ pub(crate) struct StoredFilesystemEntry {
     pub(crate) id: String,
     pub(crate) relative_path: String,
     pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) last_seen_generation: String,
     pub(crate) item_id: Option<String>,
     pub(crate) parent_identity_key: Option<String>,
     pub(crate) item_type: Option<String>,
@@ -1259,6 +1289,7 @@ fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
         id: row.get("id"),
         relative_path: row.get("relative_path"),
         fingerprint: row.get("fingerprint"),
+        last_seen_generation: row.get("last_seen_generation"),
         item_id: row.get("item_id"),
         parent_identity_key: row.get("parent_identity_key"),
         item_type: row.get("item_type"),
@@ -2395,6 +2426,7 @@ pub(crate) struct StoredThumbnailSource {
     pub(crate) item_id: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
+    pub(crate) library_media_strategy_json: Option<String>,
 }
 
 #[derive(Debug)]
@@ -2407,6 +2439,7 @@ pub(crate) struct StoredStrmMediaSource {
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
     pub(crate) thumbnail_path: Option<String>,
+    pub(crate) has_strm_thumbnail: bool,
 }
 
 #[derive(Debug)]
@@ -2832,6 +2865,7 @@ pub(crate) struct NewMediaSource<'a> {
     pub(crate) is_default: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct NewMovieFile {
     pub(crate) filesystem_entry_id: String,
     pub(crate) source_id: String,
@@ -2852,6 +2886,7 @@ pub(crate) struct NewMovieFile {
     pub(crate) external_url: Option<String>,
 }
 
+#[derive(Clone)]
 pub(crate) struct NewEpisodeFile {
     pub(crate) filesystem_entry_id: String,
     pub(crate) source_id: String,

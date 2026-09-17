@@ -516,14 +516,13 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
 - 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
-- 本地文件索引并发默认 16 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=8`，也可通过该变量在 1-1024 范围内设置全局覆盖值，设置后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置环境变量时，新建媒体库默认 16 路，媒体库的 `scanConcurrency` 可通过管理 API 单独覆盖同一范围；实际后台 worker 数仍会根据 CPU、内存和存储延迟动态降级，SQLite 入库继续遵循单写者约束。
+- 本地文件索引并发默认 16 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=8`、`LUX_PROBE_CONCURRENCY=8`、`LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；后两者分别独立控制 ffprobe 和 ffmpeg 子进程。三者的实际并发仍会根据 CPU、内存和存储延迟动态降级。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 16 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
 
 - 生产镜像为多阶段构建。
 - 运行时包含 luxd、Web 静态资源、Jellyfin `jellyfin-ffmpeg7` v7.1.4-3 和必要 CA 证书；不安装普通 Debian `ffmpeg`。
-- 非 root 用户运行。
-- 支持 PUID/PGID 或文档化的 UID/GID 映射，使容器能读写媒体目录。
+- 以 root 用户运行，使 bind-mounted NAS 目录无需 PUID/PGID 交接或递归修改所有权即可读写。
 - /config 为可写持久化卷。
 - 媒体目录必须按需求以读写方式挂载，因为 Lux 要回写 NFO 和默认图片；媒体目录中的本地资源仍需可读。
   元数据策略可选择额外将 Lux 管理的 NFO 和图片写入 /config/metadata/library。
@@ -1836,6 +1835,8 @@ services:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
       LUX_SCAN_CONCURRENCY: "8"
+      LUX_PROBE_CONCURRENCY: "8"
+      LUX_FFMPEG_CONCURRENCY: "2"
       RUST_LOG: "lux=info,tower_http=info"
       TZ: "Asia/Shanghai"
     volumes:

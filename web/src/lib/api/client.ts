@@ -229,6 +229,12 @@ export class LuxApiClient {
     });
   }
 
+  restartSetupDatabase() {
+    return this.request<{ restarting: boolean }>("/api/v1/setup/database/restart", {
+      method: "POST",
+    });
+  }
+
   setup(input: {
     username: string;
     displayName?: string;

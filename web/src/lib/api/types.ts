@@ -422,7 +422,7 @@ export type AdminWebhookDelivery = {
 export type AdminPluginConfigField = {
   key: string;
   label: string;
-  type: "password" | "text" | "select" | "toggle" | "number" | string;
+  type: "password" | "text" | "textarea" | "select" | "toggle" | "number" | string;
   required: boolean;
   sensitive: boolean;
   description?: string | null;
@@ -944,6 +944,7 @@ export type MediaImageStrategySettings = {
   banner: boolean;
   logo: boolean;
   thumbnail: boolean;
+  thumbnailScrapingMode: "NONE" | "SCREENSHOT_FIRST" | "SCRAPER_FIRST" | string;
   disc: boolean;
   wallpaper: boolean;
   writeToMetadata: boolean;

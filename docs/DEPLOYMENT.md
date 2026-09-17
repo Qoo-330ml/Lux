@@ -72,7 +72,7 @@ docker compose --profile postgres up -d
   `postgres` profile，也可以填写部署环境中已有的 PostgreSQL；无论哪种方式，PostgreSQL 都不在 Lux
   容器内部运行。
 
-PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，然后在页面填写主机、端口、数据库名、用户名、密码和 SSL 模式并测试连接。选择成功后需要重启 Lux，重启时会在 PostgreSQL 空库上运行 schema migration，再继续管理员初始化。数据库密码只保存在受 `/config` 权限保护的 `/config/database.json` 中，不会返回 API、写入日志或审计事件；请将整个 `/config` 按敏感配置进行保护。
+PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，然后在页面填写主机、端口、数据库名、用户名、密码和 SSL 模式并测试连接。选择成功后，点击页面上的“重启 Lux”按钮；Lux 会在同一容器内优雅重启服务进程，在 PostgreSQL 空库上运行 schema migration，再继续管理员初始化。数据库密码只保存在受 `/config` 权限保护的 `/config/database.json` 中，不会返回 API、写入日志或审计事件；请将整个 `/config` 按敏感配置进行保护。
 
 数据库后端只能在首次初始化前选择，已初始化实例不支持在线切换，也不会自动把已有 SQLite 数据迁移到 PostgreSQL。已有 `/config/lux.db` 的旧版 SQLite 实例会继续使用 SQLite，不会显示选择页面。使用 PostgreSQL 时，PostgreSQL 数据库需要单独纳入备份、恢复、容量和升级计划；SQLite 则随 `/config` 一起备份。
 
@@ -93,13 +93,23 @@ LUX_PROXY_URL=http://192.168.1.2:7890
 
 `LUX_PROXY_URL` 可选，用于 Lux 及其外置插件的出站网络请求，例如元数据、图片和人物头像下载。支持 `http://`、`https://`、`socks4://`、`socks4a://`、`socks5://` 和 `socks5h://` 代理地址；代理 URL 可包含用户名认证信息。留空时使用标准系统代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`）；这些变量也可使用小写形式。代理地址不参与入站反向代理，也不改变 `.strm` 直交行为。包含认证信息的代理 URL 应只通过受保护的环境变量或 secrets 注入，不能写入日志。TMDb/豆瓣凭据请在各自插件的专属配置中设置，不再通过 `LUX_TMDB_*` 环境变量注入 Lux 主进程。
 
-本地文件索引默认使用 16 路 worker。官方 Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=8`；也可设置 `LUX_SCAN_CONCURRENCY`（1-1024）作为全局覆盖，例如 `LUX_SCAN_CONCURRENCY=64`。该变量设置后优先于媒体库保存的 `scanConcurrency`，因此也会覆盖已经持久化的媒体库并发值。非容器部署未设置时，新建媒体库默认 16 路，已有媒体库可通过管理 API 的 `scanConcurrency` 单独设置。资源自适应仍可能在 CPU、内存或存储延迟较高时降低实际并发，SQLite 的批量入库保持单写者。
+本地文件索引默认使用 16 路 worker。官方 Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=8`、`LUX_PROBE_CONCURRENCY=8` 和 `LUX_FFMPEG_CONCURRENCY=2`。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 独立限制 ffprobe、ffmpeg 子进程。只设置扫描并发不会限制后两个阶段。`LUX_SCAN_CONCURRENCY` 范围为 1-1024，`LUX_PROBE_CONCURRENCY` 范围为 1-512，`LUX_FFMPEG_CONCURRENCY` 范围为 1-4。非容器部署未设置扫描环境变量时，新建媒体库索引默认 16 路；资源自适应仍可能在 CPU、内存或存储延迟较高时降低实际并发，SQLite 的批量入库保持单写者。
 
 修改 Compose 中的该变量后需要重新创建容器，单纯执行 `docker restart lux` 不会更新容器环境变量：
 
 ```bash
 docker compose up -d --force-recreate lux
-docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' lux | grep '^LUX_SCAN_CONCURRENCY='
+docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' lux | grep -E '^LUX_(SCAN|PROBE|FFMPEG)_CONCURRENCY='
+```
+
+如果修改了 Dockerfile 或构建上下文，`--force-recreate` 只会重新创建容器，不会重新构建镜像，必须先执行一次镜像 build。当前 `compose.yaml` 只引用已构建的 `image`，没有 `build` 配置；本地构建应使用仓库的 Bake 配置，并给镜像设置与 Compose 相同的标签：
+
+如果使用另行配置了 `build:` 的 Compose 文件，Dockerfile 变更时必须使用
+`docker compose up -d --build --force-recreate lux`；本仓库的 Compose 没有 `build:`，因此按下面的 Bake 命令执行构建。
+
+```bash
+docker buildx bake --load --set app.tags=pdzhou/lux:latest app
+docker compose up -d --force-recreate lux
 ```
 
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
@@ -164,7 +174,8 @@ docker buildx bake --load \
   --set app.args.LUX_VERSION=0.2.7 \
   --set app.tags=lux:0.2.7 \
   app
-docker compose up -d
+# 如果使用本地构建的镜像，请先将 compose.yaml 中 lux.image 指向 lux:0.2.7
+docker compose up -d --force-recreate lux
 ```
 
 启动时会自动执行当前已选择数据库的 migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，也不提供 SQLite 与 PostgreSQL 之间的数据迁移；正式 NAS 发布前必须由运维侧完成配置目录、媒体目录和（如使用）PostgreSQL 数据库的快照与恢复演练。

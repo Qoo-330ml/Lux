@@ -1999,6 +1999,18 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-library-strategy-toggle input:checked + span + i { background: var(--lux-accent); }
 .lux-library-strategy-toggle input:checked + span + i::after { background: #fff; transform: translateX(13px); }
 .lux-library-strategy-toggle input:focus-visible + span + i { outline: 2px solid #fff; outline-offset: 3px; }
+.lux-thumbnail-scraping-mode-field { display: grid; gap: 10px; margin-top: 16px; }
+.lux-thumbnail-scraping-mode-field > div:first-child { display: grid; gap: 4px; }
+.lux-thumbnail-scraping-mode-field strong { color: #fff; font-size: .76rem; font-weight: 600; }
+.lux-thumbnail-scraping-mode-field small { color: var(--lux-subtle); font-size: .68rem; line-height: 1.45; }
+.lux-thumbnail-scraping-mode { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 9px; background: rgba(255,255,255,.025); }
+.lux-thumbnail-scraping-mode label { position: relative; display: grid; min-width: 0; }
+.lux-thumbnail-scraping-mode label + label { border-left: 1px solid var(--lux-line-soft); }
+.lux-thumbnail-scraping-mode input { position: absolute; width: 1px; height: 1px; overflow: hidden; opacity: 0; }
+.lux-thumbnail-scraping-mode span { display: block; padding: 11px 9px; color: var(--lux-muted); font-size: .72rem; text-align: center; cursor: pointer; transition: color .2s ease, background .2s ease; }
+.lux-thumbnail-scraping-mode label:hover span { color: #fff; background: rgba(255,255,255,.06); }
+.lux-thumbnail-scraping-mode label.is-selected span { color: #fff; background: color-mix(in srgb, var(--lux-accent) 18%, transparent); }
+.lux-thumbnail-scraping-mode input:focus-visible + span { outline: 2px solid #fff; outline-offset: -3px; }
 .lux-library-strategy-image-limits { grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 15px; }
 .lux-library-strategy-image-limits label { max-width: 340px; }
 .lux-library-strategy-language-input { margin-top: 15px; }

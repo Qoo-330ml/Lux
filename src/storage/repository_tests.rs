@@ -388,6 +388,181 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
 }
 
 #[tokio::test]
+async fn marking_seen_visible_media_does_not_rewrite_item_state() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root)
+        .await
+        .expect("media root");
+    tokio::fs::write(media_root.join("Visible.Movie.2024.mkv"), b"video")
+        .await
+        .expect("movie file");
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root")
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("initial index");
+
+    sqlx::query(
+        "CREATE TABLE media_item_update_audit (
+             item_id TEXT NOT NULL,
+             old_removed_at INTEGER,
+             new_removed_at INTEGER
+         )",
+    )
+    .execute(database.pool())
+    .await
+    .expect("audit table");
+    sqlx::query(
+        "CREATE TRIGGER audit_media_item_update
+         AFTER UPDATE ON media_items
+         BEGIN
+             INSERT INTO media_item_update_audit (item_id, old_removed_at, new_removed_at)
+             VALUES (old.id, old.removed_at, new.removed_at);
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("audit trigger");
+    let entry_id: String = sqlx::query_scalar(
+        "SELECT id FROM filesystem_entries
+         WHERE library_root_id = ? AND relative_path = 'Visible.Movie.2024.mkv'",
+    )
+    .bind(root.id.to_string())
+    .fetch_one(database.pool())
+    .await
+    .expect("filesystem entry");
+    database
+        .mark_filesystem_entries_seen_batch(std::slice::from_ref(&entry_id), "next-generation")
+        .await
+        .expect("mark entry seen");
+    let updates: Vec<(String, Option<i64>, Option<i64>)> = sqlx::query_as(
+        "SELECT item_id, old_removed_at, new_removed_at
+         FROM media_item_update_audit",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("audit rows");
+    assert!(updates.is_empty());
+
+    sqlx::query("DELETE FROM media_item_update_audit")
+        .execute(database.pool())
+        .await
+        .expect("clear audit rows");
+    sqlx::query("UPDATE filesystem_entries SET is_missing = 1 WHERE id = ?")
+        .bind(&entry_id)
+        .execute(database.pool())
+        .await
+        .expect("mark entry missing");
+    sqlx::query("DELETE FROM media_item_update_audit")
+        .execute(database.pool())
+        .await
+        .expect("clear missing audit row");
+    database
+        .mark_filesystem_entries_seen_batch(std::slice::from_ref(&entry_id), "recovered-generation")
+        .await
+        .expect("restore entry");
+    let recovery_update_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_item_update_audit")
+            .fetch_one(database.pool())
+            .await
+            .expect("recovery audit count");
+    assert_eq!(recovery_update_count, 1);
+    let available: i64 = sqlx::query_scalar(
+        "SELECT has_available_source FROM media_items
+         WHERE id = (SELECT item_id FROM media_sources WHERE filesystem_entry_id = ?)",
+    )
+    .bind(&entry_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("recovered availability");
+    assert_eq!(available, 1);
+}
+
+#[tokio::test]
+async fn sidecar_targets_batch_multiple_directories_in_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for (directory, file_name) in [
+        ("Alpha", "Alpha.Movie.2020.mkv"),
+        ("Beta", "Beta.Movie.2021.mkv"),
+        ("Gamma", "Gamma.Movie.2022.mkv"),
+    ] {
+        let directory = media_root.join(directory);
+        tokio::fs::create_dir_all(&directory)
+            .await
+            .expect("movie directory");
+        tokio::fs::write(directory.join(file_name), b"video")
+            .await
+            .expect("movie file");
+    }
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root = libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root")
+        .root;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("initial index");
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await
+        .expect("scan job");
+
+    database.reset_query_count();
+    database
+        .record_scan_job_sidecar_targets(
+            &job.id,
+            &root.id.to_string(),
+            &[
+                "Alpha/poster.jpg".to_owned(),
+                "Beta/poster.jpg".to_owned(),
+                "Gamma/poster.jpg".to_owned(),
+            ],
+        )
+        .await
+        .expect("record sidecar targets");
+
+    assert_eq!(database.query_count(), 1);
+    let target_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_targets
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("sidecar target count");
+    assert_eq!(target_count, 3);
+}
+
+#[tokio::test]
 async fn library_listing_uses_constant_number_of_child_queries() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -4694,6 +4869,205 @@ async fn database_lifecycle_cleanup_is_one_time_and_preserves_retry_state() {
     .await
     .expect("expired event count");
     assert_eq!(expired_event_count, 0);
+}
+
+#[tokio::test]
+async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Atomic scan", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("root directory");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 root"))
+        .await
+        .expect("library root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+
+    let job_id = "reconciliation-atomic-test";
+    let generation = "generation-1";
+    sqlx::query(
+        "INSERT INTO scan_jobs (
+             id, library_id, job_type, status, generation, total_count,
+             discovery_completed, processed_count
+         ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', ?, 0, 1, 0)",
+    )
+    .bind(job_id)
+    .bind(&library_id)
+    .bind(generation)
+    .execute(database.pool())
+    .await
+    .expect("scan job");
+
+    let first_path = "Atomic.Movie.2024.mkv";
+    let second_path = "Already.Done.Movie.2023.mkv";
+    for path in [first_path, second_path] {
+        sqlx::query(
+            "INSERT INTO reconciliation_scan_entries (
+                 job_id, library_root_id, relative_path, entry_type, status
+             ) VALUES (?, ?, ?, 'FILE', 'PENDING')",
+        )
+        .bind(job_id)
+        .bind(&root_id)
+        .bind(path)
+        .execute(database.pool())
+        .await
+        .expect("pending work item");
+    }
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+             job_id, library_root_id, relative_path, entry_type, status
+         ) VALUES (?, ?, '', 'DIRECTORY', 'PENDING')",
+    )
+    .bind(job_id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("pending directory work item");
+
+    let movie_file = NewMovieFile {
+        filesystem_entry_id: "atomic-filesystem-entry".to_owned(),
+        source_id: "atomic-source".to_owned(),
+        relative_path: first_path.to_owned(),
+        size: 7,
+        modified_at: 1,
+        fingerprint: vec![1, 2, 3],
+        title: "Atomic Movie".to_owned(),
+        sort_title: "atomic movie".to_owned(),
+        original_title: "Atomic Movie".to_owned(),
+        production_year: Some(2024),
+        provider_ids_json: None,
+        source_kind: "LOCAL_FILE".to_owned(),
+        strm_target_kind: None,
+        edition_name: None,
+        quality_label: None,
+        container: "mkv".to_owned(),
+        external_url: None,
+    };
+    let entries = vec![
+        StoredReconciliationScanEntry {
+            library_root_id: root_id.clone(),
+            relative_path: first_path.to_owned(),
+        },
+        StoredReconciliationScanEntry {
+            library_root_id: root_id.clone(),
+            relative_path: second_path.to_owned(),
+        },
+    ];
+    let new_paths = vec![first_path.to_owned()];
+
+    sqlx::query(
+        "CREATE TRIGGER fail_reconciliation_targets
+         BEFORE INSERT ON scan_job_targets
+         BEGIN SELECT RAISE(ABORT, 'injected target failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("failure trigger");
+
+    let batch = ReconciliationBatchCommit {
+        job_id,
+        library_id: &library_id,
+        library_root_id: &root_id,
+        generation,
+        discovery_completed: true,
+        entries: &entries,
+        movie_files: std::slice::from_ref(&movie_file),
+        episode_files: &[],
+        seen_entry_ids: &[],
+        new_paths: &new_paths,
+        changed_paths: &[],
+        sidecar_paths: &[],
+    };
+    assert!(database.commit_reconciliation_batch(&batch).await.is_err());
+
+    let rollback_state: (i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM filesystem_entries),
+             (SELECT COUNT(*) FROM media_sources),
+             (SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?),
+             (SELECT processed_count FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(job_id)
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("rollback state");
+    assert_eq!(rollback_state, (0, 0, 0, 0));
+    let pending_after_failure: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = ? AND entry_type = 'FILE' AND status = 'PENDING'",
+    )
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("pending after failure");
+    assert_eq!(pending_after_failure, 2);
+
+    sqlx::query("DROP TRIGGER fail_reconciliation_targets")
+        .execute(database.pool())
+        .await
+        .expect("drop failure trigger");
+    database.reset_query_count();
+    let committed = database
+        .commit_reconciliation_batch(&batch)
+        .await
+        .expect("retry batch");
+    assert_eq!(committed.confirmed_entries, 2);
+    assert_eq!(database.query_count(), 10);
+
+    let second_commit = database
+        .commit_reconciliation_batch(&batch)
+        .await
+        .expect("idempotent confirmation");
+    assert_eq!(second_commit.confirmed_entries, 0);
+
+    let entry_states: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, COUNT(*)
+         FROM reconciliation_scan_entries
+         WHERE job_id = ?
+         GROUP BY status
+         ORDER BY status",
+    )
+    .bind(job_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("entry states");
+    assert_eq!(
+        entry_states,
+        vec![("DONE".to_owned(), 2), ("PENDING".to_owned(), 1)]
+    );
+
+    let final_state: (i64, i64, i64, i64, i64, Option<String>) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM filesystem_entries),
+             (SELECT COUNT(*) FROM media_sources),
+             (SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?),
+             (SELECT processed_count FROM scan_jobs WHERE id = ?),
+             (SELECT total_count FROM scan_jobs WHERE id = ?),
+             (SELECT cursor FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(job_id)
+    .bind(job_id)
+    .bind(job_id)
+    .bind(job_id)
+    .fetch_one(database.pool())
+    .await
+    .expect("final state");
+    assert_eq!(final_state, (1, 1, 2, 2, 2, Some(second_path.to_owned())));
+    assert!(final_state.4 >= final_state.3);
 }
 
 #[tokio::test]

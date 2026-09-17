@@ -781,6 +781,57 @@ impl ImageWriteService {
         item_id: &str,
         image_types: &[&str],
     ) -> Result<BTreeSet<String>, ImageWriteError> {
+        self.local_image_types_impl(item_id, image_types, false)
+            .await
+    }
+
+    pub(crate) async fn local_image_types_including_fallback(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
+        self.local_image_types_impl(item_id, image_types, true)
+            .await
+    }
+
+    pub(crate) async fn fallback_image_types(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
+        let image_types = image_types
+            .iter()
+            .map(|image_type| {
+                normalize_image_type(image_type)
+                    .ok_or_else(|| ImageWriteError::InvalidImageType((*image_type).to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let indexed_images = self.database.list_item_images(item_id).await?;
+        let mut found = BTreeSet::new();
+        for image_type in image_types {
+            for image in indexed_images.iter().filter(|image| {
+                image.image_type.eq_ignore_ascii_case(image_type)
+                    && image.image_index == 0
+                    && is_fallback_image_source(&image.source)
+            }) {
+                if image_file_stamp(Path::new(&image.local_path))
+                    .await?
+                    .is_some()
+                {
+                    found.insert(image_type.to_owned());
+                    break;
+                }
+            }
+        }
+        Ok(found)
+    }
+
+    async fn local_image_types_impl(
+        &self,
+        item_id: &str,
+        image_types: &[&str],
+        include_fallback: bool,
+    ) -> Result<BTreeSet<String>, ImageWriteError> {
         let image_types = image_types
             .iter()
             .map(|image_type| {
@@ -796,7 +847,7 @@ impl ImageWriteService {
             for image in indexed_images.iter().filter(|image| {
                 image.image_type.eq_ignore_ascii_case(image_type) && image.image_index == 0
             }) {
-                if !is_fallback_image_source(&image.source)
+                if (include_fallback || !is_fallback_image_source(&image.source))
                     && image_file_stamp(Path::new(&image.local_path))
                         .await?
                         .is_some()
@@ -828,13 +879,14 @@ impl ImageWriteService {
                             image_index as i64,
                             &path,
                         )
-                        && !indexed_image_path_is_fallback(
-                            &indexed_images,
-                            image_type,
-                            image_index as i64,
-                            &path,
-                        )
-                        .await?
+                        && (include_fallback
+                            || !indexed_image_path_is_fallback(
+                                &indexed_images,
+                                image_type,
+                                image_index as i64,
+                                &path,
+                            )
+                            .await?)
                         && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
                             .await?
                         && image_file_stamp(&path).await?.is_some()
@@ -866,13 +918,14 @@ impl ImageWriteService {
                         image_index as i64,
                         &path,
                     )
-                    && !indexed_image_path_is_fallback(
-                        &indexed_images,
-                        image_type,
-                        image_index as i64,
-                        &path,
-                    )
-                    .await?
+                    && (include_fallback
+                        || !indexed_image_path_is_fallback(
+                            &indexed_images,
+                            image_type,
+                            image_index as i64,
+                            &path,
+                        )
+                        .await?)
                     && !image_path_is_owned_by_other_type(&indexed_images, image_type, &path)
                         .await?
                     && image_file_stamp(&path).await?.is_some()

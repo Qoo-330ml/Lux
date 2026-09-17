@@ -19,6 +19,7 @@ use crate::application::{
 const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
 const HOME_SHARED_CACHE_TTL: Duration = Duration::from_secs(60);
 const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
+const HOME_INVALIDATION_DEBOUNCE: Duration = Duration::from_millis(100);
 const MAX_HOME_CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -106,6 +107,9 @@ struct HomeServiceInner {
     shared_compute_lock: Mutex<()>,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
+    invalidation_debounce_pending: AtomicBool,
+    #[cfg(test)]
+    invalidation_notification_count: AtomicU64,
     invalidation_notify: Notify,
 }
 
@@ -126,6 +130,9 @@ impl HomeService {
             shared_compute_lock: Mutex::new(()),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
+            invalidation_debounce_pending: AtomicBool::new(false),
+            #[cfg(test)]
+            invalidation_notification_count: AtomicU64::new(0),
             invalidation_notify: Notify::new(),
         });
         let worker_inner = Arc::downgrade(&inner);
@@ -222,10 +229,46 @@ impl HomeService {
     }
 
     pub(crate) fn invalidate(&self) {
+        // The generation and catalog cache are invalidated synchronously so a
+        // snapshot requested immediately after a change cannot reuse stale data.
+        // Only the refresh-worker wakeup is coalesced for a short burst.
         self.inner.generation.fetch_add(1, Ordering::AcqRel);
         self.inner.catalog.invalidate_library_pages();
+        if self
+            .inner
+            .invalidation_debounce_pending
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        #[cfg(test)]
+        self.inner
+            .invalidation_notification_count
+            .fetch_add(1, Ordering::Relaxed);
         self.inner.invalidation_notify.notify_waiters();
         self.schedule_refresh();
+        let first_generation = self.inner.generation.load(Ordering::Acquire);
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            tokio::time::sleep(HOME_INVALIDATION_DEBOUNCE).await;
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let generation_changed = inner.generation.load(Ordering::Acquire) != first_generation;
+            inner
+                .invalidation_debounce_pending
+                .store(false, Ordering::Release);
+            if !generation_changed {
+                return;
+            }
+            #[cfg(test)]
+            inner
+                .invalidation_notification_count
+                .fetch_add(1, Ordering::Relaxed);
+            inner.invalidation_notify.notify_waiters();
+            (HomeService { inner }).schedule_refresh();
+        });
     }
 
     fn schedule_refresh(&self) {
@@ -419,9 +462,9 @@ impl HomeService {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::atomic::Ordering, time::Duration};
 
-    use super::HomeService;
+    use super::{HOME_INVALIDATION_DEBOUNCE, HomeService};
     use crate::{
         application::{
             access::{AccessPrincipal, MediaAccessService},
@@ -520,6 +563,51 @@ mod tests {
             .expect("invalidated user snapshot");
 
         assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn rapid_invalidations_share_a_short_notification_window() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+
+        home.invalidate();
+        home.invalidate();
+
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 2);
+        assert_eq!(
+            home.inner
+                .invalidation_notification_count
+                .load(Ordering::Relaxed),
+            1
+        );
+        assert!(
+            home.inner
+                .invalidation_debounce_pending
+                .load(Ordering::Acquire)
+        );
+
+        tokio::time::sleep(HOME_INVALIDATION_DEBOUNCE + Duration::from_millis(25)).await;
+        assert!(
+            !home
+                .inner
+                .invalidation_debounce_pending
+                .load(Ordering::Acquire)
+        );
+        assert_eq!(
+            home.inner
+                .invalidation_notification_count
+                .load(Ordering::Relaxed),
+            2
+        );
     }
 
     #[tokio::test]

@@ -298,7 +298,7 @@ impl PluginManifest {
             validate_text("config field label", &field.label, 128)?;
             if !matches!(
                 field.input_type.as_str(),
-                "text" | "password" | "select" | "toggle" | "number"
+                "text" | "textarea" | "password" | "select" | "toggle" | "number"
             ) {
                 return Err(PluginManifestError::Invalid(format!(
                     "unsupported config field type: {}",

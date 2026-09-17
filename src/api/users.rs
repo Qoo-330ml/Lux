@@ -288,6 +288,112 @@ pub(super) async fn setup_database_select(
     }
 }
 
+pub(super) async fn setup_database_restart(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if !state.database_selection_required {
+        return api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::SetupAlreadyCompleted,
+            "初始设置已经完成",
+        )
+        .into_response();
+    }
+
+    let Some(setup) = state.setup.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    match setup.status().await {
+        Ok(false) => {}
+        Ok(true) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::SetupAlreadyCompleted,
+                "初始设置已经完成",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "数据库不可用",
+            )
+            .into_response();
+        }
+    }
+
+    let Some(database_setup) = state.database_setup.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务尚未就绪",
+        )
+        .into_response();
+    };
+    let status = match database_setup.status().await {
+        Ok(status) => status,
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "数据库配置不可用",
+            )
+            .into_response();
+        }
+    };
+    if !status.configured {
+        return api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::DatabaseConfigurationRequired,
+            "请先选择数据库",
+        )
+        .into_response();
+    }
+    if !status.restart_required {
+        return api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "当前不需要重启 Lux",
+        )
+        .into_response();
+    }
+
+    let Some(restart_handle) = state.restart_handle.as_ref() else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "服务不支持在线重启",
+        )
+        .into_response();
+    };
+    if !restart_handle.request_restart() {
+        return api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "Lux 已经在准备重启",
+        )
+        .into_response();
+    }
+    (StatusCode::ACCEPTED, Json(json!({ "restarting": true }))).into_response()
+}
+
 fn database_setup_error(headers: &HeaderMap, error: DatabaseSetupError) -> Response {
     let (status, code, message) = match error {
         DatabaseSetupError::Configuration(_) => (
@@ -1618,6 +1724,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/setup/database/select",
             post(users::setup_database_select),
+        )
+        .route(
+            "/api/v1/setup/database/restart",
+            post(users::setup_database_restart),
         )
         .route("/api/v1/setup/complete", post(users::setup_complete))
         .route("/api/v1/auth/login", post(users::auth_login))

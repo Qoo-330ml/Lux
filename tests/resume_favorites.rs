@@ -170,6 +170,10 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
         false
     );
     assert_eq!(
+        default_settings_body["mediaStrategy"]["images"]["thumbnailScrapingMode"],
+        "SCRAPER_FIRST"
+    );
+    assert_eq!(
         default_settings_body["mediaStrategy"]["metadataRefreshMode"],
         "FILL_MISSING"
     );
@@ -300,7 +304,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
                 "metadataLanguage": "en-US",
                 "imageLanguage": "en",
                 "region": "US",
-                "scraperId": "../org.lux.tmdb",
+                "scraperId": null,
                 "applyScope": "ALL_CONTENT",
                 "images": {
                     "poster": true,
@@ -308,6 +312,7 @@ async fn resume_thresholds_and_favorite_played_endpoints_share_user_state()
                     "banner": true,
                     "logo": false,
                     "thumbnail": false,
+                    "thumbnailScrapingMode": "UNKNOWN",
                     "disc": false,
                     "wallpaper": true,
                     "maxBackdropCount": 2,

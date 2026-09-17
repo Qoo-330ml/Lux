@@ -15,6 +15,8 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 ## 初始化
 
 - `GET /api/v1/setup/status`：返回 `initialized`。
+- `GET /api/v1/setup/database`：返回数据库选择状态；首次选择 PostgreSQL 后，`restartRequired` 为 `true`。
+- `POST /api/v1/setup/database/restart`：仅在首次初始化、数据库配置已保存且当前进程仍使用其他后端时可用。返回 202 后，Lux 优雅关闭并在同一容器进程内重新启动；页面应等待服务恢复。该接口不接受数据库凭据，也不用于已初始化实例的在线切换。
 - `POST /api/v1/setup/complete`：仅在没有用户时创建首个管理员；成功返回 201，重复或并发失败返回 `SETUP_ALREADY_COMPLETED`。
 
 请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。

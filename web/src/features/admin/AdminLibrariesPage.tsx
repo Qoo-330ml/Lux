@@ -262,7 +262,7 @@ function GlobalStrategyPanel({
   onRefresh: (mode: MetadataRefreshMode) => void;
   onBack: () => void;
 }) {
-  const updateImages = (key: keyof MediaStrategySettings["images"], value: boolean | number) => {
+  const updateImages = (key: keyof MediaStrategySettings["images"], value: boolean | number | string) => {
     onChange({ ...strategy, images: { ...strategy.images, [key]: value } });
   };
   const updateSubtitles = (key: keyof MediaStrategySettings["subtitles"], value: boolean | string[]) => {
@@ -302,14 +302,16 @@ function GlobalStrategyPanel({
         <section className="lux-library-strategy-card lux-library-strategy-card-wide">
           <div className="lux-library-strategy-card-heading"><div><h3>图像抓取</h3></div><Image size={19} aria-hidden="true" /></div>
           <div className="lux-library-strategy-toggle-grid">
-            <StrategyToggle label="海报" description="详情页和媒体库封面" checked={strategy.images.poster} onChange={(checked) => updateImages("poster", checked)} />
             <StrategyToggle label="艺术图" description="背景和横向构图" checked={strategy.images.artwork} onChange={(checked) => updateImages("artwork", checked)} />
             <StrategyToggle label="横幅图" description="宽屏入口和合集" checked={strategy.images.banner} onChange={(checked) => updateImages("banner", checked)} />
             <StrategyToggle label="徽标" description="透明标题标识" checked={strategy.images.logo} onChange={(checked) => updateImages("logo", checked)} />
-            <StrategyToggle label="缩略图" description="剧集和快速浏览" checked={strategy.images.thumbnail} onChange={(checked) => updateImages("thumbnail", checked)} />
             <StrategyToggle label="光盘封面" description="光盘样式封面图" checked={strategy.images.disc} onChange={(checked) => updateImages("disc", checked)} />
             <StrategyToggle label="壁纸" description="全屏背景和详情页" checked={strategy.images.wallpaper} onChange={(checked) => updateImages("wallpaper", checked)} />
           </div>
+          <ThumbnailScrapingModeControl
+            value={strategy.images.thumbnailScrapingMode ?? "SCRAPER_FIRST"}
+            onChange={(thumbnailScrapingMode) => updateImages("thumbnailScrapingMode", thumbnailScrapingMode)}
+          />
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
             <label>每项最大背景图数量<input type="number" min="0" max="20" value={strategy.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))} /></label>
             <label>最小下载宽度<input type="number" min="0" max="8192" step="128" value={strategy.images.minDownloadWidth} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))} /><small>设为 0 表示不限制</small></label>
@@ -348,12 +350,34 @@ function StrategyToggle({ label, description, checked, onChange }: { label: stri
   return <label className="lux-library-strategy-toggle"><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /><span><strong>{label}</strong>{description ? <small>{description}</small> : null}</span><i aria-hidden="true" /></label>;
 }
 
+type ThumbnailScrapingMode = "NONE" | "SCREENSHOT_FIRST" | "SCRAPER_FIRST";
+
+const thumbnailScrapingModes: Array<[ThumbnailScrapingMode, string, string]> = [
+  ["NONE", "不刮削", "不下载或生成海报、缩略图"],
+  ["SCREENSHOT_FIRST", "截图优先", "有截图时优先使用截图"],
+  ["SCRAPER_FIRST", "刮削器优先", "刮削器图片优先，截图补缺"],
+];
+
+function ThumbnailScrapingModeControl({ value, onChange }: { value: string; onChange: (value: ThumbnailScrapingMode) => void }) {
+  const selected = thumbnailScrapingModes.some(([mode]) => mode === value) ? value as ThumbnailScrapingMode : "SCRAPER_FIRST";
+  return <div className="lux-thumbnail-scraping-mode-field">
+    <div><strong>缩略图刮削方式</strong><small>同时控制 POSTER 和 THUMB；本地手工图片不受影响。</small></div>
+    <div className="lux-thumbnail-scraping-mode" role="radiogroup" aria-label="缩略图刮削方式">
+      {thumbnailScrapingModes.map(([mode, label, description]) => <label key={mode} className={selected === mode ? "is-selected" : ""} title={description}>
+        <input type="radio" name="thumbnail-scraping-mode" value={mode} checked={selected === mode} onChange={() => onChange(mode)} />
+        <span>{label}</span>
+      </label>)}
+    </div>
+  </div>;
+}
+
 function StrategySelect({ label, value, options, onChange }: { label: string; value: string; options: Array<[string, string]>; onChange: (value: string) => void }) {
   return <label className="lux-library-strategy-select">{label}<LuxSelect value={value} options={options.map(([optionValue, optionLabel]) => ({ value: optionValue, label: optionLabel }))} onChange={onChange} aria-label={label} /></label>;
 }
 
 function estimateStrategyStorage(strategy: MediaStrategySettings) {
-  const enabledTypes = [strategy.images.poster, strategy.images.artwork, strategy.images.banner, strategy.images.logo, strategy.images.thumbnail, strategy.images.disc, strategy.images.wallpaper].filter(Boolean).length;
+  const thumbnailsEnabled = (strategy.images.thumbnailScrapingMode ?? "SCRAPER_FIRST") !== "NONE";
+  const enabledTypes = [strategy.images.poster && thumbnailsEnabled, strategy.images.artwork, strategy.images.banner, strategy.images.logo, strategy.images.thumbnail && thumbnailsEnabled, strategy.images.disc, strategy.images.wallpaper].filter(Boolean).length;
   const extraBackdrops = strategy.images.artwork || strategy.images.banner || strategy.images.wallpaper ? Math.max(0, strategy.images.maxBackdropCount - 1) : 0;
   const imagesPerItem = enabledTypes + extraBackdrops;
   return { imagesPerItem, storage: `${Math.max(0.1, imagesPerItem * 1.8).toFixed(1)} GB` };
@@ -491,7 +515,7 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
   const [draft, setDraft] = useState<MediaStrategySettings>(() => cloneStrategy(library.mediaStrategy ?? globalStrategy));
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
-  const updateImages = (key: keyof MediaStrategySettings["images"], value: boolean | number) => setDraft((current) => ({ ...current, images: { ...current.images, [key]: value } }));
+  const updateImages = (key: keyof MediaStrategySettings["images"], value: boolean | number | string) => setDraft((current) => ({ ...current, images: { ...current.images, [key]: value } }));
   const save = async () => {
     setError("");
     try {
@@ -510,15 +534,17 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
     </div>
     {mode === "custom" ? <>
       <div className="lux-library-override-toggles">
-        <StrategyToggle label="海报" checked={draft.images.poster} onChange={(checked) => updateImages("poster", checked)} />
         <StrategyToggle label="艺术图" checked={draft.images.artwork} onChange={(checked) => updateImages("artwork", checked)} />
         <StrategyToggle label="横幅图" checked={draft.images.banner} onChange={(checked) => updateImages("banner", checked)} />
         <StrategyToggle label="徽标" checked={draft.images.logo} onChange={(checked) => updateImages("logo", checked)} />
-        <StrategyToggle label="缩略图" checked={draft.images.thumbnail} onChange={(checked) => updateImages("thumbnail", checked)} />
         <StrategyToggle label="光盘封面" checked={draft.images.disc} onChange={(checked) => updateImages("disc", checked)} />
         <StrategyToggle label="壁纸" checked={draft.images.wallpaper} onChange={(checked) => updateImages("wallpaper", checked)} />
         <StrategyToggle label="额外保存元数据到 metadata" checked={draft.images.writeToMetadata} onChange={(checked) => updateImages("writeToMetadata", checked)} />
       </div>
+      <ThumbnailScrapingModeControl
+        value={draft.images.thumbnailScrapingMode ?? "SCRAPER_FIRST"}
+        onChange={(thumbnailScrapingMode) => updateImages("thumbnailScrapingMode", thumbnailScrapingMode)}
+      />
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />
         <label>最大背景图数量<input type="number" min="0" max="20" value={draft.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))} /></label>

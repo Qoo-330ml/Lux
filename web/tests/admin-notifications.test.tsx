@@ -22,7 +22,11 @@ describe("AdminNotificationsPage", () => {
         url: "http://127.0.0.1:8787/hooks",
         payloadFormat: "LUX",
         providerPluginId: "org.lux.webhook",
-        providerConfig: { payloadFormat: "LUX" },
+        providerConfig: {
+          url: "http://127.0.0.1:8787/hooks?title={title}&content={content}",
+          bodyTemplate: '{"title":"{{title}}","content":"{{content}}"}',
+          payloadFormat: "LUX",
+        },
         enabled: true,
         allowPrivateNetwork: true,
         eventTypes: ["MEDIA_ADDED"],
@@ -50,6 +54,19 @@ describe("AdminNotificationsPage", () => {
         available: true,
         configurable: true,
         configFields: [{
+          key: "url",
+          label: "Webhook URL 模板",
+          type: "text",
+          required: true,
+          sensitive: false,
+        }, {
+          key: "bodyTemplate",
+          label: "Body 模板",
+          type: "textarea",
+          required: false,
+          sensitive: false,
+          defaultValue: '{"title":"{{title}}","content":"{{content}}"}',
+        }, {
           key: "payloadFormat",
           label: "Payload 格式",
           type: "select",
@@ -166,7 +183,10 @@ describe("AdminNotificationsPage", () => {
     expect(container.textContent).toContain("发送失败");
     expect(container.querySelector('input[name="event-MEDIA_ADDED"]')).toBeTruthy();
     expect(container.querySelector('select[name="notification-provider"]')).toBeTruthy();
+    expect(container.querySelector('input[name="notification-config-url"]')).toBeTruthy();
+    expect(container.querySelector('textarea[name="notification-config-bodyTemplate"]')).toBeTruthy();
     expect(container.querySelector('select[name="notification-config-payloadFormat"]')).toBeTruthy();
+    expect(container.querySelector('input[name="notification-url"]')).toBeNull();
     expect(container.textContent).toContain("通知内容");
     expect(container.textContent).toContain("通知器配置");
     expect(container.querySelector('button[aria-label="重试投递 delivery-1"]')).toBeTruthy();
