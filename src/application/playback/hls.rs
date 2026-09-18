@@ -144,6 +144,7 @@ impl HlsManager {
         tier: ServerTier,
         input: &Path,
         video_bitrate: Option<i64>,
+        start_time_ticks: Option<i64>,
     ) -> Result<(), HlsError> {
         let permit = self.acquire_permit(tier).await?;
         fs::create_dir_all(&self.base_directory)
@@ -160,6 +161,7 @@ impl HlsManager {
             tier,
             self.hardware_encoder.as_deref(),
             video_bitrate,
+            start_time_ticks,
         )?;
         let mut command = Command::new(&self.ffmpeg_executable);
         command
@@ -393,6 +395,7 @@ fn ffmpeg_args(
     tier: ServerTier,
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
+    start_time_ticks: Option<i64>,
 ) -> Result<Vec<String>, HlsError> {
     if tier == ServerTier::Direct {
         return Err(HlsError::InvalidAsset);
@@ -405,13 +408,18 @@ fn ffmpeg_args(
         "-loglevel".to_owned(),
         "warning".to_owned(),
         "-nostdin".to_owned(),
+    ];
+    if let Some(start_time) = ffmpeg_start_time(start_time_ticks) {
+        args.extend(["-ss".to_owned(), start_time]);
+    }
+    args.extend([
         "-i".to_owned(),
         input.to_string_lossy().into_owned(),
         "-map".to_owned(),
         "0:v:0?".to_owned(),
         "-map".to_owned(),
         "0:a:0?".to_owned(),
-    ];
+    ]);
     match tier {
         ServerTier::Remux => {
             args.extend([
@@ -487,6 +495,18 @@ fn ffmpeg_args(
     Ok(args)
 }
 
+fn ffmpeg_start_time(start_time_ticks: Option<i64>) -> Option<String> {
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+    let ticks = start_time_ticks.filter(|ticks| *ticks > 0)?;
+    let seconds = ticks / TICKS_PER_SECOND;
+    let remainder = ticks % TICKS_PER_SECOND;
+    if remainder == 0 {
+        Some(seconds.to_string())
+    } else {
+        Some(format!("{seconds}.{remainder:07}"))
+    }
+}
+
 fn is_valid_asset(asset: &str) -> bool {
     if asset.is_empty() || asset.len() > 128 {
         return false;
@@ -557,6 +577,7 @@ mod tests {
             ServerTier::Remux,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
@@ -584,6 +605,7 @@ mod tests {
             ServerTier::SoftwareTranscode,
             None,
             None,
+            None,
         )
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
@@ -598,10 +620,34 @@ mod tests {
             ServerTier::SoftwareTranscode,
             None,
             Some(1_000_000),
+            None,
         )
         .unwrap();
 
         assert!(args.windows(2).any(|pair| pair == ["-b:v", "1000000"]));
+    }
+
+    #[test]
+    fn resume_arguments_seek_before_input_using_emby_ticks() {
+        let args = ffmpeg_args(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::SoftwareTranscode,
+            None,
+            None,
+            Some(12_345_678),
+        )
+        .unwrap();
+
+        let seek = args
+            .windows(2)
+            .position(|pair| pair == ["-ss", "1.2345678"])
+            .expect("resume seek arguments");
+        let input = args
+            .iter()
+            .position(|value| value == "-i")
+            .expect("input argument");
+        assert!(seek < input);
     }
 
     #[test]
@@ -643,7 +689,13 @@ mod tests {
             script.to_string_lossy().into_owned(),
         );
         manager
-            .start("session-1", ServerTier::Remux, Path::new("input.mkv"), None)
+            .start(
+                "session-1",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+                None,
+            )
             .await
             .unwrap();
         let manifest = manager.wait_for_manifest("session-1").await.unwrap();
@@ -692,6 +744,7 @@ mod tests {
                 ServerTier::Remux,
                 Path::new("input.mkv"),
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -718,7 +771,13 @@ mod tests {
         );
 
         let error = manager
-            .start("low-space", ServerTier::Remux, Path::new("input.mkv"), None)
+            .start(
+                "low-space",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+                None,
+            )
             .await
             .unwrap_err();
 

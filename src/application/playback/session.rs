@@ -266,6 +266,7 @@ impl WebPlaybackSessionService {
         input: CreateWebPlaybackSession<'_>,
         media_path: &std::path::Path,
         video_bitrate: Option<i64>,
+        start_time_ticks: Option<i64>,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
         let _start_guard = self.emby_start_lock.lock().await;
         let user_id = input.user_id.to_owned();
@@ -301,7 +302,13 @@ impl WebPlaybackSessionService {
             }
         }
         if let Err(error) = self
-            .start_hls(&created.id, tier, media_path, video_bitrate)
+            .start_hls(
+                &created.id,
+                tier,
+                media_path,
+                video_bitrate,
+                start_time_ticks,
+            )
             .await
         {
             let _ = self.stop(&created.id, &user_id).await;
@@ -388,9 +395,10 @@ impl WebPlaybackSessionService {
         tier: ServerTier,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
+        start_time_ticks: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
         self.hls
-            .start(session_id, tier, input, video_bitrate)
+            .start(session_id, tier, input, video_bitrate, start_time_ticks)
             .await?;
         let directory = self.hls.session_directory(session_id).await?;
         let now = unix_timestamp();
@@ -788,7 +796,13 @@ mod tests {
             })
             .await?;
         service
-            .start_hls("session-1", ServerTier::Remux, Path::new("input.mkv"), None)
+            .start_hls(
+                "session-1",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+                None,
+            )
             .await?;
         service.wait_for_hls_manifest("session-1").await?;
 
@@ -864,6 +878,7 @@ mod tests {
                 "failed-manifest",
                 ServerTier::Remux,
                 Path::new("input.mkv"),
+                None,
                 None,
             )
             .await?;
@@ -977,6 +992,7 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                None,
             )
             .await?;
         assert!(matches!(
@@ -1000,6 +1016,7 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(2_000_000),
+                None,
             )
             .await?;
         service.wait_for_hls_manifest(&second.id).await?;

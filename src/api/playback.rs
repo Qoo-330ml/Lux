@@ -320,6 +320,14 @@ impl EmbyPlaybackInfoRequest {
                 }
                 continue;
             }
+            if name.eq_ignore_ascii_case("StartTimeTicks")
+                || name.eq_ignore_ascii_case("start_time_ticks")
+            {
+                if let Ok(value) = value.parse::<i64>() {
+                    self.start_time_ticks = Some(value);
+                }
+                continue;
+            }
             let value = match parse_emby_bool(value.as_ref()) {
                 Some(value) => value,
                 None => continue,
@@ -724,6 +732,7 @@ async fn create_emby_transcoding_session(
             },
             &input,
             video_bitrate,
+            request.start_time_ticks,
         )
         .await
         .map_err(emby_playback_session_error_status)?;
@@ -2366,7 +2375,10 @@ async fn create_web_playback_session_json(
                 return Err(StatusCode::FORBIDDEN.into_response());
             }
         };
-        if let Err(error) = service.start_hls(&created.id, *tier, &input, None).await {
+        if let Err(error) = service
+            .start_hls(&created.id, *tier, &input, None, None)
+            .await
+        {
             let _ = service.stop(&created.id, &user.id.to_string()).await;
             return Err(web_playback_error(headers, error));
         }
@@ -3749,6 +3761,14 @@ mod emby_playback_tests {
         source.bitrate = Some(13_912_978);
 
         assert!(request.requests_server_transcoding_for_source(false, &source));
+    }
+
+    #[test]
+    fn start_time_ticks_query_parameter_is_read() {
+        let mut request = EmbyPlaybackInfoRequest::default();
+        request.apply_query_parameters(&RawQuery(Some("StartTimeTicks=12345678".to_owned())));
+
+        assert_eq!(request.start_time_ticks, Some(12_345_678));
     }
 
     #[test]
