@@ -409,6 +409,8 @@ export type AdminWebhookDelivery = {
   destinationId: string;
   destinationName: string;
   eventType: string;
+  title?: string | null;
+  content?: string | null;
   status: string;
   attemptCount: number;
   nextAttemptAt: number;

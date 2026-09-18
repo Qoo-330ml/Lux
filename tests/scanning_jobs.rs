@@ -695,9 +695,13 @@ async fn completed_scan_enqueues_new_media_once_for_webhook_destinations()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&payload)?["addedCount"],
-        1
+    let media_added_payload = serde_json::from_str::<serde_json::Value>(&payload)?;
+    assert_eq!(media_added_payload["addedCount"], 1);
+    assert_eq!(media_added_payload["title"], "Movies新增媒体");
+    assert!(
+        media_added_payload["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("总耗时："))
     );
     let scan_completed_payload: String = sqlx::query_scalar(
         "SELECT payload_json FROM notification_events WHERE event_type = 'SCAN_COMPLETED'",
@@ -708,6 +712,12 @@ async fn completed_scan_enqueues_new_media_once_for_webhook_destinations()
         serde_json::from_str::<serde_json::Value>(&scan_completed_payload)?;
     assert_eq!(scan_completed_payload["status"], "COMPLETED");
     assert_eq!(scan_completed_payload["processedCount"], 1);
+    assert_eq!(scan_completed_payload["libraryName"], "Movies");
+    assert!(
+        scan_completed_payload["durationSeconds"]
+            .as_i64()
+            .is_some_and(|duration| duration >= 0)
+    );
 
     let second = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&second.id, 100, None).await?;
@@ -988,9 +998,13 @@ async fn completed_scan_enqueues_media_removed_for_missing_files()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(
-        serde_json::from_str::<serde_json::Value>(&payload)?["removedCount"],
-        1
+    let removed_payload = serde_json::from_str::<serde_json::Value>(&payload)?;
+    assert_eq!(removed_payload["removedCount"], 1);
+    assert_eq!(removed_payload["title"], "Movies移除媒体");
+    assert!(
+        removed_payload["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("移除媒体：1 个"))
     );
     Ok(())
 }

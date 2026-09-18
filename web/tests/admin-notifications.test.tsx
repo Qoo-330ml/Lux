@@ -93,6 +93,8 @@ describe("AdminNotificationsPage", () => {
         nextAttemptAt: 1_700_000_200,
         lastHttpStatus: 500,
         lastError: "upstream failed",
+        title: "扫描完成",
+        content: "扫描已完成\n媒体库：library-1",
         deliveredAt: null,
         createdAt: 1_700_000_000,
         updatedAt: 1_700_000_200,
@@ -167,7 +169,7 @@ describe("AdminNotificationsPage", () => {
     expect(container.querySelector(".lux-notification-destination")).toBeTruthy();
   });
 
-  it("shows destinations, event choices, delivery failures, and retry action", async () => {
+  it("keeps the create form collapsed until the new notification action is opened", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root.render(createElement(
@@ -178,9 +180,42 @@ describe("AdminNotificationsPage", () => {
     });
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
 
+    expect(container.querySelector('button[aria-label="新建通知"]')).toBeTruthy();
+    expect(container.querySelector(".lux-notification-form")).toBeNull();
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+
+    await act(async () => {
+      (container.querySelector('button[aria-label="新建通知"]') as HTMLButtonElement).click();
+    });
+
+    expect(container.querySelector(".lux-notification-form")).toBeTruthy();
+    expect(container.querySelector('[role="dialog"][aria-labelledby="notification-create-title"]')).toBeTruthy();
+
+    await act(async () => {
+      (container.querySelector('button[aria-label="关闭新建通知"]') as HTMLButtonElement).click();
+    });
+    expect(container.querySelector(".lux-notification-form")).toBeNull();
+  });
+
+  it("shows destinations, notification content, delivery failures, and retry action", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => {
+      (container.querySelector('button[aria-label="新建通知"]') as HTMLButtonElement).click();
+    });
+
     expect(container.textContent).toContain("通知");
     expect(container.textContent).toContain("本地接收器");
     expect(container.textContent).toContain("发送失败");
+    expect(container.textContent).toContain("扫描已完成");
+    expect(container.textContent).toContain("媒体库：library-1");
     expect(container.querySelector('input[name="event-MEDIA_ADDED"]')).toBeTruthy();
     expect(container.querySelector('select[name="notification-provider"]')).toBeTruthy();
     expect(container.querySelector('input[name="notification-config-url"]')).toBeTruthy();

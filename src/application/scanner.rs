@@ -4441,8 +4441,13 @@ impl ScanJobService {
             .await?;
         self.record_event(&job.id, "ERROR", error_code, "扫描任务失败", "{}")
             .await;
-        self.publish_webhook_event(job, WebhookEventType::ScanFailed, Some(error_code))
-            .await;
+        let failed_job = self.database.find_scan_job(&job.id).await?;
+        self.publish_webhook_event(
+            failed_job.as_ref().unwrap_or(job),
+            WebhookEventType::ScanFailed,
+            Some(error_code),
+        )
+        .await;
         self.clear_cancellation_flag(&job.id);
         Err(error.into())
     }
@@ -4467,8 +4472,13 @@ impl ScanJobService {
             .await?;
         self.record_event(job_id, "ERROR", error_code, "扫描任务失败", "{}")
             .await;
-        self.publish_webhook_event(&job, WebhookEventType::ScanFailed, Some(error_code))
-            .await;
+        let failed_job = self.database.find_scan_job(job_id).await?;
+        self.publish_webhook_event(
+            failed_job.as_ref().unwrap_or(&job),
+            WebhookEventType::ScanFailed,
+            Some(error_code),
+        )
+        .await;
         self.clear_cancellation_flag(job_id);
         Ok(())
     }
@@ -4525,8 +4535,13 @@ impl ScanJobService {
                     .await?;
                 self.record_event(job_id, "INFO", "JOB_COMPLETED", "局部扫描任务已完成", "{}")
                     .await;
-                self.publish_webhook_event(&job, WebhookEventType::ScanCompleted, None)
-                    .await;
+                let completed_job = self.database.find_scan_job(job_id).await?;
+                self.publish_webhook_event(
+                    completed_job.as_ref().unwrap_or(&job),
+                    WebhookEventType::ScanCompleted,
+                    None,
+                )
+                .await;
                 self.clear_cancellation_flag(job_id);
                 return Ok(ScanBatchReport {
                     status: "COMPLETED".to_owned(),
@@ -4574,8 +4589,9 @@ impl ScanJobService {
                         .await?;
                     self.record_event(job_id, "ERROR", error.code(), "局部扫描任务失败", "{}")
                         .await;
+                    let failed_job = self.database.find_scan_job(job_id).await?;
                     self.publish_webhook_event(
-                        &job,
+                        failed_job.as_ref().unwrap_or(&job),
                         WebhookEventType::ScanFailed,
                         Some(error.code()),
                     )
@@ -4650,13 +4666,25 @@ impl ScanJobService {
             .and_then(|duration| i64::try_from(duration.as_secs()).ok())
             .unwrap_or(0);
         let dedupe_key = format!("scan:{}:{}", job.id, event_type.as_str());
+        let library_name = self
+            .database
+            .find_library(&job.library_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|library| library.name);
+        let duration_seconds = job
+            .started_at
+            .map(|started_at| occurred_at.saturating_sub(started_at));
         let mut data = json!({
             "jobId": job.id,
             "libraryId": job.library_id,
+            "libraryName": library_name,
             "jobType": job.job_type,
             "status": job.status,
             "processedCount": job.processed_count,
             "totalCount": job.total_count,
+            "durationSeconds": duration_seconds,
             "errorCode": error_code,
         });
         if let (Value::Object(data), Value::Object(extra)) = (&mut data, extra) {
@@ -5348,6 +5376,9 @@ impl ScanJobService {
                 .await?;
             return Ok(());
         };
+        self.database
+            .ensure_scan_job_thumbnail_targets(job_id)
+            .await?;
         let started = Instant::now();
         match thumbnails.generate_scan_job(job_id).await {
             Ok(report) if report.failed == 0 => {

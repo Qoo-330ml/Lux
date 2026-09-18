@@ -463,28 +463,6 @@ impl WebPlaybackSessionService {
         Ok(())
     }
 
-    pub(crate) async fn stop_active_emby_sessions_for_source(
-        &self,
-        user_id: &str,
-        item_id: &str,
-        media_source_id: &str,
-    ) -> Result<(), WebPlaybackSessionError> {
-        let _start_guard = self.emby_start_lock.lock().await;
-        let sessions = self
-            .database
-            .find_active_web_playback_sessions_for_source(
-                user_id,
-                item_id,
-                media_source_id,
-                "lux-emby",
-            )
-            .await?;
-        for session in sessions {
-            self.stop(&session.id, user_id).await?;
-        }
-        Ok(())
-    }
-
     pub(crate) async fn claim_event(
         &self,
         event: WebPlaybackEvent<'_>,
@@ -1044,21 +1022,6 @@ while :; do sleep 1; done
                 .exists()
         );
 
-        service
-            .stop_active_emby_sessions_for_source(&user_id, &item_id, &source_id)
-            .await?;
-        let second_stopped = database
-            .find_web_playback_session(&second.id)
-            .await?
-            .expect("second session after fallback stop");
-        assert_eq!(second_stopped.state, "STOPPED");
-        assert!(
-            !config
-                .config_dir
-                .join("web-playback")
-                .join(&second.id)
-                .exists()
-        );
         Ok(())
     }
 }

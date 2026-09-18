@@ -1037,19 +1037,14 @@ pub(super) async fn handle_emby_playback_event(
         .unwrap_or_else(|| format!("{}:{device_id}", internal_item_id));
     let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
     let user_id = user.id.to_string();
+    // A STOPPED callback without PlaySessionId cannot be associated with a
+    // specific HLS session. Clients may send a stale callback while
+    // negotiating a new stream, so only stop the session named by the callback.
     if state_name == "STOPPED"
+        && let Some(session_id) = emby_transcode_session_id
         && let Some(service) = state.web_playback.as_ref()
     {
-        let result = if let Some(session_id) = emby_transcode_session_id {
-            service.stop(session_id, &user_id).await
-        } else if let Some(media_source_id) = media_source_id {
-            service
-                .stop_active_emby_sessions_for_source(&user_id, &internal_item_id, media_source_id)
-                .await
-        } else {
-            Ok(())
-        };
-        if let Err(error) = result {
+        if let Err(error) = service.stop(session_id, &user_id).await {
             tracing::warn!(
                 event = "emby_transcoding_session_stop_failed",
                 item_id_prefix = %item_id_prefix,

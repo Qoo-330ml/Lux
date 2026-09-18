@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.7",
+    date: "2026-09-18",
+    sections: [
+      { kind: "added", items: [
+        "管理台通知创建改为弹窗流程，通知投递历史现在展示通知标题和正文，便于快速确认实际发送内容。",
+        "通知模板补充媒体库、扫描进度、任务耗时、状态和错误上下文，并将媒体新增、移除、元数据更新、扫描和任务失败等事件转换为更易读的标题与正文。",
+      ] },
+      { kind: "fixed", items: [
+        "修复修改媒体库缩略图策略后，已有媒体不会重新生成缺失缩略图的问题；后续全量扫描会补登记现有本地媒体的缩略图目标。",
+        "修复缺少 PlaySessionId 的过期 Emby STOPPED 回调误停止当前 HLS 转码会话的问题。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.6",
     date: "2026-09-18",
     sections: [

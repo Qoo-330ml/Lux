@@ -266,6 +266,17 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
     assert_eq!(deliveries.status(), reqwest::StatusCode::OK);
     let deliveries_body: Value = deliveries.json().await?;
     assert_eq!(deliveries_body["deliveries"][0]["status"], "DELIVERED");
+    assert_eq!(
+        deliveries_body["deliveries"]
+            .as_array()
+            .and_then(|deliveries| {
+                deliveries.iter().find(|delivery| {
+                    delivery["eventType"] == "SCAN_COMPLETED" && delivery["content"].is_string()
+                })
+            })
+            .ok_or("missing scan delivery content")?["content"],
+        "扫描已完成\n媒体库：library-1"
+    );
 
     let updated = client
         .patch(format!(

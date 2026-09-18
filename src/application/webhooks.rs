@@ -64,6 +64,8 @@ pub struct WebhookDeliveryView {
     pub destination_id: String,
     pub destination_name: String,
     pub event_type: String,
+    pub title: Option<String>,
+    pub content: Option<String>,
     pub status: String,
     pub attempt_count: i64,
     pub next_attempt_at: i64,
@@ -1305,8 +1307,8 @@ fn emby_event_name(event_type: WebhookEventType) -> &'static str {
 
 fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
     match key {
-        "jobId" | "libraryId" | "jobType" | "status" | "processedCount" | "totalCount"
-        | "errorCode" => matches!(
+        "jobId" | "libraryId" | "libraryName" | "jobType" | "status" | "processedCount"
+        | "totalCount" | "durationSeconds" | "errorCode" => matches!(
             event_type,
             WebhookEventType::MediaAdded
                 | WebhookEventType::MediaRemoved
@@ -1335,10 +1337,18 @@ fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
             )
         }
         "test" => matches!(event_type, WebhookEventType::JobFailed),
-        "itemTitle" | "userName" | "container" | "size" | "bitrate" | "overview" | "playMethod"
-        | "resumed" | "mediaSourceId" | "playSessionId" | "state" | "positionTicks"
-        | "durationTicks" | "isPaused" | "client" | "deviceName" | "deviceType"
-        | "clientVersion" => matches!(
+        "itemTitle" => matches!(
+            event_type,
+            WebhookEventType::MediaRemoved
+                | WebhookEventType::MetadataUpdated
+                | WebhookEventType::PlaybackStarted
+                | WebhookEventType::PlaybackPaused
+                | WebhookEventType::PlaybackProgress
+                | WebhookEventType::PlaybackStopped
+        ),
+        "userName" | "container" | "size" | "bitrate" | "overview" | "playMethod" | "resumed"
+        | "mediaSourceId" | "playSessionId" | "state" | "positionTicks" | "durationTicks"
+        | "isPaused" | "client" | "deviceName" | "deviceType" | "clientVersion" => matches!(
             event_type,
             WebhookEventType::PlaybackStarted
                 | WebhookEventType::PlaybackPaused
@@ -1501,12 +1511,15 @@ async fn validate_provider(
 }
 
 fn delivery_view(delivery: StoredNotificationDelivery) -> WebhookDeliveryView {
+    let (title, content) = delivery_display_fields(&delivery.payload_json);
     WebhookDeliveryView {
         id: delivery.id,
         event_id: delivery.event_id,
         destination_id: delivery.destination_id,
         destination_name: delivery.destination_name,
         event_type: delivery.event_type,
+        title,
+        content,
         status: delivery.status,
         attempt_count: delivery.attempt_count,
         next_attempt_at: delivery.next_attempt_at,
@@ -1516,6 +1529,21 @@ fn delivery_view(delivery: StoredNotificationDelivery) -> WebhookDeliveryView {
         created_at: delivery.created_at,
         updated_at: delivery.updated_at,
     }
+}
+
+fn delivery_display_fields(payload_json: &str) -> (Option<String>, Option<String>) {
+    let Ok(Value::Object(payload)) = serde_json::from_str(payload_json) else {
+        return (None, None);
+    };
+    (
+        bounded_display_string(payload.get("title")),
+        bounded_display_string(payload.get("content")),
+    )
+}
+
+fn bounded_display_string(value: Option<&Value>) -> Option<String> {
+    let value = value.and_then(Value::as_str)?.trim();
+    (!value.is_empty()).then(|| value.chars().take(4096).collect())
 }
 
 async fn read_secret_map(path: &Path) -> Result<BTreeMap<String, String>, WebhookError> {
@@ -1775,6 +1803,154 @@ mod tests {
     }
 
     #[test]
+    fn scan_display_fields_include_human_readable_summary_and_duration() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-scan-display",
+            WebhookEventType::ScanCompleted,
+            1_700_000_000,
+            json!({
+                "libraryId": "library-1",
+                "libraryName": "电影库",
+                "jobType": "RECONCILE_LIBRARY",
+                "status": "COMPLETED",
+                "processedCount": 12_480,
+                "totalCount": 12_480,
+                "durationSeconds": 3_661,
+            }),
+        )
+        .expect("scan display payload should be accepted");
+        assert_eq!(payload["title"], "电影库扫描完成");
+        assert_eq!(
+            payload["content"],
+            "扫描已完成\n媒体库：电影库\n任务：全量校验\n处理：12,480 / 12,480 项\n状态：已完成\n总耗时：1小时1分1秒"
+        );
+        assert_eq!(payload["body"], payload["content"]);
+        assert_eq!(payload["libraryName"], "电影库");
+        assert_eq!(payload["durationSeconds"], 3_661);
+    }
+
+    #[test]
+    fn media_added_display_fields_include_scan_context() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-media-added-display",
+            WebhookEventType::MediaAdded,
+            1_700_000_000,
+            json!({
+                "libraryName": "电影库",
+                "jobType": "RECONCILE_LIBRARY",
+                "status": "COMPLETED",
+                "addedCount": 3,
+                "processedCount": 12_480,
+                "totalCount": 12_480,
+                "durationSeconds": 3_661,
+            }),
+        )
+        .expect("media added payload should be accepted");
+        assert_eq!(payload["title"], "电影库新增媒体");
+        assert_eq!(
+            payload["content"],
+            "新增媒体：3 个\n媒体库：电影库\n任务：全量校验\n处理：12,480 / 12,480 项\n状态：已完成\n总耗时：1小时1分1秒"
+        );
+        assert_eq!(payload["body"], payload["content"]);
+    }
+
+    #[test]
+    fn media_removed_display_fields_identify_item_and_file_count() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-media-removed-display",
+            WebhookEventType::MediaRemoved,
+            1_700_000_000,
+            json!({
+                "itemId": "item-1",
+                "itemTitle": "示例电影",
+                "libraryName": "电影库",
+                "removedCount": 1,
+                "deletedFileCount": 3,
+            }),
+        )
+        .expect("media removed payload should be accepted");
+        assert_eq!(payload["title"], "示例电影已移除");
+        assert_eq!(
+            payload["content"],
+            "媒体已移除\n媒体库：电影库\n移除媒体：1 个\n删除文件：3 个"
+        );
+        assert_eq!(payload["body"], payload["content"]);
+    }
+
+    #[test]
+    fn metadata_updated_display_fields_include_item_and_refresh_mode() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-metadata-updated-display",
+            WebhookEventType::MetadataUpdated,
+            1_700_000_000,
+            json!({
+                "itemId": "item-1",
+                "itemTitle": "示例电影",
+                "libraryName": "电影库",
+                "mode": "FILL_MISSING",
+                "status": "COMPLETED",
+                "candidateCount": 1,
+            }),
+        )
+        .expect("metadata updated payload should be accepted");
+        assert_eq!(payload["title"], "示例电影元数据已更新");
+        assert_eq!(
+            payload["content"],
+            "元数据已更新\n媒体库：电影库\n模式：补全缺失\n状态：已完成\n候选：1 个"
+        );
+        assert_eq!(payload["body"], payload["content"]);
+    }
+
+    #[test]
+    fn job_failed_display_fields_translate_task_error_and_progress() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-job-failed-display",
+            WebhookEventType::JobFailed,
+            1_700_000_000,
+            json!({
+                "libraryName": "电影库",
+                "jobType": "METADATA_REIDENTIFY",
+                "mode": "FULL_REFRESH",
+                "status": "FAILED",
+                "processedCount": 8,
+                "totalCount": 12,
+                "durationSeconds": 125,
+                "errorCode": "ITEM_FAILED",
+            }),
+        )
+        .expect("job failed payload should be accepted");
+        assert_eq!(payload["title"], "电影库元数据刷新失败");
+        assert_eq!(
+            payload["content"],
+            "任务执行失败\n媒体库：电影库\n任务：元数据刷新\n模式：刷新全部\n处理：8 / 12 项\n状态：失败\n总耗时：2分5秒\n错误：媒体项目处理失败（ITEM_FAILED）"
+        );
+        assert_eq!(payload["body"], payload["content"]);
+    }
+
+    #[test]
+    fn job_test_notification_has_a_meaningful_display() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-job-test",
+            WebhookEventType::JobFailed,
+            1_700_000_000,
+            json!({"test": true}),
+        )
+        .expect("test notification payload should be accepted");
+        assert_eq!(payload["title"], "通知测试成功");
+        assert_eq!(
+            payload["content"],
+            "通知测试成功\n这是 Lux 核心模板测试通知"
+        );
+        assert_eq!(payload["body"], payload["content"]);
+    }
+
+    #[test]
     fn playback_remote_ip_is_only_allowed_for_stop_events() {
         let payload = build_event_payload(
             "server-1",
@@ -1833,7 +2009,7 @@ mod tests {
         assert_eq!(envelope["data"]["libraryId"], "library-1");
         assert_eq!(envelope["data"]["addedCount"], 2);
         assert_eq!(envelope["data"]["source"], "lux");
-        assert_eq!(envelope["data"]["title"], "媒体新增");
+        assert_eq!(envelope["data"]["title"], "新增媒体");
         assert_eq!(
             envelope["data"]["content"],
             "新增媒体：2 个\n媒体库：library-1"
