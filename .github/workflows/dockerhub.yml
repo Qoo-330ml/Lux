@@ -8,6 +8,13 @@ on:
     branches:
       - main
 
+# A push can be delivered more than once. Serialize registry writes for the
+# same ref so concurrent runs cannot overwrite architecture tags while a
+# manifest is being assembled.
+concurrency:
+  group: dockerhub-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   # Pull requests do not receive repository secrets, so use a local-only
   # namespace for metadata while keeping publishing disabled.
@@ -214,17 +221,35 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
+          retry_imagetools() {
+            local attempts=4
+            local delay=5
+            while true; do
+              if "$@"; then
+                return 0
+              fi
+              attempts=$((attempts - 1))
+              if (( attempts == 0 )); then
+                return 1
+              fi
+              echo "Docker Hub request failed; retrying in ${delay}s..." >&2
+              sleep "$delay"
+              delay=$((delay * 2))
+            done
+          }
+
           while IFS= read -r tag; do
             [[ -z "$tag" ]] && continue
-            docker buildx imagetools create \
+            retry_imagetools docker buildx imagetools create \
               --tag "$tag" \
               "${tag}-amd64" \
               "${tag}-arm64"
           done <<< "${{ steps.meta.outputs.tags }}"
 
           runtime_image="docker.io/${IMAGE_NAMESPACE}/${RUNTIME_IMAGE_NAME}:${RUNTIME_IMAGE_TAG}"
-          if ! docker buildx imagetools inspect "$runtime_image" >/dev/null 2>&1; then
-            docker buildx imagetools create \
+          if ! retry_imagetools docker buildx imagetools inspect "$runtime_image" >/dev/null 2>&1; then
+            retry_imagetools docker buildx imagetools create \
               --tag "$runtime_image" \
               "${runtime_image}-amd64" \
               "${runtime_image}-arm64"
