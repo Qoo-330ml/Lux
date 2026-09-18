@@ -1,6 +1,7 @@
 use std::{
     collections::HashMap,
     fmt,
+    fmt::Write as _,
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
@@ -26,6 +27,8 @@ const MAX_SOFTWARE_SESSIONS: usize = 1;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
 const MANIFEST_WAIT_ATTEMPTS: usize = 50;
+const HLS_ASSET_WAIT_ATTEMPTS: usize = 600;
+const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
 const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug)]
@@ -64,6 +67,7 @@ impl std::error::Error for HlsError {
 
 struct HlsProcess {
     directory: PathBuf,
+    runtime_ticks: Option<i64>,
     child: Mutex<Option<Child>>,
     quota: Mutex<SessionQuotaCache>,
     _permit: OwnedSemaphorePermit,
@@ -145,6 +149,7 @@ impl HlsManager {
         input: &Path,
         video_bitrate: Option<i64>,
         start_time_ticks: Option<i64>,
+        runtime_ticks: Option<i64>,
     ) -> Result<(), HlsError> {
         let permit = self.acquire_permit(tier).await?;
         fs::create_dir_all(&self.base_directory)
@@ -196,6 +201,7 @@ impl HlsManager {
         }
         let process = Arc::new(HlsProcess {
             directory,
+            runtime_ticks: runtime_ticks.filter(|ticks| *ticks > 0),
             child: Mutex::new(Some(child)),
             quota: Mutex::new(SessionQuotaCache::default()),
             _permit: permit,
@@ -259,6 +265,55 @@ impl HlsManager {
             return Err(HlsError::InvalidAsset);
         }
         Ok(path)
+    }
+
+    pub(crate) async fn wait_for_asset(
+        &self,
+        session_id: &str,
+        asset: &str,
+    ) -> Result<PathBuf, HlsError> {
+        let path = self.asset_path(session_id, asset).await?;
+        for _ in 0..HLS_ASSET_WAIT_ATTEMPTS {
+            if fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+            {
+                return Ok(path);
+            }
+            let process = self
+                .processes
+                .lock()
+                .await
+                .get(session_id)
+                .cloned()
+                .ok_or(HlsError::NotFound)?;
+            let finished = {
+                let mut child = process.child.lock().await;
+                match child.as_mut() {
+                    Some(child) => child.try_wait().map_err(HlsError::Io)?.is_some(),
+                    None => true,
+                }
+            };
+            if finished {
+                return Err(HlsError::NotFound);
+            }
+            sleep(Duration::from_millis(100)).await;
+        }
+        Err(HlsError::Failed)
+    }
+
+    pub(crate) async fn vod_manifest(&self, session_id: &str) -> Result<Option<String>, HlsError> {
+        let process = self
+            .processes
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or(HlsError::NotFound)?;
+        let Some(runtime_ticks) = process.runtime_ticks else {
+            return Ok(None);
+        };
+        Ok(vod_manifest(runtime_ticks))
     }
 
     pub(crate) async fn session_directory(&self, session_id: &str) -> Result<PathBuf, HlsError> {
@@ -507,6 +562,47 @@ fn ffmpeg_start_time(start_time_ticks: Option<i64>) -> Option<String> {
     }
 }
 
+fn vod_manifest(runtime_ticks: i64) -> Option<String> {
+    if runtime_ticks <= 0 {
+        return None;
+    }
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+    let full_segments = runtime_ticks / HLS_SEGMENT_DURATION_TICKS;
+    let remainder_ticks = runtime_ticks % HLS_SEGMENT_DURATION_TICKS;
+    let segment_count = full_segments + i64::from(remainder_ticks > 0);
+    let target_duration = if full_segments > 0 {
+        HLS_SEGMENT_DURATION_TICKS / TICKS_PER_SECOND
+    } else {
+        (runtime_ticks + TICKS_PER_SECOND - 1) / TICKS_PER_SECOND
+    };
+    let mut manifest = String::new();
+    let _ = writeln!(manifest, "#EXTM3U");
+    let _ = writeln!(manifest, "#EXT-X-PLAYLIST-TYPE:VOD");
+    let _ = writeln!(manifest, "#EXT-X-VERSION:7");
+    let _ = writeln!(manifest, "#EXT-X-TARGETDURATION:{target_duration}");
+    let _ = writeln!(manifest, "#EXT-X-MEDIA-SEQUENCE:0");
+    let _ = writeln!(manifest, "#EXT-X-MAP:URI=\"init.mp4\"");
+    for index in 0..segment_count {
+        let duration_ticks = if index < full_segments {
+            HLS_SEGMENT_DURATION_TICKS
+        } else {
+            remainder_ticks
+        };
+        let duration = hls_duration_seconds(duration_ticks);
+        let _ = writeln!(manifest, "#EXTINF:{duration},");
+        let _ = writeln!(manifest, "segment_{index:06}.m4s");
+    }
+    let _ = writeln!(manifest, "#EXT-X-ENDLIST");
+    Some(manifest)
+}
+
+fn hls_duration_seconds(ticks: i64) -> String {
+    const TICKS_PER_SECOND: i64 = 10_000_000;
+    let seconds = ticks / TICKS_PER_SECOND;
+    let micros = (ticks % TICKS_PER_SECOND) * 1_000_000 / TICKS_PER_SECOND;
+    format!("{seconds}.{micros:06}")
+}
+
 fn is_valid_asset(asset: &str) -> bool {
     if asset.is_empty() || asset.len() > 128 {
         return false;
@@ -566,8 +662,23 @@ mod tests {
     };
 
     use super::{
-        SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, ffmpeg_args, is_valid_asset,
+        HLS_SEGMENT_DURATION_TICKS, SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache,
+        ffmpeg_args, is_valid_asset, vod_manifest,
     };
+
+    #[test]
+    fn vod_manifest_declares_the_complete_runtime() {
+        let manifest = vod_manifest(9 * 10_000_000 + 5_000_000).expect("positive runtime");
+
+        assert!(manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
+        assert!(manifest.contains("#EXT-X-ENDLIST\n"));
+        assert_eq!(manifest.matches("#EXTINF:").count(), 3);
+        assert_eq!(manifest.matches("segment_").count(), 3);
+        assert!(manifest.contains("#EXTINF:4.000000,"));
+        assert!(manifest.contains("#EXTINF:1.500000,"));
+        assert!(manifest.contains("#EXT-X-TARGETDURATION:4\n"));
+        assert_eq!(HLS_SEGMENT_DURATION_TICKS, 4 * 10_000_000);
+    }
 
     #[test]
     fn remux_arguments_copy_video_and_audio_into_cmaf_hls() {
@@ -695,6 +806,7 @@ mod tests {
                 Path::new("input.mkv"),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -745,6 +857,7 @@ mod tests {
                 Path::new("input.mkv"),
                 None,
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -775,6 +888,7 @@ mod tests {
                 "low-space",
                 ServerTier::Remux,
                 Path::new("input.mkv"),
+                None,
                 None,
                 None,
             )

@@ -118,7 +118,16 @@ pub(super) async fn emby_playback_info(
         let Some(source) = sources.first() else {
             return StatusCode::NOT_FOUND.into_response();
         };
-        match create_emby_transcoding_session(&state, &user, &item.id, source, &request).await {
+        match create_emby_transcoding_session(
+            &state,
+            &user,
+            &item.id,
+            source,
+            &request,
+            runtime_ticks,
+        )
+        .await
+        {
             Ok(session) => session,
             Err(status) => return status.into_response(),
         }
@@ -690,6 +699,7 @@ async fn create_emby_transcoding_session(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     request: &EmbyPlaybackInfoRequest,
+    runtime_ticks: Option<i64>,
 ) -> Result<Option<CreatedWebPlaybackSession>, StatusCode> {
     if source.source_kind != "LOCAL_FILE" {
         return Ok(None);
@@ -719,6 +729,9 @@ async fn create_emby_transcoding_session(
             Err(LocalPathError::Forbidden) => return Err(StatusCode::FORBIDDEN),
         };
     let video_bitrate = emby_transcoding_video_bitrate(source, request);
+    let stream_runtime_ticks = runtime_ticks
+        .map(|ticks| ticks.saturating_sub(request.start_time_ticks.unwrap_or_default().max(0)))
+        .filter(|ticks| *ticks > 0);
     let created = service
         .create_and_start_emby_hls(
             CreateWebPlaybackSession {
@@ -733,6 +746,7 @@ async fn create_emby_transcoding_session(
             &input,
             video_bitrate,
             request.start_time_ticks,
+            stream_runtime_ticks,
         )
         .await
         .map_err(emby_playback_session_error_status)?;
@@ -2261,11 +2275,18 @@ async fn serve_emby_transcoding_asset(
             Ok(path) => path,
             Err(error) => return emby_playback_session_error_status(error).into_response(),
         };
-        let Ok(bytes) = fs::read(path).await else {
-            return StatusCode::NOT_FOUND.into_response();
-        };
-        let Ok(manifest) = String::from_utf8(bytes) else {
-            return StatusCode::BAD_GATEWAY.into_response();
+        let manifest = match service.hls_vod_manifest(session_id).await {
+            Ok(Some(manifest)) => manifest,
+            Ok(None) => {
+                let Ok(bytes) = fs::read(path).await else {
+                    return StatusCode::NOT_FOUND.into_response();
+                };
+                let Ok(manifest) = String::from_utf8(bytes) else {
+                    return StatusCode::BAD_GATEWAY.into_response();
+                };
+                manifest
+            }
+            Err(error) => return emby_playback_session_error_status(error).into_response(),
         };
         let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
             emby_transcoding_asset_url(
@@ -2292,7 +2313,7 @@ async fn serve_emby_transcoding_asset(
             })
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
-    let path = match service.hls_asset_path(session_id, asset).await {
+    let path = match service.wait_for_hls_asset(session_id, asset).await {
         Ok(path) => path,
         Err(error) => return emby_playback_session_error_status(error).into_response(),
     };

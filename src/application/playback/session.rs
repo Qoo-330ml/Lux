@@ -267,6 +267,7 @@ impl WebPlaybackSessionService {
         media_path: &std::path::Path,
         video_bitrate: Option<i64>,
         start_time_ticks: Option<i64>,
+        runtime_ticks: Option<i64>,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
         let _start_guard = self.emby_start_lock.lock().await;
         let user_id = input.user_id.to_owned();
@@ -302,12 +303,13 @@ impl WebPlaybackSessionService {
             }
         }
         if let Err(error) = self
-            .start_hls(
+            .start_hls_with_runtime(
                 &created.id,
                 tier,
                 media_path,
                 video_bitrate,
                 start_time_ticks,
+                runtime_ticks,
             )
             .await
         {
@@ -397,8 +399,35 @@ impl WebPlaybackSessionService {
         video_bitrate: Option<i64>,
         start_time_ticks: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
+        self.start_hls_with_runtime(
+            session_id,
+            tier,
+            input,
+            video_bitrate,
+            start_time_ticks,
+            None,
+        )
+        .await
+    }
+
+    async fn start_hls_with_runtime(
+        &self,
+        session_id: &str,
+        tier: ServerTier,
+        input: &std::path::Path,
+        video_bitrate: Option<i64>,
+        start_time_ticks: Option<i64>,
+        runtime_ticks: Option<i64>,
+    ) -> Result<(), WebPlaybackSessionError> {
         self.hls
-            .start(session_id, tier, input, video_bitrate, start_time_ticks)
+            .start(
+                session_id,
+                tier,
+                input,
+                video_bitrate,
+                start_time_ticks,
+                runtime_ticks,
+            )
             .await?;
         let directory = self.hls.session_directory(session_id).await?;
         let now = unix_timestamp();
@@ -424,6 +453,21 @@ impl WebPlaybackSessionService {
                 Err(error.into())
             }
         }
+    }
+
+    pub(crate) async fn hls_vod_manifest(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<String>, WebPlaybackSessionError> {
+        Ok(self.hls.vod_manifest(session_id).await?)
+    }
+
+    pub(crate) async fn wait_for_hls_asset(
+        &self,
+        session_id: &str,
+        asset: &str,
+    ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
+        Ok(self.hls.wait_for_asset(session_id, asset).await?)
     }
 
     pub(crate) async fn hls_asset_path(
@@ -993,6 +1037,7 @@ while :; do sleep 1; done
                 Path::new("input.mkv"),
                 Some(1_000_000),
                 None,
+                None,
             )
             .await?;
         assert!(matches!(
@@ -1016,6 +1061,7 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(2_000_000),
+                None,
                 None,
             )
             .await?;

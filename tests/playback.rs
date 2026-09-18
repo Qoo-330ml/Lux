@@ -635,6 +635,8 @@ mkdir -p \"$directory\"
 printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' > \"$manifest\"
 printf init > \"$directory/init.mp4\"
 printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
+sleep 0.2
+printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000001/')\"
 ",
     )
     .await?;
@@ -886,7 +888,10 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .send()
         .await?;
     assert_eq!(device_profile_manifest.status(), reqwest::StatusCode::OK);
-    assert!(device_profile_manifest.text().await?.contains("#EXTM3U"));
+    let device_profile_manifest = device_profile_manifest.text().await?;
+    assert!(device_profile_manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
+    assert!(device_profile_manifest.contains("#EXT-X-ENDLIST\n"));
+    assert!(device_profile_manifest.contains("#EXTINF:2.335900,"));
     let device_profile_play_session_id = device_profile_body["PlaySessionId"]
         .as_str()
         .ok_or("missing DeviceProfile play session")?
@@ -1058,6 +1063,11 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .await?;
     assert_eq!(manifest.status(), reqwest::StatusCode::OK);
     let manifest = manifest.text().await?;
+    assert!(manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
+    assert!(manifest.contains("#EXT-X-ENDLIST\n"));
+    assert_eq!(manifest.matches("segment_").count(), 1_474);
+    assert!(manifest.contains("#EXTINF:4.000000,"));
+    assert!(manifest.contains("#EXTINF:2.336000,"));
     let init_url = manifest
         .split("URI=\"")
         .nth(1)
@@ -1067,6 +1077,11 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .lines()
         .find(|line| line.contains("/transcoding/") && line.contains(".m4s?"))
         .ok_or("missing signed segment URL")?;
+    let second_segment_url = manifest
+        .lines()
+        .filter(|line| line.contains("/transcoding/") && line.contains(".m4s?"))
+        .nth(1)
+        .ok_or("missing signed second segment URL")?;
     let init = client.get(format!("{base_url}{init_url}")).send().await?;
     assert_eq!(init.status(), reqwest::StatusCode::OK);
     assert_eq!(init.bytes().await?.as_ref(), b"init");
@@ -1076,6 +1091,12 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .await?;
     assert_eq!(segment.status(), reqwest::StatusCode::OK);
     assert_eq!(segment.bytes().await?.as_ref(), b"segment");
+    let second_segment = client
+        .get(format!("{base_url}{second_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(second_segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(second_segment.bytes().await?.as_ref(), b"segment");
 
     let before_heartbeat: i64 =
         sqlx::query_scalar("SELECT expires_at FROM web_playback_sessions WHERE id = ?")

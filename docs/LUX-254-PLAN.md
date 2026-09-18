@@ -55,7 +55,9 @@
     `SupportsDirectPlay`/`SupportsDirectStream` 置为 `false`，避免客户端绕过该 URL。
   - `.strm` source 保持 `SupportsTranscoding=false`，不返回 `TranscodingUrl`。
 - `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，缺失时回退到媒体项时长。
-  HLS 清单保留 `hls_list_size=0` 以支持可边转边播的动态 playlist，转码完成前不提前写入 `ENDLIST` 或声明 VOD 类型。
+  Emby HLS 清单必须按完整 `RunTimeTicks` 生成 `#EXT-X-PLAYLIST-TYPE:VOD`、完整分片列表和
+  `#EXT-X-ENDLIST`，使第三方客户端立即获得完整时间轴；FFmpeg 仍以增量方式生成分片，尚未生成的签名分片请求由服务端等待。
+  Lux Web 的内部 HLS 清单仍保持原有动态追加行为，不复用 Emby 的 VOD 清单。
 
 ### 转码资源
 

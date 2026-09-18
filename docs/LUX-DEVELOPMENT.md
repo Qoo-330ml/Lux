@@ -1346,7 +1346,8 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
   `.strm` 始终返回 `SupportsTranscoding=false`。
 - MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
 - `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，
-  缺失时回退到媒体项时长。HLS 清单仍保持可边转边播的动态 playlist，不通过提前写入 `ENDLIST` 冒充 VOD。
+  缺失时回退到媒体项时长。Emby 兼容 HLS 清单按完整媒体时长生成 VOD 时间轴、完整分片列表和
+  `ENDLIST`；尚未生成的分片请求由服务端等待。Lux Web 的内部 HLS 清单仍保持动态追加，不复用 Emby VOD 清单。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
 - `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。
