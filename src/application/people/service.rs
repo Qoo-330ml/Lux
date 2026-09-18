@@ -930,6 +930,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nfo_actor_without_identity_keeps_the_existing_profile_after_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind("item-1")
+        .bind(library.id.to_string())
+        .bind("测试电影")
+        .bind("测试电影")
+        .execute(database.pool())
+        .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let identified_actor = ActorCredit {
+            id: "57975".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "华晨宇".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        let identities = super::actor_identities(&identified_actor, "tmdb");
+        let person_id = service
+            .resolve_person_key(&identified_actor, &identities, None)
+            .await?
+            .ok_or("missing canonical person")?;
+        let person_dir = lux_person_directory(&config.config_dir, "华晨宇", &person_id)?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        tokio::fs::write(person_dir.join("folder.png"), PNG_1X1).await?;
+
+        service
+            .persist_item_actors("item-1", "tmdb", &[identified_actor])
+            .await?;
+        assert_eq!(
+            service.list_item_actors("item-1").await?[0]
+                .image_url
+                .as_deref(),
+            Some("/api/v1/people/57975/image")
+        );
+
+        let nfo_actor_without_identity = ActorCredit {
+            id: String::new(),
+            provider: None,
+            identities: Vec::new(),
+            name: "华晨宇".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &[nfo_actor_without_identity], &[1, 2, 3])
+            .await?;
+
+        let restarted = PeopleService::new(config.config_dir.clone()).with_database(database);
+        assert_eq!(
+            restarted.list_item_actors("item-1").await?[0]
+                .image_url
+                .as_deref(),
+            Some("/api/v1/people/57975/image")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn legacy_person_migration_stays_completed_when_manifest_restore_requeues()
     -> Result<(), Box<dyn std::error::Error>> {
         let config_dir = tempfile::tempdir()?;

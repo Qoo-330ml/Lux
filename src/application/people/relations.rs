@@ -321,7 +321,7 @@ impl PeopleService {
             if actor.name.trim().is_empty() {
                 continue;
             }
-            let identities = actor_identities(actor, &provider);
+            let mut identities = actor_identities(actor, &provider);
             let primary = identities.first();
             let actor_id = primary
                 .map(|identity| identity.id.as_str())
@@ -411,6 +411,31 @@ impl PeopleService {
             let bridge_person_key = (bridge_candidates.len() == 1)
                 .then(|| bridge_candidates[0].person_key.as_deref())
                 .flatten();
+            if identities.is_empty()
+                && let Some(previous) = bridge_candidates
+                    .first()
+                    .filter(|_| bridge_candidates.len() == 1)
+            {
+                identities = previous.identities.clone();
+                if identities.is_empty()
+                    && let (Some(id), provider) =
+                        (previous.id.as_deref(), previous.provider.as_str())
+                    && is_valid_person_id(id)
+                    && is_valid_person_id(provider)
+                {
+                    identities.push(PersonIdentity {
+                        provider: provider.to_owned(),
+                        id: id.to_owned(),
+                    });
+                }
+            }
+            let primary = identities.first();
+            let actor_id = primary
+                .map(|identity| identity.id.as_str())
+                .unwrap_or_default();
+            let actor_provider = primary
+                .map(|identity| identity.provider.as_str())
+                .unwrap_or_default();
             let person_key = self
                 .resolve_person_key(actor, &identities, bridge_person_key)
                 .await?;
@@ -457,7 +482,12 @@ impl PeopleService {
                 order: actor.order,
                 image_file: assets.image_file,
                 pending_assets: assets.pending_assets,
-                person: actor.person.clone(),
+                person: actor.person.clone().or_else(|| {
+                    bridge_candidates
+                        .first()
+                        .filter(|_| bridge_candidates.len() == 1)
+                        .and_then(|previous| previous.person.clone())
+                }),
             });
         }
 
