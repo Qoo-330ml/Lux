@@ -1037,6 +1037,21 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .strip_prefix("lux-emby:")
         .ok_or("invalid transcoding play session")?;
 
+    let stale_stop_without_session_id = client
+        .post(format!("{base_url}/Sessions/Playing/Stopped"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PositionTicks": 0
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        stale_stop_without_session_id.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+
     let manifest = client
         .get(format!("{base_url}{transcoding_url}"))
         .send()
@@ -1111,6 +1126,7 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
         .json(&json!({
             "ItemId": emby_item_id,
             "MediaSourceId": source_id,
+            "PlaySessionId": play_session_id,
             "PositionTicks": 0
         }))
         .send()
