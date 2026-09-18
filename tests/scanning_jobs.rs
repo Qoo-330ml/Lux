@@ -708,6 +708,12 @@ async fn completed_scan_enqueues_new_media_once_for_webhook_destinations()
         serde_json::from_str::<serde_json::Value>(&scan_completed_payload)?;
     assert_eq!(scan_completed_payload["status"], "COMPLETED");
     assert_eq!(scan_completed_payload["processedCount"], 1);
+    assert_eq!(scan_completed_payload["libraryName"], "Movies");
+    assert!(
+        scan_completed_payload["durationSeconds"]
+            .as_i64()
+            .is_some_and(|duration| duration >= 0)
+    );
 
     let second = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&second.id, 100, None).await?;

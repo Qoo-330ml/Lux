@@ -4650,13 +4650,25 @@ impl ScanJobService {
             .and_then(|duration| i64::try_from(duration.as_secs()).ok())
             .unwrap_or(0);
         let dedupe_key = format!("scan:{}:{}", job.id, event_type.as_str());
+        let library_name = self
+            .database
+            .find_library(&job.library_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|library| library.name);
+        let duration_seconds = job
+            .started_at
+            .map(|started_at| occurred_at.saturating_sub(started_at));
         let mut data = json!({
             "jobId": job.id,
             "libraryId": job.library_id,
+            "libraryName": library_name,
             "jobType": job.job_type,
             "status": job.status,
             "processedCount": job.processed_count,
             "totalCount": job.total_count,
+            "durationSeconds": duration_seconds,
             "errorCode": error_code,
         });
         if let (Value::Object(data), Value::Object(extra)) = (&mut data, extra) {

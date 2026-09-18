@@ -1307,8 +1307,8 @@ fn emby_event_name(event_type: WebhookEventType) -> &'static str {
 
 fn event_field_allowed(event_type: WebhookEventType, key: &str) -> bool {
     match key {
-        "jobId" | "libraryId" | "jobType" | "status" | "processedCount" | "totalCount"
-        | "errorCode" => matches!(
+        "jobId" | "libraryId" | "libraryName" | "jobType" | "status" | "processedCount"
+        | "totalCount" | "durationSeconds" | "errorCode" => matches!(
             event_type,
             WebhookEventType::MediaAdded
                 | WebhookEventType::MediaRemoved
@@ -1792,6 +1792,34 @@ mod tests {
         assert_eq!(payload["timestamp"], "2023-11-14T22:13:20Z");
         assert!(payload.get("path").is_none());
         assert!(payload.get("externalUrl").is_none());
+    }
+
+    #[test]
+    fn scan_display_fields_include_human_readable_summary_and_duration() {
+        let payload = build_event_payload(
+            "server-1",
+            "event-scan-display",
+            WebhookEventType::ScanCompleted,
+            1_700_000_000,
+            json!({
+                "libraryId": "library-1",
+                "libraryName": "电影库",
+                "jobType": "RECONCILE_LIBRARY",
+                "status": "COMPLETED",
+                "processedCount": 12_480,
+                "totalCount": 12_480,
+                "durationSeconds": 3_661,
+            }),
+        )
+        .expect("scan display payload should be accepted");
+        assert_eq!(payload["title"], "电影库扫描完成");
+        assert_eq!(
+            payload["content"],
+            "扫描已完成\n媒体库：电影库\n任务：全量校验\n处理：12,480 / 12,480 项\n状态：已完成\n总耗时：1小时1分1秒"
+        );
+        assert_eq!(payload["body"], payload["content"]);
+        assert_eq!(payload["libraryName"], "电影库");
+        assert_eq!(payload["durationSeconds"], 3_661);
     }
 
     #[test]

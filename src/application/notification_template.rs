@@ -40,11 +40,20 @@ fn readable_title(event_type: &str, data: &Map<String, Value>) -> String {
     match event_type {
         "MEDIA_ADDED" => "媒体新增".to_owned(),
         "MEDIA_REMOVED" => "媒体移除".to_owned(),
-        "SCAN_COMPLETED" => "扫描完成".to_owned(),
-        "SCAN_FAILED" => "扫描失败".to_owned(),
+        "SCAN_COMPLETED" => scan_title("扫描完成", data),
+        "SCAN_FAILED" => scan_title("扫描失败", data),
         "METADATA_UPDATED" => "元数据更新".to_owned(),
         "JOB_FAILED" => "后台任务失败".to_owned(),
         _ => "Lux 通知".to_owned(),
+    }
+}
+
+fn scan_title(action: &str, data: &Map<String, Value>) -> String {
+    let library = string_value(data, "libraryName");
+    if library.is_empty() {
+        action.to_owned()
+    } else {
+        format!("{library}{action}")
     }
 }
 
@@ -68,12 +77,59 @@ fn readable_content(event_type: &str, data: &Map<String, Value>) -> String {
         "JOB_FAILED" => lines.push("后台任务执行失败".to_owned()),
         _ => lines.push("收到新的 Lux 事件".to_owned()),
     }
-    append_labeled_value(&mut lines, "媒体库", data, "libraryId");
-    append_labeled_value(&mut lines, "任务", data, "jobType");
-    append_labeled_value(&mut lines, "状态", data, "status");
+    append_library_value(&mut lines, data);
+    append_mapped_value(&mut lines, "任务", data, "jobType", job_type_label);
+    if matches!(event_type, "SCAN_COMPLETED" | "SCAN_FAILED") {
+        append_scan_progress(&mut lines, data);
+    }
+    append_mapped_value(&mut lines, "状态", data, "status", status_label);
+    if matches!(event_type, "SCAN_COMPLETED" | "SCAN_FAILED") {
+        append_optional_duration(&mut lines, data);
+    }
     append_labeled_value(&mut lines, "错误", data, "errorCode");
     append_labeled_value(&mut lines, "候选", data, "candidateCount");
     lines.join("\n")
+}
+
+fn append_scan_progress(lines: &mut Vec<String>, data: &Map<String, Value>) {
+    let Some(processed) = number_value_optional(data, "processedCount") else {
+        return;
+    };
+    let total = number_value_optional(data, "totalCount");
+    let text = match total.filter(|value| *value > 0) {
+        Some(total) => format!(
+            "处理：{} / {} 项",
+            format_count(processed),
+            format_count(total)
+        ),
+        None => format!("处理：{} 项", format_count(processed)),
+    };
+    lines.push(text);
+}
+
+fn append_optional_duration(lines: &mut Vec<String>, data: &Map<String, Value>) {
+    if let Some(seconds) = number_value_optional(data, "durationSeconds") {
+        lines.push(format!("总耗时：{}", format_duration(seconds)));
+    }
+}
+
+fn job_type_label(value: &str) -> String {
+    match value {
+        "RECONCILE_LIBRARY" => "全量校验".to_owned(),
+        "INCREMENTAL_SCAN" => "增量扫描".to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
+fn status_label(value: &str) -> String {
+    match value {
+        "PENDING" => "等待中".to_owned(),
+        "RUNNING" => "进行中".to_owned(),
+        "COMPLETED" => "已完成".to_owned(),
+        "FAILED" => "失败".to_owned(),
+        "CANCELLED" => "已取消".to_owned(),
+        _ => value.to_owned(),
+    }
 }
 
 fn playback_content(event_type: &str, data: &Map<String, Value>) -> String {
@@ -170,6 +226,12 @@ fn number_value(data: &Map<String, Value>, key: &str) -> i64 {
         .max(0)
 }
 
+fn number_value_optional(data: &Map<String, Value>, key: &str) -> Option<i64> {
+    data.get(key)
+        .and_then(Value::as_i64)
+        .map(|value| value.max(0))
+}
+
 fn append_labeled_value(
     lines: &mut Vec<String>,
     label: &str,
@@ -180,6 +242,65 @@ fn append_labeled_value(
     if !value.is_empty() {
         lines.push(format!("{label}：{value}"));
     }
+}
+
+fn append_library_value(lines: &mut Vec<String>, data: &Map<String, Value>) {
+    let library_name = string_value(data, "libraryName");
+    let value = if library_name.is_empty() {
+        string_value(data, "libraryId")
+    } else {
+        library_name
+    };
+    if !value.is_empty() {
+        lines.push(format!("媒体库：{value}"));
+    }
+}
+
+fn append_mapped_value(
+    lines: &mut Vec<String>,
+    label: &str,
+    data: &Map<String, Value>,
+    key: &str,
+    mapper: fn(&str) -> String,
+) {
+    let value = string_value(data, key);
+    if !value.is_empty() {
+        lines.push(format!("{label}：{}", mapper(&value)));
+    }
+}
+
+fn format_count(value: i64) -> String {
+    let value = value.max(0).to_string();
+    let mut result = String::with_capacity(value.len() + value.len() / 3);
+    for (index, character) in value.chars().rev().enumerate() {
+        if index > 0 && index % 3 == 0 {
+            result.push(',');
+        }
+        result.push(character);
+    }
+    result.chars().rev().collect()
+}
+
+fn format_duration(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    let days = seconds / 86_400;
+    let hours = (seconds % 86_400) / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    let seconds = seconds % 60;
+    let mut parts = Vec::new();
+    if days > 0 {
+        parts.push(format!("{days}天"));
+    }
+    if hours > 0 || days > 0 {
+        parts.push(format!("{hours}小时"));
+    }
+    if minutes > 0 || hours > 0 || days > 0 {
+        parts.push(format!("{minutes}分"));
+    }
+    if seconds > 0 || parts.is_empty() {
+        parts.push(format!("{seconds}秒"));
+    }
+    parts.concat()
 }
 
 fn format_bytes(value: Option<i64>) -> Option<String> {
