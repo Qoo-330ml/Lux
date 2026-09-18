@@ -17,6 +17,23 @@ struct BatchHierarchyRow {
     identity_key: String,
 }
 
+fn parse_folder_identity_key(value: &str) -> Option<(String, String)> {
+    let value = value.strip_prefix("folder:")?;
+    let (library_root_id, relative_path) = value.split_once(':')?;
+    if library_root_id.is_empty()
+        || library_root_id.contains(['/', '\\'])
+        || relative_path.is_empty()
+        || relative_path.contains('\\')
+        || relative_path.starts_with('/')
+        || relative_path
+            .split('/')
+            .any(|component| component.is_empty() || component == "." || component == "..")
+    {
+        return None;
+    }
+    Some((library_root_id.to_owned(), relative_path.to_owned()))
+}
+
 fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
     let scraper_id = row.get::<Option<String>, _>("scraper_id");
     let series_scraper_id = row
@@ -136,6 +153,125 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn find_folder_scan_path(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredItemScanPath>, StorageError> {
+        let Some((library_id, identity_key)) = self
+            .query(
+                "SELECT mi.library_id, mi.identity_key
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.id = ? AND mi.item_type = 'FOLDER'
+                   AND mi.removed_at IS NULL
+                   AND mi.identity_key IS NOT NULL
+                 LIMIT 1",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .map(|row| {
+                (
+                    row.get::<String, _>("library_id"),
+                    row.get::<String, _>("identity_key"),
+                )
+            })
+        else {
+            return Ok(None);
+        };
+        let Some((library_root_id, relative_path)) = parse_folder_identity_key(&identity_key)
+        else {
+            return Ok(None);
+        };
+        let Some(root) = self.find_library_root(&library_root_id).await? else {
+            return Ok(None);
+        };
+        if root.library_id != library_id {
+            return Ok(None);
+        }
+        Ok(Some(StoredItemScanPath {
+            library_id,
+            library_root_id,
+            relative_path,
+        }))
+    }
+
+    pub(crate) async fn list_folder_scan_paths_page(
+        &self,
+        library_ids: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<(Vec<StoredFolderScanPath>, i64), StorageError> {
+        if library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let placeholders = std::iter::repeat_n("?", library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let total_query = format!(
+            "SELECT COUNT(*)
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.library_id IN ({placeholders}) AND mi.item_type = 'FOLDER'
+               AND mi.removed_at IS NULL
+               AND mi.identity_key LIKE 'folder:%'"
+        );
+        let mut total_statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(total_query));
+        for library_id in library_ids {
+            total_statement = total_statement.bind(library_id);
+        }
+        let total = total_statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows_query = format!(
+            "SELECT mi.id, mi.library_id, mi.parent_id, mi.title, mi.identity_key
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.library_id IN ({placeholders}) AND mi.item_type = 'FOLDER'
+               AND mi.removed_at IS NULL
+               AND mi.identity_key LIKE 'folder:%'
+             ORDER BY mi.identity_key, mi.id
+             LIMIT ? OFFSET ?"
+        );
+        let mut rows_statement = self.query(sqlx::AssertSqlSafe(rows_query));
+        for library_id in library_ids {
+            rows_statement = rows_statement.bind(library_id);
+        }
+        let rows = rows_statement
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .bind(offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let folders = rows
+            .into_iter()
+            .filter_map(|row| {
+                let (library_root_id, relative_path) =
+                    parse_folder_identity_key(row.get("identity_key"))?;
+                Some(StoredFolderScanPath {
+                    id: row.get("id"),
+                    library_id: row.get("library_id"),
+                    parent_id: row.get("parent_id"),
+                    title: row.get("title"),
+                    library_root_id,
+                    relative_path,
+                })
+            })
+            .collect();
+        Ok((folders, total))
     }
 
     pub(crate) async fn find_item_source_locator(
@@ -2294,5 +2430,33 @@ impl Database {
             rows.into_iter().map(|row| row.get("item_id")).collect(),
             total,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_folder_identity_key;
+
+    #[test]
+    fn parses_folder_identity_into_root_and_relative_path() {
+        assert_eq!(
+            parse_folder_identity_key("folder:root-1:Movies/Dune"),
+            Some(("root-1".to_owned(), "Movies/Dune".to_owned()))
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_or_unsafe_folder_identity() {
+        for value in [
+            "",
+            "movie:root-1:Movies/Dune",
+            "folder::Movies/Dune",
+            "folder:root-1:",
+            "folder:root-1:../outside",
+            r"folder:root-1:foo\..\outside",
+            "folder:root-1:/absolute",
+        ] {
+            assert_eq!(parse_folder_identity_key(value), None, "{value}");
+        }
     }
 }

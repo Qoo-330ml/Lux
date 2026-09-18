@@ -382,6 +382,106 @@ pub(super) async fn emby_library_virtual_folders(
     }
 }
 
+pub(super) async fn emby_library_media_folders(
+    headers: HeaderMap,
+    Query(query): Query<EmbyMediaFoldersQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (offset, limit) = match emby_media_folder_page_params(&query) {
+        Ok(params) => params,
+        Err(status) => return status.into_response(),
+    };
+    let library_ids = match query.library_id.as_deref().or(query.parent_id.as_deref()) {
+        Some(public_id) => {
+            let library_id = emby_internal_id(public_id);
+            if !accessible_library_ids.iter().any(|id| id == &library_id) {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            vec![library_id]
+        }
+        None => accessible_library_ids,
+    };
+    let mut root_paths = HashMap::new();
+    for library_id in &library_ids {
+        let roots = match database.list_library_roots(library_id).await {
+            Ok(roots) => roots,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        root_paths.extend(roots.into_iter().map(|root| (root.id, root.display_path)));
+    }
+    let (folders, total) = match database
+        .list_folder_scan_paths_page(&library_ids, offset, limit)
+        .await
+    {
+        Ok(result) => result,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let items = folders
+        .into_iter()
+        .filter_map(|folder| {
+            let root_path = root_paths.get(&folder.library_root_id)?;
+            let path = PathBuf::from(root_path).join(&folder.relative_path);
+            Some(json!({
+                "Name": folder.title,
+                "Id": emby_public_id(&folder.id),
+                "ParentId": emby_public_id(folder.parent_id.as_deref().unwrap_or(&folder.library_id)),
+                "Path": path.to_string_lossy(),
+                "Type": "Folder",
+                "IsFolder": true,
+                "MediaType": "Video",
+                "LibraryId": emby_public_id(&folder.library_id),
+            }))
+        })
+        .collect::<Vec<_>>();
+    Json(json!({
+        "Items": items,
+        "TotalRecordCount": total,
+        "StartIndex": offset,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyMediaFoldersQuery {
+    #[serde(flatten)]
+    pub(super) auth: EmbyTokenQuery,
+    #[serde(rename = "LibraryId", alias = "libraryId", default)]
+    pub(super) library_id: Option<String>,
+    #[serde(rename = "ParentId", alias = "parentId", default)]
+    pub(super) parent_id: Option<String>,
+    #[serde(rename = "StartIndex", alias = "startIndex", default)]
+    pub(super) start_index: Option<i64>,
+    #[serde(rename = "Limit", alias = "limit", default)]
+    pub(super) limit: Option<i64>,
+}
+
+fn emby_media_folder_page_params(query: &EmbyMediaFoldersQuery) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(100);
+    if offset < 0 || !(1..=100).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((offset, limit))
+}
+
 pub(super) async fn emby_persons(
     headers: HeaderMap,
     Query(query): Query<EmbyPersonsQuery>,

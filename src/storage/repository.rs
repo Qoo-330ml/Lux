@@ -2345,6 +2345,16 @@ pub(crate) struct StoredItemScanPath {
     pub(crate) relative_path: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredFolderScanPath {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) parent_id: Option<String>,
+    pub(crate) title: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+}
+
 pub(crate) struct StoredPlaybackSource {
     pub(crate) source_id: String,
     pub(crate) source_kind: String,

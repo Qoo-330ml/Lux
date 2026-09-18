@@ -17,6 +17,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Users/authenticatebyname", post(emby_authenticate))
         .route("/Users/New", post(emby_create_user))
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
+        .route("/Library/MediaFolders", get(emby_library_media_folders))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
         .route(
@@ -72,6 +73,7 @@ pub(super) fn api_routes() -> Router<AppState> {
                 .post(emby_update_item)
                 .delete(emby_delete_item),
         )
+        .route("/Items/{item_id}/Refresh", post(emby_refresh_item))
         .route("/Items/{item_id}/Children", get(emby_collection_children))
         .route("/api/danmu/{item_id}", get(emby_danmaku_info))
         .route("/api/danmu/{item_id}/raw", get(emby_danmaku_raw))

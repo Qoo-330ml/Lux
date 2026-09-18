@@ -61,6 +61,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`；成功后自动创建异步扫描任务并返回 `scanJob`，扫描完成后若配置刮削器会继续自动匹配元数据。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：授予或撤销普通用户访问媒体库。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
+- `POST /api/v1/admin/libraries/{libraryId}/scan-path`：管理员按媒体库根目录下的相对路径创建局部 `INCREMENTAL_SCAN`。请求体为 `{ "rootId": "<libraryRootId>", "path": "Movies/NewMovie", "recursive": true }`；单根媒体库可省略 `rootId`，多根媒体库必须提供。`path` 必须是非空的库内相对路径，不接受 `.`, `..`、绝对路径、反斜杠穿越或 Windows 盘符；当前 `recursive` 必须为 `true`。接口只入队路径并返回 202，不在 HTTP 请求中扫描目录。
 - `POST /api/v1/admin/libraries/{libraryId}/reconcile`：按当前库配置创建并异步执行一次调和扫描；已停用或不存在的媒体库返回 404。
 - `POST /api/v1/admin/jobs/{jobId}/cancel`：请求取消扫描任务，返回 202。
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
@@ -207,6 +208,8 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 
 - `GET /Items/Counts`：返回当前用户可见媒体条目的 Emby 统计字段；支持 `UserId` 指定目标用户和 `IsFavorite=true|false` 按目标用户收藏状态过滤。Lux 当前支持电影、剧集、单集和合集计数，其余 Emby 类型返回 0；`ItemCount` 为过滤后所有可见目录条目（包含季度等层级条目）的总数。
 - `GET /Library/VirtualFolders`：管理员获取 Emby 兼容的媒体库列表；返回完整的 `VirtualFolderInfo` 主要字段，包括 `Name`、`Locations`、`CollectionType`、`LibraryOptions`、`Id`、`Guid`、`ItemId`、`PrimaryImageItemId` 和刷新状态。`Id`、`Guid`、`ItemId` 使用同一个稳定的媒体库 ID，`LibraryOptions` 包含 `PathInfos`、`TypeOptions`、NFO/字幕/图片策略以及播放恢复阈值，并从 Lux 的全局或媒体库策略映射。支持根路径及 `/emby` 前缀，并接受共享 API Key。
+- `GET /Library/MediaFolders?LibraryId={libraryId}&StartIndex=0&Limit=100`：管理员获取指定媒体库中已经登记的物理 `FOLDER` 条目，返回分页的 `Items`、`TotalRecordCount` 和 `StartIndex`。每个条目提供稳定的 Emby `Id`、`Name`、`ParentId`、`Path` 和 `Type=Folder`；`LibraryId`/`ParentId` 均可作为媒体库筛选参数，根路径及 `/emby` 前缀均支持。该接口只读取 Lux 索引，不为尚未扫描过的新目录临时创建 FOLDER。
+- `POST /Items/{itemId}/Refresh`：管理员或共享管理员 API Key 异步触发局部刷新；`itemId` 为已登记的 `FOLDER` 时只扫描该 FOLDER 对应目录及其后代，`itemId` 为媒体库 ID 时按所有配置根目录执行根目录级增量兜底。请求可省略 body；`Recursive=false` 当前返回 422。成功返回 202 和 `{ "scope": "FOLDER|LIBRARY_ROOT", "job": ... }`，不会同步扫描或创建整库调和任务。
 - `GET /Persons?ParentId={libraryId}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=50`：返回指定媒体库中去重后的演员列表，使用 Emby 风格的 `Items` 和 `TotalRecordCount`；顶层不额外返回 `StartIndex`。支持 `Fields`、`SortBy=Name|DateCreated`、`SortOrder=Ascending|Descending`，`Limit` 接受任意正整数且不设置服务端硬上限；演员项使用 `Type=Person`，并包含 `ServerId`、`ImageTags`、`BackdropImageTags`、`Name`、稳定 `Id`、`Role`、`DateCreated`、人物简介/生日等字段和可用的 `PrimaryImageTag`。`Recursive=true` 聚合媒体库所有后代条目，`Recursive=false` 只聚合直接子条目；未传 `Recursive` 时为兼容旧客户端按递归查询处理。支持根路径及 `/emby` 前缀，接受 Emby token 或共享 API Key；`ParentId` 必须是当前用户可访问的媒体库 ID，列表查询使用持久化人物关系索引，不在请求中扫描媒体目录。
 - `GET /Users/{userId}/Views`：返回电影媒体库视图。
 - `GET /Users/{userId}/Items/Root`、`GET /Items/Root?userId={userId}`：返回用户虚拟根目录；将该根 ID 作为 `ParentId` 并请求 `IncludeItemTypes=CollectionFolder` 时返回当前用户可见的媒体库文件夹。

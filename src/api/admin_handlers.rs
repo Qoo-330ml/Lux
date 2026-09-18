@@ -37,6 +37,19 @@ pub(crate) struct AddLibraryRootRequest {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ScanPathRequest {
+    pub(crate) root_id: Option<String>,
+    pub(crate) path: String,
+    #[serde(default = "default_recursive_scan")]
+    pub(crate) recursive: bool,
+}
+
+fn default_recursive_scan() -> bool {
+    true
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct UpdateLibraryRequest {
     pub(crate) name: Option<String>,
     pub(crate) kind: Option<String>,
@@ -1011,6 +1024,100 @@ pub(crate) async fn admin_start_scan(
     (
         StatusCode::ACCEPTED,
         Json(json!({ "job": scan_job_json(&job) })),
+    )
+        .into_response()
+}
+
+pub(crate) async fn admin_start_library_path_scan(
+    headers: HeaderMap,
+    Path(library_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<ScanPathRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if !request.recursive {
+        return api_error(
+            &headers,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            lux::ApiErrorCode::InvalidRequest,
+            "按路径刷新暂只支持递归扫描",
+        )
+        .into_response();
+    }
+    let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体库 ID 无效",
+        )
+        .into_response();
+    };
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let job = match scan_jobs
+        .create_path_scan_job(library_id, request.root_id.as_deref(), &request.path)
+        .await
+    {
+        Ok(job) => job,
+        Err(ScanJobError::LibraryNotFound) => {
+            return api_error(
+                &headers,
+                StatusCode::NOT_FOUND,
+                lux::ApiErrorCode::NotFound,
+                "媒体库不存在",
+            )
+            .into_response();
+        }
+        Err(ScanJobError::Scanner(
+            ScannerError::InvalidRootId(_) | ScannerError::InvalidRelativePath(_),
+        )) => {
+            return api_error(
+                &headers,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                lux::ApiErrorCode::InvalidRequest,
+                "扫描根目录或相对路径无效",
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let worker = scan_jobs.clone();
+    let job_id = job.id.clone();
+    let probe = state.probe.clone();
+    let metadata = state.metadata_reidentify.clone();
+    let thumbnails = state.thumbnails.clone();
+    tokio::spawn(async move {
+        let _ = worker
+            .run_to_completion_with_metadata_and_thumbnails(
+                &job_id,
+                BACKGROUND_SCAN_BATCH_SIZE,
+                probe,
+                metadata,
+                thumbnails,
+            )
+            .await;
+    });
+    let target_id = job.id.clone();
+    record_audit_event(
+        &state,
+        &headers,
+        "SCAN_PATH_STARTED",
+        Some("scan_job"),
+        Some(&target_id),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "scope": "PATH",
+            "path": request.path,
+            "job": scan_job_json(&job),
+        })),
     )
         .into_response()
 }
