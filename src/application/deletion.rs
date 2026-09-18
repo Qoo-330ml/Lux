@@ -11,6 +11,7 @@ use tokio::fs;
 use crate::{
     application::{
         downloads::is_matching_sidecar,
+        notification_template::bounded_display_text,
         webhooks::{WebhookEventType, WebhookService},
     },
     storage::{Database, StorageError},
@@ -58,6 +59,34 @@ impl MediaDeleteService {
         if sources.is_empty() {
             return Err(MediaDeleteError::ItemNotFound);
         }
+        let (item_title, library_name) = if self.webhooks.is_some() {
+            let item_title = self
+                .database
+                .find_media_item_metadata(item_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|item| bounded_display_text(&item.title));
+            let library_name = match self
+                .database
+                .find_item_library_id(item_id)
+                .await
+                .ok()
+                .flatten()
+            {
+                Some(library_id) => self
+                    .database
+                    .find_library(&library_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|library| bounded_display_text(&library.name)),
+                None => None,
+            };
+            (item_title, library_name)
+        } else {
+            (None, None)
+        };
 
         let mut paths = Vec::new();
         let mut seen_paths = HashSet::new();
@@ -155,6 +184,9 @@ impl MediaDeleteService {
                         json!({
                             "itemId": source.item_id.as_str(),
                             "sourceId": source.source_id.as_str(),
+                            "itemTitle": item_title.as_deref(),
+                            "libraryName": library_name.as_deref(),
+                            "removedCount": 1,
                             "deletedFileCount": report.deleted_file_count,
                         }),
                     )

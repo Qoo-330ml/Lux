@@ -1,6 +1,10 @@
 use serde_json::{Map, Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+pub(crate) fn bounded_display_text(value: &str) -> String {
+    value.trim().chars().take(512).collect()
+}
+
 pub(crate) fn render(
     event_type: &str,
     occurred_at: i64,
@@ -289,12 +293,9 @@ fn playback_content(event_type: &str, data: &Map<String, Value>) -> String {
 fn string_value(data: &Map<String, Value>, key: &str) -> String {
     data.get(key)
         .and_then(Value::as_str)
-        .map(str::trim)
+        .map(bounded_display_text)
         .filter(|value| !value.is_empty())
         .unwrap_or_default()
-        .chars()
-        .take(512)
-        .collect()
 }
 
 fn number_value(data: &Map<String, Value>, key: &str) -> i64 {

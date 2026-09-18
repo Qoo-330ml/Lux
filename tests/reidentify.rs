@@ -759,6 +759,23 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
     .fetch_one(database.pool())
     .await?;
     assert!(metadata_updated >= 1);
+    let metadata_payload: String = sqlx::query_scalar(
+        "SELECT payload_json FROM notification_events
+         WHERE event_type = 'METADATA_UPDATED'
+           AND payload_json LIKE '%\"itemTitle\":\"Complete Movie\"%'
+         LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let metadata_payload = serde_json::from_str::<serde_json::Value>(&metadata_payload)?;
+    assert_eq!(metadata_payload["itemTitle"], "Complete Movie");
+    assert_eq!(metadata_payload["libraryName"], "Movies");
+    assert_eq!(metadata_payload["title"], "Complete Movie元数据已更新");
+    assert!(
+        metadata_payload["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("模式：补全缺失"))
+    );
 
     tmdb_server.abort();
     Ok(())

@@ -22,6 +22,7 @@ use crate::{
             MetadataSelectionError, MetadataSelectionMode, MetadataSelectionService,
             has_selected_provider_id,
         },
+        notification_template::bounded_display_text,
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
         webhooks::{WebhookEventType, WebhookService},
     },
@@ -698,16 +699,26 @@ impl MetadataReidentifyService {
             return;
         }
         if status == "FAILED" {
+            let library_name = if self.webhooks.is_some() {
+                self.notification_library_name_for_id(job.library_id.as_deref())
+                    .await
+            } else {
+                None
+            };
             self.publish_webhook(
                 WebhookEventType::JobFailed,
                 &format!("job-failed:{job_id}"),
                 json!({
                     "jobId": job_id,
                     "jobType": "METADATA_REIDENTIFY",
+                    "libraryName": library_name,
                     "mode": job.mode,
                     "status": status,
                     "totalCount": job.total_count,
                     "processedCount": job.processed_count,
+                    "durationSeconds": job
+                        .started_at
+                        .map(|started_at| unix_now().saturating_sub(started_at)),
                     "errorCode": "ITEM_FAILED",
                 }),
             )
@@ -718,8 +729,10 @@ impl MetadataReidentifyService {
 
     async fn process_item(&self, job_id: &str, item_id: &str, mode: MetadataRefreshMode) {
         let item_started = Instant::now();
+        let mut item_title = None;
         let result = match self.database.find_media_item_metadata(item_id).await {
             Ok(Some(item)) => {
+                item_title = Some(bounded_display_text(&item.title));
                 if !matches!(
                     item.item_type.as_str(),
                     "MOVIE" | "SERIES" | "SEASON" | "EPISODE"
@@ -787,12 +800,22 @@ impl MetadataReidentifyService {
                     .await;
                 self.publish_job_progress(job_id);
                 if !matches!(mode, MetadataRefreshMode::Reidentify) {
+                    let (item_title, library_name) = if self.webhooks.is_some() {
+                        (
+                            item_title,
+                            self.notification_library_name_for_item(item_id).await,
+                        )
+                    } else {
+                        (None, None)
+                    };
                     self.publish_webhook(
                         WebhookEventType::MetadataUpdated,
                         &format!("metadata-updated:{job_id}:{item_id}"),
                         json!({
                             "jobId": job_id,
                             "itemId": item_id,
+                            "itemTitle": item_title,
+                            "libraryName": library_name,
                             "mode": mode.as_str(),
                             "status": "COMPLETED",
                             "candidateCount": candidate_count,
@@ -836,6 +859,27 @@ impl MetadataReidentifyService {
                 self.publish_job_progress(job_id);
             }
         }
+    }
+
+    async fn notification_library_name_for_item(&self, item_id: &str) -> Option<String> {
+        let library_id = self
+            .database
+            .find_item_library_id(item_id)
+            .await
+            .ok()
+            .flatten();
+        self.notification_library_name_for_id(library_id.as_deref())
+            .await
+    }
+
+    async fn notification_library_name_for_id(&self, library_id: Option<&str>) -> Option<String> {
+        let library_id = library_id?;
+        self.database
+            .find_library(library_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|library| bounded_display_text(&library.name))
     }
 
     async fn publish_webhook(&self, event_type: WebhookEventType, dedupe_key: &str, data: Value) {
