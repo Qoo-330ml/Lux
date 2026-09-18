@@ -5348,6 +5348,9 @@ impl ScanJobService {
                 .await?;
             return Ok(());
         };
+        self.database
+            .ensure_scan_job_thumbnail_targets(job_id)
+            .await?;
         let started = Instant::now();
         match thumbnails.generate_scan_job(job_id).await {
             Ok(report) if report.failed == 0 => {

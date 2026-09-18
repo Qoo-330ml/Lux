@@ -271,6 +271,68 @@ async fn scan_generates_local_thumbnail_but_never_strm_thumbnail()
 }
 
 #[tokio::test]
+async fn full_scan_generates_missing_thumbnails_for_existing_media_after_mode_change()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Existing Movie (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Existing.Movie.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial_scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial_scan.id, 100, None).await?;
+
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(r#"{"images":{"thumbnailScrapingMode":"SCREENSHOT_FIRST"}}"#)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fake_ffmpeg(&fake, &log, 0)?;
+    let thumbnails = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5));
+    let second_scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion_with_metadata_and_thumbnails(
+        &second_scan.id,
+        100,
+        None,
+        None,
+        Some(thumbnails),
+    )
+    .await?;
+
+    assert!(movie_dir.join("Existing.Movie.2024-poster.jpg").is_file());
+    assert!(
+        movie_dir
+            .join("Existing.Movie.2024-thumbnail.jpg")
+            .is_file()
+    );
+    let image_sources: Vec<(String, String)> =
+        sqlx::query_as("SELECT image_type, source FROM item_images ORDER BY image_type")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        image_sources,
+        vec![
+            ("POSTER".to_owned(), "FFMPEG".to_owned()),
+            ("THUMB".to_owned(), "FFMPEG".to_owned()),
+        ]
+    );
+    assert_eq!(ffmpeg_invocation_count(&fs::read_to_string(log)?), 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn none_mode_skips_local_thumbnail_generation_without_removing_existing_assets()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

@@ -2127,6 +2127,38 @@ impl Database {
             })
     }
 
+    pub(crate) async fn ensure_scan_job_thumbnail_targets(
+        &self,
+        job_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind,
+                 probe_state, metadata_state, thumbnail_state
+             )
+             SELECT sj.id, 'ITEM', mi.id, mi.id, 'CHANGED',
+                    'SKIPPED', 'SKIPPED', 'PENDING'
+             FROM scan_jobs sj
+             JOIN media_items mi ON mi.library_id = sj.library_id
+             JOIN media_sources ms ON ms.item_id = mi.id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE sj.id = ?
+               AND mi.removed_at IS NULL
+               AND ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
+             GROUP BY sj.id, mi.id
+             ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+        )
+        .bind(job_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn clear_completed_scan_job_targets(
         &self,
         job_id: &str,
