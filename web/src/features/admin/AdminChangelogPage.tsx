@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.8",
+    date: "2026-09-18",
+    sections: [
+      { kind: "fixed", items: [
+        "修复第三方 Emby 客户端读取 Lux HLS 时只能看到已转码片段时长的问题；Emby HLS 现在按完整媒体时长返回 VOD 清单，并等待尚未生成的分片。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.7",
     date: "2026-09-18",
     sections: [
