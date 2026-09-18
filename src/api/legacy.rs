@@ -84,7 +84,7 @@ use crate::{
         plugins::{PluginPage, PluginService, PluginServiceError},
         reidentify::{MetadataReidentifyError, MetadataReidentifyService},
         restart::RestartHandle,
-        scanner::{ScanJob, ScanJobError, ScanJobService},
+        scanner::{ScanJob, ScanJobError, ScanJobService, ScannerError},
         schedule::validate_cron,
         scheduled_tasks::{ScheduledTaskError, ScheduledTaskRun, ScheduledTaskService},
         scraper::{ScraperProvider, ScraperResolver},

@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
 use quick_xml::{Reader, escape::unescape, events::Event};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -144,6 +145,78 @@ pub(super) async fn emby_system_info(
         "HttpServerPortNumber": 8097
     }))
     .into_response()
+}
+
+pub(super) async fn emby_refresh_item(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<EmbyRefreshQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    if query.recursive == Some(false) {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
+    }
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let item_id = emby_internal_id(&item_id);
+    let (job, scope) = match scan_jobs.create_folder_scan_job(&item_id).await {
+        Ok(job) => (job, "FOLDER"),
+        Err(ScanJobError::ItemNotFound) => {
+            let Ok(library_id) = item_id.parse::<crate::domain::ids::LibraryId>() else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            match scan_jobs.create_library_root_scan_job(library_id).await {
+                Ok(job) => (job, "LIBRARY_ROOT"),
+                Err(ScanJobError::LibraryNotFound) => {
+                    return StatusCode::NOT_FOUND.into_response();
+                }
+                Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+            }
+        }
+        Err(ScanJobError::LibraryNotFound) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let worker = scan_jobs.clone();
+    let job_id = job.id.clone();
+    let probe = state.probe.clone();
+    let metadata = state.metadata_reidentify.clone();
+    let thumbnails = state.thumbnails.clone();
+    tokio::spawn(async move {
+        let _ = worker
+            .run_to_completion_with_metadata_and_thumbnails(
+                &job_id,
+                BACKGROUND_SCAN_BATCH_SIZE,
+                probe,
+                metadata,
+                thumbnails,
+            )
+            .await;
+    });
+    record_audit_event(
+        &state,
+        &headers,
+        "EMBY_REFRESH_STARTED",
+        Some("scan_job"),
+        Some(&job.id),
+        "{}",
+    )
+    .await;
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "scope": scope,
+            "job": scan_job_json(&job),
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize, Default)]
@@ -1396,6 +1469,19 @@ pub(super) struct EmbyTokenQuery {
     pub(super) fields: Option<String>,
     #[serde(rename = "ActiveWithinSeconds", alias = "activeWithinSeconds", default)]
     pub(super) active_within_seconds: Option<i64>,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyRefreshQuery {
+    #[serde(flatten)]
+    pub(super) auth: EmbyTokenQuery,
+    #[serde(
+        rename = "Recursive",
+        alias = "recursive",
+        default,
+        deserialize_with = "deserialize_optional_bool"
+    )]
+    pub(super) recursive: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]

@@ -2721,7 +2721,7 @@ impl ScanJobService {
             return Err(ScanJobError::NoChanges);
         }
         let job = self
-            .get_or_create_incremental_scan_job(&library_id_text, true)
+            .get_or_create_incremental_scan_job_reusing_active(&library_id_text, true)
             .await?;
         self.cancellation_flag(&job.id);
         for (root_id, relative_path, kind) in valid_changes {
@@ -2739,6 +2739,132 @@ impl ScanJobService {
             "INFO",
             "PATHS_QUEUED",
             "已加入局部增量扫描路径",
+            "{}",
+        )
+        .await;
+        self.get_job(&job.id).await
+    }
+
+    pub async fn create_path_scan_job(
+        &self,
+        library_id: LibraryId,
+        library_root_id: Option<&str>,
+        relative_path: &str,
+    ) -> Result<ScanJob, ScanJobError> {
+        let library_id = library_id.to_string();
+        let Some(library) = self.database.find_library(&library_id).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        let roots = self.database.list_library_roots(&library_id).await?;
+        let root = match library_root_id {
+            Some(root_id) => roots
+                .into_iter()
+                .find(|root| root.id == root_id)
+                .ok_or_else(|| {
+                    ScanJobError::Scanner(ScannerError::InvalidRootId(root_id.to_owned()))
+                })?,
+            None => {
+                let mut roots = roots.into_iter();
+                let Some(root) = roots.next() else {
+                    return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                        "library has no configured roots".to_owned(),
+                    )));
+                };
+                if roots.next().is_some() {
+                    return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                        "library has multiple roots; rootId is required".to_owned(),
+                    )));
+                }
+                root
+            }
+        };
+        self.create_incremental_path_scan_job(&library_id, &root.id, relative_path)
+            .await
+    }
+
+    pub async fn create_library_root_scan_job(
+        &self,
+        library_id: LibraryId,
+    ) -> Result<ScanJob, ScanJobError> {
+        let library_id = library_id.to_string();
+        let Some(library) = self.database.find_library(&library_id).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        let roots = self.database.list_library_roots(&library_id).await?;
+        if roots.is_empty() {
+            return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                "library has no configured roots".to_owned(),
+            )));
+        }
+        let job = self
+            .get_or_create_incremental_scan_job_reusing_active(&library_id, false)
+            .await?;
+        self.cancellation_flag(&job.id);
+        for root in roots {
+            self.database
+                .enqueue_incremental_scan_path(&job.id, &root.id, ".", "MODIFY")
+                .await?;
+        }
+        self.record_event(
+            &job.id,
+            "WARN",
+            "LIBRARY_ROOT_REFRESH_QUEUED",
+            "未解析到具体文件夹，已加入媒体库根目录局部扫描",
+            "{}",
+        )
+        .await;
+        self.get_job(&job.id).await
+    }
+
+    pub async fn create_folder_scan_job(&self, item_id: &str) -> Result<ScanJob, ScanJobError> {
+        let Some(source) = self.database.find_folder_scan_path(item_id).await? else {
+            return Err(ScanJobError::ItemNotFound);
+        };
+        self.create_incremental_path_scan_job(
+            &source.library_id,
+            &source.library_root_id,
+            &source.relative_path,
+        )
+        .await
+    }
+
+    async fn create_incremental_path_scan_job(
+        &self,
+        library_id: &str,
+        library_root_id: &str,
+        relative_path: &str,
+    ) -> Result<ScanJob, ScanJobError> {
+        let Some(library) = self.database.find_library(library_id).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        let roots = self.database.list_library_roots(library_id).await?;
+        if !roots.iter().any(|root| root.id == library_root_id) {
+            return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                library_root_id.to_owned(),
+            )));
+        }
+        let relative_path = normalize_incremental_path(relative_path)?;
+        let job = self
+            .get_or_create_incremental_scan_job_reusing_active(library_id, false)
+            .await?;
+        self.cancellation_flag(&job.id);
+        self.database
+            .enqueue_incremental_scan_path(&job.id, library_root_id, &relative_path, "MODIFY")
+            .await?;
+        self.record_event(
+            &job.id,
+            "INFO",
+            "PATHS_QUEUED",
+            "已加入指定路径局部增量扫描",
             "{}",
         )
         .await;
@@ -2782,11 +2908,33 @@ impl ScanJobService {
         library_id: &str,
         auto_metadata_match: bool,
     ) -> Result<StoredScanJob, ScanJobError> {
+        self.get_or_create_incremental_scan_job_with_policy(library_id, auto_metadata_match, false)
+            .await
+    }
+
+    async fn get_or_create_incremental_scan_job_reusing_active(
+        &self,
+        library_id: &str,
+        auto_metadata_match: bool,
+    ) -> Result<StoredScanJob, ScanJobError> {
+        self.get_or_create_incremental_scan_job_with_policy(library_id, auto_metadata_match, true)
+            .await
+    }
+
+    async fn get_or_create_incremental_scan_job_with_policy(
+        &self,
+        library_id: &str,
+        auto_metadata_match: bool,
+        reuse_active: bool,
+    ) -> Result<StoredScanJob, ScanJobError> {
         if let Some(active) = self
             .database
             .find_active_scan_job(library_id, "INCREMENTAL_SCAN")
             .await?
         {
+            if !reuse_active {
+                return Err(ScanJobError::AlreadyActive(active.id));
+            }
             if auto_metadata_match && !active.auto_metadata_match {
                 self.database
                     .enable_scan_job_auto_metadata_match(&active.id)
@@ -2814,7 +2962,11 @@ impl ScanJobService {
                     .find_active_scan_job(library_id, "INCREMENTAL_SCAN")
                     .await?
             {
-                return Err(ScanJobError::AlreadyActive(active.id));
+                return if reuse_active {
+                    Ok(active)
+                } else {
+                    Err(ScanJobError::AlreadyActive(active.id))
+                };
             }
             return Err(error.into());
         }
@@ -6301,21 +6453,31 @@ impl std::fmt::Display for ScanJobError {
 }
 
 fn normalize_incremental_path(value: &str) -> Result<String, ScanJobError> {
-    let path = Path::new(value);
-    if value.trim().is_empty()
+    let value = value.trim().replace('\\', "/");
+    let path = Path::new(&value);
+    let has_windows_drive_prefix = value.as_bytes().get(1) == Some(&b':')
+        && value
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphabetic);
+    if value.is_empty()
         || path.is_absolute()
+        || has_windows_drive_prefix
         || path.components().any(|component| {
             matches!(
                 component,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+                Component::CurDir
+                    | Component::ParentDir
+                    | Component::RootDir
+                    | Component::Prefix(_)
             )
         })
     {
         return Err(ScanJobError::Scanner(ScannerError::InvalidRelativePath(
-            value.to_owned(),
+            value,
         )));
     }
-    Ok(value.to_owned())
+    Ok(value)
 }
 
 fn media_source_folder(value: &str) -> Result<String, ScanJobError> {
@@ -6973,7 +7135,7 @@ fn throughput_per_second(items: usize, elapsed_ms: u128) -> u64 {
 mod tests {
     use super::{
         MixedClassification, MixedClassificationCache, classify_mixed_file, media_source_folder,
-        safe_scan_activity_label,
+        normalize_incremental_path, safe_scan_activity_label,
     };
 
     #[test]
@@ -6983,6 +7145,14 @@ mod tests {
             "Movies/Dune"
         );
         assert_eq!(media_source_folder("Dune.2021.mkv").unwrap(), ".");
+    }
+
+    #[test]
+    fn normalize_incremental_path_canonicalizes_external_separators() {
+        assert_eq!(
+            normalize_incremental_path(r"Movies\Dune\Dune.2021.mkv").unwrap(),
+            "Movies/Dune/Dune.2021.mkv"
+        );
     }
 
     #[test]

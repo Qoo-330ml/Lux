@@ -232,6 +232,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_start_scan),
         )
         .route(
+            "/api/v1/admin/libraries/{library_id}/scan-path",
+            post(admin_start_library_path_scan),
+        )
+        .route(
             "/api/v1/admin/libraries/{library_id}/reidentify",
             post(admin_start_library_reidentify),
         )
