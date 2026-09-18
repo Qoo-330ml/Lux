@@ -140,8 +140,8 @@ pub(super) async fn emby_playback_info(
         .unwrap_or_else(|| Uuid::now_v7().to_string());
     Json(json!({
         "PlaySessionId": play_session_id,
-        // Emby clients use this item-level duration when an HLS transcoding
-        // playlist is still growing and therefore cannot advertise ENDLIST.
+        // Emby clients use this item-level duration as the canonical media
+        // duration alongside the VOD HLS manifest and playback callbacks.
         "RunTimeTicks": runtime_ticks,
         "MediaSources": sources
             .into_iter()
