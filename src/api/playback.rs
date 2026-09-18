@@ -729,9 +729,6 @@ async fn create_emby_transcoding_session(
             Err(LocalPathError::Forbidden) => return Err(StatusCode::FORBIDDEN),
         };
     let video_bitrate = emby_transcoding_video_bitrate(source, request);
-    let stream_runtime_ticks = runtime_ticks
-        .map(|ticks| ticks.saturating_sub(request.start_time_ticks.unwrap_or_default().max(0)))
-        .filter(|ticks| *ticks > 0);
     let created = service
         .create_and_start_emby_hls(
             CreateWebPlaybackSession {
@@ -746,7 +743,7 @@ async fn create_emby_transcoding_session(
             &input,
             video_bitrate,
             request.start_time_ticks,
-            stream_runtime_ticks,
+            runtime_ticks,
         )
         .await
         .map_err(emby_playback_session_error_status)?;

@@ -623,9 +623,11 @@ async fn emby_playback_info_negotiates_server_transcoding_and_cleans_hls()
 set -eu
 manifest=\"\"
 segment=\"\"
+start_number=0
 while [ \"$#\" -gt 0 ]; do
   case \"$1\" in
     -hls_segment_filename) segment=\"$2\"; shift 2 ;;
+    -start_number) start_number=\"$2\"; shift 2 ;;
     *.m3u8) manifest=\"$1\"; shift ;;
     *) shift ;;
   esac
@@ -634,9 +636,12 @@ directory=$(dirname \"$manifest\")
 mkdir -p \"$directory\"
 printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' > \"$manifest\"
 printf init > \"$directory/init.mp4\"
-printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"
+segment_path=$(printf '%s' \"$segment\" | sed \"s/%06d/$(printf '%06d' \"$start_number\")/\")
+printf segment > \"$segment_path\"
 sleep 0.2
-printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000001/')\"
+next_number=$((start_number + 1))
+next_segment_path=$(printf '%s' \"$segment\" | sed \"s/%06d/$(printf '%06d' \"$next_number\")/\")
+printf segment > \"$next_segment_path\"
 ",
     )
     .await?;
@@ -816,7 +821,7 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000001/')\"
             "AudioStreamIndex": 1,
             "SubtitleStreamIndex": -1,
             "MaxAudioChannels": 2,
-            "StartTimeTicks": 1000,
+            "StartTimeTicks": 40000000,
             "DeviceProfile": {
                 "DirectPlayProfiles": [{
                     "Container": "mp4",
@@ -872,7 +877,7 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000001/')\"
         "AudioStreamIndex=1",
         "SubtitleStreamIndex=-1",
         "TranscodingMaxAudioChannels=2",
-        "StartTimeTicks=1000",
+        "StartTimeTicks=40000000",
         "SegmentContainer=mp4",
         "MinSegments=1",
         "BreakOnNonKeyFrames=True",
@@ -891,7 +896,16 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000001/')\"
     let device_profile_manifest = device_profile_manifest.text().await?;
     assert!(device_profile_manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
     assert!(device_profile_manifest.contains("#EXT-X-ENDLIST\n"));
-    assert!(device_profile_manifest.contains("#EXTINF:2.335900,"));
+    assert!(device_profile_manifest.contains("#EXTINF:2.336000,"));
+    let resumed_segment_url = device_profile_manifest
+        .lines()
+        .find(|line| line.contains("segment_000001.m4s?"))
+        .ok_or("missing signed resumed segment URL")?;
+    let resumed_segment = client
+        .get(format!("{base_url}{resumed_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(resumed_segment.status(), reqwest::StatusCode::OK);
     let device_profile_play_session_id = device_profile_body["PlaySessionId"]
         .as_str()
         .ok_or("missing DeviceProfile play session")?
@@ -1075,7 +1089,7 @@ printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000001/')\"
         .ok_or("missing signed init URL")?;
     let segment_url = manifest
         .lines()
-        .find(|line| line.contains("/transcoding/") && line.contains(".m4s?"))
+        .find(|line| line.contains("segment_000001.m4s?"))
         .ok_or("missing signed segment URL")?;
     let second_segment_url = manifest
         .lines()

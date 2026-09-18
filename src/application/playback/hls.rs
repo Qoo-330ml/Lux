@@ -167,6 +167,7 @@ impl HlsManager {
             self.hardware_encoder.as_deref(),
             video_bitrate,
             start_time_ticks,
+            hls_start_number(start_time_ticks),
         )?;
         let mut command = Command::new(&self.ffmpeg_executable);
         command
@@ -451,6 +452,7 @@ fn ffmpeg_args(
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
     start_time_ticks: Option<i64>,
+    start_number: i64,
 ) -> Result<Vec<String>, HlsError> {
     if tier == ServerTier::Direct {
         return Err(HlsError::InvalidAsset);
@@ -527,6 +529,20 @@ fn ffmpeg_args(
     {
         args.extend(["-b:v".to_owned(), video_bitrate.to_string()]);
     }
+    if matches!(
+        tier,
+        ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    ) {
+        // Emby's VOD manifest exposes a complete four-second timeline before
+        // FFmpeg has produced all assets. Keep encoded video keyframes on the
+        // same cadence so the virtual segment numbers remain real files.
+        args.extend([
+            "-force_key_frames".to_owned(),
+            "expr:gte(t,n_forced*4)".to_owned(),
+            "-sc_threshold".to_owned(),
+            "0".to_owned(),
+        ]);
+    }
     args.extend([
         "-f".to_owned(),
         "hls".to_owned(),
@@ -536,6 +552,8 @@ fn ffmpeg_args(
         "0".to_owned(),
         "-hls_segment_type".to_owned(),
         "fmp4".to_owned(),
+        "-start_number".to_owned(),
+        start_number.max(0).to_string(),
         "-hls_fmp4_init_filename".to_owned(),
         "init.mp4".to_owned(),
         "-hls_segment_filename".to_owned(),
@@ -548,6 +566,12 @@ fn ffmpeg_args(
         directory.join("index.m3u8").to_string_lossy().into_owned(),
     ]);
     Ok(args)
+}
+
+fn hls_start_number(start_time_ticks: Option<i64>) -> i64 {
+    start_time_ticks
+        .filter(|ticks| *ticks > 0)
+        .map_or(0, |ticks| ticks / HLS_SEGMENT_DURATION_TICKS)
 }
 
 fn ffmpeg_start_time(start_time_ticks: Option<i64>) -> Option<String> {
@@ -663,7 +687,7 @@ mod tests {
 
     use super::{
         HLS_SEGMENT_DURATION_TICKS, SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache,
-        ffmpeg_args, is_valid_asset, vod_manifest,
+        ffmpeg_args, hls_start_number, is_valid_asset, vod_manifest,
     };
 
     #[test]
@@ -689,6 +713,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         )
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
@@ -717,6 +742,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         )
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "libx264"]));
@@ -732,10 +758,31 @@ mod tests {
             None,
             Some(1_000_000),
             None,
+            0,
         )
         .unwrap();
 
         assert!(args.windows(2).any(|pair| pair == ["-b:v", "1000000"]));
+    }
+
+    #[test]
+    fn video_transcoding_arguments_align_with_the_four_second_vod_timeline() {
+        let args = ffmpeg_args(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::SoftwareTranscode,
+            None,
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-force_key_frames", "expr:gte(t,n_forced*4)"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-sc_threshold", "0"]));
     }
 
     #[test]
@@ -747,6 +794,7 @@ mod tests {
             None,
             None,
             Some(12_345_678),
+            0,
         )
         .unwrap();
 
@@ -759,6 +807,29 @@ mod tests {
             .position(|value| value == "-i")
             .expect("input argument");
         assert!(seek < input);
+    }
+
+    #[test]
+    fn resumed_output_uses_the_virtual_segment_number_for_the_start_time() {
+        let args = ffmpeg_args(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::SoftwareTranscode,
+            None,
+            None,
+            Some(8 * 10_000_000),
+            2,
+        )
+        .unwrap();
+
+        assert!(args.windows(2).any(|pair| pair == ["-start_number", "2"]));
+    }
+
+    #[test]
+    fn hls_start_number_uses_the_four_second_timeline() {
+        assert_eq!(hls_start_number(None), 0);
+        assert_eq!(hls_start_number(Some(4 * 10_000_000)), 1);
+        assert_eq!(hls_start_number(Some(9 * 10_000_000)), 2);
     }
 
     #[test]
