@@ -948,10 +948,9 @@ impl CatalogService {
             return Ok(items);
         }
 
-        self.database
-            .refresh_recommendation_stats_if_needed()
-            .await?;
-
+        // Global recommendation statistics are refreshed by ScheduledTaskService. This request
+        // path must remain read-first so a new user's home page cannot wait on the full refresh
+        // transaction while a migration or scan is writing to the database.
         let rows = self
             .database
             .list_recommended_catalog_rows(user_id, library_ids, 0, RECOMMENDATION_CANDIDATE_POOL)

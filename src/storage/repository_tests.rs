@@ -244,6 +244,60 @@ async fn recommendation_daily_batch_is_stable_until_the_next_batch() {
     assert!(next_batch.iter().any(|item| item.id == "daily-item-2"));
 }
 
+#[tokio::test]
+async fn listing_recommendations_does_not_refresh_global_stats_synchronously() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user = SetupService::new(database.clone())
+        .expect("setup service")
+        .complete("Admin", "Admin", "correct password")
+        .await
+        .expect("setup");
+    let library = LibraryService::new(database.clone())
+        .create_library("Recommendations", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title,
+                identification_status, has_available_source
+             ) VALUES ('home-recommendation-item', ?, 'MOVIE',
+                       'Home recommendation item', 'home recommendation item',
+                       'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "UPDATE recommendation_stats_state
+         SET batch_key = -1, refreshed_at = 0
+         WHERE id = 1",
+    )
+    .execute(database.pool())
+    .await
+    .expect("invalidate recommendation stats batch");
+
+    let library_id = library.id.to_string();
+    let user_id = user.id.to_string();
+    let service = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    service
+        .list_recommended_for_library_ids(std::slice::from_ref(&library_id), &user_id, 7)
+        .await
+        .expect("recommendations");
+
+    let batch_key: i64 =
+        sqlx::query_scalar("SELECT batch_key FROM recommendation_stats_state WHERE id = 1")
+            .fetch_one(database.pool())
+            .await
+            .expect("recommendation stats state");
+    assert_eq!(batch_key, -1);
+}
+
 #[test]
 fn database_pool_max_connections_uses_backend_defaults() {
     assert_eq!(
