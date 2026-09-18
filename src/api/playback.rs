@@ -114,6 +114,23 @@ pub(super) async fn emby_playback_info(
     } else {
         false
     };
+    let transcode_user_id = user.id.to_string();
+    let transcode_start_time_ticks = if transcode_requested {
+        match emby_transcoding_start_time_ticks(
+            &state,
+            &transcode_user_id,
+            &item.id,
+            request.start_time_ticks,
+            runtime_ticks,
+        )
+        .await
+        {
+            Ok(value) => value,
+            Err(status) => return status.into_response(),
+        }
+    } else {
+        None
+    };
     let transcode_session = if transcode_requested {
         let Some(source) = sources.first() else {
             return StatusCode::NOT_FOUND.into_response();
@@ -124,6 +141,7 @@ pub(super) async fn emby_playback_info(
             &item.id,
             source,
             &request,
+            transcode_start_time_ticks,
             runtime_ticks,
         )
         .await
@@ -203,6 +221,7 @@ pub(super) async fn emby_playback_info(
                                 source,
                                 session,
                                 &request,
+                                transcode_start_time_ticks,
                                 &device_id,
                             )
                         })
@@ -699,6 +718,7 @@ async fn create_emby_transcoding_session(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     request: &EmbyPlaybackInfoRequest,
+    start_time_ticks: Option<i64>,
     runtime_ticks: Option<i64>,
 ) -> Result<Option<CreatedWebPlaybackSession>, StatusCode> {
     if source.source_kind != "LOCAL_FILE" {
@@ -742,7 +762,7 @@ async fn create_emby_transcoding_session(
             },
             &input,
             video_bitrate,
-            request.start_time_ticks,
+            start_time_ticks,
             runtime_ticks,
         )
         .await
@@ -751,6 +771,38 @@ async fn create_emby_transcoding_session(
         return Err(StatusCode::BAD_GATEWAY);
     }
     Ok(Some(created))
+}
+
+async fn emby_transcoding_start_time_ticks(
+    state: &AppState,
+    user_id: &str,
+    item_id: &str,
+    requested_start_time_ticks: Option<i64>,
+    runtime_ticks: Option<i64>,
+) -> Result<Option<i64>, StatusCode> {
+    // An explicit client value, including zero, is authoritative. Some
+    // clients omit StartTimeTicks even when they are resuming an item, so
+    // recover the saved Emby/Lux position only when the field is absent.
+    if let Some(start_time_ticks) = requested_start_time_ticks {
+        return Ok((start_time_ticks > 0).then_some(start_time_ticks));
+    }
+    let Some(database) = state.database.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let user_state = database
+        .find_user_item_state(user_id, item_id)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let Some(user_state) = user_state else {
+        return Ok(None);
+    };
+    if user_state.is_played || user_state.position_ticks <= 0 {
+        return Ok(None);
+    }
+    if runtime_ticks.is_some_and(|runtime| user_state.position_ticks >= runtime) {
+        return Ok(None);
+    }
+    Ok(Some(user_state.position_ticks))
 }
 
 fn emby_playback_session_error_status(error: WebPlaybackSessionError) -> StatusCode {
@@ -1838,6 +1890,7 @@ fn emby_transcoding_url(
     source: &crate::application::catalog::CatalogSource,
     session: &CreatedWebPlaybackSession,
     request: &EmbyPlaybackInfoRequest,
+    start_time_ticks: Option<i64>,
     device_id: &str,
 ) -> Option<String> {
     let signature = service.sign_resource(&session.id, "hls:index.m3u8", session.expires_at)?;
@@ -1898,7 +1951,7 @@ fn emby_transcoding_url(
             &max_audio_channels.to_string(),
         );
     }
-    if let Some(start_time_ticks) = request.start_time_ticks.filter(|ticks| *ticks > 0) {
+    if let Some(start_time_ticks) = start_time_ticks.filter(|ticks| *ticks > 0) {
         query.append_pair("StartTimeTicks", &start_time_ticks.to_string());
     }
     query.append_pair("SegmentContainer", "mp4");

@@ -669,9 +669,14 @@ printf segment > \"$next_segment_path\"
         .json(&json!({ "Username": "admin", "Pw": "correct password" }))
         .send()
         .await?;
-    let token = login.json::<Value>().await?["AccessToken"]
+    let login_body = login.json::<Value>().await?;
+    let token = login_body["AccessToken"]
         .as_str()
         .ok_or("missing admin token")?
+        .to_owned();
+    let user_id = login_body["User"]["Id"]
+        .as_str()
+        .ok_or("missing authenticated user id")?
         .to_owned();
 
     let direct = client
@@ -807,6 +812,18 @@ printf segment > \"$next_segment_path\"
     .execute(database.pool())
     .await?;
 
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played)
+         VALUES (?, ?, 40000000, 0)
+         ON CONFLICT(user_id, item_id) DO UPDATE SET
+             position_ticks = excluded.position_ticks,
+             is_played = excluded.is_played",
+    )
+    .bind(&user_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
     let device_profile_transcoding = client
         .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .header(
@@ -821,7 +838,6 @@ printf segment > \"$next_segment_path\"
             "AudioStreamIndex": 1,
             "SubtitleStreamIndex": -1,
             "MaxAudioChannels": 2,
-            "StartTimeTicks": 40000000,
             "DeviceProfile": {
                 "DirectPlayProfiles": [{
                     "Container": "mp4",
