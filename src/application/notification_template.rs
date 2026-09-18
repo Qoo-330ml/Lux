@@ -38,17 +38,32 @@ fn readable_title(event_type: &str, data: &Map<String, Value>) -> String {
         return format!("{user}{action}{suffix}");
     }
     match event_type {
-        "MEDIA_ADDED" => "媒体新增".to_owned(),
-        "MEDIA_REMOVED" => "媒体移除".to_owned(),
+        "MEDIA_ADDED" => contextual_title("新增媒体", data),
+        "MEDIA_REMOVED" => {
+            let item = string_value(data, "itemTitle");
+            if item.is_empty() {
+                contextual_title("移除媒体", data)
+            } else {
+                format!("{item}已移除")
+            }
+        }
         "SCAN_COMPLETED" => scan_title("扫描完成", data),
         "SCAN_FAILED" => scan_title("扫描失败", data),
-        "METADATA_UPDATED" => "元数据更新".to_owned(),
-        "JOB_FAILED" => "后台任务失败".to_owned(),
+        "METADATA_UPDATED" => {
+            let item = string_value(data, "itemTitle");
+            if item.is_empty() {
+                contextual_title("元数据更新", data)
+            } else {
+                format!("{item}元数据已更新")
+            }
+        }
+        "JOB_FAILED" if is_test_notification(data) => "通知测试成功".to_owned(),
+        "JOB_FAILED" => job_failed_title(data),
         _ => "Lux 通知".to_owned(),
     }
 }
 
-fn scan_title(action: &str, data: &Map<String, Value>) -> String {
+fn contextual_title(action: &str, data: &Map<String, Value>) -> String {
     let library = string_value(data, "libraryName");
     if library.is_empty() {
         action.to_owned()
@@ -57,9 +72,31 @@ fn scan_title(action: &str, data: &Map<String, Value>) -> String {
     }
 }
 
+fn scan_title(action: &str, data: &Map<String, Value>) -> String {
+    contextual_title(action, data)
+}
+
+fn job_failed_title(data: &Map<String, Value>) -> String {
+    let task = string_value(data, "jobType");
+    let title = if task.is_empty() {
+        "后台任务失败".to_owned()
+    } else {
+        format!("{}失败", job_type_label(&task))
+    };
+    let library = string_value(data, "libraryName");
+    if library.is_empty() {
+        title
+    } else {
+        format!("{library}{title}")
+    }
+}
+
 fn readable_content(event_type: &str, data: &Map<String, Value>) -> String {
     if event_type.starts_with("PLAYBACK_") {
         return playback_content(event_type, data);
+    }
+    if event_type == "JOB_FAILED" && is_test_notification(data) {
+        return "通知测试成功\n这是 Lux 核心模板测试通知".to_owned();
     }
     let mut lines = Vec::new();
     match event_type {
@@ -67,27 +104,36 @@ fn readable_content(event_type: &str, data: &Map<String, Value>) -> String {
             lines.push(format!("新增媒体：{} 个", number_value(data, "addedCount")));
         }
         "MEDIA_REMOVED" => {
-            let removed_count =
-                number_value(data, "removedCount").max(number_value(data, "deletedFileCount"));
-            lines.push(format!("移除媒体：{removed_count} 个"));
+            lines.push("媒体已移除".to_owned());
         }
         "SCAN_COMPLETED" => lines.push("扫描已完成".to_owned()),
         "SCAN_FAILED" => lines.push("扫描未完成".to_owned()),
         "METADATA_UPDATED" => lines.push("元数据已更新".to_owned()),
-        "JOB_FAILED" => lines.push("后台任务执行失败".to_owned()),
+        "JOB_FAILED" => lines.push("任务执行失败".to_owned()),
         _ => lines.push("收到新的 Lux 事件".to_owned()),
     }
     append_library_value(&mut lines, data);
     append_mapped_value(&mut lines, "任务", data, "jobType", job_type_label);
-    if matches!(event_type, "SCAN_COMPLETED" | "SCAN_FAILED") {
+    append_mapped_value(&mut lines, "模式", data, "mode", mode_label);
+    if matches!(
+        event_type,
+        "MEDIA_ADDED" | "MEDIA_REMOVED" | "SCAN_COMPLETED" | "SCAN_FAILED" | "JOB_FAILED"
+    ) {
         append_scan_progress(&mut lines, data);
     }
     append_mapped_value(&mut lines, "状态", data, "status", status_label);
-    if matches!(event_type, "SCAN_COMPLETED" | "SCAN_FAILED") {
+    if event_type == "MEDIA_REMOVED" {
+        append_optional_labeled_count(&mut lines, "移除媒体", data, "removedCount");
+        append_optional_labeled_count(&mut lines, "删除文件", data, "deletedFileCount");
+    }
+    if matches!(
+        event_type,
+        "MEDIA_ADDED" | "MEDIA_REMOVED" | "SCAN_COMPLETED" | "SCAN_FAILED" | "JOB_FAILED"
+    ) {
         append_optional_duration(&mut lines, data);
     }
-    append_labeled_value(&mut lines, "错误", data, "errorCode");
-    append_labeled_value(&mut lines, "候选", data, "candidateCount");
+    append_mapped_value(&mut lines, "错误", data, "errorCode", error_label);
+    append_optional_labeled_count(&mut lines, "候选", data, "candidateCount");
     lines.join("\n")
 }
 
@@ -117,6 +163,16 @@ fn job_type_label(value: &str) -> String {
     match value {
         "RECONCILE_LIBRARY" => "全量校验".to_owned(),
         "INCREMENTAL_SCAN" => "增量扫描".to_owned(),
+        "METADATA_REIDENTIFY" => "元数据刷新".to_owned(),
+        _ => value.to_owned(),
+    }
+}
+
+fn mode_label(value: &str) -> String {
+    match value {
+        "REIDENTIFY" => "重新识别".to_owned(),
+        "FILL_MISSING" => "补全缺失".to_owned(),
+        "FULL_REFRESH" => "刷新全部".to_owned(),
         _ => value.to_owned(),
     }
 }
@@ -124,12 +180,34 @@ fn job_type_label(value: &str) -> String {
 fn status_label(value: &str) -> String {
     match value {
         "PENDING" => "等待中".to_owned(),
+        "QUEUED" => "排队中".to_owned(),
         "RUNNING" => "进行中".to_owned(),
         "COMPLETED" => "已完成".to_owned(),
+        "COMPLETED_WITH_ISSUES" => "完成但有问题".to_owned(),
         "FAILED" => "失败".to_owned(),
         "CANCELLED" => "已取消".to_owned(),
+        "DEFERRED" => "已延后".to_owned(),
         _ => value.to_owned(),
     }
+}
+
+fn error_label(value: &str) -> String {
+    let label = match value {
+        "ITEM_FAILED" => "媒体项目处理失败",
+        "ITEM_ISSUES" => "部分媒体存在问题",
+        "DEFERRED_PROVIDER_UNAVAILABLE" => "元数据服务暂不可用",
+        "LIBRARY_NOT_FOUND" => "媒体库不存在",
+        "JOB_NOT_FOUND" => "任务不存在",
+        "SCAN_IO" => "扫描文件时发生读写错误",
+        "INVALID_RELATIVE_PATH" => "媒体路径无效",
+        "STORAGE_ERROR" => "数据库操作失败",
+        _ => return value.to_owned(),
+    };
+    format!("{label}（{value}）")
+}
+
+fn is_test_notification(data: &Map<String, Value>) -> bool {
+    data.get("test").and_then(Value::as_bool) == Some(true)
 }
 
 fn playback_content(event_type: &str, data: &Map<String, Value>) -> String {
@@ -232,15 +310,14 @@ fn number_value_optional(data: &Map<String, Value>, key: &str) -> Option<i64> {
         .map(|value| value.max(0))
 }
 
-fn append_labeled_value(
+fn append_optional_labeled_count(
     lines: &mut Vec<String>,
     label: &str,
     data: &Map<String, Value>,
     key: &str,
 ) {
-    let value = string_value(data, key);
-    if !value.is_empty() {
-        lines.push(format!("{label}：{value}"));
+    if let Some(value) = number_value_optional(data, key) {
+        lines.push(format!("{label}：{} 个", format_count(value)));
     }
 }
 
