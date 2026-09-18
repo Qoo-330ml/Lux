@@ -915,13 +915,14 @@ printf segment > \"$next_segment_path\"
     assert!(device_profile_manifest.contains("#EXTINF:2.336000,"));
     let resumed_segment_url = device_profile_manifest
         .lines()
-        .find(|line| line.contains("segment_000001.m4s?"))
+        .find(|line| line.contains("segment_000000.m4s?"))
         .ok_or("missing signed resumed segment URL")?;
     let resumed_segment = client
         .get(format!("{base_url}{resumed_segment_url}"))
         .send()
         .await?;
     assert_eq!(resumed_segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(resumed_segment.bytes().await?.as_ref(), b"segment");
     let device_profile_play_session_id = device_profile_body["PlaySessionId"]
         .as_str()
         .ok_or("missing DeviceProfile play session")?

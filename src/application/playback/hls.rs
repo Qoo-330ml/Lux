@@ -68,6 +68,7 @@ impl std::error::Error for HlsError {
 struct HlsProcess {
     directory: PathBuf,
     runtime_ticks: Option<i64>,
+    segment_start_number: i64,
     child: Mutex<Option<Child>>,
     quota: Mutex<SessionQuotaCache>,
     _permit: OwnedSemaphorePermit,
@@ -160,6 +161,7 @@ impl HlsManager {
         }
         let directory = self.base_directory.join(session_id);
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
+        let segment_start_number = hls_start_number(start_time_ticks);
         let args = ffmpeg_args(
             input,
             &directory,
@@ -167,7 +169,7 @@ impl HlsManager {
             self.hardware_encoder.as_deref(),
             video_bitrate,
             start_time_ticks,
-            hls_start_number(start_time_ticks),
+            segment_start_number,
         )?;
         let mut command = Command::new(&self.ffmpeg_executable);
         command
@@ -203,6 +205,7 @@ impl HlsManager {
         let process = Arc::new(HlsProcess {
             directory,
             runtime_ticks: runtime_ticks.filter(|ticks| *ticks > 0),
+            segment_start_number,
             child: Mutex::new(Some(child)),
             quota: Mutex::new(SessionQuotaCache::default()),
             _permit: permit,
@@ -261,7 +264,10 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
-        let path = process.directory.join(asset);
+        // Emby's synthetic VOD manifest uses original-timeline segment names;
+        // a resumed FFmpeg process starts writing at the corresponding offset.
+        let physical_asset = physical_asset_name(asset, process.segment_start_number)?;
+        let path = process.directory.join(physical_asset);
         if !path.starts_with(&process.directory) {
             return Err(HlsError::InvalidAsset);
         }
@@ -574,6 +580,22 @@ fn hls_start_number(start_time_ticks: Option<i64>) -> i64 {
         .map_or(0, |ticks| ticks / HLS_SEGMENT_DURATION_TICKS)
 }
 
+fn physical_asset_name(asset: &str, segment_start_number: i64) -> Result<String, HlsError> {
+    let Some(segment_number) = asset
+        .strip_prefix("segment_")
+        .and_then(|value| value.strip_suffix(".m4s"))
+    else {
+        return Ok(asset.to_owned());
+    };
+    let logical_number = segment_number
+        .parse::<i64>()
+        .map_err(|_| HlsError::InvalidAsset)?;
+    let physical_number = logical_number
+        .checked_add(segment_start_number)
+        .ok_or(HlsError::InvalidAsset)?;
+    Ok(format!("segment_{physical_number:06}.m4s"))
+}
+
 fn ffmpeg_start_time(start_time_ticks: Option<i64>) -> Option<String> {
     const TICKS_PER_SECOND: i64 = 10_000_000;
     let ticks = start_time_ticks.filter(|ticks| *ticks > 0)?;
@@ -687,7 +709,7 @@ mod tests {
 
     use super::{
         HLS_SEGMENT_DURATION_TICKS, SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache,
-        ffmpeg_args, hls_start_number, is_valid_asset, vod_manifest,
+        ffmpeg_args, hls_start_number, is_valid_asset, physical_asset_name, vod_manifest,
     };
 
     #[test]
@@ -830,6 +852,19 @@ mod tests {
         assert_eq!(hls_start_number(None), 0);
         assert_eq!(hls_start_number(Some(4 * 10_000_000)), 1);
         assert_eq!(hls_start_number(Some(9 * 10_000_000)), 2);
+    }
+
+    #[test]
+    fn logical_segment_assets_map_to_resumed_ffmpeg_numbers() {
+        assert_eq!(
+            physical_asset_name("segment_000000.m4s", 969).unwrap(),
+            "segment_000969.m4s"
+        );
+        assert_eq!(
+            physical_asset_name("segment_000001.m4s", 969).unwrap(),
+            "segment_000970.m4s"
+        );
+        assert_eq!(physical_asset_name("init.mp4", 969).unwrap(), "init.mp4");
     }
 
     #[test]
