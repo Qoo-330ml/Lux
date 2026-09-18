@@ -590,9 +590,17 @@ fn physical_asset_name(asset: &str, segment_start_number: i64) -> Result<String,
     let logical_number = segment_number
         .parse::<i64>()
         .map_err(|_| HlsError::InvalidAsset)?;
-    let physical_number = logical_number
-        .checked_add(segment_start_number)
-        .ok_or(HlsError::InvalidAsset)?;
+    // Some HLS clients probe the first logical segment before seeking to the
+    // saved position in the full VOD timeline. Alias those earlier probes to
+    // the resumed output, but keep original-timeline segment numbers at and
+    // after the resume point unchanged.
+    let physical_number = if logical_number < segment_start_number {
+        logical_number
+            .checked_add(segment_start_number)
+            .ok_or(HlsError::InvalidAsset)?
+    } else {
+        logical_number
+    };
     Ok(format!("segment_{physical_number:06}.m4s"))
 }
 
@@ -862,6 +870,14 @@ mod tests {
         );
         assert_eq!(
             physical_asset_name("segment_000001.m4s", 969).unwrap(),
+            "segment_000970.m4s"
+        );
+        assert_eq!(
+            physical_asset_name("segment_000969.m4s", 969).unwrap(),
+            "segment_000969.m4s"
+        );
+        assert_eq!(
+            physical_asset_name("segment_000970.m4s", 969).unwrap(),
             "segment_000970.m4s"
         );
         assert_eq!(physical_asset_name("init.mp4", 969).unwrap(), "init.mp4");
