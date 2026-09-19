@@ -266,48 +266,22 @@ impl WebPlaybackSessionService {
         input: CreateWebPlaybackSession<'_>,
         media_path: &std::path::Path,
         video_bitrate: Option<i64>,
-        _start_time_ticks: Option<i64>,
+        start_time_ticks: Option<i64>,
         runtime_ticks: Option<i64>,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
         let _start_guard = self.emby_start_lock.lock().await;
         let user_id = input.user_id.to_owned();
-        let item_id = input.item_id.to_owned();
-        let media_source_id = input.media_source_id.to_owned();
         let created = self.create(input).await?;
         let WebPlaybackPlan::ServerHls { tier } = created.plan else {
             return Ok(created);
         };
-
-        let active_sessions = match self
-            .database
-            .find_active_web_playback_sessions_for_source(
-                &user_id,
-                &item_id,
-                &media_source_id,
-                "lux-emby",
-            )
-            .await
-        {
-            Ok(sessions) => sessions,
-            Err(error) => {
-                let _ = self.stop(&created.id, &user_id).await;
-                return Err(error.into());
-            }
-        };
-        for session in active_sessions {
-            if session.id != created.id {
-                if let Err(error) = self.stop(&session.id, &user_id).await {
-                    let _ = self.stop(&created.id, &user_id).await;
-                    return Err(error);
-                }
-            }
-        }
         if let Err(error) = self
             .start_emby_hls_with_runtime(
                 &created.id,
                 tier,
                 media_path,
                 video_bitrate,
+                start_time_ticks,
                 runtime_ticks,
             )
             .await
@@ -447,10 +421,18 @@ impl WebPlaybackSessionService {
         tier: ServerTier,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
+        start_time_ticks: Option<i64>,
         runtime_ticks: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
         self.hls
-            .start_emby_vod(session_id, tier, input, video_bitrate, runtime_ticks)
+            .start_emby_vod(
+                session_id,
+                tier,
+                input,
+                video_bitrate,
+                start_time_ticks,
+                runtime_ticks,
+            )
             .await?;
         let directory = self.hls.session_directory(session_id).await?;
         let now = unix_timestamp();
@@ -469,6 +451,13 @@ impl WebPlaybackSessionService {
         &self,
         session_id: &str,
     ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
+        if let Err(error) = self.activate_emby_hls_session(session_id, None).await {
+            if matches!(&error, WebPlaybackSessionError::Hls(error) if error.is_terminal_process_failure())
+            {
+                self.stop_failed_hls_session(session_id).await;
+            }
+            return Err(error);
+        }
         match self.hls.wait_for_manifest(session_id).await {
             Ok(path) => Ok(path),
             Err(error) => {
@@ -490,6 +479,16 @@ impl WebPlaybackSessionService {
         session_id: &str,
         asset: &str,
     ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
+        if let Err(error) = self
+            .activate_emby_hls_session(session_id, Some(asset))
+            .await
+        {
+            if matches!(&error, WebPlaybackSessionError::Hls(error) if error.is_terminal_process_failure())
+            {
+                self.stop_failed_hls_session(session_id).await;
+            }
+            return Err(error);
+        }
         match self.hls.wait_for_asset(session_id, asset).await {
             Ok(path) => Ok(path),
             Err(error) => {
@@ -499,6 +498,45 @@ impl WebPlaybackSessionService {
                 Err(error.into())
             }
         }
+    }
+
+    async fn activate_emby_hls_session(
+        &self,
+        session_id: &str,
+        asset: Option<&str>,
+    ) -> Result<(), WebPlaybackSessionError> {
+        if self.hls.has_started(session_id).await? {
+            return Ok(());
+        }
+        let _start_guard = self.emby_start_lock.lock().await;
+        if self.hls.has_started(session_id).await? {
+            return Ok(());
+        }
+        let session = self
+            .database
+            .find_web_playback_session(session_id)
+            .await?
+            .ok_or(WebPlaybackSessionError::NotFound)?;
+        let source_id = session
+            .media_source_id
+            .as_deref()
+            .ok_or(WebPlaybackSessionError::NotFound)?;
+        let active_sessions = self
+            .database
+            .find_active_web_playback_sessions_for_source(
+                &session.user_id,
+                &session.item_id,
+                source_id,
+                "lux-emby",
+            )
+            .await?;
+        for active_session in active_sessions {
+            if active_session.id != session.id {
+                self.stop(&active_session.id, &session.user_id).await?;
+            }
+        }
+        self.hls.start_for_initial_asset(session_id, asset).await?;
+        Ok(())
     }
 
     pub(crate) async fn hls_asset_path(
@@ -1131,7 +1169,7 @@ while :; do sleep 1; done
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn emby_hls_start_replaces_an_active_session_for_the_same_source()
+    async fn emby_hls_offer_replaces_an_active_session_only_when_the_new_asset_starts()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
         let config = Config {
@@ -1247,6 +1285,21 @@ while :; do sleep 1; done
                 None,
             )
             .await?;
+
+        let first_before_second_asset = database
+            .find_web_playback_session(&first.id)
+            .await?
+            .expect("first session before second asset");
+        assert_eq!(first_before_second_asset.state, "ACTIVE");
+        assert!(
+            config
+                .config_dir
+                .join("web-playback")
+                .join(&first.id)
+                .exists()
+        );
+        assert!(!service.hls.has_started(&second.id).await?);
+
         service.wait_for_hls_manifest(&second.id).await?;
 
         let first_stored = database

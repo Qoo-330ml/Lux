@@ -1347,7 +1347,10 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
 - MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
 - `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，
   缺失时回退到媒体项时长。Emby 兼容 HLS 清单按完整媒体时长生成 VOD 时间轴、完整分片列表和
-  `ENDLIST`；尚未生成的分片请求由服务端等待。Lux Web 的内部 HLS 清单仍保持动态追加，不复用 Emby VOD 清单。
+  `ENDLIST`；`PlaybackInfo` 和已知总时长的完整清单只登记会话，首个 init 或媒体分片请求才替换同 source
+  的旧会话、取得 FFmpeg 名额并按请求的逻辑位置启动。总时长未知时允许 `index.m3u8` 请求启动 FFmpeg 并
+  回退到物理清单。各 generation 使用独立 init，init 与媒体分片并发请求跟随当前 generation；尚未生成的
+  分片请求由服务端等待。Lux Web 的内部 HLS 清单仍保持动态追加和立即启动，不复用 Emby VOD 清单。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
 - `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。
@@ -6184,6 +6187,9 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
 - 转码会话复用 `web_playback_sessions`，其 `PlaySessionId` 可被 Emby `Sessions/Playing`、`Progress` 和
   `Stopped` 回调关联；播放/暂停刷新 TTL，停止立即回收 FFmpeg 进程和临时目录。没有回调时仍由服务端
   过期清理回收。
+- Emby `PlaybackInfo` 只登记惰性 HLS 会话，不占用 FFmpeg 并发名额，也不停止同一用户、条目和 source 的
+  现有播放；首个 init、媒体分片或未知时长的物理清单请求才原子替换旧会话并启动。`StartTimeTicks` 只是
+  init 先到时的起点提示；总时长已知时，非正数以及等于或超过总时长的值都不用于启动。
 - `.strm` 无论客户端是否声明转码能力，都不返回服务端转码 URL，不启动 FFmpeg，不生成 HLS 目录，也不
   代理媒体字节。
 - 转码资源必须绑定当前用户、条目、媒体源、会话和签名有效期；错误用户、跨条目/媒体源、篡改或过期签名、
@@ -6252,6 +6258,17 @@ Clippy 仍被未修改的 `src/api/legacy.rs:44` 未使用导入阻塞。FNOS �
 `PlaybackInfo` 现在在顶层和每个媒体源返回 `RunTimeTicks`，并在 source 时长缺失时回退到媒体项时长；详情 DTO 的
 `RunTimeTicks` 与媒体源时长也使用同一回退规则。新增转码响应回归覆盖；`cargo test --locked --test playback`
 （3 个通过）通过，其他全量质量门和 FNOS/Harbor 真机复测待完成。
+
+验证记录（2026-09-19 Harbor 中段转码启动竞态修复）：FNOS 与 Harbor 日志确认，旧实现会在
+`PlaybackInfo`/`master.m3u8` 阶段提前从第 0 段启动 FFmpeg，随后 Harbor 的首个中段分片请求立即取消该 generation，
+使首个资源请求落入进程切换窗口。Emby HLS 现改为惰性启动：已知总时长的完整 VOD 清单不启动 FFmpeg，首个 init
+或媒体分片请求才取得名额并启动，首个媒体分片直接决定 generation 0 的起点；不同 generation 使用独立 init，
+并发 init waiter 会跟随当前 generation。新增回归覆盖中段首次启动、回到更早分片、init/seek 并发、新 offer 不提前
+停止旧会话，以及越界 `StartTimeTicks`。`cargo build --locked`、`cargo test --locked --all-targets`
+（513 个库测试通过、4 个忽略，所有启用的集成目标通过）、库与 playback 集成目标 Clippy、
+`cargo fmt --all -- --check` 和 `git diff --check` 通过。全量 Clippy 仍只被未修改的
+`tests/item_merge.rs:32` 参数过多 lint 阻塞；`uname -m` 为 `arm64`。FNOS 新镜像与 Harbor 真机的中段切换、回到开头、
+首帧、声音和进度推进仍需部署后验证。
 
 依赖：LUX-198、LUX-199。
 

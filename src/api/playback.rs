@@ -780,11 +780,11 @@ async fn emby_transcoding_start_time_ticks(
     requested_start_time_ticks: Option<i64>,
     runtime_ticks: Option<i64>,
 ) -> Result<Option<i64>, StatusCode> {
-    // An explicit client value, including zero, is authoritative. Some
+    // An explicit valid client value, including zero, is authoritative. Some
     // clients omit StartTimeTicks even when they are resuming an item, so
     // recover the saved Emby/Lux position only when the field is absent.
     if let Some(start_time_ticks) = requested_start_time_ticks {
-        return Ok((start_time_ticks > 0).then_some(start_time_ticks));
+        return Ok(emby_start_time_hint(start_time_ticks, runtime_ticks));
     }
     let Some(database) = state.database.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
@@ -796,13 +796,19 @@ async fn emby_transcoding_start_time_ticks(
     let Some(user_state) = user_state else {
         return Ok(None);
     };
-    if user_state.is_played || user_state.position_ticks <= 0 {
+    if user_state.is_played {
         return Ok(None);
     }
-    if runtime_ticks.is_some_and(|runtime| user_state.position_ticks >= runtime) {
-        return Ok(None);
-    }
-    Ok(Some(user_state.position_ticks))
+    Ok(emby_start_time_hint(
+        user_state.position_ticks,
+        runtime_ticks,
+    ))
+}
+
+fn emby_start_time_hint(start_time_ticks: i64, runtime_ticks: Option<i64>) -> Option<i64> {
+    (start_time_ticks > 0
+        && !runtime_ticks.is_some_and(|runtime| runtime > 0 && start_time_ticks >= runtime))
+    .then_some(start_time_ticks)
 }
 
 fn emby_playback_session_error_status(error: WebPlaybackSessionError) -> StatusCode {
@@ -2321,13 +2327,15 @@ async fn serve_emby_transcoding_asset(
         return StatusCode::NOT_FOUND.into_response();
     };
     if asset == "index.m3u8" {
-        let path = match service.wait_for_hls_manifest(session_id).await {
-            Ok(path) => path,
-            Err(error) => return emby_playback_session_error_status(error).into_response(),
-        };
         let manifest = match service.hls_vod_manifest(session_id).await {
             Ok(Some(manifest)) => manifest,
             Ok(None) => {
+                let path = match service.wait_for_hls_manifest(session_id).await {
+                    Ok(path) => path,
+                    Err(error) => {
+                        return emby_playback_session_error_status(error).into_response();
+                    }
+                };
                 let Ok(bytes) = fs::read(path).await else {
                     return StatusCode::NOT_FOUND.into_response();
                 };
@@ -2339,6 +2347,11 @@ async fn serve_emby_transcoding_asset(
             Err(error) => return emby_playback_session_error_status(error).into_response(),
         };
         let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
+            let asset = if is_emby_generation_init_asset(asset) {
+                "init.mp4"
+            } else {
+                asset
+            };
             emby_transcoding_asset_url(
                 service,
                 &session.item_id,
@@ -2399,6 +2412,15 @@ async fn serve_emby_transcoding_asset(
         .header("Content-Length", metadata.len())
         .body(body)
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+}
+
+fn is_emby_generation_init_asset(asset: &str) -> bool {
+    asset
+        .strip_prefix("generation_")
+        .and_then(|value| value.strip_suffix("_init.mp4"))
+        .is_some_and(|generation| {
+            generation.len() == 6 && generation.bytes().all(|byte| byte.is_ascii_digit())
+        })
 }
 
 async fn create_web_playback_session_json(
@@ -3414,7 +3436,8 @@ pub(super) async fn lux_set_played(
 mod emby_playback_tests {
     use super::{
         EmbyPlaybackInfoRequest, emby_force_transcode_from_raw, emby_hls_asset_kind,
-        parse_emby_playback_info_request, playback_resumed,
+        emby_start_time_hint, is_emby_generation_init_asset, parse_emby_playback_info_request,
+        playback_resumed,
     };
     use crate::application::catalog::{CatalogSource, CatalogStream};
     use crate::application::playback::decision::{
@@ -3840,6 +3863,27 @@ mod emby_playback_tests {
         request.apply_query_parameters(&RawQuery(Some("StartTimeTicks=12345678".to_owned())));
 
         assert_eq!(request.start_time_ticks, Some(12_345_678));
+    }
+
+    #[test]
+    fn start_time_hint_rejects_non_positive_and_out_of_range_positions() {
+        assert_eq!(emby_start_time_hint(0, Some(100)), None);
+        assert_eq!(emby_start_time_hint(-1, Some(100)), None);
+        assert_eq!(emby_start_time_hint(100, Some(100)), None);
+        assert_eq!(emby_start_time_hint(101, Some(100)), None);
+        assert_eq!(emby_start_time_hint(i64::MAX, Some(100)), None);
+        assert_eq!(emby_start_time_hint(99, Some(100)), Some(99));
+        assert_eq!(emby_start_time_hint(101, None), Some(101));
+    }
+
+    #[test]
+    fn only_internal_emby_generation_init_names_are_mapped_to_the_public_asset() {
+        assert!(is_emby_generation_init_asset("generation_000123_init.mp4"));
+        assert!(!is_emby_generation_init_asset("generation_123_init.mp4"));
+        assert!(!is_emby_generation_init_asset(
+            "../generation_000123_init.mp4"
+        ));
+        assert!(!is_emby_generation_init_asset("init.mp4"));
     }
 
     #[test]

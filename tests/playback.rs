@@ -623,10 +623,12 @@ async fn emby_playback_info_negotiates_server_transcoding_and_cleans_hls()
 set -eu
 manifest=\"\"
 segment=\"\"
+init=\"init.mp4\"
 start_number=0
 while [ \"$#\" -gt 0 ]; do
   case \"$1\" in
     -hls_segment_filename) segment=\"$2\"; shift 2 ;;
+    -hls_fmp4_init_filename) init=\"$2\"; shift 2 ;;
     -start_number) start_number=\"$2\"; shift 2 ;;
     *.m3u8) manifest=\"$1\"; shift ;;
     *) shift ;;
@@ -634,8 +636,9 @@ while [ \"$#\" -gt 0 ]; do
 done
 directory=$(dirname \"$manifest\")
 mkdir -p \"$directory\"
-printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_%06d.m4s\\n' \"$start_number\" > \"$manifest\"
-printf init > \"$directory/init.mp4\"
+printf '%s\\n' \"$start_number\" >> \"$directory/starts.log\"
+printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"%s\\\"\\n#EXTINF:1,\\nsegment_%06d.m4s\\n' \"$init\" \"$start_number\" > \"$manifest\"
+printf init > \"$directory/$init\"
 segment_path=$(printf '%s' \"$segment\" | sed \"s/%06d/$(printf '%06d' \"$start_number\")/\")
 printf 'segment-%s' \"$start_number\" > \"$segment_path\"
 sleep 0.2
@@ -904,25 +907,38 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         );
     }
     assert!(!device_profile_url.contains("api_key="));
+    let device_profile_play_session_id = device_profile_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing DeviceProfile play session")?
+        .to_owned();
+    let device_profile_hls_session_id: String = sqlx::query_scalar(
+        "SELECT id FROM web_playback_sessions WHERE play_session_id = ? AND state = 'ACTIVE'",
+    )
+    .bind(&device_profile_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    let device_profile_starts = config
+        .config_dir
+        .join("web-playback")
+        .join(device_profile_hls_session_id)
+        .join("starts.log");
+    assert!(
+        !device_profile_starts.exists(),
+        "PlaybackInfo must reserve the Emby HLS session without starting FFmpeg"
+    );
     let device_profile_manifest = client
         .get(format!("{base_url}{device_profile_url}"))
         .send()
         .await?;
     assert_eq!(device_profile_manifest.status(), reqwest::StatusCode::OK);
     let device_profile_manifest = device_profile_manifest.text().await?;
+    assert!(
+        !device_profile_starts.exists(),
+        "the synthetic Emby VOD manifest must not start FFmpeg"
+    );
     assert!(device_profile_manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
     assert!(device_profile_manifest.contains("#EXT-X-ENDLIST\n"));
     assert!(device_profile_manifest.contains("#EXTINF:2.336000,"));
-    let resumed_segment_url = device_profile_manifest
-        .lines()
-        .find(|line| line.contains("segment_000000.m4s?"))
-        .ok_or("missing signed resumed segment URL")?;
-    let resumed_segment = client
-        .get(format!("{base_url}{resumed_segment_url}"))
-        .send()
-        .await?;
-    assert_eq!(resumed_segment.status(), reqwest::StatusCode::OK);
-    assert_eq!(resumed_segment.bytes().await?.as_ref(), b"segment-0");
     let resumed_seek_segment_url = device_profile_manifest
         .lines()
         .find(|line| line.contains("segment_001230.m4s?"))
@@ -936,18 +952,22 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         resumed_seek_segment.bytes().await?.as_ref(),
         b"segment-1230"
     );
+    let beginning_segment_url = device_profile_manifest
+        .lines()
+        .find(|line| line.contains("segment_000000.m4s?"))
+        .ok_or("missing signed beginning segment URL")?;
     let restarted_from_beginning = client
-        .get(format!("{base_url}{resumed_segment_url}"))
+        .get(format!("{base_url}{beginning_segment_url}"))
         .send()
         .await?;
     assert_eq!(
         restarted_from_beginning.bytes().await?.as_ref(),
         b"segment-0"
     );
-    let device_profile_play_session_id = device_profile_body["PlaySessionId"]
-        .as_str()
-        .ok_or("missing DeviceProfile play session")?
-        .to_owned();
+    assert_eq!(
+        tokio::fs::read_to_string(&device_profile_starts).await?,
+        "1230\n0\n"
+    );
     let device_profile_stopped = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
         .query(&[("api_key", token.as_str())])

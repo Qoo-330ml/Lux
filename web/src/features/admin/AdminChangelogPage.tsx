@@ -15,6 +15,17 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.9",
+    date: "2026-09-19",
+    sections: [
+      { kind: "fixed", items: [
+        "修复 Harbor/Emby 切换到中段码率或续播时，HLS 会话在首个资源请求前提前启动并被立即取消，导致视频无法播放的问题；现在首个 init 或媒体分片请求才启动转码，并由首个媒体分片确定实际起点。",
+        "修复 HLS init 与 seek 分片并发请求时可能读取不同 generation 资源的问题；切换转码 generation 后，等待中的请求会跟随当前 generation，避免返回失效的 init 或分片。",
+        "修复无效或超出媒体总时长的 StartTimeTicks 导致转码从 EOF 启动失败的问题，并避免新建但尚未使用的播放 offer 提前停止当前播放会话。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.8",
     date: "2026-09-18",
     sections: [
