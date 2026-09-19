@@ -693,6 +693,14 @@ impl HlsManager {
             });
         };
 
+        let previous_init = state.init.clone();
+        let wait_for_previous_init = process.specification.emby_vod && !initial_start && !finished;
+        if wait_for_previous_init {
+            drop(state);
+            let _ = wait_for_file(&previous_init, 20).await;
+            state = process.state.lock().await;
+        }
+
         self.check_restart_resources(process).await?;
         let permit = if initial_start {
             Some(self.acquire_permit(process.specification.tier)?)
@@ -887,6 +895,19 @@ async fn session_directory_bytes(directory: &Path) -> Result<u64, HlsError> {
         }
     }
     Ok(total)
+}
+
+async fn wait_for_file(path: &Path, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if fs::metadata(path)
+            .await
+            .is_ok_and(|metadata| metadata.is_file())
+        {
+            return true;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    false
 }
 
 async fn latest_manifest_segment_number(manifest_path: &Path) -> Result<Option<i64>, HlsError> {
@@ -1868,18 +1889,21 @@ while :; do sleep 1; done
             "100\n"
         );
 
-        let segment = manager
-            .wait_for_asset("emby-init-race", "segment_000100.m4s")
-            .await
-            .unwrap();
-        assert_eq!(tokio::fs::read(segment).await.unwrap(), b"segment-100");
+        let segment_manager = manager.clone();
+        let segment_request = tokio::spawn(async move {
+            segment_manager
+                .wait_for_asset("emby-init-race", "segment_000050.m4s")
+                .await
+        });
         let init = init_request.await.unwrap().unwrap();
         assert_eq!(tokio::fs::read(init).await.unwrap(), b"init-100");
+        let segment = segment_request.await.unwrap().unwrap();
+        assert_eq!(tokio::fs::read(segment).await.unwrap(), b"segment-50");
         assert_eq!(
             tokio::fs::read_to_string(session_directory.join("starts.log"))
                 .await
                 .unwrap(),
-            "100\n"
+            "100\n50\n"
         );
 
         manager.stop("emby-init-race").await.unwrap();
