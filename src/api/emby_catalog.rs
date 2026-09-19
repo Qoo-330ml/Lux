@@ -382,6 +382,44 @@ pub(super) async fn emby_library_virtual_folders(
     }
 }
 
+pub(super) async fn emby_library_selectable_media_folders(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(access) = state.access.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
+    let accessible_library_ids = match access.accessible_library_ids(principal).await {
+        Ok(ids) => ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match libraries
+        .list_libraries_for_user(&user.id.to_string(), &accessible_library_ids)
+        .await
+    {
+        Ok(views) => Json(
+            views
+                .iter()
+                .map(emby_selectable_media_folder_json)
+                .collect::<Vec<_>>(),
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 pub(super) async fn emby_library_media_folders(
     headers: HeaderMap,
     Query(query): Query<EmbyMediaFoldersQuery>,
@@ -4253,6 +4291,27 @@ pub(super) fn emby_virtual_folder_json(
             .map(|_| public_library_id),
         "RefreshProgress": null,
         "RefreshStatus": "Idle",
+    })
+}
+
+fn emby_selectable_media_folder_json(view: &LibraryView) -> Value {
+    let public_library_id = emby_public_id(&view.library.id.to_string());
+    json!({
+        "Name": view.library.name,
+        "Id": public_library_id.clone(),
+        "Guid": public_library_id,
+        "SubFolders": view.roots.iter().map(|root| json!({
+            "Name": root
+                .display_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .filter(|name| !name.is_empty())
+                .unwrap_or(&view.library.name),
+            "Id": emby_public_id(&root.id.to_string()),
+            "Path": root.display_path.to_string_lossy(),
+            "IsUserAccessConfigurable": true,
+        })).collect::<Vec<_>>(),
+        "IsUserAccessConfigurable": true,
     })
 }
 
