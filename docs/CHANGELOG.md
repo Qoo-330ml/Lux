@@ -11,6 +11,8 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 - 修复 Harbor/Emby 切换到中段码率或续播时，HLS 会话在首个资源请求前提前启动并被立即取消，导致视频无法播放的问题；现在首个 init 或媒体分片请求才启动转码，并由首个媒体分片确定实际起点。
 - 修复 HLS init 与 seek 分片并发请求时可能读取不同 generation 资源的问题；切换转码 generation 后，等待中的请求会跟随当前 generation，避免返回失效的 init 或分片。
 - 修复无效或超出媒体总时长的 `StartTimeTicks` 导致转码从 EOF 启动失败的问题，并避免新建但尚未使用的播放 offer 提前停止当前播放会话。
+- 修复 Emby VOD 在远距离 seek 或并发切换 generation 时混用不同时间基准的 init 与媒体分片的问题；现在每个逻辑分片绑定对应的 init 和 generation 资源，旧 generation 的请求不会被新 seek 改写。
+- 修复 seek 期间 init 文件尚未落盘或被替换导致 Harbor 收到空资源的问题；generation 切换会保护已绑定的 init，并让并发 init/分片请求使用同一 generation。
 
 ## [0.4.8] - 2026-09-18
 
