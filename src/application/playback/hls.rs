@@ -472,8 +472,9 @@ fn ffmpeg_args(
         "warning".to_owned(),
         "-nostdin".to_owned(),
     ];
-    if let Some(start_time) = ffmpeg_start_time(start_time_ticks) {
-        args.extend(["-ss".to_owned(), start_time]);
+    let start_time = ffmpeg_start_time(start_time_ticks);
+    if let Some(start_time) = start_time.as_ref() {
+        args.extend(["-ss".to_owned(), start_time.clone()]);
     }
     args.extend([
         "-i".to_owned(),
@@ -548,6 +549,12 @@ fn ffmpeg_args(
             "-sc_threshold".to_owned(),
             "0".to_owned(),
         ]);
+    }
+    if let Some(start_time) = start_time {
+        // Input seeking resets encoded timestamps to zero. Emby's complete VOD
+        // manifest keeps resumed segments on the original media timeline, so
+        // shift only the muxed output while retaining relative encoder time.
+        args.extend(["-output_ts_offset".to_owned(), start_time]);
     }
     args.extend([
         "-f".to_owned(),
@@ -816,7 +823,7 @@ mod tests {
     }
 
     #[test]
-    fn resume_arguments_seek_before_input_using_emby_ticks() {
+    fn resume_arguments_seek_before_input_and_offset_output_to_original_timeline() {
         let args = ffmpeg_args(
             Path::new("movie.mkv"),
             Path::new("session"),
@@ -836,7 +843,28 @@ mod tests {
             .iter()
             .position(|value| value == "-i")
             .expect("input argument");
+        let output_offset = args
+            .windows(2)
+            .position(|pair| pair == ["-output_ts_offset", "1.2345678"])
+            .expect("output timestamp offset arguments");
         assert!(seek < input);
+        assert!(input < output_offset);
+    }
+
+    #[test]
+    fn playback_from_start_does_not_offset_output_timestamps() {
+        let args = ffmpeg_args(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::SoftwareTranscode,
+            None,
+            None,
+            None,
+            0,
+        )
+        .unwrap();
+
+        assert!(!args.iter().any(|value| value == "-output_ts_offset"));
     }
 
     #[test]
