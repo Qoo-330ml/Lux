@@ -102,6 +102,7 @@ struct HlsProcessSpecification {
 struct HlsProcessState {
     child: Option<Child>,
     generation: u64,
+    emby_segment_generations: HashMap<i64, u64>,
     init: PathBuf,
     manifest: PathBuf,
     permit: Option<OwnedSemaphorePermit>,
@@ -116,6 +117,7 @@ struct SegmentSchedule {
 struct HlsOutput<'a> {
     init_file_name: &'a str,
     manifest: &'a Path,
+    segment_file_name: String,
     preserve_input_timestamps: bool,
 }
 
@@ -267,6 +269,7 @@ impl HlsManager {
                 &directory,
                 &init,
                 &manifest,
+                generation,
                 start_time_ticks,
             ) {
                 Ok(child) => Some(child),
@@ -286,6 +289,7 @@ impl HlsManager {
             state: Mutex::new(HlsProcessState {
                 child,
                 generation,
+                emby_segment_generations: HashMap::new(),
                 init,
                 manifest,
                 permit,
@@ -311,6 +315,7 @@ impl HlsManager {
         directory: &Path,
         init: &Path,
         manifest: &Path,
+        generation: u64,
         start_time_ticks: Option<i64>,
     ) -> Result<Child, HlsError> {
         let init_file_name = init
@@ -328,6 +333,9 @@ impl HlsManager {
                 HlsOutput {
                     init_file_name,
                     manifest,
+                    segment_file_name: hls_segment_pattern(directory, true, generation)
+                        .to_string_lossy()
+                        .into_owned(),
                     preserve_input_timestamps: true,
                 },
             )?
@@ -389,13 +397,24 @@ impl HlsManager {
         if process.state.lock().await.child.is_some() {
             return Ok(());
         }
-        let requested_segment = match asset.map(asset_segment_number).transpose()? {
-            Some(Some(segment_number)) => segment_number,
+        let requested_segment = match asset {
+            Some(asset) if asset_segment_number(asset)?.is_some() => {
+                asset_segment_number(asset)?.unwrap_or(0)
+            }
+            Some(asset) if emby_init_segment_number(asset).is_some() => {
+                emby_init_segment_number(asset).unwrap_or(0)
+            }
             _ => process.state.lock().await.segment_start_number,
         };
         let requested_path = match asset {
+            Some(asset) if is_emby_generation_asset(asset) => process.directory.join(asset),
             Some("init.mp4") => emby_asset_path(&process, "init.mp4").await,
-            Some(asset) if asset_segment_number(asset)?.is_some() => process.directory.join(asset),
+            Some(asset)
+                if asset_segment_number(asset)?.is_some()
+                    || emby_init_segment_number(asset).is_some() =>
+            {
+                emby_asset_path(&process, asset).await
+            }
             _ => process
                 .directory
                 .join(format!("segment_{requested_segment:06}.m4s")),
@@ -480,16 +499,21 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
-        let is_emby_init = process.specification.emby_vod && asset == "init.mp4";
+        let is_emby_init = process.specification.emby_vod
+            && (asset == "init.mp4" || emby_init_segment_number(asset).is_some());
         let public_path = process.directory.join(asset);
         if !public_path.starts_with(&process.directory) {
             return Err(HlsError::InvalidAsset);
         }
-        let mut generation_segment = if process.specification.emby_vod {
-            match segment_number {
-                Some(segment_number) => Some(segment_number),
-                None if is_emby_init => Some(process.state.lock().await.segment_start_number),
-                None => None,
+        let generation_segment = if process.specification.emby_vod
+            && !is_emby_generation_asset(asset)
+        {
+            match (segment_number, emby_init_segment_number(asset)) {
+                (Some(segment_number), _) | (None, Some(segment_number)) => Some(segment_number),
+                (None, None) if is_emby_init => {
+                    Some(process.state.lock().await.segment_start_number)
+                }
+                (None, None) => None,
             }
         } else {
             None
@@ -504,7 +528,11 @@ impl HlsManager {
             None
         };
         for _ in 0..HLS_ASSET_WAIT_ATTEMPTS {
-            let path = emby_asset_path(&process, asset).await;
+            let path = if let Some(schedule) = schedule.as_ref() {
+                emby_asset_path_for_generation(&process, asset, schedule.generation)
+            } else {
+                emby_asset_path(&process, asset).await
+            };
             if fs::metadata(&path)
                 .await
                 .is_ok_and(|metadata| metadata.is_file())
@@ -521,28 +549,20 @@ impl HlsManager {
             if !Arc::ptr_eq(&current_process, &process) {
                 return Err(HlsError::NotFound);
             }
-            let (generation, segment_start_number, finished) = {
+            let (generation, finished) = {
                 let mut state = process.state.lock().await;
                 let finished = match state.child.as_mut() {
                     Some(child) => child.try_wait().map_err(HlsError::Io)?.is_some(),
                     None => true,
                 };
-                (state.generation, state.segment_start_number, finished)
+                (state.generation, finished)
             };
-            if let Some(segment_number) = generation_segment
+            if generation_segment.is_some()
                 && schedule
                     .as_ref()
                     .is_some_and(|scheduled| scheduled.generation != generation)
             {
-                if is_emby_init {
-                    generation_segment = Some(segment_start_number);
-                } else if !segment_is_near_current_generation(&process, segment_number).await? {
-                    return Err(HlsError::Superseded);
-                }
-                schedule = Some(SegmentSchedule {
-                    generation,
-                    restarted: false,
-                });
+                return Err(HlsError::Superseded);
             }
             if finished {
                 if let Some(segment_number) = generation_segment
@@ -550,7 +570,11 @@ impl HlsManager {
                         .as_ref()
                         .is_some_and(|scheduled| !scheduled.restarted)
                 {
-                    let path = emby_asset_path(&process, asset).await;
+                    let path = emby_asset_path_for_generation(
+                        &process,
+                        asset,
+                        process.state.lock().await.generation,
+                    );
                     schedule = Some(
                         self.restart_for_segment(session_id, &process, segment_number, &path)
                             .await?,
@@ -581,16 +605,6 @@ impl HlsManager {
         if !is_current_process {
             return Err(HlsError::NotFound);
         }
-        if fs::metadata(requested_path)
-            .await
-            .is_ok_and(|metadata| metadata.is_file())
-        {
-            let generation = process.state.lock().await.generation;
-            return Ok(SegmentSchedule {
-                generation,
-                restarted: false,
-            });
-        }
         let mut state = process.state.lock().await;
         let initial_start = state.child.is_none();
         let latest_segment = latest_manifest_segment_number(&state.manifest).await?;
@@ -600,6 +614,61 @@ impl HlsManager {
         };
         let current_segment =
             latest_segment.unwrap_or_else(|| state.segment_start_number.saturating_sub(1));
+        if process.specification.emby_vod {
+            let is_init_asset = requested_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.ends_with("_init.mp4") || value == "init.mp4");
+            if let Some(bound_generation) = state
+                .emby_segment_generations
+                .get(&requested_segment)
+                .copied()
+            {
+                if bound_generation == state.generation && !finished {
+                    return Ok(SegmentSchedule {
+                        generation: bound_generation,
+                        restarted: false,
+                    });
+                }
+                if bound_generation != state.generation {
+                    let bound_path = emby_generation_asset_path(
+                        process,
+                        bound_generation,
+                        requested_segment,
+                        is_init_asset,
+                    );
+                    if fs::metadata(bound_path)
+                        .await
+                        .is_ok_and(|metadata| metadata.is_file())
+                    {
+                        return Ok(SegmentSchedule {
+                            generation: bound_generation,
+                            restarted: false,
+                        });
+                    }
+                    return Err(HlsError::Superseded);
+                }
+                state.emby_segment_generations.remove(&requested_segment);
+            }
+        }
+        let request_is_near_current_generation = requested_segment >= state.segment_start_number
+            && requested_segment.saturating_sub(current_segment) <= HLS_SEGMENT_RESTART_GAP;
+        if request_is_near_current_generation
+            && fs::metadata(requested_path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file())
+        {
+            if process.specification.emby_vod {
+                let generation = state.generation;
+                state
+                    .emby_segment_generations
+                    .insert(requested_segment, generation);
+            }
+            return Ok(SegmentSchedule {
+                generation: state.generation,
+                restarted: false,
+            });
+        }
         let restart_reason = if initial_start {
             Some("initial_request")
         } else if finished {
@@ -612,6 +681,12 @@ impl HlsManager {
             None
         };
         let Some(restart_reason) = restart_reason else {
+            if process.specification.emby_vod {
+                let generation = state.generation;
+                state
+                    .emby_segment_generations
+                    .insert(requested_segment, generation);
+            }
             return Ok(SegmentSchedule {
                 generation: state.generation,
                 restarted: false,
@@ -644,6 +719,7 @@ impl HlsManager {
             &process.directory,
             &init,
             &manifest,
+            generation,
             Some(start_time_ticks),
         )?;
         tracing::info!(
@@ -662,6 +738,11 @@ impl HlsManager {
             state.permit = Some(permit);
         }
         state.segment_start_number = requested_segment;
+        if process.specification.emby_vod {
+            state
+                .emby_segment_generations
+                .insert(requested_segment, generation);
+        }
         Ok(SegmentSchedule {
             generation,
             restarted: true,
@@ -820,25 +901,40 @@ async fn latest_manifest_segment_number(manifest_path: &Path) -> Result<Option<i
         .max())
 }
 
-async fn segment_is_near_current_generation(
-    process: &HlsProcess,
-    requested_segment: i64,
-) -> Result<bool, HlsError> {
-    let (manifest, segment_start_number) = {
-        let state = process.state.lock().await;
-        (state.manifest.clone(), state.segment_start_number)
-    };
-    let latest_segment = latest_manifest_segment_number(&manifest).await?;
-    let current_segment = latest_segment.unwrap_or_else(|| segment_start_number.saturating_sub(1));
-    Ok(requested_segment >= segment_start_number
-        && requested_segment.saturating_sub(current_segment) <= HLS_SEGMENT_RESTART_GAP)
+async fn emby_asset_path(process: &HlsProcess, asset: &str) -> PathBuf {
+    if !process.specification.emby_vod {
+        return process.directory.join(asset);
+    }
+    if is_emby_generation_asset(asset) {
+        return process.directory.join(asset);
+    }
+    let state = process.state.lock().await;
+    emby_asset_path_for_generation(process, asset, state.generation)
 }
 
-async fn emby_asset_path(process: &HlsProcess, asset: &str) -> PathBuf {
-    if process.specification.emby_vod && asset == "init.mp4" {
-        process.state.lock().await.init.clone()
+fn emby_asset_path_for_generation(process: &HlsProcess, asset: &str, generation: u64) -> PathBuf {
+    if is_emby_generation_asset(asset) {
+        return process.directory.join(asset);
+    }
+    if asset == "init.mp4" || emby_init_segment_number(asset).is_some() {
+        hls_init_path(&process.directory, true, generation)
+    } else if let Ok(Some(segment_number)) = asset_segment_number(asset) {
+        hls_segment_path(&process.directory, true, generation, segment_number)
     } else {
         process.directory.join(asset)
+    }
+}
+
+fn emby_generation_asset_path(
+    process: &HlsProcess,
+    generation: u64,
+    segment_number: i64,
+    is_init: bool,
+) -> PathBuf {
+    if is_init {
+        hls_init_path(&process.directory, true, generation)
+    } else {
+        hls_segment_path(&process.directory, true, generation, segment_number)
     }
 }
 
@@ -855,6 +951,29 @@ fn hls_init_path(directory: &Path, emby_vod: bool, generation: u64) -> PathBuf {
         directory.join(format!("generation_{generation:06}_init.mp4"))
     } else {
         directory.join("init.mp4")
+    }
+}
+
+fn hls_segment_pattern(directory: &Path, emby_vod: bool, generation: u64) -> PathBuf {
+    if emby_vod {
+        directory.join(format!("generation_{generation:06}_segment_%06d.m4s"))
+    } else {
+        directory.join("segment_%06d.m4s")
+    }
+}
+
+fn hls_segment_path(
+    directory: &Path,
+    emby_vod: bool,
+    generation: u64,
+    segment_number: i64,
+) -> PathBuf {
+    if emby_vod {
+        directory.join(format!(
+            "generation_{generation:06}_segment_{segment_number:06}.m4s"
+        ))
+    } else {
+        directory.join(format!("segment_{segment_number:06}.m4s"))
     }
 }
 
@@ -931,6 +1050,10 @@ fn ffmpeg_args_with_timeline(
         HlsOutput {
             init_file_name: "init.mp4",
             manifest: &manifest,
+            segment_file_name: directory
+                .join("segment_%06d.m4s")
+                .to_string_lossy()
+                .into_owned(),
             preserve_input_timestamps,
         },
     )
@@ -938,7 +1061,7 @@ fn ffmpeg_args_with_timeline(
 
 fn ffmpeg_args_for_output(
     input: &Path,
-    directory: &Path,
+    _directory: &Path,
     tier: ServerTier,
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
@@ -1063,10 +1186,7 @@ fn ffmpeg_args_for_output(
         "-hls_fmp4_init_filename".to_owned(),
         output.init_file_name.to_owned(),
         "-hls_segment_filename".to_owned(),
-        directory
-            .join("segment_%06d.m4s")
-            .to_string_lossy()
-            .into_owned(),
+        output.segment_file_name,
         "-hls_flags".to_owned(),
         "independent_segments+temp_file".to_owned(),
     ]);
@@ -1084,10 +1204,16 @@ fn hls_start_number(start_time_ticks: Option<i64>) -> i64 {
 }
 
 fn asset_segment_number(asset: &str) -> Result<Option<i64>, HlsError> {
-    let Some(segment_number) = asset
-        .strip_prefix("segment_")
-        .and_then(|value| value.strip_suffix(".m4s"))
-    else {
+    let segment_number = if let Some(value) = asset.strip_prefix("segment_") {
+        value.strip_suffix(".m4s")
+    } else if let Some(value) = asset.strip_prefix("generation_") {
+        value
+            .split_once("_segment_")
+            .and_then(|(_, value)| value.strip_suffix(".m4s"))
+    } else {
+        None
+    };
+    let Some(segment_number) = segment_number else {
         return Ok(None);
     };
     let number = segment_number
@@ -1188,10 +1314,13 @@ fn is_emby_generation_asset(asset: &str) -> bool {
     let Some((generation, asset)) = value.split_once('_') else {
         return false;
     };
+    let valid_segment = asset
+        .strip_prefix("segment_")
+        .and_then(|value| value.strip_suffix(".m4s"))
+        .is_some_and(|value| value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit()));
     generation.len() == 6
         && generation.bytes().all(|byte| byte.is_ascii_digit())
-        && (asset == "init.mp4"
-            || (asset.starts_with("segment_") && asset.ends_with(".m4s")))
+        && (asset == "init.mp4" || valid_segment)
 }
 
 fn is_allowed_hardware_encoder(value: &str) -> bool {
@@ -1238,7 +1367,7 @@ mod tests {
     use super::{
         HLS_SEGMENT_DURATION_TICKS, SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache,
         asset_segment_number, emby_init_segment_number, ffmpeg_args, ffmpeg_args_with_timeline,
-        hls_start_number, is_valid_asset, vod_manifest,
+        hls_segment_path, hls_start_number, is_valid_asset, vod_manifest,
     };
 
     #[test]
@@ -1434,6 +1563,10 @@ mod tests {
             asset_segment_number("segment_000969.m4s").unwrap(),
             Some(969)
         );
+        assert_eq!(
+            asset_segment_number("generation_000001_segment_000969.m4s").unwrap(),
+            Some(969)
+        );
         assert_eq!(asset_segment_number("init.mp4").unwrap(), None);
         assert!(asset_segment_number("segment_invalid.m4s").is_err());
     }
@@ -1476,8 +1609,17 @@ mod tests {
         assert!(is_valid_asset("segment_000001.m4s"));
         assert!(is_valid_asset("generation_000001_init.mp4"));
         assert!(is_valid_asset("generation_000001_segment_000001.m4s"));
+        assert!(!is_valid_asset("generation_000001_segment_bad.m4s"));
         assert!(!is_valid_asset("../index.m3u8"));
         assert!(!is_valid_asset("other.txt"));
+    }
+
+    #[test]
+    fn emby_generation_segment_paths_are_unique() {
+        assert_eq!(
+            hls_segment_path(Path::new("/config/session"), true, 1, 969),
+            Path::new("/config/session/generation_000001_segment_000969.m4s")
+        );
     }
 
     #[test]
@@ -1603,6 +1745,11 @@ while :; do sleep 1; done
             .await
             .unwrap();
         assert_eq!(tokio::fs::read(forward).await.unwrap(), b"segment-100");
+        let initial = manager
+            .wait_for_asset("emby-generations", "init_000100.mp4")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(initial).await.unwrap(), b"init");
         let initial_manifest = session_directory.join("generation_000000.m3u8");
         assert_eq!(
             initial_manifest.file_name().and_then(|name| name.to_str()),
@@ -1615,6 +1762,19 @@ while :; do sleep 1; done
             .await
             .unwrap();
         assert_eq!(tokio::fs::read(backward).await.unwrap(), b"segment-50");
+        let original_init = manager
+            .wait_for_asset("emby-generations", "init_000100.mp4")
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(original_init).await.unwrap(), b"init");
+        let original_segment = manager
+            .wait_for_asset("emby-generations", "segment_000100.m4s")
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(original_segment).await.unwrap(),
+            b"segment-100"
+        );
         assert!(initial_manifest.exists());
 
         assert!(session_directory.join("generation_000001.m3u8").exists());
@@ -1631,7 +1791,7 @@ while :; do sleep 1; done
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn emby_init_waiter_follows_a_concurrent_segment_generation() {
+    async fn emby_init_and_segment_share_the_requested_generation() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp_dir = tempfile::tempdir().unwrap();
@@ -1688,7 +1848,7 @@ while :; do sleep 1; done
         let init_manager = manager.clone();
         let init_request = tokio::spawn(async move {
             init_manager
-                .wait_for_asset("emby-init-race", "init.mp4")
+                .wait_for_asset("emby-init-race", "init_000100.mp4")
                 .await
         });
         let session_directory = manager.session_directory("emby-init-race").await.unwrap();
@@ -1709,17 +1869,17 @@ while :; do sleep 1; done
         );
 
         let segment = manager
-            .wait_for_asset("emby-init-race", "segment_000050.m4s")
+            .wait_for_asset("emby-init-race", "segment_000100.m4s")
             .await
             .unwrap();
-        assert_eq!(tokio::fs::read(segment).await.unwrap(), b"segment-50");
+        assert_eq!(tokio::fs::read(segment).await.unwrap(), b"segment-100");
         let init = init_request.await.unwrap().unwrap();
-        assert_eq!(tokio::fs::read(init).await.unwrap(), b"init-50");
+        assert_eq!(tokio::fs::read(init).await.unwrap(), b"init-100");
         assert_eq!(
             tokio::fs::read_to_string(session_directory.join("starts.log"))
                 .await
                 .unwrap(),
-            "100\n50\n"
+            "100\n"
         );
 
         manager.stop("emby-init-race").await.unwrap();

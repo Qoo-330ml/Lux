@@ -6183,13 +6183,14 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
   `TranscodingSubProtocol=hls`、`TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
   URL 指向标准 Emby `master.m3u8` 入口，并带有 `DeviceId`、输出 codec、码率、轨道索引和 fMP4 分片参数；
   实际转码 offer 的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，同时保持
-  `SupportsDirectPlay`/`SupportsDirectStream` 为 `false`；清单中的初始化片段和媒体片段继续使用当前会话的短期签名 URL。
+  `SupportsDirectPlay`/`SupportsDirectStream` 为 `false`；清单中的每个逻辑 `segment_N.m4s` 使用对应的
+  `init_N.mp4` 和当前会话短期签名 URL，不能跨 generation 混用 fMP4 初始化段。
 - 转码会话复用 `web_playback_sessions`，其 `PlaySessionId` 可被 Emby `Sessions/Playing`、`Progress` 和
   `Stopped` 回调关联；播放/暂停刷新 TTL，停止立即回收 FFmpeg 进程和临时目录。没有回调时仍由服务端
   过期清理回收。
 - Emby `PlaybackInfo` 只登记惰性 HLS 会话，不占用 FFmpeg 并发名额，也不停止同一用户、条目和 source 的
-  现有播放；首个 init、媒体分片或未知时长的物理清单请求才原子替换旧会话并启动。`StartTimeTicks` 只是
-  init 先到时的起点提示；总时长已知时，非正数以及等于或超过总时长的值都不用于启动。
+  现有播放；首个逻辑 init、媒体分片或未知时长的物理清单请求才原子替换旧会话并启动。逻辑分片一旦绑定 generation，
+  后续 seek 不得把它改映射到另一 generation。`StartTimeTicks` 只是 init 先到时的起点提示；总时长已知时，非正数以及等于或超过总时长的值都不用于启动。
 - `.strm` 无论客户端是否声明转码能力，都不返回服务端转码 URL，不启动 FFmpeg，不生成 HLS 目录，也不
   代理媒体字节。
 - 转码资源必须绑定当前用户、条目、媒体源、会话和签名有效期；错误用户、跨条目/媒体源、篡改或过期签名、
@@ -6269,6 +6270,12 @@ Clippy 仍被未修改的 `src/api/legacy.rs:44` 未使用导入阻塞。FNOS �
 `cargo fmt --all -- --check` 和 `git diff --check` 通过。全量 Clippy 仍只被未修改的
 `tests/item_merge.rs:32` 参数过多 lint 阻塞；`uname -m` 为 `arm64`。FNOS 新镜像与 Harbor 真机的中段切换、回到开头、
 首帧、声音和进度推进仍需部署后验证。
+
+验证记录（2026-09-20 HLS init / generation 绑定修复）：FNOS Jellyfin FFmpeg 7.1.4 交叉探针确认，
+仅添加 `-start_at_zero`、`use_editlist=0` 或输出偏移仍会把中段 fMP4 fragment 的 PTS 归零；因此 Emby VOD
+清单改为每个逻辑 segment 声明对应的 `init_N.mp4`，不同 generation 的物理 segment 文件隔离命名，并将
+逻辑 segment 持久绑定到首次生成它的 generation。窄 HLS 单元测试 24 个和 Emby PlaybackInfo/HLS 集成目标
+已通过；FNOS 镜像重建、部署及 Harbor 真机首帧/seek/音画验证仍待完成。
 
 依赖：LUX-198、LUX-199。
 

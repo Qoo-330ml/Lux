@@ -1138,6 +1138,9 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     assert!(manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
     assert!(manifest.contains("#EXT-X-ENDLIST\n"));
     assert_eq!(manifest.matches("segment_").count(), 1_474);
+    assert_eq!(manifest.matches("#EXT-X-MAP:").count(), 1_474);
+    assert!(manifest.contains("/init_000000.mp4?"));
+    assert!(manifest.contains("/init_001230.mp4?"));
     assert!(manifest.contains("#EXTINF:4.000000,"));
     assert!(manifest.contains("#EXTINF:2.336000,"));
     let init_url = manifest

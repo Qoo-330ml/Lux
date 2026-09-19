@@ -56,7 +56,8 @@
   - `.strm` source 保持 `SupportsTranscoding=false`，不返回 `TranscodingUrl`。
 - `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，缺失时回退到媒体项时长。
   Emby HLS 清单必须按完整 `RunTimeTicks` 生成 `#EXT-X-PLAYLIST-TYPE:VOD`、完整分片列表和
-  `#EXT-X-ENDLIST`，使第三方客户端立即获得完整时间轴；FFmpeg 仍以增量方式生成分片，尚未生成的签名分片请求由服务端等待。
+  `#EXT-X-ENDLIST`，使第三方客户端立即获得完整时间轴；每个逻辑 `segment_N.m4s` 前声明对应的
+  `init_N.mp4`，避免 seek generation 之间混用 fMP4 时间基准。FFmpeg 仍以增量方式生成分片，尚未生成的签名分片请求由服务端等待。
   Lux Web 的内部 HLS 清单仍保持原有动态追加行为，不复用 Emby 的 VOD 清单。
 
 ### 转码资源
@@ -79,6 +80,16 @@
   Emby 鉴权头取得，缺失时使用 `unknown`，不把长期 API token 写入 URL。
 - 转码输入只允许 `canonical_local_media_path` 返回的本地普通文件；`.strm`、路径穿越和外部目标拒绝。
 - 不新增迁移、不修改 Web DTO、不实现服务器字幕转换、DRM 或自适应多码率。
+
+## Generation / init 绑定修复
+
+Emby VOD 不能把所有逻辑分片都映射为动态的单一 `init.mp4`。每个逻辑分片使用
+`init_N.mp4`，内部 FFmpeg generation 使用独立的 init 和 segment 文件名；逻辑分片第一次激活后绑定到该
+generation，后续 seek 不会把它改映射到另一个 generation。这样 Harbor 先请求恢复位置的 init、随后请求第 0 段时，
+两者会分别得到自己的时间基准，不会再组成“中段 init + 第 0 段媒体”的非法 fMP4 组合。
+
+仅增加 `-start_at_zero`、`use_editlist=0` 或输出时间戳偏移不能修复该问题：FNOS Jellyfin FFmpeg 7.1.4
+在禁用 edit list 后仍会把中段 fragment 的 PTS 归零，因此不采用参数级替代方案。
 
 ## 预计修改文件
 

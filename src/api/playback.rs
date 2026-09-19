@@ -2106,7 +2106,10 @@ fn emby_hls_asset_kind(asset: &str) -> &'static str {
     match asset {
         "index.m3u8" => "manifest",
         "init.mp4" => "initialization",
+        value if is_emby_logical_init_asset(value) => "initialization",
+        value if is_emby_generation_init_asset(value) => "initialization",
         value if value.starts_with("segment_") && value.ends_with(".m4s") => "segment",
+        value if is_emby_generation_segment_asset(value) => "segment",
         _ => "other",
     }
 }
@@ -2120,7 +2123,7 @@ fn record_emby_hls_asset_response(
     duration_ms: u128,
 ) {
     let asset_kind = emby_hls_asset_kind(asset);
-    if asset_kind != "manifest" && status.is_success() {
+    if !matches!(asset_kind, "manifest" | "initialization") && status.is_success() {
         return;
     }
     let session_id_prefix = session_id
@@ -2347,11 +2350,6 @@ async fn serve_emby_transcoding_asset(
             Err(error) => return emby_playback_session_error_status(error).into_response(),
         };
         let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
-            let asset = if is_emby_generation_init_asset(asset) {
-                "init.mp4"
-            } else {
-                asset
-            };
             emby_transcoding_asset_url(
                 service,
                 &session.item_id,
@@ -2421,6 +2419,30 @@ fn is_emby_generation_init_asset(asset: &str) -> bool {
         .is_some_and(|generation| {
             generation.len() == 6 && generation.bytes().all(|byte| byte.is_ascii_digit())
         })
+}
+
+fn is_emby_generation_segment_asset(asset: &str) -> bool {
+    let Some(value) = asset.strip_prefix("generation_") else {
+        return false;
+    };
+    let Some((generation, segment)) = value.split_once("_segment_") else {
+        return false;
+    };
+    generation.len() == 6
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+        && segment.len() == 10
+        && segment.ends_with(".m4s")
+        && segment[..6].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_emby_logical_init_asset(asset: &str) -> bool {
+    let Some(value) = asset
+        .strip_prefix("init_")
+        .and_then(|value| value.strip_suffix(".mp4"))
+    else {
+        return false;
+    };
+    value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 async fn create_web_playback_session_json(
@@ -3491,7 +3513,16 @@ mod emby_playback_tests {
     fn emby_hls_asset_kind_uses_bounded_categories() {
         assert_eq!(emby_hls_asset_kind("index.m3u8"), "manifest");
         assert_eq!(emby_hls_asset_kind("init.mp4"), "initialization");
+        assert_eq!(emby_hls_asset_kind("init_000001.mp4"), "initialization");
+        assert_eq!(
+            emby_hls_asset_kind("generation_000001_init.mp4"),
+            "initialization"
+        );
         assert_eq!(emby_hls_asset_kind("segment_000001.m4s"), "segment");
+        assert_eq!(
+            emby_hls_asset_kind("generation_000001_segment_000001.m4s"),
+            "segment"
+        );
         assert_eq!(emby_hls_asset_kind("unexpected.bin"), "other");
     }
 
