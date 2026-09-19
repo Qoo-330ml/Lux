@@ -51,9 +51,9 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 签名 URL；转码 URL 同时带有 Emby 客户端通常依赖的 `DeviceId`、输出 codec、码率、轨道索引和 fMP4 分片参数，实际
 转码 offer 将 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，同时保持不可直放能力位；Emby 播放回调会刷新会话，`Stopped`
 会回收 FFmpeg 和临时目录。为避免播放器把动态 HLS 清单当前已生成的片段长度当作完整片长，`PlaybackInfo` 响应顶层和每个
-`MediaSources[]` 都返回完整的 `RunTimeTicks`，优先使用选中 source 时长并回退到条目时长；Emby HLS 清单按完整时长立即返回 VOD 时间轴、完整分片列表和 `ENDLIST`，尚未生成的分片请求会等待 FFmpeg 输出。客户端省略 `StartTimeTicks` 时，Lux 会对未标记为已播放的条目使用保存的用户进度启动转码；客户端显式发送的值（包括 `0`）优先。Lux 自有签名参数仍保留，长期 API token 不写入转码 URL。
+`MediaSources[]` 都返回完整的 `RunTimeTicks`，优先使用选中 source 时长并回退到条目时长；Emby HLS 清单按完整时长立即返回从 `MEDIA-SEQUENCE:0` 开始的 VOD 时间轴、完整分片列表和 `ENDLIST`。Emby HLS 不再用保存进度立即启动中段 FFmpeg，也不把中段物理分片映射为逻辑第 `0` 段；缺失且远离当前输出窗口的分片会按逻辑编号对应的媒体位置重启 FFmpeg。视频转码档位使用四秒关键帧节奏，复制视频流时实际边界仍可落在源关键帧；`-copyts -avoid_negative_ts disabled` 的合同是保留源时间线并避免每次重启从零计时，不承诺任意源文件的绝对 PTS 必然等于 `分片号 × 4 秒`。各次重启使用独立的内部 generation 清单，旧的并发请求不会删除初始清单或反向覆盖更新的 seek；重启前重新检查磁盘水位和会话配额，重启失败会终止会话并释放转码名额。客户端省略 `StartTimeTicks` 时，Lux 仍会把未标记为已播放的保存进度作为转码 URL 兼容提示，客户端显式发送的值（包括 `0`）优先；实际媒体内容由客户端请求的逻辑分片决定。Lux 自有签名参数仍保留，长期 API token 不写入转码 URL。
 
-`tests/playback.rs` 已覆盖 Direct Play 优先、本地转码 PlaybackInfo 协商、manifest/init/segment 实际读取、
+`tests/playback.rs` 已覆盖 Direct Play 优先、本地转码 PlaybackInfo 协商、完整 VOD 的第 `0` 段、远距离逻辑分片重启、回到第 `0` 段，以及 manifest/init/segment 实际读取；播放模块测试另覆盖真实后向 generation 重启、并发 seek 取代、重启配额和失败清理，
 跨条目和篡改签名拒绝、播放回调刷新/停止清理，以及 `.strm` 不声明转码且不创建 HLS 会话。该自动化证据
 只证明服务端协议和资源边界；截至本记录，尚未用 VidHub、SenPlayer、Infuse 或其他第三方 Emby 客户端在
 部署实例上实测转码首帧、seek、暂停、停止和断线回收，不能据此宣称客户端已完成兼容。

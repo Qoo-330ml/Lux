@@ -634,14 +634,14 @@ while [ \"$#\" -gt 0 ]; do
 done
 directory=$(dirname \"$manifest\")
 mkdir -p \"$directory\"
-printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' > \"$manifest\"
+printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"init.mp4\\\"\\n#EXTINF:1,\\nsegment_%06d.m4s\\n' \"$start_number\" > \"$manifest\"
 printf init > \"$directory/init.mp4\"
 segment_path=$(printf '%s' \"$segment\" | sed \"s/%06d/$(printf '%06d' \"$start_number\")/\")
-printf segment > \"$segment_path\"
+printf 'segment-%s' \"$start_number\" > \"$segment_path\"
 sleep 0.2
 next_number=$((start_number + 1))
 next_segment_path=$(printf '%s' \"$segment\" | sed \"s/%06d/$(printf '%06d' \"$next_number\")/\")
-printf segment > \"$next_segment_path\"
+printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
 ",
     )
     .await?;
@@ -814,7 +814,7 @@ printf segment > \"$next_segment_path\"
 
     sqlx::query(
         "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played)
-         VALUES (?, ?, 40000000, 0)
+         VALUES (?, ?, 49200000000, 0)
          ON CONFLICT(user_id, item_id) DO UPDATE SET
              position_ticks = excluded.position_ticks,
              is_played = excluded.is_played",
@@ -893,7 +893,7 @@ printf segment > \"$next_segment_path\"
         "AudioStreamIndex=1",
         "SubtitleStreamIndex=-1",
         "TranscodingMaxAudioChannels=2",
-        "StartTimeTicks=40000000",
+        "StartTimeTicks=49200000000",
         "SegmentContainer=mp4",
         "MinSegments=1",
         "BreakOnNonKeyFrames=True",
@@ -922,7 +922,28 @@ printf segment > \"$next_segment_path\"
         .send()
         .await?;
     assert_eq!(resumed_segment.status(), reqwest::StatusCode::OK);
-    assert_eq!(resumed_segment.bytes().await?.as_ref(), b"segment");
+    assert_eq!(resumed_segment.bytes().await?.as_ref(), b"segment-0");
+    let resumed_seek_segment_url = device_profile_manifest
+        .lines()
+        .find(|line| line.contains("segment_001230.m4s?"))
+        .ok_or("missing signed resumed seek segment URL")?;
+    let resumed_seek_segment = client
+        .get(format!("{base_url}{resumed_seek_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(resumed_seek_segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        resumed_seek_segment.bytes().await?.as_ref(),
+        b"segment-1230"
+    );
+    let restarted_from_beginning = client
+        .get(format!("{base_url}{resumed_segment_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        restarted_from_beginning.bytes().await?.as_ref(),
+        b"segment-0"
+    );
     let device_profile_play_session_id = device_profile_body["PlaySessionId"]
         .as_str()
         .ok_or("missing DeviceProfile play session")?
@@ -1121,13 +1142,13 @@ printf segment > \"$next_segment_path\"
         .send()
         .await?;
     assert_eq!(segment.status(), reqwest::StatusCode::OK);
-    assert_eq!(segment.bytes().await?.as_ref(), b"segment");
+    assert_eq!(segment.bytes().await?.as_ref(), b"segment-1");
     let second_segment = client
         .get(format!("{base_url}{second_segment_url}"))
         .send()
         .await?;
     assert_eq!(second_segment.status(), reqwest::StatusCode::OK);
-    assert_eq!(second_segment.bytes().await?.as_ref(), b"segment");
+    assert_eq!(second_segment.bytes().await?.as_ref(), b"segment-1");
 
     let before_heartbeat: i64 =
         sqlx::query_scalar("SELECT expires_at FROM web_playback_sessions WHERE id = ?")

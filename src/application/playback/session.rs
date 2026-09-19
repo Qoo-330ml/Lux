@@ -266,7 +266,7 @@ impl WebPlaybackSessionService {
         input: CreateWebPlaybackSession<'_>,
         media_path: &std::path::Path,
         video_bitrate: Option<i64>,
-        start_time_ticks: Option<i64>,
+        _start_time_ticks: Option<i64>,
         runtime_ticks: Option<i64>,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
         let _start_guard = self.emby_start_lock.lock().await;
@@ -303,12 +303,11 @@ impl WebPlaybackSessionService {
             }
         }
         if let Err(error) = self
-            .start_hls_with_runtime(
+            .start_emby_hls_with_runtime(
                 &created.id,
                 tier,
                 media_path,
                 video_bitrate,
-                start_time_ticks,
                 runtime_ticks,
             )
             .await
@@ -442,6 +441,30 @@ impl WebPlaybackSessionService {
         Ok(())
     }
 
+    async fn start_emby_hls_with_runtime(
+        &self,
+        session_id: &str,
+        tier: ServerTier,
+        input: &std::path::Path,
+        video_bitrate: Option<i64>,
+        runtime_ticks: Option<i64>,
+    ) -> Result<(), WebPlaybackSessionError> {
+        self.hls
+            .start_emby_vod(session_id, tier, input, video_bitrate, runtime_ticks)
+            .await?;
+        let directory = self.hls.session_directory(session_id).await?;
+        let now = unix_timestamp();
+        if !self
+            .database
+            .set_web_playback_temp_dir(session_id, &directory.to_string_lossy(), now)
+            .await?
+        {
+            let _ = self.hls.stop(session_id).await;
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        Ok(())
+    }
+
     pub(crate) async fn wait_for_hls_manifest(
         &self,
         session_id: &str,
@@ -467,7 +490,15 @@ impl WebPlaybackSessionService {
         session_id: &str,
         asset: &str,
     ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
-        Ok(self.hls.wait_for_asset(session_id, asset).await?)
+        match self.hls.wait_for_asset(session_id, asset).await {
+            Ok(path) => Ok(path),
+            Err(error) => {
+                if error.is_terminal_process_failure() {
+                    self.stop_failed_hls_session(session_id).await;
+                }
+                Err(error.into())
+            }
+        }
     }
 
     pub(crate) async fn hls_asset_path(
@@ -572,7 +603,7 @@ impl WebPlaybackSessionService {
                 event = "web_hls_failed_session_cleanup",
                 session_id = %session_id,
                 %error,
-                "failed to stop HLS process after manifest failure"
+                "failed to stop failed HLS process"
             );
         }
         let session = match self.database.find_web_playback_session(session_id).await {
@@ -582,7 +613,7 @@ impl WebPlaybackSessionService {
                     event = "web_hls_failed_session_cleanup",
                     session_id = %session_id,
                     %error,
-                    "failed to load HLS session after manifest failure"
+                    "failed to load failed HLS session"
                 );
                 return;
             }
@@ -600,7 +631,7 @@ impl WebPlaybackSessionService {
                 event = "web_hls_failed_session_cleanup",
                 session_id = %session_id,
                 %error,
-                "failed to mark HLS session after manifest failure"
+                "failed to mark HLS session"
             );
         }
     }
@@ -944,6 +975,157 @@ mod tests {
                 .join("web-playback/failed-manifest")
                 .exists()
         );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_emby_segment_restart_stops_session_and_removes_resources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        let source_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind)
+             VALUES (?, ?, 'LOCAL_FILE')",
+        )
+        .bind(&source_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+        let script = temp_dir.path().join("fake-ffmpeg-failed-restart");
+        tokio::fs::write(
+            &script,
+            r##"#!/bin/sh
+set -eu
+manifest=""
+segment=""
+start_number=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -hls_segment_filename) segment="$2"; shift 2 ;;
+    -start_number) start_number="$2"; shift 2 ;;
+    *.m3u8) manifest="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+if [ "$start_number" -ne 0 ]; then
+  exit 1
+fi
+directory=$(dirname "$manifest")
+mkdir -p "$directory"
+printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4,\nsegment_000000.m4s\n' > "$manifest"
+printf init > "$directory/init.mp4"
+printf segment > "$(printf '%s' "$segment" | sed 's/%06d/000000/')"
+while :; do sleep 1; done
+"##,
+        )
+        .await?;
+        let mut permissions = tokio::fs::metadata(&script).await?.permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&script, permissions).await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(
+                config.config_dir.clone(),
+                script.to_string_lossy().into_owned(),
+            ),
+            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+        };
+        let user_id = user.id.to_string();
+        let created = service
+            .create_and_start_emby_hls(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-emby",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: false,
+                        hls: true,
+                        video_copy_to_fmp4: false,
+                        audio_copy_to_fmp4: false,
+                        hardware_transcode: false,
+                        software_transcode: true,
+                    },
+                },
+                Path::new("input.mkv"),
+                Some(1_000_000),
+                None,
+                Some(600 * 10_000_000),
+            )
+            .await?;
+        service.wait_for_hls_manifest(&created.id).await?;
+
+        assert!(
+            service
+                .wait_for_hls_asset(&created.id, "segment_000100.m4s")
+                .await
+                .is_err()
+        );
+        let stored = database
+            .find_web_playback_session(&created.id)
+            .await?
+            .ok_or("missing failed segment session")?;
+        assert_eq!(stored.state, "FAILED");
+        assert!(
+            !config
+                .config_dir
+                .join("web-playback")
+                .join(&created.id)
+                .exists()
+        );
+
+        let replacement = service
+            .create_and_start_emby_hls(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-emby",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: false,
+                        hls: true,
+                        video_copy_to_fmp4: false,
+                        audio_copy_to_fmp4: false,
+                        hardware_transcode: false,
+                        software_transcode: true,
+                    },
+                },
+                Path::new("input.mkv"),
+                Some(1_000_000),
+                None,
+                Some(600 * 10_000_000),
+            )
+            .await?;
+        service.wait_for_hls_manifest(&replacement.id).await?;
+        service.stop(&replacement.id, &user_id).await?;
         Ok(())
     }
 
