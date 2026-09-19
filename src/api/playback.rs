@@ -3908,7 +3908,7 @@ mod emby_playback_tests {
     }
 
     #[test]
-    fn only_internal_emby_generation_init_names_are_mapped_to_the_public_asset() {
+    fn recognizes_only_valid_internal_emby_generation_init_names() {
         assert!(is_emby_generation_init_asset("generation_000123_init.mp4"));
         assert!(!is_emby_generation_init_asset("generation_123_init.mp4"));
         assert!(!is_emby_generation_init_asset(
