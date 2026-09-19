@@ -1099,6 +1099,16 @@ fn asset_segment_number(asset: &str) -> Result<Option<i64>, HlsError> {
     Ok(Some(number))
 }
 
+fn emby_init_segment_number(asset: &str) -> Option<i64> {
+    let value = asset
+        .strip_prefix("init_")
+        .and_then(|value| value.strip_suffix(".mp4"))?;
+    if value.len() != 6 || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 fn ffmpeg_start_time(start_time_ticks: Option<i64>) -> Option<String> {
     const TICKS_PER_SECOND: i64 = 10_000_000;
     let ticks = start_time_ticks.filter(|ticks| *ticks > 0)?;
@@ -1130,8 +1140,8 @@ fn vod_manifest(runtime_ticks: i64) -> Option<String> {
     let _ = writeln!(manifest, "#EXT-X-VERSION:7");
     let _ = writeln!(manifest, "#EXT-X-TARGETDURATION:{target_duration}");
     let _ = writeln!(manifest, "#EXT-X-MEDIA-SEQUENCE:0");
-    let _ = writeln!(manifest, "#EXT-X-MAP:URI=\"init.mp4\"");
     for index in 0..segment_count {
+        let _ = writeln!(manifest, "#EXT-X-MAP:URI=\"init_{index:06}.mp4\"");
         let duration_ticks = if index < full_segments {
             HLS_SEGMENT_DURATION_TICKS
         } else {
@@ -1166,7 +1176,22 @@ fn is_valid_asset(asset: &str) -> bool {
     }
     asset == "index.m3u8"
         || asset == "init.mp4"
+        || emby_init_segment_number(asset).is_some()
         || (asset.starts_with("segment_") && asset.ends_with(".m4s"))
+        || is_emby_generation_asset(asset)
+}
+
+fn is_emby_generation_asset(asset: &str) -> bool {
+    let Some(value) = asset.strip_prefix("generation_") else {
+        return false;
+    };
+    let Some((generation, asset)) = value.split_once('_') else {
+        return false;
+    };
+    generation.len() == 6
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+        && (asset == "init.mp4"
+            || (asset.starts_with("segment_") && asset.ends_with(".m4s")))
 }
 
 fn is_allowed_hardware_encoder(value: &str) -> bool {
@@ -1212,8 +1237,8 @@ mod tests {
 
     use super::{
         HLS_SEGMENT_DURATION_TICKS, SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache,
-        asset_segment_number, ffmpeg_args, ffmpeg_args_with_timeline, hls_start_number,
-        is_valid_asset, vod_manifest,
+        asset_segment_number, emby_init_segment_number, ffmpeg_args, ffmpeg_args_with_timeline,
+        hls_start_number, is_valid_asset, vod_manifest,
     };
 
     #[test]
@@ -1228,6 +1253,19 @@ mod tests {
         assert!(manifest.contains("#EXTINF:1.500000,"));
         assert!(manifest.contains("#EXT-X-TARGETDURATION:4\n"));
         assert_eq!(HLS_SEGMENT_DURATION_TICKS, 4 * 10_000_000);
+    }
+
+    #[test]
+    fn vod_manifest_binds_each_segment_to_its_initialization_segment() {
+        let manifest = vod_manifest(9 * 10_000_000 + 5_000_000).expect("positive runtime");
+
+        assert_eq!(manifest.matches("#EXT-X-MAP:").count(), 3);
+        assert!(manifest.contains("#EXT-X-MAP:URI=\"init_000000.mp4\"\n"));
+        assert!(manifest.contains("#EXT-X-MAP:URI=\"init_000001.mp4\"\n"));
+        assert!(manifest.contains("#EXT-X-MAP:URI=\"init_000002.mp4\"\n"));
+        assert!(manifest.contains(
+            "#EXT-X-MAP:URI=\"init_000001.mp4\"\n#EXTINF:4.000000,\nsegment_000001.m4s\n"
+        ));
     }
 
     #[test]
@@ -1401,6 +1439,14 @@ mod tests {
     }
 
     #[test]
+    fn initialization_assets_keep_their_logical_number() {
+        assert_eq!(emby_init_segment_number("init_000000.mp4"), Some(0));
+        assert_eq!(emby_init_segment_number("init_000969.mp4"), Some(969));
+        assert_eq!(emby_init_segment_number("init.mp4"), None);
+        assert_eq!(emby_init_segment_number("generation_000001_init.mp4"), None);
+    }
+
+    #[test]
     fn emby_restart_preserves_input_timestamps_on_the_vod_timeline() {
         let args = ffmpeg_args_with_timeline(
             Path::new("movie.mkv"),
@@ -1426,7 +1472,10 @@ mod tests {
     #[test]
     fn asset_validation_rejects_path_traversal_and_unknown_files() {
         assert!(is_valid_asset("index.m3u8"));
+        assert!(is_valid_asset("init_000001.mp4"));
         assert!(is_valid_asset("segment_000001.m4s"));
+        assert!(is_valid_asset("generation_000001_init.mp4"));
+        assert!(is_valid_asset("generation_000001_segment_000001.m4s"));
         assert!(!is_valid_asset("../index.m3u8"));
         assert!(!is_valid_asset("other.txt"));
     }
