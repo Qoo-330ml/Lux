@@ -183,7 +183,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let media_root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&media_root).await?;
     tokio::fs::write(media_root.join("Movie (2024).mkv"), b"movie").await?;
-    libraries
+    let library_root = libraries
         .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
         .await?;
     LibraryScanner::new(database.clone())
@@ -205,6 +205,7 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::new();
     let emby_library_id = emby_public_id(&library.id.to_string());
+    let emby_root_id = emby_public_id(&library_root.root.id.to_string());
 
     let views = client
         .get(format!(
@@ -294,6 +295,29 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
             options["TypeOptions"][0]["ImageOptions"][0]["Type"],
             "Primary"
         );
+    }
+
+    for path in [
+        "/Library/SelectableMediaFolders",
+        "/emby/Library/SelectableMediaFolders",
+    ] {
+        let selectable_folders = client
+            .get(format!("http://{address}{path}?api_key={key}"))
+            .send()
+            .await?;
+        assert_eq!(selectable_folders.status(), reqwest::StatusCode::OK);
+        let body = selectable_folders.json::<serde_json::Value>().await?;
+        assert_eq!(body[0]["Name"], "Movies");
+        assert_eq!(body[0]["Id"], emby_library_id);
+        assert_eq!(body[0]["Guid"], emby_library_id);
+        assert_eq!(body[0]["IsUserAccessConfigurable"], true);
+        assert_eq!(body[0]["SubFolders"][0]["Name"], "Movies");
+        assert_eq!(body[0]["SubFolders"][0]["Id"], emby_root_id);
+        assert_eq!(
+            body[0]["SubFolders"][0]["Path"],
+            media_root.to_string_lossy().to_string()
+        );
+        assert_eq!(body[0]["SubFolders"][0]["IsUserAccessConfigurable"], true);
     }
 
     let root = client
@@ -447,6 +471,15 @@ async fn only_web_admins_can_manage_the_shared_key() -> Result<(), Box<dyn std::
         .await?;
     assert_eq!(
         viewer_virtual_folders.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+    let viewer_selectable_media_folders = client
+        .get(format!("http://{address}/Library/SelectableMediaFolders"))
+        .header("X-Emby-Token", &viewer_emby_token)
+        .send()
+        .await?;
+    assert_eq!(
+        viewer_selectable_media_folders.status(),
         reqwest::StatusCode::FORBIDDEN
     );
 

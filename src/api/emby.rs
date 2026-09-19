@@ -17,6 +17,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Users/authenticatebyname", post(emby_authenticate))
         .route("/Users/New", post(emby_create_user))
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
+        .route(
+            "/Library/SelectableMediaFolders",
+            get(emby_library_selectable_media_folders),
+        )
         .route("/Library/MediaFolders", get(emby_library_media_folders))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
