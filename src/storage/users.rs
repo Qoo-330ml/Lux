@@ -193,7 +193,23 @@ impl Database {
     }
 
     pub(crate) async fn list_users(&self) -> Result<Vec<StoredUser>, StorageError> {
-        self.query(
+        self.list_users_with_disabled(false).await
+    }
+
+    pub(crate) async fn list_all_users(&self) -> Result<Vec<StoredUser>, StorageError> {
+        self.list_users_with_disabled(true).await
+    }
+
+    async fn list_users_with_disabled(
+        &self,
+        include_disabled: bool,
+    ) -> Result<Vec<StoredUser>, StorageError> {
+        let where_clause = if include_disabled {
+            ""
+        } else {
+            " WHERE is_disabled = 0"
+        };
+        let query = format!(
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
                     is_disabled, is_admin, can_manage_server,
@@ -203,32 +219,16 @@ impl Database {
                          FROM access_tokens at WHERE at.user_id = users.id),
                         last_login_at
                     ) AS last_activity_at
-             FROM users WHERE is_disabled = 0 ORDER BY username_normalized",
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredUser {
-                    id: row.get("id"),
-                    username_normalized: row.get("username_normalized"),
-                    display_name: row.get("display_name"),
-                    password_hash: row.get("password_hash"),
-                    has_password: row.get::<i64, _>("has_password") != 0,
-                    is_disabled: row.get::<i64, _>("is_disabled") != 0,
-                    is_admin: row.get::<i64, _>("is_admin") != 0,
-                    can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-                    can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-                    can_download: row.get::<i64, _>("can_download") != 0,
-                    last_login_at: row.get("last_login_at"),
-                    last_activity_at: row.get("last_activity_at"),
-                })
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+             FROM users{where_clause} ORDER BY username_normalized"
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.into_iter().map(stored_user).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn query_users(
@@ -560,6 +560,22 @@ impl Database {
             "INSERT INTO user_library_order (user_id, library_id, position)
              SELECT ?, library_id, position
              FROM user_library_order WHERE user_id = ?",
+        )
+        .bind(target_user_id)
+        .bind(source_user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "INSERT INTO user_library_order_preferences (user_id, use_admin_library_order)
+             SELECT ?, use_admin_library_order
+             FROM user_library_order_preferences WHERE user_id = ?
+             ON CONFLICT(user_id) DO UPDATE SET
+                 use_admin_library_order = excluded.use_admin_library_order,
+                 updated_at = unixepoch()",
         )
         .bind(target_user_id)
         .bind(source_user_id)
@@ -1135,6 +1151,76 @@ impl Database {
         })
     }
 
+    pub(crate) async fn force_admin_library_order(&self) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'force_admin_library_order'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value: Option<String>| value.as_deref() == Some("1"))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn user_uses_admin_library_order(
+        &self,
+        user_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT use_admin_library_order FROM user_library_order_preferences
+             WHERE user_id = ?",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|value: Option<i64>| value.unwrap_or(1) != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_user_uses_admin_library_order(
+        &self,
+        user_id: &str,
+        enabled: bool,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO user_library_order_preferences (user_id, use_admin_library_order)
+             VALUES (?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+                 use_admin_library_order = excluded.use_admin_library_order,
+                 updated_at = unixepoch()",
+        )
+        .bind(user_id)
+        .bind(database_flag(enabled))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn admin_user_id(&self) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT id FROM users
+             WHERE is_admin = 1 AND is_disabled = 0
+             ORDER BY created_at, id
+             LIMIT 1",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn set_user_played_percent(
         &self,
         user_id: &str,
@@ -1230,6 +1316,7 @@ impl Database {
         percent: i64,
         min_ticks: i64,
         media_strategy: &str,
+        force_admin_library_order: bool,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -1243,6 +1330,10 @@ impl Database {
             ("resume_played_percent", percent.to_string()),
             ("resume_min_ticks", min_ticks.to_string()),
             ("media_strategy", media_strategy.to_owned()),
+            (
+                "force_admin_library_order",
+                if force_admin_library_order { "1" } else { "0" }.to_owned(),
+            ),
         ] {
             self.query(
                 "INSERT INTO server_settings (key, value)

@@ -20,7 +20,7 @@ use super::decision::{
     PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier,
     UnsupportedReason, choose_plan,
 };
-use super::hls::{HlsError, HlsManager, HlsSegmentContainer, HlsStartOptions};
+use super::hls::{HlsError, HlsManager, HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -372,6 +372,7 @@ impl WebPlaybackSessionService {
         Ok(session)
     }
 
+    #[cfg(test)]
     pub(crate) async fn start_hls(
         &self,
         session_id: &str,
@@ -380,7 +381,7 @@ impl WebPlaybackSessionService {
         video_bitrate: Option<i64>,
         start_time_ticks: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
-        self.start_hls_with_runtime(
+        self.start_hls_with_audio(
             session_id,
             tier,
             input,
@@ -391,24 +392,38 @@ impl WebPlaybackSessionService {
         .await
     }
 
-    async fn start_hls_with_runtime(
+    pub(crate) async fn start_hls_with_audio(
         &self,
         session_id: &str,
         tier: ServerTier,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
         start_time_ticks: Option<i64>,
-        runtime_ticks: Option<i64>,
+        audio_stream_index: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
-        self.hls
-            .start(
-                session_id,
-                tier,
-                input,
+        self.start_hls_with_runtime(
+            session_id,
+            tier,
+            input,
+            HlsWebStartOptions {
                 video_bitrate,
                 start_time_ticks,
-                runtime_ticks,
-            )
+                runtime_ticks: None,
+                audio_stream_index,
+            },
+        )
+        .await
+    }
+
+    async fn start_hls_with_runtime(
+        &self,
+        session_id: &str,
+        tier: ServerTier,
+        input: &std::path::Path,
+        options: HlsWebStartOptions,
+    ) -> Result<(), WebPlaybackSessionError> {
+        self.hls
+            .start_with_audio(session_id, tier, input, options)
             .await?;
         let directory = self.hls.session_directory(session_id).await?;
         let now = unix_timestamp();

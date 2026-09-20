@@ -17,6 +17,7 @@ import type {
   MediaSource,
   PlaybackEventState,
   WebPlaybackCapabilities,
+  WebPlaybackTrackSelection,
 } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
 import {
@@ -227,16 +228,29 @@ export function PlayerPage() {
   const bufferedEndRef = useRef(0);
 
   const requestedSourceId = searchParams.get("sourceId");
-  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${playbackAttempt}`;
+  const requestedAudioStreamIndex = searchParams.get("audioStreamIndex");
+  const requestedSubtitleStreamIndex = searchParams.get("subtitleStreamIndex");
+  const trackSelection = useMemo<WebPlaybackTrackSelection | undefined>(() => {
+    const audioStreamIndex = requestedAudioStreamIndex?.trim() ? Number(requestedAudioStreamIndex) : undefined;
+    const subtitleStreamIndex = requestedSubtitleStreamIndex?.trim() ? Number(requestedSubtitleStreamIndex) : undefined;
+    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex)
+      ? {
+        ...(Number.isInteger(audioStreamIndex) ? { audioStreamIndex } : {}),
+        ...(Number.isInteger(subtitleStreamIndex) ? { subtitleStreamIndex } : {}),
+      }
+      : undefined;
+  }, [requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
+  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
   const bootstrapCapabilities = webPlaybackCapabilities(undefined, playbackAttempt);
   const playbackBootstrap = useQuery({
-    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt),
+    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt, requestedAudioStreamIndex),
     queryFn: ({ signal }) => api.createWebPlaybackBootstrap(
       itemId,
       requestedSourceId ?? undefined,
       bootstrapCapabilities,
       signal,
+      trackSelection,
     ),
     enabled: Boolean(itemId) && playbackAttempt === 0 && sessionGateKey === bootstrapKey,
     retry: false,
@@ -305,17 +319,18 @@ export function PlayerPage() {
   const playbackKeySourceId = playbackAttempt === 0 && !requestedSourceId
     ? ""
     : source?.id ?? requestedSourceId ?? "";
-  const playbackKey = `${itemId}:${playbackKeySourceId}:${playbackAttempt}`;
+  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
   const sessionStartedRef = useRef(false);
   const playbackSessionIdRef = useRef<string | null>(null);
   const capabilities = webPlaybackCapabilities(source, playbackAttempt);
   const webPlaybackSession = useQuery({
-    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt),
+    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt, requestedAudioStreamIndex),
     queryFn: ({ signal }) => api.createWebPlaybackSession(
       itemId,
       source?.id ?? "",
       capabilities,
       signal,
+      trackSelection,
     ),
     enabled: Boolean(itemId && source?.id) && useLegacyPlaybackQueries
       && (sessionGateKey === playbackKey
@@ -516,19 +531,22 @@ export function PlayerPage() {
     setCurrentTime(0);
     setDuration(0);
     setBufferedEnd(0);
-  }, [itemId, requestedSourceId]);
+  }, [itemId, requestedAudioStreamIndex, requestedSourceId]);
 
   useEffect(() => {
     captionSelectionTouchedRef.current = false;
     setNativeCaptionTracks([]);
-    const initialCaption = defaultCaptionSelection(
-      playerCaptionOptions(source, nativeCaptionTracksSupported, []),
-    );
+    const initialCaptionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, []);
+    const initialCaption = (requestedSubtitleStreamIndex
+      ? initialCaptionOptions.find((caption) => (
+        String(caption.streamIndex) === requestedSubtitleStreamIndex && caption.available
+      ))
+      : undefined) ?? defaultCaptionSelection(initialCaptionOptions);
     setCaptionSourceId(source?.id ?? null);
     setSelectedCaptionId(initialCaption?.id ?? null);
     setCaptionStatus(null);
     setRuntimeCaptionCues([]);
-  }, [nativeCaptionTracksSupported, source?.id]);
+  }, [nativeCaptionTracksSupported, requestedSubtitleStreamIndex, source?.id]);
 
   const defaultCaptionId = defaultCaptionSelection(captionOptions)?.id ?? null;
   useEffect(() => {

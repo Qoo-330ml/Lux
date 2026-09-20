@@ -238,6 +238,10 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let force_admin_library_order = match database.force_admin_library_order().await {
+        Ok(enabled) => enabled,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let server_name = match database.server_name().await {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
@@ -248,6 +252,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "serverName": server_name,
         "resumePlayedPercent": played_percent,
         "resumeMinTicks": minimum_ticks,
+        "forceAdminLibraryOrder": force_admin_library_order,
         "mediaStrategy": media_strategy,
         "networkProxy": network_proxy,
     }))
@@ -455,6 +460,7 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
     pub(crate) server_name: Option<String>,
     pub(crate) resume_played_percent: Option<i64>,
     pub(crate) resume_min_ticks: Option<i64>,
+    pub(crate) force_admin_library_order: Option<bool>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
@@ -718,6 +724,10 @@ pub(crate) async fn admin_update_settings(
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let current_force_admin_library_order = match database.force_admin_library_order().await {
+        Ok(enabled) => enabled,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let current_server_name = match database.server_name().await {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
@@ -725,6 +735,9 @@ pub(crate) async fn admin_update_settings(
     };
     let percent = request.resume_played_percent.unwrap_or(current_percent);
     let minimum_ticks = request.resume_min_ticks.unwrap_or(current_ticks);
+    let force_admin_library_order = request
+        .force_admin_library_order
+        .unwrap_or(current_force_admin_library_order);
     let media_strategy = request.media_strategy.unwrap_or(current_media_strategy);
     let server_name = match request.server_name {
         Some(name) => match normalize_server_name(&name) {
@@ -803,12 +816,20 @@ pub(crate) async fn admin_update_settings(
         }
     }
     match database
-        .set_server_settings(percent, minimum_ticks, &media_strategy_json)
+        .set_server_settings(
+            percent,
+            minimum_ticks,
+            &media_strategy_json,
+            force_admin_library_order,
+        )
         .await
     {
         Ok(()) => {
             if database.set_server_name(&server_name).await.is_err() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
             }
             record_audit_event(
                 &state,
@@ -816,13 +837,14 @@ pub(crate) async fn admin_update_settings(
                 "SETTINGS_UPDATED",
                 Some("settings"),
                 None,
-                &format!(r#"{{"resumePlayedPercent":{percent},"resumeMinTicks":{minimum_ticks}}}"#),
+                &format!(r#"{{"resumePlayedPercent":{percent},"resumeMinTicks":{minimum_ticks},"forceAdminLibraryOrder":{force_admin_library_order}}}"#),
             )
             .await;
             Json(json!({
                 "serverName": server_name,
                 "resumePlayedPercent": percent,
                 "resumeMinTicks": minimum_ticks,
+                "forceAdminLibraryOrder": force_admin_library_order,
                 "mediaStrategy": media_strategy,
                 "networkProxy": network_proxy_settings(&state).await,
             }))
@@ -4303,7 +4325,7 @@ pub(crate) async fn admin_list_users(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    match users.list_users().await {
+    match users.list_all_users().await {
         Ok(users) => Json(json!({
             "users": users.iter().map(user_json).collect::<Vec<_>>()
         }))
@@ -5720,10 +5742,15 @@ pub(crate) async fn admin_update_user(
         .await
     {
         Ok(Some(user)) => {
+            let event_type = if request.is_disabled == Some(true) {
+                "USER_DISABLED"
+            } else {
+                "USER_UPDATED"
+            };
             record_audit_event(
                 &state,
                 &headers,
-                "USER_UPDATED",
+                event_type,
                 Some("user"),
                 Some(&user_id),
                 "{}",
@@ -5742,7 +5769,7 @@ pub(crate) async fn admin_update_user(
     }
 }
 
-pub(crate) async fn admin_disable_user(
+pub(crate) async fn admin_delete_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     State(state): State<AppState>,
@@ -5757,29 +5784,20 @@ pub(crate) async fn admin_disable_user(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    match users
-        .update_user(
-            &user_id,
-            UserUpdate {
-                is_disabled: Some(true),
-                ..UserUpdate::default()
-            },
-        )
-        .await
-    {
-        Ok(Some(user)) => {
+    match users.delete_user(&user_id).await {
+        Ok(true) => {
             record_audit_event(
                 &state,
                 &headers,
-                "USER_DISABLED",
+                "USER_DELETED",
                 Some("user"),
                 Some(&user_id),
                 "{}",
             )
             .await;
-            Json(json!({ "user": user_json(&user) })).into_response()
+            StatusCode::NO_CONTENT.into_response()
         }
-        Ok(None) => api_error(
+        Ok(false) => api_error(
             &headers,
             StatusCode::NOT_FOUND,
             lux::ApiErrorCode::NotFound,
@@ -5811,6 +5829,13 @@ pub(crate) fn user_store_error(headers: &HeaderMap, error: UserStoreError) -> Re
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "用户 ID 无效",
+        )
+        .into_response(),
+        UserStoreError::Storage(error) if error.is_unique_violation() => api_error(
+            headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户名已存在",
         )
         .into_response(),
         UserStoreError::Storage(_) => api_error(

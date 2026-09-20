@@ -296,7 +296,7 @@ pub(super) async fn lux_list_libraries(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match libraries
-        .list_libraries_for_user(&user.id.to_string(), &accessible_library_ids)
+        .list_libraries_for_user(&user.id.to_string(), user.is_admin, &accessible_library_ids)
         .await
     {
         Ok(views) => {

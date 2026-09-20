@@ -131,7 +131,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/admin/users/{user_id}",
-            patch(admin_update_user).delete(admin_disable_user),
+            patch(admin_update_user).delete(admin_delete_user),
         )
         .route(
             "/api/v1/admin/users/{user_id}/libraries",

@@ -123,6 +123,15 @@ impl UserStore {
             .collect()
     }
 
+    pub async fn list_all_users(&self) -> Result<Vec<UserRecord>, UserStoreError> {
+        self.database
+            .list_all_users()
+            .await?
+            .into_iter()
+            .map(user_record)
+            .collect()
+    }
+
     pub async fn find_by_id(&self, user_id: &str) -> Result<Option<UserRecord>, UserStoreError> {
         self.database
             .find_user_by_id(user_id)

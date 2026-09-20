@@ -60,6 +60,7 @@ import type {
   WebPlaybackCapabilities,
   WebPlaybackSession,
   WebPlaybackBootstrap,
+  WebPlaybackTrackSelection,
   WebDanmakuInfo,
   SetupStatus,
   SetupDatabaseBackend,
@@ -529,11 +530,12 @@ export class LuxApiClient {
     sourceId: string,
     capabilities: WebPlaybackCapabilities,
     signal?: AbortSignal,
+    selection?: WebPlaybackTrackSelection,
   ) {
     return this.request<WebPlaybackSession>("/api/v1/playback/sessions", {
       method: "POST",
       signal,
-      body: JSON.stringify({ itemId, sourceId, capabilities }),
+      body: JSON.stringify({ itemId, sourceId, capabilities, ...selection }),
     });
   }
 
@@ -542,11 +544,12 @@ export class LuxApiClient {
     sourceId: string | undefined,
     capabilities: WebPlaybackCapabilities,
     signal?: AbortSignal,
+    selection?: WebPlaybackTrackSelection,
   ) {
     return this.request<WebPlaybackBootstrap>("/api/v1/playback/bootstrap", {
       method: "POST",
       signal,
-      body: JSON.stringify({ itemId, sourceId, capabilities }),
+      body: JSON.stringify({ itemId, sourceId, capabilities, ...selection }),
     });
   }
 
@@ -961,6 +964,13 @@ export class LuxApiClient {
 
   disableAdminUser(userId: string) {
     return this.request<{ user: AdminUser }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+      { method: "PATCH", body: JSON.stringify({ isDisabled: true }) },
+    );
+  }
+
+  deleteAdminUser(userId: string) {
+    return this.request<void>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,
       { method: "DELETE" },
     );

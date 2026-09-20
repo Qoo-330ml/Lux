@@ -13,6 +13,7 @@ globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 const settings = {
   resumePlayedPercent: 90,
   resumeMinTicks: 1_200_000_000,
+  forceAdminLibraryOrder: false,
   mediaStrategy: {
     metadataLanguage: "zh-CN",
     imageLanguage: "zh-CN",
@@ -130,7 +131,42 @@ describe("AdminSettingsPage network proxy", () => {
 
     expect(update).toHaveBeenCalledWith({
       resumeMinTicks: 1_200_000_000,
+      forceAdminLibraryOrder: false,
       mediaStrategy: { ...settings.mediaStrategy, showMetadataPending: false },
+    });
+  });
+
+  it("saves the forced administrator library order setting", async () => {
+    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
+      ...settings,
+      forceAdminLibraryOrder: true,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const toggle = container.querySelector<HTMLInputElement>("input[aria-label='媒体库顺序强制按照管理员排序']");
+    expect(toggle?.checked).toBe(false);
+    await act(async () => {
+      toggle?.click();
+      container.querySelector<HTMLButtonElement>("button.lux-settings-save")?.click();
+    });
+
+    expect(update).toHaveBeenCalledWith({
+      resumeMinTicks: 1_200_000_000,
+      forceAdminLibraryOrder: true,
+      mediaStrategy: { ...settings.mediaStrategy, showMetadataPending: true },
     });
   });
 

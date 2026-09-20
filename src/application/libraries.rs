@@ -230,20 +230,22 @@ impl LibraryService {
     pub async fn list_libraries_for_user(
         &self,
         user_id: &str,
+        is_admin: bool,
         accessible_library_ids: &[String],
     ) -> Result<Vec<LibraryView>, LibraryServiceError> {
         let views = self.list_libraries().await?;
-        self.order_views_for_user(user_id, accessible_library_ids, views)
+        self.order_views_for_user(user_id, is_admin, accessible_library_ids, views)
             .await
     }
 
     pub(crate) async fn order_views_for_user(
         &self,
         user_id: &str,
+        is_admin: bool,
         accessible_library_ids: &[String],
         mut views: Vec<LibraryView>,
     ) -> Result<Vec<LibraryView>, LibraryServiceError> {
-        let order = self.database.user_library_order(user_id).await?;
+        let order = self.effective_library_order(user_id, is_admin).await?;
         order_library_views(&mut views, &order);
         let accessible = accessible_library_ids.iter().collect::<HashSet<_>>();
         views.retain(|view| {
@@ -262,15 +264,40 @@ impl LibraryService {
     pub async fn saved_library_order_for_user(
         &self,
         user_id: &str,
+        is_admin: bool,
         accessible_library_ids: &[String],
     ) -> Result<Vec<String>, LibraryServiceError> {
         let accessible = accessible_library_ids.iter().collect::<HashSet<_>>();
         Ok(self
-            .saved_library_order(user_id)
+            .effective_library_order(user_id, is_admin)
             .await?
             .into_iter()
             .filter(|library_id| accessible.contains(library_id))
             .collect())
+    }
+
+    pub(crate) async fn uses_admin_library_order(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<(bool, bool), LibraryServiceError> {
+        let forced = !is_admin && self.database.force_admin_library_order().await?;
+        let personal = self.database.user_uses_admin_library_order(user_id).await?;
+        Ok((forced || personal, forced))
+    }
+
+    async fn effective_library_order(
+        &self,
+        user_id: &str,
+        is_admin: bool,
+    ) -> Result<Vec<String>, LibraryServiceError> {
+        let (use_admin, _) = self.uses_admin_library_order(user_id, is_admin).await?;
+        if use_admin && !is_admin {
+            if let Some(admin_user_id) = self.database.admin_user_id().await? {
+                return Ok(self.database.user_library_order(&admin_user_id).await?);
+            }
+        }
+        Ok(self.database.user_library_order(user_id).await?)
     }
 
     pub async fn set_library_order(

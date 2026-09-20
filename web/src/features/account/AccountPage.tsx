@@ -61,6 +61,9 @@ export function AccountPage({ user }: { user: LuxUser }) {
       : libraries.data?.libraries ?? [],
     [libraries.data?.libraries, pendingLibraryOrder],
   );
+  const useAdminLibraryOrder = playbackSettings.data?.useAdminLibraryOrder ?? true;
+  const libraryOrderForced = playbackSettings.data?.libraryOrderForced ?? false;
+  const libraryOrderLocked = libraryOrderForced || (!user.canManageServer && useAdminLibraryOrder);
 
   useEffect(() => {
     if (!pendingLibraryOrder || !libraries.data?.libraries) return;
@@ -125,23 +128,38 @@ export function AccountPage({ user }: { user: LuxUser }) {
     },
   });
 
+  const saveLibraryOrderPreference = useMutation({
+    mutationFn: (useAdminLibraryOrder: boolean) => api.updateUserSettings({ useAdminLibraryOrder }),
+    onSuccess: (data) => {
+      queryClient.setQueryData(queryKeys.userSettings, data);
+      setPendingLibraryOrder(null);
+      setLibraryOrderNotice(data.useAdminLibraryOrder ? "已切换为按照管理员顺序排序" : "已切换为使用个人媒体库顺序");
+      void queryClient.invalidateQueries({ queryKey: queryKeys.libraryOrder });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.libraries });
+      void queryClient.invalidateQueries({ queryKey: queryKeys.home });
+    },
+    onError: (error) => setLibraryOrderNotice(error instanceof Error ? `媒体库顺序设置失败：${error.message}` : "媒体库顺序设置失败，请重试。"),
+  });
+
   useEffect(() => {
     if (
       legacyLibraryOrderMigrationAttempted.current
       || !libraryOrder.isSuccess
       || (libraryOrder.data?.libraryOrder.length ?? 0)
       || !settings.libraryOrder.length
+      || (!user.canManageServer && useAdminLibraryOrder)
     ) return;
     legacyLibraryOrderMigrationAttempted.current = true;
     setPendingLibraryOrder(settings.libraryOrder);
     saveLibraryOrder.mutate(settings.libraryOrder);
-  }, [libraryOrder.data?.libraryOrder, libraryOrder.isSuccess, saveLibraryOrder, settings.libraryOrder]);
+  }, [libraryOrder.data?.libraryOrder, libraryOrder.isSuccess, saveLibraryOrder, settings.libraryOrder, useAdminLibraryOrder, user.canManageServer]);
 
   const updateSettings = (patch: Partial<AccountSettings>) => {
     setSettings((current) => ({ ...current, ...patch }));
   };
 
   const persistLibraryOrder = (libraryOrder: string[]) => {
+    if (libraryOrderLocked) return;
     setLibraryOrderNotice(null);
     setPendingLibraryOrder(libraryOrder);
     updateSettings({ libraryOrder });
@@ -285,7 +303,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                   <strong>媒体库顺序</strong>
                   <p>拖动卡片调整首页媒体库的显示顺序，也可以使用右侧箭头。</p>
                 </div>
-                <span className="lux-setting-hint">可拖拽排序</span>
+                <span className="lux-setting-hint">{libraryOrderLocked ? "由管理员控制" : "可拖拽排序"}</span>
               </div>
               {libraries.isPending ? (
                 <div className="lux-account-library-list" aria-busy="true" aria-label="正在加载媒体库">
@@ -301,18 +319,18 @@ export function AccountPage({ user }: { user: LuxUser }) {
                       className="lux-account-library-row"
                       key={library.id}
                       role="listitem"
-                      draggable
-                      onDragStart={() => setDraggedLibraryId(library.id)}
+                      draggable={!libraryOrderLocked}
+                      onDragStart={() => { if (!libraryOrderLocked) setDraggedLibraryId(library.id); }}
                       onDragEnd={() => setDraggedLibraryId(null)}
                       onDragOver={(event) => event.preventDefault()}
-                      onDrop={() => dropLibrary(library.id)}
+                      onDrop={() => { if (!libraryOrderLocked) dropLibrary(library.id); }}
                     >
                       <GripVertical className="lux-drag-handle" size={17} aria-hidden="true" />
                       <div className="lux-account-library-index" aria-hidden="true">{String(index + 1).padStart(2, "0")}</div>
                       <div className="lux-account-library-copy"><strong>{library.name}</strong><span>{libraryKindLabel(library.kind)}</span></div>
                       <div className="lux-account-library-actions">
-                        <button type="button" aria-label={`上移媒体库 ${library.name}`} disabled={index === 0} onClick={() => reorderLibrary(library.id, "up")}><ChevronUp size={16} /></button>
-                        <button type="button" aria-label={`下移媒体库 ${library.name}`} disabled={index === orderedLibraries.length - 1} onClick={() => reorderLibrary(library.id, "down")}><ChevronDown size={16} /></button>
+                        <button type="button" aria-label={`上移媒体库 ${library.name}`} disabled={libraryOrderLocked || index === 0} onClick={() => reorderLibrary(library.id, "up")}><ChevronUp size={16} /></button>
+                        <button type="button" aria-label={`下移媒体库 ${library.name}`} disabled={libraryOrderLocked || index === orderedLibraries.length - 1} onClick={() => reorderLibrary(library.id, "down")}><ChevronDown size={16} /></button>
                       </div>
                     </div>
                   ))}
@@ -323,6 +341,13 @@ export function AccountPage({ user }: { user: LuxUser }) {
               {libraryOrderNotice ? <p className="lux-account-notice" role="status">{libraryOrderNotice}</p> : null}
             </div>
             <div className="lux-setting-divider" />
+            <ToggleRow
+              title="按照管理员顺序排序"
+              description={libraryOrderForced ? "服务器已强制使用管理员保存的媒体库顺序，当前设置不可取消。" : "让首页和媒体库入口使用管理员保存的媒体库顺序。"}
+              checked={useAdminLibraryOrder}
+              disabled={libraryOrderForced}
+              onChange={(checked) => saveLibraryOrderPreference.mutate(checked)}
+            />
             <ToggleRow title="显示媒体库区块" description="在首页展示你有权限访问的媒体库。" checked={settings.showMediaLibraries} onChange={(checked) => updateSettings({ showMediaLibraries: checked })} />
             <ToggleRow title="显示继续观看区块" description="在首页保留最近播放但尚未看完的内容。" checked={settings.showContinueWatching} onChange={(checked) => updateSettings({ showContinueWatching: checked })} />
           </SettingsSection>
@@ -434,11 +459,11 @@ function SettingsSection({ id, icon, title, children }: { id: string; icon: Reac
   );
 }
 
-function ToggleRow({ title, description, checked, onChange }: { title: string; description: string; checked: boolean; onChange: (checked: boolean) => void }) {
+function ToggleRow({ title, description, checked, disabled = false, onChange }: { title: string; description: string; checked: boolean; disabled?: boolean; onChange: (checked: boolean) => void }) {
   return (
     <label className="lux-setting-toggle-row">
       <span><strong>{title}</strong><small>{description}</small></span>
-      <input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      <input type="checkbox" aria-label={title} checked={checked} disabled={disabled} onChange={(event) => onChange(event.target.checked)} />
       <span className="lux-setting-switch" aria-hidden="true"><span /></span>
     </label>
   );

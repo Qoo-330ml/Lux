@@ -418,7 +418,12 @@ impl HomeService {
             async {
                 self.inner
                     .libraries
-                    .order_views_for_user(&user_id, accessible_library_ids, shared.views.clone())
+                    .order_views_for_user(
+                        &user_id,
+                        principal.is_admin,
+                        accessible_library_ids,
+                        shared.views.clone(),
+                    )
                     .await
                     .map_err(HomeError::Libraries)
             },

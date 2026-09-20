@@ -23,6 +23,7 @@ export function AdminSettingsPage() {
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
   const [minimumMinutes, setMinimumMinutes] = useState("2");
   const [showMetadataPending, setShowMetadataPending] = useState(true);
+  const [forceAdminLibraryOrder, setForceAdminLibraryOrder] = useState(false);
   const [proxyUrl, setProxyUrl] = useState("");
   const [saved, setSaved] = useState(false);
   const [proxySaved, setProxySaved] = useState(false);
@@ -32,12 +33,14 @@ export function AdminSettingsPage() {
     if (!settings.data) return;
     setMinimumMinutes(String(Math.round(settings.data.resumeMinTicks / 600000000)));
     setShowMetadataPending(settings.data.mediaStrategy.showMetadataPending ?? true);
+    setForceAdminLibraryOrder(settings.data.forceAdminLibraryOrder ?? false);
     setProxyUrl(settings.data.networkProxy?.url ?? "");
   }, [settings.data]);
 
   const save = useMutation({
     mutationFn: () => api.updateAdminSettings({
       resumeMinTicks: Number(minimumMinutes) * 600000000,
+      forceAdminLibraryOrder,
       mediaStrategy: {
         ...settings.data!.mediaStrategy,
         showMetadataPending,
@@ -112,6 +115,19 @@ export function AdminSettingsPage() {
             <span>显示媒体库待确认标记</span>
           </label>
           <small>关闭后只隐藏卡片上的标记，不会改变待确认状态或待确认筛选。</small>
+          <label className="lux-admin-toggle">
+            <input
+              type="checkbox"
+              aria-label="媒体库顺序强制按照管理员排序"
+              checked={forceAdminLibraryOrder}
+              onChange={(event) => {
+                setSaved(false);
+                setForceAdminLibraryOrder(event.target.checked);
+              }}
+            />
+            <span>媒体库顺序强制按照管理员排序</span>
+          </label>
+          <small>开启后，普通用户只能按照管理员保存的媒体库顺序浏览。</small>
           <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={save.isPending} onClick={() => save.mutate()}>
             <Save size={16} /> {save.isPending ? "保存中…" : "保存设置"}
           </button>

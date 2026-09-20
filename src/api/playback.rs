@@ -2030,6 +2030,8 @@ pub(super) struct WebPlaybackSessionRequest {
     source_id: String,
     #[serde(default)]
     capabilities: WebPlaybackCapabilitiesRequest,
+    #[serde(default)]
+    audio_stream_index: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2760,7 +2762,8 @@ async fn create_web_playback_session_json(
     user: &UserRecord,
     item_id: &str,
     source: &crate::storage::StoredPlaybackSource,
-    capabilities: PlaybackCapabilities,
+    mut capabilities: PlaybackCapabilities,
+    audio_stream_index: Option<i64>,
 ) -> Result<Value, Response> {
     let source_kind = match source.source_kind.as_str() {
         "LOCAL_FILE" => PlaybackSourceKind::LocalFile,
@@ -2770,6 +2773,12 @@ async fn create_web_playback_session_json(
     let Some(service) = state.web_playback.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
+    if source_kind == PlaybackSourceKind::LocalFile && audio_stream_index.is_some() {
+        // Direct Play cannot select a non-first source audio stream. Reuse
+        // the existing HLS plan so the selected track is fixed in the
+        // server-side playback session.
+        capabilities.direct_play = false;
+    }
     let created = service
         .create(CreateWebPlaybackSession {
             user_id: &user.id.to_string(),
@@ -2800,7 +2809,7 @@ async fn create_web_playback_session_json(
             }
         };
         if let Err(error) = service
-            .start_hls(&created.id, *tier, &input, None, None)
+            .start_hls_with_audio(&created.id, *tier, &input, None, None, audio_stream_index)
             .await
         {
             let _ = service.stop(&created.id, &user.id.to_string()).await;
@@ -2862,6 +2871,50 @@ async fn create_web_playback_session_json(
     }))
 }
 
+async fn validate_web_audio_stream(
+    state: &AppState,
+    principal: AccessPrincipal,
+    item_id: &str,
+    source_id: &str,
+    requested: Option<i64>,
+) -> Result<Option<i64>, Response> {
+    let Some(index) = requested else {
+        return Ok(None);
+    };
+    if index < 0 {
+        return Err(StatusCode::BAD_REQUEST.into_response());
+    }
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+    };
+    let item = match catalog.find_item(principal, item_id).await {
+        Ok(Some(item)) => item,
+        Ok(None) => return Err(StatusCode::NOT_FOUND.into_response()),
+        Err(CatalogError::Storage(_)) => {
+            return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
+        }
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+            return Err(StatusCode::NOT_FOUND.into_response());
+        }
+    };
+    let Some(source) = item
+        .media_sources
+        .iter()
+        .find(|source| source.id == source_id)
+    else {
+        return Err(StatusCode::NOT_FOUND.into_response());
+    };
+    if source
+        .streams
+        .iter()
+        .any(|stream| stream.index == index && stream.stream_type.eq_ignore_ascii_case("AUDIO"))
+    {
+        Ok(Some(index))
+    } else {
+        Err(StatusCode::BAD_REQUEST.into_response())
+    }
+}
+
 pub(super) async fn lux_create_web_playback_session(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -2886,6 +2939,18 @@ pub(super) async fn lux_create_web_playback_session(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let audio_stream_index = match validate_web_audio_stream(
+        &state,
+        principal,
+        &request.item_id,
+        &request.source_id,
+        request.audio_stream_index,
+    )
+    .await
+    {
+        Ok(index) => index,
+        Err(response) => return response,
+    };
     match create_web_playback_session_json(
         &headers,
         &state,
@@ -2893,6 +2958,7 @@ pub(super) async fn lux_create_web_playback_session(
         &request.item_id,
         &source,
         request.capabilities.into(),
+        audio_stream_index,
     )
     .await
     {
@@ -2908,6 +2974,8 @@ pub(super) struct WebPlaybackBootstrapRequest {
     source_id: Option<String>,
     #[serde(default)]
     capabilities: WebPlaybackCapabilitiesRequest,
+    #[serde(default)]
+    audio_stream_index: Option<i64>,
 }
 
 pub(super) async fn lux_create_web_playback_bootstrap(
@@ -2966,6 +3034,18 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         Ok(session) => session,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let audio_stream_index = match validate_web_audio_stream(
+        &state,
+        principal,
+        &request.item_id,
+        &source.source_id,
+        request.audio_stream_index,
+    )
+    .await
+    {
+        Ok(index) => index,
+        Err(response) => return response,
+    };
     let session = match create_web_playback_session_json(
         &headers,
         &state,
@@ -2973,6 +3053,7 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         &request.item_id,
         &source,
         request.capabilities.into(),
+        audio_stream_index,
     )
     .await
     {

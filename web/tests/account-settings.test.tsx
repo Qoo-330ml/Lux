@@ -120,6 +120,63 @@ describe("account settings", () => {
     expect(container.querySelector('[aria-label="上移媒体库 剧集"]')).toBeTruthy();
   });
 
+  it("defaults to the administrator library order and lets a user turn it off", async () => {
+    const update = vi.spyOn(api, "updateUserSettings").mockResolvedValue({
+      playedPercent: 95,
+      useAdminLibraryOrder: false,
+      libraryOrderForced: false,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const toggle = container.querySelector<HTMLInputElement>("input[aria-label='按照管理员顺序排序']");
+    expect(toggle?.checked).toBe(true);
+    await act(async () => {
+      toggle?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(update).toHaveBeenCalledWith({ useAdminLibraryOrder: false });
+  });
+
+  it("locks the administrator order toggle when the server forces it", async () => {
+    vi.mocked(api.userSettings).mockResolvedValueOnce({
+      playedPercent: 95,
+      useAdminLibraryOrder: true,
+      libraryOrderForced: true,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AccountPage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const toggle = container.querySelector<HTMLInputElement>("input[aria-label='按照管理员顺序排序']");
+    expect(toggle?.checked).toBe(true);
+    expect(toggle?.disabled).toBe(true);
+  });
+
   it("keeps logout beside the sidebar account identity without the device and permission card", async () => {
     const logout = vi.spyOn(api, "logout").mockResolvedValue();
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -242,6 +299,7 @@ describe("account settings", () => {
   });
 
   it("persists a changed theme and reorders libraries from an accessible control", async () => {
+    vi.mocked(api.userSettings).mockResolvedValueOnce({ playedPercent: 95, useAdminLibraryOrder: false, libraryOrderForced: false });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
     await act(async () => {
@@ -271,6 +329,7 @@ describe("account settings", () => {
   });
 
   it("supports dragging one library row before another", async () => {
+    vi.mocked(api.userSettings).mockResolvedValueOnce({ playedPercent: 95, useAdminLibraryOrder: false, libraryOrderForced: false });
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
     await act(async () => {

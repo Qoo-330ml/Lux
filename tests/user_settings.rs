@@ -45,7 +45,10 @@ async fn user_playback_threshold_defaults_to_95_and_is_csrf_protected()
         .send()
         .await?;
     assert_eq!(defaults.status(), reqwest::StatusCode::OK);
-    assert_eq!(defaults.json::<Value>().await?["playedPercent"], 95);
+    let defaults = defaults.json::<Value>().await?;
+    assert_eq!(defaults["playedPercent"], 95);
+    assert_eq!(defaults["useAdminLibraryOrder"], true);
+    assert_eq!(defaults["libraryOrderForced"], false);
 
     let missing_csrf = client
         .patch(format!("{base_url}/api/v1/auth/settings"))

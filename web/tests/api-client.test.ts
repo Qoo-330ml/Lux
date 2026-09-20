@@ -177,6 +177,22 @@ describe("LuxApiClient", () => {
     expect((options?.headers as Headers).get("Content-Type")).toBe("image/png");
   });
 
+  it("uses separate PATCH and DELETE contracts for admin user actions", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({ user: {} }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const client = new LuxApiClient();
+
+    await client.disableAdminUser("user/1");
+    await client.deleteAdminUser("user/1");
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/users/user%2F1");
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBe("PATCH");
+    expect(fetchMock.mock.calls[0]?.[1]?.body).toBe(JSON.stringify({ isDisabled: true }));
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/admin/users/user%2F1");
+    expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
+  });
+
   it("checks and selects the configured database backend without changing the setup API contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

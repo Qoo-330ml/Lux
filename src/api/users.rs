@@ -1099,16 +1099,33 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match database.user_played_percent(&user.id.to_string()).await {
-        Ok(played_percent) => Json(json!({ "playedPercent": played_percent })).into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let played_percent = match database.user_played_percent(&user.id.to_string()).await {
+        Ok(played_percent) => played_percent,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (use_admin_library_order, library_order_forced) = match libraries
+        .uses_admin_library_order(&user.id.to_string(), user.is_admin)
+        .await
+    {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(json!({
+        "playedPercent": played_percent,
+        "useAdminLibraryOrder": use_admin_library_order,
+        "libraryOrderForced": library_order_forced,
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct AuthSettingsPatch {
-    played_percent: i64,
+    played_percent: Option<i64>,
+    use_admin_library_order: Option<bool>,
 }
 
 pub(super) async fn auth_update_settings(
@@ -1123,7 +1140,10 @@ pub(super) async fn auth_update_settings(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    if !(1..=100).contains(&request.played_percent) {
+    if request
+        .played_percent
+        .is_some_and(|played_percent| !(1..=100).contains(&played_percent))
+    {
         return api_error(
             &headers,
             StatusCode::BAD_REQUEST,
@@ -1135,13 +1155,62 @@ pub(super) async fn auth_update_settings(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match database
-        .set_user_played_percent(&user.id.to_string(), request.played_percent)
+    if let Some(played_percent) = request.played_percent {
+        if database
+            .set_user_played_percent(&user.id.to_string(), played_percent)
+            .await
+            .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+    }
+    if let Some(use_admin_library_order) = request.use_admin_library_order {
+        if database
+            .set_user_uses_admin_library_order(&user.id.to_string(), use_admin_library_order)
+            .await
+            .is_err()
+        {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
+        if let Some(home) = state.home.as_ref() {
+            home.invalidate();
+        }
+    }
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let played_percent = match database.user_played_percent(&user.id.to_string()).await {
+        Ok(played_percent) => played_percent,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let (use_admin_library_order, library_order_forced) = match libraries
+        .uses_admin_library_order(&user.id.to_string(), user.is_admin)
         .await
     {
-        Ok(()) => Json(json!({ "playedPercent": request.played_percent })).into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    }
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    Json(json!({
+        "playedPercent": played_percent,
+        "useAdminLibraryOrder": use_admin_library_order,
+        "libraryOrderForced": library_order_forced,
+    }))
+    .into_response()
+}
+
+fn user_library_order_response(library_order: Vec<String>) -> Response {
+    Json(json!({ "libraryOrder": library_order })).into_response()
+}
+
+async fn effective_library_order(
+    libraries: &crate::application::libraries::LibraryService,
+    user_id: &str,
+    is_admin: bool,
+    accessible_library_ids: &[String],
+) -> Result<Vec<String>, LibraryServiceError> {
+    libraries
+        .saved_library_order_for_user(user_id, is_admin, accessible_library_ids)
+        .await
 }
 
 pub(super) async fn auth_library_order(
@@ -1163,11 +1232,15 @@ pub(super) async fn auth_library_order(
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    match libraries
-        .saved_library_order_for_user(&user.id.to_string(), &accessible_library_ids)
-        .await
+    match effective_library_order(
+        libraries,
+        &user.id.to_string(),
+        user.is_admin,
+        &accessible_library_ids,
+    )
+    .await
     {
-        Ok(library_order) => Json(json!({ "libraryOrder": library_order })).into_response(),
+        Ok(library_order) => user_library_order_response(library_order),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -1210,6 +1283,26 @@ pub(super) async fn auth_update_library_order(
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let (use_admin_library_order, _) = match libraries
+        .uses_admin_library_order(&user.id.to_string(), user.is_admin)
+        .await
+    {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if use_admin_library_order && !user.is_admin {
+        return match effective_library_order(
+            libraries,
+            &user.id.to_string(),
+            user.is_admin,
+            &accessible_library_ids,
+        )
+        .await
+        {
+            Ok(library_order) => user_library_order_response(library_order),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    }
     match libraries
         .set_library_order(
             &user.id.to_string(),

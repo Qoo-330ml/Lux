@@ -962,6 +962,88 @@ describe("MediaDetailPage series hierarchy", () => {
       .toBe("/watch/episode-1?sourceId=source-hdr");
   });
 
+  it("shows source-scoped audio and subtitle selectors and resets them when the source changes", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-1",
+      title: "第一集",
+      itemType: "EPISODE",
+      mediaSources: [
+        {
+          id: "source-default",
+          qualityLabel: "1080p",
+          container: "mkv",
+          isDefault: true,
+          streams: [
+            { index: 0, type: "VIDEO", codec: "h264" },
+            { index: 1, type: "AUDIO", codec: "aac", title: "国语", language: "zho", isDefault: true },
+            { index: 2, type: "SUBTITLE", codec: "subrip", title: "简体中文", language: "zho", isDefault: true },
+          ],
+        },
+        {
+          id: "source-alternate",
+          qualityLabel: "2160p",
+          container: "mkv",
+          streams: [
+            { index: 0, type: "VIDEO", codec: "hevc" },
+            { index: 1, type: "AUDIO", codec: "aac", title: "国语", language: "zho" },
+            { index: 2, type: "AUDIO", codec: "eac3", title: "英语", language: "eng", isDefault: true },
+            { index: 3, type: "SUBTITLE", codec: "subrip", title: "English", language: "eng", isDefault: true },
+            { index: 4, type: "SUBTITLE", codec: "ass", title: "简体中文", language: "zho" },
+          ],
+        },
+      ],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/episode-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const audioSelect = container.querySelector<HTMLButtonElement>("[data-track-selector=audio] [role=combobox]");
+    const subtitleSelect = container.querySelector<HTMLButtonElement>("[data-track-selector=subtitle] [role=combobox]");
+    expect(audioSelect?.textContent).toContain("国语");
+    expect(subtitleSelect?.textContent).toContain("简体中文");
+    expect(audioSelect?.disabled).toBe(true);
+    expect(subtitleSelect?.disabled).toBe(true);
+
+    const sourceSelect = container.querySelector<HTMLButtonElement>(".lux-source-selector [role=combobox]");
+    await act(async () => sourceSelect?.click());
+    const alternateOption = [...document.querySelectorAll<HTMLButtonElement>("[role=option]")]
+      .find((button) => button.textContent?.includes("2160p"));
+    await act(async () => alternateOption?.click());
+
+    expect(audioSelect?.textContent).toContain("英语");
+    expect(subtitleSelect?.textContent).toContain("English");
+    expect(audioSelect?.disabled).toBe(false);
+    expect(subtitleSelect?.disabled).toBe(false);
+    await act(async () => audioSelect?.click());
+    const chineseAudioOption = [...document.querySelectorAll<HTMLButtonElement>("[role=option]")]
+      .find((button) => button.textContent?.includes("国语"));
+    await act(async () => chineseAudioOption?.click());
+    await act(async () => subtitleSelect?.click());
+    const chineseSubtitleOption = [...document.querySelectorAll<HTMLButtonElement>("[role=option]")]
+      .find((button) => button.textContent?.includes("简体中文"));
+    await act(async () => chineseSubtitleOption?.click());
+    expect(container.querySelector<HTMLAnchorElement>("a.lux-button-primary")?.getAttribute("href"))
+      .toBe("/watch/episode-1?sourceId=source-alternate&subtitleStreamIndex=4");
+  });
+
   it("shows source metadata and detailed video, audio, and subtitle tracks", async () => {
     vi.spyOn(api, "item").mockResolvedValue({
       id: "movie-1",

@@ -515,6 +515,13 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-source-option-content { display: grid; gap: 5px; min-width: 0; }
 .lux-source-option-label { overflow: hidden; font-size: .82rem; font-weight: 600; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
 .lux-source-option-detail { overflow: hidden; color: var(--lux-subtle); font-size: .7rem; line-height: 1.2; text-overflow: ellipsis; white-space: nowrap; }
+.lux-track-selectors { display: grid; gap: 17px; max-width: 320px; margin-top: 20px; }
+.lux-track-selector { display: grid; gap: 10px; }
+.lux-track-selector .lux-section-heading { gap: 12px; }
+.lux-track-selector .lux-section-heading h2 { margin: 0; color: var(--lux-text); font-size: .84rem; font-weight: 600; }
+.lux-track-selector .lux-section-heading span { color: var(--lux-subtle); font-size: .7rem; }
+.lux-track-select .lux-select-trigger { min-height: 44px; }
+.lux-track-select .lux-select-trigger:disabled { color: var(--lux-muted); opacity: .58; }
 .lux-media-info { max-width: none; margin-top: 72px; }
 .lux-media-info-extra { max-width: none; }
 .lux-media-info-heading h2 { margin: 0; color: #fff; font-size: 1rem; font-weight: 650; }

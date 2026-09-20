@@ -48,6 +48,8 @@ export function MediaDetailPage() {
     enabled: pendingReview && Boolean(item.data?.libraryId),
   });
   const [selectedSourceId, setSelectedSourceId] = useState<string>();
+  const [selectedAudioStreamIndex, setSelectedAudioStreamIndex] = useState<string>();
+  const [selectedSubtitleStreamIndex, setSelectedSubtitleStreamIndex] = useState<string>();
   const [editor, setEditor] = useState<"metadata" | "images" | "subtitles" | "identify">();
   const [actionError, setActionError] = useState<string>();
   const [actionNotice, setActionNotice] = useState<string>();
@@ -95,6 +97,10 @@ export function MediaDetailPage() {
   const source = sources.find((entry) => entry.id === selectedSourceId)
     ?? sources.find((entry) => entry.isDefault)
     ?? sources[0];
+  useEffect(() => {
+    setSelectedAudioStreamIndex(defaultStreamIndex(source, "AUDIO"));
+    setSelectedSubtitleStreamIndex(defaultStreamIndex(source, "SUBTITLE"));
+  }, [source?.id]);
   const nextPlayableEpisodeId = !source && (isSeries || isSeason)
     ? selectNextPlayableEpisode(episodes.data?.items ?? [])?.id
     : undefined;
@@ -144,8 +150,14 @@ export function MediaDetailPage() {
     : isEpisode
       ? episodeTitle(media)
       : undefined;
+  const watchQuery = source ? new URLSearchParams({ sourceId: source.id }) : undefined;
+  const firstAudioStreamIndex = streamsOfType(source, "AUDIO")[0]?.index;
+  if (watchQuery && selectedAudioStreamIndex && selectedAudioStreamIndex !== String(firstAudioStreamIndex ?? "")) {
+    watchQuery.set("audioStreamIndex", selectedAudioStreamIndex);
+  }
+  if (watchQuery && selectedSubtitleStreamIndex) watchQuery.set("subtitleStreamIndex", selectedSubtitleStreamIndex);
   const watchHref = source
-    ? `/watch/${media.id}?sourceId=${encodeURIComponent(source.id)}`
+    ? `/watch/${media.id}?${watchQuery?.toString()}`
     : nextPlayableEpisodeId
       ? `/watch/${nextPlayableEpisodeId}`
       : undefined;
@@ -342,7 +354,21 @@ export function MediaDetailPage() {
               <MediaSourceSelector
                 sources={sources}
                 selectedSourceId={source?.id}
-                onSelect={setSelectedSourceId}
+                selectedAudioStreamIndex={selectedAudioStreamIndex}
+                selectedSubtitleStreamIndex={selectedSubtitleStreamIndex}
+                onSelect={(sourceId) => setSelectedSourceId(sourceId)}
+                onAudioSelect={setSelectedAudioStreamIndex}
+                onSubtitleSelect={setSelectedSubtitleStreamIndex}
+              />
+            ) : source && (source.streams ?? []).some((stream) => isTrackType(stream, "AUDIO") || isTrackType(stream, "SUBTITLE")) ? (
+              <MediaSourceSelector
+                sources={sources}
+                selectedSourceId={source.id}
+                selectedAudioStreamIndex={selectedAudioStreamIndex}
+                selectedSubtitleStreamIndex={selectedSubtitleStreamIndex}
+                onSelect={(sourceId) => setSelectedSourceId(sourceId)}
+                onAudioSelect={setSelectedAudioStreamIndex}
+                onSubtitleSelect={setSelectedSubtitleStreamIndex}
               />
             ) : null}
           </div>
@@ -500,12 +526,23 @@ function ExpandableOverview({ overview }: { overview: string }) {
 function MediaSourceSelector({
   sources,
   selectedSourceId,
+  selectedAudioStreamIndex,
+  selectedSubtitleStreamIndex,
   onSelect,
+  onAudioSelect,
+  onSubtitleSelect,
 }: {
   sources: MediaSource[];
   selectedSourceId?: string;
+  selectedAudioStreamIndex?: string;
+  selectedSubtitleStreamIndex?: string;
   onSelect: (sourceId: string) => void;
+  onAudioSelect: (streamIndex: string) => void;
+  onSubtitleSelect: (streamIndex: string) => void;
 }) {
+  const selectedSource = sources.find((source) => source.id === selectedSourceId) ?? sources[0];
+  const audioStreams = streamsOfType(selectedSource, "AUDIO");
+  const subtitleStreams = streamsOfType(selectedSource, "SUBTITLE");
   const options = sources.map((source, index) => ({
     value: source.id,
     label: (
@@ -517,20 +554,83 @@ function MediaSourceSelector({
   }));
 
   return (
-    <section className="lux-source-selector" aria-labelledby="media-source-heading">
+    <section
+      className="lux-source-selector"
+      aria-labelledby={sources.length > 1 ? "media-source-heading" : undefined}
+      aria-label={sources.length > 1 ? undefined : "播放轨道选择"}
+    >
+      {sources.length > 1 ? <>
+        <div className="lux-section-heading">
+          <h2 id="media-source-heading">选择版本</h2>
+          <span>{sources.length} 个视频文件</span>
+        </div>
+        <div className="lux-source-select">
+          <LuxSelect
+            value={selectedSourceId ?? sources[0]?.id ?? ""}
+            options={options}
+            onChange={onSelect}
+            aria-labelledby="media-source-heading"
+          />
+        </div>
+      </> : null}
+      {audioStreams.length || subtitleStreams.length ? (
+        <div className="lux-track-selectors">
+          {audioStreams.length ? (
+            <MediaTrackSelector
+              type="AUDIO"
+              streams={audioStreams}
+              selectedStreamIndex={selectedAudioStreamIndex}
+              onSelect={onAudioSelect}
+            />
+          ) : null}
+          {subtitleStreams.length ? (
+            <MediaTrackSelector
+              type="SUBTITLE"
+              streams={subtitleStreams}
+              selectedStreamIndex={selectedSubtitleStreamIndex}
+              onSelect={onSubtitleSelect}
+            />
+          ) : null}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function MediaTrackSelector({
+  type,
+  streams,
+  selectedStreamIndex,
+  onSelect,
+}: {
+  type: "AUDIO" | "SUBTITLE";
+  streams: MediaStream[];
+  selectedStreamIndex?: string;
+  onSelect: (streamIndex: string) => void;
+}) {
+  const label = type === "AUDIO" ? "音频" : "字幕";
+  const headingId = `media-${type.toLowerCase()}-heading`;
+  const options = streams.map((stream, index) => ({
+    value: String(stream.index),
+    label: streamLabel(stream, label, index),
+  }));
+  return (
+    <div className="lux-track-selector" data-track-selector={type.toLowerCase()}>
       <div className="lux-section-heading">
-        <h2 id="media-source-heading">选择版本</h2>
-        <span>{sources.length} 个视频文件</span>
+        <h2 id={headingId}>选择{label}</h2>
+        <span>{streams.length} 条{label}轨</span>
       </div>
-      <div className="lux-source-select">
+      <div className="lux-track-select">
         <LuxSelect
-          value={selectedSourceId ?? sources[0]?.id ?? ""}
+          id={`media-${type.toLowerCase()}-select`}
+          value={selectedStreamIndex ?? String(streams[0]?.index ?? "")}
           options={options}
+          disabled={streams.length <= 1}
           onChange={onSelect}
-          aria-labelledby="media-source-heading"
+          aria-labelledby={headingId}
         />
       </div>
-    </section>
+    </div>
   );
 }
 
@@ -545,6 +645,47 @@ function sourceLabel(source: MediaSource, index: number) {
     bitDepthLabel(videoStream),
   ]);
   return labels.join(" · ") || source.editionName || `${source.container?.toUpperCase() || "视频"} · 版本 ${index + 1}`;
+}
+
+function streamsOfType(source: MediaSource | undefined, type: "AUDIO" | "SUBTITLE") {
+  return source?.streams?.filter((stream) => isTrackType(stream, type)) ?? [];
+}
+
+function isTrackType(stream: MediaStream, type: "AUDIO" | "SUBTITLE") {
+  return stream.type?.toUpperCase() === type;
+}
+
+function defaultStreamIndex(source: MediaSource | undefined, type: "AUDIO" | "SUBTITLE") {
+  const streams = streamsOfType(source, type);
+  const stream = streams.find((candidate) => candidate.isDefault) ?? streams[0];
+  return stream ? String(stream.index) : undefined;
+}
+
+function streamLabel(stream: MediaStream, typeLabel: string, index: number) {
+  const labels = uniqueSourceLabels([
+    stream.title ?? undefined,
+    stream.language ? languageLabel(stream.language) : undefined,
+    stream.codec?.trim().toUpperCase(),
+  ]);
+  return labels.join(" · ") || `${typeLabel}轨道 ${index + 1}`;
+}
+
+function languageLabel(value: string) {
+  const normalized = value.trim().toLowerCase();
+  return ({
+    en: "英语",
+    chi: "中文",
+    zho: "中文",
+    eng: "英语",
+    jpn: "日语",
+    kor: "韩语",
+    zh: "中文",
+    "zh-cn": "中文",
+    "zh-hk": "中文",
+    "zh-sg": "中文",
+    "zh-tw": "中文",
+    und: "未知语言",
+  } as Record<string, string>)[normalized] ?? value;
 }
 
 function splitSourceInfo(value?: string | null) {

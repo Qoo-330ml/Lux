@@ -46,6 +46,14 @@ pub(crate) struct HlsStartOptions {
     pub(crate) runtime_ticks: Option<i64>,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct HlsWebStartOptions {
+    pub(crate) video_bitrate: Option<i64>,
+    pub(crate) start_time_ticks: Option<i64>,
+    pub(crate) runtime_ticks: Option<i64>,
+    pub(crate) audio_stream_index: Option<i64>,
+}
+
 impl HlsSegmentContainer {
     pub(crate) const fn segment_extension(self) -> &'static str {
         match self {
@@ -137,6 +145,7 @@ struct HlsProcessSpecification {
     input: PathBuf,
     tier: ServerTier,
     video_bitrate: Option<i64>,
+    audio_stream_index: Option<i64>,
     emby_vod: bool,
     segment_container: HlsSegmentContainer,
 }
@@ -161,6 +170,13 @@ struct HlsOutput<'a> {
     manifest: &'a Path,
     segment_file_name: String,
     segment_container: HlsSegmentContainer,
+    preserve_input_timestamps: bool,
+}
+
+#[derive(Clone, Copy)]
+struct FfmpegTimelineOptions {
+    start_time_ticks: Option<i64>,
+    audio_stream_index: Option<i64>,
     preserve_input_timestamps: bool,
 }
 
@@ -233,6 +249,7 @@ impl HlsManager {
         self
     }
 
+    #[cfg(test)]
     pub(crate) async fn start(
         &self,
         session_id: &str,
@@ -242,17 +259,39 @@ impl HlsManager {
         start_time_ticks: Option<i64>,
         runtime_ticks: Option<i64>,
     ) -> Result<(), HlsError> {
+        self.start_with_audio(
+            session_id,
+            tier,
+            input,
+            HlsWebStartOptions {
+                video_bitrate,
+                start_time_ticks,
+                runtime_ticks,
+                audio_stream_index: None,
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_audio(
+        &self,
+        session_id: &str,
+        tier: ServerTier,
+        input: &Path,
+        options: HlsWebStartOptions,
+    ) -> Result<(), HlsError> {
         self.start_process(
             session_id,
             HlsProcessSpecification {
                 input: input.to_path_buf(),
                 tier,
-                video_bitrate,
+                video_bitrate: options.video_bitrate,
+                audio_stream_index: options.audio_stream_index,
                 emby_vod: false,
                 segment_container: HlsSegmentContainer::FragmentedMp4,
             },
-            start_time_ticks,
-            runtime_ticks,
+            options.start_time_ticks,
+            options.runtime_ticks,
             true,
         )
         .await
@@ -272,6 +311,7 @@ impl HlsManager {
                 input: input.to_path_buf(),
                 tier,
                 video_bitrate,
+                audio_stream_index: None,
                 emby_vod: true,
                 segment_container: options.segment_container,
             },
@@ -369,13 +409,16 @@ impl HlsManager {
     ) -> Result<Child, HlsError> {
         let init_file_name = init.file_name().and_then(|name| name.to_str());
         let args = if specification.emby_vod {
-            ffmpeg_args_for_output(
+            ffmpeg_args_for_output_with_audio(
                 &specification.input,
-                directory,
                 specification.tier,
                 self.hardware_encoder.as_deref(),
                 specification.video_bitrate,
-                start_time_ticks,
+                FfmpegTimelineOptions {
+                    start_time_ticks,
+                    audio_stream_index: specification.audio_stream_index,
+                    preserve_input_timestamps: true,
+                },
                 HlsOutput {
                     init_file_name: init_file_name.unwrap_or("init.mp4"),
                     manifest,
@@ -392,13 +435,14 @@ impl HlsManager {
                 },
             )?
         } else {
-            ffmpeg_args(
+            ffmpeg_args_with_audio(
                 &specification.input,
                 directory,
                 specification.tier,
                 self.hardware_encoder.as_deref(),
                 specification.video_bitrate,
                 start_time_ticks,
+                specification.audio_stream_index,
             )?
         };
         let mut command = Command::new(&self.ffmpeg_executable);
@@ -1170,6 +1214,7 @@ fn ffmpeg_executable() -> String {
     std::env::var("LUX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned())
 }
 
+#[cfg(test)]
 fn ffmpeg_args(
     input: &Path,
     directory: &Path,
@@ -1178,17 +1223,41 @@ fn ffmpeg_args(
     video_bitrate: Option<i64>,
     start_time_ticks: Option<i64>,
 ) -> Result<Vec<String>, HlsError> {
-    ffmpeg_args_with_timeline(
+    ffmpeg_args_with_audio(
         input,
         directory,
         tier,
         hardware_encoder,
         video_bitrate,
         start_time_ticks,
-        false,
+        None,
     )
 }
 
+fn ffmpeg_args_with_audio(
+    input: &Path,
+    directory: &Path,
+    tier: ServerTier,
+    hardware_encoder: Option<&str>,
+    video_bitrate: Option<i64>,
+    start_time_ticks: Option<i64>,
+    audio_stream_index: Option<i64>,
+) -> Result<Vec<String>, HlsError> {
+    ffmpeg_args_with_timeline_audio(
+        input,
+        directory,
+        tier,
+        hardware_encoder,
+        video_bitrate,
+        FfmpegTimelineOptions {
+            start_time_ticks,
+            audio_stream_index,
+            preserve_input_timestamps: false,
+        },
+    )
+}
+
+#[cfg(test)]
 fn ffmpeg_args_with_timeline(
     input: &Path,
     directory: &Path,
@@ -1198,14 +1267,35 @@ fn ffmpeg_args_with_timeline(
     start_time_ticks: Option<i64>,
     preserve_input_timestamps: bool,
 ) -> Result<Vec<String>, HlsError> {
-    let manifest = directory.join("index.m3u8");
-    ffmpeg_args_for_output(
+    ffmpeg_args_with_timeline_audio(
         input,
         directory,
         tier,
         hardware_encoder,
         video_bitrate,
-        start_time_ticks,
+        FfmpegTimelineOptions {
+            start_time_ticks,
+            audio_stream_index: None,
+            preserve_input_timestamps,
+        },
+    )
+}
+
+fn ffmpeg_args_with_timeline_audio(
+    input: &Path,
+    directory: &Path,
+    tier: ServerTier,
+    hardware_encoder: Option<&str>,
+    video_bitrate: Option<i64>,
+    timing: FfmpegTimelineOptions,
+) -> Result<Vec<String>, HlsError> {
+    let manifest = directory.join("index.m3u8");
+    ffmpeg_args_for_output_with_audio(
+        input,
+        tier,
+        hardware_encoder,
+        video_bitrate,
+        timing,
         HlsOutput {
             init_file_name: "init.mp4",
             manifest: &manifest,
@@ -1214,11 +1304,12 @@ fn ffmpeg_args_with_timeline(
                 .to_string_lossy()
                 .into_owned(),
             segment_container: HlsSegmentContainer::FragmentedMp4,
-            preserve_input_timestamps,
+            preserve_input_timestamps: timing.preserve_input_timestamps,
         },
     )
 }
 
+#[cfg(test)]
 fn ffmpeg_args_for_output(
     input: &Path,
     _directory: &Path,
@@ -1226,6 +1317,28 @@ fn ffmpeg_args_for_output(
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
     start_time_ticks: Option<i64>,
+    output: HlsOutput<'_>,
+) -> Result<Vec<String>, HlsError> {
+    ffmpeg_args_for_output_with_audio(
+        input,
+        tier,
+        hardware_encoder,
+        video_bitrate,
+        FfmpegTimelineOptions {
+            start_time_ticks,
+            audio_stream_index: None,
+            preserve_input_timestamps: output.preserve_input_timestamps,
+        },
+        output,
+    )
+}
+
+fn ffmpeg_args_for_output_with_audio(
+    input: &Path,
+    tier: ServerTier,
+    hardware_encoder: Option<&str>,
+    video_bitrate: Option<i64>,
+    timing: FfmpegTimelineOptions,
     output: HlsOutput<'_>,
 ) -> Result<Vec<String>, HlsError> {
     if tier == ServerTier::Direct {
@@ -1240,7 +1353,7 @@ fn ffmpeg_args_for_output(
         "warning".to_owned(),
         "-nostdin".to_owned(),
     ];
-    let start_time = ffmpeg_start_time(start_time_ticks);
+    let start_time = ffmpeg_start_time(timing.start_time_ticks);
     if let Some(start_time) = start_time.as_ref() {
         args.extend(["-ss".to_owned(), start_time.clone()]);
     }
@@ -1250,7 +1363,10 @@ fn ffmpeg_args_for_output(
         "-map".to_owned(),
         "0:v:0?".to_owned(),
         "-map".to_owned(),
-        "0:a:0?".to_owned(),
+        timing
+            .audio_stream_index
+            .map(|index| format!("0:{index}?"))
+            .unwrap_or_else(|| "0:a:0?".to_owned()),
     ]);
     match tier {
         ServerTier::Remux => {
@@ -1345,7 +1461,7 @@ fn ffmpeg_args_for_output(
             HlsSegmentContainer::FragmentedMp4 => "fmp4".to_owned(),
         },
         "-start_number".to_owned(),
-        hls_start_number(start_time_ticks).to_string(),
+        hls_start_number(timing.start_time_ticks).to_string(),
     ]);
     if output.segment_container.uses_initialization_segment() {
         args.extend([
@@ -1557,8 +1673,8 @@ mod tests {
     use super::{
         HLS_SEGMENT_DURATION_TICKS, HlsSegmentContainer, HlsStartOptions, SESSION_QUOTA_CACHE_TTL,
         ServerTier, SessionQuotaCache, asset_segment_number, emby_init_segment_number, ffmpeg_args,
-        ffmpeg_args_for_output, ffmpeg_args_with_timeline, hls_segment_path, hls_start_number,
-        is_valid_asset, vod_manifest,
+        ffmpeg_args_for_output, ffmpeg_args_with_audio, ffmpeg_args_with_timeline,
+        hls_segment_path, hls_start_number, is_valid_asset, vod_manifest,
     };
 
     #[test]
@@ -1671,6 +1787,22 @@ mod tests {
             args.iter()
                 .any(|value| value == "segment_%06d.m4s" || value.ends_with("segment_%06d.m4s"))
         );
+    }
+
+    #[test]
+    fn selected_audio_stream_maps_the_source_stream_index() {
+        let args = ffmpeg_args_with_audio(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::Remux,
+            None,
+            None,
+            None,
+            Some(3),
+        )
+        .unwrap();
+
+        assert!(args.windows(2).any(|pair| pair == ["-map", "0:3?"]));
     }
 
     #[test]

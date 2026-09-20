@@ -34,6 +34,8 @@ export type LuxUser = {
 
 export type UserPlaybackSettings = {
   playedPercent: number;
+  useAdminLibraryOrder?: boolean;
+  libraryOrderForced?: boolean;
 };
 
 export type UserLibraryOrder = {
@@ -295,6 +297,11 @@ export type WebPlaybackSession = {
   tier: number;
   expiresAt: number;
   plan: WebPlaybackPlan;
+};
+
+export type WebPlaybackTrackSelection = {
+  audioStreamIndex?: number;
+  subtitleStreamIndex?: number;
 };
 
 export type WebPlaybackBootstrap = {
@@ -907,6 +914,7 @@ export type AdminSettings = {
   serverName?: string;
   resumePlayedPercent: number;
   resumeMinTicks: number;
+  forceAdminLibraryOrder?: boolean;
   mediaStrategy: MediaStrategySettings;
   networkProxy?: AdminNetworkProxySettings;
 };

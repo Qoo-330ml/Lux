@@ -1332,7 +1332,7 @@ pub(super) async fn emby_ordered_views(state: &AppState, user: &UserRecord) -> V
         return Vec::new();
     };
     libraries
-        .saved_library_order_for_user(&user.id.to_string(), &accessible_library_ids)
+        .saved_library_order_for_user(&user.id.to_string(), user.is_admin, &accessible_library_ids)
         .await
         .unwrap_or_default()
         .into_iter()
@@ -1753,6 +1753,12 @@ async fn emby_user_configuration(
         return configuration;
     };
     merge_emby_json_object(&mut configuration, stored);
+    if !user.is_admin
+        && matches!(database.force_admin_library_order().await, Ok(true))
+        && let Some(object) = configuration.as_object_mut()
+    {
+        object.insert("OrderedViews".to_owned(), json!(ordered_views));
+    }
     normalize_emby_ordered_views(&mut configuration);
     configuration
 }

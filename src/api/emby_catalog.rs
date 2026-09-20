@@ -361,7 +361,7 @@ pub(super) async fn emby_library_virtual_folders(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match libraries
-        .list_libraries_for_user(&user.id.to_string(), &accessible_library_ids)
+        .list_libraries_for_user(&user.id.to_string(), user.is_admin, &accessible_library_ids)
         .await
     {
         Ok(views) => Json(
@@ -406,7 +406,7 @@ pub(super) async fn emby_library_selectable_media_folders(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match libraries
-        .list_libraries_for_user(&user.id.to_string(), &accessible_library_ids)
+        .list_libraries_for_user(&user.id.to_string(), user.is_admin, &accessible_library_ids)
         .await
     {
         Ok(views) => Json(
@@ -735,7 +735,11 @@ pub(super) async fn emby_visible_library_items(
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let views = libraries
-        .list_libraries_for_user(&principal.user_id.to_string(), &accessible_library_ids)
+        .list_libraries_for_user(
+            &principal.user_id.to_string(),
+            principal.is_admin,
+            &accessible_library_ids,
+        )
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
     let child_counts = state

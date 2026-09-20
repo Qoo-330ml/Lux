@@ -68,6 +68,23 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .ok_or("missing user id")?
         .to_owned();
 
+    let duplicate = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({
+            "username": "MANAGED",
+            "displayName": "Another Managed",
+            "password": "another password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+    assert_eq!(
+        duplicate.json::<Value>().await?["error"]["message"],
+        "用户名已存在"
+    );
+
     let library = client
         .post(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookie)
@@ -143,6 +160,10 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .send()
         .await?;
     assert_eq!(regular.status(), reqwest::StatusCode::CREATED);
+    let regular_id = regular.json::<Value>().await?["user"]["id"]
+        .as_str()
+        .ok_or("missing regular user id")?
+        .to_owned();
     let regular_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({
@@ -193,12 +214,39 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
     let manager_csrf = cookie_value(managed_login.headers(), "lux_csrf");
 
     let disabled_admin = client
-        .delete(format!("{base_url}/api/v1/admin/users/{}", admin_user.id))
+        .patch(format!("{base_url}/api/v1/admin/users/{}", admin_user.id))
         .header(COOKIE, &manager_cookie)
         .header("x-csrf-token", &manager_csrf)
+        .json(&json!({ "isDisabled": true }))
         .send()
         .await?;
     assert_eq!(disabled_admin.status(), reqwest::StatusCode::OK);
+
+    let listed_after_disable = client
+        .get(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &manager_cookie)
+        .send()
+        .await?;
+    assert_eq!(listed_after_disable.status(), reqwest::StatusCode::OK);
+    assert!(
+        listed_after_disable.json::<Value>().await?["users"]
+            .as_array()
+            .is_some_and(|users| {
+                users.iter().any(|user| {
+                    user["id"] == admin_user.id.to_string() && user["isDisabled"] == true
+                })
+            })
+    );
+
+    let disabled_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "admin",
+            "password": "correct password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(disabled_login.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let admin_demotion = client
         .patch(format!("{base_url}/api/v1/admin/users/{created_id}"))
@@ -208,6 +256,26 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         .send()
         .await?;
     assert_eq!(admin_demotion.status(), reqwest::StatusCode::CONFLICT);
+
+    let deleted_regular = client
+        .delete(format!("{base_url}/api/v1/admin/users/{regular_id}"))
+        .header(COOKIE, &manager_cookie)
+        .header("x-csrf-token", &manager_csrf)
+        .send()
+        .await?;
+    assert_eq!(deleted_regular.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let recreated_regular = client
+        .post(format!("{base_url}/api/v1/admin/users"))
+        .header(COOKIE, &manager_cookie)
+        .header("x-csrf-token", &manager_csrf)
+        .json(&json!({
+            "username": "regular",
+            "password": "regular password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(recreated_regular.status(), reqwest::StatusCode::CREATED);
 
     let audit = client
         .get(format!("{base_url}/api/v1/admin/audit?pageSize=100"))
@@ -233,6 +301,11 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
         audit_events
             .iter()
             .any(|event| event["eventType"] == "USER_DISABLED")
+    );
+    assert!(
+        audit_events
+            .iter()
+            .any(|event| event["eventType"] == "USER_DELETED")
     );
 
     server.abort();
