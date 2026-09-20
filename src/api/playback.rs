@@ -3453,7 +3453,7 @@ pub(super) async fn lux_web_playback_event(
                 None,
                 &user.display_name,
                 AccessPrincipal::new(user.id, user.is_admin),
-                Some(web_playback_notification_method(&session)),
+                web_playback_notification_method(&session),
                 if event_type_is_stopped(event_type) {
                     activity_remote_ip
                 } else {
@@ -3474,14 +3474,14 @@ pub(super) async fn lux_web_playback_event(
 
 fn web_playback_notification_method(
     session: &crate::storage::StoredWebPlaybackSession,
-) -> &'static str {
+) -> Option<&'static str> {
     if session.plan != "SERVER_HLS" {
-        return "DirectPlay";
+        return None;
     }
     if session.tier <= i64::from(ServerTier::Remux.number()) {
-        "DirectStream"
+        Some("DirectStream")
     } else {
-        "Transcode"
+        Some("Transcode")
     }
 }
 

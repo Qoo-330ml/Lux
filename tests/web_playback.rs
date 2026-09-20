@@ -346,6 +346,32 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let strm_direct_session_id = strm_direct_body["sessionId"]
         .as_str()
         .ok_or("missing direct STRM session id")?;
+    let strm_event = client
+        .post(format!(
+            "{base_url}/api/v1/playback/sessions/{strm_direct_session_id}/events"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "eventId": "strm-event-1",
+            "sequence": 1,
+            "state": "PLAYING",
+            "positionTicks": 0,
+            "durationTicks": 1_000
+        }))
+        .send()
+        .await?;
+    assert_eq!(strm_event.status(), reqwest::StatusCode::OK);
+    assert_eq!(strm_event.json::<Value>().await?["accepted"], true);
+    assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
+    let strm_started: Value = serde_json::from_slice(
+        &receiver
+            .recv()
+            .await
+            .ok_or("missing STRM playback notification")?,
+    )?;
+    assert_eq!(strm_started["eventType"], "PLAYBACK_STARTED");
+    assert_eq!(strm_started["playMethod"], "DirectStream");
     let strm_direct_stopped = client
         .delete(format!(
             "{base_url}/api/v1/playback/sessions/{strm_direct_session_id}"
