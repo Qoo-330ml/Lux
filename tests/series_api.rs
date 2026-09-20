@@ -423,6 +423,49 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         "Video"
     );
 
+    let vidhub_episodes_small_limit = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Limit=1",
+            admin.id
+        ))
+        .header("User-Agent", "VidHub/1.0")
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(
+        vidhub_episodes_small_limit.status(),
+        reqwest::StatusCode::OK
+    );
+    let vidhub_episodes_small_limit_body: Value = vidhub_episodes_small_limit.json().await?;
+    assert_eq!(vidhub_episodes_small_limit_body["TotalRecordCount"], 3);
+    assert_eq!(
+        vidhub_episodes_small_limit_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(3)
+    );
+
+    let standard_episodes_small_limit = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Limit=1",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(
+        standard_episodes_small_limit.status(),
+        reqwest::StatusCode::OK
+    );
+    let standard_episodes_small_limit_body: Value = standard_episodes_small_limit.json().await?;
+    assert_eq!(standard_episodes_small_limit_body["TotalRecordCount"], 3);
+    assert_eq!(
+        standard_episodes_small_limit_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
     let filmly_episodes = client
         .get(format!(
             "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields=BasicSyncInfo,Overview,ProviderIds,Path,Size,People,RuntimeTicks,Chapters,MediaSources,CanDownload&Limit=10",

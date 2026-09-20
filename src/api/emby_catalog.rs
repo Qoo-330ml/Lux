@@ -4,6 +4,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
 const EMBY_LATEST_SERIES_EPISODE_PAGE_SIZE: i64 = 100;
 const EMBY_LATEST_SERIES_EPISODE_MAX_ITEMS: i64 = 10_000;
+const EMBY_VIDHUB_SHOW_EPISODE_MAX_ITEMS: i64 = 4_096;
 
 use crate::application::catalog::CatalogItemCounts;
 
@@ -1297,9 +1298,19 @@ pub(super) async fn emby_show_episodes(
         Ok(user) => user,
         Err(status) => return status.into_response(),
     };
-    let (offset, limit) = match emby_page_params(&query) {
+    let (offset, requested_limit) = match emby_page_params(&query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
+    };
+    // VidHub's season screen requests the first page from this endpoint but
+    // does not continue with StartIndex when the response contains a normal
+    // Emby page. Keep the standard page contract for other clients, while
+    // returning a bounded complete episode list for this exact compatibility
+    // shape.
+    let limit = if offset == 0 && is_vidhub_request(&headers) {
+        EMBY_VIDHUB_SHOW_EPISODE_MAX_ITEMS
+    } else {
+        requested_limit
     };
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1411,6 +1422,22 @@ pub(super) async fn emby_collection_children(
         }
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
+}
+
+fn is_vidhub_request(headers: &HeaderMap) -> bool {
+    ["user-agent", "x-emby-client", "x-mediabrowser-client"]
+        .iter()
+        .filter_map(|name| header_str(headers, name))
+        .any(is_vidhub_user_agent)
+}
+
+fn is_vidhub_user_agent(value: &str) -> bool {
+    value.split_ascii_whitespace().next().is_some_and(|client| {
+        client.eq_ignore_ascii_case("vidhub")
+            || client
+                .get(.."VidHub/".len())
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("VidHub/"))
+    })
 }
 
 pub(super) async fn emby_catalog_page_for_user_with_fields(
