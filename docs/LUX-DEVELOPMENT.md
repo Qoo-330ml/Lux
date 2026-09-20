@@ -126,7 +126,8 @@ Lux 的核心价值不是功能数量，而是：
 ### 3.3 播放
 
 - 本地媒体的 Web 播放使用 0～4 档服务端计划：档位 0 为 Direct Play，档位 1 为视频/音频 copy 的 Remux，档位 2 为视频 copy、音频转码，档位 3 为硬件转码，档位 4 为软件转码。决策始终优先选择较低档位。
-- 档位 1～4 输出会话级 fMP4/CMAF HLS；HLS 清单和分片只存在于播放会话临时目录，不生成永久媒体副本。
+- Lux Web 的档位 1～4 输出会话级 fMP4/CMAF HLS；Emby 第三方客户端按会话容器协商，默认使用 MPEG-TS，
+  仅在客户端明确声明 `mp4`/`fmp4` 时使用 fMP4。两类 HLS 清单和分片都只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可以位于媒体库根目录之外；目标必须是 Lux 进程实际可读取、canonicalize 后存在的普通文件，且不会把目录或另一个 `.strm` 当作视频返回。
 - URL 和本地路径型 `.strm` 在 `Path` 保留原始目标；`PlaybackInfo` 对这两类目标的 `DirectStreamUrl` 使用标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，可额外携带标准 `UserId` 供外部代理关联播放身份；`UserId` 不承担授权。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 的 `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby token 作为 `api_key` 写入签名 URL；本地文件和 SMB/FTP 解析源不携带长期 token。Lux 仍强制验证 HMAC 票据。外部播放代理从原始 `Path` 提取映射或 302 信息，客户端始终请求当前公网代理域名而不是 `.strm` 中的内网地址。Lux 仍保留直接访问 URL 型 `.strm` 时使用播放器 User-Agent 有限解析重定向并返回 307 的兼容回退；不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 继续使用 Lux 的协议解析器和受保护播放入口；空目标和其他协议不可播放。
@@ -6179,12 +6180,14 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
   协商；HLS profile 限定 codec 时，只复制兼容的流，否则进入相应的音频或视频转码档位。
   `forceTranscode=true` 查询参数可覆盖 `EnableDirectPlay=true`。GET 和空 body 的 POST 保持
   Direct Play 行为。
-- 本地媒体源在选择服务端转码时返回 `SupportsTranscoding=true`、`TranscodingUrl`、
-  `TranscodingSubProtocol=hls`、`TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
-  URL 指向标准 Emby `master.m3u8` 入口，并带有 `DeviceId`、输出 codec、码率、轨道索引和 fMP4 分片参数；
-  实际转码 offer 的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，同时保持
-  `SupportsDirectPlay`/`SupportsDirectStream` 为 `false`；清单中的每个逻辑 `segment_N.m4s` 使用对应的
-  `init_N.mp4` 和当前会话短期签名 URL，不能跨 generation 混用 fMP4 初始化段。
+- 本地媒体源在选择服务端转码时返回 `SupportsTranscoding=true`、`TranscodingUrl` 和
+  `TranscodingSubProtocol=hls`。没有明确容器声明时使用 MPEG-TS，并返回 `TranscodingContainer=ts`、
+  `TranscodingMimeType=video/mp2t`；客户端明确声明 `mp4`/`fmp4` 时使用 fMP4，并返回对应的
+  `mp4`/`video/mp4`。URL 指向标准 Emby `master.m3u8` 入口，并带有 `DeviceId`、输出 codec、码率、轨道索引
+  和 `SegmentContainer` 参数；实际转码 offer 的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS
+  清单，同时保持 `SupportsDirectPlay`/`SupportsDirectStream` 为 `false`。TS 清单不带 init；fMP4 清单中的
+  每个逻辑 `segment_N.m4s` 使用对应的 `init_N.mp4` 和当前会话短期签名 URL，不能跨 generation 混用 fMP4
+  初始化段，签名资源还必须绑定会话容器。
 - 转码会话复用 `web_playback_sessions`，其 `PlaySessionId` 可被 Emby `Sessions/Playing`、`Progress` 和
   `Stopped` 回调关联；播放/暂停刷新 TTL，停止立即回收 FFmpeg 进程和临时目录。没有回调时仍由服务端
   过期清理回收。
@@ -6198,8 +6201,8 @@ FFmpeg、临时目录、并发限制、签名资源和生命周期继续由现�
 
 验收：
 
-- [x] 第三方 Emby `PlaybackInfo` POST 可以为本地媒体协商服务端转码，并实际取得 `master.m3u8`、init
-      segment 和 media segment；Direct Play 仍优先。
+- [x] 第三方 Emby `PlaybackInfo` POST 可以为本地媒体协商服务端转码，并实际取得 `master.m3u8` 和 media
+      segment；fMP4 profile 额外取得 init segment，Direct Play 仍优先。
 - [x] Emby 转码播放事件能够刷新会话并在 `Stopped` 后回收资源；无事件会被 TTL/孤儿清理回收。
 - [x] `.strm`、无权限 source、错误用户、跨 source、过期/篡改签名和路径穿越均不会启动或泄露转码资源。
 - [x] 现有 Web 播放、Emby 直放、ACL、Range、进度和媒体代理行为不回退。
@@ -6276,6 +6279,14 @@ Clippy 仍被未修改的 `src/api/legacy.rs:44` 未使用导入阻塞。FNOS �
 清单改为每个逻辑 segment 声明对应的 `init_N.mp4`，不同 generation 的物理 segment 文件隔离命名，并将
 逻辑 segment 持久绑定到首次生成它的 generation。窄 HLS 单元测试 24 个和 Emby PlaybackInfo/HLS 集成目标
 已通过；FNOS 镜像重建、部署及 Harbor 真机首帧/seek/音画验证仍待完成。
+
+验证记录（2026-09-20 Emby HLS 容器协商修复）：Emby 转码会话现在默认协商 MPEG-TS，只有请求或
+`DeviceProfile.TranscodingProfiles` 明确声明 `mp4`/`fmp4` 时才选择 fMP4；`TranscodingContainer`、MIME、
+FFmpeg segment type、manifest init 结构、分片扩展名和 Content-Type 保持一致。Emby HLS 资源签名绑定会话容器，
+TS 也覆盖中段首次启动、回到第 0 段和容器篡改拒绝。`cargo test --locked --lib playback::hls`（27 个通过）、
+`cargo test --locked --lib emby_playback_tests`（23 个通过）和 `cargo test --locked --test playback
+emby_playback_info_negotiates_server_transcoding_and_cleans_hls`（1 个通过）已通过；完整质量门、FNOS
+重部署以及 Harbor 真机首帧/seek/音画验证仍待完成。
 
 依赖：LUX-198、LUX-199。
 

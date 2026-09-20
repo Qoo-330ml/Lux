@@ -19,12 +19,14 @@
    Emby 对省略的播放开关按启用处理，因此只提交 `DeviceProfile` 的客户端也能完成标准协商。
    `MaxStreamingBitrate`（顶层或 `DeviceProfile` 内）也参与协商；当本地 source 的已知码率超过该限制且声明了 HLS
    转码 profile 时选择服务端转码，码率未知时不因未知值触发转码。
-3. HLS 输出继续使用现有 fMP4/CMAF 资产，Emby 对外声明 `TranscodingSubProtocol=hls`、
-   `TranscodingContainer=mp4` 和 `TranscodingMimeType=video/mp4`。
-   `TranscodingUrl` 同时返回 Emby 播放器通常使用的 `DeviceId`、输出 codec、码率、轨道索引、
-   `SegmentContainer=mp4`、`MinSegments`、`BreakOnNonKeyFrames` 和 `TranscodeReasons` 参数；实际转码 offer
-   的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，兼容依赖 `DirectStreamUrl` 的客户端；
-   `SupportsDirectPlay`/`SupportsDirectStream` 仍为 `false`，不会将该 offer 误报为直放。Lux 的短期 HMAC 参数作为额外安全约束保留。
+3. Emby HLS 按播放会话协商分片容器：没有明确容器声明时默认输出 MPEG-TS，
+   `TranscodingContainer=ts`、`TranscodingMimeType=video/mp2t`；客户端在
+   `DeviceProfile.TranscodingProfiles.Container` 或请求参数中明确声明 `mp4`/`fmp4` 时才输出
+   fMP4/CMAF，并返回对应的 `mp4`/`video/mp4`。`TranscodingUrl` 同时返回 Emby 播放器通常使用的
+   `DeviceId`、输出 codec、码率、轨道索引、`SegmentContainer`、`MinSegments`、`BreakOnNonKeyFrames`
+   和 `TranscodeReasons` 参数；实际转码 offer 的 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS
+   清单，兼容依赖 `DirectStreamUrl` 的客户端；`SupportsDirectPlay`/`SupportsDirectStream` 仍为 `false`，
+   不会将该 offer 误报为直放。Lux 的短期 HMAC 参数绑定会话容器和资源，防止 TS/fMP4 混用。
 4. `.strm` 是 Direct-only；本任务不扩大它的服务端处理边界。
 5. 第三方客户端可能不发送 Web 心跳，因此 Emby 播放回调负责刷新转码会话，回调缺失时依靠现有 TTL
    和孤儿目录清理。
@@ -56,8 +58,9 @@
   - `.strm` source 保持 `SupportsTranscoding=false`，不返回 `TranscodingUrl`。
 - `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，缺失时回退到媒体项时长。
   Emby HLS 清单必须按完整 `RunTimeTicks` 生成 `#EXT-X-PLAYLIST-TYPE:VOD`、完整分片列表和
-  `#EXT-X-ENDLIST`，使第三方客户端立即获得完整时间轴；每个逻辑 `segment_N.m4s` 前声明对应的
-  `init_N.mp4`，避免 seek generation 之间混用 fMP4 时间基准。FFmpeg 仍以增量方式生成分片，尚未生成的签名分片请求由服务端等待。
+  `#EXT-X-ENDLIST`，使第三方客户端立即获得完整时间轴。MPEG-TS 清单直接列出逻辑 `.ts` 分片且不带
+  `EXT-X-MAP`；fMP4 清单才为每个逻辑 `segment_N.m4s` 声明对应的 `init_N.mp4`，避免 seek generation
+  之间混用 fMP4 时间基准。FFmpeg 仍以增量方式生成分片，尚未生成的签名分片请求由服务端等待。
   Lux Web 的内部 HLS 清单仍保持原有动态追加行为，不复用 Emby 的 VOD 清单。
 
 ### 转码资源
@@ -83,10 +86,11 @@
 
 ## Generation / init 绑定修复
 
-Emby VOD 不能把所有逻辑分片都映射为动态的单一 `init.mp4`。每个逻辑分片使用
+Emby fMP4 VOD 不能把所有逻辑分片都映射为动态的单一 `init.mp4`。每个逻辑分片使用
 `init_N.mp4`，内部 FFmpeg generation 使用独立的 init 和 segment 文件名；逻辑分片第一次激活后绑定到该
 generation，后续 seek 不会把它改映射到另一个 generation。这样 Harbor 先请求恢复位置的 init、随后请求第 0 段时，
-两者会分别得到自己的时间基准，不会再组成“中段 init + 第 0 段媒体”的非法 fMP4 组合。
+两者会分别得到自己的时间基准，不会再组成“中段 init + 第 0 段媒体”的非法 fMP4 组合。TS 会话不创建 init，
+也不会进入这条 fMP4 generation 绑定规则，但仍按逻辑 segment 绑定 generation。
 
 仅增加 `-start_at_zero`、`use_editlist=0` 或输出时间戳偏移不能修复该问题：FNOS Jellyfin FFmpeg 7.1.4
 在禁用 edit list 后仍会把中段 fragment 的 PTS 归零，因此不采用参数级替代方案。

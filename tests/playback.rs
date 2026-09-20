@@ -8,7 +8,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, RANGE};
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -624,6 +624,7 @@ set -eu
 manifest=\"\"
 segment=\"\"
 init=\"init.mp4\"
+extension=\"ts\"
 start_number=0
 while [ \"$#\" -gt 0 ]; do
   case \"$1\" in
@@ -637,8 +638,16 @@ done
 directory=$(dirname \"$manifest\")
 mkdir -p \"$directory\"
 printf '%s\\n' \"$start_number\" >> \"$directory/starts.log\"
-printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"%s\\\"\\n#EXTINF:1,\\nsegment_%06d.m4s\\n' \"$init\" \"$start_number\" > \"$manifest\"
-printf init > \"$directory/$init\"
+case \"$segment\" in
+  *.m4s)
+    extension=\"m4s\"
+    printf '#EXTM3U\\n#EXT-X-MAP:URI=\\\"%s\\\"\\n#EXTINF:1,\\nsegment_%06d.%s\\n' \"$init\" \"$start_number\" \"$extension\" > \"$manifest\"
+    printf init > \"$directory/$init\"
+    ;;
+  *)
+    printf '#EXTM3U\\n#EXTINF:1,\\nsegment_%06d.%s\\n' \"$start_number\" \"$extension\" > \"$manifest\"
+    ;;
+esac
 segment_path=$(printf '%s' \"$segment\" | sed \"s/%06d/$(printf '%06d' \"$start_number\")/\")
 printf 'segment-%s' \"$start_number\" > \"$segment_path\"
 sleep 0.2
@@ -873,6 +882,14 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         device_profile_body["MediaSources"][0]["SupportsDirectStream"],
         false
     );
+    assert_eq!(
+        device_profile_body["MediaSources"][0]["TranscodingContainer"],
+        "mp4"
+    );
+    assert_eq!(
+        device_profile_body["MediaSources"][0]["TranscodingMimeType"],
+        "video/mp4"
+    );
     assert_eq!(device_profile_body["RunTimeTicks"], expected_runtime_ticks);
     assert_eq!(
         device_profile_body["MediaSources"][0]["RunTimeTicks"],
@@ -887,6 +904,7 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         .as_str()
         .ok_or("missing DeviceProfile transcoding URL")?;
     assert!(device_profile_url.starts_with(&format!("/Videos/{emby_item_id}/master.m3u8?")));
+    assert!(device_profile_url.contains("SegmentContainer=mp4"));
     for expected in [
         "DeviceId=harbor-device",
         "MediaSourceId=",
@@ -1099,12 +1117,13 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     let body = transcoding.json::<Value>().await?;
     assert_eq!(body["MediaSources"][0]["SupportsTranscoding"], true);
     assert_eq!(body["MediaSources"][0]["TranscodingSubProtocol"], "hls");
-    assert_eq!(body["MediaSources"][0]["TranscodingContainer"], "mp4");
-    assert_eq!(body["MediaSources"][0]["TranscodingMimeType"], "video/mp4");
+    assert_eq!(body["MediaSources"][0]["TranscodingContainer"], "ts");
+    assert_eq!(body["MediaSources"][0]["TranscodingMimeType"], "video/mp2t");
     let transcoding_url = body["MediaSources"][0]["TranscodingUrl"]
         .as_str()
         .ok_or("missing transcoding URL")?;
     assert!(transcoding_url.starts_with(&format!("/Videos/{emby_item_id}/master.m3u8?")));
+    assert!(transcoding_url.contains("SegmentContainer=ts"));
     assert!(!transcoding_url.contains(&token));
     let play_session_id = body["PlaySessionId"]
         .as_str()
@@ -1138,34 +1157,36 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     assert!(manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
     assert!(manifest.contains("#EXT-X-ENDLIST\n"));
     assert_eq!(manifest.matches("segment_").count(), 1_474);
-    assert_eq!(manifest.matches("#EXT-X-MAP:").count(), 1_474);
-    assert!(manifest.contains("/init_000000.mp4?"));
-    assert!(manifest.contains("/init_001230.mp4?"));
+    assert_eq!(manifest.matches("#EXT-X-MAP:").count(), 0);
+    assert!(manifest.contains("/segment_000000.ts?"));
+    assert!(manifest.contains("/segment_001230.ts?"));
     assert!(manifest.contains("#EXTINF:4.000000,"));
     assert!(manifest.contains("#EXTINF:2.336000,"));
-    let init_url = manifest
-        .split("URI=\"")
-        .nth(1)
-        .and_then(|value| value.split('\"').next())
-        .ok_or("missing signed init URL")?;
     let segment_url = manifest
         .lines()
-        .find(|line| line.contains("segment_000001.m4s?"))
+        .find(|line| line.contains("segment_000001.ts?"))
         .ok_or("missing signed segment URL")?;
     let second_segment_url = manifest
         .lines()
-        .filter(|line| line.contains("/transcoding/") && line.contains(".m4s?"))
+        .filter(|line| line.contains("/transcoding/") && line.contains(".ts?"))
         .nth(1)
         .ok_or("missing signed second segment URL")?;
-    let init = client.get(format!("{base_url}{init_url}")).send().await?;
-    assert_eq!(init.status(), reqwest::StatusCode::OK);
-    assert_eq!(init.bytes().await?.as_ref(), b"init");
     let segment = client
         .get(format!("{base_url}{segment_url}"))
         .send()
         .await?;
     assert_eq!(segment.status(), reqwest::StatusCode::OK);
+    assert_eq!(segment.headers()[CONTENT_TYPE], "video/mp2t");
     assert_eq!(segment.bytes().await?.as_ref(), b"segment-1");
+    let tampered_container = segment_url.replace("SegmentContainer=ts", "SegmentContainer=mp4");
+    assert_eq!(
+        client
+            .get(format!("{base_url}{tampered_container}"))
+            .send()
+            .await?
+            .status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
     let second_segment = client
         .get(format!("{base_url}{second_segment_url}"))
         .send()

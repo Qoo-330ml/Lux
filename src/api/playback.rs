@@ -2,7 +2,7 @@ use super::*;
 
 use crate::application::playback::{
     decision::ServerTier,
-    hls::HlsSegmentContainer,
+    hls::{HlsSegmentContainer, HlsStartOptions},
     session::{CreatedWebPlaybackSession, WebPlaybackPlan},
 };
 use crate::storage::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
@@ -132,6 +132,17 @@ pub(super) async fn emby_playback_info(
     } else {
         None
     };
+    let transcode_container = if transcode_requested {
+        let Some(source) = sources.first() else {
+            return StatusCode::NOT_FOUND.into_response();
+        };
+        match request.selected_hls_container(source) {
+            Ok(container) => Some(container),
+            Err(_) => return StatusCode::BAD_REQUEST.into_response(),
+        }
+    } else {
+        None
+    };
     let transcode_session = if transcode_requested {
         let Some(source) = sources.first() else {
             return StatusCode::NOT_FOUND.into_response();
@@ -141,9 +152,14 @@ pub(super) async fn emby_playback_info(
             &user,
             &item.id,
             source,
-            &request,
-            transcode_start_time_ticks,
-            runtime_ticks,
+            EmbyTranscodingSessionOptions {
+                request: &request,
+                hls: HlsStartOptions {
+                    segment_container: transcode_container.unwrap_or(HlsSegmentContainer::MpegTs),
+                    start_time_ticks: transcode_start_time_ticks,
+                    runtime_ticks,
+                },
+            },
         )
         .await
         {
@@ -221,9 +237,16 @@ pub(super) async fn emby_playback_info(
                                 &item.id,
                                 source,
                                 session,
-                                &request,
-                                transcode_start_time_ticks,
-                                &device_id,
+                                EmbyTranscodingUrlOptions {
+                                    request: &request,
+                                    hls: HlsStartOptions {
+                                        segment_container: transcode_container
+                                            .unwrap_or(HlsSegmentContainer::MpegTs),
+                                        start_time_ticks: transcode_start_time_ticks,
+                                        runtime_ticks,
+                                    },
+                                    device_id: &device_id,
+                                },
                             )
                         })
                     });
@@ -256,11 +279,19 @@ pub(super) async fn emby_playback_info(
                         );
                     }
                     if let Some(url) = transcoding_url {
+                        let segment_container = transcode_container
+                            .unwrap_or(HlsSegmentContainer::MpegTs);
                         object.insert("SupportsTranscoding".to_owned(), json!(true));
                         object.insert("TranscodingUrl".to_owned(), json!(url));
                         object.insert("TranscodingSubProtocol".to_owned(), json!("hls"));
-                        object.insert("TranscodingContainer".to_owned(), json!("mp4"));
-                        object.insert("TranscodingMimeType".to_owned(), json!("video/mp4"));
+                        object.insert(
+                            "TranscodingContainer".to_owned(),
+                            json!(segment_container.emby_container()),
+                        );
+                        object.insert(
+                            "TranscodingMimeType".to_owned(),
+                            json!(segment_container.mime_type()),
+                        );
                         // Emby keeps DirectStreamUrl and TranscodingUrl pointed
                         // at the same HLS manifest during transcoding. Harbor
                         // follows DirectStreamUrl, even when the capability bit
@@ -331,8 +362,14 @@ struct EmbyPlaybackInfoRequest {
     max_audio_channels: Option<i64>,
     #[serde(rename = "StartTimeTicks", alias = "startTimeTicks")]
     start_time_ticks: Option<i64>,
+    #[serde(rename = "SegmentContainer", alias = "segmentContainer")]
+    segment_container: Option<String>,
+    #[serde(rename = "TranscodingContainer", alias = "transcodingContainer")]
+    transcoding_container: Option<String>,
     #[serde(rename = "DeviceProfile", alias = "deviceProfile")]
     device_profile: Option<EmbyDeviceProfile>,
+    #[serde(skip)]
+    request_container_hints: Vec<String>,
 }
 
 impl EmbyPlaybackInfoRequest {
@@ -355,6 +392,14 @@ impl EmbyPlaybackInfoRequest {
                 if let Ok(value) = value.parse::<i64>() {
                     self.start_time_ticks = Some(value);
                 }
+                continue;
+            }
+            if name.eq_ignore_ascii_case("SegmentContainer")
+                || name.eq_ignore_ascii_case("segment_container")
+                || name.eq_ignore_ascii_case("TranscodingContainer")
+                || name.eq_ignore_ascii_case("transcoding_container")
+            {
+                self.request_container_hints.push(value.into_owned());
                 continue;
             }
             let value = match parse_emby_bool(value.as_ref()) {
@@ -489,6 +534,68 @@ impl EmbyPlaybackInfoRequest {
             software_transcode: true,
         }
     }
+
+    fn selected_hls_container(
+        &self,
+        _source: &crate::application::catalog::CatalogSource,
+    ) -> Result<HlsSegmentContainer, EmbyHlsContainerError> {
+        let requested = self.requested_hls_container()?;
+        let Some(device_profile) = self.device_profile.as_ref() else {
+            return Ok(requested.unwrap_or(HlsSegmentContainer::MpegTs));
+        };
+        let profiles = device_profile
+            .transcoding_profiles
+            .iter()
+            .filter(|profile| {
+                is_video_profile(profile.profile_type.as_deref())
+                    && is_hls_profile(profile)
+                    && profile.supports_hls_segment_container()
+            })
+            .collect::<Vec<_>>();
+        if let Some(requested) = requested {
+            if profiles
+                .iter()
+                .any(|profile| profile.supports_hls_segment_container_value(requested))
+            {
+                return Ok(requested);
+            }
+            if profiles.is_empty() {
+                return Ok(requested);
+            }
+            return Err(EmbyHlsContainerError::Unsupported);
+        }
+        Ok(profiles
+            .first()
+            .and_then(|profile| profile.first_hls_segment_container())
+            .unwrap_or(HlsSegmentContainer::MpegTs))
+    }
+
+    fn requested_hls_container(
+        &self,
+    ) -> Result<Option<HlsSegmentContainer>, EmbyHlsContainerError> {
+        let mut values = self
+            .segment_container
+            .iter()
+            .chain(self.transcoding_container.iter())
+            .chain(self.request_container_hints.iter());
+        let mut selected = None;
+        for value in values.by_ref() {
+            let container =
+                normalize_hls_segment_container(value).ok_or(EmbyHlsContainerError::Invalid)?;
+            if selected.is_some_and(|existing| existing != container) {
+                return Err(EmbyHlsContainerError::Conflict);
+            }
+            selected = Some(container);
+        }
+        Ok(selected)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EmbyHlsContainerError {
+    Invalid,
+    Conflict,
+    Unsupported,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -531,7 +638,9 @@ enum EmbyProfileCompatibility {
 impl EmbyDeviceProfile {
     fn supports_lux_hls(&self) -> bool {
         self.transcoding_profiles.iter().any(|profile| {
-            is_video_profile(profile.profile_type.as_deref()) && is_hls_profile(profile)
+            is_video_profile(profile.profile_type.as_deref())
+                && is_hls_profile(profile)
+                && profile.supports_hls_segment_container()
         })
     }
 
@@ -603,6 +712,28 @@ impl EmbyDeviceProfile {
 }
 
 impl EmbyPlaybackProfile {
+    fn supports_hls_segment_container(&self) -> bool {
+        self.container.as_deref().is_none_or(|value| {
+            value
+                .split(',')
+                .any(|value| normalize_hls_segment_container(value).is_some())
+        })
+    }
+
+    fn supports_hls_segment_container_value(&self, container: HlsSegmentContainer) -> bool {
+        self.container.as_deref().is_none_or(|value| {
+            value
+                .split(',')
+                .any(|value| normalize_hls_segment_container(value) == Some(container))
+        })
+    }
+
+    fn first_hls_segment_container(&self) -> Option<HlsSegmentContainer> {
+        self.container
+            .as_deref()
+            .and_then(|value| value.split(',').find_map(normalize_hls_segment_container))
+    }
+
     fn direct_play_compatibility(
         &self,
         container: Option<&str>,
@@ -621,6 +752,14 @@ impl EmbyPlaybackProfile {
         } else {
             EmbyProfileCompatibility::Compatible
         }
+    }
+}
+
+fn normalize_hls_segment_container(value: &str) -> Option<HlsSegmentContainer> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "ts" | "mpegts" | "m2ts" => Some(HlsSegmentContainer::MpegTs),
+        "mp4" | "fmp4" => Some(HlsSegmentContainer::FragmentedMp4),
+        _ => None,
     }
 }
 
@@ -713,14 +852,17 @@ fn emby_force_transcode_from_raw(raw_query: &RawQuery) -> bool {
     })
 }
 
+struct EmbyTranscodingSessionOptions<'a> {
+    request: &'a EmbyPlaybackInfoRequest,
+    hls: HlsStartOptions,
+}
+
 async fn create_emby_transcoding_session(
     state: &AppState,
     user: &UserRecord,
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
-    request: &EmbyPlaybackInfoRequest,
-    start_time_ticks: Option<i64>,
-    runtime_ticks: Option<i64>,
+    options: EmbyTranscodingSessionOptions<'_>,
 ) -> Result<Option<CreatedWebPlaybackSession>, StatusCode> {
     if source.source_kind != "LOCAL_FILE" {
         return Ok(None);
@@ -749,7 +891,7 @@ async fn create_emby_transcoding_session(
             Err(LocalPathError::Missing) => return Err(StatusCode::NOT_FOUND),
             Err(LocalPathError::Forbidden) => return Err(StatusCode::FORBIDDEN),
         };
-    let video_bitrate = emby_transcoding_video_bitrate(source, request);
+    let video_bitrate = emby_transcoding_video_bitrate(source, options.request);
     let created = service
         .create_and_start_emby_hls(
             CreateWebPlaybackSession {
@@ -759,13 +901,13 @@ async fn create_emby_transcoding_session(
                 media_source_id: &source.id,
                 play_session_prefix: "lux-emby",
                 source_kind: PlaybackSourceKind::LocalFile,
-                capabilities: request.playback_capabilities_for_source(Some(source)),
+                capabilities: options
+                    .request
+                    .playback_capabilities_for_source(Some(source)),
             },
             &input,
             video_bitrate,
-            HlsSegmentContainer::FragmentedMp4,
-            start_time_ticks,
-            runtime_ticks,
+            options.hls,
         )
         .await
         .map_err(emby_playback_session_error_status)?;
@@ -1892,16 +2034,28 @@ pub(super) fn web_playback_hls_url(
     ))
 }
 
+struct EmbyTranscodingUrlOptions<'a> {
+    request: &'a EmbyPlaybackInfoRequest,
+    hls: HlsStartOptions,
+    device_id: &'a str,
+}
+
 fn emby_transcoding_url(
     service: &WebPlaybackSessionService,
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     session: &CreatedWebPlaybackSession,
-    request: &EmbyPlaybackInfoRequest,
-    start_time_ticks: Option<i64>,
-    device_id: &str,
+    options: EmbyTranscodingUrlOptions<'_>,
 ) -> Option<String> {
-    let signature = service.sign_resource(&session.id, "hls:index.m3u8", session.expires_at)?;
+    let request = options.request;
+    let segment_container = options.hls.segment_container;
+    let start_time_ticks = options.hls.start_time_ticks;
+    let device_id = options.device_id;
+    let signature = service.sign_resource(
+        &session.id,
+        &emby_hls_resource(segment_container, "index.m3u8"),
+        session.expires_at,
+    )?;
     let public_item_id = emby_public_id(item_id);
     let tier = match &session.plan {
         WebPlaybackPlan::ServerHls { tier } => *tier,
@@ -1962,7 +2116,7 @@ fn emby_transcoding_url(
     if let Some(start_time_ticks) = start_time_ticks.filter(|ticks| *ticks > 0) {
         query.append_pair("StartTimeTicks", &start_time_ticks.to_string());
     }
-    query.append_pair("SegmentContainer", "mp4");
+    query.append_pair("SegmentContainer", segment_container.emby_container());
     query.append_pair("MinSegments", "1");
     query.append_pair("BreakOnNonKeyFrames", "True");
     query.append_pair("TranscodeReasons", emby_transcode_reason(request, source));
@@ -2110,7 +2264,7 @@ fn emby_hls_asset_kind(asset: &str) -> &'static str {
         "init.mp4" => "initialization",
         value if is_emby_logical_init_asset(value) => "initialization",
         value if is_emby_generation_init_asset(value) => "initialization",
-        value if value.starts_with("segment_") && value.ends_with(".m4s") => "segment",
+        value if is_emby_segment_asset(value) => "segment",
         value if is_emby_generation_segment_asset(value) => "segment",
         _ => "other",
     }
@@ -2157,24 +2311,37 @@ fn record_emby_hls_asset_response(
     }
 }
 
+struct EmbyTranscodingAssetUrlOptions<'a> {
+    item_id: &'a str,
+    source_id: &'a str,
+    session_id: &'a str,
+    play_session_id: &'a str,
+    asset: &'a str,
+    segment_container: HlsSegmentContainer,
+    expires_at: i64,
+}
+
 fn emby_transcoding_asset_url(
     service: &WebPlaybackSessionService,
-    item_id: &str,
-    source_id: &str,
-    session_id: &str,
-    play_session_id: &str,
-    asset: &str,
-    expires_at: i64,
+    options: EmbyTranscodingAssetUrlOptions<'_>,
 ) -> Option<String> {
-    let resource = format!("hls:{asset}");
-    let signature = service.sign_resource(session_id, &resource, expires_at)?;
+    let resource = emby_hls_resource(options.segment_container, options.asset);
+    let signature = service.sign_resource(options.session_id, &resource, options.expires_at)?;
     Some(format!(
-        "/Videos/{}/transcoding/{session_id}/{asset}?MediaSourceId={source_id}&PlaySessionId={}&luxPlaybackExpires={}&luxPlaybackSignature={}",
-        emby_public_id(item_id),
-        percent_encode_filename(play_session_id),
+        "/Videos/{}/transcoding/{}/{}?MediaSourceId={}&PlaySessionId={}&SegmentContainer={}&luxPlaybackExpires={}&luxPlaybackSignature={}",
+        emby_public_id(options.item_id),
+        options.session_id,
+        options.asset,
+        options.source_id,
+        percent_encode_filename(options.play_session_id),
+        options.segment_container.emby_container(),
         signature.expires_at,
         signature.signature,
     ))
+}
+
+fn emby_hls_resource(segment_container: HlsSegmentContainer, asset: &str) -> String {
+    format!("hls:{}:{asset}", segment_container.emby_container())
 }
 
 #[derive(Default)]
@@ -2182,6 +2349,7 @@ struct EmbyTranscodingQuery {
     media_source_id: Option<String>,
     play_session_id: Option<String>,
     playback_session_id: Option<String>,
+    segment_container: Option<String>,
     expires: Option<i64>,
     signature: Option<String>,
 }
@@ -2206,6 +2374,9 @@ fn emby_transcoding_query_from_raw(raw_query: RawQuery) -> EmbyTranscodingQuery 
             && name.eq_ignore_ascii_case("luxPlaybackSessionId")
         {
             query.playback_session_id = Some(value.into_owned());
+        } else if query.segment_container.is_none() && name.eq_ignore_ascii_case("SegmentContainer")
+        {
+            query.segment_container = Some(value.into_owned());
         } else if query.expires.is_none() && name.eq_ignore_ascii_case("luxPlaybackExpires") {
             query.expires = value.parse().ok();
         } else if query.signature.is_none() && name.eq_ignore_ascii_case("luxPlaybackSignature") {
@@ -2311,7 +2482,13 @@ async fn serve_emby_transcoding_asset(
     let Some(service) = state.web_playback.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let resource = format!("hls:{asset}");
+    let Some(segment_container_value) = query.segment_container.as_deref() else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let Some(segment_container) = normalize_hls_segment_container(segment_container_value) else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    let resource = emby_hls_resource(segment_container, asset);
     let session = match service
         .authorize_resource(session_id, &resource, expires_at, signature)
         .await
@@ -2327,6 +2504,11 @@ async fn serve_emby_transcoding_asset(
             .is_some_and(|source_id| session.media_source_id.as_deref() != Some(source_id))
     {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    match service.hls_segment_container(session_id).await {
+        Ok(actual) if actual == segment_container => {}
+        Ok(_) => return StatusCode::NOT_FOUND.into_response(),
+        Err(error) => return emby_playback_session_error_status(error).into_response(),
     }
     let Some(source_id) = session.media_source_id.as_deref() else {
         return StatusCode::NOT_FOUND.into_response();
@@ -2354,12 +2536,15 @@ async fn serve_emby_transcoding_asset(
         let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
             emby_transcoding_asset_url(
                 service,
-                &session.item_id,
-                source_id,
-                &session.id,
-                &session.play_session_id,
-                asset,
-                session.expires_at,
+                EmbyTranscodingAssetUrlOptions {
+                    item_id: &session.item_id,
+                    source_id,
+                    session_id: &session.id,
+                    play_session_id: &session.play_session_id,
+                    asset,
+                    segment_container,
+                    expires_at: session.expires_at,
+                },
             )
         }) else {
             return StatusCode::BAD_GATEWAY.into_response();
@@ -2392,7 +2577,9 @@ async fn serve_emby_transcoding_asset(
         Ok(metadata) if metadata.is_file() => metadata,
         _ => return StatusCode::NOT_FOUND.into_response(),
     };
-    let content_type = if asset.ends_with(".m4s") || asset.ends_with(".mp4") {
+    let content_type = if asset.ends_with(".ts") {
+        "video/mp2t"
+    } else if asset.ends_with(".m4s") || asset.ends_with(".mp4") {
         "video/mp4"
     } else {
         "application/octet-stream"
@@ -2432,9 +2619,14 @@ fn is_emby_generation_segment_asset(asset: &str) -> bool {
     };
     generation.len() == 6
         && generation.bytes().all(|byte| byte.is_ascii_digit())
-        && segment.len() == 10
-        && segment.ends_with(".m4s")
-        && segment[..6].bytes().all(|byte| byte.is_ascii_digit())
+        && (segment
+            .strip_suffix(".m4s")
+            .or_else(|| segment.strip_suffix(".ts")))
+        .is_some_and(|value| value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn is_emby_segment_asset(asset: &str) -> bool {
+    asset.starts_with("segment_") && (asset.ends_with(".m4s") || asset.ends_with(".ts"))
 }
 
 fn is_emby_logical_init_asset(asset: &str) -> bool {
@@ -3467,6 +3659,7 @@ mod emby_playback_tests {
     use crate::application::playback::decision::{
         PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier, choose_plan,
     };
+    use crate::application::playback::hls::HlsSegmentContainer;
     use axum::{body::Bytes, extract::RawQuery};
     use std::collections::BTreeMap;
 
@@ -3521,8 +3714,13 @@ mod emby_playback_tests {
             "initialization"
         );
         assert_eq!(emby_hls_asset_kind("segment_000001.m4s"), "segment");
+        assert_eq!(emby_hls_asset_kind("segment_000001.ts"), "segment");
         assert_eq!(
             emby_hls_asset_kind("generation_000001_segment_000001.m4s"),
+            "segment"
+        );
+        assert_eq!(
+            emby_hls_asset_kind("generation_000001_segment_000001.ts"),
             "segment"
         );
         assert_eq!(emby_hls_asset_kind("unexpected.bin"), "other");
@@ -3832,6 +4030,61 @@ mod emby_playback_tests {
             PlaybackPlan::ServerHls {
                 tier: ServerTier::HardwareTranscode,
             }
+        );
+    }
+
+    #[test]
+    fn unqualified_hls_profile_defaults_to_mpeg_ts() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "TranscodingProfiles": [{
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+
+        assert_eq!(
+            request.selected_hls_container(&profile_source("mkv", "hevc", "aac")),
+            Ok(HlsSegmentContainer::MpegTs)
+        );
+    }
+
+    #[test]
+    fn explicit_hls_profile_container_selects_fragmented_mp4() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "TranscodingProfiles": [{
+                        "Container": "mp4",
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+
+        assert_eq!(
+            request.selected_hls_container(&profile_source("mkv", "hevc", "aac")),
+            Ok(HlsSegmentContainer::FragmentedMp4)
+        );
+    }
+
+    #[test]
+    fn conflicting_segment_container_hints_are_rejected() {
+        let mut request = EmbyPlaybackInfoRequest::default();
+        request.apply_query_parameters(&RawQuery(Some(
+            "SegmentContainer=ts&TranscodingContainer=mp4".to_owned(),
+        )));
+
+        assert!(
+            request
+                .selected_hls_container(&profile_source("mkv", "hevc", "aac"))
+                .is_err()
         );
     }
 

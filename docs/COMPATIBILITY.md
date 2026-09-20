@@ -47,8 +47,8 @@ HLS `TranscodingProfiles` 时，才选择服务端转码。容器/codec/码率�
 `TranscodingUrl` 时同时将 `SupportsDirectPlay` 和 `SupportsDirectStream` 置为 `false`，避免客户端选择直放 URL。
 HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则升级到视频或音频转码档位。
 服务端返回带短期 HMAC 票据的 `TranscodingUrl`。POST 查询参数 `forceTranscode=true` 可覆盖 `EnableDirectPlay=true`；GET
-不因该参数创建转码会话。HLS 清单通过标准 `master.m3u8` 入口返回，init 和 m4s 片段使用同一转码会话的
-签名 URL；转码 URL 同时带有 Emby 客户端通常依赖的 `DeviceId`、输出 codec、码率、轨道索引和 fMP4 分片参数，实际
+不因该参数创建转码会话。HLS 清单通过标准 `master.m3u8` 入口返回，fMP4 的 init/m4s 或 MPEG-TS 的 ts 片段使用同一转码会话的
+签名 URL；转码 URL 同时带有 Emby 客户端通常依赖的 `DeviceId`、输出 codec、码率、轨道索引和会话容器分片参数，实际
 转码 offer 将 `DirectStreamUrl` 与 `TranscodingUrl` 指向同一个签名 HLS 清单，同时保持不可直放能力位；Emby 播放回调会刷新会话，`Stopped`
 会回收 FFmpeg 和临时目录。为避免播放器把动态 HLS 清单当前已生成的片段长度当作完整片长，`PlaybackInfo` 响应顶层和每个
 `MediaSources[]` 都返回完整的 `RunTimeTicks`，优先使用选中 source 时长并回退到条目时长；Emby HLS 清单按完整时长立即返回从 `MEDIA-SEQUENCE:0` 开始的 VOD 时间轴、完整分片列表和 `ENDLIST`。`PlaybackInfo` 和已知总时长的 master 清单只登记并保留会话，不占用 FFmpeg 并发名额，也不替换同一 source 正在播放的旧会话；首个 init 或媒体分片请求才替换旧会话、取得名额并启动 generation 0，首个媒体分片可直接决定起点，避免先启动第 `0` 段再被 Harbor 的中段请求立即取消。总时长未知而无法合成完整清单时，物理 `index.m3u8` 请求本身作为首个资源启动 FFmpeg。若 init 先到，合法范围内的 `StartTimeTicks` 只作为首选起点；已知总时长下等于或超过总时长的提示会被忽略。Emby HLS 不把中段物理分片映射为逻辑第 `0` 段；缺失且远离当前输出窗口的分片会按逻辑编号对应的媒体位置重启 FFmpeg。视频转码档位使用四秒关键帧节奏，复制视频流时实际边界仍可落在源关键帧；`-copyts -avoid_negative_ts disabled` 的合同是保留源时间线并避免每次重启从零计时，不承诺任意源文件的绝对 PTS 必然等于 `分片号 × 4 秒`。后续重启使用独立的内部 generation 清单和 init 文件；init 与媒体分片并发请求会跟随当前 generation，旧的并发媒体分片请求不会反向覆盖更新的 seek。重启前重新检查磁盘水位和会话配额，重启失败会终止会话并释放转码名额。客户端省略 `StartTimeTicks` 时，Lux 仍会把未标记为已播放的保存进度作为转码 URL 兼容提示，客户端显式发送的有效值（包括 `0`）优先；实际媒体内容由客户端请求的逻辑分片决定。Lux 自有签名参数仍保留，长期 API token 不写入转码 URL。
@@ -57,6 +57,13 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 跨条目和篡改签名拒绝、播放回调刷新/停止清理，以及 `.strm` 不声明转码且不创建 HLS 会话。该自动化证据
 只证明服务端协议和资源边界；截至本记录，尚未用 VidHub、SenPlayer、Infuse 或其他第三方 Emby 客户端在
 部署实例上实测转码首帧、seek、暂停、停止和断线回收，不能据此宣称客户端已完成兼容。
+
+2026-09-20 容器兼容修复：Emby HLS 会话现在默认使用 MPEG-TS，`TranscodingContainer=ts`、
+`TranscodingMimeType=video/mp2t`，清单直接列出 `.ts` 分片且不生成 `EXT-X-MAP`；只有客户端明确声明
+`mp4`/`fmp4` 时才使用 `TranscodingContainer=mp4` 的 fMP4/CMAF 和对应 init 分片。master、逻辑分片和
+资源签名都绑定同一个会话容器，TS 与 fMP4 不可混用。服务端回归已覆盖无容器默认 TS、显式 mp4 fMP4、
+中段启动/回到开头、分片 Content-Type 和容器篡改拒绝；这仍不替代 FNOS 部署后的 Harbor 真机首帧、seek、
+音画和进度验证。
 
 ## LUX-144 TMDb 语言组与详情回退（2026-09-08）
 

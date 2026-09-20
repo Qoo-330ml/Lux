@@ -20,7 +20,7 @@ use super::decision::{
     PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier,
     UnsupportedReason, choose_plan,
 };
-use super::hls::{HlsError, HlsManager, HlsSegmentContainer};
+use super::hls::{HlsError, HlsManager, HlsSegmentContainer, HlsStartOptions};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -266,9 +266,7 @@ impl WebPlaybackSessionService {
         input: CreateWebPlaybackSession<'_>,
         media_path: &std::path::Path,
         video_bitrate: Option<i64>,
-        segment_container: HlsSegmentContainer,
-        start_time_ticks: Option<i64>,
-        runtime_ticks: Option<i64>,
+        options: HlsStartOptions,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
         let _start_guard = self.emby_start_lock.lock().await;
         let user_id = input.user_id.to_owned();
@@ -277,15 +275,7 @@ impl WebPlaybackSessionService {
             return Ok(created);
         };
         if let Err(error) = self
-            .start_emby_hls_with_runtime(
-                &created.id,
-                tier,
-                media_path,
-                video_bitrate,
-                segment_container,
-                start_time_ticks,
-                runtime_ticks,
-            )
+            .start_emby_hls_with_runtime(&created.id, tier, media_path, video_bitrate, options)
             .await
         {
             let _ = self.stop(&created.id, &user_id).await;
@@ -423,20 +413,10 @@ impl WebPlaybackSessionService {
         tier: ServerTier,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
-        segment_container: HlsSegmentContainer,
-        start_time_ticks: Option<i64>,
-        runtime_ticks: Option<i64>,
+        options: HlsStartOptions,
     ) -> Result<(), WebPlaybackSessionError> {
         self.hls
-            .start_emby_vod(
-                session_id,
-                tier,
-                input,
-                video_bitrate,
-                segment_container,
-                start_time_ticks,
-                runtime_ticks,
-            )
+            .start_emby_vod(session_id, tier, input, video_bitrate, options)
             .await?;
         let directory = self.hls.session_directory(session_id).await?;
         let now = unix_timestamp();
@@ -549,6 +529,13 @@ impl WebPlaybackSessionService {
         asset: &str,
     ) -> Result<std::path::PathBuf, WebPlaybackSessionError> {
         Ok(self.hls.asset_path(session_id, asset).await?)
+    }
+
+    pub(crate) async fn hls_segment_container(
+        &self,
+        session_id: &str,
+    ) -> Result<HlsSegmentContainer, WebPlaybackSessionError> {
+        Ok(self.hls.segment_container(session_id).await?)
     }
 
     pub(crate) async fn hls_within_quota(
@@ -769,7 +756,7 @@ mod tests {
             libraries::LibraryService,
             playback::{
                 decision::{PlaybackCapabilities, PlaybackSourceKind, ServerTier},
-                hls::{HlsManager, HlsSegmentContainer},
+                hls::{HlsManager, HlsSegmentContainer, HlsStartOptions},
                 session::{
                     CreateWebPlaybackSession, WebPlaybackEvent, WebPlaybackPlan,
                     WebPlaybackSessionService,
@@ -1117,9 +1104,11 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                None,
-                Some(600 * 10_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: Some(600 * 10_000_000),
+                },
             )
             .await?;
         service.wait_for_hls_manifest(&created.id).await?;
@@ -1163,9 +1152,11 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                None,
-                Some(600 * 10_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: Some(600 * 10_000_000),
+                },
             )
             .await?;
         service.wait_for_hls_manifest(&replacement.id).await?;
@@ -1262,9 +1253,11 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                None,
-                None,
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: None,
+                },
             )
             .await?;
         assert!(matches!(
@@ -1288,9 +1281,11 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(2_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                None,
-                None,
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: None,
+                },
             )
             .await?;
 

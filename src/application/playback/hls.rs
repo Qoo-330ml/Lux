@@ -39,6 +39,13 @@ pub(crate) enum HlsSegmentContainer {
     FragmentedMp4,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HlsStartOptions {
+    pub(crate) segment_container: HlsSegmentContainer,
+    pub(crate) start_time_ticks: Option<i64>,
+    pub(crate) runtime_ticks: Option<i64>,
+}
+
 impl HlsSegmentContainer {
     pub(crate) const fn segment_extension(self) -> &'static str {
         match self {
@@ -153,6 +160,7 @@ struct HlsOutput<'a> {
     init_file_name: &'a str,
     manifest: &'a Path,
     segment_file_name: String,
+    segment_container: HlsSegmentContainer,
     preserve_input_timestamps: bool,
 }
 
@@ -256,9 +264,7 @@ impl HlsManager {
         tier: ServerTier,
         input: &Path,
         video_bitrate: Option<i64>,
-        segment_container: HlsSegmentContainer,
-        start_time_ticks: Option<i64>,
-        runtime_ticks: Option<i64>,
+        options: HlsStartOptions,
     ) -> Result<(), HlsError> {
         self.start_process(
             session_id,
@@ -267,10 +273,10 @@ impl HlsManager {
                 tier,
                 video_bitrate,
                 emby_vod: true,
-                segment_container,
+                segment_container: options.segment_container,
             },
-            start_time_ticks,
-            runtime_ticks,
+            options.start_time_ticks,
+            options.runtime_ticks,
             false,
         )
         .await
@@ -370,7 +376,6 @@ impl HlsManager {
                 self.hardware_encoder.as_deref(),
                 specification.video_bitrate,
                 start_time_ticks,
-                specification.segment_container,
                 HlsOutput {
                     init_file_name: init_file_name.unwrap_or("init.mp4"),
                     manifest,
@@ -382,6 +387,7 @@ impl HlsManager {
                     )
                     .to_string_lossy()
                     .into_owned(),
+                    segment_container: specification.segment_container,
                     preserve_input_timestamps: true,
                 },
             )?
@@ -486,9 +492,10 @@ impl HlsManager {
         let manifest = process.initial_manifest.clone();
         if process.specification.emby_vod && fs::metadata(&manifest).await.is_err() {
             let initial_segment = process.state.lock().await.segment_start_number;
-            let initial_segment_path = process
-                .directory
-                .join(format!("segment_{initial_segment:06}.m4s"));
+            let initial_segment_path = process.directory.join(format!(
+                "segment_{initial_segment:06}.{}",
+                process.specification.segment_container.segment_extension()
+            ));
             self.restart_for_segment(session_id, &process, initial_segment, &initial_segment_path)
                 .await?;
         }
@@ -875,6 +882,20 @@ impl HlsManager {
         Ok(started)
     }
 
+    pub(crate) async fn segment_container(
+        &self,
+        session_id: &str,
+    ) -> Result<HlsSegmentContainer, HlsError> {
+        let process = self
+            .processes
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or(HlsError::NotFound)?;
+        Ok(process.specification.segment_container)
+    }
+
     pub(crate) async fn within_quota(&self, session_id: &str) -> Result<bool, HlsError> {
         let process = self
             .processes
@@ -1185,7 +1206,6 @@ fn ffmpeg_args_with_timeline(
         hardware_encoder,
         video_bitrate,
         start_time_ticks,
-        HlsSegmentContainer::FragmentedMp4,
         HlsOutput {
             init_file_name: "init.mp4",
             manifest: &manifest,
@@ -1193,6 +1213,7 @@ fn ffmpeg_args_with_timeline(
                 .join("segment_%06d.m4s")
                 .to_string_lossy()
                 .into_owned(),
+            segment_container: HlsSegmentContainer::FragmentedMp4,
             preserve_input_timestamps,
         },
     )
@@ -1205,7 +1226,6 @@ fn ffmpeg_args_for_output(
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
     start_time_ticks: Option<i64>,
-    segment_container: HlsSegmentContainer,
     output: HlsOutput<'_>,
 ) -> Result<Vec<String>, HlsError> {
     if tier == ServerTier::Direct {
@@ -1320,14 +1340,14 @@ fn ffmpeg_args_for_output(
         "-hls_list_size".to_owned(),
         "0".to_owned(),
         "-hls_segment_type".to_owned(),
-        match segment_container {
+        match output.segment_container {
             HlsSegmentContainer::MpegTs => "mpegts".to_owned(),
             HlsSegmentContainer::FragmentedMp4 => "fmp4".to_owned(),
         },
         "-start_number".to_owned(),
         hls_start_number(start_time_ticks).to_string(),
     ]);
-    if segment_container.uses_initialization_segment() {
+    if output.segment_container.uses_initialization_segment() {
         args.extend([
             "-hls_fmp4_init_filename".to_owned(),
             output.init_file_name.to_owned(),
@@ -1487,9 +1507,10 @@ fn is_emby_generation_asset(asset: &str, segment_container: HlsSegmentContainer)
         .strip_prefix("segment_")
         .and_then(|value| value.strip_suffix(&extension))
         .is_some_and(|value| value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit()));
+    let valid_init = segment_container.uses_initialization_segment() && asset == "init.mp4";
     generation.len() == 6
         && generation.bytes().all(|byte| byte.is_ascii_digit())
-        && (asset == "init.mp4" || valid_segment)
+        && (valid_init || valid_segment)
 }
 
 fn is_allowed_hardware_encoder(value: &str) -> bool {
@@ -1534,8 +1555,8 @@ mod tests {
     };
 
     use super::{
-        HLS_SEGMENT_DURATION_TICKS, HlsSegmentContainer, SESSION_QUOTA_CACHE_TTL, ServerTier,
-        SessionQuotaCache, asset_segment_number, emby_init_segment_number, ffmpeg_args,
+        HLS_SEGMENT_DURATION_TICKS, HlsSegmentContainer, HlsStartOptions, SESSION_QUOTA_CACHE_TTL,
+        ServerTier, SessionQuotaCache, asset_segment_number, emby_init_segment_number, ffmpeg_args,
         ffmpeg_args_for_output, ffmpeg_args_with_timeline, hls_segment_path, hls_start_number,
         is_valid_asset, vod_manifest,
     };
@@ -1606,11 +1627,11 @@ mod tests {
             None,
             None,
             None,
-            HlsSegmentContainer::MpegTs,
             super::HlsOutput {
                 init_file_name: "init.mp4",
                 manifest: Path::new("session/index.m3u8"),
                 segment_file_name: "session/segment_%06d.ts".to_owned(),
+                segment_container: HlsSegmentContainer::MpegTs,
                 preserve_input_timestamps: true,
             },
         )
@@ -1844,6 +1865,14 @@ mod tests {
             "segment_000001.ts",
             HlsSegmentContainer::MpegTs
         ));
+        assert!(is_valid_asset(
+            "generation_000001_segment_000001.ts",
+            HlsSegmentContainer::MpegTs
+        ));
+        assert!(!is_valid_asset(
+            "generation_000001_init.mp4",
+            HlsSegmentContainer::MpegTs
+        ));
         assert!(!is_valid_asset(
             "init_000001.mp4",
             HlsSegmentContainer::MpegTs
@@ -1974,9 +2003,11 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                Some(100 * HLS_SEGMENT_DURATION_TICKS),
-                Some(600 * 10_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: Some(100 * HLS_SEGMENT_DURATION_TICKS),
+                    runtime_ticks: Some(600 * 10_000_000),
+                },
             )
             .await
             .unwrap();
@@ -2086,9 +2117,11 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                Some(100 * HLS_SEGMENT_DURATION_TICKS),
-                Some(600 * 10_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: Some(100 * HLS_SEGMENT_DURATION_TICKS),
+                    runtime_ticks: Some(600 * 10_000_000),
+                },
             )
             .await
             .unwrap();
@@ -2185,9 +2218,11 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                None,
-                Some(1_000 * 10_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: Some(1_000 * 10_000_000),
+                },
             )
             .await
             .unwrap();
@@ -2274,9 +2309,11 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
-                HlsSegmentContainer::FragmentedMp4,
-                None,
-                Some(600 * 10_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: Some(600 * 10_000_000),
+                },
             )
             .await
             .unwrap();
