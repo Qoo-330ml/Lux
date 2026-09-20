@@ -24,6 +24,8 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复无效或超出媒体总时长的 StartTimeTicks 导致转码从 EOF 启动失败的问题，并避免新建但尚未使用的播放 offer 提前停止当前播放会话。",
         "修复 Emby VOD 在远距离 seek 或并发切换 generation 时混用不同时间基准的 init 与媒体分片的问题；现在每个逻辑分片绑定对应的 init 和 generation 资源，旧 generation 的请求不会被新 seek 改写。",
         "修复 seek 期间 init 文件尚未落盘或被替换导致 Harbor 收到空资源的问题；generation 切换会保护已绑定的 init，并让并发 init/分片请求使用同一 generation。",
+        "修复 Emby 客户端未声明 fMP4 时无法稳定切换 HLS 播放流的问题；现在默认协商 MPEG-TS，只有明确声明 mp4/fmp4 时才使用 fMP4。",
+        "修复 HLS 分片容器、文件扩展名、MIME 类型、清单 init 结构和签名资源不一致的问题；TS 与 fMP4 会话现在严格隔离，避免 Harbor 将不同容器的资源混用。",
       ] },
     ],
   },
