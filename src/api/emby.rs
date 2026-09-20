@@ -22,6 +22,7 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(emby_library_selectable_media_folders),
         )
         .route("/Library/MediaFolders", get(emby_library_media_folders))
+        .route("/Library/Media/Updated", post(emby_media_updated))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))
         .route(
