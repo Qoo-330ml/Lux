@@ -11,6 +11,15 @@ const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_ite
                    AND media_items.item_type IN ('MOVIE', 'SERIES')
              )";
 
+struct CatalogSearchPageBindings<'a> {
+    fts_query: Option<&'a str>,
+    like_query: Option<&'a str>,
+    item_types: &'a [String],
+    library_ids: Option<&'a [String]>,
+    offset: i64,
+    limit: i64,
+}
+
 fn postgres_recent_catalog_rows_by_library_query(library_count: usize) -> String {
     let values = std::iter::repeat_n("(?)", library_count)
         .collect::<Vec<_>>()
@@ -530,13 +539,23 @@ impl Database {
         &self,
         query: &str,
         like_query: &str,
+        item_types: &[String],
         library_ids: Option<&[String]>,
         offset: i64,
         limit: i64,
     ) -> Result<(Vec<String>, i64), StorageError> {
+        if item_types.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
         if self.backend == DatabaseBackend::Postgres {
             return self
-                .search_catalog_item_ids_postgres(like_query, library_ids, offset, limit)
+                .search_catalog_item_ids_postgres(
+                    like_query,
+                    item_types,
+                    library_ids,
+                    offset,
+                    limit,
+                )
                 .await;
         }
 
@@ -553,12 +572,18 @@ impl Database {
                     .join(", ")
             )
         });
+        let item_type_filter = format!(
+            " AND mi.item_type IN ({})",
+            std::iter::repeat_n("?", item_types.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let fts_query = format!(
             "SELECT mi.id FROM media_search
              JOIN media_items mi ON mi.id = media_search.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              WHERE media_search MATCH ? AND mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}{}",
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
         // Complete-token searches are served by FTS alone. The LIKE branch remains
@@ -571,11 +596,14 @@ impl Database {
         let fts_page = self
             .fetch_catalog_search_page(
                 &fts_page_query,
-                Some(query),
-                None,
-                library_ids,
-                offset,
-                limit,
+                CatalogSearchPageBindings {
+                    fts_query: Some(query),
+                    like_query: None,
+                    item_types,
+                    library_ids,
+                    offset,
+                    limit,
+                },
             )
             .await?;
         if !fts_page.0.is_empty() {
@@ -589,7 +617,7 @@ impl Database {
                     OR EXISTS (SELECT 1 FROM item_aliases ia
                                WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
                AND mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}{}",
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
         let like_page_query = format!(
@@ -601,11 +629,14 @@ impl Database {
             return self
                 .fetch_catalog_search_page(
                     &like_page_query,
-                    None,
-                    Some(like_query),
-                    library_ids,
-                    offset,
-                    limit,
+                    CatalogSearchPageBindings {
+                        fts_query: None,
+                        like_query: Some(like_query),
+                        item_types,
+                        library_ids,
+                        offset,
+                        limit,
+                    },
                 )
                 .await;
         }
@@ -618,11 +649,14 @@ impl Database {
         );
         self.fetch_catalog_search_page(
             &union_page_query,
-            Some(query),
-            Some(like_query),
-            library_ids,
-            offset,
-            limit,
+            CatalogSearchPageBindings {
+                fts_query: Some(query),
+                like_query: Some(like_query),
+                item_types,
+                library_ids,
+                offset,
+                limit,
+            },
         )
         .await
     }
@@ -630,6 +664,7 @@ impl Database {
     async fn search_catalog_item_ids_postgres(
         &self,
         like_query: &str,
+        item_types: &[String],
         library_ids: Option<&[String]>,
         offset: i64,
         limit: i64,
@@ -647,6 +682,12 @@ impl Database {
                     .join(", ")
             )
         });
+        let item_type_filter = format!(
+            " AND mi.item_type IN ({})",
+            std::iter::repeat_n("?", item_types.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         let like_query_sql = format!(
             "SELECT mi.id FROM media_search ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -654,7 +695,7 @@ impl Database {
              WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
                     OR ms.aliases ILIKE ? ESCAPE '\\')
                AND mi.removed_at IS NULL
-               AND mi.item_type <> 'FOLDER'{CATALOG_VISIBLE_PREDICATE}{}",
+               {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}",
             library_filter.as_deref().unwrap_or_default()
         );
         let page_query = format!(
@@ -664,11 +705,14 @@ impl Database {
         );
         self.fetch_catalog_search_page(
             &page_query,
-            None,
-            Some(like_query),
-            library_ids,
-            offset,
-            limit,
+            CatalogSearchPageBindings {
+                fts_query: None,
+                like_query: Some(like_query),
+                item_types,
+                library_ids,
+                offset,
+                limit,
+            },
         )
         .await
     }
@@ -676,32 +720,34 @@ impl Database {
     async fn fetch_catalog_search_page(
         &self,
         query: &str,
-        fts_query: Option<&str>,
-        like_query: Option<&str>,
-        library_ids: Option<&[String]>,
-        offset: i64,
-        limit: i64,
+        bindings: CatalogSearchPageBindings<'_>,
     ) -> Result<(Vec<String>, i64), StorageError> {
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
-        if let Some(fts_query) = fts_query {
+        if let Some(fts_query) = bindings.fts_query {
             statement = statement.bind(fts_query);
-            if let Some(library_ids) = library_ids {
+            for item_type in bindings.item_types {
+                statement = statement.bind(item_type);
+            }
+            if let Some(library_ids) = bindings.library_ids {
                 for library_id in library_ids {
                     statement = statement.bind(library_id);
                 }
             }
         }
-        if let Some(like_query) = like_query {
+        if let Some(like_query) = bindings.like_query {
             statement = statement.bind(like_query).bind(like_query).bind(like_query);
-            if let Some(library_ids) = library_ids {
+            for item_type in bindings.item_types {
+                statement = statement.bind(item_type);
+            }
+            if let Some(library_ids) = bindings.library_ids {
                 for library_id in library_ids {
                     statement = statement.bind(library_id);
                 }
             }
         }
         let rows = statement
-            .bind(limit)
-            .bind(offset)
+            .bind(bindings.limit)
+            .bind(bindings.offset)
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {

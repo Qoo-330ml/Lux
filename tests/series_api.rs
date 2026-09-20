@@ -720,6 +720,24 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(latest_children_body.as_array().map(Vec::len), Some(3));
     assert_eq!(latest_children_body[0]["Type"], "Episode");
 
+    let latest_children_small_limit = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/Latest?ParentId={series_id}&IncludeItemTypes=Episode&GroupItems=false&Limit=1",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(
+        latest_children_small_limit.status(),
+        reqwest::StatusCode::OK
+    );
+    let latest_children_small_limit_body: Value = latest_children_small_limit.json().await?;
+    assert_eq!(
+        latest_children_small_limit_body.as_array().map(Vec::len),
+        Some(3)
+    );
+
     let episodes = client
         .get(format!(
             "{base_url}/Shows/{series_id}/Episodes?StartIndex=1&Limit=1"

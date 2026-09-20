@@ -183,3 +183,145 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn search_returns_series_by_default_but_preserves_explicit_episode_search()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season_dir = root.join("Target Show/Season 01");
+    tokio::fs::create_dir_all(&season_dir).await?;
+    for episode in 1..=2 {
+        tokio::fs::write(
+            season_dir.join(format!("Target.Show.S01E0{episode}.mkv")),
+            b"episode",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+
+    // Make every hierarchy level match the same query so the regression test
+    // proves that filtering happens before pagination, not in presentation.
+    sqlx::query(
+        "UPDATE media_items
+         SET title = 'Target Show', sort_title = 'target show', original_title = 'Target Show'
+         WHERE library_id = ?",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="SearchTest", Device="Mac", DeviceId="search-series", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing token")?
+        .to_owned();
+
+    let emby_items = client
+        .get(format!("{base_url}/Users/{}/Items", admin.id))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("SearchTerm", "Target Show"),
+            ("Recursive", "true"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(emby_items.status(), reqwest::StatusCode::OK);
+    let emby_items_body = emby_items.json::<Value>().await?;
+    assert_eq!(emby_items_body["TotalRecordCount"], 1);
+    assert_eq!(emby_items_body["Items"][0]["Type"], "Series");
+
+    let hints = client
+        .get(format!("{base_url}/Search/Hints"))
+        .query(&[("api_key", token.as_str()), ("SearchTerm", "Target Show")])
+        .send()
+        .await?;
+    assert_eq!(hints.status(), reqwest::StatusCode::OK);
+    let hints_body = hints.json::<Value>().await?;
+    assert_eq!(hints_body["TotalRecordCount"], 1);
+    assert_eq!(hints_body["SearchHints"][0]["Type"], "Series");
+
+    let lux_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let session = lux_login
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .find_map(|value| {
+            let value = value.to_str().ok()?;
+            value.strip_prefix("lux_session=")?.split(';').next()
+        })
+        .ok_or("missing session")?;
+    let lux = client
+        .get(format!("{base_url}/api/v1/search?q=Target%20Show"))
+        .header("Cookie", format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(lux.status(), reqwest::StatusCode::OK);
+    let lux_body = lux.json::<Value>().await?;
+    assert_eq!(lux_body["total"], 1);
+    assert_eq!(lux_body["items"][0]["itemType"], "SERIES");
+
+    let episodes = client
+        .get(format!("{base_url}/Users/{}/Items", admin.id))
+        .query(&[
+            ("api_key", token.as_str()),
+            ("SearchTerm", "Target Show"),
+            ("IncludeItemTypes", "Episode"),
+            ("Recursive", "true"),
+        ])
+        .send()
+        .await?;
+    assert_eq!(episodes.status(), reqwest::StatusCode::OK);
+    let episodes_body = episodes.json::<Value>().await?;
+    assert_eq!(episodes_body["TotalRecordCount"], 2);
+    assert!(
+        episodes_body["Items"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["Type"] == "Episode"))
+    );
+
+    server.abort();
+    Ok(())
+}

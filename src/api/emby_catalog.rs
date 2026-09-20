@@ -2,6 +2,8 @@ use super::*;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
+const EMBY_LATEST_SERIES_EPISODE_PAGE_SIZE: i64 = 100;
+const EMBY_LATEST_SERIES_EPISODE_MAX_ITEMS: i64 = 10_000;
 
 use crate::application::catalog::CatalogItemCounts;
 
@@ -26,6 +28,8 @@ pub(super) struct EmbyItemsQuery {
     pub(super) parent_id: Option<String>,
     #[serde(rename = "Ids", default)]
     pub(super) ids: Option<String>,
+    #[serde(rename = "AnyProviderIdEquals", alias = "anyProviderIdEquals", default)]
+    pub(super) any_provider_id_equals: Option<String>,
     #[serde(rename = "IncludeItemTypes", default)]
     pub(super) include_item_types: Option<String>,
     #[serde(rename = "ExcludeItemTypes", default)]
@@ -213,6 +217,7 @@ pub(super) fn catalog_filter_from_values(
         item_ids: None,
         person_id: None,
         media_source_ids: None,
+        provider_id_equals: None,
         years,
         is_played,
         is_favorite,
@@ -271,6 +276,10 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
     // encoded as a numeric item id. Keeping the raw candidates here preserves
     // the existing `GET /Items?Ids=<MediaSourceId>` compatibility lookup.
     filter.media_source_ids = ids;
+    filter.provider_id_equals = query
+        .any_provider_id_equals
+        .as_deref()
+        .map(parse_emby_provider_id_equals);
     filter.excluded_item_types = query
         .exclude_item_types
         .as_deref()
@@ -282,6 +291,21 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         })
         .unwrap_or_default();
     filter
+}
+
+fn parse_emby_provider_id_equals(value: &str) -> Vec<(String, String)> {
+    value
+        .split(',')
+        .filter_map(|candidate| {
+            let (provider, provider_id) = candidate.trim().split_once('.')?;
+            let provider = provider.trim().to_ascii_lowercase();
+            let provider_id = provider_id.trim();
+            if provider.is_empty() || provider_id.is_empty() {
+                return None;
+            }
+            Some((provider, provider_id.to_owned()))
+        })
+        .collect()
 }
 
 pub(super) fn emby_compat_media_source_id<'a>(
@@ -875,8 +899,12 @@ pub(super) async fn emby_user_latest(
     query.sort_by = Some("DateCreated".to_owned());
     query.sort_order = Some("Descending".to_owned());
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let page = match emby_catalog_page_from_query(&state, principal, &query).await {
-        Ok(page) => page,
+    let page = match emby_latest_series_episode_compat_page(&state, principal, &query).await {
+        Ok(Some(page)) => page,
+        Ok(None) => match emby_catalog_page_from_query(&state, principal, &query).await {
+            Ok(page) => page,
+            Err(status) => return status.into_response(),
+        },
         Err(status) => return status.into_response(),
     };
     if group_items && emby_latest_groups_children(&query) {
@@ -926,6 +954,75 @@ pub(super) async fn emby_user_latest(
         Ok(items) => Json(items).into_response(),
         Err(status) => status.into_response(),
     }
+}
+
+pub(super) async fn emby_latest_series_episode_compat_page(
+    state: &AppState,
+    principal: AccessPrincipal,
+    query: &EmbyItemsQuery,
+) -> Result<Option<CatalogPage>, StatusCode> {
+    let requests_episodes_only = query.include_item_types.as_deref().is_some_and(|types| {
+        let mut item_types = types
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        matches!(item_types.next(), Some(value) if value.eq_ignore_ascii_case("episode"))
+            && item_types.next().is_none()
+    });
+    if query.start_index.unwrap_or(0) != 0
+        || query.group_items != Some(false)
+        || !requests_episodes_only
+    {
+        return Ok(None);
+    }
+    let Some(parent_id) = query.parent_id.as_deref().map(emby_internal_id) else {
+        return Ok(None);
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let parent = catalog
+        .find_item(principal, &parent_id)
+        .await
+        .map_err(emby_catalog_error_status)?;
+    if !matches!(parent.as_ref(), Some(item) if item.item_type == "SERIES") {
+        return Ok(None);
+    }
+
+    // Some Emby clients use this array-shaped endpoint as the series detail
+    // episode list and do not request a second page. Preserve the normal
+    // Limit contract for every other query, but make this compatibility shape
+    // useful by fetching a bounded number of pages internally.
+    let season_id = query.season_id.as_deref().map(emby_internal_id);
+    let mut items = Vec::new();
+    let mut offset = 0;
+    let mut total = 0;
+    while offset < EMBY_LATEST_SERIES_EPISODE_MAX_ITEMS {
+        let page = catalog
+            .list_series_episodes(
+                principal,
+                &parent_id,
+                season_id.as_deref(),
+                offset,
+                EMBY_LATEST_SERIES_EPISODE_PAGE_SIZE,
+            )
+            .await
+            .map_err(emby_catalog_error_status)?;
+        total = page.total;
+        let page_len = i64::try_from(page.items.len()).unwrap_or(i64::MAX);
+        items.extend(page.items);
+        if page_len == 0 || offset + page_len >= total {
+            break;
+        }
+        offset += page_len;
+    }
+
+    Ok(Some(CatalogPage {
+        items,
+        total,
+        offset: 0,
+        limit: EMBY_LATEST_SERIES_EPISODE_MAX_ITEMS,
+    }))
 }
 
 pub(super) async fn emby_user_favorites(
@@ -1019,6 +1116,7 @@ pub(super) async fn emby_group_latest_page(
             item_ids: Some(series_ids.clone()),
             person_id: None,
             media_source_ids: None,
+            provider_id_equals: None,
             years: Vec::new(),
             is_played: None,
             is_favorite: None,
@@ -2001,8 +2099,21 @@ pub(super) async fn emby_catalog_page_from_query(
                 limit,
             });
         };
+        let item_types = query
+            .include_item_types
+            .as_deref()
+            .filter(|values| values.split(',').any(|value| !value.trim().is_empty()))
+            .map(|_| catalog_filter_from_emby(query).item_types)
+            .unwrap_or_else(|| vec!["MOVIE".to_owned(), "SERIES".to_owned()]);
         return catalog
-            .search_items(principal, &search_query, &like_query, offset, limit)
+            .search_items_with_types(
+                principal,
+                &search_query,
+                &like_query,
+                item_types,
+                offset,
+                limit,
+            )
             .await
             .map_err(emby_catalog_error_status);
     }

@@ -2003,6 +2003,7 @@ fn catalog_filter_where_clause<'a>(
     let item_ids = filter.item_ids;
     let person_id = filter.person_id;
     let media_source_ids = filter.media_source_ids;
+    let provider_id_equals = filter.provider_id_equals;
     let excluded_item_types = filter.excluded_item_types;
     let years = filter.years;
     let is_played = filter.is_played;
@@ -2060,6 +2061,30 @@ fn catalog_filter_where_clause<'a>(
             where_clause.push_str(" AND 1 = 0");
         } else {
             where_clause.push_str(&format!(" AND ({})", id_predicates.join(" OR ")));
+        }
+    }
+    if let Some(provider_id_equals) = provider_id_equals {
+        if provider_id_equals.is_empty() {
+            where_clause.push_str(" AND 1 = 0");
+        } else {
+            let predicates = std::iter::repeat_n(
+                "(provider_filter.provider = ? AND provider_filter.provider_id = ?)",
+                provider_id_equals.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(" OR ");
+            where_clause.push_str(&format!(
+                " AND EXISTS (
+                     SELECT 1
+                     FROM media_item_provider_ids provider_filter
+                     WHERE provider_filter.media_item_id = mi.id
+                       AND ({predicates})
+                 )"
+            ));
+            for (provider, provider_id) in provider_id_equals {
+                binds.push(CatalogBind::Text(provider.as_str()));
+                binds.push(CatalogBind::Text(provider_id.as_str()));
+            }
         }
     }
     if let Some(person_id) = person_id {
@@ -2320,6 +2345,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) item_ids: Option<&'a [String]>,
     pub(crate) person_id: Option<&'a str>,
     pub(crate) media_source_ids: Option<&'a [String]>,
+    pub(crate) provider_id_equals: Option<&'a [(String, String)]>,
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,

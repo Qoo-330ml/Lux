@@ -29,6 +29,7 @@ pub struct CatalogFilter {
     pub item_ids: Option<Vec<String>>,
     pub person_id: Option<String>,
     pub media_source_ids: Option<Vec<String>>,
+    pub provider_id_equals: Option<Vec<(String, String)>>,
     pub years: Vec<i64>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
@@ -60,6 +61,7 @@ const MAX_LIBRARY_PAGE_CACHE_ENTRIES: usize = 256;
 // Cold pages are refreshed on demand; the background worker keeps only hot pages warm.
 const MAX_LIBRARY_PAGE_REFRESH_ENTRIES: usize = 64;
 const MAX_SEARCH_FLIGHTS: usize = 256;
+const DEFAULT_SEARCH_ITEM_TYPES: [&str; 2] = ["MOVIE", "SERIES"];
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct SearchFlightKey {
@@ -68,6 +70,7 @@ struct SearchFlightKey {
     library_ids: Option<Vec<String>>,
     query: String,
     like_query: String,
+    item_types: Vec<String>,
     offset: i64,
     limit: i64,
 }
@@ -522,6 +525,7 @@ impl CatalogService {
             item_ids: filter.item_ids.as_deref(),
             person_id: filter.person_id.as_deref(),
             media_source_ids: filter.media_source_ids.as_deref(),
+            provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
@@ -565,6 +569,7 @@ impl CatalogService {
             item_ids: filter.item_ids.as_deref(),
             person_id: filter.person_id.as_deref(),
             media_source_ids: filter.media_source_ids.as_deref(),
+            provider_id_equals: filter.provider_id_equals.as_deref(),
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
@@ -1219,6 +1224,23 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        let item_types = DEFAULT_SEARCH_ITEM_TYPES
+            .iter()
+            .map(|item_type| (*item_type).to_owned())
+            .collect();
+        self.search_items_with_types(principal, query, like_query, item_types, offset, limit)
+            .await
+    }
+
+    pub async fn search_items_with_types(
+        &self,
+        principal: AccessPrincipal,
+        query: &str,
+        like_query: &str,
+        item_types: Vec<String>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
         let library_ids = if principal.is_admin {
             None
         } else {
@@ -1230,6 +1252,7 @@ impl CatalogService {
             library_ids: library_ids.clone(),
             query: query.to_owned(),
             like_query: like_query.to_owned(),
+            item_types: item_types.clone(),
             offset,
             limit,
         };
@@ -1243,12 +1266,14 @@ impl CatalogService {
                 let task_query = query.to_owned();
                 let task_like_query = like_query.to_owned();
                 let task_library_ids = library_ids.clone();
+                let task_item_types = item_types.clone();
                 let task = tokio::spawn(async move {
                     let result = service
                         .search_items_uncached(
                             &task_query,
                             &task_like_query,
                             task_library_ids.as_deref(),
+                            &task_item_types,
                             offset,
                             limit,
                         )
@@ -1271,12 +1296,26 @@ impl CatalogService {
                 if let Some(page) = flight.wait().await {
                     return Ok((*page).clone());
                 }
-                self.search_items_uncached(query, like_query, library_ids.as_deref(), offset, limit)
-                    .await
+                self.search_items_uncached(
+                    query,
+                    like_query,
+                    library_ids.as_deref(),
+                    &item_types,
+                    offset,
+                    limit,
+                )
+                .await
             }
             SearchFlightHandle::Bypass => {
-                self.search_items_uncached(query, like_query, library_ids.as_deref(), offset, limit)
-                    .await
+                self.search_items_uncached(
+                    query,
+                    like_query,
+                    library_ids.as_deref(),
+                    &item_types,
+                    offset,
+                    limit,
+                )
+                .await
             }
         }
     }
@@ -1286,12 +1325,13 @@ impl CatalogService {
         query: &str,
         like_query: &str,
         library_ids: Option<&[String]>,
+        item_types: &[String],
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
         let (ids, total) = self
             .database
-            .search_catalog_item_ids(query, like_query, library_ids, offset, limit)
+            .search_catalog_item_ids(query, like_query, item_types, library_ids, offset, limit)
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&ids).await?;
         let items_by_id = assemble_items(rows)
@@ -1750,6 +1790,7 @@ mod tests {
             library_ids: Some(vec!["library-1".to_owned()]),
             query: "query".to_owned(),
             like_query: "%query%".to_owned(),
+            item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
             offset: 0,
             limit: 50,
         };

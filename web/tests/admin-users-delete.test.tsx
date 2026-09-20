@@ -61,6 +61,53 @@ describe("AdminUsersPage user actions", () => {
     });
   });
 
+  it("shows an enable button for disabled users and restores login", async () => {
+    const list = vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: true,
+      isAdmin: false, canManageServer: false, canRemoteAccess: false, canDownload: false,
+    }] });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    const update = vi.spyOn(api, "updateAdminUser").mockResolvedValue({ user: {
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: false,
+      isAdmin: false,
+    } });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderPage();
+
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+    const button = container.querySelector<HTMLButtonElement>('button[aria-label="启用观众账户"]');
+    expect(button).toBeTruthy();
+    expect(button?.textContent).toContain("启用");
+    expect(container.querySelector('button[aria-label="禁用观众账户"]')).toBeNull();
+    act(() => button?.click());
+    expect(confirm).toHaveBeenCalledWith("确定要启用账户“观众”吗？账户将恢复登录。");
+    expect(update).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    await act(async () => {
+      button?.click();
+      await vi.waitFor(() => expect(update).toHaveBeenCalledWith("user-1", { isDisabled: false }));
+      await vi.waitFor(() => expect(list).toHaveBeenCalledTimes(2));
+    });
+  });
+
+  it("shows a text disable button for enabled users", async () => {
+    vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: false,
+      isAdmin: false, canManageServer: false, canRemoteAccess: false, canDownload: false,
+    }] });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    vi.spyOn(api, "disableAdminUser").mockResolvedValue({ user: {
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: true,
+      isAdmin: false,
+    } });
+    renderPage();
+
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+    const button = container.querySelector<HTMLButtonElement>('button[aria-label="禁用观众账户"]');
+    expect(button?.textContent).toContain("禁用");
+  });
+
   it("confirms before permanently deleting and refreshes the list", async () => {
     const list = vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
       id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: false,

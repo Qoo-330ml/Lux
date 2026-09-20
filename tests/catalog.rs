@@ -191,6 +191,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         .bind(&beta_item_id)
         .execute(database.pool())
         .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = ? WHERE id = ?")
+        .bind(r#"{"tmdb":"12345"}"#)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = ? WHERE id = ?")
+        .bind(r#"{"imdb":"tt12345","tmdb":"67890"}"#)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
     sqlx::query("UPDATE media_sources SET duration_ticks = ? WHERE item_id = ?")
         .bind(2_000_000_000_i64)
         .bind(&item_id)
@@ -455,6 +465,80 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
         "mkv"
+    );
+
+    let provider_filtered = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.12345&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(provider_filtered.status(), reqwest::StatusCode::OK);
+    let provider_filtered_body: Value = provider_filtered.json().await?;
+    assert_eq!(provider_filtered_body["TotalRecordCount"], 1);
+    assert_eq!(
+        provider_filtered_body["Items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(provider_filtered_body["Items"][0]["Name"], "Alpha Movie");
+
+    let provider_filtered_multiple = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.67890,imdb.tt12345&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(provider_filtered_multiple.status(), reqwest::StatusCode::OK);
+    let provider_filtered_multiple_body: Value = provider_filtered_multiple.json().await?;
+    assert_eq!(provider_filtered_multiple_body["TotalRecordCount"], 1);
+    assert_eq!(
+        provider_filtered_multiple_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        provider_filtered_multiple_body["Items"][0]["Name"],
+        "Beta Movie"
+    );
+
+    let provider_filtered_namespace = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.tt12345&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        provider_filtered_namespace.status(),
+        reqwest::StatusCode::OK
+    );
+    let provider_filtered_namespace_body: Value = provider_filtered_namespace.json().await?;
+    assert_eq!(provider_filtered_namespace_body["TotalRecordCount"], 0);
+    assert_eq!(
+        provider_filtered_namespace_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let provider_filtered_missing = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.does-not-exist&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(provider_filtered_missing.status(), reqwest::StatusCode::OK);
+    let provider_filtered_missing_body: Value = provider_filtered_missing.json().await?;
+    assert_eq!(provider_filtered_missing_body["TotalRecordCount"], 0);
+    assert_eq!(
+        provider_filtered_missing_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
     );
 
     let empty_optional_favorite = client

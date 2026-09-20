@@ -15,6 +15,21 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.11",
+    date: "2026-09-20",
+    sections: [
+      { kind: "added", items: [
+        "Emby 搜索和媒体列表支持按 Provider ID 精确过滤，并保留客户端明确请求季度或单集时的层级结果。",
+        "增加部分 Emby 客户端的剧集最新单集兼容处理；请求剧集单集列表时可在服务端合并完整结果，避免客户端因不继续分页而遗漏分集。",
+        "管理员用户管理支持分别启用、禁用和永久删除账户；禁用保留账户数据，永久删除清理账户及关联数据。",
+      ] },
+      { kind: "fixed", items: [
+        "修复普通搜索和搜索提示默认返回季度、单集，导致客户端结果重复或层级混乱的问题；默认只返回电影和整剧，显式类型请求仍按协议返回对应层级。",
+        "修复 Emby 媒体列表在 Provider ID、类型筛选和 ACL 组合使用时的结果范围与分页问题。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.10",
     date: "2026-09-20",
     sections: [
