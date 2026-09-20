@@ -78,9 +78,10 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
       </div>
 
       <div className="lux-now-playing-facts">
+        <Fact icon={<Radio size={17} />} label="播放" value={playMethodLabel(session.playMethod)} detail={playMethodDetail(session)} />
         <Fact icon={<Radio size={17} />} label="来源" value={source?.qualityLabel || "—"} detail={sourceDetail(source)} />
-        <Fact icon={<Video size={17} />} label="视频" value={source?.video?.codec || "—"} detail={source?.video?.title || "—"} />
-        <Fact icon={<AudioLines size={17} />} label="音频" value={audioLabel(source)} detail={source?.audio?.title || "—"} />
+        <Fact icon={<Video size={17} />} label="视频" value={videoLabel(session)} detail={videoDetail(session)} />
+        <Fact icon={<AudioLines size={17} />} label="音频" value={audioLabel(session)} detail={audioDetail(session)} />
       </div>
 
       <div className="lux-now-playing-network">
@@ -119,9 +120,73 @@ function episodeLabel(session: AdminPlaybackSession) {
   return season && episode ? `${season}${episode}` : season || episode || "单集";
 }
 
-function audioLabel(source: AdminPlaybackSession["source"]) {
-  if (!source?.audio) return "—";
-  return [source.audio.codec, source.audio.language].filter(Boolean).join(" · ") || "音频轨道";
+function playMethodLabel(playMethod: AdminPlaybackSession["playMethod"]) {
+  if (playMethod === "DirectPlay") return "直连播放";
+  if (playMethod === "DirectStream") return "直流播放";
+  if (playMethod === "Transcode") return "转码播放";
+  return "—";
+}
+
+function playMethodDetail(session: AdminPlaybackSession) {
+  if (session.playMethod !== "Transcode" && session.playMethod !== "DirectStream") return "—";
+  const tier = session.serverTier == null ? undefined : serverTierLabel(session.serverTier);
+  const container = session.output?.container?.toUpperCase();
+  return ["服务端 HLS", tier, container].filter(Boolean).join(" · ") || "—";
+}
+
+function serverTierLabel(tier: number) {
+  if (tier === 1) return "封装转换";
+  if (tier === 2) return "音频转码";
+  if (tier === 3) return "硬件转码";
+  if (tier === 4) return "软件转码";
+  return undefined;
+}
+
+function videoLabel(session: AdminPlaybackSession) {
+  return formatCodec(session.output?.videoCodec || session.source?.video?.codec);
+}
+
+function audioLabel(session: AdminPlaybackSession) {
+  const source = session.source;
+  const codec = formatCodec(session.output?.audioCodec || source?.audio?.codec);
+  if (codec === "—") return codec;
+  return [codec, source?.audio?.language].filter(Boolean).join(" · ");
+}
+
+function videoDetail(session: AdminPlaybackSession) {
+  const output = session.output;
+  const source = session.source?.video;
+  const original = source?.codec && output?.videoCodec && source.codec.toLowerCase() !== output.videoCodec.toLowerCase()
+    ? `原始 ${formatCodec(source.codec)}`
+    : undefined;
+  return [original, source?.title, output?.videoBitrate ? formatTrackBitrate(output.videoBitrate) : undefined]
+    .filter(Boolean)
+    .join(" · ") || "—";
+}
+
+function audioDetail(session: AdminPlaybackSession) {
+  const output = session.output;
+  const source = session.source?.audio;
+  const original = source?.codec && output?.audioCodec && source.codec.toLowerCase() !== output.audioCodec.toLowerCase()
+    ? `原始 ${formatCodec(source.codec)}`
+    : undefined;
+  return [original, source?.title, output?.audioBitrate ? formatTrackBitrate(output.audioBitrate) : undefined]
+    .filter(Boolean)
+    .join(" · ") || "—";
+}
+
+function formatCodec(codec: string | null | undefined) {
+  if (!codec) return "—";
+  const normalized = codec.trim().toLowerCase();
+  if (normalized === "h264" || normalized === "avc") return "H.264";
+  if (normalized === "hevc" || normalized === "h265") return "HEVC";
+  if (normalized === "aac") return "AAC";
+  return codec.toUpperCase();
+}
+
+function formatTrackBitrate(bitsPerSecond: number) {
+  if (bitsPerSecond < 1_000_000) return `${Math.round(bitsPerSecond / 1_000)} kbps`;
+  return formatBitrate(bitsPerSecond);
 }
 
 function sourceDetail(source: AdminPlaybackSession["source"]) {

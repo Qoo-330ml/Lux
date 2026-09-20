@@ -48,6 +48,6 @@ pub(crate) use repository::{
     StoredScheduledTaskPlanLibrary, StoredSeriesMetadataSource, StoredStrmMediaSource,
     StoredStrmProbeJob, StoredSubtitleStream, StoredThumbnailSource, StoredUser,
     StoredUserItemState, StoredWebPlaybackSession, StoredWebSession, StoredWebSessionSummary,
-    UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim, movie_parent_folder_identity,
-    recommendation_batch_key_at,
+    UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
+    WebPlaybackTranscodingDetails, movie_parent_folder_identity, recommendation_batch_key_at,
 };

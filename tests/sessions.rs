@@ -172,6 +172,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let sessions_body = sessions.json::<Value>().await?;
     assert_eq!(sessions_body.as_array().map(Vec::len), Some(1));
     assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 900);
+    assert_eq!(sessions_body[0]["PlayState"]["PlayMethod"], "Transcode");
     assert_eq!(sessions_body[0]["NowPlayingItem"]["Id"], emby_item_id);
     assert_eq!(sessions_body[0]["NowPlayingItem"]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["RunTimeTicks"], 1000);

@@ -15,6 +15,20 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.10",
+    date: "2026-09-20",
+    sections: [
+      { kind: "added", items: [
+        "管理台“正在播放”补充真实播放方式、服务端 HLS 档位、输出容器、视频/音频 codec 和码率等信息，便于确认当前实际播放链路。",
+        "Emby 会话详情补充服务端转码输出信息，并持久化播放会话的输出容器、视频/音频 codec 与码率。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Emby 播放会话仍显示为直放、无法反映实际转码输出的问题；现在会根据活动 HLS 会话返回准确的 Transcode 与 TranscodingInfo。",
+        "登录表单补充标准用户名和密码自动填充字段，改善浏览器和密码管理器的识别。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.9",
     date: "2026-09-19",
     sections: [

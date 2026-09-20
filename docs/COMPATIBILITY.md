@@ -58,6 +58,10 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 只证明服务端协议和资源边界；截至本记录，尚未用 VidHub、SenPlayer、Infuse 或其他第三方 Emby 客户端在
 部署实例上实测转码首帧、seek、暂停、停止和断线回收，不能据此宣称客户端已完成兼容。
 
+2026-09-20 播放状态兼容：Emby `GET /Sessions` 和 Lux 管理仪表盘现在根据活动 HLS 会话报告
+`DirectStream` 或 `Transcode`，不再把服务端转码固定报告为 `DirectPlay`；可用时同时返回/展示 HLS 容器、视频/音频输出 codec
+及目标码率。该状态信息来自 Lux 的实际播放会话和 FFmpeg 输出档位，不代表 Harbor 等第三方客户端已完成部署环境实测。
+
 2026-09-20 容器兼容修复：Emby HLS 会话现在默认使用 MPEG-TS，`TranscodingContainer=ts`、
 `TranscodingMimeType=video/mp2t`，清单直接列出 `.ts` 分片且不生成 `EXT-X-MAP`；只有客户端明确声明
 `mp4`/`fmp4` 时才使用 `TranscodingContainer=mp4` 的 fMP4/CMAF 和对应 init 分片。master、逻辑分片和

@@ -642,7 +642,18 @@ export type AdminPlaybackSession = {
   remoteIp?: string | null;
   remoteIpLocation?: AdminIpLocation | null;
   playSessionId: string;
+  playMethod?: "DirectPlay" | "DirectStream" | "Transcode" | string | null;
+  playbackPlan?: "DIRECT" | "SERVER_HLS" | string | null;
+  serverTier?: number | null;
+  output?: AdminPlaybackOutput | null;
   source?: AdminPlaybackSource | null;
+};
+export type AdminPlaybackOutput = {
+  container?: string | null;
+  videoCodec?: string | null;
+  audioCodec?: string | null;
+  videoBitrate?: number | null;
+  audioBitrate?: number | null;
 };
 export type AdminIpLocation = {
   location?: string | null;

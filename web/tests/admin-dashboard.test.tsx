@@ -54,6 +54,7 @@ const dashboard: AdminDashboard = {
     deviceType: "Phone",
     remoteIp: "192.0.2.10",
     playSessionId: "session-1",
+    playMethod: "DirectPlay",
     source: {
       id: "source-1",
       qualityLabel: "4K HEVC",
@@ -201,10 +202,11 @@ describe("AdminDashboardPage", () => {
     expect(container.querySelector('[role="group"][aria-label="IP 归属地"]')).not.toBeNull();
     expect(container.querySelector(".lux-now-playing-account")).not.toBeNull();
     expect(container.querySelector(".lux-now-playing-facts")).not.toBeNull();
-    expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(3);
-    expect(container.querySelectorAll(".lux-now-playing-fact")[0]?.textContent).toBe("来源：4K HEVC · MKV · 4.0 Mbps");
-    expect(container.querySelectorAll(".lux-now-playing-fact")[1]?.textContent).toBe("视频：HEVC · 4K HDR");
-    expect(container.querySelectorAll(".lux-now-playing-fact")[2]?.textContent).toBe("音频：AAC · zh-CN · 立体声");
+    expect(container.querySelectorAll(".lux-now-playing-fact")).toHaveLength(4);
+    expect(container.querySelectorAll(".lux-now-playing-fact")[0]?.textContent).toBe("播放：直连播放");
+    expect(container.querySelectorAll(".lux-now-playing-fact")[1]?.textContent).toBe("来源：4K HEVC · MKV · 4.0 Mbps");
+    expect(container.querySelectorAll(".lux-now-playing-fact")[2]?.textContent).toBe("视频：HEVC · 4K HDR");
+    expect(container.querySelectorAll(".lux-now-playing-fact")[3]?.textContent).toBe("音频：AAC · zh-CN · 立体声");
     expect(container.querySelectorAll(".lux-now-playing-placeholder")).toHaveLength(1);
     expect(container.textContent).toContain("开始播放");
     expect(container.textContent).toContain("暂停播放");

@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 use crate::storage::{
     Database, NewWebPlaybackEvent, NewWebPlaybackSession, StorageError, StoredWebPlaybackSession,
-    WebPlaybackEventClaim,
+    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
 };
 
 use super::decision::{
@@ -282,6 +282,22 @@ impl WebPlaybackSessionService {
             return Err(error);
         }
         Ok(created)
+    }
+
+    pub(crate) async fn set_transcoding_details(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        details: &WebPlaybackTranscodingDetails,
+    ) -> Result<(), WebPlaybackSessionError> {
+        if !self
+            .database
+            .set_web_playback_transcoding_details(session_id, user_id, details, unix_timestamp())
+            .await?
+        {
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        Ok(())
     }
 
     pub(crate) fn sign_resource(

@@ -38,7 +38,7 @@ use crate::{
     application::downloads::{DownloadArtifact, DownloadError, DownloadService},
     application::embedded_subtitle::EmbeddedSubtitleService,
     application::home::{HomeError, HomeService},
-    application::playback::decision::{PlaybackCapabilities, PlaybackSourceKind},
+    application::playback::decision::{PlaybackCapabilities, PlaybackSourceKind, ServerTier},
     application::playback::session::{
         CreateWebPlaybackSession, EMBY_DIRECT_STREAM_TTL_SECONDS, WebPlaybackEvent,
         WebPlaybackSessionError, WebPlaybackSessionService,

@@ -1768,6 +1768,15 @@ pub(crate) struct NewWebPlaybackEvent<'a> {
     pub(crate) now: i64,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct WebPlaybackTranscodingDetails {
+    pub(crate) video_codec: Option<String>,
+    pub(crate) audio_codec: Option<String>,
+    pub(crate) video_bitrate: Option<i64>,
+    pub(crate) audio_bitrate: Option<i64>,
+    pub(crate) transcoding_container: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum WebPlaybackEventClaim {
     Accepted,
@@ -1790,6 +1799,11 @@ pub(crate) struct StoredWebPlaybackSession {
     pub(crate) expires_at: i64,
     pub(crate) last_heartbeat_at: i64,
     pub(crate) last_sequence: i64,
+    pub(crate) video_codec: Option<String>,
+    pub(crate) audio_codec: Option<String>,
+    pub(crate) video_bitrate: Option<i64>,
+    pub(crate) audio_bitrate: Option<i64>,
+    pub(crate) transcoding_container: Option<String>,
     pub(crate) created_at: i64,
     pub(crate) updated_at: i64,
 }
@@ -1809,6 +1823,11 @@ fn stored_web_playback_session(row: sqlx::any::AnyRow) -> StoredWebPlaybackSessi
         expires_at: row.get("expires_at"),
         last_heartbeat_at: row.get("last_heartbeat_at"),
         last_sequence: row.get("last_sequence"),
+        video_codec: row.get("video_codec"),
+        audio_codec: row.get("audio_codec"),
+        video_bitrate: row.get("video_bitrate"),
+        audio_bitrate: row.get("audio_bitrate"),
+        transcoding_container: row.get("transcoding_container"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }

@@ -102,13 +102,35 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
             .fetch_one(database.pool())
             .await?;
+    let source_id: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ? LIMIT 1")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query(
+        "INSERT INTO web_playback_sessions (
+            id, user_id, item_id, media_source_id, play_session_id,
+            tier, plan, state, is_admin, expires_at, last_heartbeat_at,
+            video_codec, audio_codec, video_bitrate, audio_bitrate, transcoding_container
+         ) VALUES (?, ?, ?, ?, ?, 4, 'SERVER_HLS', 'ACTIVE', 1,
+                   unixepoch() + 900, unixepoch(), 'h264', 'aac', 1000000, 192000, 'ts')",
+    )
+    .bind("dashboard-transcode-session")
+    .bind(&user_id)
+    .bind(&item_id)
+    .bind(&source_id)
+    .bind("lux-emby:dashboard-transcode-session")
+    .execute(database.pool())
+    .await?;
     let playing = client
         .post(format!("{base_url}/Sessions/Playing"))
         .header("X-Emby-Token", &token)
         .header("X-Forwarded-For", "203.0.113.10")
         .json(&json!({
             "ItemId": item_id,
-            "PlaySessionId": "dashboard-play-session",
+            "MediaSourceId": source_id,
+            "PlaySessionId": "lux-emby:dashboard-transcode-session",
             "PositionTicks": 600000000,
             "RunTimeTicks": 36_000_000_000i64,
             "DeviceId": "dashboard-device",
@@ -175,6 +197,14 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["nowPlaying"][0]["deviceName"], "Mac");
     assert_eq!(body["nowPlaying"][0]["deviceType"], "Desktop");
     assert_eq!(body["nowPlaying"][0]["deviceId"], "dashboard-device");
+    assert_eq!(body["nowPlaying"][0]["playMethod"], "Transcode");
+    assert_eq!(body["nowPlaying"][0]["playbackPlan"], "SERVER_HLS");
+    assert_eq!(body["nowPlaying"][0]["serverTier"], 4);
+    assert_eq!(body["nowPlaying"][0]["output"]["videoCodec"], "h264");
+    assert_eq!(body["nowPlaying"][0]["output"]["audioCodec"], "aac");
+    assert_eq!(body["nowPlaying"][0]["output"]["videoBitrate"], 1_000_000);
+    assert_eq!(body["nowPlaying"][0]["output"]["audioBitrate"], 192_000);
+    assert_eq!(body["nowPlaying"][0]["output"]["container"], "ts");
     assert_eq!(body["nowPlaying"][0]["remoteIp"], "203.0.113.10");
     assert!(body["nowPlaying"][0]["remoteIpLocation"].is_null());
     let events = body["activity"].as_array().ok_or("missing activity")?;
@@ -205,7 +235,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
          SET last_event_at = unixepoch() - 3600
          WHERE play_session_id = ?",
     )
-    .bind("dashboard-play-session")
+    .bind("lux-emby:dashboard-transcode-session")
     .execute(database.pool())
     .await?;
     let stale_dashboard = client
@@ -226,7 +256,8 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .header("X-Emby-Token", &token)
         .json(&json!({
             "ItemId": body["nowPlaying"][0]["itemId"],
-            "PlaySessionId": "dashboard-play-session",
+            "MediaSourceId": source_id,
+            "PlaySessionId": "lux-emby:dashboard-transcode-session",
             "PositionTicks": 600000000,
         }))
         .send()

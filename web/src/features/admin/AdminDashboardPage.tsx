@@ -225,7 +225,7 @@ export function AdminDashboardPage() {
       ) : null}
 
       <section className="lux-admin-dashboard-monitor-section" aria-labelledby="now-playing-heading">
-        <div className="lux-admin-monitor-heading"><div><h2 id="now-playing-heading">正在播放</h2><p>实时查看每个账户的播放状态与直放链路。</p></div><span className="lux-admin-monitor-count">{nowPlaying.length} 个会话</span></div>
+        <div className="lux-admin-monitor-heading"><div><h2 id="now-playing-heading">正在播放</h2><p>实时查看每个账户的播放状态、播放方式和输出轨道。</p></div><span className="lux-admin-monitor-count">{nowPlaying.length} 个会话</span></div>
         <AdminDashboardNowPlaying sessions={nowPlaying} />
       </section>
 

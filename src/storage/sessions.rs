@@ -419,6 +419,36 @@ impl Database {
         })
     }
 
+    pub(crate) async fn set_web_playback_transcoding_details(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        details: &WebPlaybackTranscodingDetails,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE web_playback_sessions
+             SET video_codec = ?, audio_codec = ?, video_bitrate = ?, audio_bitrate = ?,
+                 transcoding_container = ?, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(details.video_codec.as_deref())
+        .bind(details.audio_codec.as_deref())
+        .bind(details.video_bitrate)
+        .bind(details.audio_bitrate)
+        .bind(details.transcoding_container.as_deref())
+        .bind(now)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_web_playback_session(
         &self,
         session_id: &str,
@@ -426,7 +456,8 @@ impl Database {
         self.query(
             "SELECT id, user_id, item_id, media_source_id, play_session_id,
                     tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
-                    last_sequence, created_at, updated_at
+                    last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                    transcoding_container, created_at, updated_at
              FROM web_playback_sessions
              WHERE id = ?",
         )
@@ -440,6 +471,38 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_web_playback_sessions_for_playbacks(
+        &self,
+        play_session_ids: &[String],
+    ) -> Result<Vec<StoredWebPlaybackSession>, StorageError> {
+        if play_session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = std::iter::repeat_n("?", play_session_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                    tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                    last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                    transcoding_container, created_at, updated_at
+             FROM web_playback_sessions
+             WHERE state = 'ACTIVE' AND play_session_id IN ({placeholders})"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for play_session_id in play_session_ids {
+            statement = statement.bind(play_session_id);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn find_active_web_playback_sessions_for_source(
         &self,
         user_id: &str,
@@ -451,7 +514,8 @@ impl Database {
         self.query(
             "SELECT id, user_id, item_id, media_source_id, play_session_id,
                     tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
-                    last_sequence, created_at, updated_at
+                    last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                    transcoding_container, created_at, updated_at
              FROM web_playback_sessions
              WHERE user_id = ? AND item_id = ? AND media_source_id = ?
                AND state = 'ACTIVE' AND play_session_id LIKE ?
@@ -478,7 +542,8 @@ impl Database {
             .query(
                 "SELECT id, user_id, item_id, media_source_id, play_session_id,
                         tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
-                        last_sequence, created_at, updated_at
+                        last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                        transcoding_container, created_at, updated_at
                  FROM web_playback_sessions
                  WHERE state = 'ACTIVE' AND expires_at < ?
                  ORDER BY expires_at ASC, id ASC
@@ -526,7 +591,8 @@ impl Database {
             .query(
                 "SELECT id, user_id, item_id, media_source_id, play_session_id,
                         tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
-                        last_sequence, created_at, updated_at
+                        last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                        transcoding_container, created_at, updated_at
                  FROM web_playback_sessions
                  WHERE state = 'ACTIVE' AND plan = 'SERVER_HLS' AND last_heartbeat_at < ?
                  ORDER BY last_heartbeat_at ASC, id ASC

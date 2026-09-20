@@ -5,7 +5,7 @@ use crate::application::playback::{
     hls::{HlsSegmentContainer, HlsStartOptions},
     session::{CreatedWebPlaybackSession, WebPlaybackPlan},
 };
-use crate::storage::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
+use crate::storage::{MAX_PLAYBACK_SESSION_WINDOW_SECONDS, WebPlaybackTranscodingDetails};
 
 pub(super) async fn emby_playback_info(
     headers: HeaderMap,
@@ -914,6 +914,22 @@ async fn create_emby_transcoding_session(
     if !matches!(created.plan, WebPlaybackPlan::ServerHls { .. }) {
         return Err(StatusCode::BAD_GATEWAY);
     }
+    if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
+        let output = emby_transcoding_output(
+            source,
+            options.request,
+            *tier,
+            options.hls.segment_container,
+        );
+        if service
+            .set_transcoding_details(&created.id, &user_id, &output)
+            .await
+            .is_err()
+        {
+            let _ = service.stop(&created.id, &user_id).await;
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
     Ok(Some(created))
 }
 
@@ -1715,6 +1731,21 @@ pub(super) async fn emby_sessions(
         Ok(sessions) => sessions,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let emby_play_session_ids = sessions
+        .iter()
+        .filter(|session| session.play_session_id.starts_with("lux-emby:"))
+        .map(|session| session.play_session_id.clone())
+        .collect::<Vec<_>>();
+    let web_sessions = match database
+        .find_web_playback_sessions_for_playbacks(&emby_play_session_ids)
+        .await
+    {
+        Ok(sessions) => sessions
+            .into_iter()
+            .map(|session| (session.play_session_id.clone(), session))
+            .collect::<std::collections::HashMap<_, _>>(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let catalog_items = if sessions.iter().any(|session| {
         session.duration_ticks.is_none_or(|ticks| ticks <= 0)
             || session.play_session_id.starts_with("lux-emby:")
@@ -1727,7 +1758,9 @@ pub(super) async fn emby_sessions(
             return Json(
                 sessions
                     .iter()
-                    .map(|session| emby_session_json(session, None))
+                    .map(|session| {
+                        emby_session_json(session, None, web_sessions.get(&session.play_session_id))
+                    })
                     .collect::<Vec<_>>(),
             )
             .into_response();
@@ -1745,7 +1778,13 @@ pub(super) async fn emby_sessions(
     Json(
         sessions
             .iter()
-            .map(|session| emby_session_json(session, catalog_items.get(&session.item_id)))
+            .map(|session| {
+                emby_session_json(
+                    session,
+                    catalog_items.get(&session.item_id),
+                    web_sessions.get(&session.play_session_id),
+                )
+            })
             .collect::<Vec<_>>(),
     )
     .into_response()
@@ -1754,8 +1793,10 @@ pub(super) async fn emby_sessions(
 pub(super) fn emby_session_json(
     session: &crate::storage::StoredPlaybackSession,
     catalog_item: Option<&CatalogItem>,
+    web_session: Option<&crate::storage::StoredWebPlaybackSession>,
 ) -> Value {
     let runtime_ticks = session_runtime_ticks(session, catalog_item);
+    let (play_method, transcoding_info) = emby_session_playback_details(session, web_session);
     let mut now_playing_item = json!({
         "Id": emby_public_id(&session.item_id),
         "RunTimeTicks": runtime_ticks,
@@ -1797,13 +1838,52 @@ pub(super) fn emby_session_json(
             "PositionTicks": session.position_ticks.max(0),
             "IsPaused": session.is_paused,
             "CanSeek": true,
-            "PlayMethod": "DirectPlay",
+            "PlayMethod": play_method,
             "VolumeLevel": 100,
         },
         "NowPlayingItem": now_playing_item,
         "RunTimeTicks": runtime_ticks,
         "LastActivityDate": session.last_event_at,
+        "TranscodingInfo": transcoding_info,
     })
+}
+
+fn emby_session_playback_details(
+    session: &crate::storage::StoredPlaybackSession,
+    web_session: Option<&crate::storage::StoredWebPlaybackSession>,
+) -> (&'static str, Option<Value>) {
+    let Some(web_session) = web_session.filter(|session| session.plan == "SERVER_HLS") else {
+        return (
+            if session.play_session_id.starts_with("lux-emby:") {
+                "Transcode"
+            } else {
+                "DirectPlay"
+            },
+            None,
+        );
+    };
+    let play_method = if web_session.tier <= i64::from(ServerTier::Remux.number()) {
+        "DirectStream"
+    } else {
+        "Transcode"
+    };
+    let total_bitrate = web_session
+        .video_bitrate
+        .unwrap_or_default()
+        .saturating_add(web_session.audio_bitrate.unwrap_or_default());
+    (
+        play_method,
+        Some(json!({
+            "Container": web_session.transcoding_container,
+            "VideoCodec": web_session.video_codec,
+            "AudioCodec": web_session.audio_codec,
+            "VideoBitrate": web_session.video_bitrate,
+            "AudioBitrate": web_session.audio_bitrate,
+            "Bitrate": (total_bitrate > 0).then_some(total_bitrate),
+            "IsVideoDirect": web_session.tier <= i64::from(ServerTier::AudioTranscode.number()),
+            "IsAudioDirect": web_session.tier == i64::from(ServerTier::Remux.number()),
+        })),
+    )
 }
 
 fn session_runtime_ticks(
@@ -2241,6 +2321,41 @@ fn emby_transcoding_audio_bitrate(
         .iter()
         .filter(|stream| stream.stream_type.eq_ignore_ascii_case("AUDIO"))
         .find_map(|stream| stream_detail_i64(stream, "BitRate"))
+}
+
+fn emby_transcoding_output(
+    source: &crate::application::catalog::CatalogSource,
+    request: &EmbyPlaybackInfoRequest,
+    tier: ServerTier,
+    segment_container: HlsSegmentContainer,
+) -> WebPlaybackTranscodingDetails {
+    let video_transcoded = matches!(
+        tier,
+        ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    );
+    let audio_transcoded = matches!(
+        tier,
+        ServerTier::AudioTranscode | ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    );
+    WebPlaybackTranscodingDetails {
+        video_codec: if video_transcoded {
+            Some("h264".to_owned())
+        } else {
+            source_stream_codec(source, "VIDEO").map(str::to_owned)
+        },
+        audio_codec: if audio_transcoded {
+            Some("aac".to_owned())
+        } else {
+            source_stream_codec(source, "AUDIO").map(str::to_owned)
+        },
+        video_bitrate: if video_transcoded {
+            emby_transcoding_video_bitrate(source, request)
+        } else {
+            None
+        },
+        audio_bitrate: emby_transcoding_audio_bitrate(source, tier),
+        transcoding_container: Some(segment_container.emby_container().to_owned()),
+    }
 }
 
 fn emby_transcode_reason(

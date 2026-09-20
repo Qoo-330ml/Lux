@@ -5380,6 +5380,24 @@ pub(crate) async fn dashboard_playback_json(
         .iter()
         .take(DASHBOARD_PLAYBACK_LIMIT)
         .collect::<Vec<_>>();
+    let web_play_session_ids = sessions
+        .iter()
+        .filter(|session| {
+            session.play_session_id.starts_with("lux-emby:")
+                || session.play_session_id.starts_with("lux-web:")
+        })
+        .map(|session| session.play_session_id.clone())
+        .collect::<Vec<_>>();
+    let Some(database) = state.database.as_ref() else {
+        return Ok(Vec::new());
+    };
+    let web_sessions = database
+        .find_web_playback_sessions_for_playbacks(&web_play_session_ids)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
+        .into_iter()
+        .map(|session| (session.play_session_id.clone(), session))
+        .collect::<HashMap<_, _>>();
     let item_ids = sessions
         .iter()
         .map(|session| session.item_id.clone())
@@ -5425,6 +5443,7 @@ pub(crate) async fn dashboard_playback_json(
                 .map(String::as_str)
                 .unwrap_or("未知账户"),
             remote_ip_location.as_ref(),
+            web_sessions.get(&session.play_session_id),
         ));
     }
     Ok(values)
@@ -5436,6 +5455,7 @@ pub(crate) fn dashboard_playback_item_json(
     series: Option<&CatalogItem>,
     user_name: &str,
     remote_ip_location: Option<&IpLocation>,
+    web_session: Option<&crate::storage::StoredWebPlaybackSession>,
 ) -> Value {
     let source = session
         .media_source_id
@@ -5474,7 +5494,64 @@ pub(crate) fn dashboard_playback_item_json(
         "remoteIp": session.remote_ip,
         "remoteIpLocation": remote_ip_location.map(dashboard_ip_location_json),
         "playSessionId": session.play_session_id,
+        "playMethod": dashboard_play_method(session, web_session),
+        "playbackPlan": web_session.map(|session| session.plan.as_str()),
+        "serverTier": web_session.map(|session| session.tier),
+        "output": web_session.and_then(|web_session| {
+            (web_session.plan == "SERVER_HLS").then(|| dashboard_playback_output(web_session, source))
+        }),
         "source": source.map(dashboard_source_json),
+    })
+}
+
+fn dashboard_play_method(
+    session: &StoredPlaybackSession,
+    web_session: Option<&crate::storage::StoredWebPlaybackSession>,
+) -> &'static str {
+    let Some(web_session) = web_session.filter(|session| session.plan == "SERVER_HLS") else {
+        return if session.play_session_id.starts_with("lux-emby:") {
+            "Transcode"
+        } else {
+            "DirectPlay"
+        };
+    };
+    if web_session.tier <= i64::from(ServerTier::Remux.number()) {
+        "DirectStream"
+    } else {
+        "Transcode"
+    }
+}
+
+fn dashboard_playback_output(
+    web_session: &crate::storage::StoredWebPlaybackSession,
+    source: Option<&CatalogSource>,
+) -> Value {
+    let source_video_codec = source.and_then(|source| {
+        source
+            .streams
+            .iter()
+            .find(|stream| stream.stream_type.eq_ignore_ascii_case("VIDEO"))
+            .and_then(|stream| stream.codec.clone())
+    });
+    let source_audio_codec = source.and_then(|source| {
+        source
+            .streams
+            .iter()
+            .find(|stream| stream.stream_type.eq_ignore_ascii_case("AUDIO"))
+            .and_then(|stream| stream.codec.clone())
+    });
+    let video_transcoded = web_session.tier >= i64::from(ServerTier::HardwareTranscode.number());
+    let audio_transcoded = web_session.tier >= i64::from(ServerTier::AudioTranscode.number());
+    json!({
+        "container": web_session.transcoding_container,
+        "videoCodec": web_session.video_codec.as_deref().or_else(|| {
+            video_transcoded.then_some("h264").or(source_video_codec.as_deref())
+        }),
+        "audioCodec": web_session.audio_codec.as_deref().or_else(|| {
+            audio_transcoded.then_some("aac").or(source_audio_codec.as_deref())
+        }),
+        "videoBitrate": web_session.video_bitrate,
+        "audioBitrate": web_session.audio_bitrate,
     })
 }
 

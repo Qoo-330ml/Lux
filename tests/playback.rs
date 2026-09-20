@@ -614,6 +614,11 @@ async fn emby_playback_info_negotiates_server_transcoding_and_cleans_hls()
         .bind(&item_id)
         .execute(database.pool())
         .await?;
+    sqlx::query("UPDATE media_sources SET bitrate = ? WHERE id = ?")
+        .bind(4_000_000_i64)
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
     let emby_item_id = emby_public_id(&item_id);
 
     let fake_ffmpeg = temp_dir.path().join("fake-ffmpeg");
@@ -1106,6 +1111,7 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         .query(&[("api_key", token.as_str())])
         .json(&json!({
             "MediaSourceId": source_id,
+            "MaxStreamingBitrate": 1_000_000,
             "EnableDirectStream": false,
             "EnableTranscoding": true,
             "AllowVideoStreamCopy": false,
@@ -1132,6 +1138,27 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     let session_id = play_session_id
         .strip_prefix("lux-emby:")
         .ok_or("invalid transcoding play session")?;
+    let stored_output = sqlx::query_as::<
+        _,
+        (
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+            Option<i64>,
+            Option<String>,
+        ),
+    >(
+        "SELECT video_codec, audio_codec, video_bitrate, audio_bitrate, transcoding_container
+         FROM web_playback_sessions WHERE id = ?",
+    )
+    .bind(session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored_output.0.as_deref(), Some("h264"));
+    assert_eq!(stored_output.1.as_deref(), Some("aac"));
+    assert_eq!(stored_output.2, Some(1_000_000));
+    assert_eq!(stored_output.3, Some(192_000));
+    assert_eq!(stored_output.4.as_deref(), Some("ts"));
 
     let stale_stop_without_session_id = client
         .post(format!("{base_url}/Sessions/Playing/Stopped"))
@@ -1147,6 +1174,44 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         stale_stop_without_session_id.status(),
         reqwest::StatusCode::NO_CONTENT
     );
+
+    let playing = client
+        .post(format!("{base_url}/Sessions/Playing"))
+        .query(&[("api_key", token.as_str())])
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": play_session_id,
+            "PositionTicks": 0,
+            "RunTimeTicks": expected_runtime_ticks,
+        }))
+        .send()
+        .await?;
+    assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+    let sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let current_session = sessions
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["PlaySessionId"] == play_session_id)
+        })
+        .ok_or("missing transcoding session")?;
+    assert_eq!(current_session["PlayState"]["PlayMethod"], "Transcode");
+    assert_eq!(current_session["TranscodingInfo"]["Container"], "ts");
+    assert_eq!(current_session["TranscodingInfo"]["VideoCodec"], "h264");
+    assert_eq!(current_session["TranscodingInfo"]["AudioCodec"], "aac");
+    assert_eq!(
+        current_session["TranscodingInfo"]["VideoBitrate"],
+        1_000_000
+    );
+    assert_eq!(current_session["TranscodingInfo"]["AudioBitrate"], 192_000);
 
     let manifest = client
         .get(format!("{base_url}{transcoding_url}"))

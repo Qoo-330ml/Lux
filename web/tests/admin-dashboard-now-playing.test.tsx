@@ -60,4 +60,36 @@ describe("AdminDashboardNowPlaying", () => {
     expect(location?.textContent).toContain("美国 · 加利福尼亚州 · 山景城");
     expect(location?.textContent).toContain("Santa Clara · Amphitheatre Parkway · Google");
   });
+
+  it("shows server transcoding and output codecs", () => {
+    const transcodingSession: AdminPlaybackSession = {
+      ...session,
+      playMethod: "Transcode",
+      serverTier: 4,
+      output: {
+        container: "ts",
+        videoCodec: "h264",
+        audioCodec: "aac",
+        videoBitrate: 1_000_000,
+        audioBitrate: 192_000,
+      },
+      source: {
+        id: "source-1",
+        video: { codec: "hevc", title: "4K HDR" },
+        audio: { codec: "ac3", language: "zh-CN", title: "立体声" },
+      },
+    };
+
+    act(() => {
+      root.render(
+        <MemoryRouter>
+          <AdminDashboardNowPlaying sessions={[transcodingSession]} />
+        </MemoryRouter>,
+      );
+    });
+
+    expect(container.textContent).toContain("播放：转码播放 · 服务端 HLS · 软件转码 · TS");
+    expect(container.textContent).toContain("视频：H.264 · 原始 HEVC · 4K HDR · 1.0 Mbps");
+    expect(container.textContent).toContain("音频：AAC · zh-CN · 原始 AC3 · 立体声 · 192 kbps");
+  });
 });
