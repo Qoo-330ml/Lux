@@ -20,7 +20,7 @@ use super::decision::{
     PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier,
     UnsupportedReason, choose_plan,
 };
-use super::hls::{HlsError, HlsManager};
+use super::hls::{HlsError, HlsManager, HlsSegmentContainer};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -266,6 +266,7 @@ impl WebPlaybackSessionService {
         input: CreateWebPlaybackSession<'_>,
         media_path: &std::path::Path,
         video_bitrate: Option<i64>,
+        segment_container: HlsSegmentContainer,
         start_time_ticks: Option<i64>,
         runtime_ticks: Option<i64>,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
@@ -281,6 +282,7 @@ impl WebPlaybackSessionService {
                 tier,
                 media_path,
                 video_bitrate,
+                segment_container,
                 start_time_ticks,
                 runtime_ticks,
             )
@@ -421,6 +423,7 @@ impl WebPlaybackSessionService {
         tier: ServerTier,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
+        segment_container: HlsSegmentContainer,
         start_time_ticks: Option<i64>,
         runtime_ticks: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
@@ -430,6 +433,7 @@ impl WebPlaybackSessionService {
                 tier,
                 input,
                 video_bitrate,
+                segment_container,
                 start_time_ticks,
                 runtime_ticks,
             )
@@ -765,7 +769,7 @@ mod tests {
             libraries::LibraryService,
             playback::{
                 decision::{PlaybackCapabilities, PlaybackSourceKind, ServerTier},
-                hls::HlsManager,
+                hls::{HlsManager, HlsSegmentContainer},
                 session::{
                     CreateWebPlaybackSession, WebPlaybackEvent, WebPlaybackPlan,
                     WebPlaybackSessionService,
@@ -1113,6 +1117,7 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 None,
                 Some(600 * 10_000_000),
             )
@@ -1158,6 +1163,7 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 None,
                 Some(600 * 10_000_000),
             )
@@ -1256,6 +1262,7 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 None,
                 None,
             )
@@ -1281,6 +1288,7 @@ while :; do sleep 1; done
                 },
                 Path::new("input.mkv"),
                 Some(2_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 None,
                 None,
             )

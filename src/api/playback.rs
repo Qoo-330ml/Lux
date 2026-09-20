@@ -2,6 +2,7 @@ use super::*;
 
 use crate::application::playback::{
     decision::ServerTier,
+    hls::HlsSegmentContainer,
     session::{CreatedWebPlaybackSession, WebPlaybackPlan},
 };
 use crate::storage::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
@@ -762,6 +763,7 @@ async fn create_emby_transcoding_session(
             },
             &input,
             video_bitrate,
+            HlsSegmentContainer::FragmentedMp4,
             start_time_ticks,
             runtime_ticks,
         )

@@ -30,7 +30,41 @@ const MANIFEST_WAIT_ATTEMPTS: usize = 50;
 const HLS_ASSET_WAIT_ATTEMPTS: usize = 600;
 const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
 const HLS_SEGMENT_RESTART_GAP: i64 = 6;
+const MAX_EMBY_VOD_SEGMENTS: i64 = 1_000_000;
 const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HlsSegmentContainer {
+    MpegTs,
+    FragmentedMp4,
+}
+
+impl HlsSegmentContainer {
+    pub(crate) const fn segment_extension(self) -> &'static str {
+        match self {
+            Self::MpegTs => "ts",
+            Self::FragmentedMp4 => "m4s",
+        }
+    }
+
+    pub(crate) const fn mime_type(self) -> &'static str {
+        match self {
+            Self::MpegTs => "video/mp2t",
+            Self::FragmentedMp4 => "video/mp4",
+        }
+    }
+
+    pub(crate) const fn emby_container(self) -> &'static str {
+        match self {
+            Self::MpegTs => "ts",
+            Self::FragmentedMp4 => "mp4",
+        }
+    }
+
+    const fn uses_initialization_segment(self) -> bool {
+        matches!(self, Self::FragmentedMp4)
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum HlsError {
@@ -97,6 +131,7 @@ struct HlsProcessSpecification {
     tier: ServerTier,
     video_bitrate: Option<i64>,
     emby_vod: bool,
+    segment_container: HlsSegmentContainer,
 }
 
 struct HlsProcessState {
@@ -206,6 +241,7 @@ impl HlsManager {
                 tier,
                 video_bitrate,
                 emby_vod: false,
+                segment_container: HlsSegmentContainer::FragmentedMp4,
             },
             start_time_ticks,
             runtime_ticks,
@@ -220,6 +256,7 @@ impl HlsManager {
         tier: ServerTier,
         input: &Path,
         video_bitrate: Option<i64>,
+        segment_container: HlsSegmentContainer,
         start_time_ticks: Option<i64>,
         runtime_ticks: Option<i64>,
     ) -> Result<(), HlsError> {
@@ -230,6 +267,7 @@ impl HlsManager {
                 tier,
                 video_bitrate,
                 emby_vod: true,
+                segment_container,
             },
             start_time_ticks,
             runtime_ticks,
@@ -261,7 +299,12 @@ impl HlsManager {
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
         let segment_start_number = hls_start_number(start_time_ticks);
         let generation = 0;
-        let init = hls_init_path(&directory, specification.emby_vod, generation);
+        let init = hls_init_path(
+            &directory,
+            specification.emby_vod,
+            generation,
+            specification.segment_container,
+        );
         let manifest = hls_manifest_path(&directory, specification.emby_vod, generation);
         let child = if spawn_immediately {
             match self.spawn_child(
@@ -318,10 +361,7 @@ impl HlsManager {
         generation: u64,
         start_time_ticks: Option<i64>,
     ) -> Result<Child, HlsError> {
-        let init_file_name = init
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or(HlsError::InvalidAsset)?;
+        let init_file_name = init.file_name().and_then(|name| name.to_str());
         let args = if specification.emby_vod {
             ffmpeg_args_for_output(
                 &specification.input,
@@ -330,12 +370,18 @@ impl HlsManager {
                 self.hardware_encoder.as_deref(),
                 specification.video_bitrate,
                 start_time_ticks,
+                specification.segment_container,
                 HlsOutput {
-                    init_file_name,
+                    init_file_name: init_file_name.unwrap_or("init.mp4"),
                     manifest,
-                    segment_file_name: hls_segment_pattern(directory, true, generation)
-                        .to_string_lossy()
-                        .into_owned(),
+                    segment_file_name: hls_segment_pattern(
+                        directory,
+                        true,
+                        generation,
+                        specification.segment_container,
+                    )
+                    .to_string_lossy()
+                    .into_owned(),
                     preserve_input_timestamps: true,
                 },
             )?
@@ -382,11 +428,6 @@ impl HlsManager {
         session_id: &str,
         asset: Option<&str>,
     ) -> Result<(), HlsError> {
-        if let Some(asset) = asset
-            && !is_valid_asset(asset)
-        {
-            return Err(HlsError::InvalidAsset);
-        }
         let process = self
             .processes
             .lock()
@@ -394,6 +435,11 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
+        if let Some(asset) = asset
+            && !is_valid_asset(asset, process.specification.segment_container)
+        {
+            return Err(HlsError::InvalidAsset);
+        }
         if process.state.lock().await.child.is_some() {
             return Ok(());
         }
@@ -407,7 +453,11 @@ impl HlsManager {
             _ => process.state.lock().await.segment_start_number,
         };
         let requested_path = match asset {
-            Some(asset) if is_emby_generation_asset(asset) => process.directory.join(asset),
+            Some(asset)
+                if is_emby_generation_asset(asset, process.specification.segment_container) =>
+            {
+                process.directory.join(asset)
+            }
             Some("init.mp4") => emby_asset_path(&process, "init.mp4").await,
             Some(asset)
                 if asset_segment_number(asset)?.is_some()
@@ -415,9 +465,10 @@ impl HlsManager {
             {
                 emby_asset_path(&process, asset).await
             }
-            _ => process
-                .directory
-                .join(format!("segment_{requested_segment:06}.m4s")),
+            _ => process.directory.join(format!(
+                "segment_{requested_segment:06}.{}",
+                process.specification.segment_container.segment_extension()
+            )),
         };
         self.restart_for_segment(session_id, &process, requested_segment, &requested_path)
             .await?;
@@ -465,9 +516,6 @@ impl HlsManager {
         session_id: &str,
         asset: &str,
     ) -> Result<PathBuf, HlsError> {
-        if !is_valid_asset(asset) {
-            return Err(HlsError::InvalidAsset);
-        }
         let process = self
             .processes
             .lock()
@@ -475,6 +523,9 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
+        if !is_valid_asset(asset, process.specification.segment_container) {
+            return Err(HlsError::InvalidAsset);
+        }
         asset_segment_number(asset)?;
         let path = process.directory.join(asset);
         if !path.starts_with(&process.directory) {
@@ -488,9 +539,6 @@ impl HlsManager {
         session_id: &str,
         asset: &str,
     ) -> Result<PathBuf, HlsError> {
-        if !is_valid_asset(asset) {
-            return Err(HlsError::InvalidAsset);
-        }
         let segment_number = asset_segment_number(asset)?;
         let process = self
             .processes
@@ -499,14 +547,21 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
+        if !is_valid_asset(asset, process.specification.segment_container) {
+            return Err(HlsError::InvalidAsset);
+        }
         let is_emby_init = process.specification.emby_vod
+            && process
+                .specification
+                .segment_container
+                .uses_initialization_segment()
             && (asset == "init.mp4" || emby_init_segment_number(asset).is_some());
         let public_path = process.directory.join(asset);
         if !public_path.starts_with(&process.directory) {
             return Err(HlsError::InvalidAsset);
         }
         let generation_segment = if process.specification.emby_vod
-            && !is_emby_generation_asset(asset)
+            && !is_emby_generation_asset(asset, process.specification.segment_container)
         {
             match (segment_number, emby_init_segment_number(asset)) {
                 (Some(segment_number), _) | (None, Some(segment_number)) => Some(segment_number),
@@ -615,10 +670,14 @@ impl HlsManager {
         let current_segment =
             latest_segment.unwrap_or_else(|| state.segment_start_number.saturating_sub(1));
         if process.specification.emby_vod {
-            let is_init_asset = requested_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|value| value.ends_with("_init.mp4") || value == "init.mp4");
+            let is_init_asset = process
+                .specification
+                .segment_container
+                .uses_initialization_segment()
+                && requested_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.ends_with("_init.mp4") || value == "init.mp4");
             if let Some(bound_generation) = state
                 .emby_segment_generations
                 .get(&requested_segment)
@@ -721,7 +780,12 @@ impl HlsManager {
         } else {
             hls_manifest_path(&process.directory, true, generation)
         };
-        let init = hls_init_path(&process.directory, true, generation);
+        let init = hls_init_path(
+            &process.directory,
+            true,
+            generation,
+            process.specification.segment_container,
+        );
         let child = self.spawn_child(
             &process.specification,
             &process.directory,
@@ -782,7 +846,10 @@ impl HlsManager {
         let Some(runtime_ticks) = process.runtime_ticks else {
             return Ok(None);
         };
-        Ok(vod_manifest(runtime_ticks))
+        Ok(vod_manifest(
+            runtime_ticks,
+            process.specification.segment_container,
+        ))
     }
 
     pub(crate) async fn session_directory(&self, session_id: &str) -> Result<PathBuf, HlsError> {
@@ -926,7 +993,7 @@ async fn emby_asset_path(process: &HlsProcess, asset: &str) -> PathBuf {
     if !process.specification.emby_vod {
         return process.directory.join(asset);
     }
-    if is_emby_generation_asset(asset) {
+    if is_emby_generation_asset(asset, process.specification.segment_container) {
         return process.directory.join(asset);
     }
     let state = process.state.lock().await;
@@ -934,13 +1001,29 @@ async fn emby_asset_path(process: &HlsProcess, asset: &str) -> PathBuf {
 }
 
 fn emby_asset_path_for_generation(process: &HlsProcess, asset: &str, generation: u64) -> PathBuf {
-    if is_emby_generation_asset(asset) {
+    if is_emby_generation_asset(asset, process.specification.segment_container) {
         return process.directory.join(asset);
     }
-    if asset == "init.mp4" || emby_init_segment_number(asset).is_some() {
-        hls_init_path(&process.directory, true, generation)
+    if process
+        .specification
+        .segment_container
+        .uses_initialization_segment()
+        && (asset == "init.mp4" || emby_init_segment_number(asset).is_some())
+    {
+        hls_init_path(
+            &process.directory,
+            true,
+            generation,
+            process.specification.segment_container,
+        )
     } else if let Ok(Some(segment_number)) = asset_segment_number(asset) {
-        hls_segment_path(&process.directory, true, generation, segment_number)
+        hls_segment_path(
+            &process.directory,
+            true,
+            generation,
+            segment_number,
+            process.specification.segment_container,
+        )
     } else {
         process.directory.join(asset)
     }
@@ -952,10 +1035,26 @@ fn emby_generation_asset_path(
     segment_number: i64,
     is_init: bool,
 ) -> PathBuf {
-    if is_init {
-        hls_init_path(&process.directory, true, generation)
+    if is_init
+        && process
+            .specification
+            .segment_container
+            .uses_initialization_segment()
+    {
+        hls_init_path(
+            &process.directory,
+            true,
+            generation,
+            process.specification.segment_container,
+        )
     } else {
-        hls_segment_path(&process.directory, true, generation, segment_number)
+        hls_segment_path(
+            &process.directory,
+            true,
+            generation,
+            segment_number,
+            process.specification.segment_container,
+        )
     }
 }
 
@@ -967,19 +1066,32 @@ fn hls_manifest_path(directory: &Path, emby_vod: bool, generation: u64) -> PathB
     }
 }
 
-fn hls_init_path(directory: &Path, emby_vod: bool, generation: u64) -> PathBuf {
-    if emby_vod {
+fn hls_init_path(
+    directory: &Path,
+    emby_vod: bool,
+    generation: u64,
+    segment_container: HlsSegmentContainer,
+) -> PathBuf {
+    if emby_vod && segment_container.uses_initialization_segment() {
         directory.join(format!("generation_{generation:06}_init.mp4"))
     } else {
         directory.join("init.mp4")
     }
 }
 
-fn hls_segment_pattern(directory: &Path, emby_vod: bool, generation: u64) -> PathBuf {
+fn hls_segment_pattern(
+    directory: &Path,
+    emby_vod: bool,
+    generation: u64,
+    segment_container: HlsSegmentContainer,
+) -> PathBuf {
+    let extension = segment_container.segment_extension();
     if emby_vod {
-        directory.join(format!("generation_{generation:06}_segment_%06d.m4s"))
+        directory.join(format!(
+            "generation_{generation:06}_segment_%06d.{extension}"
+        ))
     } else {
-        directory.join("segment_%06d.m4s")
+        directory.join(format!("segment_%06d.{extension}"))
     }
 }
 
@@ -988,13 +1100,18 @@ fn hls_segment_path(
     emby_vod: bool,
     generation: u64,
     segment_number: i64,
+    segment_container: HlsSegmentContainer,
 ) -> PathBuf {
     if emby_vod {
         directory.join(format!(
-            "generation_{generation:06}_segment_{segment_number:06}.m4s"
+            "generation_{generation:06}_segment_{segment_number:06}.{}",
+            segment_container.segment_extension()
         ))
     } else {
-        directory.join(format!("segment_{segment_number:06}.m4s"))
+        directory.join(format!(
+            "segment_{segment_number:06}.{}",
+            segment_container.segment_extension()
+        ))
     }
 }
 
@@ -1068,6 +1185,7 @@ fn ffmpeg_args_with_timeline(
         hardware_encoder,
         video_bitrate,
         start_time_ticks,
+        HlsSegmentContainer::FragmentedMp4,
         HlsOutput {
             init_file_name: "init.mp4",
             manifest: &manifest,
@@ -1087,6 +1205,7 @@ fn ffmpeg_args_for_output(
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
     start_time_ticks: Option<i64>,
+    segment_container: HlsSegmentContainer,
     output: HlsOutput<'_>,
 ) -> Result<Vec<String>, HlsError> {
     if tier == ServerTier::Direct {
@@ -1201,11 +1320,20 @@ fn ffmpeg_args_for_output(
         "-hls_list_size".to_owned(),
         "0".to_owned(),
         "-hls_segment_type".to_owned(),
-        "fmp4".to_owned(),
+        match segment_container {
+            HlsSegmentContainer::MpegTs => "mpegts".to_owned(),
+            HlsSegmentContainer::FragmentedMp4 => "fmp4".to_owned(),
+        },
         "-start_number".to_owned(),
         hls_start_number(start_time_ticks).to_string(),
-        "-hls_fmp4_init_filename".to_owned(),
-        output.init_file_name.to_owned(),
+    ]);
+    if segment_container.uses_initialization_segment() {
+        args.extend([
+            "-hls_fmp4_init_filename".to_owned(),
+            output.init_file_name.to_owned(),
+        ]);
+    }
+    args.extend([
         "-hls_segment_filename".to_owned(),
         output.segment_file_name,
         "-hls_flags".to_owned(),
@@ -1226,11 +1354,15 @@ fn hls_start_number(start_time_ticks: Option<i64>) -> i64 {
 
 fn asset_segment_number(asset: &str) -> Result<Option<i64>, HlsError> {
     let segment_number = if let Some(value) = asset.strip_prefix("segment_") {
-        value.strip_suffix(".m4s")
-    } else if let Some(value) = asset.strip_prefix("generation_") {
         value
-            .split_once("_segment_")
-            .and_then(|(_, value)| value.strip_suffix(".m4s"))
+            .strip_suffix(".m4s")
+            .or_else(|| value.strip_suffix(".ts"))
+    } else if let Some(value) = asset.strip_prefix("generation_") {
+        value.split_once("_segment_").and_then(|(_, value)| {
+            value
+                .strip_suffix(".m4s")
+                .or_else(|| value.strip_suffix(".ts"))
+        })
     } else {
         None
     };
@@ -1268,14 +1400,17 @@ fn ffmpeg_start_time(start_time_ticks: Option<i64>) -> Option<String> {
     }
 }
 
-fn vod_manifest(runtime_ticks: i64) -> Option<String> {
+fn vod_manifest(runtime_ticks: i64, segment_container: HlsSegmentContainer) -> Option<String> {
     if runtime_ticks <= 0 {
         return None;
     }
     const TICKS_PER_SECOND: i64 = 10_000_000;
     let full_segments = runtime_ticks / HLS_SEGMENT_DURATION_TICKS;
     let remainder_ticks = runtime_ticks % HLS_SEGMENT_DURATION_TICKS;
-    let segment_count = full_segments + i64::from(remainder_ticks > 0);
+    let segment_count = full_segments.checked_add(i64::from(remainder_ticks > 0))?;
+    if segment_count > MAX_EMBY_VOD_SEGMENTS {
+        return None;
+    }
     let target_duration = if full_segments > 0 {
         HLS_SEGMENT_DURATION_TICKS / TICKS_PER_SECOND
     } else {
@@ -1288,7 +1423,9 @@ fn vod_manifest(runtime_ticks: i64) -> Option<String> {
     let _ = writeln!(manifest, "#EXT-X-TARGETDURATION:{target_duration}");
     let _ = writeln!(manifest, "#EXT-X-MEDIA-SEQUENCE:0");
     for index in 0..segment_count {
-        let _ = writeln!(manifest, "#EXT-X-MAP:URI=\"init_{index:06}.mp4\"");
+        if segment_container.uses_initialization_segment() {
+            let _ = writeln!(manifest, "#EXT-X-MAP:URI=\"init_{index:06}.mp4\"");
+        }
         let duration_ticks = if index < full_segments {
             HLS_SEGMENT_DURATION_TICKS
         } else {
@@ -1296,7 +1433,11 @@ fn vod_manifest(runtime_ticks: i64) -> Option<String> {
         };
         let duration = hls_duration_seconds(duration_ticks);
         let _ = writeln!(manifest, "#EXTINF:{duration},");
-        let _ = writeln!(manifest, "segment_{index:06}.m4s");
+        let _ = writeln!(
+            manifest,
+            "segment_{index:06}.{}",
+            segment_container.segment_extension()
+        );
     }
     let _ = writeln!(manifest, "#EXT-X-ENDLIST");
     Some(manifest)
@@ -1309,7 +1450,7 @@ fn hls_duration_seconds(ticks: i64) -> String {
     format!("{seconds}.{micros:06}")
 }
 
-fn is_valid_asset(asset: &str) -> bool {
+fn is_valid_asset(asset: &str, segment_container: HlsSegmentContainer) -> bool {
     if asset.is_empty() || asset.len() > 128 {
         return false;
     }
@@ -1321,23 +1462,30 @@ fn is_valid_asset(asset: &str) -> bool {
     {
         return false;
     }
-    asset == "index.m3u8"
-        || asset == "init.mp4"
-        || emby_init_segment_number(asset).is_some()
-        || (asset.starts_with("segment_") && asset.ends_with(".m4s"))
-        || is_emby_generation_asset(asset)
+    if asset == "index.m3u8" {
+        return true;
+    }
+    if segment_container.uses_initialization_segment()
+        && (asset == "init.mp4" || emby_init_segment_number(asset).is_some())
+    {
+        return true;
+    }
+    let extension = format!(".{}", segment_container.segment_extension());
+    (asset.starts_with("segment_") && asset.ends_with(&extension))
+        || is_emby_generation_asset(asset, segment_container)
 }
 
-fn is_emby_generation_asset(asset: &str) -> bool {
+fn is_emby_generation_asset(asset: &str, segment_container: HlsSegmentContainer) -> bool {
     let Some(value) = asset.strip_prefix("generation_") else {
         return false;
     };
     let Some((generation, asset)) = value.split_once('_') else {
         return false;
     };
+    let extension = format!(".{}", segment_container.segment_extension());
     let valid_segment = asset
         .strip_prefix("segment_")
-        .and_then(|value| value.strip_suffix(".m4s"))
+        .and_then(|value| value.strip_suffix(&extension))
         .is_some_and(|value| value.len() == 6 && value.bytes().all(|byte| byte.is_ascii_digit()));
     generation.len() == 6
         && generation.bytes().all(|byte| byte.is_ascii_digit())
@@ -1386,14 +1534,19 @@ mod tests {
     };
 
     use super::{
-        HLS_SEGMENT_DURATION_TICKS, SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache,
-        asset_segment_number, emby_init_segment_number, ffmpeg_args, ffmpeg_args_with_timeline,
-        hls_segment_path, hls_start_number, is_valid_asset, vod_manifest,
+        HLS_SEGMENT_DURATION_TICKS, HlsSegmentContainer, SESSION_QUOTA_CACHE_TTL, ServerTier,
+        SessionQuotaCache, asset_segment_number, emby_init_segment_number, ffmpeg_args,
+        ffmpeg_args_for_output, ffmpeg_args_with_timeline, hls_segment_path, hls_start_number,
+        is_valid_asset, vod_manifest,
     };
 
     #[test]
     fn vod_manifest_declares_the_complete_runtime() {
-        let manifest = vod_manifest(9 * 10_000_000 + 5_000_000).expect("positive runtime");
+        let manifest = vod_manifest(
+            9 * 10_000_000 + 5_000_000,
+            HlsSegmentContainer::FragmentedMp4,
+        )
+        .expect("positive runtime");
 
         assert!(manifest.contains("#EXT-X-PLAYLIST-TYPE:VOD\n"));
         assert!(manifest.contains("#EXT-X-ENDLIST\n"));
@@ -1407,7 +1560,11 @@ mod tests {
 
     #[test]
     fn vod_manifest_binds_each_segment_to_its_initialization_segment() {
-        let manifest = vod_manifest(9 * 10_000_000 + 5_000_000).expect("positive runtime");
+        let manifest = vod_manifest(
+            9 * 10_000_000 + 5_000_000,
+            HlsSegmentContainer::FragmentedMp4,
+        )
+        .expect("positive runtime");
 
         assert_eq!(manifest.matches("#EXT-X-MAP:").count(), 3);
         assert!(manifest.contains("#EXT-X-MAP:URI=\"init_000000.mp4\"\n"));
@@ -1416,6 +1573,55 @@ mod tests {
         assert!(manifest.contains(
             "#EXT-X-MAP:URI=\"init_000001.mp4\"\n#EXTINF:4.000000,\nsegment_000001.m4s\n"
         ));
+    }
+
+    #[test]
+    fn ts_vod_manifest_has_independent_ts_segments_without_an_init_map() {
+        let manifest = vod_manifest(9 * 10_000_000 + 5_000_000, HlsSegmentContainer::MpegTs)
+            .expect("positive runtime");
+
+        assert!(!manifest.contains("#EXT-X-MAP"));
+        assert!(manifest.contains("segment_000000.ts\n"));
+        assert!(manifest.contains("segment_000002.ts\n"));
+        assert!(manifest.contains("#EXT-X-ENDLIST\n"));
+    }
+
+    #[test]
+    fn hls_container_contract_exposes_matching_extensions_and_mime_types() {
+        assert_eq!(HlsSegmentContainer::MpegTs.segment_extension(), "ts");
+        assert_eq!(HlsSegmentContainer::MpegTs.mime_type(), "video/mp2t");
+        assert_eq!(
+            HlsSegmentContainer::FragmentedMp4.segment_extension(),
+            "m4s"
+        );
+        assert_eq!(HlsSegmentContainer::FragmentedMp4.mime_type(), "video/mp4");
+    }
+
+    #[test]
+    fn emby_ts_ffmpeg_arguments_do_not_request_fmp4_or_an_init_file() {
+        let args = ffmpeg_args_for_output(
+            Path::new("movie.mkv"),
+            Path::new("session"),
+            ServerTier::SoftwareTranscode,
+            None,
+            None,
+            None,
+            HlsSegmentContainer::MpegTs,
+            super::HlsOutput {
+                init_file_name: "init.mp4",
+                manifest: Path::new("session/index.m3u8"),
+                segment_file_name: "session/segment_%06d.ts".to_owned(),
+                preserve_input_timestamps: true,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-hls_segment_type", "mpegts"])
+        );
+        assert!(!args.iter().any(|value| value == "-hls_fmp4_init_filename"));
+        assert!(args.iter().any(|value| value.ends_with("segment_%06d.ts")));
     }
 
     #[test]
@@ -1625,20 +1831,39 @@ mod tests {
 
     #[test]
     fn asset_validation_rejects_path_traversal_and_unknown_files() {
-        assert!(is_valid_asset("index.m3u8"));
-        assert!(is_valid_asset("init_000001.mp4"));
-        assert!(is_valid_asset("segment_000001.m4s"));
-        assert!(is_valid_asset("generation_000001_init.mp4"));
-        assert!(is_valid_asset("generation_000001_segment_000001.m4s"));
-        assert!(!is_valid_asset("generation_000001_segment_bad.m4s"));
-        assert!(!is_valid_asset("../index.m3u8"));
-        assert!(!is_valid_asset("other.txt"));
+        let fmp4 = HlsSegmentContainer::FragmentedMp4;
+        assert!(is_valid_asset("index.m3u8", fmp4));
+        assert!(is_valid_asset("init_000001.mp4", fmp4));
+        assert!(is_valid_asset("segment_000001.m4s", fmp4));
+        assert!(is_valid_asset("generation_000001_init.mp4", fmp4));
+        assert!(is_valid_asset("generation_000001_segment_000001.m4s", fmp4));
+        assert!(!is_valid_asset("generation_000001_segment_bad.m4s", fmp4));
+        assert!(!is_valid_asset("../index.m3u8", fmp4));
+        assert!(!is_valid_asset("other.txt", fmp4));
+        assert!(is_valid_asset(
+            "segment_000001.ts",
+            HlsSegmentContainer::MpegTs
+        ));
+        assert!(!is_valid_asset(
+            "init_000001.mp4",
+            HlsSegmentContainer::MpegTs
+        ));
+        assert!(!is_valid_asset(
+            "segment_000001.m4s",
+            HlsSegmentContainer::MpegTs
+        ));
     }
 
     #[test]
     fn emby_generation_segment_paths_are_unique() {
         assert_eq!(
-            hls_segment_path(Path::new("/config/session"), true, 1, 969),
+            hls_segment_path(
+                Path::new("/config/session"),
+                true,
+                1,
+                969,
+                HlsSegmentContainer::FragmentedMp4,
+            ),
             Path::new("/config/session/generation_000001_segment_000969.m4s")
         );
     }
@@ -1749,6 +1974,7 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 Some(100 * HLS_SEGMENT_DURATION_TICKS),
                 Some(600 * 10_000_000),
             )
@@ -1860,6 +2086,7 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 Some(100 * HLS_SEGMENT_DURATION_TICKS),
                 Some(600 * 10_000_000),
             )
@@ -1958,6 +2185,7 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 None,
                 Some(1_000 * 10_000_000),
             )
@@ -2046,6 +2274,7 @@ while :; do sleep 1; done
                 ServerTier::SoftwareTranscode,
                 Path::new("input.mkv"),
                 Some(1_000_000),
+                HlsSegmentContainer::FragmentedMp4,
                 None,
                 Some(600 * 10_000_000),
             )
