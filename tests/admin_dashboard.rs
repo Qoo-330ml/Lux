@@ -160,6 +160,16 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .await?;
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
 
+    for _ in 0..24 {
+        let repeated_login = client
+            .post(format!("{base_url}/api/v1/auth/login"))
+            .header("X-Forwarded-For", "203.0.113.10")
+            .json(&json!({ "username": "admin", "password": "correct password" }))
+            .send()
+            .await?;
+        assert_eq!(repeated_login.status(), reqwest::StatusCode::OK);
+    }
+
     let dashboard = client
         .get(format!("{base_url}/api/v1/admin/dashboard"))
         .header(COOKIE, &cookies)
