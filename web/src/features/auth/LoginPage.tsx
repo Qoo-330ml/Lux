@@ -32,9 +32,9 @@ export function LoginPage() {
         <div className="lux-auth-brand"><LuxLogo className="lux-brand-logo" /><strong>Lux</strong></div>
         <h1>欢迎回到 Lux</h1>
         <p>进入你的私人电影空间。</p>
-        <form className="lux-auth-form" onSubmit={submit}>
-          <label>用户名<input value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required /></label>
-          <label>密码<input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" required /></label>
+        <form className="lux-auth-form" autoComplete="on" onSubmit={submit}>
+          <label htmlFor="username">用户名<input id="username" name="username" type="text" value={username} onChange={(event) => setUsername(event.target.value)} autoComplete="username" required /></label>
+          <label htmlFor="password">密码<input id="password" name="password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="current-password" required /></label>
           <button className="lux-button lux-button-large lux-button-primary" type="submit" disabled={login.isPending}>{login.isPending ? "正在进入…" : "进入 Lux"}</button>
         </form>
         {login.error ? <p className="lux-error-copy" role="alert">{login.error.message}</p> : null}

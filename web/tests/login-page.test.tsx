@@ -22,6 +22,31 @@ describe("LoginPage session state", () => {
     vi.restoreAllMocks();
   });
 
+  it("renders standard credential autofill metadata", () => {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    const form = container.querySelector<HTMLFormElement>("form.lux-auth-form");
+    const username = container.querySelector<HTMLInputElement>("#username");
+    const password = container.querySelector<HTMLInputElement>("#password");
+
+    expect(form?.getAttribute("autocomplete")).toBe("on");
+    expect(username?.getAttribute("name")).toBe("username");
+    expect(username?.getAttribute("autocomplete")).toBe("username");
+    expect(password?.getAttribute("name")).toBe("password");
+    expect(password?.getAttribute("autocomplete")).toBe("current-password");
+  });
+
   it("stores the authenticated user under the session shape used by routes", async () => {
     const user = {
       id: "user-1",
