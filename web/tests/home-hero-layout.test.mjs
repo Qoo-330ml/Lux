@@ -16,6 +16,13 @@ test("hero carousel controls share a flexible row and stay at its right edge", (
   assert.match(carouselRule, /margin-top:\s*0/);
 });
 
+test("hero carousel uses a bordered progress dot instead of arrow controls", () => {
+  assert.doesNotMatch(stylesheet, /\.lux-hero-carousel-arrow/);
+  assert.match(stylesheet, /\.lux-hero-dot\.is-active\s*\{[^}]*border:\s*1px\s+solid/);
+  assert.match(stylesheet, /\.lux-hero-dot-progress\s*\{[^}]*animation:\s*lux-hero-dot-progress/);
+  assert.match(stylesheet, /@keyframes lux-hero-dot-progress\s*\{[\s\S]*?100%\s*\{[^}]*transform:\s*scaleX\(1\)/);
+});
+
 test("hero keeps a shorter vertical footprint across responsive breakpoints", () => {
   assert.match(stylesheet, /\.lux-hero\s*\{[^}]*min-height:\s*min\(82vh,\s*820px\)/);
   assert.match(stylesheet, /@media \(max-width: 900px\) \{[\s\S]*?\.lux-hero\s*\{\s*min-height:\s*680px/);

@@ -6,6 +6,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { HomePage } from "../src/features/home/HomePage";
+import { HERO_CAROUSEL_INTERVAL_MS } from "../src/features/home/carousel";
 import { api } from "../src/lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../src/lib/api/query-keys";
 import { accountSettingsStorageKey } from "../src/features/account/account-settings";
@@ -229,6 +230,99 @@ describe("HomePage shelves", () => {
     expect(actionRow?.querySelector(".lux-hero-actions")).not.toBeNull();
     expect(actionRow?.querySelector(".lux-hero-carousel-controls")).not.toBeNull();
     expect(actionRow?.querySelector(".lux-hero-carousel-controls")?.parentElement).toBe(actionRow);
+  });
+
+  it("uses clickable dots without arrows for quick selection", async () => {
+    vi.spyOn(api, "home").mockResolvedValue({
+      libraries: [],
+      recommended: [
+        { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+        { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+      ],
+      continueWatching: [],
+      recentlyAdded: [],
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <HomePage user={user} />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const controls = container.querySelector(".lux-hero-carousel-controls");
+    expect(controls?.querySelectorAll(".lux-hero-carousel-arrow")).toHaveLength(0);
+    expect(controls?.querySelectorAll(".lux-hero-dot")).toHaveLength(2);
+    expect(controls?.querySelector(".lux-hero-dot.is-active .lux-hero-dot-progress")).not.toBeNull();
+
+    const dots = controls?.querySelectorAll<HTMLButtonElement>(".lux-hero-dot");
+    await act(async () => {
+      dots?.[1].click();
+      await new Promise((resolve) => setTimeout(resolve, 450));
+    });
+    const nextDots = container.querySelectorAll<HTMLButtonElement>(".lux-hero-dot");
+    expect(nextDots[1].getAttribute("aria-current")).toBe("true");
+    expect(nextDots[1].querySelector(".lux-hero-dot-progress")).not.toBeNull();
+  });
+
+  it("advances to the next slide after the active dot's fill duration", async () => {
+    try {
+      vi.spyOn(api, "home").mockResolvedValue({
+        libraries: [],
+        recommended: [
+          { id: "featured-1", title: "精选电影", itemType: "MOVIE" },
+          { id: "featured-2", title: "精选剧集", itemType: "SERIES" },
+        ],
+        continueWatching: [],
+        recentlyAdded: [],
+      });
+
+      container = document.createElement("div");
+      document.body.append(container);
+      root = createRoot(container);
+      const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+      await act(async () => {
+        root?.render(
+          <QueryClientProvider client={queryClient}>
+            <MemoryRouter>
+              <HomePage user={user} />
+            </MemoryRouter>
+          </QueryClientProvider>,
+        );
+      });
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(container.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
+        .toContain("第 1 条精选");
+
+      vi.useFakeTimers();
+      await act(async () => {
+        container.querySelectorAll<HTMLButtonElement>(".lux-hero-dot")[1]?.click();
+        vi.advanceTimersByTime(HERO_CAROUSEL_INTERVAL_MS);
+        vi.advanceTimersByTime(450);
+      });
+      expect(container.querySelector<HTMLButtonElement>(".lux-hero-dot.is-active")?.getAttribute("aria-label"))
+        .toContain("第 1 条精选");
+    } finally {
+      if (vi.isFakeTimers()) {
+        act(() => root?.unmount());
+        root = undefined;
+      }
+      vi.useRealTimers();
+    }
   });
 
   it("starts an unfinished episode when the carousel highlights its series", async () => {

@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { AnimatePresence, motion } from "framer-motion";
-import { ChevronLeft, ChevronRight, Info, Play } from "lucide-react";
+import { Info, Play } from "lucide-react";
 import { Link } from "react-router-dom";
 import { useEffect, useMemo, useState } from "react";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
@@ -109,12 +109,12 @@ function HeroCarousel({ items, continueWatching }: { items: MediaItem[]; continu
 
   useEffect(() => {
     if (items.length < 2) return undefined;
-    const interval = window.setInterval(
+    const timeout = window.setTimeout(
       () => setActiveIndex((index) => (index + 1) % items.length),
       HERO_CAROUSEL_INTERVAL_MS,
     );
-    return () => window.clearInterval(interval);
-  }, [items.length, slideKey]);
+    return () => window.clearTimeout(timeout);
+  }, [activeIndex, items.length, slideKey]);
 
   const safeIndex = items.length ? activeIndex % items.length : 0;
   const item = items[safeIndex];
@@ -155,7 +155,7 @@ function HeroCarousel({ items, continueWatching }: { items: MediaItem[]; continu
               <Link className="lux-button lux-button-large lux-button-primary" to={playbackHref}><Play size={17} fill="currentColor" /> {item ? playbackLabel : "浏览媒体库"}</Link>
               {item ? <Link className="lux-button lux-button-large lux-button-glass" to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
             </div>
-            {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><button className="lux-hero-carousel-arrow" type="button" aria-label="上一条精选" onClick={() => goTo(safeIndex - 1)}><ChevronLeft size={17} /></button><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)} />)}</div><button className="lux-hero-carousel-arrow" type="button" aria-label="下一条精选" onClick={() => goTo(safeIndex + 1)}><ChevronRight size={17} /></button></div> : null}
+            {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className="lux-hero-dot-progress" aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
           </div>
         </motion.div>
       </AnimatePresence>
