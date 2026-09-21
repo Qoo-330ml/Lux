@@ -1902,13 +1902,25 @@ fn emby_session_playback_details(
     web_session: Option<&crate::storage::StoredWebPlaybackSession>,
 ) -> (&'static str, Option<Value>) {
     let Some(web_session) = web_session.filter(|session| session.plan == "SERVER_HLS") else {
+        let play_method = if session.play_session_id.starts_with("lux-emby:") {
+            "Transcode"
+        } else {
+            "DirectPlay"
+        };
         return (
-            if session.play_session_id.starts_with("lux-emby:") {
-                "Transcode"
-            } else {
-                "DirectPlay"
-            },
-            None,
+            play_method,
+            Some(json!({
+                // Session-card consumers perform arithmetic on these fields,
+                // including for direct play and sessions without probe data.
+                "Container": "",
+                "VideoCodec": "",
+                "AudioCodec": "",
+                "VideoBitrate": 0,
+                "AudioBitrate": 0,
+                "Bitrate": 0,
+                "IsVideoDirect": play_method == "DirectPlay",
+                "IsAudioDirect": play_method == "DirectPlay",
+            })),
         );
     };
     let play_method = if web_session.tier <= i64::from(ServerTier::Remux.number()) {
@@ -1920,15 +1932,20 @@ fn emby_session_playback_details(
         .video_bitrate
         .unwrap_or_default()
         .saturating_add(web_session.audio_bitrate.unwrap_or_default());
+    let container = web_session.transcoding_container.as_deref().unwrap_or("");
+    let video_codec = web_session.video_codec.as_deref().unwrap_or("");
+    let audio_codec = web_session.audio_codec.as_deref().unwrap_or("");
+    let video_bitrate = web_session.video_bitrate.unwrap_or_default();
+    let audio_bitrate = web_session.audio_bitrate.unwrap_or_default();
     (
         play_method,
         Some(json!({
-            "Container": web_session.transcoding_container,
-            "VideoCodec": web_session.video_codec,
-            "AudioCodec": web_session.audio_codec,
-            "VideoBitrate": web_session.video_bitrate,
-            "AudioBitrate": web_session.audio_bitrate,
-            "Bitrate": (total_bitrate > 0).then_some(total_bitrate),
+            "Container": container,
+            "VideoCodec": video_codec,
+            "AudioCodec": audio_codec,
+            "VideoBitrate": video_bitrate,
+            "AudioBitrate": audio_bitrate,
+            "Bitrate": total_bitrate,
             "IsVideoDirect": web_session.tier <= i64::from(ServerTier::AudioTranscode.number()),
             "IsAudioDirect": web_session.tier == i64::from(ServerTier::Remux.number()),
         })),

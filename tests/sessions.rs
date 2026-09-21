@@ -378,6 +378,9 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .ok_or("missing direct playback session")?;
     assert_eq!(direct_session["UserName"], "Admin");
     assert_eq!(direct_session["NowPlayingItem"]["Name"], "Session Movie");
+    assert_eq!(direct_session["TranscodingInfo"]["Bitrate"], 0);
+    assert_eq!(direct_session["TranscodingInfo"]["VideoBitrate"], 0);
+    assert_eq!(direct_session["TranscodingInfo"]["AudioBitrate"], 0);
     let direct_stopped = client
         .post(format!("{event_url}/Stopped"))
         .header("X-Emby-Token", &token)

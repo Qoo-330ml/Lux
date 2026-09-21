@@ -67,6 +67,9 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 `UserId` 映射用户名，不会把所有会话显示成管理员。`tests/sessions.rs` 已覆盖 Emby 播放会话和独立直播放会话的用户名、标题及停止后移除；
 该自动化证据不替代 FNOS 部署后的 nextEmby 轮询和真实客户端停止事件复测。
 
+同日会话数值兼容：`TranscodingInfo` 的码率字段在直播放、未知探针结果和服务端 HLS 会话中统一返回非空整数，未知值为 `0`；
+这样依赖数值比较的第三方会话卡片不会因 `None > 0` 失败。空的 codec/container 也返回空字符串，不影响 `PlayMethod` 和真实转码码率。
+
 2026-09-20 容器兼容修复：Emby HLS 会话现在默认使用 MPEG-TS，`TranscodingContainer=ts`、
 `TranscodingMimeType=video/mp2t`，清单直接列出 `.ts` 分片且不生成 `EXT-X-MAP`；只有客户端明确声明
 `mp4`/`fmp4` 时才使用 `TranscodingContainer=mp4` 的 fMP4/CMAF 和对应 init 分片。master、逻辑分片和
