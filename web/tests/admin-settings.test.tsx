@@ -171,6 +171,40 @@ describe("AdminSettingsPage network proxy", () => {
     });
   });
 
+  it("saves the login background source and explains its public visibility", async () => {
+    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
+      ...settings,
+      loginBackgroundSource: "RECENTLY_ADDED",
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
+    expect(select?.value).toBe("STATIC");
+    expect(container.textContent).toContain("未登录页面公开展示");
+    await act(async () => {
+      select!.value = "RECENTLY_ADDED";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("保存登录页背景"))
+        ?.click();
+    });
+
+    expect(update).toHaveBeenCalledWith({ loginBackgroundSource: "RECENTLY_ADDED" });
+  });
+
   it("shows the shared API key in server settings", async () => {
     vi.spyOn(api, "adminApiKey").mockResolvedValue({ configured: false, apiKey: null });
     const rotate = vi.spyOn(api, "rotateAdminApiKey").mockResolvedValue({
