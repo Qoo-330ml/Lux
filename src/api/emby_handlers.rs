@@ -219,6 +219,198 @@ pub(super) async fn emby_refresh_item(
         .into_response()
 }
 
+pub(super) async fn emby_media_updated(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<EmbyMediaUpdatedRequest>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    if request.updates.is_empty() {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+
+    let roots = match database.list_all_library_roots().await {
+        Ok(roots) => roots,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut changes_by_library = HashMap::<
+        crate::domain::ids::LibraryId,
+        Vec<crate::application::scanner::IncrementalScanChange>,
+    >::new();
+    for update in request.updates {
+        let path = PathBuf::from(update.path.trim());
+        let Some((root, root_path)) = emby_matching_root(&roots, &path) else {
+            continue;
+        };
+        let Ok(library_id) = root.library_id.parse() else {
+            continue;
+        };
+        let Ok(relative_path) = path.strip_prefix(&root_path) else {
+            continue;
+        };
+        let Some(relative_path) = relative_path.to_str() else {
+            continue;
+        };
+        if relative_path.is_empty() {
+            continue;
+        }
+        changes_by_library.entry(library_id).or_default().push(
+            crate::application::scanner::IncrementalScanChange {
+                root_id: root.id.clone(),
+                relative_path: relative_path.to_owned(),
+                kind: emby_update_change_kind(&update.update_type),
+            },
+        );
+    }
+    if changes_by_library.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    let mut jobs = Vec::with_capacity(changes_by_library.len());
+    for (library_id, changes) in changes_by_library {
+        match scan_jobs
+            .enqueue_incremental_changes(library_id, changes)
+            .await
+        {
+            Ok(job) => jobs.push(job),
+            Err(ScanJobError::LibraryNotFound | ScanJobError::NoChanges) => continue,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    if jobs.is_empty() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    for job in &jobs {
+        spawn_emby_scan_job(&state, job.id.clone());
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "scope": "PATH",
+            "jobs": jobs.iter().map(scan_job_json).collect::<Vec<_>>(),
+        })),
+    )
+        .into_response()
+}
+
+pub(super) async fn emby_scheduled_tasks(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut active_full_scan = None;
+    for status in ["PENDING", "RUNNING"] {
+        let jobs = match database.list_scan_jobs(Some(status), 0, 10_000).await {
+            Ok(jobs) => jobs,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        if let Some(job) = jobs
+            .into_iter()
+            .find(|job| job.job_type != "INCREMENTAL_SCAN")
+        {
+            active_full_scan = Some(job);
+            break;
+        }
+    }
+    let state = active_full_scan.as_ref().map_or("Idle", |_| "Running");
+    let progress = active_full_scan
+        .as_ref()
+        .filter(|job| job.total_count > 0)
+        .map(|job| {
+            ((job.processed_count.max(0) as f64 / job.total_count as f64) * 100.0).clamp(0.0, 100.0)
+        })
+        .unwrap_or(0.0);
+    Json(json!([{
+        "Id": "lux-refresh-media-library",
+        "Name": "Scan media library",
+        "Key": "RefreshMediaLibrary",
+        "Description": "Scans the media library for new and updated items.",
+        "Category": "Library",
+        "IsHidden": false,
+        "IsEnabled": true,
+        "State": state,
+        "CurrentProgressPercentage": progress,
+        "LastExecutionResult": Value::Null,
+        "Triggers": [],
+    }]))
+    .into_response()
+}
+
+fn emby_update_change_kind(update_type: &str) -> crate::application::watch::ChangeKind {
+    match update_type.trim().to_ascii_lowercase().as_str() {
+        "created" | "create" => crate::application::watch::ChangeKind::Create,
+        "deleted" | "delete" | "removed" | "remove" => {
+            crate::application::watch::ChangeKind::Remove
+        }
+        "renamed" | "rename" => crate::application::watch::ChangeKind::Rename,
+        _ => crate::application::watch::ChangeKind::Modify,
+    }
+}
+
+fn emby_matching_root<'a>(
+    roots: &'a [crate::storage::StoredLibraryRoot],
+    path: &FsPath,
+) -> Option<(&'a crate::storage::StoredLibraryRoot, PathBuf)> {
+    let mut matching: Option<(&'a crate::storage::StoredLibraryRoot, PathBuf)> = None;
+    for root in roots {
+        for root_path in [&root.canonical_path, &root.display_path] {
+            let root_path = FsPath::new(root_path);
+            if !path.starts_with(root_path)
+                || matching.as_ref().is_some_and(|(_, current)| {
+                    current.components().count() >= root_path.components().count()
+                })
+            {
+                continue;
+            }
+            matching = Some((root, root_path.to_path_buf()));
+        }
+    }
+    matching
+}
+
+fn spawn_emby_scan_job(state: &AppState, job_id: String) {
+    let Some(scan_jobs) = state.scan_jobs.clone() else {
+        return;
+    };
+    let probe = state.probe.clone();
+    let metadata = state.metadata_reidentify.clone();
+    let thumbnails = state.thumbnails.clone();
+    tokio::spawn(async move {
+        let _ = scan_jobs
+            .run_to_completion_with_metadata_and_thumbnails(
+                &job_id,
+                BACKGROUND_SCAN_BATCH_SIZE,
+                probe,
+                metadata,
+                thumbnails,
+            )
+            .await;
+    });
+}
+
 #[derive(Deserialize, Default)]
 pub(super) struct EmbyDisplayPreferencesQuery {
     #[serde(flatten)]
@@ -1482,6 +1674,20 @@ pub(super) struct EmbyRefreshQuery {
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) recursive: Option<bool>,
+}
+
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyMediaUpdatedRequest {
+    #[serde(rename = "Updates", alias = "updates", default)]
+    pub(super) updates: Vec<EmbyMediaUpdatedEntry>,
+}
+
+#[derive(Deserialize)]
+pub(super) struct EmbyMediaUpdatedEntry {
+    #[serde(rename = "Path", alias = "path", default)]
+    pub(super) path: String,
+    #[serde(rename = "UpdateType", alias = "updateType", default)]
+    pub(super) update_type: String,
 }
 
 #[derive(Deserialize, Default)]

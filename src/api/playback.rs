@@ -3357,7 +3357,34 @@ pub(super) async fn lux_web_playback_event(
         let Some(database) = state.database.as_ref() else {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         };
-        let played_percent = match database.user_played_percent(&user.id.to_string()).await {
+        let user_id = user.id.to_string();
+        let previous_session = match database
+            .find_playback_session(&user_id, &session.play_session_id)
+            .await
+        {
+            Ok(session) => session,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        let activity_event =
+            playback_activity_event_type(previous_session.as_ref(), request.state.as_str());
+        let resumed = playback_resumed(previous_session.as_ref(), request.state.as_str());
+        let occurred_at = current_unix_timestamp();
+        let webhook_event = webhook_event_type_for_playback(
+            activity_event,
+            should_publish_playback_progress(
+                previous_session.as_ref(),
+                request.state.as_str(),
+                request.position_ticks,
+                occurred_at,
+            ),
+        );
+        let remote_ip = request_client_ip(&headers, &state.remote_access);
+        let activity_remote_ip = remote_ip.as_deref().or_else(|| {
+            previous_session
+                .as_ref()
+                .and_then(|session| session.remote_ip.as_deref())
+        });
+        let played_percent = match database.user_played_percent(&user_id).await {
             Ok(value) => value,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
@@ -3372,7 +3399,7 @@ pub(super) async fn lux_web_playback_event(
                 device_name: Some("Web"),
                 client_version: None,
                 device_type: Some("Web"),
-                remote_ip: request_client_ip(&headers, &state.remote_access).as_deref(),
+                remote_ip: remote_ip.as_deref(),
                 state: request.state.as_str(),
                 position_ticks: request.position_ticks,
                 duration_ticks: request.duration_ticks,
@@ -3391,6 +3418,51 @@ pub(super) async fn lux_web_playback_event(
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        if let Some(event_type) = activity_event {
+            record_activity_event(
+                Some(database),
+                &state.admin_events,
+                &user_id,
+                event_type,
+                Some(&session.item_id),
+                json!({
+                    "client": "Lux",
+                    "deviceType": "Web",
+                    "deviceName": "Web",
+                    "state": request.state.as_str(),
+                    "remoteIp": activity_remote_ip,
+                }),
+            )
+            .await;
+        }
+        if let Some(event_type) = webhook_event {
+            publish_playback_webhook(
+                &state,
+                event_type,
+                occurred_at,
+                &session.item_id,
+                session.media_source_id.as_deref(),
+                &session.play_session_id,
+                request.state.as_str(),
+                request.position_ticks,
+                request.duration_ticks,
+                matches!(request.state, LuxPlaybackState::Paused),
+                Some("Lux"),
+                Some("Web"),
+                Some("Web"),
+                None,
+                &user.display_name,
+                AccessPrincipal::new(user.id, user.is_admin),
+                web_playback_notification_method(&session),
+                if event_type_is_stopped(event_type) {
+                    activity_remote_ip
+                } else {
+                    None
+                },
+                resumed,
+            )
+            .await;
+        }
     }
     Json(json!({
         "accepted": claim == WebPlaybackEventClaim::Accepted,
@@ -3398,6 +3470,19 @@ pub(super) async fn lux_web_playback_event(
         "stale": claim == WebPlaybackEventClaim::Stale,
     }))
     .into_response()
+}
+
+fn web_playback_notification_method(
+    session: &crate::storage::StoredWebPlaybackSession,
+) -> Option<&'static str> {
+    if session.plan != "SERVER_HLS" {
+        return None;
+    }
+    if session.tier <= i64::from(ServerTier::Remux.number()) {
+        Some("DirectStream")
+    } else {
+        Some("Transcode")
+    }
 }
 
 pub(super) async fn lux_web_playback_heartbeat(

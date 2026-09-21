@@ -1,6 +1,10 @@
+use axum::{Router, body::Bytes, extract::State, response::IntoResponse, routing::post};
 use luxd::{
     api::{AppState, app_with_state},
-    application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
+    application::{
+        libraries::LibraryService, scanner::LibraryScanner, setup::SetupService,
+        webhooks::WebhookService,
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
@@ -8,7 +12,7 @@ use luxd::{
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::mpsc};
 
 fn emby_public_id(id: &str) -> String {
     uuid::Uuid::parse_str(id)
@@ -31,6 +35,22 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> Option<Stri
 #[tokio::test]
 async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
 -> Result<(), Box<dyn std::error::Error>> {
+    let (sender, mut receiver) = mpsc::channel::<Bytes>(2);
+    let receiver_app = Router::new()
+        .route(
+            "/hook",
+            post(
+                |State(sender): State<mpsc::Sender<Bytes>>, body: Bytes| async move {
+                    let _ = sender.send(body).await;
+                    ().into_response()
+                },
+            ),
+        )
+        .with_state(sender);
+    let receiver_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let receiver_address = receiver_listener.local_addr()?;
+    let receiver_server =
+        tokio::spawn(async move { axum::serve(receiver_listener, receiver_app).await });
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
         http_addr: "127.0.0.1:8097".parse()?,
@@ -60,6 +80,22 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
         .bind(&item_id)
         .fetch_one(database.pool())
+        .await?;
+    let webhook_service = WebhookService::new(database.clone(), temp_dir.path().join("config"))?;
+    webhook_service
+        .create_destination(
+            "Web playback receiver",
+            &format!("http://{receiver_address}/hook"),
+            true,
+            true,
+            &[
+                "PLAYBACK_STARTED".to_owned(),
+                "PLAYBACK_PAUSED".to_owned(),
+                "PLAYBACK_PROGRESS".to_owned(),
+                "PLAYBACK_STOPPED".to_owned(),
+            ],
+            Some("web-playback-secret"),
+        )
         .await?;
     let fixed_caption_tracks = [
         (2_i64, "subrip", "zho", "中文", 1_i64),
@@ -199,6 +235,22 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let accepted = event("event-1", 1, "PLAYING", 500).send().await?;
     assert_eq!(accepted.status(), reqwest::StatusCode::OK);
     assert_eq!(accepted.json::<Value>().await?["accepted"], true);
+    assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
+    let started: Value = serde_json::from_slice(
+        &receiver
+            .recv()
+            .await
+            .ok_or("missing web playback notification")?,
+    )?;
+    assert_eq!(started["eventType"], "PLAYBACK_STARTED");
+    let activity_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM audit_events
+         WHERE event_type = 'PLAYBACK_STARTED' AND target_id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(activity_count, 1);
     let duplicate = event("event-1", 1, "PLAYING", 100).send().await?;
     assert_eq!(duplicate.json::<Value>().await?["duplicate"], true);
     let stale = event("event-2", 0, "PAUSED", 0).send().await?;
@@ -294,6 +346,32 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let strm_direct_session_id = strm_direct_body["sessionId"]
         .as_str()
         .ok_or("missing direct STRM session id")?;
+    let strm_event = client
+        .post(format!(
+            "{base_url}/api/v1/playback/sessions/{strm_direct_session_id}/events"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "eventId": "strm-event-1",
+            "sequence": 1,
+            "state": "PLAYING",
+            "positionTicks": 0,
+            "durationTicks": 1_000
+        }))
+        .send()
+        .await?;
+    assert_eq!(strm_event.status(), reqwest::StatusCode::OK);
+    assert_eq!(strm_event.json::<Value>().await?["accepted"], true);
+    assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
+    let strm_started: Value = serde_json::from_slice(
+        &receiver
+            .recv()
+            .await
+            .ok_or("missing STRM playback notification")?,
+    )?;
+    assert_eq!(strm_started["eventType"], "PLAYBACK_STARTED");
+    assert_eq!(strm_started["playMethod"], "DirectStream");
     let strm_direct_stopped = client
         .delete(format!(
             "{base_url}/api/v1/playback/sessions/{strm_direct_session_id}"
@@ -359,5 +437,6 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     assert_eq!(after_stop.status(), reqwest::StatusCode::GONE);
 
     server.abort();
+    receiver_server.abort();
     Ok(())
 }

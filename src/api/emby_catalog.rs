@@ -2,9 +2,7 @@ use super::*;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
-const EMBY_LATEST_SERIES_EPISODE_PAGE_SIZE: i64 = 100;
-const EMBY_LATEST_SERIES_EPISODE_MAX_ITEMS: i64 = 10_000;
-const EMBY_VIDHUB_SHOW_EPISODE_MAX_ITEMS: i64 = 4_096;
+const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = 4_096;
 
 use crate::application::catalog::CatalogItemCounts;
 
@@ -900,12 +898,8 @@ pub(super) async fn emby_user_latest(
     query.sort_by = Some("DateCreated".to_owned());
     query.sort_order = Some("Descending".to_owned());
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let page = match emby_latest_series_episode_compat_page(&state, principal, &query).await {
-        Ok(Some(page)) => page,
-        Ok(None) => match emby_catalog_page_from_query(&state, principal, &query).await {
-            Ok(page) => page,
-            Err(status) => return status.into_response(),
-        },
+    let page = match emby_catalog_page_from_query(&state, principal, &query).await {
+        Ok(page) => page,
         Err(status) => return status.into_response(),
     };
     if group_items && emby_latest_groups_children(&query) {
@@ -955,75 +949,6 @@ pub(super) async fn emby_user_latest(
         Ok(items) => Json(items).into_response(),
         Err(status) => status.into_response(),
     }
-}
-
-pub(super) async fn emby_latest_series_episode_compat_page(
-    state: &AppState,
-    principal: AccessPrincipal,
-    query: &EmbyItemsQuery,
-) -> Result<Option<CatalogPage>, StatusCode> {
-    let requests_episodes_only = query.include_item_types.as_deref().is_some_and(|types| {
-        let mut item_types = types
-            .split(',')
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        matches!(item_types.next(), Some(value) if value.eq_ignore_ascii_case("episode"))
-            && item_types.next().is_none()
-    });
-    if query.start_index.unwrap_or(0) != 0
-        || query.group_items != Some(false)
-        || !requests_episodes_only
-    {
-        return Ok(None);
-    }
-    let Some(parent_id) = query.parent_id.as_deref().map(emby_internal_id) else {
-        return Ok(None);
-    };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
-    let parent = catalog
-        .find_item(principal, &parent_id)
-        .await
-        .map_err(emby_catalog_error_status)?;
-    if !matches!(parent.as_ref(), Some(item) if item.item_type == "SERIES") {
-        return Ok(None);
-    }
-
-    // Some Emby clients use this array-shaped endpoint as the series detail
-    // episode list and do not request a second page. Preserve the normal
-    // Limit contract for every other query, but make this compatibility shape
-    // useful by fetching a bounded number of pages internally.
-    let season_id = query.season_id.as_deref().map(emby_internal_id);
-    let mut items = Vec::new();
-    let mut offset = 0;
-    let mut total = 0;
-    while offset < EMBY_LATEST_SERIES_EPISODE_MAX_ITEMS {
-        let page = catalog
-            .list_series_episodes(
-                principal,
-                &parent_id,
-                season_id.as_deref(),
-                offset,
-                EMBY_LATEST_SERIES_EPISODE_PAGE_SIZE,
-            )
-            .await
-            .map_err(emby_catalog_error_status)?;
-        total = page.total;
-        let page_len = i64::try_from(page.items.len()).unwrap_or(i64::MAX);
-        items.extend(page.items);
-        if page_len == 0 || offset + page_len >= total {
-            break;
-        }
-        offset += page_len;
-    }
-
-    Ok(Some(CatalogPage {
-        items,
-        total,
-        offset: 0,
-        limit: EMBY_LATEST_SERIES_EPISODE_MAX_ITEMS,
-    }))
 }
 
 pub(super) async fn emby_user_favorites(
@@ -1298,19 +1223,9 @@ pub(super) async fn emby_show_episodes(
         Ok(user) => user,
         Err(status) => return status.into_response(),
     };
-    let (offset, requested_limit) = match emby_page_params(&query) {
+    let (offset, limit) = match emby_show_episode_page_params(&query) {
         Ok(params) => params,
         Err(status) => return status.into_response(),
-    };
-    // VidHub's season screen requests the first page from this endpoint but
-    // does not continue with StartIndex when the response contains a normal
-    // Emby page. Keep the standard page contract for other clients, while
-    // returning a bounded complete episode list for this exact compatibility
-    // shape.
-    let limit = if offset == 0 && is_vidhub_request(&headers) {
-        EMBY_VIDHUB_SHOW_EPISODE_MAX_ITEMS
-    } else {
-        requested_limit
     };
     let Some(catalog) = state.catalog.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -1422,22 +1337,6 @@ pub(super) async fn emby_collection_children(
         }
         Err(CatalogError::Storage(_)) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-}
-
-fn is_vidhub_request(headers: &HeaderMap) -> bool {
-    ["user-agent", "x-emby-client", "x-mediabrowser-client"]
-        .iter()
-        .filter_map(|name| header_str(headers, name))
-        .any(is_vidhub_user_agent)
-}
-
-fn is_vidhub_user_agent(value: &str) -> bool {
-    value.split_ascii_whitespace().next().is_some_and(|client| {
-        client.eq_ignore_ascii_case("vidhub")
-            || client
-                .get(.."VidHub/".len())
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("VidHub/"))
-    })
 }
 
 pub(super) async fn emby_catalog_page_for_user_with_fields(
@@ -2932,6 +2831,17 @@ pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), Sta
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
     if offset < 0 || !(1..=100).contains(&limit) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((offset, limit))
+}
+
+pub(super) fn emby_show_episode_page_params(
+    query: &EmbyItemsQuery,
+) -> Result<(i64, i64), StatusCode> {
+    let offset = query.start_index.unwrap_or(0);
+    let limit = query.limit.unwrap_or(EMBY_SHOW_EPISODE_DEFAULT_LIMIT);
+    if offset < 0 || query.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))

@@ -97,6 +97,15 @@ Emby 兼容层提供 `DELETE /Items/{itemId}`。拥有服务器管理权限的 E
 返回 `403`，未知条目或媒体源返回 `404`。媒体详情 DTO 的 `CanDelete` 与该服务器管理权限保持一致，
 不会再固定返回 `false`。这只是协议回归证据，尚未据此宣称任一目标客户端的真实删除 UI 已实测。
 
+## Emby 增量同步状态兼容合同
+
+Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `RefreshMediaLibrary` 任务项。
+排队或运行中的非 `INCREMENTAL_SCAN` 任务报告为 `Running`，没有全库扫描任务时报告为 `Idle`；增量扫描本身不会
+阻塞该全库状态判断。该接口只提供状态观察，不会因为查询而启动扫描。
+
+自动化回归覆盖 `/emby/ScheduledTasks` 的管理员 API Key 调用、`RefreshMediaLibrary` 任务形状和排队全库扫描的
+`Running` 状态；这证明 Lux 服务端协议，不代表 Nextfind 已在 FNOS 部署实例上重新验证。
+
 ## 目标矩阵
 
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |

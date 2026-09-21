@@ -687,19 +687,34 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<StoredActivityEvent>, StorageError> {
+        let category_limit = (limit / 2).max(1);
         self.query(
-            "SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
-                    ae.event_type, ae.target_type, ae.target_id,
-                    mi.title AS target_title, ae.metadata_json, ae.created_at
-             FROM audit_events ae
-             LEFT JOIN users u ON u.id = ae.actor_user_id
-             LEFT JOIN media_items mi ON mi.id = ae.target_id
-             WHERE ae.event_type IN (
-                 'AUTH_LOGIN', 'PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED'
+            "WITH ranked_activity AS (
+                 SELECT ae.id, ae.actor_user_id, u.username_normalized AS actor_username,
+                        ae.event_type, ae.target_type, ae.target_id,
+                        mi.title AS target_title, ae.metadata_json, ae.created_at,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY CASE
+                                WHEN ae.event_type = 'AUTH_LOGIN' THEN 'AUTH'
+                                ELSE 'PLAYBACK'
+                            END
+                            ORDER BY ae.created_at DESC, ae.id DESC
+                        ) AS category_rank
+                 FROM audit_events ae
+                 LEFT JOIN users u ON u.id = ae.actor_user_id
+                 LEFT JOIN media_items mi ON mi.id = ae.target_id
+                 WHERE ae.event_type IN (
+                     'AUTH_LOGIN', 'PLAYBACK_STARTED', 'PLAYBACK_PAUSED', 'PLAYBACK_STOPPED'
+                 )
              )
-             ORDER BY ae.created_at DESC, ae.id DESC
+             SELECT id, actor_user_id, actor_username, event_type, target_type, target_id,
+                    target_title, metadata_json, created_at
+             FROM ranked_activity
+             WHERE category_rank <= ?
+             ORDER BY created_at DESC, id DESC
              LIMIT ?",
         )
+        .bind(category_limit)
         .bind(limit)
         .fetch_all(&self.pool)
         .await

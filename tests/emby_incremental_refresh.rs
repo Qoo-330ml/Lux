@@ -157,6 +157,111 @@ async fn emby_media_folders_returns_concrete_folder_ids_and_refreshes_one_folder
 }
 
 #[tokio::test]
+async fn emby_media_updated_queues_incremental_scan_for_absolute_path()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let new_folder = media_root.join("NewMovie");
+    tokio::fs::create_dir_all(&new_folder).await?;
+    let root = libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let (base_url, _server) = start_server(config, database.clone(), setup).await?;
+
+    let response = reqwest::Client::new()
+        .post(format!("{base_url}/Library/Media/Updated"))
+        .query(&[("api_key", key.as_str())])
+        .json(&json!({
+            "Updates": [{
+                "Path": new_folder.to_string_lossy(),
+                "UpdateType": "Created"
+            }]
+        }))
+        .send()
+        .await?;
+
+    let response_status = response.status();
+    let response_body = response.text().await?;
+    assert_eq!(response_status, StatusCode::ACCEPTED, "{response_body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&response_body)?["scope"],
+        "PATH"
+    );
+    let job_type: String = sqlx::query_scalar("SELECT job_type FROM scan_jobs LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(job_type, "INCREMENTAL_SCAN");
+    let queued_path: String =
+        sqlx::query_scalar("SELECT relative_path FROM scan_job_paths LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(queued_path, "NewMovie");
+    assert_eq!(root.library_id, library.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_scheduled_tasks_reports_library_scan_state() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let scan = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let (base_url, _server) = start_server(config, database, setup).await?;
+
+    let response = reqwest::Client::new()
+        .get(format!("{base_url}/emby/ScheduledTasks"))
+        .query(&[("api_key", key.as_str())])
+        .send()
+        .await?;
+    let response_status = response.status();
+    let response_body = response.text().await?;
+    assert_eq!(response_status, StatusCode::OK, "{response_body}");
+    let tasks = serde_json::from_str::<Vec<serde_json::Value>>(&response_body)?;
+    let refresh_task = tasks
+        .iter()
+        .find(|task| task["Key"] == "RefreshMediaLibrary")
+        .ok_or("missing RefreshMediaLibrary task")?;
+    assert_eq!(refresh_task["State"], "Running");
+    assert_eq!(refresh_task["IsHidden"], false);
+    assert_eq!(scan.status, "PENDING");
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_path_scan_queues_only_the_requested_relative_path()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
