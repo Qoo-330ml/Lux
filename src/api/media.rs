@@ -1935,7 +1935,7 @@ pub(super) async fn emby_stream(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    serve_media_file(
+    serve_emby_media_file(
         &state,
         principal,
         &headers,
@@ -1969,7 +1969,7 @@ pub(super) async fn emby_stream_with_container(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    serve_media_file(
+    serve_emby_media_file(
         &state,
         principal,
         &headers,
@@ -1997,7 +1997,7 @@ pub(super) async fn emby_stream_with_source(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    serve_media_file(
+    serve_emby_media_file(
         &state,
         principal,
         &headers,
@@ -2026,7 +2026,7 @@ pub(super) async fn emby_stream_with_source_and_container(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    serve_media_file(
+    serve_emby_media_file(
         &state,
         principal,
         &headers,
@@ -2125,6 +2125,12 @@ pub(super) fn percent_encode_filename(value: &str) -> String {
         .collect()
 }
 
+struct MediaFileRequest<'a> {
+    item_id: &'a str,
+    media_source_id: Option<&'a str>,
+    pass_through_external_url: bool,
+}
+
 pub(super) async fn serve_media_file(
     state: &AppState,
     principal: AccessPrincipal,
@@ -2134,11 +2140,59 @@ pub(super) async fn serve_media_file(
     media_source_id: Option<&str>,
     _requested_container: Option<&str>,
 ) -> Response {
+    serve_media_file_internal(
+        state,
+        principal,
+        headers,
+        method,
+        MediaFileRequest {
+            item_id,
+            media_source_id,
+            pass_through_external_url: false,
+        },
+    )
+    .await
+}
+
+pub(super) async fn serve_emby_media_file(
+    state: &AppState,
+    principal: AccessPrincipal,
+    headers: &HeaderMap,
+    method: &Method,
+    item_id: &str,
+    media_source_id: Option<&str>,
+    _requested_container: Option<&str>,
+) -> Response {
+    // Emby is also the handoff boundary for external proxies. Once Lux has
+    // authenticated the request, let the player issue the original URL
+    // request so its User-Agent, Range, cookies, and redirect state reach the
+    // 302 service unchanged.
+    serve_media_file_internal(
+        state,
+        principal,
+        headers,
+        method,
+        MediaFileRequest {
+            item_id,
+            media_source_id,
+            pass_through_external_url: true,
+        },
+    )
+    .await
+}
+
+async fn serve_media_file_internal(
+    state: &AppState,
+    principal: AccessPrincipal,
+    headers: &HeaderMap,
+    method: &Method,
+    request: MediaFileRequest<'_>,
+) -> Response {
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let source = match access
-        .authorized_playback_source(principal, item_id, media_source_id)
+        .authorized_playback_source(principal, request.item_id, request.media_source_id)
         .await
     {
         Ok(Some(source)) => source,
@@ -2151,6 +2205,11 @@ pub(super) async fn serve_media_file(
         };
         match classify_strm_target(&external_url).kind {
             StrmTargetKind::Url => {
+                if request.pass_through_external_url {
+                    // Do not consume a load-balanced redirect with Lux's
+                    // server-side Range: bytes=0-0 probe.
+                    return redirect_strm_playback(&external_url);
+                }
                 let Some(resolver) = state.strm_playback.as_ref() else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
                 };

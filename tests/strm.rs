@@ -393,6 +393,11 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         unsigned_remote_stream.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
+    let proxy_requests_before_emby_handoff = forwarded_user_agents
+        .lock()
+        .map_err(|_| "proxy mutex poisoned")?
+        .len();
+    let expected_remote_location = url::Url::parse(&remote_target)?.to_string();
     let signed_remote_stream = no_redirect_client
         .get(format!("http://{address}{remote_direct_url}"))
         .header(reqwest::header::USER_AGENT, "VidHub/9.0 (iPhone; iOS 18.0)")
@@ -404,7 +409,15 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         signed_remote_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/cdn.mkv"
+        expected_remote_location.as_str()
+    );
+    assert_eq!(
+        forwarded_user_agents
+            .lock()
+            .map_err(|_| "proxy mutex poisoned")?
+            .len(),
+        proxy_requests_before_emby_handoff,
+        "Emby handoff must not preflight the original 302 service from Lux"
     );
 
     let signed_path_stream = no_redirect_client
@@ -428,7 +441,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         senplayer_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/cdn.mkv"
+        expected_remote_location.as_str()
     );
 
     let numeric_senplayer_stream = no_redirect_client
@@ -446,7 +459,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         numeric_senplayer_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/cdn.mkv"
+        expected_remote_location.as_str()
     );
 
     let numeric_path_stream = no_redirect_client
@@ -481,7 +494,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         duplicate_source_query_stream.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/cdn.mkv"
+        expected_remote_location.as_str()
     );
 
     let path_stream = no_redirect_client
@@ -514,7 +527,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
     assert_eq!(
         unmatched_video_path.headers()[reqwest::header::LOCATION],
-        "http://media.example.test/cdn.mkv"
+        expected_remote_location.as_str()
     );
 
     let missing_source_video_path = no_redirect_client
@@ -606,11 +619,9 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     let forwarded_user_agents = forwarded_user_agents
         .lock()
         .map_err(|_| "proxy mutex poisoned")?;
-    assert!(!forwarded_user_agents.is_empty());
     assert!(
-        forwarded_user_agents
-            .iter()
-            .all(|user_agent| user_agent == player_user_agent)
+        forwarded_user_agents.is_empty(),
+        "Emby media requests must leave the original 302 request to the player"
     );
     server.abort();
     proxy_server.abort();
