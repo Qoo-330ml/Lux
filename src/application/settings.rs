@@ -3,6 +3,15 @@ use std::{io::Write, path::Path};
 use tokio::fs;
 
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
+pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";
+pub const RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE: &str = "RECENTLY_ADDED";
+
+pub fn is_valid_login_background_source(value: &str) -> bool {
+    matches!(
+        value,
+        DEFAULT_LOGIN_BACKGROUND_SOURCE | RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE
+    )
+}
 
 pub fn read_network_proxy_url(config_dir: &Path) -> Option<String> {
     read_secret(config_dir.join(NETWORK_PROXY_URL_FILE))

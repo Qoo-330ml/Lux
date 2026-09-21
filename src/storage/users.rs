@@ -1332,6 +1332,7 @@ impl Database {
         min_ticks: i64,
         media_strategy: &str,
         force_admin_library_order: bool,
+        login_background_source: &str,
     ) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
@@ -1348,6 +1349,10 @@ impl Database {
             (
                 "force_admin_library_order",
                 if force_admin_library_order { "1" } else { "0" }.to_owned(),
+            ),
+            (
+                "login_background_source",
+                login_background_source.to_owned(),
             ),
         ] {
             self.query(
@@ -1540,6 +1545,19 @@ impl Database {
         self.query_scalar(
             "SELECT value FROM server_settings
              WHERE key = 'media_strategy'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn login_background_source(&self) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'login_background_source'",
         )
         .fetch_optional(&self.pool)
         .await

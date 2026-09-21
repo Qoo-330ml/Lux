@@ -2,6 +2,10 @@ use super::*;
 
 use crate::auth::device_pairings::{DevicePairingError, PrismDeviceInfo};
 use crate::{
+    application::settings::{
+        DEFAULT_LOGIN_BACKGROUND_SOURCE, RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE,
+        is_valid_login_background_source,
+    },
     auth::sessions::AuthenticatedSession,
     security::{
         DEVICE_PAIRING_CREATE_LIMIT, DEVICE_PAIRING_REDEEM_LIMIT,
@@ -9,8 +13,61 @@ use crate::{
     },
 };
 
+const MAX_LOGIN_BACKGROUND_IMAGES: i64 = 18;
+
 pub(super) async fn live() -> Json<Value> {
     Json(json!({ "status": "ok" }))
+}
+
+pub(super) async fn login_background(State(state): State<AppState>) -> Response {
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let source = match database.login_background_source().await {
+        Ok(Some(source)) if is_valid_login_background_source(&source) => source,
+        Ok(_) => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if source != RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE {
+        return Json(json!({ "source": source, "images": [] })).into_response();
+    }
+
+    let Some(libraries) = state.libraries.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let enabled_library_ids = match libraries.list_libraries().await {
+        Ok(views) => views
+            .into_iter()
+            .filter(|view| view.library.is_enabled)
+            .map(|view| view.library.id.to_string())
+            .collect::<Vec<_>>(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let Some(catalog) = state.catalog.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let page = match catalog
+        .list_recently_added_for_library_ids(&enabled_library_ids, 0, MAX_LOGIN_BACKGROUND_IMAGES)
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let images = page
+        .items
+        .into_iter()
+        .filter_map(|item| {
+            let tag = item.poster_image_tag.as_deref()?;
+            Some(format!(
+                "/emby/Items/{}/Images/Primary?tag={}",
+                emby_public_id(&item.id),
+                percent_encode_filename(tag),
+            ))
+        })
+        .take(MAX_LOGIN_BACKGROUND_IMAGES as usize)
+        .collect::<Vec<_>>();
+
+    Json(json!({ "source": source, "images": images })).into_response()
 }
 
 pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
@@ -1808,6 +1865,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/health/live", get(users::live))
         .route("/health/ready", get(users::ready))
         .route("/api/v1/version", get(users::version))
+        .route(
+            "/api/v1/auth/login-background",
+            get(users::login_background),
+        )
         .route("/api/v1/setup/status", get(users::setup_status))
         .route("/api/v1/setup/database", get(users::setup_database_status))
         .route(
