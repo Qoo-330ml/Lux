@@ -14,6 +14,7 @@ const settings = {
   resumePlayedPercent: 90,
   resumeMinTicks: 1_200_000_000,
   forceAdminLibraryOrder: false,
+  loginBackgroundSource: "STATIC" as const,
   mediaStrategy: {
     metadataLanguage: "zh-CN",
     imageLanguage: "zh-CN",

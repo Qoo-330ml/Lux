@@ -992,6 +992,22 @@ describe("LuxApiClient", () => {
     });
   });
 
+  it("loads the anonymous login background contract", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      expect(String(input)).toBe("/api/v1/auth/login-background");
+      return new Response(JSON.stringify({
+        source: "RECENTLY_ADDED",
+        images: ["/emby/Items/123/Images/Primary?tag=poster-tag"],
+      }), { status: 200 });
+    });
+
+    await expect(new LuxApiClient().loginBackground()).resolves.toEqual({
+      source: "RECENTLY_ADDED",
+      images: ["/emby/Items/123/Images/Primary?tag=poster-tag"],
+    });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
   it("keeps the login CSRF nonce in memory when privacy mode blocks browser storage", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       if (String(input) === "/api/v1/auth/login") {

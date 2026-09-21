@@ -47,6 +47,13 @@ export type AuthSession = {
   serverName?: string | null;
 };
 
+export type LoginBackgroundSource = "STATIC" | "RECENTLY_ADDED";
+
+export type LoginBackgroundResponse = {
+  source: LoginBackgroundSource;
+  images: string[];
+};
+
 export type AdminApiKey = {
   configured: boolean;
   apiKey?: string | null;
@@ -915,6 +922,7 @@ export type AdminSettings = {
   resumePlayedPercent: number;
   resumeMinTicks: number;
   forceAdminLibraryOrder?: boolean;
+  loginBackgroundSource: LoginBackgroundSource;
   mediaStrategy: MediaStrategySettings;
   networkProxy?: AdminNetworkProxySettings;
 };

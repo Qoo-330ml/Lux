@@ -52,6 +52,7 @@ import type {
   ItemMetadata,
   ItemImage,
   ImageSearchResult,
+  LoginBackgroundResponse,
   MetadataFieldName,
   PageResponse,
   PersonDetail,
@@ -262,6 +263,10 @@ export class LuxApiClient {
       }
       return response.user;
     });
+  }
+
+  loginBackground() {
+    return this.request<LoginBackgroundResponse>("/api/v1/auth/login-background");
   }
 
   logout() {
