@@ -358,7 +358,12 @@ struct EmbyPlaybackInfoRequest {
     audio_stream_index: Option<i64>,
     #[serde(rename = "SubtitleStreamIndex", alias = "subtitleStreamIndex")]
     subtitle_stream_index: Option<i64>,
-    #[serde(rename = "MaxAudioChannels", alias = "maxAudioChannels")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_emby_optional_i64",
+        rename = "MaxAudioChannels",
+        alias = "maxAudioChannels"
+    )]
     max_audio_channels: Option<i64>,
     #[serde(rename = "StartTimeTicks", alias = "startTimeTicks")]
     start_time_ticks: Option<i64>,
@@ -620,7 +625,12 @@ struct EmbyPlaybackProfile {
     video_codec: Option<String>,
     #[serde(rename = "AudioCodec", alias = "audioCodec")]
     audio_codec: Option<String>,
-    #[serde(rename = "MaxAudioChannels", alias = "maxAudioChannels")]
+    #[serde(
+        default,
+        deserialize_with = "deserialize_emby_optional_i64",
+        rename = "MaxAudioChannels",
+        alias = "maxAudioChannels"
+    )]
     max_audio_channels: Option<i64>,
     #[serde(rename = "Protocol", alias = "protocol")]
     protocol: Option<String>,
@@ -831,6 +841,28 @@ fn parse_emby_playback_info_request(body: &Bytes) -> Result<EmbyPlaybackInfoRequ
         return Ok(EmbyPlaybackInfoRequest::default());
     }
     serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST)
+}
+
+fn deserialize_emby_optional_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Number(value)) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| serde::de::Error::custom("expected a signed integer")),
+        Some(serde_json::Value::String(value)) => value
+            .trim()
+            .parse::<i64>()
+            .map(Some)
+            .map_err(|_| serde::de::Error::custom("expected an integer or integer string")),
+        Some(_) => Err(serde::de::Error::custom(
+            "expected an integer or integer string",
+        )),
+    }
 }
 
 fn parse_emby_bool(value: &str) -> Option<bool> {
@@ -4121,6 +4153,29 @@ mod emby_playback_tests {
         .expect("valid DeviceProfile request");
         let source = profile_source("mkv", "hevc", "aac");
         assert!(request.requests_server_transcoding_for_source(false, &source));
+    }
+
+    #[test]
+    fn device_profile_accepts_string_max_audio_channels() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "TranscodingProfiles": [{
+                        "MaxAudioChannels": "6"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+
+        assert_eq!(
+            request
+                .device_profile
+                .expect("DeviceProfile")
+                .transcoding_profiles[0]
+                .max_audio_channels,
+            Some(6)
+        );
     }
 
     #[test]
