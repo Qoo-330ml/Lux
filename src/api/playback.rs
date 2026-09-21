@@ -1778,10 +1778,21 @@ pub(super) async fn emby_sessions(
             .collect::<std::collections::HashMap<_, _>>(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let catalog_items = if sessions.iter().any(|session| {
-        session.duration_ticks.is_none_or(|ticks| ticks <= 0)
-            || session.play_session_id.starts_with("lux-emby:")
-    }) {
+    let user_names = if user.is_admin {
+        let session_user_ids = sessions
+            .iter()
+            .map(|session| session.user_id.clone())
+            .collect::<Vec<_>>();
+        match database.find_user_display_names(&session_user_ids).await {
+            Ok(user_names) => user_names,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    } else {
+        std::collections::HashMap::from([(user_id.clone(), user.display_name.clone())])
+    };
+    let catalog_items = if sessions.is_empty() {
+        HashMap::new()
+    } else {
         let item_ids = sessions
             .iter()
             .map(|session| session.item_id.clone())
@@ -1791,7 +1802,12 @@ pub(super) async fn emby_sessions(
                 sessions
                     .iter()
                     .map(|session| {
-                        emby_session_json(session, None, web_sessions.get(&session.play_session_id))
+                        emby_session_json(
+                            session,
+                            None,
+                            web_sessions.get(&session.play_session_id),
+                            user_names.get(&session.user_id).map(String::as_str),
+                        )
                     })
                     .collect::<Vec<_>>(),
             )
@@ -1804,8 +1820,6 @@ pub(super) async fn emby_sessions(
             Ok(items) => items,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
-    } else {
-        HashMap::new()
     };
     Json(
         sessions
@@ -1815,6 +1829,7 @@ pub(super) async fn emby_sessions(
                     session,
                     catalog_items.get(&session.item_id),
                     web_sessions.get(&session.play_session_id),
+                    user_names.get(&session.user_id).map(String::as_str),
                 )
             })
             .collect::<Vec<_>>(),
@@ -1826,6 +1841,7 @@ pub(super) fn emby_session_json(
     session: &crate::storage::StoredPlaybackSession,
     catalog_item: Option<&CatalogItem>,
     web_session: Option<&crate::storage::StoredWebPlaybackSession>,
+    user_name: Option<&str>,
 ) -> Value {
     let runtime_ticks = session_runtime_ticks(session, catalog_item);
     let (play_method, transcoding_info) = emby_session_playback_details(session, web_session);
@@ -1857,6 +1873,7 @@ pub(super) fn emby_session_json(
     json!({
         "Id": session.id,
         "UserId": session.user_id,
+        "UserName": user_name.unwrap_or("Unknown"),
         "ItemId": emby_public_id(&session.item_id),
         "MediaSourceId": session.media_source_id.as_deref().unwrap_or(""),
         "PlaySessionId": session.play_session_id,

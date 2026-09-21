@@ -15,6 +15,18 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.13",
+    date: "2026-09-22",
+    sections: [
+      { kind: "added", items: [
+        "Emby 播放会话补充对应用户名称、当前播放媒体标题及可用剧集/集信息，管理员查看多用户会话时按实际用户正确展示。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 Emby STRM 外部直链播放的交接流程；认证后直接将原始地址重定向给客户端，避免 Lux 预探测负载均衡重定向并保留客户端的请求上下文。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.12",
     date: "2026-09-21",
     sections: [
