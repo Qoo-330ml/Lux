@@ -47,7 +47,11 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let page = match catalog
-        .list_recently_added_for_library_ids(&enabled_library_ids, 0, MAX_LOGIN_BACKGROUND_IMAGES)
+        .list_recently_added_movies_and_series_for_library_ids(
+            &enabled_library_ids,
+            0,
+            MAX_LOGIN_BACKGROUND_IMAGES,
+        )
         .await
     {
         Ok(page) => page,
