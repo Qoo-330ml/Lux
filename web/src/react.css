@@ -741,6 +741,34 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 @keyframes lux-spin { to { transform: rotate(360deg); } }
 
 .lux-auth-screen { position: relative; display: grid; place-items: center; min-height: 100vh; overflow: hidden; padding: 24px; background: #050506; }
+.lux-auth-screen.lux-auth-split-layout { display: flex; flex-direction: row; min-height: 100vh; width: 100vw; overflow: hidden; padding: 0; background: #090a0f; }
+.lux-auth-visual { flex: 1; position: relative; overflow: hidden; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #090a0f; }
+.lux-auth-poster-wall { width: 100%; height: 100%; object-fit: cover; object-position: left center; pointer-events: none; user-select: none; }
+.lux-auth-visual-fade { position: absolute; top: 0; bottom: 0; right: 0; width: 140px; background: linear-gradient(to right, transparent, #090a0f); pointer-events: none; }
+.lux-auth-panel { flex: 0 0 500px; width: 500px; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 40px 48px; background: #090a0f; z-index: 10; position: relative; }
+.lux-auth-split-layout .lux-auth-card { position: relative; width: min(100%, 390px); padding: 36px 32px; border: 1px solid rgba(255,255,255,.08); border-radius: 24px; background: rgba(21, 21, 27, .95); box-shadow: 0 24px 60px rgba(0,0,0,.7); backdrop-filter: blur(24px); }
+.lux-auth-header { margin-bottom: 24px; }
+.lux-auth-eyebrow { font-size: 11px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; color: var(--lux-accent); font-family: monospace, sans-serif; display: block; }
+.lux-auth-title { font-size: 26px; font-weight: 700; letter-spacing: -.02em; color: #fff; margin: 6px 0 4px; }
+.lux-auth-desc { font-size: 12px; color: #7f8490; margin: 0; font-weight: 400; }
+.lux-auth-field { display: flex; flex-direction: column; gap: 6px; }
+.lux-auth-field label { font-size: 12px; font-weight: 500; color: #b3b7c1; }
+.lux-auth-field input { width: 100%; height: 44px; padding: 0 14px; border-radius: 11px; font-size: 13px; background: rgba(255,255,255,.04); border: 1px solid rgba(255,255,255,.1); color: #fff; transition: border-color .15s ease, box-shadow .15s ease; outline: 0; box-sizing: border-box; }
+.lux-auth-field input:focus { border-color: var(--lux-accent); box-shadow: 0 0 16px color-mix(in srgb, var(--lux-accent) 45%, transparent); }
+.lux-auth-password-wrapper { position: relative; width: 100%; }
+.lux-auth-password-wrapper input { padding-right: 42px; }
+.lux-auth-password-toggle { position: absolute; right: 10px; top: 50%; transform: translateY(-50%); background: transparent; border: 0; padding: 4px; color: #7f8490; cursor: pointer; display: flex; align-items: center; justify-content: center; border-radius: 4px; transition: color .15s ease; }
+.lux-auth-password-toggle:hover { color: #fff; }
+.lux-eye-icon { width: 18px; height: 18px; }
+.lux-auth-submit-btn { width: 100%; height: 46px; border-radius: 13px; background: linear-gradient(135deg, var(--lux-accent) 0%, color-mix(in srgb, var(--lux-accent) 80%, #000) 100%); color: #fff; font-size: 13px; font-weight: 600; border: 0; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 6px; box-shadow: 0 0 24px color-mix(in srgb, var(--lux-accent) 45%, transparent), 0 8px 20px rgba(0,0,0,.4); transition: all .2s cubic-bezier(0.16, 1, 0.3, 1); margin-top: 10px; }
+.lux-auth-submit-btn:hover:not(:disabled) { filter: brightness(1.1); box-shadow: 0 0 30px color-mix(in srgb, var(--lux-accent) 65%, transparent), 0 10px 24px rgba(0,0,0,.5); transform: translateY(-1px); }
+.lux-auth-submit-btn:active:not(:disabled) { transform: translateY(0); filter: brightness(.95); }
+.lux-auth-submit-btn:disabled { opacity: .6; cursor: not-allowed; }
+.lux-auth-footer-notice { text-align: center; font-size: 11px; color: #5a5e69; padding-top: 6px; user-select: none; }
+@media (max-width: 1024px) {
+  .lux-auth-visual { display: none; }
+  .lux-auth-panel { flex: 1; width: 100%; padding: 24px; }
+}
 .lux-auth-backdrop { position: absolute; inset: 0; background: radial-gradient(circle at 50% 20%, rgba(93, 55, 89, .24), transparent 40%), linear-gradient(120deg, #15151a, #050506 60%); opacity: .75; }
 .lux-auth-card { position: relative; width: min(100%, 430px); padding: 44px; border: 1px solid var(--lux-line); border-radius: 18px; background: rgba(14,14,17,.78); box-shadow: 0 28px 90px rgba(0,0,0,.54); backdrop-filter: blur(20px); }
 .lux-setup-card { width: min(100%, 530px); }

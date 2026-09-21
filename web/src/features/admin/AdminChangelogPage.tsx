@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.12",
+    date: "2026-09-21",
+    sections: [
+      { kind: "added", items: [
+        "登录页升级为媒体中心风格的响应式分栏界面，新增海报墙、品牌资源、欢迎文案和更清晰的登录表单布局。",
+        "密码输入框新增显示/隐藏切换按钮，并保留用户名和密码自动填充能力。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.11",
     date: "2026-09-20",
     sections: [
