@@ -6,6 +6,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import { AdminApiKeyPanel } from "../account/AdminApiKeyPanel";
 import type {
   AdminNetworkProxySettings,
+  LoginBackgroundSource,
   NetworkProxyDiagnostics,
   NetworkProxyProbe,
 } from "../../lib/api/types";
@@ -24,8 +25,10 @@ export function AdminSettingsPage() {
   const [minimumMinutes, setMinimumMinutes] = useState("2");
   const [showMetadataPending, setShowMetadataPending] = useState(true);
   const [forceAdminLibraryOrder, setForceAdminLibraryOrder] = useState(false);
+  const [loginBackgroundSource, setLoginBackgroundSource] = useState<LoginBackgroundSource>("STATIC");
   const [proxyUrl, setProxyUrl] = useState("");
   const [saved, setSaved] = useState(false);
+  const [loginBackgroundSaved, setLoginBackgroundSaved] = useState(false);
   const [proxySaved, setProxySaved] = useState(false);
   const [proxyDiagnostics, setProxyDiagnostics] = useState<NetworkProxyDiagnostics | null>(null);
 
@@ -34,6 +37,7 @@ export function AdminSettingsPage() {
     setMinimumMinutes(String(Math.round(settings.data.resumeMinTicks / 600000000)));
     setShowMetadataPending(settings.data.mediaStrategy.showMetadataPending ?? true);
     setForceAdminLibraryOrder(settings.data.forceAdminLibraryOrder ?? false);
+    setLoginBackgroundSource(settings.data.loginBackgroundSource ?? "STATIC");
     setProxyUrl(settings.data.networkProxy?.url ?? "");
   }, [settings.data]);
 
@@ -63,6 +67,16 @@ export function AdminSettingsPage() {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
     },
     onError: () => setProxySaved(false),
+  });
+
+  const saveLoginBackground = useMutation({
+    mutationFn: () => api.updateAdminSettings({ loginBackgroundSource }),
+    onSuccess: (data) => {
+      setLoginBackgroundSource(data.loginBackgroundSource);
+      setLoginBackgroundSaved(true);
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminSettings });
+    },
+    onError: () => setLoginBackgroundSaved(false),
   });
 
   const testProxy = useMutation({
@@ -134,6 +148,42 @@ export function AdminSettingsPage() {
         </div>
         {saved ? <p className="lux-settings-saved"><Check size={15} /> 设置已保存</p> : null}
         {save.error ? <p className="lux-error-copy">{save.error.message}</p> : null}
+      </section>
+
+      <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="login-background-heading">
+        <div className="lux-admin-panel-heading">
+          <div><h2 id="login-background-heading">登录页背景</h2></div>
+        </div>
+        <div className="lux-admin-settings-form">
+          <label>
+            <span>登录页背景来源</span>
+            <small>固定海报墙保持现有登录页视觉；最新添加会按媒体库新增时间展示真实海报。</small>
+            <select
+              aria-label="登录页背景来源"
+              value={loginBackgroundSource}
+              onChange={(event) => {
+                setLoginBackgroundSaved(false);
+                setLoginBackgroundSource(event.target.value as LoginBackgroundSource);
+              }}
+            >
+              <option value="STATIC">固定海报墙</option>
+              <option value="RECENTLY_ADDED">媒体库最新添加</option>
+            </select>
+          </label>
+          <p className="lux-login-background-warning">
+            选择“媒体库最新添加”后，选中的海报会在未登录页面公开展示，请确认这些资源适合公开展示。
+          </p>
+          <button
+            className="lux-button lux-button-primary lux-settings-save"
+            type="button"
+            disabled={saveLoginBackground.isPending}
+            onClick={() => saveLoginBackground.mutate()}
+          >
+            <Save size={16} /> {saveLoginBackground.isPending ? "保存中…" : "保存登录页背景"}
+          </button>
+        </div>
+        {loginBackgroundSaved ? <p className="lux-settings-saved"><Check size={15} /> 登录页背景设置已保存</p> : null}
+        {saveLoginBackground.error ? <p className="lux-error-copy">{saveLoginBackground.error.message}</p> : null}
       </section>
 
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="network-proxy-heading">

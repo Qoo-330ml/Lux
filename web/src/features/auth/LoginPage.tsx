@@ -1,4 +1,4 @@
-import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import { FormEvent, useState } from "react";
 import { api } from "../../lib/api/client";
@@ -6,6 +6,12 @@ import { queryKeys } from "../../lib/api/query-keys";
 
 export function LoginPage() {
   const queryClient = useQueryClient();
+  const loginBackground = useQuery({
+    queryKey: queryKeys.loginBackground,
+    queryFn: () => api.loginBackground(),
+    retry: false,
+    staleTime: 5 * 60 * 1000,
+  });
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -26,16 +32,45 @@ export function LoginPage() {
     login.mutate();
   }
 
+  const posterImages = loginBackground.data?.source === "RECENTLY_ADDED"
+    ? loginBackground.data.images.filter((image) => image.trim().length > 0)
+    : [];
+
   return (
     <main className="lux-auth-screen lux-auth-split-layout">
+      {/* 顶部品牌标 (浮动在左上角，与效果图完全一致) */}
+      <div className="lux-auth-brand-badge">
+        <img
+          className="lux-auth-brand-icon"
+          src="/logo-white.svg"
+          alt="Lux"
+          width="34"
+          height="34"
+        />
+        <span className="lux-auth-brand-text">Lux</span>
+      </div>
+
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-hidden="true">
-        <img
-          className="lux-auth-poster-wall"
-          src="/lux-poster-wall.jpg"
-          alt=""
-          loading="eager"
-        />
+        {posterImages.length > 0 ? (
+          <div className="lux-auth-poster-grid">
+            {posterImages.map((image, index) => (
+              <img
+                key={image}
+                src={image}
+                alt=""
+                loading={index < 6 ? "eager" : "lazy"}
+              />
+            ))}
+          </div>
+        ) : (
+          <img
+            className="lux-auth-poster-wall"
+            src="/lux-poster-wall.jpg"
+            alt=""
+            loading="eager"
+          />
+        )}
         <div className="lux-auth-visual-fade" />
       </section>
 

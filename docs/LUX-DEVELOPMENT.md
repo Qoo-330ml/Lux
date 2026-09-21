@@ -2133,6 +2133,7 @@ services:
 | LUX-254 | docs/LUX-254-PLAN.md、src/application/playback/session.rs、src/api/playback.rs、src/api/emby.rs、src/api/legacy.rs、tests/playback.rs、docs/API.md、docs/COMPATIBILITY.md；Emby 客户端服务端转码 |
 | LUX-255 | docs/LUX-DEVELOPMENT.md、docs/API.md、docs/COMPATIBILITY.md、src/api/users.rs、src/api/admin_handlers.rs、tests/lux_api_auth.rs、tests/admin_api_key.rs；Lux 用户级客户端令牌与第三方首页 API |
 | LUX-256 | docs/LUX-DEVELOPMENT.md、src/application/thumbnail_policy.rs、src/application/thumbnails.rs、src/application/candidates.rs、src/application/strm_probe.rs、src/storage/、src/api/admin_handlers.rs、web/src/features/admin/AdminLibrariesPage.tsx、web/src/lib/api/types.ts、web/src/react.css、tests/、web/tests/；媒体库缩略图刮削模式与截图优先级 |
+| LUX-258 | docs/LUX-DEVELOPMENT.md、src/storage/users.rs、src/api/admin_handlers.rs、src/api/users.rs、web/src/features/admin/AdminSettingsPage.tsx、web/src/features/auth/LoginPage.tsx、web/src/lib/api/、tests/、web/tests/；登录页背景来源选择（固定海报墙或媒体库最新添加） |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6380,6 +6381,35 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 明确不做：
 
 - 不改变媒体库内部影片/剧集的浏览器本地排序；不改变媒体库 ACL、Emby DTO 结构或其他服务器设置。
+
+#### LUX-258：登录页背景来源选择
+
+范围：在服务器设置中增加登录页背景来源选择，支持现有固定海报墙和媒体库最新添加海报。选择最新添加时，
+登录页通过公开的带图片标签的 Emby 图片地址展示最近加入媒体库的真实海报；没有可用海报、媒体库为空或接口
+失败时回退固定海报墙。该设置默认保持固定海报墙，不引入 TMDb 榜单或新的插件能力。
+
+验收：
+
+- [ ] `GET/PATCH /api/v1/admin/settings` 读写 `loginBackgroundSource`，只允许 `STATIC` 和 `RECENTLY_ADDED`，默认 `STATIC`。
+- [ ] `GET /api/v1/auth/login-background` 无需登录即可返回当前来源和有限数量的海报地址；响应不返回媒体标题、路径、库名或其他媒体元数据。
+- [ ] `RECENTLY_ADDED` 只选择启用媒体库中按新增时间倒序的条目，并且只返回有登记海报标签的条目。
+- [ ] 登录页加载服务器背景并渲染真实海报；接口失败或无海报时继续显示固定海报墙。
+- [ ] 管理设置明确提示“最新添加”会让选中海报在未登录页面公开展示。
+
+验证：
+
+- `cargo test --locked --test login_background`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+- `pnpm --dir web test -- --run web/tests/login-page.test.tsx web/tests/admin-settings.test.tsx web/tests/api-client.test.ts`
+- `pnpm --dir web build`
+
+依赖：LUX-110、LUX-255。
+
+明确不做：
+
+- 不实现 TMDb 热门、TMDb 高分或 Top 250；这些需要后续外置插件榜单发现能力和后台缓存任务。
+- 不改变现有用户媒体库 ACL；该设置明确开启后，登录页展示的海报属于管理员主动选择的公开展示资源。
 
 ## 26. 风险与缓解
 

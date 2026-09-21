@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/app/App";
 import { LoginPage } from "../src/features/auth/LoginPage";
 import { ApiError, api } from "../src/lib/api/client";
@@ -16,10 +16,67 @@ describe("LoginPage session state", () => {
   let container: HTMLDivElement;
   let root: Root;
 
+  beforeEach(() => {
+    vi.spyOn(api, "loginBackground").mockResolvedValue({ source: "STATIC", images: [] });
+  });
+
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
     vi.restoreAllMocks();
+  });
+
+  it("renders real recently added posters when the server provides them", async () => {
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "RECENTLY_ADDED",
+      images: [
+        "/emby/Items/123/Images/Primary?tag=poster-one",
+        "/emby/Items/456/Images/Primary?tag=poster-two",
+      ],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelectorAll(".lux-auth-poster-grid img")).toHaveLength(2);
+      });
+    });
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-grid img")?.src)
+      .toContain("/emby/Items/123/Images/Primary?tag=poster-one");
+    expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
+  });
+
+  it("keeps the fixed poster wall when the background request fails", async () => {
+    vi.mocked(api.loginBackground).mockRejectedValue(new Error("background unavailable"));
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await vi.waitFor(() => {
+      expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.getAttribute("src"))
+        .toBe("/lux-poster-wall.jpg");
+    });
+    expect(container.querySelector(".lux-auth-poster-grid")).toBeNull();
   });
 
   it("renders standard credential autofill metadata", () => {

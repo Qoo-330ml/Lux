@@ -2,6 +2,7 @@ export const queryKeys = {
   setup: ["setup"] as const,
   setupDatabase: ["setup", "database"] as const,
   me: ["me"] as const,
+  loginBackground: ["login-background"] as const,
   userSettings: ["user-settings"] as const,
   libraryOrder: ["library-order"] as const,
   home: ["home"] as const,

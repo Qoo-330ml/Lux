@@ -1,5 +1,8 @@
 use super::*;
 use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
+use crate::application::settings::{
+    DEFAULT_LOGIN_BACKGROUND_SOURCE, is_valid_login_background_source,
+};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -242,6 +245,11 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Ok(enabled) => enabled,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let login_background_source = match database.login_background_source().await {
+        Ok(Some(source)) if is_valid_login_background_source(&source) => source,
+        Ok(_) => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let server_name = match database.server_name().await {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
@@ -253,6 +261,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "resumePlayedPercent": played_percent,
         "resumeMinTicks": minimum_ticks,
         "forceAdminLibraryOrder": force_admin_library_order,
+        "loginBackgroundSource": login_background_source,
         "mediaStrategy": media_strategy,
         "networkProxy": network_proxy,
     }))
@@ -461,6 +470,7 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
     pub(crate) resume_played_percent: Option<i64>,
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
+    pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
@@ -728,6 +738,11 @@ pub(crate) async fn admin_update_settings(
         Ok(enabled) => enabled,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let current_login_background_source = match database.login_background_source().await {
+        Ok(Some(source)) if is_valid_login_background_source(&source) => source,
+        Ok(_) => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let current_server_name = match database.server_name().await {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
@@ -738,6 +753,19 @@ pub(crate) async fn admin_update_settings(
     let force_admin_library_order = request
         .force_admin_library_order
         .unwrap_or(current_force_admin_library_order);
+    let login_background_source = match request.login_background_source {
+        Some(source) if is_valid_login_background_source(&source) => source,
+        Some(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "登录页背景来源无效",
+            )
+            .into_response();
+        }
+        None => current_login_background_source,
+    };
     let media_strategy = request.media_strategy.unwrap_or(current_media_strategy);
     let server_name = match request.server_name {
         Some(name) => match normalize_server_name(&name) {
@@ -821,6 +849,7 @@ pub(crate) async fn admin_update_settings(
             minimum_ticks,
             &media_strategy_json,
             force_admin_library_order,
+            &login_background_source,
         )
         .await
     {
@@ -837,7 +866,7 @@ pub(crate) async fn admin_update_settings(
                 "SETTINGS_UPDATED",
                 Some("settings"),
                 None,
-                &format!(r#"{{"resumePlayedPercent":{percent},"resumeMinTicks":{minimum_ticks},"forceAdminLibraryOrder":{force_admin_library_order}}}"#),
+                &format!(r#"{{"resumePlayedPercent":{percent},"resumeMinTicks":{minimum_ticks},"forceAdminLibraryOrder":{force_admin_library_order},"loginBackgroundSource":"{login_background_source}"}}"#),
             )
             .await;
             Json(json!({
@@ -845,6 +874,7 @@ pub(crate) async fn admin_update_settings(
                 "resumePlayedPercent": percent,
                 "resumeMinTicks": minimum_ticks,
                 "forceAdminLibraryOrder": force_admin_library_order,
+                "loginBackgroundSource": login_background_source,
                 "mediaStrategy": media_strategy,
                 "networkProxy": network_proxy_settings(&state).await,
             }))
