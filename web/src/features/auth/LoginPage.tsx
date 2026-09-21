@@ -53,7 +53,7 @@ export function LoginPage() {
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-hidden="true">
         {posterImages.length > 0 ? (
-          <div className="lux-auth-poster-grid">
+          <div className="lux-auth-poster-collage">
             {posterImages.map((image, index) => (
               <img
                 key={image}
