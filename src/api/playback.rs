@@ -1306,12 +1306,16 @@ pub(super) async fn handle_emby_playback_event(
         .clone()
         .unwrap_or_else(|| format!("{}:{device_id}", internal_item_id));
     if state_name == "STOPPED" && requested_play_session_id.is_none() {
+        let stop_device_id = {
+            let trimmed = device_id.trim();
+            (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("unknown")).then_some(trimmed)
+        };
         match database
             .find_active_playback_session_for_stop(
                 &user.id.to_string(),
                 &internal_item_id,
                 media_source_id,
-                &device_id,
+                stop_device_id,
             )
             .await
         {

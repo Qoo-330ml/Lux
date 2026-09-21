@@ -360,10 +360,15 @@ impl Database {
         user_id: &str,
         item_id: &str,
         media_source_id: Option<&str>,
-        device_id: &str,
+        device_id: Option<&str>,
     ) -> Result<Option<StoredPlaybackSession>, StorageError> {
         let media_source_filter = if media_source_id.is_some() {
             " AND media_source_id = ?"
+        } else {
+            ""
+        };
+        let device_filter = if device_id.is_some() {
+            " AND device_id = ?"
         } else {
             ""
         };
@@ -376,7 +381,7 @@ impl Database {
              FROM playback_sessions
              WHERE user_id = ?
                AND item_id = ?
-             AND device_id = ?
+               {device_filter}
                AND state != 'STOPPED'
                AND last_event_at > unixepoch() - ?
                {media_source_filter}
@@ -384,7 +389,10 @@ impl Database {
              LIMIT 2"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
-        statement = statement.bind(user_id).bind(item_id).bind(device_id);
+        statement = statement.bind(user_id).bind(item_id);
+        if let Some(device_id) = device_id {
+            statement = statement.bind(device_id);
+        }
         statement = statement.bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
         if let Some(media_source_id) = media_source_id {
             statement = statement.bind(media_source_id);
