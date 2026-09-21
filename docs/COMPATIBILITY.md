@@ -70,6 +70,11 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 同日会话数值兼容：`TranscodingInfo` 的码率字段在直播放、未知探针结果和服务端 HLS 会话中统一返回非空整数，未知值为 `0`；
 这样依赖数值比较的第三方会话卡片不会因 `None > 0` 失败。空的 codec/container 也返回空字符串，不影响 `PlayMethod` 和真实转码码率。
 
+同日播放停止兼容：Emby `Sessions/Playing/Stopped` 回调缺少 `PlaySessionId` 时，Lux 会按认证用户、条目、媒体源和设备
+匹配唯一的近期活动会话，并将该会话标记为 `STOPPED`；因此依赖轮询 `GET /Sessions` 的 nextEmby 能在这类客户端回调中移除虚拟会话卡片。
+若存在多个无法唯一判断的候选会话，Lux 不会误停其中一个，仍依赖客户端补发 `PlaySessionId` 或活动会话自然过期。该自动化回归不替代
+FNOS 部署后真实播放、停止回调和 nextEmby 卡片生命周期复测。
+
 2026-09-20 容器兼容修复：Emby HLS 会话现在默认使用 MPEG-TS，`TranscodingContainer=ts`、
 `TranscodingMimeType=video/mp2t`，清单直接列出 `.ts` 分片且不生成 `EXT-X-MAP`；只有客户端明确声明
 `mp4`/`fmp4` 时才使用 `TranscodingContainer=mp4` 的 fMP4/CMAF 和对应 init 分片。master、逻辑分片和

@@ -1301,15 +1301,29 @@ pub(super) async fn handle_emby_playback_event(
         .device_type
         .as_deref()
         .or_else(|| (!header_device.device.is_empty()).then_some(header_device.device.as_str()));
-    let play_session_id = request
-        .play_session_id
-        .filter(|value| !value.is_empty())
+    let requested_play_session_id = request.play_session_id.filter(|value| !value.is_empty());
+    let mut play_session_id = requested_play_session_id
+        .clone()
         .unwrap_or_else(|| format!("{}:{device_id}", internal_item_id));
+    if state_name == "STOPPED" && requested_play_session_id.is_none() {
+        match database
+            .find_active_playback_session_for_stop(
+                &user.id.to_string(),
+                &internal_item_id,
+                media_source_id,
+                &device_id,
+            )
+            .await
+        {
+            Ok(Some(session)) => play_session_id = session.play_session_id,
+            Ok(None) => {}
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
     let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
     let user_id = user.id.to_string();
-    // A STOPPED callback without PlaySessionId cannot be associated with a
-    // specific HLS session. Clients may send a stale callback while
-    // negotiating a new stream, so only stop the session named by the callback.
+    // Stop only the HLS session selected by the callback's play session ID or
+    // by the active session matching its item, source, and device.
     if state_name == "STOPPED"
         && let Some(session_id) = emby_transcode_session_id
         && let Some(service) = state.web_playback.as_ref()

@@ -394,6 +394,52 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .await?;
     assert_eq!(direct_stopped.status(), reqwest::StatusCode::NO_CONTENT);
 
+    let explicit_stop_playing = client
+        .post(&event_url)
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "explicit-stop-session",
+            "DeviceId": "stop-device",
+            "PositionTicks": 100,
+            "RunTimeTicks": 1000,
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        explicit_stop_playing.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let implicit_stopped = client
+        .post(format!("{event_url}/Stopped"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "DeviceId": "stop-device",
+            "PositionTicks": 100,
+        }))
+        .send()
+        .await?;
+    assert_eq!(implicit_stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    let sessions_after_implicit_stop = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(
+        !sessions_after_implicit_stop
+            .as_array()
+            .is_some_and(|sessions| {
+                sessions
+                    .iter()
+                    .any(|session| session["PlaySessionId"] == "explicit-stop-session")
+            })
+    );
+
     let position: i64 = sqlx::query_scalar(
         "SELECT position_ticks FROM user_item_state
          WHERE item_id = ? LIMIT 1",
