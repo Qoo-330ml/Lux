@@ -62,6 +62,11 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 `DirectStream` 或 `Transcode`，不再把服务端转码固定报告为 `DirectPlay`；可用时同时返回/展示 HLS 容器、视频/音频输出 codec
 及目标码率。该状态信息来自 Lux 的实际播放会话和 FFmpeg 输出档位，不代表 Harbor 等第三方客户端已完成部署环境实测。
 
+2026-09-22 Emby 会话元数据兼容：`GET /Sessions` 现在为每个会话返回对应用户的 `UserName`，并统一从 catalog
+补齐 `NowPlayingItem.Name` 及可用的剧集/集数字段，包括已经保存有效时长的直播放会话。管理员令牌查询多个用户的会话时按
+`UserId` 映射用户名，不会把所有会话显示成管理员。`tests/sessions.rs` 已覆盖 Emby 播放会话和独立直播放会话的用户名、标题及停止后移除；
+该自动化证据不替代 FNOS 部署后的 nextEmby 轮询和真实客户端停止事件复测。
+
 2026-09-20 容器兼容修复：Emby HLS 会话现在默认使用 MPEG-TS，`TranscodingContainer=ts`、
 `TranscodingMimeType=video/mp2t`，清单直接列出 `.ts` 分片且不生成 `EXT-X-MAP`；只有客户端明确声明
 `mp4`/`fmp4` 时才使用 `TranscodingContainer=mp4` 的 fMP4/CMAF 和对应 init 分片。master、逻辑分片和

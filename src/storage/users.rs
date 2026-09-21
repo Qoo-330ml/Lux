@@ -200,6 +200,44 @@ impl Database {
         self.list_users_with_disabled(true).await
     }
 
+    pub(crate) async fn find_user_display_names(
+        &self,
+        user_ids: &[String],
+    ) -> Result<HashMap<String, String>, StorageError> {
+        if user_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let unique_user_ids = user_ids
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let mut display_names = HashMap::with_capacity(unique_user_ids.len());
+        for user_ids in unique_user_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", user_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!("SELECT id, display_name FROM users WHERE id IN ({placeholders})");
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in user_ids {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                display_names.insert(row.get("id"), row.get("display_name"));
+            }
+        }
+        Ok(display_names)
+    }
+
     async fn list_users_with_disabled(
         &self,
         include_disabled: bool,

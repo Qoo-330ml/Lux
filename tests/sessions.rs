@@ -174,6 +174,8 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body[0]["PlayState"]["PositionTicks"], 900);
     assert_eq!(sessions_body[0]["PlayState"]["PlayMethod"], "Transcode");
     assert_eq!(sessions_body[0]["NowPlayingItem"]["Id"], emby_item_id);
+    assert_eq!(sessions_body[0]["UserName"], "Admin");
+    assert_eq!(sessions_body[0]["NowPlayingItem"]["Name"], "Session Movie");
     assert_eq!(sessions_body[0]["NowPlayingItem"]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["DeviceId"], "session-device");
@@ -345,6 +347,49 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
             .map(Vec::len),
         Some(0)
     );
+
+    let direct_playing = client
+        .post(&event_url)
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "direct-playback-session",
+            "PositionTicks": 100,
+            "RunTimeTicks": 1000,
+        }))
+        .send()
+        .await?;
+    assert_eq!(direct_playing.status(), reqwest::StatusCode::NO_CONTENT);
+    let direct_sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let direct_session = direct_sessions
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["PlaySessionId"] == "direct-playback-session")
+        })
+        .ok_or("missing direct playback session")?;
+    assert_eq!(direct_session["UserName"], "Admin");
+    assert_eq!(direct_session["NowPlayingItem"]["Name"], "Session Movie");
+    let direct_stopped = client
+        .post(format!("{event_url}/Stopped"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "direct-playback-session",
+            "PositionTicks": 100,
+        }))
+        .send()
+        .await?;
+    assert_eq!(direct_stopped.status(), reqwest::StatusCode::NO_CONTENT);
 
     let position: i64 = sqlx::query_scalar(
         "SELECT position_ticks FROM user_item_state
