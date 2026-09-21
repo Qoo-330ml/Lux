@@ -38,6 +38,18 @@ export function LoginPage() {
 
   return (
     <main className="lux-auth-screen lux-auth-split-layout">
+      {/* 顶部品牌标 (浮动在左上角，与效果图完全一致) */}
+      <div className="lux-auth-brand-badge">
+        <img
+          className="lux-auth-brand-icon"
+          src="/logo-white.svg"
+          alt="Lux"
+          width="34"
+          height="34"
+        />
+        <span className="lux-auth-brand-text">Lux</span>
+      </div>
+
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-hidden="true">
         {posterImages.length > 0 ? (

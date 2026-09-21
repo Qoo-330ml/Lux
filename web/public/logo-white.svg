@@ -1,4 +1,30 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="306" height="346" viewBox="92 70 306 346">
-  <path fill="#FFFFFF" d="M92,70 C92,70 189.33333333333334,141.33333333333334 238,177 C193.61904761904765,216.19047619047618 237.42857142857144,176.19047619047618 194.09523809523813,215.23809523809524 C178.42857142857147,203.9047619047619 152.84210526315792,183.33333333333334 152.84210526315792,183.33333333333334 L152.84210526315792,283.5928143712575 L394.99999999999994,69.99999999999999 C394.99999999999994,69.99999999999999 395,105 395,121 C395,133 397.2982456140351,153.48755121336274 388.63157894736844,161.48755121336274 C298.2982456140351,247.48755121336274 111,409 111,409 C105,414.3333333333333 98.66666666666667,415.3333333333333 92,412 C92,298 92,70 92,70 Z"/>
-  <path fill="#FFFFFF" d="M302.19048055012894 274.3280145554311C328.8571472167956 294.328014555431 387.2760409400573 339.98620460147225 387.2760409400573 339.98620460147225C392.60937427339064 344.6528712681391 395.2760409400573 350.98620460147237 395.2760409400573 358.9862046014725C395.2760409400573 374.31953793480574 394.03794642857 413.8096647716697 395.2760409400573 404.9862046014727C395.2760409400573 408.9862046014726 388.03794642857 416.00014096214585 384.03794642857 413.3334742954792C349.03794642857 385.3334742954792 304.57143293108135 350.9946812220979 258.38095674060514 315.7565859840027C301.71429007393846 274.3280145554311 258.38095674060514 315.7565859840027 302.19048055012894 274.3280145554311Z"/>
+<svg xmlns="http://www.w3.org/2000/svg" width="500" height="500" viewBox="0 0 500 500" fill="none">
+  <defs>
+    <!-- Facet 1: Top facet gradient -->
+    <linearGradient id="luxTopFacet" x1="175" y1="25" x2="385" y2="205" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#FFFFFF" />
+      <stop offset="60%" stop-color="#EEF2F8" />
+      <stop offset="100%" stop-color="#DCE2EC" />
+    </linearGradient>
+    <!-- Facet 2: Left vertical pillar gradient -->
+    <linearGradient id="luxLeftFacet" x1="110" y1="95" x2="110" y2="475" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#F8FAFC" />
+      <stop offset="50%" stop-color="#E2E8F0" />
+      <stop offset="100%" stop-color="#CBD5E1" />
+    </linearGradient>
+    <!-- Facet 3: Bottom-right play arrow facet gradient -->
+    <linearGradient id="luxBottomFacet" x1="185" y1="425" x2="445" y2="225" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#CBD5E1" />
+      <stop offset="60%" stop-color="#E2E8F0" />
+      <stop offset="100%" stop-color="#F8FAFC" />
+    </linearGradient>
+  </defs>
+  <g id="lux-origami-prism-logo">
+    <!-- Top Slanted Facet -->
+    <path fill="url(#luxTopFacet)" d="M 175 25 L 435 165 L 325 235 L 305 225 L 65 85 Z" />
+    <!-- Left Vertical Facet -->
+    <path fill="url(#luxLeftFacet)" d="M 55 95 L 165 165 L 165 475 L 55 385 Z" />
+    <!-- Bottom Right Facet -->
+    <path fill="url(#luxBottomFacet)" d="M 445 185 L 435 325 L 185 475 L 185 345 Z" />
+  </g>
 </svg>

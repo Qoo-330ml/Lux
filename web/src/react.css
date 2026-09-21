@@ -741,7 +741,10 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 @keyframes lux-spin { to { transform: rotate(360deg); } }
 
 .lux-auth-screen { position: relative; display: grid; place-items: center; min-height: 100vh; overflow: hidden; padding: 24px; background: #050506; }
-.lux-auth-screen.lux-auth-split-layout { display: flex; flex-direction: row; min-height: 100vh; width: 100vw; overflow: hidden; padding: 0; background: #090a0f; }
+.lux-auth-screen.lux-auth-split-layout { display: flex; flex-direction: row; min-height: 100vh; width: 100vw; overflow: hidden; padding: 0; background: #090a0f; position: relative; }
+.lux-auth-brand-badge { position: absolute; top: 36px; left: 42px; z-index: 25; display: flex; align-items: center; gap: 12px; user-select: none; pointer-events: auto; }
+.lux-auth-brand-icon { width: 36px; height: 36px; object-fit: contain; filter: drop-shadow(0 4px 16px rgba(0,0,0,.5)); }
+.lux-auth-brand-text { font-size: 26px; font-weight: 800; letter-spacing: -.03em; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; text-shadow: 0 2px 12px rgba(0,0,0,.6); }
 .lux-auth-visual { flex: 1; position: relative; overflow: hidden; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #090a0f; }
 .lux-auth-poster-wall { width: 100%; height: 100%; object-fit: cover; object-position: left center; pointer-events: none; user-select: none; }
 .lux-auth-poster-grid { position: absolute; inset: -6% -3%; display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); grid-template-rows: repeat(3, minmax(0, 1fr)); gap: 12px; padding: 24px; transform: rotate(-4deg) scale(1.08); }
@@ -772,6 +775,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-auth-submit-btn:disabled { opacity: .6; cursor: not-allowed; }
 .lux-auth-footer-notice { text-align: center; font-size: 11px; color: #5a5e69; padding-top: 6px; user-select: none; }
 @media (max-width: 1024px) {
+  .lux-auth-brand-badge { top: 24px; left: 24px; }
   .lux-auth-visual { display: none; }
   .lux-auth-panel { flex: 1; width: 100%; padding: 24px; }
 }
