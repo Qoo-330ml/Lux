@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
-        admin_events::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope},
+        admin_events::{AdminEventHub, AdminEventScope, UserEventHub},
         home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
         media_matching::{
@@ -2602,6 +2602,13 @@ impl ScanJobService {
         flags.remove(job_id);
     }
 
+    async fn flush_home_after_scan_terminal(&self) {
+        if let Some(home) = &self.home {
+            home.flush_scan_invalidation().await;
+            self.user_events.publish_home_now().await;
+        }
+    }
+
     fn cancellation_requested_in_memory(&self, job_id: &str) -> bool {
         let flags = match self.cancellation_flags.lock() {
             Ok(flags) => flags,
@@ -2634,6 +2641,7 @@ impl ScanJobService {
     async fn cancel_running_job(&self, job_id: &str) -> Result<ScanBatchReport, ScanJobError> {
         if self.database.find_scan_job(job_id).await?.is_none() {
             self.clear_cancellation_flag(job_id);
+            self.flush_home_after_scan_terminal().await;
             return Ok(ScanBatchReport {
                 status: "CANCELLED".to_owned(),
                 processed: 0,
@@ -2648,6 +2656,7 @@ impl ScanJobService {
         self.database
             .finish_scan_job(job_id, "CANCELLED", None)
             .await?;
+        self.flush_home_after_scan_terminal().await;
         self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
             .await;
         self.clear_cancellation_flag(job_id);
@@ -3043,14 +3052,23 @@ impl ScanJobService {
             return Err(ScanJobError::InvalidBatchSize);
         }
         let _scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
-        let report = self
+        let report = match self
             .run_batch_with_failure_handling(job_id, batch_size, false)
-            .await?;
-        if report.processed > 0
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                self.flush_home_after_scan_terminal().await;
+                return Err(error);
+            }
+        };
+        if report.status == "COMPLETED" {
+            self.flush_home_after_scan_terminal().await;
+        } else if report.processed > 0
             && let Some(home) = &self.home
         {
-            home.invalidate();
-            self.user_events.publish(UserEventScope::Home);
+            home.invalidate_scan_batch().await;
+            self.user_events.publish_home_coalesced().await;
         }
         Ok(report)
     }
@@ -5101,8 +5119,8 @@ impl ScanJobService {
                     {
                         Ok(report) if report.items_processed > 0 => {
                             if let Some(home) = &home {
-                                home.invalidate();
-                                user_events.publish(UserEventScope::Home);
+                                home.invalidate_scan_batch().await;
+                                user_events.publish_home_coalesced().await;
                             }
                             notify.notify_waiters();
                         }
@@ -5247,6 +5265,25 @@ impl ScanJobService {
         if batch_size == 0 {
             return Err(ScanJobError::InvalidBatchSize);
         }
+        let result = self
+            .run_to_completion_with_metadata_and_thumbnails_inner(
+                job_id, batch_size, probe, metadata, thumbnails,
+            )
+            .await;
+        if result.is_err() {
+            self.flush_home_after_scan_terminal().await;
+        }
+        result
+    }
+
+    async fn run_to_completion_with_metadata_and_thumbnails_inner(
+        &self,
+        job_id: &str,
+        batch_size: usize,
+        probe: Option<MediaProbeService>,
+        metadata: Option<MetadataReidentifyService>,
+        thumbnails: Option<ThumbnailService>,
+    ) -> Result<(), ScanJobError> {
         let mut scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
         let mut local_metadata_worker = Some(self.start_local_metadata_worker(job_id));
         let mut created_items = 0_usize;
@@ -5264,8 +5301,8 @@ impl ScanJobService {
             if report.processed > 0
                 && let Some(home) = &self.home
             {
-                home.invalidate();
-                self.user_events.publish(UserEventScope::Home);
+                home.invalidate_scan_batch().await;
+                self.user_events.publish_home_coalesced().await;
             }
             created_items = created_items.saturating_add(report.created_items);
             if !report.completed {
@@ -5330,8 +5367,8 @@ impl ScanJobService {
                     };
                     self.run_auto_library_cover_after_scan(job_id).await?;
                     if let Some(home) = &self.home {
-                        home.invalidate();
-                        self.user_events.publish(UserEventScope::Home);
+                        home.flush_scan_invalidation().await;
+                        self.user_events.publish_home_now().await;
                     }
                     self.publish_media_added_event(&completed_job, created_items)
                         .await;
@@ -5380,6 +5417,7 @@ impl ScanJobService {
                         .await;
                     }
                     Self::stop_local_metadata_worker(&mut local_metadata_worker).await;
+                    self.flush_home_after_scan_terminal().await;
                     return Ok(());
                 }
                 if completed_job.auto_metadata_match {
@@ -5389,8 +5427,8 @@ impl ScanJobService {
                     }
                 }
                 if let Some(home) = &self.home {
-                    home.invalidate();
-                    self.user_events.publish(UserEventScope::Home);
+                    home.flush_scan_invalidation().await;
+                    self.user_events.publish_home_now().await;
                 }
                 self.publish_media_added_event(&completed_job, created_items)
                     .await;

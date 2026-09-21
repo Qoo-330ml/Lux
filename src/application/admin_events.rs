@@ -1,6 +1,9 @@
-use tokio::sync::broadcast;
+use std::{sync::Arc, time::Duration};
+
+use tokio::sync::{Mutex, broadcast};
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+const HOME_EVENT_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdminEventScope {
@@ -50,6 +53,14 @@ pub struct AdminEventHub {
 #[derive(Clone)]
 pub struct UserEventHub {
     sender: broadcast::Sender<UserEventScope>,
+    home_event_state: Arc<Mutex<HomeEventState>>,
+}
+
+#[derive(Default)]
+struct HomeEventState {
+    scheduled: bool,
+    dirty: bool,
+    epoch: u64,
 }
 
 impl AdminEventHub {
@@ -76,7 +87,10 @@ impl Default for AdminEventHub {
 impl UserEventHub {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        Self { sender }
+        Self {
+            sender,
+            home_event_state: Arc::new(Mutex::new(HomeEventState::default())),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<UserEventScope> {
@@ -85,6 +99,55 @@ impl UserEventHub {
 
     pub fn publish(&self, scope: UserEventScope) {
         let _ = self.sender.send(scope);
+    }
+
+    pub async fn publish_home_coalesced(&self) {
+        let epoch = {
+            let mut state = self.home_event_state.lock().await;
+            if state.scheduled {
+                state.dirty = true;
+                return;
+            }
+            state.scheduled = true;
+            state.dirty = false;
+            state.epoch = state.epoch.wrapping_add(1);
+            state.epoch
+        };
+
+        let _ = self.sender.send(UserEventScope::Home);
+        let sender = self.sender.clone();
+        let state = Arc::clone(&self.home_event_state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HOME_EVENT_COALESCE_WINDOW).await;
+                let send_trailing = {
+                    let mut state = state.lock().await;
+                    if state.epoch != epoch || !state.scheduled {
+                        return;
+                    }
+                    if state.dirty {
+                        state.dirty = false;
+                        true
+                    } else {
+                        state.scheduled = false;
+                        false
+                    }
+                };
+                if !send_trailing {
+                    return;
+                }
+                let _ = sender.send(UserEventScope::Home);
+            }
+        });
+    }
+
+    pub async fn publish_home_now(&self) {
+        let mut state = self.home_event_state.lock().await;
+        state.scheduled = false;
+        state.dirty = false;
+        state.epoch = state.epoch.wrapping_add(1);
+        drop(state);
+        let _ = self.sender.send(UserEventScope::Home);
     }
 }
 
@@ -96,6 +159,10 @@ impl Default for UserEventHub {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
+    use tokio::time::timeout;
+
     use super::{AdminEventHub, AdminEventScope, UserEventHub, UserEventScope};
 
     #[tokio::test]
@@ -133,5 +200,34 @@ mod tests {
 
         assert_eq!(first.recv().await, Ok(UserEventScope::Home));
         assert_eq!(second.recv().await, Ok(UserEventScope::Home));
+    }
+
+    #[tokio::test]
+    async fn coalesces_home_events_and_flushes_immediately() {
+        let hub = UserEventHub::new();
+        let mut receiver = hub.subscribe();
+
+        hub.publish_home_coalesced().await;
+        assert_eq!(receiver.recv().await, Ok(UserEventScope::Home));
+
+        hub.publish_home_coalesced().await;
+        assert!(
+            timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(25)).await;
+        assert_eq!(receiver.recv().await, Ok(UserEventScope::Home));
+
+        hub.publish_home_now().await;
+        assert_eq!(receiver.recv().await, Ok(UserEventScope::Home));
+
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(25)).await;
+        assert!(
+            timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err()
+        );
     }
 }

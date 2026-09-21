@@ -20,6 +20,7 @@ const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
 const HOME_SHARED_CACHE_TTL: Duration = Duration::from_secs(60);
 const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const HOME_INVALIDATION_DEBOUNCE: Duration = Duration::from_millis(100);
+const HOME_SCAN_INVALIDATION_DEBOUNCE: Duration = Duration::from_secs(1);
 const MAX_HOME_CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +99,13 @@ struct CachedSharedSnapshot {
     snapshot: Arc<HomeSharedSnapshot>,
 }
 
+#[derive(Default)]
+struct ScanInvalidationState {
+    scheduled: bool,
+    dirty: bool,
+    epoch: u64,
+}
+
 struct HomeServiceInner {
     catalog: CatalogService,
     libraries: LibraryService,
@@ -107,6 +115,7 @@ struct HomeServiceInner {
     shared_compute_lock: Mutex<()>,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
+    scan_invalidation: Mutex<ScanInvalidationState>,
     invalidation_debounce_pending: AtomicBool,
     #[cfg(test)]
     invalidation_notification_count: AtomicU64,
@@ -130,6 +139,7 @@ impl HomeService {
             shared_compute_lock: Mutex::new(()),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
+            scan_invalidation: Mutex::new(ScanInvalidationState::default()),
             invalidation_debounce_pending: AtomicBool::new(false),
             #[cfg(test)]
             invalidation_notification_count: AtomicU64::new(0),
@@ -229,13 +239,16 @@ impl HomeService {
     }
 
     pub(crate) fn invalidate(&self) {
+        Self::invalidate_now(&self.inner);
+    }
+
+    fn invalidate_now(inner: &Arc<HomeServiceInner>) {
         // The generation and catalog cache are invalidated synchronously so a
         // snapshot requested immediately after a change cannot reuse stale data.
         // Only the refresh-worker wakeup is coalesced for a short burst.
-        self.inner.generation.fetch_add(1, Ordering::AcqRel);
-        self.inner.catalog.invalidate_library_pages();
-        if self
-            .inner
+        inner.generation.fetch_add(1, Ordering::AcqRel);
+        inner.catalog.invalidate_library_pages();
+        if inner
             .invalidation_debounce_pending
             .swap(true, Ordering::AcqRel)
         {
@@ -243,16 +256,19 @@ impl HomeService {
         }
 
         #[cfg(test)]
-        self.inner
+        inner
             .invalidation_notification_count
             .fetch_add(1, Ordering::Relaxed);
-        self.inner.invalidation_notify.notify_waiters();
-        self.schedule_refresh();
-        let first_generation = self.inner.generation.load(Ordering::Acquire);
-        let inner = Arc::downgrade(&self.inner);
+        inner.invalidation_notify.notify_waiters();
+        (HomeService {
+            inner: Arc::clone(inner),
+        })
+        .schedule_refresh();
+        let first_generation = inner.generation.load(Ordering::Acquire);
+        let weak_inner = Arc::downgrade(inner);
         tokio::spawn(async move {
             tokio::time::sleep(HOME_INVALIDATION_DEBOUNCE).await;
-            let Some(inner) = inner.upgrade() else {
+            let Some(inner) = weak_inner.upgrade() else {
                 return;
             };
             let generation_changed = inner.generation.load(Ordering::Acquire) != first_generation;
@@ -269,6 +285,60 @@ impl HomeService {
             inner.invalidation_notify.notify_waiters();
             (HomeService { inner }).schedule_refresh();
         });
+    }
+
+    pub(crate) async fn invalidate_scan_batch(&self) {
+        let epoch = {
+            let mut state = self.inner.scan_invalidation.lock().await;
+            if state.scheduled {
+                state.dirty = true;
+                return;
+            }
+            state.scheduled = true;
+            state.dirty = false;
+            state.epoch = state.epoch.wrapping_add(1);
+            Self::invalidate_now(&self.inner);
+            state.epoch
+        };
+        let inner = Arc::downgrade(&self.inner);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(HOME_SCAN_INVALIDATION_DEBOUNCE).await;
+                let Some(inner) = inner.upgrade() else {
+                    return;
+                };
+                let continue_window = {
+                    let mut state = inner.scan_invalidation.lock().await;
+                    if state.epoch != epoch || !state.scheduled {
+                        return;
+                    }
+                    if state.dirty {
+                        state.dirty = false;
+                        Self::invalidate_now(&inner);
+                        true
+                    } else {
+                        state.scheduled = false;
+                        false
+                    }
+                };
+                if !continue_window {
+                    return;
+                }
+            }
+        });
+    }
+
+    pub(crate) async fn flush_scan_invalidation(&self) {
+        let mut state = self.inner.scan_invalidation.lock().await;
+        if !state.scheduled {
+            return;
+        }
+        state.epoch = state.epoch.wrapping_add(1);
+        state.scheduled = false;
+        if state.dirty {
+            state.dirty = false;
+            Self::invalidate_now(&self.inner);
+        }
     }
 
     fn schedule_refresh(&self) {
@@ -568,6 +638,33 @@ mod tests {
             .expect("invalidated user snapshot");
 
         assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn scan_invalidations_coalesce_until_the_final_flush() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+
+        home.invalidate_scan_batch().await;
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 1);
+
+        home.invalidate_scan_batch().await;
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 1);
+
+        home.flush_scan_invalidation().await;
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 2);
+
+        home.flush_scan_invalidation().await;
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 2);
     }
 
     #[tokio::test]
