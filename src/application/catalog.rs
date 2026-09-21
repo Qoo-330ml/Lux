@@ -862,9 +862,30 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        self.list_recently_added_for_library_ids_with_filter(library_ids, offset, limit, false)
+            .await
+    }
+
+    pub(crate) async fn list_recently_added_movies_and_series_for_library_ids(
+        &self,
+        library_ids: &[String],
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        self.list_recently_added_for_library_ids_with_filter(library_ids, offset, limit, true)
+            .await
+    }
+
+    async fn list_recently_added_for_library_ids_with_filter(
+        &self,
+        library_ids: &[String],
+        offset: i64,
+        limit: i64,
+        media_only: bool,
+    ) -> Result<CatalogPage, CatalogError> {
         let (item_ids, total) = self
             .database
-            .list_recent_catalog_item_ids(library_ids, offset, limit)
+            .list_recent_catalog_item_ids(library_ids, offset, limit, media_only)
             .await?;
         let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
         let mut items = assemble_items(rows);

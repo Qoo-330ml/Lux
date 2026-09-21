@@ -763,10 +763,21 @@ impl Database {
         library_ids: &[String],
         offset: i64,
         limit: i64,
+        media_only: bool,
     ) -> Result<(Vec<String>, i64), StorageError> {
         if library_ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
+        let available_item_types = if media_only {
+            "mi.item_type IN ('MOVIE', 'SERIES')"
+        } else {
+            "mi.item_type <> 'FOLDER'"
+        };
+        let unavailable_item_types = if media_only {
+            "mi.item_type = 'SERIES'"
+        } else {
+            "mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')"
+        };
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -777,7 +788,7 @@ impl Database {
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.removed_at IS NULL
-                   AND mi.item_type <> 'FOLDER'
+                   AND {available_item_types}
                    AND mi.has_available_source = 1
                    AND mi.library_id IN ({placeholders})
                  UNION ALL
@@ -785,7 +796,7 @@ impl Database {
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.removed_at IS NULL
-                   AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+                   AND {unavailable_item_types}
                    AND mi.has_available_source = 0
                    AND mi.library_id IN ({placeholders})
                    AND (
@@ -823,7 +834,7 @@ impl Database {
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.removed_at IS NULL
-                   AND mi.item_type <> 'FOLDER'
+                   AND {available_item_types}
                    AND mi.has_available_source = 1
                    AND mi.library_id IN ({placeholders})
                  UNION ALL
@@ -831,7 +842,7 @@ impl Database {
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.removed_at IS NULL
-                   AND mi.item_type IN ('SERIES', 'SEASON', 'BOX_SET')
+                   AND {unavailable_item_types}
                    AND mi.has_available_source = 0
                    AND mi.library_id IN ({placeholders})
                    AND (

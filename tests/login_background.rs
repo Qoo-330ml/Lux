@@ -11,7 +11,15 @@ use luxd::{
 };
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 use tokio::net::TcpListener;
+use uuid::Uuid;
+
+fn emby_public_id(id: &str) -> String {
+    Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
@@ -55,9 +63,46 @@ async fn login_background_uses_recent_posters_only_when_enabled()
     MetadataEnricher::new(database.clone())
         .enrich_movie_library(library.id)
         .await?;
+
+    let shows_library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let shows_root = temp_dir.path().join("Shows");
+    let episode_dir = shows_root.join("Example Show (2024)").join("Season 01");
+    tokio::fs::create_dir_all(&episode_dir).await?;
+    tokio::fs::write(
+        shows_root.join("Example Show (2024)").join("poster.jpg"),
+        b"series-poster",
+    )
+    .await?;
+    tokio::fs::write(episode_dir.join("poster.jpg"), b"season-poster").await?;
+    tokio::fs::write(episode_dir.join("Example.Show.S01E01.mkv"), b"episode").await?;
+    tokio::fs::write(
+        episode_dir.join("Example.Show.S01E01-poster.jpg"),
+        b"episode-poster",
+    )
+    .await?;
+    libraries
+        .add_root(
+            shows_library.id,
+            shows_root.to_str().ok_or("non-utf8 root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(shows_library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .enrich_series_library(shows_library.id)
+        .await?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        auth,
+        emby_auth,
+    ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -113,10 +158,36 @@ async fn login_background_uses_recent_posters_only_when_enabled()
     assert_eq!(background.status(), reqwest::StatusCode::OK);
     let body: Value = background.json().await?;
     assert_eq!(body["source"], "RECENTLY_ADDED");
+    let allowed_public_ids = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM media_items WHERE item_type IN ('MOVIE', 'SERIES')",
+    )
+    .fetch_all(database.pool())
+    .await?
+    .into_iter()
+    .map(|id| emby_public_id(&id))
+    .collect::<BTreeSet<_>>();
+    let returned_public_ids = body["images"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter_map(|url| url.split('/').nth(3))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert!(!returned_public_ids.is_empty());
+    assert!(returned_public_ids.is_subset(&allowed_public_ids));
+    let movie_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    let movie_public_id = emby_public_id(&movie_id);
     let image_url = body["images"]
         .as_array()
-        .and_then(|images| images.first())
-        .and_then(Value::as_str)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .find(|url| url.contains(&format!("/Items/{movie_public_id}/")))
+        .map(str::to_owned)
         .ok_or("missing login background image")?;
     assert!(image_url.starts_with("/emby/Items/"));
     assert!(image_url.contains("/Images/Primary?tag="));
