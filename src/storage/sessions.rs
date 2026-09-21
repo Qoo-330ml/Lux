@@ -355,6 +355,65 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_active_playback_session_for_stop(
+        &self,
+        user_id: &str,
+        item_id: &str,
+        media_source_id: Option<&str>,
+        device_id: Option<&str>,
+    ) -> Result<Option<StoredPlaybackSession>, StorageError> {
+        let media_source_filter = if media_source_id.is_some() {
+            " AND media_source_id = ?"
+        } else {
+            ""
+        };
+        let device_filter = if device_id.is_some() {
+            " AND device_id = ?"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                    device_id, client, device_name, client_version, device_type,
+                    remote_ip, state,
+                    position_ticks, duration_ticks, is_paused, started_at,
+                    last_event_at
+             FROM playback_sessions
+             WHERE user_id = ?
+               AND item_id = ?
+               {device_filter}
+               AND state != 'STOPPED'
+               AND last_event_at > unixepoch() - ?
+               {media_source_filter}
+             ORDER BY last_event_at DESC, id
+             LIMIT 2"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        statement = statement.bind(user_id).bind(item_id);
+        if let Some(device_id) = device_id {
+            statement = statement.bind(device_id);
+        }
+        statement = statement.bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        if let Some(media_source_id) = media_source_id {
+            statement = statement.bind(media_source_id);
+        }
+        let sessions = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(stored_playback_session)
+            .collect::<Vec<_>>();
+        if sessions.len() == 1 {
+            Ok(sessions.into_iter().next())
+        } else {
+            Ok(None)
+        }
+    }
+
     pub(crate) async fn find_active_playback_session(
         &self,
         user_id: &str,

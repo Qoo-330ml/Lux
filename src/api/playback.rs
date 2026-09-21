@@ -1301,15 +1301,33 @@ pub(super) async fn handle_emby_playback_event(
         .device_type
         .as_deref()
         .or_else(|| (!header_device.device.is_empty()).then_some(header_device.device.as_str()));
-    let play_session_id = request
-        .play_session_id
-        .filter(|value| !value.is_empty())
+    let requested_play_session_id = request.play_session_id.filter(|value| !value.is_empty());
+    let mut play_session_id = requested_play_session_id
+        .clone()
         .unwrap_or_else(|| format!("{}:{device_id}", internal_item_id));
+    if state_name == "STOPPED" && requested_play_session_id.is_none() {
+        let stop_device_id = {
+            let trimmed = device_id.trim();
+            (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("unknown")).then_some(trimmed)
+        };
+        match database
+            .find_active_playback_session_for_stop(
+                &user.id.to_string(),
+                &internal_item_id,
+                media_source_id,
+                stop_device_id,
+            )
+            .await
+        {
+            Ok(Some(session)) => play_session_id = session.play_session_id,
+            Ok(None) => {}
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
     let emby_transcode_session_id = emby_transcode_session_id_from_play_session(&play_session_id);
     let user_id = user.id.to_string();
-    // A STOPPED callback without PlaySessionId cannot be associated with a
-    // specific HLS session. Clients may send a stale callback while
-    // negotiating a new stream, so only stop the session named by the callback.
+    // Stop only the HLS session selected by the callback's play session ID or
+    // by the active session matching its item, source, and device.
     if state_name == "STOPPED"
         && let Some(session_id) = emby_transcode_session_id
         && let Some(service) = state.web_playback.as_ref()
@@ -1902,13 +1920,25 @@ fn emby_session_playback_details(
     web_session: Option<&crate::storage::StoredWebPlaybackSession>,
 ) -> (&'static str, Option<Value>) {
     let Some(web_session) = web_session.filter(|session| session.plan == "SERVER_HLS") else {
+        let play_method = if session.play_session_id.starts_with("lux-emby:") {
+            "Transcode"
+        } else {
+            "DirectPlay"
+        };
         return (
-            if session.play_session_id.starts_with("lux-emby:") {
-                "Transcode"
-            } else {
-                "DirectPlay"
-            },
-            None,
+            play_method,
+            Some(json!({
+                // Session-card consumers perform arithmetic on these fields,
+                // including for direct play and sessions without probe data.
+                "Container": "",
+                "VideoCodec": "",
+                "AudioCodec": "",
+                "VideoBitrate": 0,
+                "AudioBitrate": 0,
+                "Bitrate": 0,
+                "IsVideoDirect": play_method == "DirectPlay",
+                "IsAudioDirect": play_method == "DirectPlay",
+            })),
         );
     };
     let play_method = if web_session.tier <= i64::from(ServerTier::Remux.number()) {
@@ -1920,15 +1950,20 @@ fn emby_session_playback_details(
         .video_bitrate
         .unwrap_or_default()
         .saturating_add(web_session.audio_bitrate.unwrap_or_default());
+    let container = web_session.transcoding_container.as_deref().unwrap_or("");
+    let video_codec = web_session.video_codec.as_deref().unwrap_or("");
+    let audio_codec = web_session.audio_codec.as_deref().unwrap_or("");
+    let video_bitrate = web_session.video_bitrate.unwrap_or_default();
+    let audio_bitrate = web_session.audio_bitrate.unwrap_or_default();
     (
         play_method,
         Some(json!({
-            "Container": web_session.transcoding_container,
-            "VideoCodec": web_session.video_codec,
-            "AudioCodec": web_session.audio_codec,
-            "VideoBitrate": web_session.video_bitrate,
-            "AudioBitrate": web_session.audio_bitrate,
-            "Bitrate": (total_bitrate > 0).then_some(total_bitrate),
+            "Container": container,
+            "VideoCodec": video_codec,
+            "AudioCodec": audio_codec,
+            "VideoBitrate": video_bitrate,
+            "AudioBitrate": audio_bitrate,
+            "Bitrate": total_bitrate,
             "IsVideoDirect": web_session.tier <= i64::from(ServerTier::AudioTranscode.number()),
             "IsAudioDirect": web_session.tier == i64::from(ServerTier::Remux.number()),
         })),

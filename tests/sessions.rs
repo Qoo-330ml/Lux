@@ -1,7 +1,7 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
-    auth::{emby::EmbyAuthService, sessions::WebAuthService},
+    auth::{admin_api_key::AdminApiKeyService, emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     library::LibraryKind,
     storage::Database,
@@ -61,6 +61,9 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
+    let admin_api_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
     let app = app_with_state(AppState::ready(
         config,
         database.clone(),
@@ -378,6 +381,9 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .ok_or("missing direct playback session")?;
     assert_eq!(direct_session["UserName"], "Admin");
     assert_eq!(direct_session["NowPlayingItem"]["Name"], "Session Movie");
+    assert_eq!(direct_session["TranscodingInfo"]["Bitrate"], 0);
+    assert_eq!(direct_session["TranscodingInfo"]["VideoBitrate"], 0);
+    assert_eq!(direct_session["TranscodingInfo"]["AudioBitrate"], 0);
     let direct_stopped = client
         .post(format!("{event_url}/Stopped"))
         .header("X-Emby-Token", &token)
@@ -390,6 +396,51 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .send()
         .await?;
     assert_eq!(direct_stopped.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let explicit_stop_playing = client
+        .post(&event_url)
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "explicit-stop-session",
+            "DeviceId": "stop-device",
+            "PositionTicks": 100,
+            "RunTimeTicks": 1000,
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        explicit_stop_playing.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let implicit_stopped = client
+        .post(format!("{event_url}/Stopped"))
+        .header("X-Lux-Api-Key", &admin_api_key)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PositionTicks": 100,
+        }))
+        .send()
+        .await?;
+    assert_eq!(implicit_stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    let sessions_after_implicit_stop = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(
+        !sessions_after_implicit_stop
+            .as_array()
+            .is_some_and(|sessions| {
+                sessions
+                    .iter()
+                    .any(|session| session["PlaySessionId"] == "explicit-stop-session")
+            })
+    );
 
     let position: i64 = sqlx::query_scalar(
         "SELECT position_ticks FROM user_item_state
@@ -542,6 +593,57 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(header_session["DeviceId"], "header-device");
     assert_eq!(header_session["DeviceType"], "AppleTV");
     assert_eq!(header_session["ApplicationVersion"], "2");
+
+    for (play_session_id, device_id) in [
+        ("ambiguous-stop-session-a", "ambiguous-device-a"),
+        ("ambiguous-stop-session-b", "ambiguous-device-b"),
+    ] {
+        let ambiguous_playing = client
+            .post(&event_url)
+            .header("X-Emby-Token", &token)
+            .json(&json!({
+                "ItemId": emby_item_id,
+                "MediaSourceId": source_id,
+                "PlaySessionId": play_session_id,
+                "DeviceId": device_id,
+                "PositionTicks": 100,
+                "RunTimeTicks": 1000,
+            }))
+            .send()
+            .await?;
+        assert_eq!(ambiguous_playing.status(), reqwest::StatusCode::NO_CONTENT);
+    }
+    let ambiguous_stopped = client
+        .post(format!("{event_url}/Stopped"))
+        .header("X-Lux-Api-Key", &admin_api_key)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PositionTicks": 100,
+        }))
+        .send()
+        .await?;
+    assert_eq!(ambiguous_stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    let sessions_after_ambiguous_stop = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let active_session_ids = sessions_after_ambiguous_stop
+        .as_array()
+        .ok_or("sessions response is not an array")?;
+    assert!(
+        active_session_ids
+            .iter()
+            .any(|session| { session["PlaySessionId"] == "ambiguous-stop-session-a" })
+    );
+    assert!(
+        active_session_ids
+            .iter()
+            .any(|session| { session["PlaySessionId"] == "ambiguous-stop-session-b" })
+    );
 
     server.abort();
     Ok(())
