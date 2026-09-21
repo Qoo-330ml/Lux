@@ -49,10 +49,11 @@ describe("LoginPage session state", () => {
 
     await act(async () => {
       await vi.waitFor(() => {
-        expect(container.querySelectorAll(".lux-auth-poster-collage img")).toHaveLength(2);
+        expect(container.querySelectorAll(".lux-auth-poster-waterfall img")).toHaveLength(2);
+        expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(3);
       });
     });
-    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-collage img")?.src)
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-waterfall img")?.src)
       .toContain("/emby/Items/123/Images/Primary?tag=poster-one");
     expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
   });
@@ -76,7 +77,7 @@ describe("LoginPage session state", () => {
       expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.getAttribute("src"))
         .toBe("/lux-poster-wall.jpg");
     });
-    expect(container.querySelector(".lux-auth-poster-collage")).toBeNull();
+    expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
   });
 
   it("renders standard credential autofill metadata", () => {

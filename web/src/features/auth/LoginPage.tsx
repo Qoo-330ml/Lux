@@ -35,6 +35,13 @@ export function LoginPage() {
   const posterImages = loginBackground.data?.source === "RECENTLY_ADDED"
     ? loginBackground.data.images.filter((image) => image.trim().length > 0)
     : [];
+  const posterColumns = posterImages.reduce<Array<Array<{ image: string; index: number }>>>(
+    (columns, image, index) => {
+      columns[index % 3].push({ image, index });
+      return columns;
+    },
+    [[], [], []],
+  );
 
   return (
     <main className="lux-auth-screen lux-auth-split-layout">
@@ -53,14 +60,18 @@ export function LoginPage() {
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-hidden="true">
         {posterImages.length > 0 ? (
-          <div className="lux-auth-poster-collage">
-            {posterImages.map((image, index) => (
-              <img
-                key={image}
-                src={image}
-                alt=""
-                loading={index < 6 ? "eager" : "lazy"}
-              />
+          <div className="lux-auth-poster-waterfall">
+            {posterColumns.map((column, columnIndex) => (
+              <div className="lux-auth-poster-waterfall-column" key={`poster-column-${columnIndex}`}>
+                {column.map(({ image, index }) => (
+                  <img
+                    key={image}
+                    src={image}
+                    alt=""
+                    loading={index < 6 ? "eager" : "lazy"}
+                  />
+                ))}
+              </div>
             ))}
           </div>
         ) : (
