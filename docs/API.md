@@ -220,14 +220,14 @@ Emby 目录查询要求有效 `X-Emby-Token` 或 `api_key`：
 - `GET /Users/{userId}/Items/{itemId}`、`GET /Items/{itemId}`：返回 Emby 兼容电影、剧集和季度详情 DTO；目录和详情条目使用标准 `SortName`、`SeasonId`、`IndexNumber`、`ParentIndexNumber`、`PremiereDate`、`ProviderIds` 和用户权限相关的 `CanDownload` 字段，旧客户端使用的 `Index` 别名继续保留；带 `Fields` 的列表按请求投影可选字段，缺失值不序列化为 JSON `null`，日期字段按 Emby 列表使用的 UTC ISO 时间格式输出；请求列表 `Fields=Chapters` 时返回章节数组（当前无本地章节数据时为空数组），章节元素使用 `StartPositionTicks`、`Name`、`MarkerType` 和 `ChapterIndex`。电影列表的 `ImageTags` 支持已索引的 `Primary`、`Logo`、`Thumb`、`Banner`、`Disc`、`Art` 和 `Wallpaper`，`BackdropImageTags` 保留所有背景图标签。文件夹类型返回 `ChildCount`/`RecursiveItemCount`，`UserData` 在没有播放位置时省略 `PlayedPercentage`，其余字段包含 `PlaybackPositionTicks`、`Played`、`IsFavorite` 和 `PlayCount`；剧集/季度额外返回按当前用户可播放分集计算的 `UnplayedItemCount`。
 - `DELETE /Items/{itemId}`：Emby 管理权限用户可删除指定媒体源及其同名旁车文件；支持 `MediaSourceId`（以及常见大小写/`SourceId` 别名）选择版本，不传时删除该条目及剧集后代的全部可删除媒体源。成功返回 204，条目或媒体源不存在返回 404，普通用户返回 403；该兼容路由使用 Emby token 或 `api_key` 认证，不使用 Lux Web 的 CSRF 会话。详情 DTO 对拥有同一管理权限的用户返回 `CanDelete=true`，其他用户返回 `false`。
 - `GET /Shows/{seriesId}/Seasons`：按用户媒体库权限返回季度。
-- `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页。对首个请求且 User-Agent 为 VidHub 的客户端，为兼容其不继续请求 `StartIndex` 的季列表行为，服务端最多返回 4,096 集；其他客户端仍严格按 `Limit` 分页。
+- `GET /Shows/{seriesId}/Episodes?SeasonId={seasonId}&StartIndex=0&Limit=50`：返回剧集，可省略 `SeasonId` 获取整部剧集，支持分页；对齐 Emby 语义，省略 `StartIndex` 和 `Limit` 时返回完整剧集列表（Lux 设置 4,096 集安全上限），显式传入 `Limit` 时按该值分页。
 - `GET /Users/{userId}/Items/NextUp`：按该用户的播放状态返回未看完单集。
 - `GET /Shows/NextUp?UserId={userId}`：返回与 Emby 客户端兼容的用户未看完单集列表，支持 `StartIndex`、`Limit` 和 `Fields`。
 - `GET|HEAD /Items/{itemId}/Images/{Type}`、`/{Type}/{Index}`：读取与 Lux API 相同的本地图片记录，支持 `X-Emby-Token` 或 `api_key`。
 - `GET /api/danmu/{itemId}`：返回旁车 XML 的兼容信息和读取地址；支持 `option=Refresh`、`option=GetJsonById` 别名，但不会在客户端请求中访问上游。
 - `GET /api/danmu/{itemId}/raw`：读取同目录同 basename 的有效 `.xml` 旁车，返回 `application/xml; charset=utf-8`；需要 `X-Emby-Token` 或 `api_key`，并执行媒体库 ACL。
 - `GET /Users/{userId}/Items/Resume`：按用户播放位置、已看状态和服务器 Resume 阈值返回继续观看列表。
-- `GET /Users/{userId}/Items/Latest`：按最近添加顺序返回当前用户可见媒体；`GroupItems` 默认开启，根目录或媒体库范围内默认只返回电影/剧集根条目，剧集/季度结果按剧集聚合并返回 `ChildCount`，传 `GroupItems=false` 可通过 `ParentId` 获取剧集单集。针对部分把该裸数组当作完整剧集列表且不会继续翻页的客户端，当 `ParentId` 为剧集、`IncludeItemTypes=Episode`、`GroupItems=false` 且从 `StartIndex=0` 开始时，Lux 会在服务端合并最多 10,000 集；显式请求后续 `StartIndex` 仍按普通分页处理。
+- `GET /Users/{userId}/Items/Latest`：按最近添加顺序返回当前用户可见媒体；返回裸数组，`GroupItems` 默认开启，根目录或媒体库范围内默认只返回电影/剧集根条目，剧集/季度结果按剧集聚合并返回 `ChildCount`，传 `GroupItems=false` 可通过 `ParentId` 获取剧集单集；`Limit` 按请求值生效。
 - `GET /Search/Hints?SearchTerm=关键词&StartIndex=0&Limit=50`：返回 Emby 搜索提示，默认只返回 `Movie`、`Series`，不返回季度或单集；结果执行当前用户 ACL。
 - `GET|HEAD /api/v1/items/{itemId}/subtitles/{streamIndex}`：读取指定外挂字幕流；需要 Web session 或用户级客户端令牌，并执行媒体库 ACL。
 - `GET|HEAD /api/v1/items/{itemId}/stream`：读取默认本地媒体源；可通过 `sourceId` 选择媒体源，需要 Web session 或用户级客户端令牌和媒体库 ACL。

@@ -442,6 +442,28 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         vidhub_episodes_small_limit_body["Items"]
             .as_array()
             .map(Vec::len),
+        Some(1)
+    );
+
+    let vidhub_episodes_without_limit = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}",
+            admin.id
+        ))
+        .header("User-Agent", "VidHub/1.0")
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(
+        vidhub_episodes_without_limit.status(),
+        reqwest::StatusCode::OK
+    );
+    let vidhub_episodes_without_limit_body: Value = vidhub_episodes_without_limit.json().await?;
+    assert_eq!(vidhub_episodes_without_limit_body["TotalRecordCount"], 3);
+    assert_eq!(
+        vidhub_episodes_without_limit_body["Items"]
+            .as_array()
+            .map(Vec::len),
         Some(3)
     );
 
@@ -778,7 +800,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     let latest_children_small_limit_body: Value = latest_children_small_limit.json().await?;
     assert_eq!(
         latest_children_small_limit_body.as_array().map(Vec::len),
-        Some(3)
+        Some(1)
     );
 
     let episodes = client
@@ -1090,6 +1112,56 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         "WITH RECURSIVE sequence(value) AS (
              SELECT 1
              UNION ALL
+             SELECT value + 1 FROM sequence WHERE value < 60
+         )
+         INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id,
+             season_number, episode_number, title, sort_title,
+             identification_status, identity_key, has_available_source
+         )
+         SELECT printf('unpaged-episode-%05d', value), ?, 'EPISODE', ?, ?,
+                2, 20000 + value, printf('Unpaged Episode %05d', value),
+                printf('Unpaged Episode %05d', value), 'LOCAL_CONFIRMED',
+                printf('unpaged-episode:%05d', value), 1
+         FROM sequence",
+    )
+    .bind(library.id.to_string())
+    .bind(&season_id)
+    .bind(&series_id)
+    .execute(database.pool())
+    .await?;
+    let unpaged_episodes = client
+        .get(format!("{base_url}/Shows/{series_id}/Episodes"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(unpaged_episodes.status(), reqwest::StatusCode::OK);
+    let unpaged_episodes_body = unpaged_episodes.json::<Value>().await?;
+    assert_eq!(unpaged_episodes_body["TotalRecordCount"], 63);
+    assert_eq!(
+        unpaged_episodes_body["Items"].as_array().map(Vec::len),
+        Some(63)
+    );
+
+    let explicitly_paged_episodes = client
+        .get(format!("{base_url}/Shows/{series_id}/Episodes?Limit=50"))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(explicitly_paged_episodes.status(), reqwest::StatusCode::OK);
+    let explicitly_paged_episodes_body = explicitly_paged_episodes.json::<Value>().await?;
+    assert_eq!(explicitly_paged_episodes_body["TotalRecordCount"], 63);
+    assert_eq!(
+        explicitly_paged_episodes_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(50)
+    );
+
+    sqlx::query(
+        "WITH RECURSIVE sequence(value) AS (
+             SELECT 1
+             UNION ALL
              SELECT value + 1 FROM sequence WHERE value < 20000
          )
          INSERT INTO media_items (
@@ -1121,7 +1193,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     .map_err(|_| "episode page materialized the complete series")??;
     assert_eq!(large_page.status(), reqwest::StatusCode::OK);
     let large_page_body = large_page.json::<Value>().await?;
-    assert_eq!(large_page_body["TotalRecordCount"], 20003);
+    assert_eq!(large_page_body["TotalRecordCount"], 20063);
     assert_eq!(large_page_body["Items"].as_array().map(Vec::len), Some(1));
     assert_eq!(large_page_body["Items"][0]["Id"], "bulk-episode-00001");
 
