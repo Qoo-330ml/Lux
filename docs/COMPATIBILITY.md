@@ -133,6 +133,25 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 自动化回归覆盖 `/emby/ScheduledTasks` 的管理员 API Key 调用、`RefreshMediaLibrary` 任务形状和排队全库扫描的
 `Running` 状态；这证明 Lux 服务端协议，不代表 Nextfind 已在 FNOS 部署实例上重新验证。
 
+## Qmby 使用的 Emby 接口补齐（2026-09-23）
+
+针对 Qmby 的请求序列，Lux 兼容层补齐了以下行为；每条路径同时支持根路径和 `/emby` 前缀：
+
+| 请求 | 成功行为 | 主要错误行为 |
+|---|---|---|
+| `POST /Library/Refresh` | 管理员 token/API key 使用空 body 触发所有启用媒体库的异步全量校验，返回 `202` 和 `scope: "ALL"`、`jobs`；已有活动任务直接复用 | 普通用户 `403`；服务未就绪 `503` |
+| `POST /Users/New?Name=...` | 允许空 body、无 `Content-Type`；从查询参数读取名称，返回创建用户 DTO `200`；原有 JSON/XML body 仍保留 | 缺少/非法名称 `400`；重复用户名 `409`；非管理员 `403` |
+| `POST /Sessions/{sessionId}/Playing/Stop` | `sessionId` 使用 `GET /Sessions` 返回的 `Id`；会话所有者或管理员可停止，停止 HLS 资源并返回 `204`；已停止会话重复请求仍为 `204` | 未知或非本人会话 `404`；服务未就绪 `503` |
+
+媒体条目 DTO 的 `DateCreated` 来自 `media_items.added_at`，`DateLastSaved` 和 `DateModified` 来自
+`media_items.updated_at`；带 `Fields` 时仍遵循字段选择。数据库迁移 `0126_emby_item_timestamps` 为旧库补充
+`updated_at` 和索引，元数据/NFO 写入、扫描恢复/移除、层级修复及合集/版本关系更新会同步刷新该值。
+
+自动化证据：`tests/emby_incremental_refresh.rs`、`tests/emby_auth.rs`、`tests/sessions.rs`、
+`tests/catalog.rs`，以及存储层 `recommended_catalog_rows_use_rating_median_for_missing_ratings` 回归。
+这些测试证明 Lux 服务端的请求路径、权限、状态码、响应字段和资源清理，不替代 Qmby 在 FNOS 部署实例上的完整
+登录、首页、详情、播放、进度和停止请求序列复测。
+
 ## 目标矩阵
 
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |
