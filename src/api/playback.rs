@@ -279,6 +279,23 @@ pub(super) async fn emby_playback_info(
                             json!(emby_source_needs_proxy_identity(source)),
                         );
                     }
+                    if request.device_profile.is_some()
+                        && source.source_kind == "STRM_URL"
+                        && source.external_url.as_deref().is_some_and(|target| {
+                            matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
+                        })
+                    {
+                        // Emby leaves URL-STRM DirectStreamUrl empty for
+                        // profiled clients. This keeps Hills/FileBar on the
+                        // standard /Videos handoff that an external Emby
+                        // proxy can intercept, instead of exposing Lux's
+                        // private playback ticket to that proxy.
+                        object.insert("DirectStreamUrl".to_owned(), Value::Null);
+                        object.insert(
+                            "AddApiKeyToDirectStreamUrl".to_owned(),
+                            json!(false),
+                        );
+                    }
                     if let Some(url) = transcoding_url {
                         let segment_container = transcode_container
                             .unwrap_or(HlsSegmentContainer::MpegTs);

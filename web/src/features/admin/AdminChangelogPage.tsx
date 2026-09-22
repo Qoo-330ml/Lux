@@ -23,6 +23,9 @@ export const changelogReleases: ChangelogRelease[] = [
         "Emby 播放会话进一步补齐简介、原标题、层级关系、季名称、图片标签和 ProviderIds，并将 LastActivityDate 统一为 UTC RFC3339；缺失字段使用稳定的空值形状。",
         "扫描任务活动接口新增发现阶段状态，管理台和后台活动面板会在目录发现完成前显示“发现中”，不再展示尚未确定的临时百分比。",
         "补全元数据任务会跳过已具备完整本地元数据的条目，并复用已有 Provider ID 获取缺失图片，减少不必要的标题搜索和远端请求。",
+        "补齐 Qmby 所需的 Emby 兼容接口：支持管理员触发全库异步刷新、通过查询参数创建用户，以及按会话 ID 停止播放，并同时兼容根路径和 /emby 前缀。",
+        "新增 Emby 合集创建、成员增删和媒体库封面上传能力，便于外部客户端维护合集与媒体库展示资源。",
+        "扩展 Emby 目录查询，支持 IsPlayed/IsUnplayed、MinDateLastSaved、合集子项和最高 1000 条分页，并返回稳定的 DateCreated、DateLastSaved 与 DateModified 时间字段。",
       ] },
       { kind: "fixed", items: [
         "修复 Emby STRM 外部直链播放的交接流程；认证后直接将原始地址重定向给客户端，避免 Lux 预探测负载均衡重定向并保留客户端的请求上下文。",
@@ -33,6 +36,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 Emby 直播放地址缺少 PlaySessionId 和 static=true 参数的问题；第三方代理现在可以正确识别并切换对应的播放流。",
         "修复 URL/路径型 .strm 媒体源未声明兼容转码能力的问题；现在向外部 Emby 播放代理保留 SupportsTranscoding，同时不会在 Lux 本地创建 HLS 转码会话或伪造转码地址。",
         "修复 URL/路径型 .strm 的 Emby MediaSource.Name 可能返回空值的问题；现在始终返回稳定的字符串名称，避免客户端反序列化失败。",
+        "修复带设备配置的 URL 型 STRM 仍暴露 Lux 私有 DirectStreamUrl 的问题；现在交由外部 Emby 代理使用标准 /Videos 播放交接，避免代理丢失或误用 Lux 播放票据。",
         "修正登录页动态海报瀑布流的位置、缩放和错落布局，使海报墙与登录面板的视觉对齐更稳定。",
         "优化登录页动态海报瀑布流的响应式布局，根据可用宽度自适应列数并独立调整海报卡片尺寸，改善不同窗口宽度下的展示效果。",
         "收紧登录页海报瀑布流的列间距并将卡片靠右对齐，减少宽屏下的空白并保持紧凑的海报墙效果。",
