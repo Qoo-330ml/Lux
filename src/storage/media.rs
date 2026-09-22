@@ -508,7 +508,8 @@ impl Database {
                     "UPDATE media_items
                      SET library_id = ?, item_type = 'FOLDER', parent_id = ?,
                          title = ?, sort_title = ?, original_title = ?,
-                         identification_status = 'LOCAL_CONFIRMED', removed_at = NULL
+                         identification_status = 'LOCAL_CONFIRMED', removed_at = NULL,
+                         updated_at = unixepoch()
                      WHERE id = ?",
                 )
                 .bind(library_id)
@@ -735,7 +736,8 @@ impl Database {
                 .join(", ");
             let query = format!(
                 "UPDATE media_items
-                 SET parent_id = CASE id {cases} END
+                 SET parent_id = CASE id {cases} END,
+                     updated_at = unixepoch()
                  WHERE item_type = 'MOVIE' AND id IN ({ids})"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -773,7 +775,8 @@ impl Database {
                 .join(", ");
             let query = format!(
                 "UPDATE media_items
-                 SET provider_ids_json = CASE id {cases} END
+                 SET provider_ids_json = CASE id {cases} END,
+                     updated_at = unixepoch()
                  WHERE item_type = 'MOVIE'
                    AND id IN ({ids})
                    AND (provider_ids_json IS NULL OR provider_ids_json = '{{}}')"
@@ -833,7 +836,8 @@ impl Database {
                         "UPDATE media_items
                          SET library_id = ?, item_type = 'FOLDER', parent_id = ?,
                              title = ?, sort_title = ?, original_title = ?,
-                             identification_status = 'LOCAL_CONFIRMED', removed_at = NULL
+                             identification_status = 'LOCAL_CONFIRMED', removed_at = NULL,
+                             updated_at = unixepoch()
                          WHERE id = ?",
                     )
                     .bind(library_id)
@@ -934,7 +938,7 @@ impl Database {
             )
             .await?;
         self.query(
-            "UPDATE media_items SET parent_id = ?
+            "UPDATE media_items SET parent_id = ?, updated_at = unixepoch()
              WHERE id = ? AND item_type = 'MOVIE'",
         )
         .bind(parent_folder_id.as_deref())
@@ -1672,7 +1676,7 @@ impl Database {
                 "UPDATE media_items
                  SET library_id = ?, item_type = ?, parent_id = ?, series_id = ?,
                      season_number = ?, episode_number = ?, absolute_number = ?,
-                     removed_at = NULL
+                     removed_at = NULL, updated_at = unixepoch()
                  WHERE id = ?",
             )
             .bind(&row.library_id)
@@ -1838,7 +1842,7 @@ impl Database {
         }
         self.query(
             "UPDATE media_items
-             SET identity_key = ?, removed_at = NULL
+             SET identity_key = ?, removed_at = NULL, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(identity_key)
@@ -1930,15 +1934,19 @@ impl Database {
             (&season_id, season_identity),
             (&episode_id, episode_identity),
         ] {
-            self.query("UPDATE media_items SET identity_key = ?, removed_at = NULL WHERE id = ?")
-                .bind(identity_key)
-                .bind(item_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            self.query(
+                "UPDATE media_items
+                 SET identity_key = ?, removed_at = NULL, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(identity_key)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         }
         transaction
             .commit()
@@ -2246,7 +2254,8 @@ impl Database {
         })?;
         self.query(
             "UPDATE media_items
-             SET title = ?, sort_title = ?, original_title = ?, overview = ?
+             SET title = ?, sort_title = ?, original_title = ?, overview = ?,
+                 updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(title)
@@ -2430,6 +2439,303 @@ impl Database {
             rows.into_iter().map(|row| row.get("item_id")).collect(),
             total,
         ))
+    }
+
+    pub(crate) async fn create_emby_collection(
+        &self,
+        title: &str,
+        item_ids: &[String],
+    ) -> Result<Option<StoredEmbyCollection>, StorageError> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(None);
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let library_id = if let Some(item_id) = item_ids.first() {
+            self.query_scalar::<Option<String>>(
+                "SELECT mi.library_id
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.id = ? AND mi.removed_at IS NULL",
+            )
+            .bind(item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        } else {
+            None
+        }
+        .or_else(|| None);
+        let library_id = match library_id {
+            Some(library_id) => library_id,
+            None => self
+                .query_scalar::<Option<String>>(
+                    "SELECT id FROM libraries WHERE is_enabled = 1 ORDER BY id LIMIT 1",
+                )
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .flatten(),
+        };
+        let Some(library_id) = library_id else {
+            return Ok(None);
+        };
+        let existing = self
+            .query(
+                "SELECT item_id, title
+                 FROM collections
+                 WHERE library_id = ? AND lower(provider) = 'emby' AND lower(title) = lower(?)
+                 LIMIT 1",
+            )
+            .bind(&library_id)
+            .bind(title)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let collection_item_id = if let Some(row) = existing {
+            row.get::<String, _>("item_id")
+        } else {
+            let item_id = Uuid::now_v7().to_string();
+            let collection_id = Uuid::now_v7().to_string();
+            let identity_key = format!("collection:emby:{library_id}:{collection_id}");
+            self.query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, original_title,
+                    identification_status, identity_key
+                 ) VALUES (?, ?, 'BOX_SET', ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+            )
+            .bind(&item_id)
+            .bind(&library_id)
+            .bind(title)
+            .bind(title.to_ascii_lowercase())
+            .bind(title)
+            .bind(&identity_key)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO collections (
+                    id, item_id, library_id, provider, provider_id, title
+                 ) VALUES (?, ?, ?, 'EMBY', ?, ?)",
+            )
+            .bind(&collection_id)
+            .bind(&item_id)
+            .bind(&library_id)
+            .bind(&collection_id)
+            .bind(title)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            item_id
+        };
+        self.add_emby_collection_members_in_transaction(
+            &mut transaction,
+            &collection_item_id,
+            &library_id,
+            item_ids,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(StoredEmbyCollection {
+            collection_item_id,
+            library_id,
+            title: title.to_owned(),
+        }))
+    }
+
+    pub(crate) async fn add_emby_collection_items(
+        &self,
+        collection_item_id: &str,
+        item_ids: &[String],
+    ) -> Result<Option<StoredEmbyCollection>, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(row) = self
+            .query(
+                "SELECT c.library_id, c.title
+                 FROM collections c
+                 WHERE c.item_id = ? AND lower(c.provider) = 'emby'",
+            )
+            .bind(collection_item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        let library_id = row.get::<String, _>("library_id");
+        let title = row.get::<String, _>("title");
+        self.add_emby_collection_members_in_transaction(
+            &mut transaction,
+            collection_item_id,
+            &library_id,
+            item_ids,
+        )
+        .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(StoredEmbyCollection {
+            collection_item_id: collection_item_id.to_owned(),
+            library_id,
+            title,
+        }))
+    }
+
+    pub(crate) async fn remove_emby_collection_items(
+        &self,
+        collection_item_id: &str,
+        item_ids: &[String],
+    ) -> Result<Option<StoredEmbyCollection>, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(row) = self
+            .query(
+                "SELECT c.id, c.library_id, c.title
+                 FROM collections c
+                 WHERE c.item_id = ? AND lower(c.provider) = 'emby'",
+            )
+            .bind(collection_item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        else {
+            return Ok(None);
+        };
+        let collection_id = row.get::<String, _>("id");
+        let library_id = row.get::<String, _>("library_id");
+        let title = row.get::<String, _>("title");
+        for item_id in item_ids {
+            self.query(
+                "DELETE FROM collection_items
+                 WHERE collection_id = ? AND item_id = ?",
+            )
+            .bind(&collection_id)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(StoredEmbyCollection {
+            collection_item_id: collection_item_id.to_owned(),
+            library_id,
+            title,
+        }))
+    }
+
+    async fn add_emby_collection_members_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        collection_item_id: &str,
+        library_id: &str,
+        item_ids: &[String],
+    ) -> Result<(), StorageError> {
+        let collection_id = self
+            .query_scalar::<String>("SELECT id FROM collections WHERE item_id = ?")
+            .bind(collection_item_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut sort_order = self
+            .query_scalar::<Option<i64>>(
+                "SELECT MAX(sort_order) FROM collection_items WHERE collection_id = ?",
+            )
+            .bind(&collection_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .unwrap_or(-1);
+        let mut seen = HashSet::new();
+        for item_id in item_ids {
+            if !seen.insert(item_id) {
+                continue;
+            }
+            sort_order = sort_order.saturating_add(1);
+            self.query(
+                "INSERT INTO collection_items (collection_id, item_id, sort_order)
+                 SELECT ?, mi.id, ?
+                 FROM media_items mi
+                 WHERE mi.id = ? AND mi.library_id = ? AND mi.removed_at IS NULL
+                 ON CONFLICT (collection_id, item_id) DO NOTHING",
+            )
+            .bind(&collection_id)
+            .bind(sort_order)
+            .bind(item_id)
+            .bind(library_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        Ok(())
     }
 }
 

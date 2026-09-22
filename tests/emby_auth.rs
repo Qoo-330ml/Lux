@@ -693,6 +693,93 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
 }
 
 #[tokio::test]
+async fn emby_create_user_accepts_query_name_without_a_request_body()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let viewer = UserStore::new(database.clone())?
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let admin_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database)?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::new();
+
+    let created = client
+        .post(format!("http://{address}/emby/Users/New"))
+        .query(&[("Name", "QueryUser")])
+        .header("X-Emby-Token", &admin_key)
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+    let created_body = created.json::<serde_json::Value>().await?;
+    assert_eq!(created_body["Name"], "QueryUser");
+    let created_id = created_body["Id"]
+        .as_str()
+        .ok_or("missing created user id")?;
+    assert_eq!(created_body["HasPassword"], false);
+    assert!(uuid::Uuid::parse_str(created_id).is_ok());
+
+    let duplicate = client
+        .post(format!("http://{address}/Users/New"))
+        .query(&[("Name", "QueryUser")])
+        .header("X-Emby-Token", &admin_key)
+        .send()
+        .await?;
+    assert_eq!(duplicate.status(), reqwest::StatusCode::CONFLICT);
+
+    let missing_name = client
+        .post(format!("http://{address}/Users/New"))
+        .header("X-Emby-Token", &admin_key)
+        .send()
+        .await?;
+    assert_eq!(missing_name.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let viewer_login = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "viewer",
+            "Pw": "viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(viewer_login.status(), reqwest::StatusCode::OK);
+    let viewer_token = viewer_login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned();
+    let forbidden = client
+        .post(format!("http://{address}/Users/New"))
+        .query(&[("Name", "ForbiddenUser")])
+        .header("X-Emby-Token", viewer_token)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+    assert_eq!(viewer.id.to_string().len(), 36);
+    Ok(())
+}
+
+#[tokio::test]
 async fn emby_user_creation_deletion_and_configuration_are_persistent()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

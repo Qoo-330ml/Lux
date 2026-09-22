@@ -518,7 +518,7 @@ impl Database {
                  metadata_scraper_id = CASE WHEN ? IS NULL THEN metadata_scraper_id ELSE ? END,
                  identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
-                 poster_fallback_required = ?
+                 poster_fallback_required = ?, updated_at = unixepoch()
              WHERE id = ? AND removed_at IS NULL",
         )
         .bind(update.title)

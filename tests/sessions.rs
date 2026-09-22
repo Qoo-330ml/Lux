@@ -1,7 +1,10 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{libraries::LibraryService, scanner::LibraryScanner, setup::SetupService},
-    auth::{admin_api_key::AdminApiKeyService, emby::EmbyAuthService, sessions::WebAuthService},
+    auth::{
+        admin_api_key::AdminApiKeyService, emby::EmbyAuthService, sessions::WebAuthService,
+        users::UserStore,
+    },
     config::Config,
     library::LibraryKind,
     storage::Database,
@@ -710,6 +713,161 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     );
 
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_session_stop_by_session_id_stops_only_owned_sessions_and_is_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Session.Stop.2024.mkv"), b"video").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let admin_api_key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .await
+    });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let item_id = emby_public_id(&item_id);
+    let playing = client
+        .post(format!("{base_url}/Sessions/Playing"))
+        .header("X-Emby-Token", &admin_api_key)
+        .json(&json!({
+            "ItemId": item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "session-command-stop",
+            "PositionTicks": 100,
+            "RunTimeTicks": 1_000,
+        }))
+        .send()
+        .await?;
+    assert_eq!(playing.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let sessions = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &admin_api_key)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let session_id = sessions
+        .as_array()
+        .and_then(|sessions| {
+            sessions.iter().find_map(|session| {
+                (session["PlaySessionId"] == "session-command-stop")
+                    .then(|| session["Id"].as_str())
+                    .flatten()
+            })
+        })
+        .ok_or("missing session id")?
+        .to_owned();
+
+    let viewer = UserStore::new(database.clone())?
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let viewer_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "viewer",
+            "Pw": "viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(viewer_login.status(), reqwest::StatusCode::OK);
+    let viewer_token = viewer_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned();
+    let forbidden = client
+        .post(format!("{base_url}/Sessions/{session_id}/Playing/Stop"))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::NOT_FOUND);
+
+    let stopped = client
+        .post(format!(
+            "{base_url}/emby/Sessions/{session_id}/Playing/Stop"
+        ))
+        .header("X-Emby-Token", &admin_api_key)
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let sessions_after_stop = client
+        .get(format!("{base_url}/Sessions"))
+        .header("X-Emby-Token", &admin_api_key)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert!(
+        !sessions_after_stop
+            .as_array()
+            .is_some_and(|sessions| sessions.iter().any(|session| session["Id"] == session_id))
+    );
+    let stopped_again = client
+        .post(format!("{base_url}/Sessions/{session_id}/Playing/Stop"))
+        .header("X-Emby-Token", &admin_api_key)
+        .send()
+        .await?;
+    assert_eq!(stopped_again.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let unknown = client
+        .post(format!("{base_url}/Sessions/unknown-session/Playing/Stop"))
+        .header("X-Emby-Token", &admin_api_key)
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    let state: String = sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = ?")
+        .bind(&session_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(state, "STOPPED");
+    assert_eq!(viewer.id.to_string().len(), 36);
+    server.abort();
+    assert_eq!(admin.id.to_string().len(), 36);
     Ok(())
 }
 

@@ -4743,7 +4743,7 @@ impl Database {
                      WHERE id IN (SELECT item_id FROM source_items)
                  )
                  UPDATE media_items
-                 SET removed_at = NULL
+                 SET removed_at = NULL, updated_at = unixepoch()
                  WHERE removed_at IS NOT NULL
                    AND id IN (SELECT item_id FROM items_to_restore)"
             );
@@ -4868,7 +4868,7 @@ impl Database {
         if let Some(library_id) = library_id {
             self.query(
                 "UPDATE media_items
-                 SET removed_at = unixepoch()
+                 SET removed_at = unixepoch(), updated_at = unixepoch()
                  WHERE library_id = ?
                    AND item_type IN ('MOVIE', 'EPISODE', 'UNRESOLVED')
                    AND removed_at IS NULL
@@ -4896,7 +4896,7 @@ impl Database {
             for item_type in ["SEASON", "SERIES"] {
                 self.query(
                     "UPDATE media_items
-                     SET removed_at = unixepoch()
+                     SET removed_at = unixepoch(), updated_at = unixepoch()
                      WHERE library_id = ?
                        AND item_type = ?
                        AND removed_at IS NULL
@@ -4924,15 +4924,19 @@ impl Database {
     }
 
     pub(crate) async fn restore_media_item(&self, item_id: &str) -> Result<(), StorageError> {
-        self.query("UPDATE media_items SET removed_at = NULL WHERE id = ?")
-            .bind(item_id)
-            .execute(&self.pool)
-            .await
-            .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.query(
+            "UPDATE media_items
+             SET removed_at = NULL, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(item_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn reset_media_probe_for_filesystem_entry(
@@ -5112,7 +5116,7 @@ impl Database {
         {
             self.query(
                 "UPDATE media_items
-                 SET removed_at = unixepoch()
+                 SET removed_at = unixepoch(), updated_at = unixepoch()
                  WHERE id = ?
                    AND removed_at IS NULL
                    AND NOT EXISTS (
@@ -5188,7 +5192,7 @@ impl Database {
         {
             self.query(
                 "UPDATE media_items
-                 SET removed_at = unixepoch()
+                 SET removed_at = unixepoch(), updated_at = unixepoch()
                  WHERE id = ? AND removed_at IS NULL
                    AND NOT EXISTS (
                        SELECT 1 FROM media_sources WHERE item_id = media_items.id

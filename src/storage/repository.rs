@@ -1482,6 +1482,13 @@ pub(crate) struct StoredCollectionRefresh {
     pub(crate) member_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyCollection {
+    pub(crate) collection_item_id: String,
+    pub(crate) library_id: String,
+    pub(crate) title: String,
+}
+
 pub(crate) struct NewCollection<'a> {
     pub(crate) library_id: &'a str,
     pub(crate) provider: &'a str,
@@ -1668,6 +1675,8 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<String>,
     pub(crate) runtime_ticks: Option<i64>,
+    pub(crate) added_at: i64,
+    pub(crate) updated_at: i64,
     pub(crate) poster_image_tag: Option<String>,
     pub(crate) fanart_image_tag: Option<String>,
     pub(crate) thumb_image_tag: Option<String>,
@@ -2009,6 +2018,7 @@ fn catalog_filter_where_clause<'a>(
     let years = filter.years;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
+    let min_date_last_saved = filter.min_date_last_saved;
     let metadata_pending = filter.metadata_pending;
     let mut where_clause = format!(
         "WHERE mi.removed_at IS NULL
@@ -2218,6 +2228,10 @@ fn catalog_filter_where_clause<'a>(
             )",
         );
     }
+    if let Some(min_date_last_saved) = min_date_last_saved {
+        where_clause.push_str(" AND mi.updated_at >= ?");
+        binds.push(CatalogBind::Integer(min_date_last_saved));
+    }
     (where_clause, binds)
 }
 
@@ -2350,6 +2364,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
+    pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,

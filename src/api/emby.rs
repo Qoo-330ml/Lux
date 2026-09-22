@@ -16,6 +16,15 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/authenticatebyname", post(emby_authenticate))
         .route("/Users/New", post(emby_create_user))
+        .route("/Collections", post(emby_create_collection))
+        .route(
+            "/Collections/{collection_id}/Items",
+            post(emby_add_collection_items),
+        )
+        .route(
+            "/Collections/{collection_id}/Items/Delete",
+            post(emby_remove_collection_items),
+        )
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route(
             "/Library/SelectableMediaFolders",
@@ -80,6 +89,7 @@ pub(super) fn api_routes() -> Router<AppState> {
                 .delete(emby_delete_item),
         )
         .route("/Items/{item_id}/Refresh", post(emby_refresh_item))
+        .route("/Library/Refresh", post(emby_refresh_library))
         .route("/Items/{item_id}/Children", get(emby_collection_children))
         .route("/api/danmu/{item_id}", get(emby_danmaku_info))
         .route("/api/danmu/{item_id}/raw", get(emby_danmaku_raw))
@@ -87,7 +97,8 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/Items/{item_id}/Images/{image_type}",
             get(emby_image)
                 .head(emby_image)
-                .post(emby_update_person_image),
+                .post(emby_update_person_or_library_image)
+                .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
         )
         .route(
             "/Items/{item_id}/Images/{image_type}/{image_index}",
@@ -169,6 +180,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Sessions/Playing", post(emby_playing))
         .route("/Sessions/Playing/Progress", post(emby_playing_progress))
         .route("/Sessions/Playing/Stopped", post(emby_playing_stopped))
+        .route(
+            "/Sessions/{session_id}/Playing/Stop",
+            post(emby_stop_session),
+        )
         .route(
             "/Users/{user_id}/PlayedItems/{item_id}",
             post(emby_mark_played).delete(emby_unmark_played),

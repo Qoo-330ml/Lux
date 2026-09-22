@@ -219,6 +219,60 @@ pub(super) async fn emby_refresh_item(
         .into_response()
 }
 
+pub(super) async fn emby_refresh_library(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let library_ids = match database.list_enabled_library_ids().await {
+        Ok(library_ids) => library_ids,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let mut jobs = Vec::with_capacity(library_ids.len());
+    for library_id in library_ids {
+        let Ok(library_id) = library_id.parse::<crate::domain::ids::LibraryId>() else {
+            continue;
+        };
+        match scan_jobs.create_movie_scan_job(library_id).await {
+            Ok(job) => {
+                let job_id = job.id.clone();
+                jobs.push(scan_job_json(&job));
+                spawn_emby_scan_job(&state, job_id);
+            }
+            Err(ScanJobError::AlreadyActive(job_id)) => {
+                match database.find_scan_job(&job_id).await {
+                    Ok(Some(job)) => jobs.push(scan_job_json_from_storage(&job)),
+                    Ok(None) => {}
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                }
+            }
+            Err(ScanJobError::LibraryNotFound) => {}
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "scope": "ALL",
+            "jobs": jobs,
+        })),
+    )
+        .into_response()
+}
+
 pub(super) async fn emby_media_updated(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
@@ -687,6 +741,130 @@ pub(super) async fn emby_user(
 }
 
 #[derive(Deserialize, Default)]
+pub(super) struct EmbyCollectionMutationQuery {
+    #[serde(flatten)]
+    pub(super) auth: EmbyTokenQuery,
+    #[serde(rename = "Name", alias = "name", default)]
+    pub(super) name: Option<String>,
+    #[serde(rename = "Ids", alias = "ids", default)]
+    pub(super) ids: Option<String>,
+}
+
+fn parse_emby_collection_item_ids(ids: Option<&str>) -> Result<Vec<String>, StatusCode> {
+    let ids = ids
+        .unwrap_or_default()
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(emby_internal_id)
+        .collect::<Vec<_>>();
+    if ids.len() > 1_000 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(ids)
+}
+
+pub(super) async fn emby_create_collection(
+    headers: HeaderMap,
+    Query(query): Query<EmbyCollectionMutationQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(name) = query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    else {
+        return StatusCode::BAD_REQUEST.into_response();
+    };
+    if name.chars().count() > 256 {
+        return StatusCode::BAD_REQUEST.into_response();
+    }
+    let ids = match parse_emby_collection_item_ids(query.ids.as_deref()) {
+        Ok(ids) => ids,
+        Err(status) => return status.into_response(),
+    };
+    let Some(collections) = state.collections.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match collections.create_emby_collection(name, &ids).await {
+        Ok(Some(collection)) => Json(json!({
+            "Id": emby_public_id(&collection.collection_item_id),
+            "Name": collection.title,
+            "Type": "BoxSet",
+            "IsFolder": true,
+            "CollectionType": "movies"
+        }))
+        .into_response(),
+        Ok(None) => StatusCode::BAD_REQUEST.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(super) async fn emby_add_collection_items(
+    headers: HeaderMap,
+    Path(collection_id): Path<String>,
+    Query(query): Query<EmbyCollectionMutationQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    emby_mutate_collection_items(&headers, &collection_id, query, &state, true).await
+}
+
+pub(super) async fn emby_remove_collection_items(
+    headers: HeaderMap,
+    Path(collection_id): Path<String>,
+    Query(query): Query<EmbyCollectionMutationQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    emby_mutate_collection_items(&headers, &collection_id, query, &state, false).await
+}
+
+async fn emby_mutate_collection_items(
+    headers: &HeaderMap,
+    collection_id: &str,
+    query: EmbyCollectionMutationQuery,
+    state: &AppState,
+    add: bool,
+) -> Response {
+    let user = match require_emby_user(headers, state, query.auth.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    if !user.can_manage_server {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let ids = match parse_emby_collection_item_ids(query.ids.as_deref()) {
+        Ok(ids) => ids,
+        Err(status) => return status.into_response(),
+    };
+    let Some(collections) = state.collections.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let collection_id = emby_internal_id(collection_id);
+    let result = if add {
+        collections
+            .add_emby_collection_items(&collection_id, &ids)
+            .await
+    } else {
+        collections
+            .remove_emby_collection_items(&collection_id, &ids)
+            .await
+    };
+    match result {
+        Ok(Some(_)) => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+#[derive(Deserialize, Default)]
 #[serde(rename_all = "PascalCase")]
 pub(super) struct EmbyCreateUserRequest {
     name: Option<String>,
@@ -694,17 +872,26 @@ pub(super) struct EmbyCreateUserRequest {
     user_copy_options: Option<Vec<String>>,
 }
 
+#[derive(Deserialize, Default)]
+pub(super) struct EmbyCreateUserQuery {
+    #[serde(flatten)]
+    auth: EmbyTokenQuery,
+    #[serde(rename = "Name", alias = "name", default)]
+    name: Option<String>,
+}
+
 pub(super) async fn emby_create_user(
     headers: HeaderMap,
-    Query(query): Query<EmbyTokenQuery>,
+    Query(query): Query<EmbyCreateUserQuery>,
     State(state): State<AppState>,
     body: Bytes,
 ) -> Response {
-    let request = match parse_emby_create_user_request(&headers, &body) {
+    let request = match parse_emby_create_user_request(&headers, &body, query.name.as_deref()) {
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
-    let acting_user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+    let acting_user = match require_emby_user(&headers, &state, query.auth.api_key.as_deref()).await
+    {
         Ok(user) => user,
         Err(status) => return status.into_response(),
     };
@@ -1012,7 +1199,14 @@ fn parse_emby_user_update_request(
 fn parse_emby_create_user_request(
     headers: &HeaderMap,
     body: &[u8],
+    query_name: Option<&str>,
 ) -> Result<EmbyCreateUserRequest, StatusCode> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(EmbyCreateUserRequest {
+            name: query_name.map(str::to_owned),
+            ..EmbyCreateUserRequest::default()
+        });
+    }
     match emby_request_content_type(headers) {
         "application/json" => serde_json::from_slice(body).map_err(|_| StatusCode::BAD_REQUEST),
         "application/xml" | "text/xml" => {

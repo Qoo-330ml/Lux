@@ -3,6 +3,7 @@ use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
 const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = 4_096;
+const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
 
@@ -53,6 +54,15 @@ pub(super) struct EmbyItemsQuery {
         deserialize_with = "deserialize_optional_bool"
     )]
     pub(super) is_favorite: Option<bool>,
+    #[serde(rename = "Filters", alias = "filters", default)]
+    pub(super) filters: Option<String>,
+    #[serde(
+        rename = "MinDateLastSaved",
+        alias = "minDateLastSaved",
+        default,
+        deserialize_with = "deserialize_optional_emby_timestamp"
+    )]
+    pub(super) min_date_last_saved: Option<i64>,
     #[serde(rename = "Years", default)]
     pub(super) years: Option<String>,
     #[serde(rename = "SortBy", default)]
@@ -114,6 +124,22 @@ where
         None | Some("") => Ok(None),
         Some(value) => value.parse().map(Some).map_err(serde::de::Error::custom),
     }
+}
+
+fn deserialize_optional_emby_timestamp<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    let Some(value) = value.map(|value| value.trim().to_owned()) else {
+        return Ok(None);
+    };
+    if value.is_empty() {
+        return Ok(None);
+    }
+    time::OffsetDateTime::parse(&value, &time::format_description::well_known::Rfc3339)
+        .map(|timestamp| Some(timestamp.unix_timestamp()))
+        .map_err(serde::de::Error::custom)
 }
 
 /// Converts an internal UUID to the decimal string used by the Emby
@@ -183,6 +209,7 @@ pub(super) fn catalog_filter_from_values(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
     metadata_pending: bool,
+    min_date_last_saved: Option<i64>,
 ) -> CatalogFilter {
     let item_types = item_types
         .map(|values| {
@@ -220,6 +247,7 @@ pub(super) fn catalog_filter_from_values(
         years,
         is_played,
         is_favorite,
+        min_date_last_saved,
         metadata_pending,
         sort_by: match sort_by {
             Some(value)
@@ -259,7 +287,20 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
         false,
+        query.min_date_last_saved,
     );
+    let requested_filters = query.filters.as_deref().unwrap_or_default();
+    if requested_filters
+        .split(',')
+        .any(|value| value.trim().eq_ignore_ascii_case("IsUnplayed"))
+    {
+        filter.is_played = Some(false);
+    } else if requested_filters
+        .split(',')
+        .any(|value| value.trim().eq_ignore_ascii_case("IsPlayed"))
+    {
+        filter.is_played = Some(true);
+    }
     let ids = query.ids.as_deref().map(|values| {
         values
             .split(',')
@@ -537,7 +578,7 @@ pub(super) struct EmbyMediaFoldersQuery {
 fn emby_media_folder_page_params(query: &EmbyMediaFoldersQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(100);
-    if offset < 0 || !(1..=100).contains(&limit) {
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -1046,6 +1087,7 @@ pub(super) async fn emby_group_latest_page(
             years: Vec::new(),
             is_played: None,
             is_favorite: None,
+            min_date_last_saved: None,
             metadata_pending: false,
             sort_by: CatalogSort::Name,
             descending: false,
@@ -2115,6 +2157,11 @@ pub(super) async fn emby_catalog_page_for_item_parent(
             .list_series_episodes(principal, parent_id, season_id.as_deref(), offset, limit)
             .await;
     }
+    if parent.item_type == "BOX_SET" {
+        return catalog
+            .list_collection_items(principal, parent_id, offset, limit)
+            .await;
+    }
     let child_type = match (parent.item_type.as_str(), requested_type) {
         (_, Some(item_type)) => item_type,
         ("SERIES", _) => "SEASON",
@@ -2830,7 +2877,7 @@ pub(super) fn emby_person_image_tag(person_id: &str) -> String {
 pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(50);
-    if offset < 0 || !(1..=100).contains(&limit) {
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -2841,7 +2888,11 @@ pub(super) fn emby_show_episode_page_params(
 ) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
     let limit = query.limit.unwrap_or(EMBY_SHOW_EPISODE_DEFAULT_LIMIT);
-    if offset < 0 || query.limit.is_some_and(|limit| !(1..=100).contains(&limit)) {
+    if offset < 0
+        || query
+            .limit
+            .is_some_and(|limit| !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit))
+    {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -3130,9 +3181,12 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         // filesystem path on detail DTOs. Lux ids are UUIDv7, so the embedded
         // timestamp is the real item creation time; the path is a stable,
         // harmless label because Lux never reveals real local paths.
-        if let Some(created) = emby_item_timestamp(&item.id) {
+        if let Some(created) = emby_timestamp(item.added_at) {
             object.insert("DateCreated".to_owned(), json!(created));
-            object.insert("DateModified".to_owned(), json!(created));
+        }
+        if let Some(saved) = emby_timestamp(item.updated_at) {
+            object.insert("DateLastSaved".to_owned(), json!(saved.clone()));
+            object.insert("DateModified".to_owned(), json!(saved));
         }
         object.insert(
             "Path".to_owned(),
@@ -3355,8 +3409,22 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
             object.insert("SupportsSync".to_owned(), json!(supports_sync));
         }
         if emby_fields_include(fields, "DateModified") {
-            if let Some(modified) = emby_item_timestamp(&item.id) {
+            if let Some(modified) = emby_timestamp(item.updated_at) {
                 object.insert("DateModified".to_owned(), json!(modified));
+            }
+        }
+        if (emby_fields_include(fields, "DateCreated")
+            || emby_fields_include(fields, "DateLastSaved"))
+            && let Some(created) = emby_timestamp(item.added_at)
+        {
+            if emby_fields_include(fields, "DateCreated") {
+                object.insert("DateCreated".to_owned(), json!(created.clone()));
+            }
+            if emby_fields_include(fields, "DateLastSaved") {
+                object.insert(
+                    "DateLastSaved".to_owned(),
+                    json!(emby_timestamp(item.updated_at).unwrap_or(created)),
+                );
             }
         }
         if emby_fields_include(fields, "Path") {
@@ -3792,19 +3860,6 @@ pub(super) fn emby_safe_path(item: &CatalogItem, default_source: Option<&Catalog
             .unwrap_or("strm")
     };
     format!("/media/{}/{title}.{container}", item.library_id)
-}
-
-/// Extracts the creation timestamp embedded in Lux's UUIDv7 item ids. The first
-/// 48 bits of a v7 uuid are Unix milliseconds, which is exactly when Lux
-/// generated the id for the media item. Non-v7 ids (imported/migrated data)
-/// return None and the field is omitted instead of emitting a fabricated value.
-pub(super) fn emby_item_timestamp(item_id: &str) -> Option<String> {
-    let compact = item_id.replace('-', "");
-    if compact.len() != 32 || compact.as_bytes().get(12).is_none_or(|byte| *byte != b'7') {
-        return None;
-    }
-    let millis = u64::from_str_radix(&compact[..12], 16).ok()?;
-    emby_timestamp(i64::try_from(millis / 1000).ok()?)
 }
 
 /// Reads a video stream dimension (Width or Height) from the default source's
@@ -4593,7 +4648,11 @@ pub(super) fn emby_stream_type(stream_type: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::emby_playback_container_name;
+    use axum::http::StatusCode;
+
+    use super::{
+        EmbyItemsQuery, catalog_filter_from_emby, emby_page_params, emby_playback_container_name,
+    };
 
     #[test]
     fn playback_media_source_uses_emby_matroska_wire_name() {
@@ -4601,5 +4660,32 @@ mod tests {
         assert_eq!(emby_playback_container_name("matroska"), "matroska");
         assert_eq!(emby_playback_container_name("matroska,webm"), "matroska");
         assert_eq!(emby_playback_container_name("mp4"), "mp4");
+    }
+
+    #[test]
+    fn qmby_page_limits_are_accepted_but_hard_capped() {
+        let mut query = EmbyItemsQuery {
+            limit: Some(500),
+            ..EmbyItemsQuery::default()
+        };
+        assert_eq!(emby_page_params(&query), Ok((0, 500)));
+
+        query.limit = Some(1_000);
+        assert_eq!(emby_page_params(&query), Ok((0, 1_000)));
+
+        query.limit = Some(1_001);
+        assert_eq!(emby_page_params(&query), Err(StatusCode::BAD_REQUEST));
+    }
+
+    #[test]
+    fn qmby_unplayed_filter_maps_to_user_playback_state() {
+        let query = EmbyItemsQuery {
+            filters: Some("IsUnplayed".to_owned()),
+            min_date_last_saved: Some(1_700_000_000),
+            ..EmbyItemsQuery::default()
+        };
+        let filter = catalog_filter_from_emby(&query);
+        assert_eq!(filter.is_played, Some(false));
+        assert_eq!(filter.min_date_last_saved, Some(1_700_000_000));
     }
 }

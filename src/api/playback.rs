@@ -279,6 +279,23 @@ pub(super) async fn emby_playback_info(
                             json!(emby_source_needs_proxy_identity(source)),
                         );
                     }
+                    if request.device_profile.is_some()
+                        && source.source_kind == "STRM_URL"
+                        && source.external_url.as_deref().is_some_and(|target| {
+                            matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
+                        })
+                    {
+                        // Emby leaves URL-STRM DirectStreamUrl empty for
+                        // profiled clients. This keeps Hills/FileBar on the
+                        // standard /Videos handoff that an external Emby
+                        // proxy can intercept, instead of exposing Lux's
+                        // private playback ticket to that proxy.
+                        object.insert("DirectStreamUrl".to_owned(), Value::Null);
+                        object.insert(
+                            "AddApiKeyToDirectStreamUrl".to_owned(),
+                            json!(false),
+                        );
+                    }
                     if let Some(url) = transcoding_url {
                         let segment_container = transcode_container
                             .unwrap_or(HlsSegmentContainer::MpegTs);
@@ -1875,6 +1892,50 @@ pub(super) async fn emby_sessions(
             .collect::<Vec<_>>(),
     )
     .into_response()
+}
+
+pub(super) async fn emby_stop_session(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let session = match database.find_playback_session_by_id(&session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let user_id = user.id.to_string();
+    if !user.is_admin && session.user_id != user_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(transcode_session_id) =
+        emby_transcode_session_id_from_play_session(&session.play_session_id)
+        && let Some(service) = state.web_playback.as_ref()
+        && let Err(error) = service.stop(transcode_session_id, &session.user_id).await
+    {
+        tracing::warn!(
+            session_id = %session.id,
+            error = %error,
+            "failed to stop Emby web playback session"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match database
+        .stop_playback_session(&session.id, current_unix_timestamp())
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
 }
 
 pub(super) fn emby_session_json(
