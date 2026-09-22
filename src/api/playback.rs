@@ -225,19 +225,6 @@ pub(super) async fn emby_playback_info(
                         }
                     }
                 }
-                if request.device_profile.is_some()
-                    && source.source_kind == "STRM_URL"
-                    && source.external_url.as_deref().is_some_and(|target| {
-                        matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
-                    })
-                    && let Value::Object(object) = &mut value
-                {
-                    // FileBar/libmpv follows the raw URL-STRM Path through an
-                    // external proxy. Do not steer profiled playback into
-                    // Lux's signed /Videos handoff, which selects a different
-                    // proxy path before the external 302 service is reached.
-                    object.insert("DirectStreamUrl".to_owned(), Value::Null);
-                }
                 let has_direct_stream_url = value
                     .get("DirectStreamUrl")
                     .is_some_and(Value::is_string);
