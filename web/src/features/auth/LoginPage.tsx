@@ -5,7 +5,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 
 const MIN_POSTER_COLUMN_WIDTH = 180;
-const POSTER_COLUMN_GAP = 22;
+const POSTER_COLUMN_GAP = 12;
 const POSTER_HORIZONTAL_PADDING = 40;
 const MIN_POSTER_COLUMNS = 3;
 const MAX_POSTER_COLUMNS = 5;
