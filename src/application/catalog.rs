@@ -33,6 +33,7 @@ pub struct CatalogFilter {
     pub years: Vec<i64>,
     pub is_played: Option<bool>,
     pub is_favorite: Option<bool>,
+    pub min_date_last_saved: Option<i64>,
     pub metadata_pending: bool,
     pub sort_by: CatalogSort,
     pub descending: bool,
@@ -529,6 +530,7 @@ impl CatalogService {
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,
@@ -573,6 +575,7 @@ impl CatalogService {
             years: &filter.years,
             is_played: filter.is_played,
             is_favorite: filter.is_favorite,
+            min_date_last_saved: filter.min_date_last_saved,
             metadata_pending: filter.metadata_pending,
             sort_by: match filter.sort_by {
                 CatalogSort::Name => StorageCatalogSort::Name,

@@ -529,6 +529,7 @@ pub(super) async fn lux_list_library_items(
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
         metadata_pending,
+        None,
     );
     match catalog
         .list_library_items_filtered(principal, &library_id, &filter, offset, limit)

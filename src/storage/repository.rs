@@ -2009,6 +2009,7 @@ fn catalog_filter_where_clause<'a>(
     let years = filter.years;
     let is_played = filter.is_played;
     let is_favorite = filter.is_favorite;
+    let min_date_last_saved = filter.min_date_last_saved;
     let metadata_pending = filter.metadata_pending;
     let mut where_clause = format!(
         "WHERE mi.removed_at IS NULL
@@ -2218,6 +2219,10 @@ fn catalog_filter_where_clause<'a>(
             )",
         );
     }
+    if let Some(min_date_last_saved) = min_date_last_saved {
+        where_clause.push_str(" AND mi.updated_at >= ?");
+        binds.push(CatalogBind::Integer(min_date_last_saved));
+    }
     (where_clause, binds)
 }
 
@@ -2350,6 +2355,7 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) years: &'a [i64],
     pub(crate) is_played: Option<bool>,
     pub(crate) is_favorite: Option<bool>,
+    pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
