@@ -26,6 +26,16 @@ Lux 自有 API 的媒体、搜索、首页、图片、播放和用户状态接�
 failed，`cargo fmt --all -- --check` 与 `git diff --check` 也通过。该证据只证明 Lux 服务端协议，不代表
 VidHub、SenPlayer、Infuse 或其他第三方客户端已经完成真实客户端兼容性验证。
 
+## LUX-234 URL 型 `.strm` 容器名兼容（2026-09-22）
+
+ffprobe 对 Matroska 媒体可能返回内部容器名 `matroska,webm`；Emby 兼容 DTO 不直接暴露这个复合值，
+而是使用 `mkv`，并生成 `/Videos/{itemId}/stream.mkv` 形式的直放入口。Lux 保留数据库中的原始探测值，
+仅在 Emby 输出边界将 `matroska,webm` 规范化为 `mkv`，同时应用于媒体源 `Container` 和播放 URL 后缀。
+这样需要依据容器后缀选择播放分支的外部 Emby 代理不会把该媒体降级为无后缀 `/stream` 请求。
+
+`src/api/legacy.rs` 的 Emby 媒体源回归测试覆盖该字段与 URL 形状；这证明 Lux 服务端兼容合同，仍需在
+FNOS 部署新镜像后用 FileBar 的普通用户 115 秒传场景验证实际播放和后续 302。
+
 ## LUX-247 Emby 局域网发现（2026-09-09）
 
 Lux 服务端监听 UDP `7359`，对大小写不敏感的 `who is EmbyServer?` UTF-8/UTF-16LE 请求返回 Emby 兼容的

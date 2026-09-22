@@ -1901,7 +1901,7 @@ mod tests {
         let source = CatalogSource {
             id: "source-1".to_owned(),
             source_kind: "STRM_URL".to_owned(),
-            container: Some("mkv".to_owned()),
+            container: Some("matroska,webm".to_owned()),
             size: Some(1_234_567),
             external_url: Some("https://example.invalid/media.mkv".to_owned()),
             edition_name: None,
@@ -1929,6 +1929,7 @@ mod tests {
         };
 
         let body = emby_media_source_json("item-1", &source, true);
+        assert_eq!(body["Container"], "mkv");
         assert_eq!(body["Path"], "https://example.invalid/media.mkv");
         assert_eq!(body["Size"], 1_234_567);
         assert_eq!(body["SupportsDirectPlay"], true);
@@ -2134,7 +2135,7 @@ mod tests {
     }
 
     #[test]
-    fn composite_container_names_use_the_generic_stream_entrypoint() {
+    fn composite_matroska_container_uses_the_emby_mkv_stream_entrypoint() {
         assert_eq!(
             emby_media_source_stream_url_parts(
                 "item-1",
@@ -2142,7 +2143,7 @@ mod tests {
                 "LOCAL_FILE",
                 Some("matroska,webm"),
             ),
-            "/Videos/item-1/stream?MediaSourceId=source-1"
+            "/Videos/item-1/stream.mkv?MediaSourceId=source-1"
         );
     }
 

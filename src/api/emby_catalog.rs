@@ -3158,7 +3158,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 "Container",
                 default_source
                     .and_then(|source| source.container.clone())
-                    .map(Value::from),
+                    .map(|value| Value::from(emby_container_name(&value))),
             );
             emby_insert_optional(
                 &mut object,
@@ -3453,7 +3453,7 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
                 "Container",
                 default_source
                     .and_then(|source| source.container.clone())
-                    .map(|value| json!(value)),
+                    .map(|value| json!(emby_container_name(&value))),
             );
         }
         if emby_fields_include(fields, "Size") {
@@ -3747,6 +3747,17 @@ pub(super) fn emby_file_name(
     Some(format!("{}.{}", item.title, container))
 }
 
+/// Emby clients use `mkv` for Matroska media, while ffprobe reports the
+/// container as `matroska,webm`. Keep this normalization at the Emby boundary
+/// and leave the stored probe value unchanged.
+pub(super) fn emby_container_name(container: &str) -> &str {
+    if container.eq_ignore_ascii_case("matroska,webm") {
+        "mkv"
+    } else {
+        container
+    }
+}
+
 /// Emby exposes a filesystem-shaped path on item DTOs. Keep STRM entries
 /// recognizable as `.strm` files without exposing the real filesystem path or
 /// the external playback target; proxies consume the source-level `Path`.
@@ -3970,7 +3981,7 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
         "Edition": source.edition_name,
         "Quality": source.quality_label,
         "VideoType": source.quality_label,
-        "Container": source.container,
+        "Container": source.container.as_deref().map(emby_container_name),
         "Size": source.size,
         "Bitrate": source.bitrate,
         "RunTimeTicks": source.duration_ticks,
@@ -4050,6 +4061,7 @@ pub(super) fn emby_media_source_stream_url_parts(
 ) -> String {
     let item_id = emby_public_id(item_id);
     let stream_suffix = container
+        .map(emby_container_name)
         .filter(|container| !(source_kind == "STRM_URL" && container.eq_ignore_ascii_case("strm")))
         .filter(|container| {
             !container.is_empty() && container.bytes().all(|byte| byte.is_ascii_alphanumeric())
