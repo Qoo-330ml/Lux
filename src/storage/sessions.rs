@@ -286,6 +286,7 @@ impl Database {
     ) -> Result<Vec<StoredPlaybackSession>, StorageError> {
         let active_within_seconds = active_within_seconds
             .unwrap_or(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
+            .min(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
             .clamp(1, MAX_PLAYBACK_SESSION_WINDOW_SECONDS);
         let (query, bind) = if user_id.is_some() {
             (

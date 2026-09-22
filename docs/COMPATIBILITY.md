@@ -522,8 +522,9 @@ Emby 用户管理接口已按当前官方 OpenAPI 的 `UserDto`、`UserPolicy`�
 `Content-Type: image/png`，但请求体是未带 Data URL 前缀的标准 Base64 PNG 文本。Lux 仅对声明为 JPEG、PNG 或 WebP
 的请求尝试解码该兼容形态，随后仍按解码后的实际图片签名和 5 MiB 上限校验，并保存为图片二进制。Policy、Password、用户删除和头像写入成功均返回
 `200` 空响应；其中 NextEmby v4.6.3 会把 Policy 的合法 `200` 空响应记录成客户端侧警告，但不影响策略写入。
-`GET /Sessions` 保留无参数时的 90 秒活动窗口，并兼容 NextEmby 使用的 `ActiveWithinSeconds` 扩展参数；显式值按 1 秒至 30 天校验后在数据库查询层过滤，
-非法值返回 `400 Bad Request`。官方来源：https://swagger.emby.media/openapi.json 。
+`GET /Sessions` 保留无参数时的 90 秒活动窗口，并兼容 NextEmby 使用的 `ActiveWithinSeconds` 扩展参数；显式值按 1 秒至 30 天校验，
+但实际活动窗口不会超过服务端 90 秒失活阈值，避免请求 `ActiveWithinSeconds=300` 重新暴露已失活会话；非法值返回 `400 Bad Request`。
+官方来源：https://swagger.emby.media/openapi.json 。
 
 Emby 官方源码中的 `SqliteUserDataRepository` 只持久化 `played`、`playCount`、`isFavorite`、
 `playbackPositionTicks` 和 `lastPlayedDate` 等条目聚合状态，没有公开事件流字段；官方 Session API

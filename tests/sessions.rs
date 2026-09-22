@@ -374,7 +374,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
             .await?
             .as_array()
             .map(Vec::len),
-        Some(1)
+        Some(0)
     );
 
     let stopped = client
