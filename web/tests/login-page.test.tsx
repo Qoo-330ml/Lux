@@ -23,6 +23,7 @@ describe("LoginPage session state", () => {
   afterEach(() => {
     act(() => root.unmount());
     container.remove();
+    vi.unstubAllGlobals();
     vi.restoreAllMocks();
   });
 
@@ -56,6 +57,50 @@ describe("LoginPage session state", () => {
     expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-waterfall img")?.src)
       .toContain("/emby/Items/123/Images/Primary?tag=poster-one");
     expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
+  });
+
+  it("adds poster columns when the waterfall has room", async () => {
+    class FakeResizeObserver {
+      constructor(private readonly callback: unknown) {}
+
+      observe() {
+        (this.callback as (entries: Array<{ contentRect: { width: number } }>) => void)([
+          { contentRect: { width: 900 } },
+        ]);
+      }
+
+      disconnect() {}
+    }
+    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+    Object.defineProperty(window, "ResizeObserver", {
+      configurable: true,
+      value: FakeResizeObserver,
+      writable: true,
+    });
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "RECENTLY_ADDED",
+      images: Array.from({ length: 8 }, (_, index) => `/poster-${index + 1}.jpg`),
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(4);
+    expect(container.querySelector<HTMLDivElement>(".lux-auth-poster-waterfall")?.style.getPropertyValue(
+      "--lux-auth-poster-column-count",
+    )).toBe("4");
   });
 
   it("keeps the fixed poster wall when the background request fails", async () => {

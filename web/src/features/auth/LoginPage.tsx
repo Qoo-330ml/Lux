@@ -1,8 +1,22 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
-import { FormEvent, useState } from "react";
+import { FormEvent, type CSSProperties, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+
+const MIN_POSTER_COLUMN_WIDTH = 180;
+const POSTER_COLUMN_GAP = 22;
+const POSTER_HORIZONTAL_PADDING = 40;
+const MIN_POSTER_COLUMNS = 3;
+const MAX_POSTER_COLUMNS = 5;
+
+function getPosterColumnCount(width: number) {
+  const availableWidth = Math.max(0, width - POSTER_HORIZONTAL_PADDING);
+  const columnCount = Math.floor(
+    (availableWidth + POSTER_COLUMN_GAP) / (MIN_POSTER_COLUMN_WIDTH + POSTER_COLUMN_GAP),
+  );
+  return Math.min(MAX_POSTER_COLUMNS, Math.max(MIN_POSTER_COLUMNS, columnCount));
+}
 
 export function LoginPage() {
   const queryClient = useQueryClient();
@@ -15,6 +29,8 @@ export function LoginPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const posterWaterfallRef = useRef<HTMLDivElement>(null);
+  const [posterColumnCount, setPosterColumnCount] = useState(MIN_POSTER_COLUMNS);
 
   const login = useMutation({
     mutationFn: () => api.login(username, password),
@@ -35,12 +51,32 @@ export function LoginPage() {
   const posterImages = loginBackground.data?.source === "RECENTLY_ADDED"
     ? loginBackground.data.images.filter((image) => image.trim().length > 0)
     : [];
+  useEffect(() => {
+    const posterWaterfall = posterWaterfallRef.current;
+    const ResizeObserverConstructor = typeof window !== "undefined" ? window.ResizeObserver : undefined;
+    if (!posterWaterfall || !ResizeObserverConstructor) {
+      return undefined;
+    }
+
+    const updateColumnCount = (width: number) => {
+      const columnCount = getPosterColumnCount(width);
+      setPosterColumnCount(columnCount);
+    };
+    const observer = new ResizeObserverConstructor(([entry]) => {
+      updateColumnCount(entry?.contentRect.width ?? posterWaterfall.clientWidth);
+    });
+
+    updateColumnCount(posterWaterfall.clientWidth);
+    observer.observe(posterWaterfall);
+    return () => observer.disconnect();
+  }, [posterImages.length]);
+
   const posterColumns = posterImages.reduce<Array<Array<{ image: string; index: number }>>>(
     (columns, image, index) => {
-      columns[index % 3].push({ image, index });
+      columns[index % posterColumnCount].push({ image, index });
       return columns;
     },
-    [[], [], []],
+    Array.from({ length: posterColumnCount }, () => []),
   );
 
   return (
@@ -60,7 +96,11 @@ export function LoginPage() {
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-hidden="true">
         {posterImages.length > 0 ? (
-          <div className="lux-auth-poster-waterfall">
+          <div
+            className="lux-auth-poster-waterfall"
+            ref={posterWaterfallRef}
+            style={{ "--lux-auth-poster-column-count": posterColumnCount } as CSSProperties}
+          >
             {posterColumns.map((column, columnIndex) => (
               <div className="lux-auth-poster-waterfall-column" key={`poster-column-${columnIndex}`}>
                 {column.map(({ image, index }) => (
