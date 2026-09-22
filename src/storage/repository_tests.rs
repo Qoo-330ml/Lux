@@ -4959,7 +4959,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
         "INSERT INTO scan_jobs (
              id, library_id, job_type, status, generation, total_count,
              discovery_completed, processed_count
-         ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', ?, 0, 1, 0)",
+         ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', ?, 7, 0, 0)",
     )
     .bind(job_id)
     .bind(&library_id)
@@ -5039,7 +5039,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
         library_id: &library_id,
         library_root_id: &root_id,
         generation,
-        discovery_completed: true,
+        discovery_completed: false,
         entries: &entries,
         movie_files: std::slice::from_ref(&movie_file),
         episode_files: &[],
@@ -5083,7 +5083,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
         .await
         .expect("retry batch");
     assert_eq!(committed.confirmed_entries, 2);
-    assert_eq!(database.query_count(), 10);
+    assert_eq!(database.query_count(), 11);
 
     let second_commit = database
         .commit_reconciliation_batch(&batch)
@@ -5123,7 +5123,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
     .fetch_one(database.pool())
     .await
     .expect("final state");
-    assert_eq!(final_state, (1, 1, 2, 2, 2, Some(second_path.to_owned())));
+    assert_eq!(final_state, (1, 1, 2, 2, 7, Some(second_path.to_owned())));
     assert!(final_state.4 >= final_state.3);
 }
 
