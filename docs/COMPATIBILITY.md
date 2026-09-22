@@ -72,6 +72,8 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 
 同日会话条目兼容：`NowPlayingItem.ProductionYear` 对所有 `/Sessions` 会话都返回数值；条目没有年份元数据时使用 `0`，避免 nextEmby 等会话卡片把缺失年份当作 `null` 后进行数值比较。
 
+同日会话条目完整性兼容：`NowPlayingItem` 现在补齐已有 catalog 中的简介、原标题、层级 ID、季名称、图片标签和 ProviderIds；缺失的文本、对象和数组使用稳定的空值形状。会话顶层的 `LastActivityDate` 使用 UTC RFC3339 字符串，减少依赖 Emby 日期字段解析的客户端把 Unix 整数误当作无效日期。
+
 同日播放停止兼容：Emby `Sessions/Playing/Stopped` 回调缺少 `PlaySessionId` 时，Lux 会按认证用户、条目和媒体源匹配近期活动会话；
 回调带有可信 `DeviceId` 时还会按设备过滤，缺少设备 ID 或设备值为 `unknown` 时仅在候选唯一的情况下停止，并将该会话标记为 `STOPPED`。
 因此依赖轮询 `GET /Sessions` 的 nextEmby 能在这类客户端回调中移除虚拟会话卡片。若存在多个无法唯一判断的候选会话，Lux 不会误停其中一个，

@@ -1863,22 +1863,113 @@ pub(super) fn emby_session_json(
 ) -> Value {
     let runtime_ticks = session_runtime_ticks(session, catalog_item);
     let (play_method, transcoding_info) = emby_session_playback_details(session, web_session);
-    let production_year = catalog_item
-        .and_then(|item| item.production_year)
-        .unwrap_or_default();
     let mut now_playing_item = json!({
         "Id": emby_public_id(&session.item_id),
         "RunTimeTicks": runtime_ticks,
-        "ProductionYear": production_year,
+        "Overview": catalog_item
+            .and_then(|item| item.overview.as_deref())
+            .unwrap_or_default(),
+        "OriginalTitle": catalog_item
+            .and_then(|item| item.original_title.as_deref())
+            .unwrap_or_default(),
+        "ProductionYear": catalog_item
+            .and_then(|item| item.production_year)
+            .unwrap_or_default(),
+        "ImageTags": {},
+        "BackdropImageTags": [],
+        "ParentBackdropImageTags": [],
+        "ProviderIds": {},
+        "ParentId": "",
+        "SeriesId": "",
+        "SeasonName": "",
     });
     if let Some(item) = catalog_item
         && let Value::Object(object) = &mut now_playing_item
     {
+        let mut image_tags = serde_json::Map::new();
+        if let Some(tag) = item.poster_image_tag.as_ref() {
+            image_tags.insert("Primary".to_owned(), json!(tag));
+        } else if item.item_type == "EPISODE"
+            && let Some(tag) = item.thumb_image_tag.as_ref()
+        {
+            image_tags.insert("Primary".to_owned(), json!(tag));
+        }
+        for (name, tag) in [
+            ("Logo", item.logo_image_tag.as_ref()),
+            ("Thumb", item.thumb_image_tag.as_ref()),
+            ("Banner", item.banner_image_tag.as_ref()),
+            ("Disc", item.disc_image_tag.as_ref()),
+            ("Art", item.art_image_tag.as_ref()),
+            ("Wallpaper", item.wallpaper_image_tag.as_ref()),
+        ] {
+            if let Some(tag) = tag {
+                image_tags.insert(name.to_owned(), json!(tag));
+            }
+        }
+        let backdrop_image_tags = if item.fanart_image_tags.is_empty() {
+            item.fanart_image_tag
+                .as_ref()
+                .map(|tag| vec![tag.clone()])
+                .unwrap_or_default()
+        } else {
+            item.fanart_image_tags.clone()
+        };
+        let series_id = item.series_id.clone().or_else(|| {
+            (item.item_type == "SEASON")
+                .then(|| item.parent_id.clone())
+                .flatten()
+        });
+        let season_name = match item.item_type.as_str() {
+            "SEASON" => Some(item.title.clone()),
+            "EPISODE" => item
+                .season_number
+                .map(|number| format!("Season {number:02}")),
+            _ => None,
+        };
+        let provider_ids = item
+            .provider_ids
+            .iter()
+            .map(|(name, value)| {
+                let name = match name.to_ascii_lowercase().as_str() {
+                    "tmdb" => "Tmdb",
+                    "tvdb" => "Tvdb",
+                    "imdb" => "Imdb",
+                    _ => name,
+                };
+                (name.to_owned(), value.clone())
+            })
+            .collect::<BTreeMap<_, _>>();
         object.insert("Name".to_owned(), json!(item.title));
         object.insert("Type".to_owned(), json!(emby_item_type(&item.item_type)));
-        if let Some(series_name) = item.series_name.as_deref() {
-            object.insert("SeriesName".to_owned(), json!(series_name));
-        }
+        object.insert(
+            "SeriesName".to_owned(),
+            json!(item.series_name.as_deref().unwrap_or_default()),
+        );
+        object.insert(
+            "ParentId".to_owned(),
+            json!(emby_public_id(
+                item.parent_id.as_deref().unwrap_or(&item.library_id)
+            )),
+        );
+        object.insert(
+            "SeriesId".to_owned(),
+            json!(
+                series_id
+                    .map(|value| emby_public_id(&value))
+                    .unwrap_or_default()
+            ),
+        );
+        object.insert(
+            "SeasonName".to_owned(),
+            json!(season_name.unwrap_or_default()),
+        );
+        object.insert("ImageTags".to_owned(), Value::Object(image_tags));
+        object.insert("BackdropImageTags".to_owned(), json!(backdrop_image_tags));
+        object.insert(
+            "ParentBackdropImageTags".to_owned(),
+            json!(item.series_fanart_image_tags),
+        );
+        object.insert("ProviderIds".to_owned(), json!(provider_ids));
         if let Some(season_number) = item.season_number {
             object.insert("ParentIndexNumber".to_owned(), json!(season_number));
         }
@@ -1896,6 +1987,7 @@ pub(super) fn emby_session_json(
         "Id": session.id,
         "UserId": session.user_id,
         "UserName": user_name.unwrap_or("Unknown"),
+        "UserPrimaryImageTag": Value::Null,
         "ItemId": emby_public_id(&session.item_id),
         "MediaSourceId": session.media_source_id.as_deref().unwrap_or(""),
         "PlaySessionId": session.play_session_id,
@@ -1914,9 +2006,21 @@ pub(super) fn emby_session_json(
         },
         "NowPlayingItem": now_playing_item,
         "RunTimeTicks": runtime_ticks,
-        "LastActivityDate": session.last_event_at,
+        "LastActivityDate": emby_session_timestamp(session.last_event_at),
         "TranscodingInfo": transcoding_info,
     })
+}
+
+fn emby_session_timestamp(unix_seconds: i64) -> Value {
+    time::OffsetDateTime::from_unix_timestamp(unix_seconds)
+        .ok()
+        .and_then(|timestamp| {
+            timestamp
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()
+        })
+        .map(Value::String)
+        .unwrap_or(Value::Null)
 }
 
 fn emby_session_playback_details(

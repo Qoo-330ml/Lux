@@ -63,6 +63,35 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .bind(&item_id)
         .execute(database.pool())
         .await?;
+    sqlx::query(
+        "UPDATE media_items
+         SET original_title = ?, overview = ?, provider_ids_json = ?
+         WHERE id = ?",
+    )
+    .bind("Session Movie Original")
+    .bind("A session-card metadata fixture.")
+    .bind(r#"{"tmdb":"12345"}"#)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path, source)
+         VALUES (?, ?, ?, ?, ?, ?), (?, ?, ?, ?, ?, ?)",
+    )
+    .bind("session-primary-image")
+    .bind(&item_id)
+    .bind("POSTER")
+    .bind(0_i64)
+    .bind("poster.jpg")
+    .bind("LOCAL")
+    .bind("session-backdrop-image")
+    .bind(&item_id)
+    .bind("FANART")
+    .bind(0_i64)
+    .bind("backdrop.jpg")
+    .bind("LOCAL")
+    .execute(database.pool())
+    .await?;
     let emby_item_id = emby_public_id(&item_id);
 
     let auth = WebAuthService::new(database.clone())?;
@@ -186,6 +215,34 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body[0]["UserName"], "Admin");
     assert_eq!(sessions_body[0]["NowPlayingItem"]["Name"], "Session Movie");
     assert_eq!(sessions_body[0]["NowPlayingItem"]["ProductionYear"], 0);
+    assert_eq!(
+        sessions_body[0]["NowPlayingItem"]["OriginalTitle"],
+        "Session Movie Original"
+    );
+    assert_eq!(
+        sessions_body[0]["NowPlayingItem"]["Overview"],
+        "A session-card metadata fixture."
+    );
+    assert_eq!(
+        sessions_body[0]["NowPlayingItem"]["ImageTags"]["Primary"],
+        "session-primary-image"
+    );
+    assert_eq!(
+        sessions_body[0]["NowPlayingItem"]["BackdropImageTags"],
+        json!(["session-backdrop-image"])
+    );
+    assert_eq!(
+        sessions_body[0]["NowPlayingItem"]["ProviderIds"]["Tmdb"],
+        "12345"
+    );
+    assert_eq!(sessions_body[0]["NowPlayingItem"]["SeriesId"], "");
+    assert_eq!(sessions_body[0]["NowPlayingItem"]["SeasonName"], "");
+    assert!(
+        sessions_body[0]["LastActivityDate"]
+            .as_str()
+            .is_some_and(|value| value.ends_with('Z') && value.contains('T'))
+    );
+    assert_eq!(sessions_body[0]["UserPrimaryImageTag"], Value::Null);
     assert_eq!(sessions_body[0]["NowPlayingItem"]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["DeviceId"], "session-device");

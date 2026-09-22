@@ -1114,6 +1114,7 @@ impl CatalogService {
             items.retain(|item| allowed_libraries.contains(&item.library_id));
         }
         self.populate_item_details(&mut items).await?;
+        self.populate_image_tags(&mut items).await?;
         self.populate_chapters(&mut items).await?;
         Ok(items
             .into_iter()
