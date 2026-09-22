@@ -11,6 +11,7 @@ test("login poster waterfall keeps the requested scale, inset, and stagger", () 
 
   assert.match(waterfallRule, /left:\s*16%/);
   assert.match(waterfallRule, /right:\s*0%/);
+  assert.match(waterfallRule, /grid-template-columns:\s*repeat\(var\(--lux-auth-poster-column-count,\s*3\)/);
   assert.match(waterfallRule, /transform:\s*translateX\(4%\)\s*rotate\(6deg\)/);
   assert.match(waterfallRule, /transform-origin:\s*left center/);
   assert.match(middleColumnRule, /margin-top:\s*-9%/);
