@@ -1345,7 +1345,7 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
   POST 声明 `EnableTranscoding=true` 且未启用直放、或同时声明直放/转码但由 `DeviceProfile` 确认直放
   profile 不匹配且存在 HLS 转码 profile、或携带 `forceTranscode=true` 时返回服务端转码能力；顶层布尔值
   全部省略时也按 `DeviceProfile` 协商。源容器或 codec 缺失/待探测时视为未知，不因此自动认定直放不兼容；
-  `.strm` 始终返回 `SupportsTranscoding=false`。
+  URL/路径型 `.strm` 为兼容外部 Emby 播放代理返回 `SupportsTranscoding=true`，但 Lux 不为这两类源创建本地 HLS 转码会话或伪造 `TranscodingUrl`；本地媒体仍按实际 HLS 能力返回该字段。
 - MediaSources 包含版本、容器、码率、大小、时长、流列表、章节和直放 URL。
 - `PlaybackInfo` 响应顶层和每个 `MediaSources[]` 返回完整 `RunTimeTicks`；优先使用选中 source 的探测时长，
   缺失时回退到媒体项时长。Emby 兼容 HLS 清单按完整媒体时长生成 VOD 时间轴、完整分片列表和

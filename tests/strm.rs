@@ -355,6 +355,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     assert_eq!(body["MediaSources"][0]["Path"], remote_target);
     assert_eq!(body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(body["MediaSources"][0]["SupportsDirectStream"], true);
+    assert_eq!(body["MediaSources"][0]["SupportsTranscoding"], true);
     let remote_direct_url = body["MediaSources"][0]["DirectStreamUrl"]
         .as_str()
         .ok_or("missing proxy-compatible remote direct stream URL")?;

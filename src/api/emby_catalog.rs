@@ -4010,7 +4010,12 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
         "SupportsDirectPlay": is_playable,
         "SupportsDirectStream": is_playable,
         "SupportsProbing": !source.probe_status.eq_ignore_ascii_case("FAILED"),
-        "SupportsTranscoding": false,
+        // Emby advertises transcoding capability for external URL/path STRM
+        // sources even when the external playback proxy owns the actual
+        // fallback. Lux still does not create a local HLS session for these
+        // sources; the capability bit keeps the external Emby contract
+        // compatible with the upstream response.
+        "SupportsTranscoding": is_proxy_compatible_strm_target,
         "DirectStreamUrl": direct_stream_url,
         // Android clients deserialize this compatibility field as a number,
         // even while a source is waiting for media probing and has no audio

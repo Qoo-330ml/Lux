@@ -1348,7 +1348,7 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
         .await?;
     assert_eq!(strm_response.status(), reqwest::StatusCode::OK);
     let strm_body = strm_response.json::<Value>().await?;
-    assert_eq!(strm_body["MediaSources"][0]["SupportsTranscoding"], false);
+    assert_eq!(strm_body["MediaSources"][0]["SupportsTranscoding"], true);
     assert!(strm_body["MediaSources"][0].get("TranscodingUrl").is_none());
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
