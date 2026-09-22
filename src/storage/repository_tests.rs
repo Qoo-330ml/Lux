@@ -393,7 +393,7 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
     .await
     .expect("complete local metadata target");
 
-    database
+    let changed = database
         .record_scan_job_sidecar_targets(
             &job.id,
             &root_id,
@@ -401,6 +401,7 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
         )
         .await
         .expect("record changed sidecar target");
+    assert!(changed);
     let state: String = sqlx::query_scalar(
         "SELECT metadata_state
          FROM scan_job_targets
@@ -421,7 +422,7 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
     .execute(database.pool())
     .await
     .expect("set stable sidecar timestamp");
-    database
+    let changed = database
         .record_scan_job_sidecar_targets(
             &job.id,
             &root_id,
@@ -429,6 +430,7 @@ async fn changed_sidecar_target_requeues_completed_local_metadata() {
         )
         .await
         .expect("repeat unchanged sidecar target");
+    assert!(!changed);
     let updated_at: i64 = sqlx::query_scalar(
         "SELECT updated_at
          FROM scan_job_targets
@@ -3271,6 +3273,48 @@ async fn subtitle_stream_query_is_source_scoped_and_paginated() {
 }
 
 #[tokio::test]
+async fn library_roots_can_be_loaded_by_id_in_one_query() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let first_path = temp_dir.path().join("first");
+    let second_path = temp_dir.path().join("second");
+    tokio::fs::create_dir_all(&first_path)
+        .await
+        .expect("first root");
+    tokio::fs::create_dir_all(&second_path)
+        .await
+        .expect("second root");
+    let first = libraries
+        .add_root(library.id, first_path.to_str().expect("first path"))
+        .await
+        .expect("first library root")
+        .root;
+    let second = libraries
+        .add_root(library.id, second_path.to_str().expect("second path"))
+        .await
+        .expect("second library root")
+        .root;
+
+    database.reset_query_count();
+    let roots = database
+        .list_library_roots_by_ids(&[first.id.to_string(), second.id.to_string()])
+        .await
+        .expect("roots");
+
+    assert_eq!(roots.len(), 2);
+    assert_eq!(database.query_count(), 1);
+}
+
+#[tokio::test]
 async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -3878,6 +3922,11 @@ async fn reconciliation_entries_use_scan_safe_batches() {
         .create_movie_scan_job(library.id)
         .await
         .expect("scan job");
+    sqlx::query("UPDATE scan_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .expect("start scan job");
     database
         .clear_reconciliation_scan_entries(&job.id)
         .await
@@ -3888,9 +3937,15 @@ async fn reconciliation_entries_use_scan_safe_batches() {
         .collect::<Vec<_>>();
     database.reset_query_count();
     database
-        .append_reconciliation_directory_entries(&job.id, &root.id.to_string(), &[], &paths)
+        .commit_reconciliation_discovery_chunk(&job.id, &root.id.to_string(), &[], &paths, None)
         .await
-        .expect("append reconciliation entries");
+        .expect("commit reconciliation entries");
+
+    database.reset_query_count();
+    database
+        .commit_reconciliation_discovery_chunk(&job.id, &root.id.to_string(), &[], &paths, None)
+        .await
+        .expect("re-commit reconciliation entries");
 
     assert_eq!(database.query_count(), 6);
     let stored: i64 = sqlx::query_scalar(
@@ -3902,6 +3957,102 @@ async fn reconciliation_entries_use_scan_safe_batches() {
     .await
     .expect("stored reconciliation entries");
     assert_eq!(stored, 1_025);
+    let total_count: i64 = sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("scan total count");
+    assert_eq!(total_count, 1_025);
+}
+
+#[tokio::test]
+async fn reconciliation_discovery_chunk_commits_entries_progress_and_completion() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Discovery commit", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("media root path"))
+        .await
+        .expect("library root")
+        .root;
+    let root_id = root.id.to_string();
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await
+        .expect("scan job");
+    sqlx::query("UPDATE scan_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await
+        .expect("start scan job");
+    database
+        .clear_reconciliation_scan_entries(&job.id)
+        .await
+        .expect("clear initial directory");
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+             job_id, library_root_id, relative_path, entry_type, status
+         ) VALUES (?, ?, '', 'DIRECTORY', 'PENDING')",
+    )
+    .bind(&job.id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await
+    .expect("root directory entry");
+
+    database
+        .commit_reconciliation_discovery_chunk(
+            &job.id,
+            &root_id,
+            &["Movie".to_owned()],
+            &[
+                "Movie/First.Movie.2024.mkv".to_owned(),
+                "Movie/Second.Movie.2024.mkv".to_owned(),
+                "Movie/First.Movie.2024.mkv".to_owned(),
+            ],
+            Some(""),
+        )
+        .await
+        .expect("discovery chunk");
+
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM reconciliation_scan_entries
+              WHERE job_id = ? AND entry_type = 'DIRECTORY'),
+             (SELECT COUNT(*) FROM reconciliation_scan_entries
+              WHERE job_id = ? AND entry_type = 'FILE'),
+             (SELECT total_count FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await
+    .expect("discovery state");
+    assert_eq!(counts, (1, 2, 2));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM reconciliation_scan_entries
+             WHERE job_id = ? AND relative_path = '' AND entry_type = 'DIRECTORY'",
+        )
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await
+        .expect("completed directory count"),
+        0
+    );
 }
 
 #[tokio::test]
@@ -4929,7 +5080,7 @@ async fn database_lifecycle_cleanup_is_one_time_and_preserves_retry_state() {
 }
 
 #[tokio::test]
-async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries() {
+async fn reconciliation_batch_commit_is_atomic_and_counts_confirmed_and_missing_entries() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
         http_addr: "127.0.0.1:8097".parse().expect("test address"),
@@ -5024,6 +5175,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
         },
     ];
     let new_paths = vec![first_path.to_owned()];
+    let missing_paths = vec![second_path.to_owned()];
 
     sqlx::query(
         "CREATE TRIGGER fail_reconciliation_targets
@@ -5039,11 +5191,11 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
         library_id: &library_id,
         library_root_id: &root_id,
         generation,
-        discovery_completed: true,
         entries: &entries,
         movie_files: std::slice::from_ref(&movie_file),
         episode_files: &[],
         seen_entry_ids: &[],
+        missing_paths: &missing_paths,
         new_paths: &new_paths,
         changed_paths: &[],
         sidecar_paths: &[],
@@ -5083,13 +5235,15 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
         .await
         .expect("retry batch");
     assert_eq!(committed.confirmed_entries, 2);
-    assert_eq!(database.query_count(), 10);
+    assert!(committed.metadata_targets_changed);
+    assert_eq!(database.query_count(), 11);
 
     let second_commit = database
         .commit_reconciliation_batch(&batch)
         .await
         .expect("idempotent confirmation");
     assert_eq!(second_commit.confirmed_entries, 0);
+    assert!(!second_commit.metadata_targets_changed);
 
     let entry_states: Vec<(String, i64)> = sqlx::query_as(
         "SELECT status, COUNT(*)
@@ -5104,7 +5258,7 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
     .expect("entry states");
     assert_eq!(
         entry_states,
-        vec![("DONE".to_owned(), 2), ("PENDING".to_owned(), 1)]
+        vec![("DONE".to_owned(), 1), ("PENDING".to_owned(), 1)]
     );
 
     let final_state: (i64, i64, i64, i64, i64, Option<String>) = sqlx::query_as(
@@ -5125,6 +5279,41 @@ async fn reconciliation_batch_commit_is_atomic_and_counts_only_confirmed_entries
     .expect("final state");
     assert_eq!(final_state, (1, 1, 2, 2, 2, Some(second_path.to_owned())));
     assert!(final_state.4 >= final_state.3);
+}
+
+#[tokio::test]
+async fn empty_reconciliation_batch_is_a_noop() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let batch = ReconciliationBatchCommit {
+        job_id: "missing-job",
+        library_id: "missing-library",
+        library_root_id: "missing-root",
+        generation: "missing-generation",
+        entries: &[],
+        movie_files: &[],
+        episode_files: &[],
+        seen_entry_ids: &[],
+        missing_paths: &[],
+        new_paths: &[],
+        changed_paths: &[],
+        sidecar_paths: &[],
+    };
+
+    database.reset_query_count();
+    let result = database
+        .commit_reconciliation_batch(&batch)
+        .await
+        .expect("empty batch should be ignored");
+
+    assert_eq!(result.confirmed_entries, 0);
+    assert_eq!(result.created_items, 0);
+    assert!(!result.metadata_targets_changed);
+    assert_eq!(database.query_count(), 0);
 }
 
 #[tokio::test]

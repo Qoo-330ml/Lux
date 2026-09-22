@@ -3068,7 +3068,6 @@ impl ScanJobService {
             && let Some(home) = &self.home
         {
             home.invalidate_scan_batch().await;
-            self.user_events.publish_home_coalesced().await;
         }
         Ok(report)
     }
@@ -3175,7 +3174,6 @@ impl ScanJobService {
         job_id: &str,
         root: &StoredLibraryRoot,
         relative_directory: &str,
-        discovered_count_base: i64,
         cancellation: &AtomicBool,
     ) -> Result<Option<usize>, ScannerError> {
         let relative = Path::new(relative_directory);
@@ -3202,7 +3200,7 @@ impl ScanJobService {
                 })?;
         let mut directories = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
         let mut media_files = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
-        let mut discovered_media_files = 0_usize;
+        let mut inserted_media_files = 0_usize;
         while let Some(entry) = entries
             .next_entry()
             .await
@@ -3235,46 +3233,43 @@ impl ScanJobService {
                 directories.push(relative_path);
             } else {
                 media_files.push(relative_path);
-                discovered_media_files = discovered_media_files.saturating_add(1);
             }
             if directories.len() >= DISCOVERY_ENTRY_BATCH_SIZE
                 || media_files.len() >= DISCOVERY_ENTRY_BATCH_SIZE
             {
                 directories.sort_unstable();
                 media_files.sort_unstable();
-                self.database
-                    .append_reconciliation_directory_entries(
+                let inserted_count = self
+                    .database
+                    .commit_reconciliation_discovery_chunk(
                         job_id,
                         &root.id,
                         &directories,
                         &media_files,
+                        None,
                     )
                     .await?;
-                self.database
-                    .update_scan_job_discovery_progress(
-                        job_id,
-                        discovered_count_base.saturating_add(
-                            i64::try_from(discovered_media_files).unwrap_or(i64::MAX),
-                        ),
-                    )
-                    .await?;
+                inserted_media_files = inserted_media_files
+                    .saturating_add(usize::try_from(inserted_count).unwrap_or(usize::MAX));
                 directories.clear();
                 media_files.clear();
             }
         }
         directories.sort_unstable();
         media_files.sort_unstable();
-        self.database
-            .append_reconciliation_directory_entries(job_id, &root.id, &directories, &media_files)
-            .await?;
-        self.database
-            .update_scan_job_discovery_progress(
+        let inserted_count = self
+            .database
+            .commit_reconciliation_discovery_chunk(
                 job_id,
-                discovered_count_base
-                    .saturating_add(i64::try_from(discovered_media_files).unwrap_or(i64::MAX)),
+                &root.id,
+                &directories,
+                &media_files,
+                Some(relative_directory),
             )
             .await?;
-        Ok(Some(discovered_media_files))
+        inserted_media_files = inserted_media_files
+            .saturating_add(usize::try_from(inserted_count).unwrap_or(usize::MAX));
+        Ok(Some(inserted_media_files))
     }
 
     async fn run_reconciliation_discovery_batch(
@@ -3297,6 +3292,13 @@ impl ScanJobService {
             "DISCOVERY",
         )
         .await?;
+        let root_ids = directories
+            .iter()
+            .map(|directory| directory.library_root_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let roots_by_id = self.database.list_library_roots_by_ids(&root_ids).await?;
         let mut unavailable_root_ids = HashSet::new();
         let mut discovered_count = job.total_count;
         for directory in directories {
@@ -3306,11 +3308,7 @@ impl ScanJobService {
             if unavailable_root_ids.contains(&directory.library_root_id) {
                 continue;
             }
-            let Some(root) = self
-                .database
-                .find_library_root(&directory.library_root_id)
-                .await?
-            else {
+            let Some(root) = roots_by_id.get(&directory.library_root_id).cloned() else {
                 self.database
                     .discard_reconciliation_root_entries(&job.id, &directory.library_root_id)
                     .await?;
@@ -3321,7 +3319,6 @@ impl ScanJobService {
                     &job.id,
                     &root,
                     &directory.relative_path,
-                    discovered_count,
                     cancellation,
                 )
                 .await
@@ -3335,15 +3332,6 @@ impl ScanJobService {
                             .update_library_root_availability(&root.id, true)
                             .await?;
                     }
-                    self.database
-                        .complete_reconciliation_directory(
-                            &job.id,
-                            &root.id,
-                            &directory.relative_path,
-                            &[],
-                            &[],
-                        )
-                        .await?;
                 }
                 Ok(None) => return self.cancel_running_job(&job.id).await,
                 Err(ScannerError::Io { .. }) => {
@@ -3390,9 +3378,6 @@ impl ScanJobService {
             )
             .await;
         } else {
-            self.database
-                .update_scan_job_discovery_progress(&job.id, discovered_count)
-                .await?;
             let details =
                 format!(r#"{{"discovered":{discovered_count},"discoveryCompleted":false}}"#);
             self.record_event(
@@ -3488,9 +3473,9 @@ impl ScanJobService {
                 loop {
                     let missing_paths = self
                         .database
-                        .list_unseen_filesystem_entry_paths_page(
+                        .list_reconciliation_missing_filesystem_entry_paths_page(
+                            &job.id,
                             &root.id,
-                            &job.generation,
                             after_relative_path.as_deref(),
                             i64::try_from(MISSING_ENTRY_BATCH_SIZE).unwrap_or(i64::MAX),
                         )
@@ -3589,7 +3574,6 @@ impl ScanJobService {
                     &batch,
                     scan_concurrency,
                     cancellation,
-                    discovery_completed,
                 )
                 .await;
         }
@@ -3607,6 +3591,7 @@ impl ScanJobService {
         let mut new_works_by_root = HashMap::<String, Vec<ReconciliationScanWork>>::new();
         let mut root_has_existing_index = HashMap::<String, bool>::new();
         let mut quick_seen_entry_ids = HashMap::<String, Vec<String>>::new();
+        let mut missing_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut regular_works = Vec::<ReconciliationRegularWork>::new();
         let mut classification_cache = MixedClassificationCache::default();
         for entry in &batch {
@@ -3689,6 +3674,10 @@ impl ScanJobService {
                 }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
+                missing_paths_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry.relative_path.clone());
                 completed_entries.push(entry.clone());
                 continue;
             }
@@ -3715,18 +3704,10 @@ impl ScanJobService {
                         .entry(root.id.clone())
                         .or_default()
                         .push(entry.relative_path.clone());
-                    // Persist the sidecar target before acknowledging the
-                    // reconciliation entry. If the later batch commit fails,
-                    // the retry still has an explicit metadata target even
-                    // though the sidecar fingerprint is now up to date.
-                    self.database
-                        .record_scan_job_sidecar_targets(
-                            &job.id,
-                            &root.id,
-                            std::slice::from_ref(&entry.relative_path),
-                        )
-                        .await?;
-                    self.notify_local_metadata_worker(&job.id);
+                    // The target is persisted by the atomic root batch before
+                    // the reconciliation entry is acknowledged. If file
+                    // preparation fails first, the pending entry and the
+                    // generation marker let the retry recover the target.
                 } else {
                     quick_seen_entry_ids
                         .entry(root.id.clone())
@@ -4029,7 +4010,6 @@ impl ScanJobService {
                 library_id: &job.library_id,
                 library_root_id: &root.id,
                 generation: &job.generation,
-                discovery_completed,
                 entries: &root_entries,
                 movie_files: prepared_movie_files
                     .get(&root.id)
@@ -4038,6 +4018,9 @@ impl ScanJobService {
                     .get(&root.id)
                     .map_or(&[][..], Vec::as_slice),
                 seen_entry_ids: quick_seen_entry_ids
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                missing_paths: missing_paths_by_root
                     .get(&root.id)
                     .map_or(&[][..], Vec::as_slice),
                 new_paths: new_paths_by_root
@@ -4119,7 +4102,6 @@ impl ScanJobService {
         batch: &[StoredReconciliationScanEntry],
         configured_concurrency: i64,
         cancellation: &AtomicBool,
-        discovery_completed: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let mut processed = 0_usize;
         let mut next_count = job.processed_count;
@@ -4133,6 +4115,7 @@ impl ScanJobService {
         let mut new_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut changed_sidecar_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut quick_seen_entry_ids = HashMap::<String, Vec<String>>::new();
+        let mut missing_paths_by_root = HashMap::<String, Vec<String>>::new();
         let mut new_files = Vec::<(
             usize,
             String,
@@ -4230,6 +4213,10 @@ impl ScanJobService {
                 }
                 next_count = next_count.saturating_add(1);
                 processed = processed.saturating_add(1);
+                missing_paths_by_root
+                    .entry(root.id.clone())
+                    .or_default()
+                    .push(entry.relative_path.clone());
                 completed_entries.push((index, entry.clone()));
                 continue;
             }
@@ -4256,14 +4243,6 @@ impl ScanJobService {
                         .entry(root.id.clone())
                         .or_default()
                         .push(entry.relative_path.clone());
-                    self.database
-                        .record_scan_job_sidecar_targets(
-                            &job.id,
-                            &root.id,
-                            std::slice::from_ref(&entry.relative_path),
-                        )
-                        .await?;
-                    self.notify_local_metadata_worker(&job.id);
                 } else {
                     quick_seen_entry_ids
                         .entry(root.id.clone())
@@ -4524,11 +4503,13 @@ impl ScanJobService {
                 library_id: &job.library_id,
                 library_root_id: &root.id,
                 generation: &job.generation,
-                discovery_completed,
                 entries: &root_entries,
                 movie_files: prepared_files.get(&root.id).map_or(&[][..], Vec::as_slice),
                 episode_files: &[],
                 seen_entry_ids: quick_seen_entry_ids
+                    .get(&root.id)
+                    .map_or(&[][..], Vec::as_slice),
+                missing_paths: missing_paths_by_root
                     .get(&root.id)
                     .map_or(&[][..], Vec::as_slice),
                 new_paths: new_paths_by_root
@@ -4561,7 +4542,9 @@ impl ScanJobService {
         batch: &ReconciliationBatchCommit<'_>,
     ) -> Result<(usize, usize), ScanJobError> {
         let result = self.database.commit_reconciliation_batch(batch).await?;
-        self.notify_local_metadata_worker(batch.job_id);
+        if result.metadata_targets_changed {
+            self.notify_local_metadata_worker(batch.job_id);
+        }
         Ok((result.confirmed_entries, result.created_items))
     }
 
@@ -4888,10 +4871,13 @@ impl ScanJobService {
         if metadata.is_none() {
             if is_supported_sidecar_file(&media_path) {
                 let sidecar_paths = [path.relative_path.clone()];
-                self.database
+                let targets_changed = self
+                    .database
                     .record_scan_job_sidecar_targets(&job.id, &root.id, &sidecar_paths)
                     .await?;
-                self.notify_local_metadata_worker(&job.id);
+                if targets_changed {
+                    self.notify_local_metadata_worker(&job.id);
+                }
             }
             self.database
                 .mark_filesystem_entry_missing_by_path(&root.id, &path.relative_path)
@@ -5006,10 +4992,13 @@ impl ScanJobService {
             || report.created_items > 0
             || report.created_sources > 0
         {
-            self.database
+            let targets_changed = self
+                .database
                 .record_scan_job_targets(&job.id, &root.id, &[relative_path], "CHANGED")
                 .await?;
-            self.notify_local_metadata_worker(&job.id);
+            if targets_changed {
+                self.notify_local_metadata_worker(&job.id);
+            }
         }
         Ok(report.created_items)
     }
@@ -5037,10 +5026,13 @@ impl ScanJobService {
             .scan_sidecar_file(root, root_path, path, &existing_entries, &job.generation)
             .await?;
         if changed {
-            self.database
+            let targets_changed = self
+                .database
                 .record_scan_job_sidecar_targets(&job.id, &root.id, &relative_paths)
                 .await?;
-            self.notify_local_metadata_worker(&job.id);
+            if targets_changed {
+                self.notify_local_metadata_worker(&job.id);
+            }
         }
         Ok(())
     }
@@ -5051,7 +5043,6 @@ impl ScanJobService {
         let people = self.people.clone();
         let local_nfo = self.local_nfo.clone();
         let home = self.home.clone();
-        let user_events = self.user_events.clone();
         let scan_job_id = scan_job_id.to_owned();
         let notifications = Arc::clone(&self.metadata_notifications);
         let notify = Arc::new(Notify::new());
@@ -5120,7 +5111,6 @@ impl ScanJobService {
                         Ok(report) if report.items_processed > 0 => {
                             if let Some(home) = &home {
                                 home.invalidate_scan_batch().await;
-                                user_events.publish_home_coalesced().await;
                             }
                             notify.notify_waiters();
                         }
@@ -5302,7 +5292,6 @@ impl ScanJobService {
                 && let Some(home) = &self.home
             {
                 home.invalidate_scan_batch().await;
-                self.user_events.publish_home_coalesced().await;
             }
             created_items = created_items.saturating_add(report.created_items);
             if !report.completed {

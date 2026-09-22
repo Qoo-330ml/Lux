@@ -832,12 +832,16 @@ function Pagination({ page, pageSize, total, onPageChange }: { page: number; pag
 
 function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: OperationsJob; libraryNames: ReadonlyMap<string, string>; onCancel: () => void; onRetry: () => void; busy: boolean }) {
   const [detailsOpen, setDetailsOpen] = useState(false);
-  const progress = job.totalCount && job.totalCount > 0 ? Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100)) : null;
   const active = isActiveJob(job);
   const postprocessing = isPostprocessingJob(job);
   const cancellable = isActiveStatus(job.status);
   const cancelling = cancellable && job.kind !== "cover" && Boolean(job.cancelRequested);
   const discovering = active && job.kind === "scan" && job.discoveryCompleted === false;
+  const progress = discovering
+    ? null
+    : job.totalCount && job.totalCount > 0
+      ? Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100))
+      : null;
   const jobContext = job.kind === "strm"
     ? "STRM 媒体信息任务"
     : job.kind === "chapter"
@@ -865,7 +869,7 @@ function JobRow({ job, libraryNames, onCancel, onRetry, busy }: { job: Operation
     <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" || job.status === "COMPLETED_WITH_ISSUES" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" && !postprocessing ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
     <div className="lux-admin-job-main">
       <div className="lux-admin-job-heading"><strong>{jobLabel}</strong><span className={`lux-job-status ${postprocessing ? "status-postprocessing" : `status-${job.status.toLowerCase().replaceAll("_", "-")}`}`}>{postprocessing ? "后处理进行中" : formatJobStatus(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : postprocessing ? "索引已完成，后处理进行中" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount ? ` / ${job.totalCount}` : ""}</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{cancelling ? "正在停止…" : postprocessing ? "索引已完成，后处理进行中" : discovering ? "正在发现目录" : jobContext}{libraryLabel ? ` · 媒体库：${libraryLabel}` : ""}</span><span className="lux-admin-job-count">{job.processedCount ?? 0}{job.totalCount && !discovering ? ` / ${job.totalCount}` : ""}</span></div>
       {currentItem ? <span className="lux-admin-job-current-item">当前：{currentItem}</span> : null}
       {error ? <div className="lux-admin-job-error" role="alert"><strong>失败原因</strong><span>{error}</span></div> : null}
       {detailsOpen && job.kind === "metadata" ? <div className="lux-admin-job-details">

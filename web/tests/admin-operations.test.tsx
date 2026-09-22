@@ -591,6 +591,34 @@ describe("AdminOperationsPage", () => {
     expect(container.querySelector<HTMLButtonElement>('button[aria-label="正在取消任务"]')?.disabled).toBe(true);
   });
 
+  it("does not show a completed percentage while discovery is still running", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
+      id: "scan-job-discovery-complete-looking",
+      libraryId: "library-1",
+      jobType: "RECONCILE_LIBRARY",
+      status: "RUNNING",
+      processedCount: 10,
+      totalCount: 10,
+      discoveryCompleted: false,
+      cancelRequested: false,
+      createdAt: 1_700_000_001,
+    }] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [{ id: "library-1", name: "电影库" }] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+
+    expect(container.textContent).toContain("正在发现目录");
+    expect(container.textContent).not.toContain("10 / 10");
+    expect(container.querySelector<HTMLElement>(".lux-job-progress.is-indeterminate")).not.toBeNull();
+  });
+
   it("does not present scan postprocessing as finally completed", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [{
       id: "scan-job-postprocessing",

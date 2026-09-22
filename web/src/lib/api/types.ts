@@ -728,6 +728,7 @@ export type AdminTaskActivity = {
   status: "PENDING" | "QUEUED" | "RUNNING" | string;
   processedCount?: number;
   totalCount?: number | null;
+  discoveryCompleted?: boolean;
   cancelRequested?: boolean;
   currentItem?: string | null;
   scanPhase?: "DISCOVERY" | "INDEXING" | "FINALIZING" | "POSTPROCESSING" | "IDLE" | string;

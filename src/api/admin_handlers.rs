@@ -2616,6 +2616,7 @@ pub(crate) async fn admin_list_task_activity(
             "status": job.status,
             "processedCount": job.processed_count,
             "totalCount": job.total_count,
+            "discoveryCompleted": job.discovery_completed,
             "cancelRequested": job.cancel_requested,
             "currentItem": job.current_item,
             "scanPhase": job.scan_phase,

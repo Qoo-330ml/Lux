@@ -20,7 +20,6 @@ const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
 const HOME_SHARED_CACHE_TTL: Duration = Duration::from_secs(60);
 const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
 const HOME_INVALIDATION_DEBOUNCE: Duration = Duration::from_millis(100);
-const HOME_SCAN_INVALIDATION_DEBOUNCE: Duration = Duration::from_secs(1);
 const MAX_HOME_CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -103,7 +102,6 @@ struct CachedSharedSnapshot {
 struct ScanInvalidationState {
     scheduled: bool,
     dirty: bool,
-    epoch: u64,
 }
 
 struct HomeServiceInner {
@@ -116,6 +114,7 @@ struct HomeServiceInner {
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
     scan_invalidation: Mutex<ScanInvalidationState>,
+    scan_refresh_epoch: AtomicU64,
     invalidation_debounce_pending: AtomicBool,
     #[cfg(test)]
     invalidation_notification_count: AtomicU64,
@@ -140,6 +139,7 @@ impl HomeService {
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
             scan_invalidation: Mutex::new(ScanInvalidationState::default()),
+            scan_refresh_epoch: AtomicU64::new(0),
             invalidation_debounce_pending: AtomicBool::new(false),
             #[cfg(test)]
             invalidation_notification_count: AtomicU64::new(0),
@@ -156,7 +156,7 @@ impl HomeService {
                     break;
                 };
                 inner.refresh_pending.store(false, Ordering::Release);
-                (Self { inner }).refresh_cached_entries().await;
+                (Self { inner }).refresh_cached_entries(false).await;
             }
         });
         let service = Self { inner };
@@ -199,43 +199,51 @@ impl HomeService {
             library_ids: library_ids.to_vec(),
         };
         let entry = self.entry(key, principal).await;
-        let generation = self.inner.generation.load(Ordering::Acquire);
-        {
-            let cached = entry.value.lock().await;
-            if let Some(cached) = cached.as_ref()
-                && cached.generation == generation
+        loop {
+            let generation = self.inner.generation.load(Ordering::Acquire);
             {
-                if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
-                    self.schedule_refresh();
+                let cached = entry.value.lock().await;
+                if let Some(cached) = cached.as_ref()
+                    && cached.generation == generation
+                {
+                    if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
+                        self.schedule_refresh();
+                    }
+                    return Ok(cached.snapshot.clone());
                 }
-                return Ok(cached.snapshot.clone());
             }
-        }
 
-        let _compute_guard = entry.compute_lock.lock().await;
-        let generation = self.inner.generation.load(Ordering::Acquire);
-        {
-            let cached = entry.value.lock().await;
-            if let Some(cached) = cached.as_ref()
-                && cached.generation == generation
+            let _compute_guard = entry.compute_lock.lock().await;
+            let generation = self.inner.generation.load(Ordering::Acquire);
+            let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
             {
-                if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
-                    self.schedule_refresh();
+                let cached = entry.value.lock().await;
+                if let Some(cached) = cached.as_ref()
+                    && cached.generation == generation
+                {
+                    if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
+                        self.schedule_refresh();
+                    }
+                    return Ok(cached.snapshot.clone());
                 }
-                return Ok(cached.snapshot.clone());
             }
-        }
 
-        let snapshot = Arc::new(
-            self.build_cached_snapshot(principal, library_ids, true)
-                .await?,
-        );
-        *entry.value.lock().await = Some(CachedSnapshot {
-            generation,
-            refreshed_at: Instant::now(),
-            snapshot: snapshot.clone(),
-        });
-        Ok(snapshot)
+            let snapshot = Arc::new(
+                self.build_cached_snapshot(principal, library_ids, true)
+                    .await?,
+            );
+            if self.inner.generation.load(Ordering::Acquire) != generation
+                || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch
+            {
+                continue;
+            }
+            *entry.value.lock().await = Some(CachedSnapshot {
+                generation,
+                refreshed_at: Instant::now(),
+                snapshot: snapshot.clone(),
+            });
+            return Ok(snapshot);
+        }
     }
 
     pub(crate) fn invalidate(&self) {
@@ -288,56 +296,28 @@ impl HomeService {
     }
 
     pub(crate) async fn invalidate_scan_batch(&self) {
-        let epoch = {
-            let mut state = self.inner.scan_invalidation.lock().await;
-            if state.scheduled {
-                state.dirty = true;
-                return;
-            }
-            state.scheduled = true;
-            state.dirty = false;
-            state.epoch = state.epoch.wrapping_add(1);
-            Self::invalidate_now(&self.inner);
-            state.epoch
-        };
-        let inner = Arc::downgrade(&self.inner);
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(HOME_SCAN_INVALIDATION_DEBOUNCE).await;
-                let Some(inner) = inner.upgrade() else {
-                    return;
-                };
-                let continue_window = {
-                    let mut state = inner.scan_invalidation.lock().await;
-                    if state.epoch != epoch || !state.scheduled {
-                        return;
-                    }
-                    if state.dirty {
-                        state.dirty = false;
-                        Self::invalidate_now(&inner);
-                        true
-                    } else {
-                        state.scheduled = false;
-                        false
-                    }
-                };
-                if !continue_window {
-                    return;
-                }
-            }
-        });
+        let mut state = self.inner.scan_invalidation.lock().await;
+        state.scheduled = true;
+        state.dirty = true;
+        drop(state);
+        self.inner.catalog.invalidate_library_pages();
     }
 
     pub(crate) async fn flush_scan_invalidation(&self) {
-        let mut state = self.inner.scan_invalidation.lock().await;
-        if !state.scheduled {
-            return;
-        }
-        state.epoch = state.epoch.wrapping_add(1);
-        state.scheduled = false;
-        if state.dirty {
-            state.dirty = false;
-            Self::invalidate_now(&self.inner);
+        let should_refresh = {
+            let mut state = self.inner.scan_invalidation.lock().await;
+            if !state.scheduled {
+                false
+            } else {
+                let dirty = state.dirty;
+                state.scheduled = false;
+                state.dirty = false;
+                dirty
+            }
+        };
+        if should_refresh {
+            self.inner.scan_refresh_epoch.fetch_add(1, Ordering::AcqRel);
+            self.refresh_cached_entries(true).await;
         }
     }
 
@@ -369,12 +349,16 @@ impl HomeService {
             .clone()
     }
 
-    async fn refresh_shared_snapshot(&self) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
+    async fn refresh_shared_snapshot(
+        &self,
+        force: bool,
+    ) -> Result<Arc<HomeSharedSnapshot>, HomeError> {
         let _compute_guard = self.inner.shared_compute_lock.lock().await;
         let generation = self.inner.generation.load(Ordering::Acquire);
         {
             let cached = self.inner.shared.lock().await;
-            if let Some(cached) = cached.as_ref()
+            if !force
+                && let Some(cached) = cached.as_ref()
                 && cached.generation == generation
                 && cached.refreshed_at.elapsed() < HOME_SHARED_CACHE_TTL
             {
@@ -412,8 +396,8 @@ impl HomeService {
         Ok(snapshot)
     }
 
-    async fn refresh_cached_entries(&self) {
-        if let Err(error) = self.refresh_shared_snapshot().await {
+    async fn refresh_cached_entries(&self, force: bool) {
+        if let Err(error) = self.refresh_shared_snapshot(force).await {
             tracing::warn!(%error, "failed to refresh shared home snapshot");
         }
         let entries = self
@@ -425,15 +409,23 @@ impl HomeService {
             .cloned()
             .collect::<Vec<_>>();
         for entry in entries {
-            let Ok(_compute_guard) = entry.compute_lock.try_lock() else {
+            let compute_guard = if force {
+                Some(entry.compute_lock.lock().await)
+            } else {
+                entry.compute_lock.try_lock().ok()
+            };
+            let Some(_compute_guard) = compute_guard else {
                 continue;
             };
             let generation = self.inner.generation.load(Ordering::Acquire);
+            let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
             let cached = entry.value.lock().await;
-            if cached.as_ref().is_some_and(|cached| {
-                cached.generation == generation
-                    && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
-            }) {
+            if !force
+                && cached.as_ref().is_some_and(|cached| {
+                    cached.generation == generation
+                        && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
+                })
+            {
                 continue;
             }
             drop(cached);
@@ -444,7 +436,9 @@ impl HomeService {
             };
             match result {
                 Some(Ok(snapshot))
-                    if self.inner.generation.load(Ordering::Acquire) == generation =>
+                    if self.inner.generation.load(Ordering::Acquire) == generation
+                        && self.inner.scan_refresh_epoch.load(Ordering::Acquire)
+                            == scan_refresh_epoch =>
                 {
                     *entry.value.lock().await = Some(CachedSnapshot {
                         generation,
@@ -465,7 +459,7 @@ impl HomeService {
         require_fresh_shared: bool,
     ) -> Result<CachedHomeSnapshot, HomeError> {
         let shared = if require_fresh_shared {
-            self.refresh_shared_snapshot().await?
+            self.refresh_shared_snapshot(false).await?
         } else {
             self.shared_snapshot().await?
         };
@@ -531,7 +525,7 @@ impl HomeService {
                 return Ok(cached.snapshot.clone());
             }
         }
-        self.refresh_shared_snapshot().await
+        self.refresh_shared_snapshot(false).await
     }
 }
 
@@ -641,7 +635,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_invalidations_coalesce_until_the_final_flush() {
+    async fn scan_invalidations_keep_user_snapshot_until_the_final_flush() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let config = Config {
             http_addr: "127.0.0.1:8097".parse().expect("test address"),
@@ -653,18 +647,35 @@ mod tests {
             CatalogService::new(database.clone(), access),
             LibraryService::new(database),
         );
+        let principal = AccessPrincipal::new(UserId::new(), false);
+        let first = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("initial user snapshot");
 
         home.invalidate_scan_batch().await;
-        assert_eq!(home.inner.generation.load(Ordering::Acquire), 1);
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
+
+        let during_scan = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("user snapshot during scan");
+        assert!(std::ptr::eq(first.as_ref(), during_scan.as_ref()));
 
         home.invalidate_scan_batch().await;
-        assert_eq!(home.inner.generation.load(Ordering::Acquire), 1);
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
 
         home.flush_scan_invalidation().await;
-        assert_eq!(home.inner.generation.load(Ordering::Acquire), 2);
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
+
+        let after_scan = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("user snapshot after scan");
+        assert!(!std::ptr::eq(first.as_ref(), after_scan.as_ref()));
 
         home.flush_scan_invalidation().await;
-        assert_eq!(home.inner.generation.load(Ordering::Acquire), 2);
+        assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
     }
 
     #[tokio::test]

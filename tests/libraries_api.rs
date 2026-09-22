@@ -1107,6 +1107,7 @@ async fn admin_task_activity_includes_scan_postprocessing() -> Result<(), Box<dy
         .ok_or("postprocessing scan missing from activity")?;
     assert_eq!(scan["status"], "COMPLETED");
     assert_eq!(scan["scanPhase"], "POSTPROCESSING");
+    assert_eq!(scan["discoveryCompleted"], false);
     assert_eq!(scan["currentItem"], "媒体探测");
 
     server.abort();

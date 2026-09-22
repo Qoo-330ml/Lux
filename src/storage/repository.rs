@@ -1071,11 +1071,11 @@ pub(crate) struct ReconciliationBatchCommit<'a> {
     pub(crate) library_id: &'a str,
     pub(crate) library_root_id: &'a str,
     pub(crate) generation: &'a str,
-    pub(crate) discovery_completed: bool,
     pub(crate) entries: &'a [StoredReconciliationScanEntry],
     pub(crate) movie_files: &'a [NewMovieFile],
     pub(crate) episode_files: &'a [NewEpisodeFile],
     pub(crate) seen_entry_ids: &'a [String],
+    pub(crate) missing_paths: &'a [String],
     pub(crate) new_paths: &'a [String],
     pub(crate) changed_paths: &'a [String],
     pub(crate) sidecar_paths: &'a [String],
@@ -1085,6 +1085,7 @@ pub(crate) struct ReconciliationBatchCommit<'a> {
 pub(crate) struct ReconciliationBatchCommitResult {
     pub(crate) confirmed_entries: usize,
     pub(crate) created_items: usize,
+    pub(crate) metadata_targets_changed: bool,
 }
 
 #[derive(Debug)]

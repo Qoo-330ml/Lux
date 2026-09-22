@@ -103,6 +103,47 @@ describe("ScanActivityPopover", () => {
     expect(container.textContent).not.toContain("等待调度");
   });
 
+  it("keeps a queued scan waiting and hides discovery's provisional total", async () => {
+    vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
+      activities: [{
+        id: "scan-job-discovery",
+        kind: "scan",
+        taskType: "RECONCILE_LIBRARY",
+        libraryId: "library-1",
+        status: "PENDING",
+        processedCount: 10,
+        totalCount: 10,
+        discoveryCompleted: false,
+        scanPhase: "INDEXING",
+      }],
+    });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({
+      libraries: [{ id: "library-1", name: "电影库" }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <ScanActivityPopover />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector("button[aria-label*='后台任务活动']")).not.toBeNull());
+    });
+    act(() => container.querySelector<HTMLButtonElement>("button[aria-label*='后台任务活动']")?.click());
+
+    expect(container.textContent).toContain("等待调度");
+    expect(container.textContent).toContain("发现中");
+    expect(container.textContent).not.toContain("10/10");
+  });
+
   it("closes when clicking outside the activity popover", async () => {
     vi.spyOn(api, "adminTaskActivity").mockResolvedValue({
       activities: [{

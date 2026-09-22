@@ -125,19 +125,22 @@ function libraryLabel(job: AdminTaskActivity, libraries?: Array<{ id: string; na
 }
 
 function phaseLabel(job: AdminTaskActivity) {
-  if (job.kind === "cover") return job.status === "RUNNING" ? "生成封面" : "等待执行";
+  if (job.status === "PENDING" || job.status === "QUEUED") return "等待调度";
+  if (job.kind === "cover") return job.status === "RUNNING" ? "生成封面" : "处理中";
   if (job.scanPhase) return PHASE_LABELS[job.scanPhase] ?? "处理中";
-  return job.status === "PENDING" || job.status === "QUEUED" ? "等待调度" : "处理中";
+  return "处理中";
 }
 
 function progressValue(job: AdminTaskActivity) {
   if (isPostprocessingActivityJob(job)) return null;
+  if (job.kind === "scan" && job.discoveryCompleted === false) return null;
   if (!job.totalCount || job.totalCount <= 0) return null;
   return Math.min(100, Math.round(((job.processedCount ?? 0) / job.totalCount) * 100));
 }
 
 function progressLabel(job: AdminTaskActivity) {
   if (isPostprocessingActivityJob(job)) return "索引完成，后处理进行中";
+  if (job.kind === "scan" && job.discoveryCompleted === false) return "发现中";
   const total = job.totalCount ?? 0;
   return total > 0 ? `${job.processedCount ?? 0}/${total}` : "发现中";
 }

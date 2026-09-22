@@ -802,6 +802,52 @@ async fn unchanged_reconciliation_skips_index_targets() -> Result<(), Box<dyn st
 }
 
 #[tokio::test]
+async fn unchanged_reconciliation_does_not_rewrite_filesystem_presence_state()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let media_path = root.join("Stable.Movie.2024.mkv");
+    tokio::fs::write(&media_path, b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first.id, 100, None).await?;
+    sqlx::query(
+        "UPDATE filesystem_entries
+         SET updated_at = 1234
+         WHERE relative_path = 'Stable.Movie.2024.mkv'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&second.id, 100, None).await?;
+
+    let state: (i64, i64) = sqlx::query_as(
+        "SELECT updated_at, is_missing
+         FROM filesystem_entries
+         WHERE relative_path = 'Stable.Movie.2024.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(state, (1234, 0));
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconciliation_persists_removed_media_and_sidecar_targets()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
