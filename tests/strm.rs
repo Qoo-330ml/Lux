@@ -309,6 +309,27 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         true
     );
 
+    let profiled_playback = client
+        .post(format!(
+            "http://{address}/emby/Items/{remote_item_id}/PlaybackInfo"
+        ))
+        .header("X-Emby-Token", &token)
+        .query(&[
+            ("UserId", user_id.as_str()),
+            ("MediaSourceId", remote_source_id.as_str()),
+            ("IsPlayback", "true"),
+        ])
+        .json(&json!({
+            "DeviceProfile": {
+                "DirectPlayProfiles": [{"Container": "matroska", "Type": "Video"}]
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(profiled_playback.status(), reqwest::StatusCode::OK);
+    let profiled_playback_body = profiled_playback.json::<Value>().await?;
+    assert!(profiled_playback_body["MediaSources"][0]["DirectStreamUrl"].is_null());
+
     let playback = client
         .get(format!(
             "http://{address}/Items/{remote_item_id}/PlaybackInfo"

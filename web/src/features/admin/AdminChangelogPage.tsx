@@ -27,6 +27,7 @@ export const changelogReleases: ChangelogRelease[] = [
         "修复 Emby STRM 外部直链播放的交接流程；认证后直接将原始地址重定向给客户端，避免 Lux 预探测负载均衡重定向并保留客户端的请求上下文。",
         "修复 Emby STRM 媒体详情暴露外部目标地址的问题；详情中的 Path 保持安全的 .strm 形态，同时 URL 型 STRM 在 PlaybackInfo 中正确标记为远程可播放媒体。",
         "修复 Emby 对 Matroska 容器的兼容性；将 matroska,webm 规范化为 mkv，并生成带 .mkv 后缀的播放入口，避免第三方代理降级到无后缀流地址。",
+        "修复带设备配置的 URL 型 STRM 播放协商；不再生成会绕过外部 302 代理链路的 Lux DirectStreamUrl，让兼容客户端按原始 STRM 目标完成播放交接。",
         "修正登录页动态海报瀑布流的位置、缩放和错落布局，使海报墙与登录面板的视觉对齐更稳定。",
         "修复 Emby 会话 TranscodingInfo 的码率字段可能返回空值的问题；直播放、未知探针结果和服务端 HLS 会话现在统一返回数值，未知值为 0。",
         "兼容缺少 PlaySessionId 或 DeviceId 的 Emby 停止回调；仅在用户、媒体和近期会话候选唯一时停止对应会话，避免误停多个活动会话。",
