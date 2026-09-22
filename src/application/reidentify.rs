@@ -584,43 +584,33 @@ impl MetadataReidentifyService {
             let mut queue_exhausted = false;
             while workers.len() < concurrency {
                 let queue_wait_started = Instant::now();
-                let available = concurrency.saturating_sub(workers.len());
-                let mut worker_permits = Vec::with_capacity(available);
-                for _ in 0..available {
-                    let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
-                    else {
-                        queue_exhausted = true;
-                        break;
-                    };
-                    worker_permits.push(worker_permit);
-                }
-                if queue_exhausted {
-                    break;
-                }
-                let Ok(item_ids) = self
-                    .database
-                    .claim_next_metadata_reidentify_items(job_id, available)
-                    .await
+                let Ok(worker_permit) = Arc::clone(&self.worker_permits).acquire_owned().await
                 else {
                     queue_exhausted = true;
                     break;
                 };
-                if item_ids.is_empty() {
+                let Ok(item_ids) = self
+                    .database
+                    .claim_next_metadata_reidentify_items(job_id, 1)
+                    .await
+                else {
+                    drop(worker_permit);
                     queue_exhausted = true;
                     break;
-                }
-                for _ in 0..item_ids.len() {
-                    self.resources
-                        .record_metadata_stage("queue_wait", queue_wait_started.elapsed());
-                }
-                for (item_id, worker_permit) in item_ids.into_iter().zip(worker_permits) {
-                    let service = self.clone();
-                    let job_id = job_id.to_owned();
-                    workers.spawn(async move {
-                        let _worker_permit = worker_permit;
-                        service.process_item(&job_id, &item_id, mode).await;
-                    });
-                }
+                };
+                let Some(item_id) = item_ids.into_iter().next() else {
+                    drop(worker_permit);
+                    queue_exhausted = true;
+                    break;
+                };
+                self.resources
+                    .record_metadata_stage("queue_wait", queue_wait_started.elapsed());
+                let service = self.clone();
+                let job_id = job_id.to_owned();
+                workers.spawn(async move {
+                    let _worker_permit = worker_permit;
+                    service.process_item(&job_id, &item_id, mode).await;
+                });
             }
             if workers.is_empty() && queue_exhausted {
                 break;
@@ -755,6 +745,12 @@ impl MetadataReidentifyService {
                         Ok(None)
                     };
                     match request_plan {
+                        Ok(Some(plan))
+                            if matches!(mode, MetadataRefreshMode::FillMissing)
+                                && metadata_request_plan_is_complete(plan) =>
+                        {
+                            Ok(0)
+                        }
                         Ok(request_plan) => {
                             match self
                                 .providers_for_item(
@@ -1828,6 +1824,136 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         Ok((temp_dir, config, database, item_id))
+    }
+
+    #[tokio::test]
+    async fn fill_missing_skips_complete_local_items_before_resolving_scrapers()
+    -> Result<(), Box<dyn Error>> {
+        let (temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                item_type = 'EPISODE', overview = 'Existing overview',
+                premiere_date = '2020-01-01',
+                provider_ids_json = ?, identification_status = 'LOCAL_CONFIRMED',
+                metadata_scraper_id = NULL, metadata_provenance_json = ?
+             WHERE id = ?",
+        )
+        .bind(serde_json::json!({"tmdb": "603", "imdb": "tt0133093"}).to_string())
+        .bind(serde_json::json!({"title": "LOCAL_NFO", "overview": "LOCAL_NFO"}).to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO item_images (id, item_id, image_type, image_index, local_path, source)
+             VALUES ('fill-missing-local-fanart', ?, 'FANART', 0, ?, 'LOCAL')",
+        )
+        .bind(&item_id)
+        .bind(
+            temp_dir
+                .path()
+                .join("Movies/Example Movie (2020)/backdrop.jpg")
+                .to_string_lossy()
+                .as_ref(),
+        )
+        .execute(database.pool())
+        .await?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let scraper = RoleRecordingAdapter::with_search_failure("tmdb", Arc::clone(&calls));
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir,
+        );
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture episode is missing")?;
+        let plan = selection
+            .fill_missing_request_plan_for_current(&item_id, &current)
+            .await?;
+        assert!(
+            super::metadata_request_plan_is_complete(plan),
+            "unexpected fill-missing plan: {plan:?}"
+        );
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(scraper),
+            Some(selection),
+        );
+
+        let job = service
+            .create_item_refresh_job(&item_id, super::MetadataRefreshMode::FillMissing)
+            .await?;
+        service.run(&job.id).await;
+
+        let completed = service.get_job(&job.id).await?;
+        assert_eq!(completed.status, "COMPLETED");
+        assert!(
+            calls
+                .lock()
+                .expect("scraper call list should not be poisoned")
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn fill_missing_uses_existing_provider_id_without_title_search()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                provider_ids_json = ?, metadata_scraper_id = NULL,
+                identification_status = 'LOCAL_CONFIRMED'
+             WHERE id = ?",
+        )
+        .bind(serde_json::json!({"tmdb": "603"}).to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let scraper = RoleRecordingAdapter::new("tmdb", Arc::clone(&calls));
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new(database.clone())?,
+            config.config_dir,
+        );
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(scraper.clone()),
+            Some(selection),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![super::ResolvedScraper {
+            scraper_id: "tmdb".to_owned(),
+            role: LibraryScraperRole::Primary,
+            provider: super::ScraperProvider::from_adapter(scraper),
+        }];
+
+        service
+            .refresh_with_scraper_roles(
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FillMissing,
+                &scrapers,
+                Some(MetadataRequestPlan {
+                    needs_images: true,
+                    ..MetadataRequestPlan::default()
+                }),
+            )
+            .await?;
+
+        let calls = calls
+            .lock()
+            .expect("scraper call list should not be poisoned")
+            .clone();
+        assert!(calls.iter().any(|call| call == "tmdb:images"));
+        assert!(calls.iter().all(|call| call != "tmdb:search"));
+        Ok(())
     }
 
     #[tokio::test]

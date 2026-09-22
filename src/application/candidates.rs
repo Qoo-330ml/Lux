@@ -1472,9 +1472,11 @@ fn selected_scraper_provider_id(
     let selected_scraper = current
         .metadata_scraper_id
         .as_deref()
-        .or(current.scraper_id.as_deref())?
-        .trim();
-    if !scraper.matches_scraper_id(selected_scraper) {
+        .or(current.scraper_id.as_deref())
+        .map(str::trim);
+    if selected_scraper
+        .is_some_and(|selected| !selected.is_empty() && !scraper.matches_scraper_id(selected))
+    {
         return None;
     }
     let raw = current.provider_ids_json.as_deref()?;
@@ -3570,7 +3572,7 @@ mod tests {
         ACTOR_METADATA_FETCH_CONCURRENCY, candidate_actors, credits_are_missing,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_images,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_match_score,
-        metadata_request_plan, parse_image_selection_policy,
+        metadata_request_plan, parse_image_selection_policy, selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -3789,6 +3791,45 @@ mod tests {
         assert!(!plan.needs_credits);
         assert!(!plan.needs_external_ids);
         assert!(!plan.needs_trailers);
+    }
+
+    #[test]
+    fn fill_missing_reuses_provider_id_when_item_scraper_is_not_persisted() {
+        let current = StoredMediaMetadata {
+            item_type: "MOVIE".to_owned(),
+            title: "Example Movie".to_owned(),
+            original_title: None,
+            overview: None,
+            production_year: Some(2020),
+            premiere_date: None,
+            last_air_date: None,
+            status: None,
+            original_language: None,
+            rating: None,
+            provider_ids_json: Some(json!({"tmdb": "603"}).to_string()),
+            metadata_scraper_id: None,
+            identification_status: "LOCAL_CONFIRMED".to_owned(),
+            scraper_id: None,
+            provenance_json: None,
+            locked_fields_json: None,
+            nfo_metadata_json: None,
+            series_item_id: None,
+            series_title: None,
+            series_production_year: None,
+            series_provider_name: None,
+            series_provider_id: None,
+            season_number: None,
+            episode_number: None,
+        };
+        let scraper = ScraperProvider::from_adapter(DelayedActorAdapter {
+            active: Arc::new(AtomicUsize::new(0)),
+            maximum: Arc::new(AtomicUsize::new(0)),
+        });
+
+        assert_eq!(
+            selected_scraper_provider_id(&current, &scraper).as_deref(),
+            Some("603")
+        );
     }
 
     #[test]
