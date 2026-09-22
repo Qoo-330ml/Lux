@@ -3988,10 +3988,24 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|stream| stream.index)
         .unwrap_or(-1);
+    // Emby's MediaSource DTO requires Name to be a string. STRM sources often
+    // have no edition label, so do not serialize the optional database value
+    // directly as JSON null; retain a stable compatibility name instead.
+    let media_source_name = source
+        .edition_name
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            source
+                .quality_label
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or("Default");
     let mut value = json!({
         "Id": source.id,
         "ItemId": public_item_id,
-        "Name": source.edition_name,
+        "Name": media_source_name,
         "Edition": source.edition_name,
         "Quality": source.quality_label,
         "VideoType": source.quality_label,
