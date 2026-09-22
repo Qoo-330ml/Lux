@@ -1482,6 +1482,13 @@ pub(crate) struct StoredCollectionRefresh {
     pub(crate) member_count: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyCollection {
+    pub(crate) collection_item_id: String,
+    pub(crate) library_id: String,
+    pub(crate) title: String,
+}
+
 pub(crate) struct NewCollection<'a> {
     pub(crate) library_id: &'a str,
     pub(crate) provider: &'a str,

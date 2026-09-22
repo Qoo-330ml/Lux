@@ -1668,7 +1668,7 @@ pub(super) async fn serve_emby_person_item_image(
     )
 }
 
-pub(super) async fn emby_update_person_image(
+pub(super) async fn emby_update_person_or_library_image(
     headers: HeaderMap,
     Path((item_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
@@ -1681,6 +1681,37 @@ pub(super) async fn emby_update_person_image(
     };
     if normalize_image_type(&image_type) != Some("POSTER") {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    let internal_item_id = emby_internal_id(&item_id);
+    if let Ok(library_id) = internal_item_id.parse::<crate::domain::ids::LibraryId>()
+        && let Some(database) = state.database.as_ref()
+        && database
+            .find_library(&library_id.to_string())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+    {
+        if !user.can_manage_server {
+            return StatusCode::FORBIDDEN.into_response();
+        }
+        let Some(covers) = state.library_covers.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        let content_type = headers
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        return match covers.store(library_id, content_type, &body).await {
+            Ok(_) => StatusCode::NO_CONTENT.into_response(),
+            Err(
+                LibraryCoverError::UnsupportedContentType(_)
+                | LibraryCoverError::InvalidContent { .. }
+                | LibraryCoverError::TooLarge { .. },
+            ) => StatusCode::BAD_REQUEST.into_response(),
+            Err(LibraryCoverError::LibraryNotFound) => StatusCode::NOT_FOUND.into_response(),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     }
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();

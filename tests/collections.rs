@@ -21,6 +21,12 @@ use reqwest::header::{AUTHORIZATION, COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
 async fn tmdb_movie() -> Json<Value> {
     Json(json!({
         "id": 7,
@@ -317,6 +323,138 @@ async fn tmdb_collection_refresh_is_idempotent_and_filters_members_by_acl()
     server.abort();
     tmdb_server.abort();
     assert_ne!(admin.id, viewer.id);
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_manual_collections_and_library_cover_follow_qmby_contract()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Movie.A.2020.mkv"), b"a").await?;
+    tokio::fs::write(root.join("Movie.B.2021.mkv"), b"b").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 2);
+
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::new();
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="QmbyContract", Device="test", DeviceId="qmby-contract", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let token = login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing Emby token")?
+        .to_owned();
+    let first_id = emby_public_id(&item_ids[0]);
+    let second_id = emby_public_id(&item_ids[1]);
+    let created = client
+        .post(format!("{base_url}/Collections"))
+        .query(&[("Name", "Qmby Collection"), ("Ids", first_id.as_str())])
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+    let collection = created.json::<Value>().await?;
+    assert_eq!(collection["Name"], "Qmby Collection");
+    assert_eq!(collection["Type"], "BoxSet");
+    let collection_id = collection["Id"].as_str().ok_or("missing collection id")?;
+
+    let members = client
+        .get(format!("{base_url}/Items"))
+        .query(&[("ParentId", collection_id), ("Limit", "1000")])
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(members.status(), reqwest::StatusCode::OK);
+    assert_eq!(members.json::<Value>().await?["TotalRecordCount"], 1);
+
+    let added = client
+        .post(format!("{base_url}/Collections/{collection_id}/Items"))
+        .query(&[("Ids", second_id.as_str())])
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(added.status(), reqwest::StatusCode::NO_CONTENT);
+    let removed = client
+        .post(format!(
+            "{base_url}/Collections/{collection_id}/Items/Delete"
+        ))
+        .query(&[("Ids", first_id.as_str())])
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(removed.status(), reqwest::StatusCode::NO_CONTENT);
+
+    let cover_bytes = {
+        use image::{DynamicImage, ImageFormat, Rgba, RgbaImage};
+        let mut bytes = Vec::new();
+        DynamicImage::ImageRgba8(RgbaImage::from_pixel(1, 1, Rgba([1, 2, 3, 255])))
+            .write_to(&mut std::io::Cursor::new(&mut bytes), ImageFormat::Png)?;
+        bytes
+    };
+    let uploaded = client
+        .post(format!(
+            "{base_url}/Items/{}/Images/Primary",
+            emby_public_id(&library.id.to_string())
+        ))
+        .header("X-Emby-Token", &token)
+        .header("Content-Type", "image/png")
+        .body(cover_bytes)
+        .send()
+        .await?;
+    assert_eq!(uploaded.status(), reqwest::StatusCode::NO_CONTENT);
+    let cover = client
+        .get(format!(
+            "{base_url}/Items/{}/Images/Primary",
+            emby_public_id(&library.id.to_string())
+        ))
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(cover.headers()["content-type"], "image/png");
+
+    server.abort();
     Ok(())
 }
 

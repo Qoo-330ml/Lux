@@ -16,6 +16,15 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route("/Users/authenticatebyname", post(emby_authenticate))
         .route("/Users/New", post(emby_create_user))
+        .route("/Collections", post(emby_create_collection))
+        .route(
+            "/Collections/{collection_id}/Items",
+            post(emby_add_collection_items),
+        )
+        .route(
+            "/Collections/{collection_id}/Items/Delete",
+            post(emby_remove_collection_items),
+        )
         .route("/Library/VirtualFolders", get(emby_library_virtual_folders))
         .route(
             "/Library/SelectableMediaFolders",
@@ -87,7 +96,8 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/Items/{item_id}/Images/{image_type}",
             get(emby_image)
                 .head(emby_image)
-                .post(emby_update_person_image),
+                .post(emby_update_person_or_library_image)
+                .layer(DefaultBodyLimit::max(MAX_LIBRARY_COVER_BYTES as usize)),
         )
         .route(
             "/Items/{item_id}/Images/{image_type}/{image_index}",

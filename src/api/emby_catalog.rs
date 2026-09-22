@@ -2157,6 +2157,11 @@ pub(super) async fn emby_catalog_page_for_item_parent(
             .list_series_episodes(principal, parent_id, season_id.as_deref(), offset, limit)
             .await;
     }
+    if parent.item_type == "BOX_SET" {
+        return catalog
+            .list_collection_items(principal, parent_id, offset, limit)
+            .await;
+    }
     let child_type = match (parent.item_type.as_str(), requested_type) {
         (_, Some(item_type)) => item_type,
         ("SERIES", _) => "SEASON",

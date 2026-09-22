@@ -8,7 +8,7 @@ use crate::{
             provider_id_for_key,
         },
     },
-    storage::{Database, NewCollection, StorageError},
+    storage::{Database, NewCollection, StorageError, StoredEmbyCollection},
 };
 
 #[derive(Clone)]
@@ -133,6 +133,34 @@ impl CollectionService {
             collection_item_id: result.collection_item_id,
             member_count: result.member_count,
         })
+    }
+
+    pub(crate) async fn create_emby_collection(
+        &self,
+        title: &str,
+        item_ids: &[String],
+    ) -> Result<Option<StoredEmbyCollection>, StorageError> {
+        self.database.create_emby_collection(title, item_ids).await
+    }
+
+    pub(crate) async fn add_emby_collection_items(
+        &self,
+        collection_item_id: &str,
+        item_ids: &[String],
+    ) -> Result<Option<StoredEmbyCollection>, StorageError> {
+        self.database
+            .add_emby_collection_items(collection_item_id, item_ids)
+            .await
+    }
+
+    pub(crate) async fn remove_emby_collection_items(
+        &self,
+        collection_item_id: &str,
+        item_ids: &[String],
+    ) -> Result<Option<StoredEmbyCollection>, StorageError> {
+        self.database
+            .remove_emby_collection_items(collection_item_id, item_ids)
+            .await
     }
 
     async fn provider_for_item(&self, item_id: &str) -> Result<ScraperProvider, CollectionError> {
