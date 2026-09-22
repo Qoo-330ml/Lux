@@ -6,6 +6,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 
 const MIN_POSTER_COLUMN_WIDTH = 180;
 const POSTER_COLUMN_GAP = 12;
+const POSTER_WIDTH_PERCENT = 78;
 const POSTER_HORIZONTAL_PADDING = 40;
 const MIN_POSTER_COLUMNS = 3;
 const MAX_POSTER_COLUMNS = 5;
@@ -78,6 +79,7 @@ export function LoginPage() {
     },
     Array.from({ length: posterColumnCount }, () => []),
   );
+  const posterColumnWidth = `${POSTER_WIDTH_PERCENT / posterColumnCount}%`;
 
   return (
     <main className="lux-auth-screen lux-auth-split-layout">
@@ -99,7 +101,10 @@ export function LoginPage() {
           <div
             className="lux-auth-poster-waterfall"
             ref={posterWaterfallRef}
-            style={{ "--lux-auth-poster-column-count": posterColumnCount } as CSSProperties}
+            style={{
+              "--lux-auth-poster-column-count": posterColumnCount,
+              "--lux-auth-poster-column-width": posterColumnWidth,
+            } as CSSProperties}
           >
             {posterColumns.map((column, columnIndex) => (
               <div className="lux-auth-poster-waterfall-column" key={`poster-column-${columnIndex}`}>

@@ -60,14 +60,13 @@ describe("LoginPage session state", () => {
   });
 
   it("adds poster columns when the waterfall has room", async () => {
+    let resizeObserverCallback: ((entries: Array<{ contentRect: { width: number } }>) => void) | undefined;
     class FakeResizeObserver {
-      constructor(private readonly callback: unknown) {}
-
-      observe() {
-        (this.callback as (entries: Array<{ contentRect: { width: number } }>) => void)([
-          { contentRect: { width: 900 } },
-        ]);
+      constructor(callback: unknown) {
+        resizeObserverCallback = callback as (entries: Array<{ contentRect: { width: number } }>) => void;
       }
+
+      observe() {}
 
       disconnect() {}
     }
@@ -94,13 +93,23 @@ describe("LoginPage session state", () => {
       );
     });
 
-    await act(async () => {
-      await new Promise((resolve) => setTimeout(resolve, 0));
+    await vi.waitFor(() => {
+      expect(resizeObserverCallback).toBeTypeOf("function");
+      expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(3);
+    });
+    act(() => {
+      resizeObserverCallback?.([{ contentRect: { width: 900 } }]);
+    });
+    await vi.waitFor(() => {
+      expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(4);
     });
     expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(4);
     expect(container.querySelector<HTMLDivElement>(".lux-auth-poster-waterfall")?.style.getPropertyValue(
       "--lux-auth-poster-column-count",
     )).toBe("4");
+    expect(container.querySelector<HTMLDivElement>(".lux-auth-poster-waterfall")?.style.getPropertyValue(
+      "--lux-auth-poster-column-width",
+    )).toBe("19.5%");
   });
 
   it("keeps the fixed poster wall when the background request fails", async () => {
