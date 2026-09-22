@@ -1863,9 +1863,13 @@ pub(super) fn emby_session_json(
 ) -> Value {
     let runtime_ticks = session_runtime_ticks(session, catalog_item);
     let (play_method, transcoding_info) = emby_session_playback_details(session, web_session);
+    let production_year = catalog_item
+        .and_then(|item| item.production_year)
+        .unwrap_or_default();
     let mut now_playing_item = json!({
         "Id": emby_public_id(&session.item_id),
         "RunTimeTicks": runtime_ticks,
+        "ProductionYear": production_year,
     });
     if let Some(item) = catalog_item
         && let Value::Object(object) = &mut now_playing_item

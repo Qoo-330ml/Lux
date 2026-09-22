@@ -57,6 +57,12 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
         .bind(&source_id)
         .execute(database.pool())
         .await?;
+    // Some Lux items legitimately have no year metadata. Emby session
+    // consumers still expect the numeric field to be present.
+    sqlx::query("UPDATE media_items SET production_year = NULL WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
     let emby_item_id = emby_public_id(&item_id);
 
     let auth = WebAuthService::new(database.clone())?;
@@ -179,6 +185,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     assert_eq!(sessions_body[0]["NowPlayingItem"]["Id"], emby_item_id);
     assert_eq!(sessions_body[0]["UserName"], "Admin");
     assert_eq!(sessions_body[0]["NowPlayingItem"]["Name"], "Session Movie");
+    assert_eq!(sessions_body[0]["NowPlayingItem"]["ProductionYear"], 0);
     assert_eq!(sessions_body[0]["NowPlayingItem"]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["RunTimeTicks"], 1000);
     assert_eq!(sessions_body[0]["DeviceId"], "session-device");

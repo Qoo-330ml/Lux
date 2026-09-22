@@ -70,6 +70,8 @@ HLS profile 限定视频或音频 codec 时，Lux 只复制兼容的流，否则
 同日会话数值兼容：`TranscodingInfo` 的码率字段在直播放、未知探针结果和服务端 HLS 会话中统一返回非空整数，未知值为 `0`；
 这样依赖数值比较的第三方会话卡片不会因 `None > 0` 失败。空的 codec/container 也返回空字符串，不影响 `PlayMethod` 和真实转码码率。
 
+同日会话条目兼容：`NowPlayingItem.ProductionYear` 对所有 `/Sessions` 会话都返回数值；条目没有年份元数据时使用 `0`，避免 nextEmby 等会话卡片把缺失年份当作 `null` 后进行数值比较。
+
 同日播放停止兼容：Emby `Sessions/Playing/Stopped` 回调缺少 `PlaySessionId` 时，Lux 会按认证用户、条目和媒体源匹配近期活动会话；
 回调带有可信 `DeviceId` 时还会按设备过滤，缺少设备 ID 或设备值为 `unknown` 时仅在候选唯一的情况下停止，并将该会话标记为 `STOPPED`。
 因此依赖轮询 `GET /Sessions` 的 nextEmby 能在这类客户端回调中移除虚拟会话卡片。若存在多个无法唯一判断的候选会话，Lux 不会误停其中一个，
