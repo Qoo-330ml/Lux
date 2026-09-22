@@ -259,6 +259,7 @@ pub(super) async fn emby_playback_info(
                             &item.id,
                             source,
                             &user,
+                            &play_session_id,
                             if emby_source_needs_proxy_identity(source) {
                                 standard_api_key.as_deref()
                             } else {

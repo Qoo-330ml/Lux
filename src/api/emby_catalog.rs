@@ -4093,6 +4093,7 @@ pub(super) fn emby_signed_direct_stream_url(
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
     user: &UserRecord,
+    play_session_id: &str,
     api_key: Option<&str>,
 ) -> Option<String> {
     let expires_at = current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
@@ -4105,6 +4106,12 @@ pub(super) fn emby_signed_direct_stream_url(
         expires_at,
     )?;
     let mut url = emby_media_source_stream_url(item_id, source);
+    // Emby's standard video endpoint requires the PlaybackInfo session ID and
+    // uses `static=true` to select direct streaming. External proxies use the
+    // same context to associate the independent media request with playback.
+    url.push_str("&PlaySessionId=");
+    url.push_str(&percent_encode_filename(play_session_id));
+    url.push_str("&static=true");
     if let Some(api_key) = api_key.filter(|api_key| !api_key.is_empty()) {
         // Some clients advertise AddApiKeyToDirectStreamUrl but drop the
         // token on their independent media request. External proxies need
