@@ -1475,21 +1475,23 @@ impl Database {
         let confirmed_count = i64::try_from(confirmed_entries).map_err(|_| {
             StorageError::Conflict("reconciliation batch confirmation count overflow".to_owned())
         })?;
+        // Discovery updates `scan_jobs.total_count` as directories are walked.
+        // Re-counting the ever-growing reconciliation table for every file batch
+        // turns a large scan into repeated full index walks. Read the maintained
+        // counter instead; it is part of the same transaction and remains valid
+        // while discovery is streaming files to the indexer.
         let observed_total: Option<i64> = if batch.discovery_completed {
             None
         } else {
             Some(
-                self.query_scalar(
-                    "SELECT COUNT(*) FROM reconciliation_scan_entries
-                     WHERE job_id = ? AND entry_type = 'FILE'",
-                )
-                .bind(batch.job_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?,
+                self.query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
+                    .bind(batch.job_id)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?,
             )
         };
         let update_sql = if batch.discovery_completed {
