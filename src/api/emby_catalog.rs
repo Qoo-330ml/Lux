@@ -3747,19 +3747,10 @@ pub(super) fn emby_file_name(
     Some(format!("{}.{}", item.title, container))
 }
 
-/// Emby always exposes a filesystem path on item DTOs. External proxies need
-/// the original STRM target here to map playback, while ordinary local media
-/// continues to use a stable, harmless path instead of revealing the real
-/// filesystem location.
+/// Emby exposes a filesystem-shaped path on item DTOs. Keep STRM entries
+/// recognizable as `.strm` files without exposing the real filesystem path or
+/// the external playback target; proxies consume the source-level `Path`.
 pub(super) fn emby_safe_path(item: &CatalogItem, default_source: Option<&CatalogSource>) -> String {
-    if let Some(target) = default_source
-        .filter(|source| source.source_kind == "STRM_URL")
-        .and_then(|source| source.external_url.as_deref())
-        .filter(|target| !target.is_empty())
-    {
-        return target.to_owned();
-    }
-
     let title = &item.title;
     if matches!(
         item.item_type.as_str(),
@@ -3767,10 +3758,14 @@ pub(super) fn emby_safe_path(item: &CatalogItem, default_source: Option<&Catalog
     ) {
         return format!("/media/{}/{title}", item.library_id);
     }
-    let container = default_source
-        .and_then(|source| source.container.as_deref())
-        .filter(|value| !value.is_empty())
-        .unwrap_or("strm");
+    let container = if default_source.is_some_and(|source| source.source_kind == "STRM_URL") {
+        "strm"
+    } else {
+        default_source
+            .and_then(|source| source.container.as_deref())
+            .filter(|value| !value.is_empty())
+            .unwrap_or("strm")
+    };
     format!("/media/{}/{title}.{container}", item.library_id)
 }
 
@@ -3952,7 +3947,8 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
     } else {
         None
     };
-    let is_remote_playback = is_resolver_target;
+    let is_remote_playback =
+        is_resolver_target || matches!(strm_target_kind, Some(StrmTargetKind::Url));
     let is_playable =
         source.source_kind == "LOCAL_FILE" || is_proxy_compatible_strm_target || is_remote_playback;
     let default_audio_stream_index = source
