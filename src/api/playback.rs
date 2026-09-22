@@ -445,6 +445,13 @@ impl EmbyPlaybackInfoRequest {
         force_transcode: bool,
         source: &crate::application::catalog::CatalogSource,
     ) -> bool {
+        // URL STRM sources are handed to the external playback proxy. Lux's
+        // HLS pipeline is intentionally local-file-only, so a client profile
+        // mismatch must not turn this source into an impossible transcode
+        // request.
+        if source.source_kind.eq_ignore_ascii_case("STRM_URL") {
+            return false;
+        }
         if self.device_profile.is_none() {
             return self.requests_server_transcoding(force_transcode);
         }
@@ -751,7 +758,11 @@ impl EmbyPlaybackProfile {
         audio_codec: Option<&str>,
     ) -> EmbyProfileCompatibility {
         let constraints = [
-            profile_value_compatibility(self.container.as_deref(), container, values_match),
+            profile_value_compatibility(
+                self.container.as_deref(),
+                container,
+                emby_container_values_match,
+            ),
             codec_value_compatibility(self.video_codec.as_deref(), video_codec),
             codec_value_compatibility(self.audio_codec.as_deref(), audio_codec),
         ];
@@ -825,6 +836,16 @@ fn codec_value_compatibility(
 
 fn values_match(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
+}
+
+fn emby_container_values_match(left: &str, right: &str) -> bool {
+    let left_is_matroska = ["mkv", "matroska", "matroska,webm"]
+        .iter()
+        .any(|value| left.trim().eq_ignore_ascii_case(value));
+    let right_is_matroska = ["mkv", "matroska", "matroska,webm"]
+        .iter()
+        .any(|value| right.trim().eq_ignore_ascii_case(value));
+    (left_is_matroska && right_is_matroska) || values_match(left.trim(), right.trim())
 }
 
 fn normalize_emby_codec(value: &str) -> String {
@@ -4313,6 +4334,59 @@ mod emby_playback_tests {
         .expect("valid DeviceProfile request");
         let source = profile_source("mkv", "hevc", "aac");
         assert!(request.requests_server_transcoding_for_source(false, &source));
+    }
+
+    #[test]
+    fn url_strm_does_not_request_server_transcoding_for_filebar_profile() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [{
+                        "Container": "mkv",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Container": "mp4",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid FileBar-shaped DeviceProfile request");
+        let mut source = profile_source("strm", "h264", "eac3");
+        source.source_kind = "STRM_URL".to_owned();
+
+        assert!(!request.requests_server_transcoding_for_source(false, &source));
+    }
+
+    #[test]
+    fn direct_play_profile_matches_matroska_container_aliases() {
+        let request = parse_emby_playback_info_request(&Bytes::from_static(
+            br#"{
+                "DeviceProfile": {
+                    "DirectPlayProfiles": [{
+                        "Container": "mkv",
+                        "VideoCodec": "h264",
+                        "AudioCodec": "aac",
+                        "Type": "Video"
+                    }],
+                    "TranscodingProfiles": [{
+                        "Container": "mp4",
+                        "Protocol": "hls",
+                        "Type": "Video"
+                    }]
+                }
+            }"#,
+        ))
+        .expect("valid DeviceProfile request");
+        let source = profile_source("matroska,webm", "h264", "aac");
+
+        assert!(!request.requests_server_transcoding_for_source(false, &source));
     }
 
     #[test]

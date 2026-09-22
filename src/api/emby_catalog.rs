@@ -3758,6 +3758,20 @@ pub(super) fn emby_container_name(container: &str) -> &str {
     }
 }
 
+/// Emby's PlaybackInfo wire value for Matroska is `matroska`. Keep the
+/// existing `mkv` normalization for URL suffixes, which are separate from
+/// the media-source capability field.
+pub(super) fn emby_playback_container_name(container: &str) -> &str {
+    if ["mkv", "matroska", "matroska,webm"]
+        .iter()
+        .any(|value| container.eq_ignore_ascii_case(value))
+    {
+        "matroska"
+    } else {
+        emby_container_name(container)
+    }
+}
+
 /// Emby exposes a filesystem-shaped path on item DTOs. Keep STRM entries
 /// recognizable as `.strm` files without exposing the real filesystem path or
 /// the external playback target; proxies consume the source-level `Path`.
@@ -3981,7 +3995,10 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
         "Edition": source.edition_name,
         "Quality": source.quality_label,
         "VideoType": source.quality_label,
-        "Container": source.container.as_deref().map(emby_container_name),
+        "Container": source
+            .container
+            .as_deref()
+            .map(emby_playback_container_name),
         "Size": source.size,
         "Bitrate": source.bitrate,
         "RunTimeTicks": source.duration_ticks,
@@ -4545,5 +4562,18 @@ pub(super) fn emby_stream_type(stream_type: &str) -> &'static str {
         "AUDIO" => "Audio",
         "SUBTITLE" => "Subtitle",
         _ => "Unknown",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::emby_playback_container_name;
+
+    #[test]
+    fn playback_media_source_uses_emby_matroska_wire_name() {
+        assert_eq!(emby_playback_container_name("mkv"), "matroska");
+        assert_eq!(emby_playback_container_name("matroska"), "matroska");
+        assert_eq!(emby_playback_container_name("matroska,webm"), "matroska");
+        assert_eq!(emby_playback_container_name("mp4"), "mp4");
     }
 }
