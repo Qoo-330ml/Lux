@@ -1675,6 +1675,8 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) rating: Option<f64>,
     pub(crate) rating_source: Option<String>,
     pub(crate) runtime_ticks: Option<i64>,
+    pub(crate) added_at: i64,
+    pub(crate) updated_at: i64,
     pub(crate) poster_image_tag: Option<String>,
     pub(crate) fanart_image_tag: Option<String>,
     pub(crate) thumb_image_tag: Option<String>,

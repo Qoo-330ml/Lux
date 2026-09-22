@@ -1316,6 +1316,10 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
             .collect::<Vec<_>>()
     );
 
+    sqlx::query("UPDATE media_items SET updated_at = 0 WHERE id = 'rating-low'")
+        .execute(database.pool())
+        .await
+        .expect("reset metadata timestamp");
     database
         .update_media_item_metadata(MediaMetadataUpdate {
             item_id: "rating-low",
@@ -1332,6 +1336,12 @@ async fn recommended_catalog_rows_use_rating_median_for_missing_ratings() {
         })
         .await
         .expect("updated rating");
+    let updated_at: i64 =
+        sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = 'rating-low'")
+            .fetch_one(database.pool())
+            .await
+            .expect("metadata timestamp");
+    assert!(updated_at > 0);
     database.reset_query_count();
     let refreshed_rows = database
         .list_recommended_catalog_rows(&user_id, std::slice::from_ref(&library_id), 0, 3)

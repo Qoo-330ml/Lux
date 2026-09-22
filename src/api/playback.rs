@@ -1877,6 +1877,50 @@ pub(super) async fn emby_sessions(
     .into_response()
 }
 
+pub(super) async fn emby_stop_session(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_emby_user(&headers, &state, query.api_key.as_deref()).await {
+        Ok(user) => user,
+        Err(status) => return status.into_response(),
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let session = match database.find_playback_session_by_id(&session_id).await {
+        Ok(Some(session)) => session,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let user_id = user.id.to_string();
+    if !user.is_admin && session.user_id != user_id {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    if let Some(transcode_session_id) =
+        emby_transcode_session_id_from_play_session(&session.play_session_id)
+        && let Some(service) = state.web_playback.as_ref()
+        && let Err(error) = service.stop(transcode_session_id, &session.user_id).await
+    {
+        tracing::warn!(
+            session_id = %session.id,
+            error = %error,
+            "failed to stop Emby web playback session"
+        );
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    match database
+        .stop_playback_session(&session.id, current_unix_timestamp())
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => StatusCode::NOT_FOUND.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 pub(super) fn emby_session_json(
     session: &crate::storage::StoredPlaybackSession,
     catalog_item: Option<&CatalogItem>,

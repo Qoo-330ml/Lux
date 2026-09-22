@@ -89,6 +89,7 @@ pub(super) fn api_routes() -> Router<AppState> {
                 .delete(emby_delete_item),
         )
         .route("/Items/{item_id}/Refresh", post(emby_refresh_item))
+        .route("/Library/Refresh", post(emby_refresh_library))
         .route("/Items/{item_id}/Children", get(emby_collection_children))
         .route("/api/danmu/{item_id}", get(emby_danmaku_info))
         .route("/api/danmu/{item_id}/raw", get(emby_danmaku_raw))
@@ -179,6 +180,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route("/Sessions/Playing", post(emby_playing))
         .route("/Sessions/Playing/Progress", post(emby_playing_progress))
         .route("/Sessions/Playing/Stopped", post(emby_playing_stopped))
+        .route(
+            "/Sessions/{session_id}/Playing/Stop",
+            post(emby_stop_session),
+        )
         .route(
             "/Users/{user_id}/PlayedItems/{item_id}",
             post(emby_mark_played).delete(emby_unmark_played),

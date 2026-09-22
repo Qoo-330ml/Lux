@@ -508,7 +508,8 @@ impl Database {
                     "UPDATE media_items
                      SET library_id = ?, item_type = 'FOLDER', parent_id = ?,
                          title = ?, sort_title = ?, original_title = ?,
-                         identification_status = 'LOCAL_CONFIRMED', removed_at = NULL
+                         identification_status = 'LOCAL_CONFIRMED', removed_at = NULL,
+                         updated_at = unixepoch()
                      WHERE id = ?",
                 )
                 .bind(library_id)
@@ -735,7 +736,8 @@ impl Database {
                 .join(", ");
             let query = format!(
                 "UPDATE media_items
-                 SET parent_id = CASE id {cases} END
+                 SET parent_id = CASE id {cases} END,
+                     updated_at = unixepoch()
                  WHERE item_type = 'MOVIE' AND id IN ({ids})"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -773,7 +775,8 @@ impl Database {
                 .join(", ");
             let query = format!(
                 "UPDATE media_items
-                 SET provider_ids_json = CASE id {cases} END
+                 SET provider_ids_json = CASE id {cases} END,
+                     updated_at = unixepoch()
                  WHERE item_type = 'MOVIE'
                    AND id IN ({ids})
                    AND (provider_ids_json IS NULL OR provider_ids_json = '{{}}')"
@@ -833,7 +836,8 @@ impl Database {
                         "UPDATE media_items
                          SET library_id = ?, item_type = 'FOLDER', parent_id = ?,
                              title = ?, sort_title = ?, original_title = ?,
-                             identification_status = 'LOCAL_CONFIRMED', removed_at = NULL
+                             identification_status = 'LOCAL_CONFIRMED', removed_at = NULL,
+                             updated_at = unixepoch()
                          WHERE id = ?",
                     )
                     .bind(library_id)
@@ -934,7 +938,7 @@ impl Database {
             )
             .await?;
         self.query(
-            "UPDATE media_items SET parent_id = ?
+            "UPDATE media_items SET parent_id = ?, updated_at = unixepoch()
              WHERE id = ? AND item_type = 'MOVIE'",
         )
         .bind(parent_folder_id.as_deref())
@@ -1672,7 +1676,7 @@ impl Database {
                 "UPDATE media_items
                  SET library_id = ?, item_type = ?, parent_id = ?, series_id = ?,
                      season_number = ?, episode_number = ?, absolute_number = ?,
-                     removed_at = NULL
+                     removed_at = NULL, updated_at = unixepoch()
                  WHERE id = ?",
             )
             .bind(&row.library_id)
@@ -1838,7 +1842,7 @@ impl Database {
         }
         self.query(
             "UPDATE media_items
-             SET identity_key = ?, removed_at = NULL
+             SET identity_key = ?, removed_at = NULL, updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(identity_key)
@@ -1930,15 +1934,19 @@ impl Database {
             (&season_id, season_identity),
             (&episode_id, episode_identity),
         ] {
-            self.query("UPDATE media_items SET identity_key = ?, removed_at = NULL WHERE id = ?")
-                .bind(identity_key)
-                .bind(item_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            self.query(
+                "UPDATE media_items
+                 SET identity_key = ?, removed_at = NULL, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(identity_key)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         }
         transaction
             .commit()
@@ -2246,7 +2254,8 @@ impl Database {
         })?;
         self.query(
             "UPDATE media_items
-             SET title = ?, sort_title = ?, original_title = ?, overview = ?
+             SET title = ?, sort_title = ?, original_title = ?, overview = ?,
+                 updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(title)

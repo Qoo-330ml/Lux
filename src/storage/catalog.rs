@@ -938,6 +938,7 @@ impl Database {
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1041,6 +1042,7 @@ impl Database {
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1229,6 +1231,7 @@ impl Database {
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1423,6 +1426,7 @@ impl Database {
                     series.title AS series_name,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1539,6 +1543,7 @@ impl Database {
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1635,6 +1640,7 @@ impl Database {
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1700,6 +1706,7 @@ impl Database {
                         mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
                         mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                        mi.added_at, mi.updated_at,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1751,6 +1758,7 @@ impl Database {
                         mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
                         mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                        mi.added_at, mi.updated_at,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1805,6 +1813,7 @@ impl Database {
                     mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                     mi.title, mi.sort_title, mi.original_title, mi.overview,
                     mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                      ORDER BY image_index LIMIT 1) AS poster_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -1855,6 +1864,7 @@ impl Database {
                         mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                         mi.title, mi.sort_title, mi.original_title, mi.overview,
                         mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                        mi.added_at, mi.updated_at,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
                          ORDER BY image_index LIMIT 1) AS poster_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
@@ -2070,6 +2080,8 @@ impl Database {
                         rating: row.get("rating"),
                         rating_source: row.get("rating_source"),
                         runtime_ticks: row.get("runtime_ticks"),
+                        added_at: row.get("added_at"),
+                        updated_at: row.get("updated_at"),
                         poster_image_tag: row.get("poster_image_tag"),
                         fanart_image_tag: row.get("fanart_image_tag"),
                         thumb_image_tag: row.get("thumb_image_tag"),
@@ -2145,7 +2157,7 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_items
-             SET provider_ids_json = ?
+             SET provider_ids_json = ?, updated_at = unixepoch()
              WHERE id = ? AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
         )
         .bind(provider_ids_json)
@@ -2207,7 +2219,7 @@ impl Database {
                 .map_err(|error| StorageError::Serialization(error.to_string()))?;
             self.query(
                 "UPDATE media_items
-                 SET provider_ids_json = ?
+                 SET provider_ids_json = ?, updated_at = unixepoch()
                  WHERE id = ? AND removed_at IS NULL",
             )
             .bind(provider_ids_json)
@@ -2235,7 +2247,7 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE media_items
-             SET provider_ids_json = ?
+             SET provider_ids_json = ?, updated_at = unixepoch()
              WHERE identity_key = ? AND item_type = 'SERIES'
                AND removed_at IS NULL
                AND (provider_ids_json IS NULL OR provider_ids_json = '{}')",
@@ -4739,7 +4751,8 @@ impl Database {
              SET title = ?, sort_title = ?, original_title = ?, production_year = ?,
                  provider_ids_json = CASE
                      WHEN ? IS NOT NULL AND (provider_ids_json IS NULL OR provider_ids_json = '{}')
-                     THEN ? ELSE provider_ids_json END
+                     THEN ? ELSE provider_ids_json END,
+                 updated_at = unixepoch()
              WHERE id = ?
                AND identification_status IN ('LOCAL_CONFIRMED', 'PENDING')
                AND metadata_provenance_json IS NULL
@@ -4803,7 +4816,8 @@ impl Database {
                  rating_source = CASE WHEN ? IS NULL THEN rating_source ELSE ? END,
                  metadata_fingerprint = ?,
                  metadata_provenance_json = ?,
-                 locked_fields_json = ?
+                 locked_fields_json = ?,
+                 updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(update.title)
@@ -4863,7 +4877,7 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
-             SET premiere_date = ?
+             SET premiere_date = ?, updated_at = unixepoch()
              WHERE id = ? AND NULLIF(premiere_date, '') IS NULL",
         )
         .bind(premiere_date)
@@ -4936,7 +4950,8 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
-             SET nfo_metadata_json = ?, nfo_metadata_fingerprint = ?
+             SET nfo_metadata_json = ?, nfo_metadata_fingerprint = ?,
+                 updated_at = unixepoch()
              WHERE id = ?",
         )
         .bind(nfo_metadata_json)
@@ -4967,7 +4982,8 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
-             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL
+             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL,
+                 updated_at = unixepoch()
              WHERE id = ? AND nfo_metadata_json = ?",
         )
         .bind(item_id)
@@ -4997,7 +5013,8 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
             "UPDATE media_items
-             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL
+             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL,
+                 updated_at = unixepoch()
              WHERE id = ?
                AND (nfo_metadata_fingerprint IS NULL OR nfo_metadata_fingerprint <> ?)",
         )
@@ -5026,16 +5043,20 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query("UPDATE media_items SET metadata_fingerprint = ? WHERE id = ?")
-            .bind(metadata_fingerprint)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        self.query(
+            "UPDATE media_items
+             SET metadata_fingerprint = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(metadata_fingerprint)
+        .bind(item_id)
+        .execute(&mut *transaction)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         transaction
             .commit()
             .await

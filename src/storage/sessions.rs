@@ -356,6 +356,50 @@ impl Database {
         })
     }
 
+    pub(crate) async fn find_playback_session_by_id(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredPlaybackSession>, StorageError> {
+        self.query(
+            "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                    device_id, client, device_name, client_version, device_type,
+                    remote_ip, state,
+                    position_ticks, duration_ticks, is_paused, started_at,
+                    last_event_at
+             FROM playback_sessions
+             WHERE id = ?",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(stored_playback_session))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn stop_playback_session(
+        &self,
+        session_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE playback_sessions
+             SET state = 'STOPPED', is_paused = 0, last_event_at = ?
+             WHERE id = ?",
+        )
+        .bind(now)
+        .bind(session_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_active_playback_session_for_stop(
         &self,
         user_id: &str,

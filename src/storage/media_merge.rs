@@ -126,7 +126,7 @@ impl Database {
             .await?;
             self.query(
                 "UPDATE media_items
-                 SET merged_into_item_id = ?
+                 SET merged_into_item_id = ?, updated_at = unixepoch()
                  WHERE id = ? AND merged_into_item_id IS NULL",
             )
             .bind(primary_item_id)
@@ -234,7 +234,7 @@ impl Database {
             let Some(target_season_id) = target_season else {
                 self.query(
                     "UPDATE media_items
-                     SET parent_id = ?, series_id = ?
+                     SET parent_id = ?, series_id = ?, updated_at = unixepoch()
                      WHERE id = ? AND item_type = 'SEASON'",
                 )
                 .bind(target_series_id)
@@ -248,7 +248,9 @@ impl Database {
                 })?;
                 for episode in source_episodes {
                     self.query(
-                        "UPDATE media_items SET series_id = ? WHERE id = ? AND item_type = 'EPISODE'",
+                        "UPDATE media_items
+                         SET series_id = ?, updated_at = unixepoch()
+                         WHERE id = ? AND item_type = 'EPISODE'",
                     )
                     .bind(target_series_id)
                     .bind(episode.id)
@@ -268,15 +270,19 @@ impl Database {
                 &target_season_id,
             )
             .await?;
-            self.query("UPDATE media_items SET merged_into_item_id = ? WHERE id = ?")
-                .bind(&target_season_id)
-                .bind(&source_season.id)
-                .execute(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            self.query(
+                "UPDATE media_items
+                 SET merged_into_item_id = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(&target_season_id)
+            .bind(&source_season.id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
 
             let target_episodes = self
                 .list_series_episodes_in_transaction(transaction, &target_season_id)
@@ -304,19 +310,23 @@ impl Database {
                         &target_episode_id,
                     )
                     .await?;
-                    self.query("UPDATE media_items SET merged_into_item_id = ? WHERE id = ?")
-                        .bind(&target_episode_id)
-                        .bind(&source_episode.id)
-                        .execute(&mut **transaction)
-                        .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                    self.query(
+                        "UPDATE media_items
+                         SET merged_into_item_id = ?, updated_at = unixepoch()
+                         WHERE id = ?",
+                    )
+                    .bind(&target_episode_id)
+                    .bind(&source_episode.id)
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
                 } else {
                     self.query(
                         "UPDATE media_items
-                         SET parent_id = ?, series_id = ?
+                         SET parent_id = ?, series_id = ?, updated_at = unixepoch()
                          WHERE id = ? AND item_type = 'EPISODE'",
                     )
                     .bind(&target_season_id)

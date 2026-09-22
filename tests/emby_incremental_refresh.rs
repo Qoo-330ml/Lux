@@ -262,6 +262,90 @@ async fn emby_scheduled_tasks_reports_library_scan_state() -> Result<(), Box<dyn
 }
 
 #[tokio::test]
+async fn emby_library_refresh_queues_all_enabled_libraries_and_reuses_active_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let movies = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let series = libraries
+        .create_library("Series", LibraryKind::Series, false)
+        .await?;
+    let movies_root = temp_dir.path().join("Movies");
+    let series_root = temp_dir.path().join("Series");
+    tokio::fs::create_dir_all(&movies_root).await?;
+    tokio::fs::create_dir_all(&series_root).await?;
+    libraries
+        .add_root(
+            movies.id,
+            movies_root.to_str().ok_or("non-utf8 movies root")?,
+        )
+        .await?;
+    libraries
+        .add_root(
+            series.id,
+            series_root.to_str().ok_or("non-utf8 series root")?,
+        )
+        .await?;
+
+    let existing = ScanJobService::new(database.clone())
+        .create_movie_scan_job(movies.id)
+        .await?;
+    let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let viewer = UserStore::new(database.clone())?
+        .create_user("Viewer", "Viewer", "viewer password", false)
+        .await?;
+    let (base_url, _server) = start_server(config, database.clone(), setup).await?;
+    let client = reqwest::Client::new();
+
+    let response = client
+        .post(format!("{base_url}/emby/Library/Refresh"))
+        .header("X-Emby-Token", &key)
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response.json::<serde_json::Value>().await?;
+    let jobs = body["jobs"].as_array().ok_or("missing refresh jobs")?;
+    assert_eq!(jobs.len(), 2);
+    assert!(jobs.iter().any(|job| job["id"] == existing.id));
+    assert!(jobs.iter().all(|job| job["jobType"] == "RECONCILE_LIBRARY"));
+
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .json(&json!({
+            "Username": "Viewer",
+            "Pw": "viewer password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), StatusCode::OK);
+    let viewer_token = login.json::<serde_json::Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned();
+    let forbidden = client
+        .post(format!("{base_url}/Library/Refresh"))
+        .header("X-Emby-Token", viewer_token)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+    assert_eq!(viewer.id.to_string().len(), 36);
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_path_scan_queues_only_the_requested_relative_path()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

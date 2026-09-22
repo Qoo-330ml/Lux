@@ -3181,10 +3181,12 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         // filesystem path on detail DTOs. Lux ids are UUIDv7, so the embedded
         // timestamp is the real item creation time; the path is a stable,
         // harmless label because Lux never reveals real local paths.
-        if let Some(created) = emby_item_timestamp(&item.id) {
+        if let Some(created) = emby_timestamp(item.added_at) {
             object.insert("DateCreated".to_owned(), json!(created));
-            object.insert("DateLastSaved".to_owned(), json!(created));
-            object.insert("DateModified".to_owned(), json!(created));
+        }
+        if let Some(saved) = emby_timestamp(item.updated_at) {
+            object.insert("DateLastSaved".to_owned(), json!(saved.clone()));
+            object.insert("DateModified".to_owned(), json!(saved));
         }
         object.insert(
             "Path".to_owned(),
@@ -3407,19 +3409,22 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
             object.insert("SupportsSync".to_owned(), json!(supports_sync));
         }
         if emby_fields_include(fields, "DateModified") {
-            if let Some(modified) = emby_item_timestamp(&item.id) {
+            if let Some(modified) = emby_timestamp(item.updated_at) {
                 object.insert("DateModified".to_owned(), json!(modified));
             }
         }
         if (emby_fields_include(fields, "DateCreated")
             || emby_fields_include(fields, "DateLastSaved"))
-            && let Some(created) = emby_item_timestamp(&item.id)
+            && let Some(created) = emby_timestamp(item.added_at)
         {
             if emby_fields_include(fields, "DateCreated") {
                 object.insert("DateCreated".to_owned(), json!(created.clone()));
             }
             if emby_fields_include(fields, "DateLastSaved") {
-                object.insert("DateLastSaved".to_owned(), json!(created));
+                object.insert(
+                    "DateLastSaved".to_owned(),
+                    json!(emby_timestamp(item.updated_at).unwrap_or(created)),
+                );
             }
         }
         if emby_fields_include(fields, "Path") {
@@ -3855,19 +3860,6 @@ pub(super) fn emby_safe_path(item: &CatalogItem, default_source: Option<&Catalog
             .unwrap_or("strm")
     };
     format!("/media/{}/{title}.{container}", item.library_id)
-}
-
-/// Extracts the creation timestamp embedded in Lux's UUIDv7 item ids. The first
-/// 48 bits of a v7 uuid are Unix milliseconds, which is exactly when Lux
-/// generated the id for the media item. Non-v7 ids (imported/migrated data)
-/// return None and the field is omitted instead of emitting a fabricated value.
-pub(super) fn emby_item_timestamp(item_id: &str) -> Option<String> {
-    let compact = item_id.replace('-', "");
-    if compact.len() != 32 || compact.as_bytes().get(12).is_none_or(|byte| *byte != b'7') {
-        return None;
-    }
-    let millis = u64::from_str_radix(&compact[..12], 16).ok()?;
-    emby_timestamp(i64::try_from(millis / 1000).ok()?)
 }
 
 /// Reads a video stream dimension (Width or Height) from the default source's

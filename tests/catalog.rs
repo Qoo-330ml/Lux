@@ -464,7 +464,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_page_body["Items"][0]["ParentId"], emby_alpha_parent_id);
     assert_eq!(
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
-        "mkv"
+        "matroska"
     );
 
     let provider_filtered = client
@@ -869,10 +869,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         detail_body["PrimaryImageAspectRatio"].as_f64(),
         Some(2.0 / 3.0)
     );
+    sqlx::query("UPDATE media_items SET added_at = ?, updated_at = ? WHERE id = ?")
+        .bind(1_700_000_000_i64)
+        .bind(1_700_000_100_i64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
 
     let user_scoped_detail = client
         .get(format!(
-            "{base_url}/emby/Users/{}/Items/{emby_item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateModified%2CCanDownload%2CCanDelete",
+            "{base_url}/emby/Users/{}/Items/{emby_item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateCreated%2CDateLastSaved%2CDateModified%2CCanDownload%2CCanDelete",
             admin.id
         ))
         .header("X-Emby-Token", &admin_token)
@@ -887,6 +893,18 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(
         user_scoped_detail_body["PrimaryImageAspectRatio"].as_f64(),
         Some(2.0 / 3.0)
+    );
+    assert_eq!(
+        user_scoped_detail_body["DateCreated"],
+        "2023-11-14T22:13:20.0000000Z"
+    );
+    assert_eq!(
+        user_scoped_detail_body["DateLastSaved"],
+        "2023-11-14T22:15:00.0000000Z"
+    );
+    assert_eq!(
+        user_scoped_detail_body["DateModified"],
+        "2023-11-14T22:15:00.0000000Z"
     );
     assert!(user_scoped_detail_body["MediaStreams"].is_array());
     assert_eq!(user_scoped_detail_body["MediaStreams"][0]["Width"], 1920);
