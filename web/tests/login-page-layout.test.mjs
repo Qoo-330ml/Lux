@@ -17,7 +17,7 @@ test("login poster waterfall keeps the requested scale, inset, and stagger", () 
   assert.match(waterfallRule, /column-gap:\s*12px/);
   assert.match(waterfallRule, /row-gap:\s*12px/);
   assert.match(waterfallRule, /justify-content:\s*start/);
-  assert.match(waterfallRule, /transform:\s*rotate\(6deg\)/);
+  assert.match(waterfallRule, /transform:\s*rotate\(9deg\)/);
   assert.match(waterfallRule, /transform-origin:\s*left center/);
   assert.match(stylesheet, /\.lux-auth-poster-waterfall-column\s*\{[^}]*align-items:\s*flex-end[^}]*gap:\s*12px/);
   assert.match(middleColumnRule, /margin-top:\s*-15%/);
