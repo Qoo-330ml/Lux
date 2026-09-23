@@ -161,6 +161,13 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 - 2026-08-09 的新结果用于当前提交 `c022fcac`；新增电影后台任务的有界文件准备并发、容器 CPU 配额和首页 p95 自适应降档、按根批量写入；基准脚本本身仍是直接扫描路径，不能据此宣称持久化后台任务的精确耗时变化。
 - 2026-08-10 的新结果用于提交 `5e0bef61`；目录聚合请求使用有界背压，50 个并发目录请求全部成功。剧集、合集、Resume、STRM 与弹幕的大数据量回归由对应合成数据库测试覆盖；本机没有用户的真实媒体库，Docker daemon 也未运行，因此该记录不证明目标 NAS 上的峰值 RSS 或任务结束后的 glibc RSS 回收效果。
 
+## LUX-266 Manifest 发现写入边界
+
+- 新建全量扫描时，scan job、Manifest、root 状态和根目录 frontier 在同一短事务中创建；扫描目录只从 Manifest frontier 取出，不再把目录待办写入 `reconciliation_scan_entries`。
+- 每个有界发现 chunk 在同一事务中追加不可变 observation、插入子目录 frontier、更新 Manifest/root/job 计数，并只在成功枚举目录的最终 chunk 标记该目录完成。取消或失败保留已提交 observation/frontier；未完成的 root 标记为 `INCOMPLETE`，不可进入后续缺失判断。
+- 每条 observation 使用 11 个绑定参数，按 80 条/语句（最多 880 binds）写入；子目录按 200 条（600 binds）写入；为保持本任务增量独立，已发现文件暂由旧文件索引工作队列承接，按 200 条（最多 800 binds）写入。LUX-267 完成 Manifest delta apply 后再移除这段过渡桥接。
+- `cargo test --locked --test scanning_jobs` 覆盖 1,025 个文件的跨批次发现、observation 指纹/重观察版本、取消时保留已提交 frontier，以及 root 不可用后恢复。该测试证明正确性和 SQLite 批次边界，不是耗时/吞吐基准；此任务未运行 release benchmark，也不据此声称扫描速度提升或推断 PostgreSQL/NAS 性能。
+
 ## Web Bilibili 弹幕解析
 
 基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。输入包含 5,000 条合法弹幕和一个超过 4 MiB 的 ASCII XML；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。

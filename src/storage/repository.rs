@@ -1023,14 +1023,11 @@ pub(crate) struct StoredScanJob {
 }
 
 #[derive(Clone, Copy, Debug)]
-#[allow(dead_code)] // LUX-266 wires these values into the persisted discovery worker.
 pub(crate) struct NewScanManifestRoot<'a> {
     pub(crate) library_root_id: &'a str,
-    pub(crate) is_available: bool,
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // LUX-266 wires these values into the persisted discovery worker.
 pub(crate) struct NewScanManifest<'a> {
     pub(crate) id: &'a str,
     pub(crate) job_id: &'a str,
@@ -1051,7 +1048,7 @@ pub(crate) struct NewScanManifestDelta<'a> {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)] // LUX-266 reads progress while recovering persisted discovery work.
+#[allow(dead_code)] // LUX-267 consumes the persisted diff and apply counters.
 pub(crate) struct StoredScanManifest {
     pub(crate) id: String,
     pub(crate) job_id: String,
@@ -1066,6 +1063,32 @@ pub(crate) struct StoredScanManifest {
     pub(crate) remove_count: i64,
     pub(crate) reappeared_count: i64,
     pub(crate) applied_delta_count: i64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NewScanManifestEntry {
+    pub(crate) relative_path: String,
+    pub(crate) entry_kind: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(crate) struct NewScanManifestDiscoveryChunk<'a> {
+    pub(crate) manifest_id: &'a str,
+    pub(crate) job_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) child_directories: &'a [String],
+    pub(crate) entries: &'a [NewScanManifestEntry],
+    pub(crate) completed_directory: Option<&'a str>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestDirectory {
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
 }
 
 #[derive(Debug)]

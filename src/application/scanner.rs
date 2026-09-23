@@ -14,6 +14,16 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+use std::os::{
+    fd::{AsRawFd, FromRawFd},
+    unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+};
 use tokio::{
     fs,
     sync::{Notify, OwnedSemaphorePermit, Semaphore, watch},
@@ -48,10 +58,11 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, FilesystemEntryMove, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem,
-        NewMediaItem, NewMediaSource, NewMovieFile, NewScanJobEvent, ReconciliationBatchCommit,
-        StorageError, StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
-        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
-        movie_parent_folder_identity,
+        NewMediaItem, NewMediaSource, NewMovieFile, NewScanJobEvent, NewScanManifest,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestRoot,
+        ReconciliationBatchCommit, StorageError, StoredEpisodeIdentityCandidate,
+        StoredFilesystemEntry, StoredLibraryRoot, StoredReconciliationScanEntry, StoredScanJob,
+        StoredScanJobPath, movie_parent_folder_identity,
     },
 };
 
@@ -60,6 +71,410 @@ pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 100;
 const DISCOVERY_BATCH_SIZE: usize = 16;
 const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
 const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
+
+struct ManifestDirectoryBatch {
+    child_directories: Vec<String>,
+    entries: Vec<NewScanManifestEntry>,
+    completed: bool,
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+struct ManifestDirectoryReader {
+    root_path: PathBuf,
+    relative_directory: String,
+    _directory: std::fs::File,
+    entries: *mut libc::DIR,
+    directory_observation: NewScanManifestEntry,
+}
+
+// The DIR stream is exclusively owned and is only accessed by one blocking task at a time.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+// SAFETY: the raw pointer is created by `fdopendir`, never copied, only dereferenced while
+// the reader is moved by value into a blocking task, and closed exactly once by `Drop`.
+unsafe impl Send for ManifestDirectoryReader {}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+impl ManifestDirectoryReader {
+    fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
+        if !root_path.is_absolute() {
+            return Err(ScannerError::InvalidRelativePath(
+                root_path.to_string_lossy().into_owned(),
+            ));
+        }
+        let display_path = root_path.join(relative_directory);
+        let mut directory = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/")
+            .map_err(|source| ScannerError::Io {
+                path: PathBuf::from("/"),
+                source,
+            })?;
+
+        for component in root_path
+            .components()
+            .chain(Path::new(relative_directory).components())
+        {
+            let Component::Normal(name) = component else {
+                if matches!(component, Component::RootDir) {
+                    continue;
+                }
+                return Err(ScannerError::InvalidRelativePath(
+                    relative_directory.to_owned(),
+                ));
+            };
+            directory = open_manifest_directory_component(
+                directory.as_raw_fd(),
+                name,
+                &display_path,
+                relative_directory,
+            )?;
+        }
+
+        let metadata = directory.metadata().map_err(|source| ScannerError::Io {
+            path: display_path.clone(),
+            source,
+        })?;
+        let directory_observation = manifest_entry_observation(
+            relative_directory.to_owned(),
+            "DIRECTORY",
+            &metadata,
+            &display_path,
+        )?;
+        // SAFETY: directory owns a valid descriptor, and fcntl does not take ownership.
+        let entries_fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+        if entries_fd < 0 {
+            return Err(ScannerError::Io {
+                path: display_path,
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        // SAFETY: entries_fd is a fresh valid descriptor for a directory; fdopendir takes
+        // ownership of it, leaving `directory` available for openat/fstatat calls.
+        let entries = unsafe { libc::fdopendir(entries_fd) };
+        if entries.is_null() {
+            let source = std::io::Error::last_os_error();
+            // SAFETY: fdopendir failed, so ownership of entries_fd did not transfer.
+            unsafe { libc::close(entries_fd) };
+            return Err(ScannerError::Io {
+                path: display_path,
+                source,
+            });
+        }
+
+        Ok(Self {
+            root_path: root_path.to_owned(),
+            relative_directory: relative_directory.to_owned(),
+            _directory: directory,
+            entries,
+            directory_observation,
+        })
+    }
+
+    fn next_batch(self) -> Result<(Self, ManifestDirectoryBatch), ScannerError> {
+        let mut child_directories = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
+        let mut observations = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
+        let mut completed = false;
+
+        for _ in 0..DISCOVERY_ENTRY_BATCH_SIZE {
+            clear_manifest_errno();
+            // SAFETY: `entries` remains a live, exclusively owned DIR stream until Drop.
+            let entry = unsafe { libc::readdir(self.entries) };
+            if entry.is_null() {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error().is_some_and(|code| code != 0) {
+                    return Err(ScannerError::Io {
+                        path: self.root_path.join(&self.relative_directory),
+                        source,
+                    });
+                }
+                completed = true;
+                break;
+            }
+            // SAFETY: readdir returns a dirent whose d_name is NUL-terminated and remains
+            // valid until the next readdir call; the name is copied immediately below.
+            let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }
+                .to_str()
+                .map_err(|_| ScannerError::NonUtf8Path)?;
+            if name == "." || name == ".." {
+                continue;
+            }
+            let relative_path = Path::new(&self.relative_directory)
+                .join(name)
+                .to_str()
+                .ok_or(ScannerError::NonUtf8Path)?
+                .to_owned();
+            let path = self.root_path.join(&relative_path);
+            let name_c = std::ffi::CString::new(name)
+                .map_err(|_| ScannerError::InvalidRelativePath(relative_path.clone()))?;
+            let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            // SAFETY: the directory descriptor is open, name_c is NUL-terminated, and stat
+            // points to writable storage for the duration of the call.
+            let stat_result = unsafe {
+                libc::fstatat(
+                    self._directory.as_raw_fd(),
+                    name_c.as_ptr(),
+                    stat.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            if stat_result < 0 {
+                let source = std::io::Error::last_os_error();
+                if source.raw_os_error().is_some_and(|code| {
+                    code == libc::ENOENT || code == libc::ENOTDIR || code == libc::ELOOP
+                }) {
+                    continue;
+                }
+                return Err(ScannerError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+            // SAFETY: fstatat initialized the struct on success.
+            let stat = unsafe { stat.assume_init() };
+            let file_type = stat.st_mode & libc::S_IFMT;
+            let is_directory = file_type == libc::S_IFDIR;
+            let is_regular_file = file_type == libc::S_IFREG;
+            if !(is_directory
+                || is_regular_file
+                    && (is_supported_movie_file(Path::new(name))
+                        || is_supported_sidecar_file(Path::new(name))))
+            {
+                continue;
+            }
+            let entry_kind = if is_directory {
+                child_directories.push(relative_path.clone());
+                Some("DIRECTORY")
+            } else if is_regular_file {
+                Some("FILE")
+            } else {
+                None
+            };
+            if let Some(entry_kind) = entry_kind {
+                observations.push(manifest_entry_observation_from_stat(
+                    relative_path,
+                    entry_kind,
+                    &stat,
+                    &path,
+                )?);
+            }
+        }
+
+        if completed {
+            observations.push(self.directory_observation.clone());
+        }
+        Ok((
+            self,
+            ManifestDirectoryBatch {
+                child_directories,
+                entries: observations,
+                completed,
+            },
+        ))
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn clear_manifest_errno() {
+    // SAFETY: errno location is thread-local and readdir is called synchronously afterward.
+    unsafe { *libc::__errno_location() = 0 };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+fn clear_manifest_errno() {
+    // SAFETY: errno location is thread-local and readdir is called synchronously afterward.
+    unsafe { *libc::__error() = 0 };
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+impl Drop for ManifestDirectoryReader {
+    fn drop(&mut self) {
+        if !self.entries.is_null() {
+            // SAFETY: this reader uniquely owns the stream returned by fdopendir.
+            unsafe { libc::closedir(self.entries) };
+            self.entries = std::ptr::null_mut();
+        }
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn open_manifest_directory_component(
+    parent_descriptor: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    display_path: &Path,
+    relative_directory: &str,
+) -> Result<std::fs::File, ScannerError> {
+    let name_c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|_| ScannerError::InvalidRelativePath(relative_directory.to_owned()))?;
+    // SAFETY: parent_descriptor remains owned by the caller and name_c is NUL-terminated.
+    let descriptor = unsafe {
+        libc::openat(
+            parent_descriptor,
+            name_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor < 0 {
+        let source = std::io::Error::last_os_error();
+        if source.raw_os_error() == Some(libc::ELOOP) {
+            return Err(ScannerError::InvalidRelativePath(
+                relative_directory.to_owned(),
+            ));
+        }
+        return Err(ScannerError::Io {
+            path: display_path.to_owned(),
+            source,
+        });
+    }
+    // SAFETY: descriptor is a newly opened directory and ownership transfers to File.
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+struct ManifestDirectoryReader {
+    root_path: PathBuf,
+    relative_directory: String,
+    directory_path: PathBuf,
+    entries: std::fs::ReadDir,
+    directory_observation: NewScanManifestEntry,
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+impl ManifestDirectoryReader {
+    fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
+        let directory_path = root_path.join(relative_directory);
+        let canonical_directory_path =
+            std::fs::canonicalize(&directory_path).map_err(|source| ScannerError::Io {
+                path: directory_path.clone(),
+                source,
+            })?;
+        if !canonical_directory_path.starts_with(root_path)
+            || canonical_directory_path != directory_path
+        {
+            return Err(ScannerError::InvalidRelativePath(
+                relative_directory.to_owned(),
+            ));
+        }
+        let metadata =
+            std::fs::metadata(&canonical_directory_path).map_err(|source| ScannerError::Io {
+                path: canonical_directory_path.clone(),
+                source,
+            })?;
+        let directory_observation = manifest_entry_observation(
+            relative_directory.to_owned(),
+            "DIRECTORY",
+            &metadata,
+            &canonical_directory_path,
+        )?;
+        let entries =
+            std::fs::read_dir(&canonical_directory_path).map_err(|source| ScannerError::Io {
+                path: canonical_directory_path.clone(),
+                source,
+            })?;
+        Ok(Self {
+            root_path: root_path.to_owned(),
+            relative_directory: relative_directory.to_owned(),
+            directory_path: canonical_directory_path,
+            entries,
+            directory_observation,
+        })
+    }
+
+    fn next_batch(mut self) -> Result<(Self, ManifestDirectoryBatch), ScannerError> {
+        let mut child_directories = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
+        let mut observations = Vec::with_capacity(DISCOVERY_ENTRY_BATCH_SIZE);
+        let mut completed = false;
+        for _ in 0..DISCOVERY_ENTRY_BATCH_SIZE {
+            let Some(entry) = self.entries.next() else {
+                completed = true;
+                break;
+            };
+            let entry = entry.map_err(|source| ScannerError::Io {
+                path: self.directory_path.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            let file_type = entry.file_type().map_err(|source| ScannerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if !(file_type.is_dir()
+                || file_type.is_file()
+                    && (is_supported_movie_file(&path) || is_supported_sidecar_file(&path)))
+            {
+                continue;
+            }
+            let relative_path = path
+                .strip_prefix(&self.root_path)
+                .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                .to_str()
+                .ok_or(ScannerError::NonUtf8Path)?
+                .to_owned();
+            let metadata = entry.metadata().map_err(|source| ScannerError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            let entry_kind = if file_type.is_dir() {
+                child_directories.push(relative_path.clone());
+                "DIRECTORY"
+            } else {
+                "FILE"
+            };
+            observations.push(manifest_entry_observation(
+                relative_path,
+                entry_kind,
+                &metadata,
+                &path,
+            )?);
+        }
+        if completed {
+            observations.push(self.directory_observation.clone());
+        }
+        Ok((
+            self,
+            ManifestDirectoryBatch {
+                child_directories,
+                entries: observations,
+                completed,
+            },
+        ))
+    }
+}
 const MISSING_ENTRY_BATCH_SIZE: usize = 500;
 const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
 const LOCAL_METADATA_BATCH_SIZE: usize = 16;
@@ -2650,6 +3065,9 @@ impl ScanJobService {
             });
         }
         self.database
+            .finish_scan_manifest(job_id, "CANCELLED")
+            .await?;
+        self.database
             .clear_reconciliation_scan_entries(job_id)
             .await?;
         self.database.clear_scan_job_paths(job_id).await?;
@@ -3015,16 +3433,22 @@ impl ScanJobService {
         let roots = self.database.list_library_roots(&library_id_text).await?;
         let id = Uuid::now_v7().to_string();
         let generation = Uuid::now_v7().to_string();
-        let root_ids = roots.into_iter().map(|root| root.id).collect::<Vec<_>>();
+        let manifest_id = Uuid::now_v7().to_string();
+        let manifest_roots = roots
+            .iter()
+            .map(|root| NewScanManifestRoot {
+                library_root_id: &root.id,
+            })
+            .collect::<Vec<_>>();
+        let manifest = NewScanManifest {
+            id: &manifest_id,
+            job_id: &id,
+            library_id: &library_id_text,
+            roots: &manifest_roots,
+        };
         if let Err(error) = self
             .database
-            .create_reconciliation_scan_job(
-                &id,
-                &library_id_text,
-                &generation,
-                &root_ids,
-                auto_metadata_match,
-            )
+            .create_full_scan_manifest_job(&id, &generation, auto_metadata_match, &manifest)
             .await
         {
             if error.is_unique_violation()
@@ -3156,6 +3580,17 @@ impl ScanJobService {
         }
 
         if !job.discovery_completed {
+            if let Some(manifest) = self.database.get_scan_manifest_by_job(&job.id).await? {
+                return self
+                    .run_scan_manifest_discovery_batch(
+                        &job,
+                        &manifest.id,
+                        batch_size,
+                        &cancellation,
+                        stream_files_during_discovery,
+                    )
+                    .await;
+            }
             return self
                 .run_reconciliation_discovery_batch(
                     &job,
@@ -3167,6 +3602,281 @@ impl ScanJobService {
         }
         self.run_reconciliation_file_batch(&job, batch_size, &cancellation, true)
             .await
+    }
+
+    async fn discover_scan_manifest_directory_batches(
+        &self,
+        job_id: &str,
+        manifest_id: &str,
+        root: &StoredLibraryRoot,
+        relative_directory: &str,
+        cancellation: &AtomicBool,
+    ) -> Result<Option<usize>, ScannerError> {
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let relative = Path::new(relative_directory);
+        if relative.is_absolute()
+            || relative.components().any(|component| {
+                matches!(
+                    component,
+                    Component::CurDir
+                        | Component::ParentDir
+                        | Component::RootDir
+                        | Component::Prefix(_)
+                )
+            })
+        {
+            return Err(ScannerError::InvalidRelativePath(
+                relative_directory.to_owned(),
+            ));
+        }
+        let root_path = PathBuf::from(&root.canonical_path);
+        let open_root_path = root_path.clone();
+        let open_relative_directory = relative_directory.to_owned();
+        let mut reader = tokio::task::spawn_blocking(move || {
+            ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
+        })
+        .await
+        .map_err(|source| ScannerError::Io {
+            path: root_path.clone(),
+            source: std::io::Error::other(source.to_string()),
+        })??;
+        let mut inserted_media_files = 0_usize;
+        loop {
+            let reader_to_move = reader;
+            let (next_reader, batch) =
+                tokio::task::spawn_blocking(move || reader_to_move.next_batch())
+                    .await
+                    .map_err(|source| ScannerError::Io {
+                        path: root_path.clone(),
+                        source: std::io::Error::other(source.to_string()),
+                    })??;
+            reader = next_reader;
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let completed = batch.completed;
+            let mut child_directories = batch.child_directories;
+            let mut observations = batch.entries;
+            if !completed && child_directories.is_empty() && observations.is_empty() {
+                continue;
+            }
+            child_directories.sort_unstable();
+            observations
+                .sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+            let completed_directory = completed.then_some(relative_directory);
+            let Some(inserted_count) = self
+                .commit_scan_manifest_discovery_chunk(
+                    &NewScanManifestDiscoveryChunk {
+                        manifest_id,
+                        job_id,
+                        library_root_id: &root.id,
+                        child_directories: &child_directories,
+                        entries: &observations,
+                        completed_directory,
+                    },
+                    cancellation,
+                )
+                .await?
+            else {
+                return Ok(None);
+            };
+            inserted_media_files = inserted_media_files
+                .saturating_add(usize::try_from(inserted_count).unwrap_or(usize::MAX));
+            if completed {
+                return Ok(Some(inserted_media_files));
+            }
+        }
+    }
+
+    async fn commit_scan_manifest_discovery_chunk(
+        &self,
+        chunk: &NewScanManifestDiscoveryChunk<'_>,
+        cancellation: &AtomicBool,
+    ) -> Result<Option<i64>, ScannerError> {
+        match self
+            .database
+            .commit_scan_manifest_discovery_chunk(chunk)
+            .await
+        {
+            Ok(inserted_count) => Ok(Some(inserted_count)),
+            Err(error) => {
+                if cancellation.load(Ordering::Acquire)
+                    || self
+                        .database
+                        .scan_job_cancel_requested(chunk.job_id)
+                        .await?
+                {
+                    Ok(None)
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
+    }
+
+    async fn run_scan_manifest_discovery_batch(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        batch_size: usize,
+        cancellation: &AtomicBool,
+        stream_files_during_discovery: bool,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        let limit = i64::try_from(batch_size.min(DISCOVERY_BATCH_SIZE)).unwrap_or(i64::MAX);
+        let directories = self
+            .database
+            .list_scan_manifest_directories(manifest_id, limit)
+            .await?;
+        self.update_activity(
+            &job.id,
+            directories
+                .last()
+                .map(|directory| directory.relative_path.as_str()),
+            "DISCOVERY",
+        )
+        .await?;
+        let root_ids = directories
+            .iter()
+            .map(|directory| directory.library_root_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let roots_by_id = self.database.list_library_roots_by_ids(&root_ids).await?;
+        let mut unavailable_root_ids = HashSet::new();
+        let mut discovered_count = job.total_count;
+        for directory in directories {
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(&job.id).await;
+            }
+            if unavailable_root_ids.contains(&directory.library_root_id) {
+                continue;
+            }
+            let Some(root) = roots_by_id.get(&directory.library_root_id).cloned() else {
+                self.database
+                    .mark_scan_manifest_root_unavailable(manifest_id, &directory.library_root_id)
+                    .await?;
+                self.database
+                    .discard_reconciliation_root_entries(&job.id, &directory.library_root_id)
+                    .await?;
+                unavailable_root_ids.insert(directory.library_root_id);
+                continue;
+            };
+            match self
+                .discover_scan_manifest_directory_batches(
+                    &job.id,
+                    manifest_id,
+                    &root,
+                    &directory.relative_path,
+                    cancellation,
+                )
+                .await
+            {
+                Ok(Some(discovered_count_for_directory)) => {
+                    discovered_count = discovered_count.saturating_add(
+                        i64::try_from(discovered_count_for_directory).unwrap_or(i64::MAX),
+                    );
+                    if !root.is_available {
+                        self.database
+                            .update_library_root_availability(&root.id, true)
+                            .await?;
+                    }
+                }
+                Ok(None) => return self.cancel_running_job(&job.id).await,
+                Err(_error)
+                    if self
+                        .cancellation_requested(&job.id, false, cancellation)
+                        .await? =>
+                {
+                    return self.cancel_running_job(&job.id).await;
+                }
+                Err(ScannerError::Io { .. }) => {
+                    unavailable_root_ids.insert(root.id.clone());
+                    self.database
+                        .update_library_root_availability(&root.id, false)
+                        .await?;
+                    self.database
+                        .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
+                        .await?;
+                    self.database
+                        .discard_reconciliation_root_entries(&job.id, &root.id)
+                        .await?;
+                    self.record_event(
+                        &job.id,
+                        "WARN",
+                        "ROOT_UNAVAILABLE",
+                        "媒体库根路径不可用，已跳过本轮缺失判定",
+                        "{}",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return self
+                        .fail_reconciliation_job(job, error, &[], job.processed_count)
+                        .await;
+                }
+            }
+        }
+
+        if self
+            .cancellation_requested(&job.id, false, cancellation)
+            .await?
+        {
+            return self.cancel_running_job(&job.id).await;
+        }
+        let remaining = self
+            .database
+            .list_scan_manifest_directories(manifest_id, 1)
+            .await?;
+        if remaining.is_empty() {
+            let total = match self
+                .database
+                .finish_scan_manifest_discovery(manifest_id, &job.id)
+                .await
+            {
+                Ok(total) => total,
+                Err(_error)
+                    if self
+                        .cancellation_requested(&job.id, false, cancellation)
+                        .await? =>
+                {
+                    return self.cancel_running_job(&job.id).await;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let details = format!(r#"{{"discovered":{total},"discoveryCompleted":true}}"#);
+            self.record_event(
+                &job.id,
+                "INFO",
+                "DISCOVERY_COMPLETED",
+                "媒体库目录发现完成",
+                &details,
+            )
+            .await;
+        } else {
+            let details =
+                format!(r#"{{"discovered":{discovered_count},"discoveryCompleted":false}}"#);
+            self.record_event(
+                &job.id,
+                "INFO",
+                "DISCOVERY_PROGRESS",
+                "媒体库目录发现进行中",
+                &details,
+            )
+            .await;
+        }
+        if stream_files_during_discovery {
+            return self
+                .run_reconciliation_file_batch(job, batch_size, cancellation, remaining.is_empty())
+                .await;
+        }
+        Ok(ScanBatchReport {
+            status: "RUNNING".to_owned(),
+            processed: 0,
+            created_items: 0,
+            completed: false,
+        })
     }
 
     async fn discover_reconciliation_directory_batches(
@@ -4590,6 +5300,9 @@ impl ScanJobService {
     ) -> Result<ScanBatchReport, ScanJobError> {
         let error_code = error.code();
         self.database
+            .finish_scan_manifest(&job.id, "FAILED")
+            .await?;
+        self.database
             .finish_scan_job(&job.id, "FAILED", Some(&error.to_string()))
             .await?;
         self.record_event(&job.id, "ERROR", error_code, "扫描任务失败", "{}")
@@ -4620,6 +5333,7 @@ impl ScanJobService {
             return Ok(());
         }
         let error_code = error.code();
+        self.database.finish_scan_manifest(job_id, "FAILED").await?;
         self.database
             .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
             .await?;
@@ -6087,6 +6801,18 @@ impl ScanJobService {
             return Err(ScanJobError::AlreadyActive(active.id));
         }
         if job.job_type == "RECONCILE_LIBRARY" {
+            if job.status == "FAILED"
+                && !job.discovery_completed
+                && self
+                    .database
+                    .get_scan_manifest_by_job(&job.id)
+                    .await?
+                    .is_some_and(|manifest| manifest.state == "FAILED")
+            {
+                return self
+                    .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
+                    .await;
+            }
             let has_reconciliation_entries = self
                 .database
                 .has_reconciliation_scan_entries(&job.id)
@@ -6595,6 +7321,74 @@ pub fn compute_file_fingerprint(
     hasher.update(device.unwrap_or_default().to_le_bytes());
     hasher.update(inode.unwrap_or_default().to_le_bytes());
     hasher.finalize().to_vec()
+}
+
+fn manifest_entry_observation(
+    relative_path: String,
+    entry_kind: &str,
+    metadata: &std::fs::Metadata,
+    path: &Path,
+) -> Result<NewScanManifestEntry, ScannerError> {
+    let size = i64::try_from(metadata.len())
+        .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+        .unwrap_or(0);
+    let (device, inode) = file_identity(metadata);
+    let fingerprint = compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+    Ok(NewScanManifestEntry {
+        relative_path,
+        entry_kind: entry_kind.to_owned(),
+        size,
+        modified_at,
+        inode: inode.and_then(|inode| i64::try_from(inode).ok()),
+        fingerprint,
+    })
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn manifest_entry_observation_from_stat(
+    relative_path: String,
+    entry_kind: &str,
+    metadata: &libc::stat,
+    path: &Path,
+) -> Result<NewScanManifestEntry, ScannerError> {
+    let size = u64::try_from(metadata.st_size)
+        .ok()
+        .and_then(|size| i64::try_from(size).ok())
+        .ok_or_else(|| ScannerError::FileSizeOverflow(path.to_owned()))?;
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let (modified_seconds, modified_nanoseconds) = (metadata.st_mtime, metadata.st_mtime_nsec);
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    let (modified_seconds, modified_nanoseconds) = (metadata.st_mtime, metadata.st_mtime_nsec);
+    let modified_at = i128::from(modified_seconds)
+        .saturating_mul(1_000_000_000)
+        .saturating_add(i128::from(modified_nanoseconds));
+    let modified_at = if modified_at < 0 {
+        0
+    } else {
+        i64::try_from(modified_at).unwrap_or(i64::MAX)
+    };
+    let device = u64::try_from(metadata.st_dev).ok();
+    let inode: u64 = metadata.st_ino;
+    let fingerprint =
+        compute_file_fingerprint(&relative_path, size, modified_at, device, Some(inode));
+    Ok(NewScanManifestEntry {
+        relative_path,
+        entry_kind: entry_kind.to_owned(),
+        size,
+        modified_at,
+        inode: i64::try_from(inode).ok(),
+        fingerprint,
+    })
 }
 
 async fn current_file_fingerprint(
@@ -7161,9 +7955,44 @@ fn throughput_per_second(items: usize, elapsed_ms: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MixedClassification, MixedClassificationCache, classify_mixed_file, media_source_folder,
-        normalize_incremental_path, safe_scan_activity_label,
+        ManifestDirectoryReader, MixedClassification, MixedClassificationCache,
+        classify_mixed_file, media_source_folder, normalize_incremental_path,
+        safe_scan_activity_label,
     };
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[test]
+    fn manifest_directory_reader_enumerates_from_the_open_directory_handle()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let root = std::fs::canonicalize(temp_dir.path())?;
+        std::fs::create_dir(root.join("Nested"))?;
+        std::fs::write(root.join("Example.Movie.2025.mkv"), b"fixture")?;
+
+        let reader = ManifestDirectoryReader::open(&root, "")?;
+        let (_reader, batch) = reader.next_batch()?;
+
+        assert!(batch.completed);
+        assert_eq!(batch.child_directories, vec!["Nested"]);
+        assert!(
+            batch
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == "Example.Movie.2025.mkv")
+        );
+        assert!(
+            batch
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path.is_empty())
+        );
+        Ok(())
+    }
 
     #[test]
     fn media_source_folder_uses_the_source_parent_directory() {

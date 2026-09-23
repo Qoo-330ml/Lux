@@ -152,6 +152,12 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 这些测试证明 Lux 服务端的请求路径、权限、状态码、响应字段和资源清理，不替代 Qmby 在 FNOS 部署实例上的完整
 登录、首页、详情、播放、进度和停止请求序列复测。
 
+## LUX-266 全量扫描 Manifest 存储兼容
+
+新建全量扫描时，job、Manifest、root 状态和目录 frontier 同事务创建；扫描发现将文件/目录 stat 与 fingerprint 作为追加式 observation 持久化，目录 frontier 不再写入 `reconciliation_scan_entries`。已发现的文件索引工作暂由该旧表的 FILE 行承接，直到 LUX-267 将差异应用切换到 Manifest。此内部存储变化不改变 Lux、Webhook 或 Emby 公共合同。
+
+SQLite 与 PostgreSQL 共用有界 `INSERT`/`SELECT`/`UNION ALL`/`ON CONFLICT` 写入，不依赖 COPY、临时表或 PostgreSQL 专属核心 SQL。SQLite 集成测试覆盖多批次与取消/失败保留；PostgreSQL Manifest migration 的结构静态检查通过，但本次没有可用的 PostgreSQL 服务，因此不宣称已完成 PostgreSQL runtime 验证；该验证留到 LUX-270。
+
 ## 目标矩阵
 
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |

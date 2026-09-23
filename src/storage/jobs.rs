@@ -61,6 +61,22 @@ fn valid_scan_manifest_transition(expected: &str, next: &str) -> bool {
     )
 }
 
+fn validate_scan_manifest(manifest: &NewScanManifest<'_>) -> Result<i64, StorageError> {
+    let root_count = i64::try_from(manifest.roots.len())
+        .map_err(|_| StorageError::Conflict("manifest root count overflow".to_owned()))?;
+    let mut unique_roots = std::collections::HashSet::with_capacity(manifest.roots.len());
+    if manifest
+        .roots
+        .iter()
+        .any(|root| !unique_roots.insert(root.library_root_id))
+    {
+        return Err(StorageError::Conflict(
+            "manifest root list contains duplicates".to_owned(),
+        ));
+    }
+    Ok(root_count)
+}
+
 impl Database {
     /// Marks every unfinished persistent background job as cancelled.
     ///
@@ -451,28 +467,12 @@ impl Database {
         })
     }
 
-    #[allow(dead_code)] // LUX-266 starts new full scans through this persistence boundary.
+    #[cfg(test)]
     pub(crate) async fn create_scan_manifest(
         &self,
         manifest: &NewScanManifest<'_>,
     ) -> Result<(), StorageError> {
-        if manifest.roots.is_empty() {
-            return Err(StorageError::Conflict(
-                "a full-scan manifest requires at least one root".to_owned(),
-            ));
-        }
-        let root_count = i64::try_from(manifest.roots.len())
-            .map_err(|_| StorageError::Conflict("manifest root count overflow".to_owned()))?;
-        let mut unique_roots = std::collections::HashSet::with_capacity(manifest.roots.len());
-        if manifest
-            .roots
-            .iter()
-            .any(|root| !unique_roots.insert(root.library_root_id))
-        {
-            return Err(StorageError::Conflict(
-                "manifest root list contains duplicates".to_owned(),
-            ));
-        }
+        let root_count = validate_scan_manifest(manifest)?;
 
         let mut transaction = self.begin_scan_write_transaction().await?;
         let existing: Option<(String, String)> = self
@@ -525,26 +525,17 @@ impl Database {
             ));
         }
 
-        let mut available_root_count = 0_i64;
         for root in manifest.roots {
-            let state = if root.is_available {
-                "PENDING"
-            } else {
-                "UNAVAILABLE"
-            };
             let created_root = self
                 .query(
                     "INSERT INTO scan_manifest_roots (
-                         manifest_id, library_root_id, state, directory_count, finished_at
+                         manifest_id, library_root_id, state, directory_count
                      )
-                     SELECT ?, lr.id, ?, ?, CASE WHEN ? = 0 THEN unixepoch() END
+                     SELECT ?, lr.id, 'PENDING', 1
                      FROM library_roots lr
                      WHERE lr.id = ? AND lr.library_id = ?",
                 )
                 .bind(manifest.id)
-                .bind(state)
-                .bind(i64::from(root.is_available))
-                .bind(i64::from(root.is_available))
                 .bind(root.library_root_id)
                 .bind(manifest.library_id)
                 .execute(&mut *transaction)
@@ -559,22 +550,19 @@ impl Database {
                     root.library_root_id
                 )));
             }
-            if root.is_available {
-                self.query(
-                    "INSERT INTO scan_manifest_directories (
-                         manifest_id, library_root_id, relative_path, state
-                     ) VALUES (?, ?, '', 'PENDING')",
-                )
-                .bind(manifest.id)
-                .bind(root.library_root_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-                available_root_count += 1;
-            }
+            self.query(
+                "INSERT INTO scan_manifest_directories (
+                     manifest_id, library_root_id, relative_path, state
+                 ) VALUES (?, ?, '', 'PENDING')",
+            )
+            .bind(manifest.id)
+            .bind(root.library_root_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         }
 
         self.query(
@@ -582,7 +570,121 @@ impl Database {
              SET discovered_directory_count = ?, updated_at = unixepoch()
              WHERE id = ?",
         )
-        .bind(available_root_count)
+        .bind(root_count)
+        .bind(manifest.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn create_full_scan_manifest_job(
+        &self,
+        id: &str,
+        generation: &str,
+        auto_metadata_match: bool,
+        manifest: &NewScanManifest<'_>,
+    ) -> Result<(), StorageError> {
+        if manifest.job_id != id {
+            return Err(StorageError::Conflict(
+                "manifest job id does not match the scan job".to_owned(),
+            ));
+        }
+        let root_count = validate_scan_manifest(manifest)?;
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "INSERT INTO scan_jobs (
+                id, library_id, job_type, status, generation, total_count,
+                discovery_completed, auto_metadata_match
+             ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'PENDING', ?, 0, 0, ?)",
+        )
+        .bind(id)
+        .bind(manifest.library_id)
+        .bind(generation)
+        .bind(database_flag(auto_metadata_match))
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let created_manifest = self
+            .query(
+                "INSERT INTO scan_manifests (id, job_id, library_id, state, root_count)
+                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', ?
+                 FROM scan_jobs sj
+                 WHERE sj.id = ? AND sj.library_id = ?
+                   AND sj.job_type = 'RECONCILE_LIBRARY' AND sj.status = 'PENDING'",
+            )
+            .bind(manifest.id)
+            .bind(root_count)
+            .bind(id)
+            .bind(manifest.library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if created_manifest.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "manifest must reference its new full-scan job".to_owned(),
+            ));
+        }
+        for root in manifest.roots {
+            let created_root = self
+                .query(
+                    "INSERT INTO scan_manifest_roots (
+                         manifest_id, library_root_id, state, directory_count
+                     )
+                     SELECT ?, lr.id, 'PENDING', 1
+                     FROM library_roots lr
+                     WHERE lr.id = ? AND lr.library_id = ?",
+                )
+                .bind(manifest.id)
+                .bind(root.library_root_id)
+                .bind(manifest.library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if created_root.rows_affected() != 1 {
+                return Err(StorageError::Conflict(format!(
+                    "library root {} does not belong to the manifest library",
+                    root.library_root_id
+                )));
+            }
+            self.query(
+                "INSERT INTO scan_manifest_directories (
+                     manifest_id, library_root_id, relative_path, state
+                 ) VALUES (?, ?, '', 'PENDING')",
+            )
+            .bind(manifest.id)
+            .bind(root.library_root_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        self.query(
+            "UPDATE scan_manifests
+             SET discovered_directory_count = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(root_count)
         .bind(manifest.id)
         .execute(&mut *transaction)
         .await
@@ -635,6 +737,586 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn get_scan_manifest_by_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<StoredScanManifest>, StorageError> {
+        self.query(
+            "SELECT id, job_id, library_id, state, root_count,
+                    discovered_directory_count, completed_directory_count,
+                    observed_file_count, add_count, change_count, remove_count,
+                    reappeared_count, applied_delta_count
+             FROM scan_manifests WHERE job_id = ?",
+        )
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredScanManifest {
+                id: row.get("id"),
+                job_id: row.get("job_id"),
+                library_id: row.get("library_id"),
+                state: row.get("state"),
+                root_count: row.get("root_count"),
+                discovered_directory_count: row.get("discovered_directory_count"),
+                completed_directory_count: row.get("completed_directory_count"),
+                observed_file_count: row.get("observed_file_count"),
+                add_count: row.get("add_count"),
+                change_count: row.get("change_count"),
+                remove_count: row.get("remove_count"),
+                reappeared_count: row.get("reappeared_count"),
+                applied_delta_count: row.get("applied_delta_count"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_manifest_directories(
+        &self,
+        manifest_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredScanManifestDirectory>, StorageError> {
+        self.query(
+            "SELECT library_root_id, relative_path
+             FROM scan_manifest_directories
+             WHERE manifest_id = ? AND state = 'PENDING'
+             ORDER BY library_root_id, relative_path
+             LIMIT ?",
+        )
+        .bind(manifest_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredScanManifestDirectory {
+                    library_root_id: row.get("library_root_id"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn commit_scan_manifest_discovery_chunk(
+        &self,
+        chunk: &NewScanManifestDiscoveryChunk<'_>,
+    ) -> Result<i64, StorageError> {
+        if chunk.child_directories.iter().any(|path| {
+            let path = std::path::Path::new(path);
+            path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+        }) || chunk.entries.iter().any(|entry| {
+            let path = std::path::Path::new(&entry.relative_path);
+            !matches!(entry.entry_kind.as_str(), "FILE" | "DIRECTORY")
+                || entry.size < 0
+                || path.is_absolute()
+                || path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::ParentDir
+                            | std::path::Component::RootDir
+                            | std::path::Component::Prefix(_)
+                    )
+                })
+        }) {
+            return Err(StorageError::Conflict(
+                "manifest discovery chunk contains an invalid relative path or observation"
+                    .to_owned(),
+            ));
+        }
+        let mut observed_paths = std::collections::HashSet::with_capacity(chunk.entries.len());
+        if chunk
+            .entries
+            .iter()
+            .any(|entry| !observed_paths.insert(entry.relative_path.as_str()))
+        {
+            return Err(StorageError::Conflict(
+                "manifest discovery chunk contains duplicate observation paths".to_owned(),
+            ));
+        }
+        if chunk.child_directories.is_empty()
+            && chunk.entries.is_empty()
+            && chunk.completed_directory.is_none()
+        {
+            return Ok(0);
+        }
+
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let started = self
+            .query(
+                "UPDATE scan_manifest_roots
+                 SET state = 'SCANNING', started_at = COALESCE(started_at, unixepoch()),
+                     updated_at = unixepoch()
+                 WHERE manifest_id = ? AND library_root_id = ?
+                   AND state IN ('PENDING', 'SCANNING')
+                   AND EXISTS (
+                       SELECT 1 FROM scan_manifests
+                       WHERE id = ? AND state = 'DISCOVERING'
+                   )",
+            )
+            .bind(chunk.manifest_id)
+            .bind(chunk.library_root_id)
+            .bind(chunk.manifest_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if started.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "manifest root is not available for discovery".to_owned(),
+            ));
+        }
+
+        let mut inserted_directory_count = 0_u64;
+        for paths in chunk.child_directories.chunks(SCAN_DML_CHUNK_SIZE) {
+            if paths.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?, ?, ?, 'PENDING')", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO scan_manifest_directories (
+                     manifest_id, library_root_id, relative_path, state
+                 ) VALUES {values}
+                 ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for path in paths {
+                statement = statement
+                    .bind(chunk.manifest_id)
+                    .bind(chunk.library_root_id)
+                    .bind(path);
+            }
+            let result = statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            inserted_directory_count = inserted_directory_count
+                .checked_add(result.rows_affected())
+                .ok_or_else(|| {
+                    StorageError::Conflict("manifest directory count overflow".to_owned())
+                })?;
+        }
+
+        // Eleven binds per observation keep each statement below SQLite's historical 999 cap.
+        for entries in chunk.entries.chunks(80) {
+            if entries.is_empty() {
+                continue;
+            }
+            let selects = std::iter::repeat_n(
+                "SELECT ?, ?, ?,
+                        (SELECT COALESCE(MAX(observation_sequence), 0) + 1
+                         FROM scan_manifest_entries
+                         WHERE manifest_id = ? AND library_root_id = ? AND relative_path = ?),
+                        ?, ?, ?, ?, ?, unixepoch()",
+                entries.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+            let query = format!(
+                "INSERT INTO scan_manifest_entries (
+                     manifest_id, library_root_id, relative_path, observation_sequence,
+                     entry_kind, size, modified_at, inode, fingerprint, observed_at
+                 ) {selects}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for entry in entries {
+                statement = statement
+                    .bind(chunk.manifest_id)
+                    .bind(chunk.library_root_id)
+                    .bind(&entry.relative_path)
+                    .bind(chunk.manifest_id)
+                    .bind(chunk.library_root_id)
+                    .bind(&entry.relative_path)
+                    .bind(&entry.entry_kind)
+                    .bind(entry.size)
+                    .bind(entry.modified_at)
+                    .bind(entry.inode)
+                    .bind(&entry.fingerprint);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let media_files = chunk
+            .entries
+            .iter()
+            .filter(|entry| entry.entry_kind == "FILE")
+            .map(|entry| entry.relative_path.clone())
+            .collect::<Vec<_>>();
+        let inserted_file_count = self
+            .insert_reconciliation_directory_entries(
+                &mut transaction,
+                chunk.job_id,
+                chunk.library_root_id,
+                &[],
+                &media_files,
+            )
+            .await?;
+        self.increment_reconciliation_total_count_in_transaction(
+            &mut transaction,
+            chunk.job_id,
+            inserted_file_count,
+        )
+        .await?;
+
+        let inserted_file_count_i64 = i64::try_from(inserted_file_count)
+            .map_err(|_| StorageError::Conflict("manifest file count overflow".to_owned()))?;
+        let inserted_directory_count_i64 = i64::try_from(inserted_directory_count)
+            .map_err(|_| StorageError::Conflict("manifest directory count overflow".to_owned()))?;
+        self.query(
+            "UPDATE scan_manifest_roots
+             SET directory_count = directory_count + ?,
+                 observed_file_count = observed_file_count + ?, updated_at = unixepoch()
+             WHERE manifest_id = ? AND library_root_id = ?",
+        )
+        .bind(inserted_directory_count_i64)
+        .bind(inserted_file_count_i64)
+        .bind(chunk.manifest_id)
+        .bind(chunk.library_root_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_manifests
+             SET discovered_directory_count = discovered_directory_count + ?,
+                 observed_file_count = observed_file_count + ?,
+                 updated_at = unixepoch()
+             WHERE id = ? AND state = 'DISCOVERING'",
+        )
+        .bind(inserted_directory_count_i64)
+        .bind(inserted_file_count_i64)
+        .bind(chunk.manifest_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let accepting_discovery = self
+            .query(
+                "UPDATE scan_jobs SET updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
+            )
+            .bind(chunk.job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if accepting_discovery.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "scan job is no longer accepting manifest discovery chunks".to_owned(),
+            ));
+        }
+
+        if let Some(completed_directory) = chunk.completed_directory {
+            let completed = self
+                .query(
+                    "UPDATE scan_manifest_directories
+                     SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
+                     WHERE manifest_id = ? AND library_root_id = ?
+                       AND relative_path = ? AND state <> 'COMPLETE'",
+                )
+                .bind(chunk.manifest_id)
+                .bind(chunk.library_root_id)
+                .bind(completed_directory)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if completed.rows_affected() > 0 {
+                self.query(
+                    "UPDATE scan_manifest_roots
+                     SET completed_directory_count = completed_directory_count + 1,
+                         updated_at = unixepoch()
+                     WHERE manifest_id = ? AND library_root_id = ?",
+                )
+                .bind(chunk.manifest_id)
+                .bind(chunk.library_root_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                self.query(
+                    "UPDATE scan_manifests
+                     SET completed_directory_count = completed_directory_count + 1,
+                         updated_at = unixepoch()
+                     WHERE id = ? AND state = 'DISCOVERING'",
+                )
+                .bind(chunk.manifest_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            self.query(
+                "UPDATE scan_manifest_roots
+                 SET state = 'COMPLETE', finished_at = COALESCE(finished_at, unixepoch()),
+                     updated_at = unixepoch()
+                 WHERE manifest_id = ? AND library_root_id = ? AND state = 'SCANNING'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_directories
+                       WHERE manifest_id = ? AND library_root_id = ? AND state = 'PENDING'
+                   )",
+            )
+            .bind(chunk.manifest_id)
+            .bind(chunk.library_root_id)
+            .bind(chunk.manifest_id)
+            .bind(chunk.library_root_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        i64::try_from(inserted_file_count)
+            .map_err(|_| StorageError::Conflict("manifest file count overflow".to_owned()))
+    }
+
+    pub(crate) async fn mark_scan_manifest_root_unavailable(
+        &self,
+        manifest_id: &str,
+        library_root_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE scan_manifest_roots
+             SET state = 'UNAVAILABLE', error = 'filesystem root could not be read',
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE manifest_id = ? AND library_root_id = ?
+               AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+        )
+        .bind(manifest_id)
+        .bind(library_root_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_manifest_directories
+             SET state = 'FAILED', error = 'filesystem root could not be read',
+                 updated_at = unixepoch()
+             WHERE manifest_id = ? AND library_root_id = ? AND state = 'PENDING'",
+        )
+        .bind(manifest_id)
+        .bind(library_root_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn finish_scan_manifest_discovery(
+        &self,
+        manifest_id: &str,
+        job_id: &str,
+    ) -> Result<i64, StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let pending_directories: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_manifest_directories
+                 WHERE manifest_id = ? AND state = 'PENDING'",
+            )
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let pending_roots: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_manifest_roots
+                 WHERE manifest_id = ? AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+            )
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if pending_directories != 0 || pending_roots != 0 {
+            return Err(StorageError::Conflict(
+                "manifest discovery cannot complete while frontier or roots remain unresolved"
+                    .to_owned(),
+            ));
+        }
+        let discovered_file_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM reconciliation_scan_entries
+                 WHERE job_id = ? AND entry_type = 'FILE'",
+            )
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let processed_count: i64 = self
+            .query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
+            .bind(job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let total_count = discovered_file_count.max(processed_count);
+        let job_update = self
+            .query(
+                "UPDATE scan_jobs
+             SET discovery_completed = 1, total_count = ?, updated_at = unixepoch()
+             WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
+            )
+            .bind(total_count)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if job_update.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "scan job is no longer accepting manifest discovery completion".to_owned(),
+            ));
+        }
+        let manifest_update = self
+            .query(
+                "UPDATE scan_manifests
+             SET state = 'READY_TO_DIFF', updated_at = unixepoch()
+             WHERE id = ? AND state = 'DISCOVERING'",
+            )
+            .bind(manifest_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if manifest_update.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "manifest is no longer accepting discovery completion".to_owned(),
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(total_count)
+    }
+
+    pub(crate) async fn finish_scan_manifest(
+        &self,
+        job_id: &str,
+        next_state: &str,
+    ) -> Result<(), StorageError> {
+        if !matches!(next_state, "FAILED" | "CANCELLED") {
+            return Err(StorageError::Conflict(
+                "invalid manifest terminal state".to_owned(),
+            ));
+        }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE scan_manifests
+             SET state = ?, updated_at = unixepoch()
+             WHERE job_id = ? AND state IN (
+                 'DISCOVERING', 'READY_TO_DIFF', 'APPLYING', 'POSTPROCESSING'
+             )",
+        )
+        .bind(next_state)
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_manifest_roots
+             SET state = 'INCOMPLETE', error = 'scan did not complete this root',
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+               AND state IN ('PENDING', 'SCANNING')",
+        )
+        .bind(job_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     #[allow(dead_code)] // Lifecycle owners use this compare-and-swap in LUX-266 onward.
@@ -1280,62 +1962,6 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
-    }
-
-    pub(crate) async fn create_reconciliation_scan_job(
-        &self,
-        id: &str,
-        library_id: &str,
-        generation: &str,
-        library_root_ids: &[String],
-        auto_metadata_match: bool,
-    ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        self.query(
-            "INSERT INTO scan_jobs (
-                id, library_id, job_type, status, generation, total_count,
-                discovery_completed, auto_metadata_match
-             ) VALUES (?, ?, 'RECONCILE_LIBRARY', 'PENDING', ?, 0, 0, ?)",
-        )
-        .bind(id)
-        .bind(library_id)
-        .bind(generation)
-        .bind(database_flag(auto_metadata_match))
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        for root_id in library_root_ids {
-            self.query(
-                "INSERT INTO reconciliation_scan_entries (
-                    job_id, library_root_id, relative_path, entry_type
-                 ) VALUES (?, ?, '', 'DIRECTORY')",
-            )
-            .bind(id)
-            .bind(root_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-        transaction
-            .commit()
-            .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
@@ -5678,8 +6304,8 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use super::{
-        Database, NewScanManifest, NewScanManifestDelta, NewScanManifestRoot,
-        prune_sidecar_directories, sidecar_target_query,
+        Database, NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk,
+        NewScanManifestEntry, NewScanManifestRoot, prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
 
@@ -5733,20 +6359,15 @@ mod tests {
         let mut roots = vec![
             NewScanManifestRoot {
                 library_root_id: "root-available",
-                is_available: true,
             },
             NewScanManifestRoot {
                 library_root_id: "root-unavailable",
-                is_available: false,
             },
         ];
         roots.extend(
             bulk_root_ids
                 .iter()
-                .map(|library_root_id| NewScanManifestRoot {
-                    library_root_id,
-                    is_available: true,
-                }),
+                .map(|library_root_id| NewScanManifestRoot { library_root_id }),
         );
         let manifest = NewScanManifest {
             id: "manifest",
@@ -5766,7 +6387,7 @@ mod tests {
         assert_eq!(stored.library_id, "lib");
         assert_eq!(stored.state, "DISCOVERING");
         assert_eq!(stored.root_count, 252);
-        assert_eq!(stored.discovered_directory_count, 251);
+        assert_eq!(stored.discovered_directory_count, 252);
         assert_eq!(stored.completed_directory_count, 0);
         assert_eq!(stored.observed_file_count, 0);
         assert_eq!(stored.remove_count, 0);
@@ -5785,7 +6406,7 @@ mod tests {
             root_states,
             vec![
                 ("root-available".to_owned(), "PENDING".to_owned()),
-                ("root-unavailable".to_owned(), "UNAVAILABLE".to_owned()),
+                ("root-unavailable".to_owned(), "PENDING".to_owned()),
             ]
         );
         let initial_frontiers: i64 = database
@@ -5795,7 +6416,7 @@ mod tests {
             )
             .fetch_one(database.pool())
             .await?;
-        assert_eq!(initial_frontiers, 251);
+        assert_eq!(initial_frontiers, 252);
 
         assert!(
             database
@@ -5887,6 +6508,169 @@ mod tests {
                 .await
                 .is_err()
         );
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manifest_discovery_chunk_does_not_complete_directory_after_cancel_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        let roots = [NewScanManifestRoot {
+            library_root_id: "root",
+        }];
+        let manifest = NewScanManifest {
+            id: "manifest",
+            job_id: "job",
+            library_id: "lib",
+            roots: &roots,
+        };
+        database
+            .create_full_scan_manifest_job("job", "generation", false, &manifest)
+            .await?;
+        assert!(database.claim_scan_job("job").await?);
+        database
+            .query("UPDATE scan_jobs SET cancel_requested = 1 WHERE id = 'job'")
+            .execute(database.pool())
+            .await?;
+        let entries = [NewScanManifestEntry {
+            relative_path: String::new(),
+            entry_kind: "DIRECTORY".to_owned(),
+            size: 0,
+            modified_at: 0,
+            inode: None,
+            fingerprint: Vec::new(),
+        }];
+        let chunk = NewScanManifestDiscoveryChunk {
+            manifest_id: "manifest",
+            job_id: "job",
+            library_root_id: "root",
+            child_directories: &[],
+            entries: &entries,
+            completed_directory: Some(""),
+        };
+
+        assert!(
+            database
+                .commit_scan_manifest_discovery_chunk(&chunk)
+                .await
+                .is_err()
+        );
+        let directory_state: String = database
+            .query_scalar(
+                "SELECT state FROM scan_manifest_directories
+                 WHERE manifest_id = 'manifest' AND relative_path = ''",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(directory_state, "PENDING");
+        let root_state: String = database
+            .query_scalar(
+                "SELECT state FROM scan_manifest_roots
+                 WHERE manifest_id = 'manifest' AND library_root_id = 'root'",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(root_state, "PENDING");
+        let observations: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_manifest_entries")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(observations, 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manifest_discovery_finalize_does_not_ignore_cancel_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/root', '/root', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        let roots = [NewScanManifestRoot {
+            library_root_id: "root",
+        }];
+        let manifest = NewScanManifest {
+            id: "manifest",
+            job_id: "job",
+            library_id: "lib",
+            roots: &roots,
+        };
+        database
+            .create_full_scan_manifest_job("job", "generation", false, &manifest)
+            .await?;
+        assert!(database.claim_scan_job("job").await?);
+        let entries = [NewScanManifestEntry {
+            relative_path: String::new(),
+            entry_kind: "DIRECTORY".to_owned(),
+            size: 0,
+            modified_at: 0,
+            inode: None,
+            fingerprint: Vec::new(),
+        }];
+        let chunk = NewScanManifestDiscoveryChunk {
+            manifest_id: "manifest",
+            job_id: "job",
+            library_root_id: "root",
+            child_directories: &[],
+            entries: &entries,
+            completed_directory: Some(""),
+        };
+        database
+            .commit_scan_manifest_discovery_chunk(&chunk)
+            .await?;
+        database
+            .query("UPDATE scan_jobs SET cancel_requested = 1 WHERE id = 'job'")
+            .execute(database.pool())
+            .await?;
+
+        assert!(
+            database
+                .finish_scan_manifest_discovery("manifest", "job")
+                .await
+                .is_err()
+        );
+        let job_state: (i64, String) = database
+            .query_as(
+                "SELECT discovery_completed,
+                        (SELECT state FROM scan_manifests WHERE id = 'manifest')
+                 FROM scan_jobs WHERE id = 'job'",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(job_state, (0, "DISCOVERING".to_owned()));
         database.close().await;
         Ok(())
     }
