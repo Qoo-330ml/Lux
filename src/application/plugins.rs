@@ -1,9 +1,13 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt, io,
     net::IpAddr,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
@@ -18,6 +22,7 @@ use uuid::Uuid;
 use crate::network::is_public_address;
 use crate::{
     application::provider_cache::ProviderResponseCache,
+    application::settings::login_background_plugin_id,
     application::{
         plugin_protocol::{
             CHAPTER_DETECT_CAPABILITY, CHAPTER_DETECT_METHOD,
@@ -27,12 +32,14 @@ use crate::{
             ChapterLookupRpcRequest, ChapterLookupRpcResult, DANMAKU_MATCH_CAPABILITY,
             DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult,
             DanmakuMatchStatus, EMBY_MIGRATION_CAPABILITY, IP_LOCATION_CAPABILITY,
-            IpLocationRpcRequest, IpLocationRpcResult, MEDIA_PROBE_CAPABILITY, MediaProbeRpcResult,
-            MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY, NOTIFICATION_SEND_METHOD,
-            NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_MIGRATION,
-            PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_CATEGORY_SCRAPER,
-            PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION,
-            PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
+            IpLocationRpcRequest, IpLocationRpcResult, LOGIN_BACKGROUND_GET_CAPABILITY,
+            LOGIN_BACKGROUND_GET_METHOD, LoginBackgroundRpcResult, MEDIA_PROBE_CAPABILITY,
+            MediaProbeRpcResult, MediaProbeRpcStreamType, NOTIFICATION_SEND_CAPABILITY,
+            NOTIFICATION_SEND_METHOD, NotificationSendRpcResult, PLUGIN_CATEGORY_MEDIA,
+            PLUGIN_CATEGORY_MIGRATION, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
+            PLUGIN_CATEGORY_SCRAPER, PLUGIN_CATEGORY_UTILITY, PLUGIN_TYPE_CHAPTER_DETECTOR,
+            PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_DATA_MIGRATION, PLUGIN_TYPE_IP_LOCATION,
+            PLUGIN_TYPE_LOGIN_BACKGROUND, PLUGIN_TYPE_NOTIFICATION, PLUGIN_TYPE_STRM_RESOLVER,
             PluginConfigField, PluginConfigOption, STRM_RESOLVE_CAPABILITY, STRM_RESOLVE_METHOD,
             StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
         },
@@ -51,6 +58,7 @@ use crate::{
     domain::ids::LibraryId,
     storage::{Database, StorageError},
 };
+use tokio::sync::Notify;
 
 pub const MEDIA_INFO_PLUGIN_ID: &str = "org.lux.strm-media-info";
 pub const CHAPTER_DETECTOR_PLUGIN_ID: &str = "org.lux.intro-outro-detector";
@@ -71,6 +79,11 @@ const MAX_MEDIA_PROBE_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 30;
 pub const MIN_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 1;
 pub const MAX_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 99;
+const LOGIN_BACKGROUND_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const LOGIN_BACKGROUND_REFRESH_AFTER: i64 = 24 * 60 * 60;
+const LOGIN_BACKGROUND_CACHE_MAX_AGE: i64 = 48 * 60 * 60;
+const LOGIN_BACKGROUND_RETRY_BASE: i64 = 60;
+const LOGIN_BACKGROUND_RETRY_MAX: i64 = 6 * 60 * 60;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaInfoSettings {
@@ -109,6 +122,14 @@ pub struct MediaProbeOutput {
     pub media: MediaProbeResult,
     pub thumbnail_jpeg: Option<Vec<u8>>,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct LoginBackgroundRefreshFailure {
+    attempts: u8,
+    retry_at: i64,
+    code: &'static str,
+}
+
 #[derive(Clone)]
 pub struct PluginService {
     database: Database,
@@ -118,6 +139,9 @@ pub struct PluginService {
     supervisor: PluginSupervisor,
     store: Option<PluginStore>,
     provider_cache: ProviderResponseCache,
+    login_background_refresh_notify: Arc<Notify>,
+    login_background_refresh_worker_started: Arc<AtomicBool>,
+    login_background_refresh_failures: Arc<Mutex<HashMap<String, LoginBackgroundRefreshFailure>>>,
 }
 
 impl PluginService {
@@ -137,7 +161,7 @@ impl PluginService {
             .with_config_dir(config_dir.clone())
             .with_network_proxy_url(proxy_url.clone());
         let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
-        Self {
+        let service = Self {
             database,
             config_dir: config_dir.clone(),
             catalog,
@@ -147,11 +171,231 @@ impl PluginService {
             provider_cache: ProviderResponseCache::new(Some(
                 config_dir.join("metadata/provider-responses.json"),
             )),
-        }
+            login_background_refresh_notify: Arc::new(Notify::new()),
+            login_background_refresh_worker_started: Arc::new(AtomicBool::new(false)),
+            login_background_refresh_failures: Arc::new(Mutex::new(HashMap::new())),
+        };
+        service.start_login_background_refresh_worker();
+        service
     }
 
     pub(crate) fn provider_cache(&self) -> ProviderResponseCache {
         self.provider_cache.clone()
+    }
+
+    fn start_login_background_refresh_worker(&self) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self
+            .login_background_refresh_worker_started
+            .swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let service = self.clone();
+        runtime.spawn(async move {
+            let mut interval = tokio::time::interval(LOGIN_BACKGROUND_REFRESH_INTERVAL);
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => service.refresh_selected_login_background(false).await,
+                    _ = service.login_background_refresh_notify.notified() => {
+                        service.refresh_selected_login_background(true).await;
+                    }
+                }
+            }
+        });
+    }
+
+    pub(crate) fn request_login_background_refresh(&self) {
+        self.login_background_refresh_notify.notify_one();
+    }
+
+    pub async fn validate_login_background_provider(
+        &self,
+        plugin_id: &str,
+    ) -> Result<(), PluginServiceError> {
+        self.login_background_plugin(plugin_id)
+            .await
+            .map(|_| ())
+            .map_err(|_| PluginServiceError::Unavailable(plugin_id.to_owned()))
+    }
+
+    pub async fn cached_login_background_result(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<LoginBackgroundRpcResult>, PluginServiceError> {
+        let selected_source = self
+            .database
+            .login_background_source()
+            .await?
+            .unwrap_or_default();
+        if login_background_plugin_id(&selected_source) != Some(plugin_id) {
+            return Ok(None);
+        }
+        let plugin = match self.login_background_plugin(plugin_id).await {
+            Ok(plugin) => plugin,
+            Err(_) => return Ok(None),
+        };
+        let Some((payload_json, refreshed_at)) = self
+            .database
+            .login_background_plugin_cache(plugin_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let now = current_epoch_seconds();
+        if refreshed_at > now || now.saturating_sub(refreshed_at) > LOGIN_BACKGROUND_CACHE_MAX_AGE {
+            return Ok(None);
+        }
+        let value = match serde_json::from_str(&payload_json) {
+            Ok(value) => value,
+            Err(_) => return Ok(None),
+        };
+        let result = match LoginBackgroundRpcResult::validate(value, &plugin.manifest) {
+            Ok(result) if !result.items.is_empty() => result,
+            _ => return Ok(None),
+        };
+        Ok(Some(result))
+    }
+
+    pub async fn login_background_source_status(&self, source: &str) -> String {
+        let Some(plugin_id) = login_background_plugin_id(source) else {
+            return "READY".to_owned();
+        };
+        if let Err(code) = self.login_background_plugin(plugin_id).await {
+            return code.to_owned();
+        }
+        let has_valid_cache = self
+            .cached_login_background_result(plugin_id)
+            .await
+            .is_ok_and(|result| result.is_some());
+        let failures = self.login_background_refresh_failures.lock().await;
+        if let Some(failure) = failures.get(plugin_id) {
+            return if has_valid_cache {
+                "REFRESH_FAILED_USING_CACHE".to_owned()
+            } else {
+                failure.code.to_owned()
+            };
+        }
+        if has_valid_cache {
+            "READY".to_owned()
+        } else {
+            "REFRESHING".to_owned()
+        }
+    }
+
+    async fn login_background_plugin(
+        &self,
+        plugin_id: &str,
+    ) -> Result<DiscoveredPlugin, &'static str> {
+        let catalog = self.catalog_snapshot().await;
+        let Some(plugin) = catalog.get(plugin_id) else {
+            return Err("PLUGIN_UNAVAILABLE");
+        };
+        if !is_login_background_plugin(plugin) {
+            return Err("PLUGIN_UNAVAILABLE");
+        }
+        let (installed, enabled) = self
+            .plugin_state(plugin_id)
+            .await
+            .map_err(|_| "PLUGIN_UNAVAILABLE")?;
+        if !installed {
+            return Err("PLUGIN_NOT_INSTALLED");
+        }
+        if !enabled {
+            return Err("PLUGIN_DISABLED");
+        }
+        let view = self
+            .dynamic_view(plugin, installed, enabled)
+            .await
+            .map_err(|_| "PLUGIN_UNAVAILABLE")?;
+        if !view.available {
+            return Err("PLUGIN_UNAVAILABLE");
+        }
+        Ok(plugin.clone())
+    }
+
+    async fn refresh_selected_login_background(&self, force: bool) {
+        let source = match self.database.login_background_source().await {
+            Ok(Some(source)) => source,
+            Ok(None) | Err(_) => return,
+        };
+        let Some(plugin_id) = login_background_plugin_id(&source) else {
+            return;
+        };
+        let now = current_epoch_seconds();
+        if !force {
+            let failures = self.login_background_refresh_failures.lock().await;
+            if failures
+                .get(plugin_id)
+                .is_some_and(|failure| failure.retry_at > now)
+            {
+                return;
+            }
+            drop(failures);
+            if let Ok(Some((_, refreshed_at))) =
+                self.database.login_background_plugin_cache(plugin_id).await
+                && refreshed_at <= now
+                && now.saturating_sub(refreshed_at) < LOGIN_BACKGROUND_REFRESH_AFTER
+            {
+                return;
+            }
+        }
+
+        let failure_code = self
+            .refresh_login_background_plugin(plugin_id, now)
+            .await
+            .err();
+        let mut failures = self.login_background_refresh_failures.lock().await;
+        if let Some(code) = failure_code {
+            let failure =
+                failures
+                    .entry(plugin_id.to_owned())
+                    .or_insert(LoginBackgroundRefreshFailure {
+                        attempts: 0,
+                        retry_at: now,
+                        code,
+                    });
+            failure.attempts = failure.attempts.saturating_add(1).min(16);
+            failure.code = code;
+            let multiplier = 1_i64 << failure.attempts.saturating_sub(1).min(9);
+            let delay = LOGIN_BACKGROUND_RETRY_BASE
+                .saturating_mul(multiplier)
+                .min(LOGIN_BACKGROUND_RETRY_MAX);
+            failure.retry_at = now.saturating_add(delay);
+            tracing::warn!(
+                plugin_id,
+                error_code = code,
+                "login background plugin refresh failed"
+            );
+        } else {
+            failures.remove(plugin_id);
+        }
+    }
+
+    async fn refresh_login_background_plugin(
+        &self,
+        plugin_id: &str,
+        refreshed_at: i64,
+    ) -> Result<(), &'static str> {
+        let plugin = self.login_background_plugin(plugin_id).await?;
+        let value = self
+            .supervisor
+            .call_isolated(plugin_id, LOGIN_BACKGROUND_GET_METHOD, json!({}))
+            .await
+            .map_err(|_| "PLUGIN_EXECUTION_FAILED")?;
+        let result = LoginBackgroundRpcResult::validate(value, &plugin.manifest)
+            .map_err(|_| "INVALID_PLUGIN_RESPONSE")?;
+        if result.items.is_empty() {
+            return Err("EMPTY_PLUGIN_RESPONSE");
+        }
+        let payload_json = serde_json::to_string(&result).map_err(|_| "INVALID_PLUGIN_RESPONSE")?;
+        self.database
+            .upsert_login_background_plugin_cache(plugin_id, &payload_json, refreshed_at)
+            .await
+            .map_err(|_| "CACHE_WRITE_FAILED")
     }
 
     pub async fn list(&self, offset: i64, limit: i64) -> Result<PluginPage, PluginServiceError> {
@@ -280,6 +524,12 @@ impl PluginService {
         }
         self.database.install_plugin(&plugin_id).await?;
         let current_catalog = self.catalog_snapshot().await;
+        if current_catalog
+            .get(&plugin_id)
+            .is_some_and(is_login_background_plugin)
+        {
+            self.request_login_background_refresh();
+        }
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
         } else if current_catalog
@@ -435,6 +685,11 @@ impl PluginService {
             .await?;
         if !enabled {
             self.supervisor.stop(&plugin_id).await;
+        } else if catalog
+            .get(&plugin_id)
+            .is_some_and(is_login_background_plugin)
+        {
+            self.request_login_background_refresh();
         }
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
@@ -951,6 +1206,9 @@ impl PluginService {
             chapter_detector_settings_from_values(&plugin_id, &fields, &values)?;
         }
         self.write_plugin_config(&plugin_id, &values).await?;
+        if is_login_background_plugin(plugin) {
+            self.request_login_background_refresh();
+        }
         if plugin_id == MEDIA_INFO_PLUGIN_ID {
             self.sync_media_info_scheduled_task().await?;
         } else if is_chapter_detector_plugin(plugin) {
@@ -2727,6 +2985,21 @@ fn is_ip_location_plugin(plugin: &DiscoveredPlugin) -> bool {
             .capabilities
             .iter()
             .any(|capability| capability == IP_LOCATION_CAPABILITY)
+}
+
+fn is_login_background_plugin(plugin: &DiscoveredPlugin) -> bool {
+    plugin.manifest.plugin_type == PLUGIN_TYPE_LOGIN_BACKGROUND
+        && plugin.manifest.category == PLUGIN_CATEGORY_UTILITY
+        && plugin.manifest.capabilities.as_slice() == [LOGIN_BACKGROUND_GET_CAPABILITY]
+        && !plugin.manifest.permissions.image_hosts.is_empty()
+}
+
+fn current_epoch_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
+        .unwrap_or(0)
 }
 
 fn is_strm_resolver_plugin(plugin: &DiscoveredPlugin) -> bool {

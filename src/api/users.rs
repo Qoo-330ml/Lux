@@ -4,7 +4,7 @@ use crate::auth::device_pairings::{DevicePairingError, PrismDeviceInfo};
 use crate::{
     application::settings::{
         DEFAULT_LOGIN_BACKGROUND_SOURCE, RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE,
-        is_valid_login_background_source,
+        is_valid_login_background_source, login_background_plugin_id,
     },
     auth::sessions::AuthenticatedSession,
     security::{
@@ -28,6 +28,28 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
         Ok(_) => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if let Some(plugin_id) = login_background_plugin_id(&source) {
+        let Some(plugins) = state.plugins.as_ref() else {
+            return Json(json!({ "source": DEFAULT_LOGIN_BACKGROUND_SOURCE, "images": [] }))
+                .into_response();
+        };
+        let result = match plugins.cached_login_background_result(plugin_id).await {
+            Ok(Some(result)) => result,
+            Ok(None) | Err(_) => {
+                return Json(json!({ "source": DEFAULT_LOGIN_BACKGROUND_SOURCE, "images": [] }))
+                    .into_response();
+            }
+        };
+        let mut result = match serde_json::to_value(result) {
+            Ok(Value::Object(result)) => result,
+            _ => {
+                return Json(json!({ "source": DEFAULT_LOGIN_BACKGROUND_SOURCE, "images": [] }))
+                    .into_response();
+            }
+        };
+        result.insert("source".to_owned(), Value::String(source));
+        return Json(Value::Object(result)).into_response();
+    }
     if source != RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE {
         return Json(json!({ "source": source, "images": [] })).into_response();
     }

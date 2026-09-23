@@ -1,7 +1,7 @@
 use super::*;
 use crate::application::scanner::BACKGROUND_SCAN_BATCH_SIZE;
 use crate::application::settings::{
-    DEFAULT_LOGIN_BACKGROUND_SOURCE, is_valid_login_background_source,
+    DEFAULT_LOGIN_BACKGROUND_SOURCE, is_valid_login_background_source, login_background_plugin_id,
 };
 
 #[derive(Deserialize)]
@@ -250,6 +250,15 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Ok(_) => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let login_background_source_status = if let Some(plugins) = state.plugins.as_ref() {
+        plugins
+            .login_background_source_status(&login_background_source)
+            .await
+    } else if login_background_plugin_id(&login_background_source).is_some() {
+        "PLUGIN_UNAVAILABLE".to_owned()
+    } else {
+        "READY".to_owned()
+    };
     let server_name = match database.server_name().await {
         Ok(Some(name)) if !name.trim().is_empty() => name,
         Ok(_) => DEFAULT_SERVER_NAME.to_owned(),
@@ -262,6 +271,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "resumeMinTicks": minimum_ticks,
         "forceAdminLibraryOrder": force_admin_library_order,
         "loginBackgroundSource": login_background_source,
+        "loginBackgroundSourceStatus": login_background_source_status,
         "mediaStrategy": media_strategy,
         "networkProxy": network_proxy,
     }))
@@ -753,6 +763,7 @@ pub(crate) async fn admin_update_settings(
     let force_admin_library_order = request
         .force_admin_library_order
         .unwrap_or(current_force_admin_library_order);
+    let login_background_source_was_requested = request.login_background_source.is_some();
     let login_background_source = match request.login_background_source {
         Some(source) if is_valid_login_background_source(&source) => source,
         Some(_) => {
@@ -764,8 +775,32 @@ pub(crate) async fn admin_update_settings(
             )
             .into_response();
         }
-        None => current_login_background_source,
+        None => current_login_background_source.clone(),
     };
+    let login_background_source_changed =
+        login_background_source != current_login_background_source;
+    if login_background_source_was_requested
+        && login_background_source_changed
+        && let Some(plugin_id) = login_background_plugin_id(&login_background_source)
+    {
+        let provider_available = if let Some(plugins) = state.plugins.as_ref() {
+            plugins
+                .validate_login_background_provider(plugin_id)
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        if !provider_available {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "登录页背景插件不可用",
+            )
+            .into_response();
+        }
+    }
     let media_strategy = request.media_strategy.unwrap_or(current_media_strategy);
     let server_name = match request.server_name {
         Some(name) => match normalize_server_name(&name) {
@@ -854,12 +889,27 @@ pub(crate) async fn admin_update_settings(
         .await
     {
         Ok(()) => {
+            if login_background_source_changed
+                && login_background_plugin_id(&login_background_source).is_some()
+                && let Some(plugins) = state.plugins.as_ref()
+            {
+                plugins.request_login_background_refresh();
+            }
             if database.set_server_name(&server_name).await.is_err() {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
+            let login_background_source_status = if let Some(plugins) = state.plugins.as_ref() {
+                plugins
+                    .login_background_source_status(&login_background_source)
+                    .await
+            } else if login_background_plugin_id(&login_background_source).is_some() {
+                "PLUGIN_UNAVAILABLE".to_owned()
+            } else {
+                "READY".to_owned()
+            };
             record_audit_event(
                 &state,
                 &headers,
@@ -875,6 +925,7 @@ pub(crate) async fn admin_update_settings(
                 "resumeMinTicks": minimum_ticks,
                 "forceAdminLibraryOrder": force_admin_library_order,
                 "loginBackgroundSource": login_background_source,
+                "loginBackgroundSourceStatus": login_background_source_status,
                 "mediaStrategy": media_strategy,
                 "networkProxy": network_proxy_settings(&state).await,
             }))

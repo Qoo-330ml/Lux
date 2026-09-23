@@ -5,12 +5,26 @@ use tokio::fs;
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
 pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";
 pub const RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE: &str = "RECENTLY_ADDED";
+pub const LOGIN_BACKGROUND_PLUGIN_SOURCE_PREFIX: &str = "PLUGIN:";
 
 pub fn is_valid_login_background_source(value: &str) -> bool {
     matches!(
         value,
         DEFAULT_LOGIN_BACKGROUND_SOURCE | RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE
-    )
+    ) || login_background_plugin_id(value).is_some()
+}
+
+pub fn login_background_plugin_id(source: &str) -> Option<&str> {
+    let plugin_id = source.strip_prefix(LOGIN_BACKGROUND_PLUGIN_SOURCE_PREFIX)?;
+    if plugin_id.is_empty()
+        || plugin_id.len() > 128
+        || !plugin_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+    {
+        return None;
+    }
+    Some(plugin_id)
 }
 
 pub fn read_network_proxy_url(config_dir: &Path) -> Option<String> {
