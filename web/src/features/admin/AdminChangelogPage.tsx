@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.15",
+    date: "2026-09-23",
+    sections: [
+      { kind: "fixed", items: [
+        "修复 Emby 单条媒体详情缺少媒体源、播放时长、容器、文件大小和码率的问题；即使请求只包含有限的 Fields，详情仍提供这些播放信息，目录列表继续遵循字段筛选。",
+        "修复 Emby 播放进度更新后首页没有及时刷新的问题；收到进度回调后会合并发送首页失效事件，让播放状态和进度及时同步。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.14",
     date: "2026-09-23",
     sections: [
@@ -24,9 +34,6 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "changed", items: [
         "调整登录页海报墙的位置并将倾斜角度设为 9°，扩大海报覆盖区域。",
         "登录表单改用 Lux 白色强调色，并移除页脚提示文案，使登录界面更简洁统一。",
-      ] },
-      { kind: "fixed", items: [
-        "修复 Emby 单条媒体详情缺少媒体源、播放时长、容器、文件大小和码率的问题；即使请求只包含有限的 Fields，详情仍提供这些播放信息，目录列表继续遵循字段筛选。",
       ] },
     ],
   },
