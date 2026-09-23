@@ -1,5 +1,5 @@
 use luxd::{
-    application::{libraries::LibraryService, setup::SetupService},
+    application::{libraries::LibraryService, scanner::ScanJobService, setup::SetupService},
     config::Config,
     library::LibraryKind,
     storage::Database,
@@ -17,11 +17,21 @@ async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dy
     let admin = SetupService::new(database.clone())?
         .complete("Admin", "Admin", "correct password")
         .await?;
-    let library = LibraryService::new(database.clone())
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
     let library_id = library.id.to_string();
     let admin_id = admin.id.to_string();
+    let legacy_root_path = temp_dir.path().join("legacy-root");
+    tokio::fs::create_dir_all(&legacy_root_path).await?;
+    let legacy_root = libraries
+        .add_root(
+            library.id,
+            legacy_root_path.to_str().ok_or("non-UTF-8 root path")?,
+        )
+        .await?
+        .root;
 
     sqlx::query(
         "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
@@ -29,6 +39,21 @@ async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dy
                 ('shutdown-scan-postprocessing', ?, 'RECONCILE_LIBRARY', 'COMPLETED', 'generation-2', 'POSTPROCESSING')",
     )
     .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+             job_id, library_root_id, relative_path, entry_type
+         ) VALUES ('shutdown-scan-pending', ?, 'legacy.mkv', 'FILE')",
+    )
+    .bind(legacy_root.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifests (id, job_id, library_id, state)
+         VALUES ('shutdown-manifest', 'shutdown-scan-postprocessing', ?, 'POSTPROCESSING')",
+    )
     .bind(&library_id)
     .execute(database.pool())
     .await?;
@@ -104,9 +129,78 @@ async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dy
     .fetch_all(database.pool())
     .await?;
     assert_eq!(statuses.len(), 9);
-    assert!(statuses.iter().all(
-        |(status, error)| status == "CANCELLED" && error.as_deref() == Some("SERVER_SHUTDOWN")
-    ));
+    assert!(statuses.iter().all(|(status, _)| status == "CANCELLED"));
+    assert_eq!(
+        statuses
+            .iter()
+            .filter(|(_, error)| error.as_deref() == Some("SERVER_SHUTDOWN"))
+            .count(),
+        8
+    );
+    let legacy_scan_status: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error FROM scan_jobs WHERE id = 'shutdown-scan-pending'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        legacy_scan_status,
+        (
+            "CANCELLED".to_owned(),
+            Some("LEGACY_SCAN_REQUIRES_NEW_MANIFEST".to_owned())
+        )
+    );
+    let legacy_scan_event: (String, String) = sqlx::query_as(
+        "SELECT event_code, message FROM scan_job_events
+         WHERE job_id = 'shutdown-scan-pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(legacy_scan_event.0, "LEGACY_SCAN_REQUIRES_NEW_MANIFEST");
+    assert!(legacy_scan_event.1.contains("重试"));
+    let preserved_legacy_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = 'shutdown-scan-pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preserved_legacy_entries, 1);
+
+    database.run_database_lifecycle_cleanup().await?;
+    let retained_for_retry: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = 'shutdown-scan-pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(retained_for_retry, 1);
+    let jobs = ScanJobService::new(database.clone());
+    let postprocessing_retry = jobs.retry("shutdown-scan-postprocessing").await?;
+    assert_eq!(postprocessing_retry.id, "shutdown-scan-postprocessing");
+    jobs.run_to_completion(&postprocessing_retry.id, 100, None)
+        .await?;
+    let completed_manifest_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifests WHERE job_id = 'shutdown-scan-postprocessing'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(completed_manifest_state, "COMPLETED");
+
+    let retry = jobs.retry("shutdown-scan-pending").await?;
+    assert_ne!(retry.id, "shutdown-scan-pending");
+    let replacement_manifest_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifests WHERE job_id = ? AND state = 'DISCOVERING'",
+    )
+    .bind(&retry.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(replacement_manifest_count, 1);
+    let copied_legacy_entries: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = 'shutdown-scan-pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(copied_legacy_entries, 0);
+    jobs.run_to_completion(&retry.id, 100, None).await?;
 
     let active_count: i64 = sqlx::query_scalar(
         "SELECT SUM(count) FROM (

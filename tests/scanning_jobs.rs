@@ -186,7 +186,7 @@ async fn full_scan_manifest_persists_discovery_and_reobservations_without_direct
     .await?;
     assert_eq!(
         final_manifest_state,
-        ("POSTPROCESSING".to_owned(), "COMPLETE".to_owned(), 2, 2)
+        ("COMPLETED".to_owned(), "COMPLETE".to_owned(), 2, 2)
     );
     let manifest_file_work: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reconciliation_scan_entries
@@ -450,18 +450,17 @@ async fn manifest_confirms_missing_file_when_its_parent_directory_is_gone()
             .bind(relative_path)
             .fetch_one(database.pool())
             .await?;
-    let delta_state: String = sqlx::query_scalar(
-        "SELECT state FROM scan_manifest_deltas
-         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
-           AND relative_path = ?",
+    let manifest_summary: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, remove_count,
+                (SELECT COUNT(*) FROM scan_manifest_deltas WHERE manifest_id = scan_manifests.id)
+         FROM scan_manifests WHERE job_id = ?",
     )
     .bind(&reconciliation.id)
-    .bind(relative_path)
     .fetch_one(database.pool())
     .await?;
 
     assert_eq!(missing, 1);
-    assert_eq!(delta_state, "APPLIED");
+    assert_eq!(manifest_summary, ("COMPLETED".to_owned(), 1, 0));
     Ok(())
 }
 
@@ -689,7 +688,7 @@ async fn manifest_cancellation_preserves_committed_frontier_and_observations()
 }
 
 #[tokio::test]
-async fn failed_manifest_discovery_retry_uses_a_fresh_incomplete_safe_snapshot()
+async fn failed_manifest_discovery_retries_its_pending_frontier_safely()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -732,8 +731,16 @@ async fn failed_manifest_discovery_retry_uses_a_fresh_incomplete_safe_snapshot()
         ("FAILED".to_owned(), "INCOMPLETE".to_owned(), 0)
     );
 
+    sqlx::query(
+        "UPDATE scan_manifest_directories SET relative_path = ''
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&failed.id)
+    .execute(database.pool())
+    .await?;
+
     let retried = jobs.retry(&failed.id).await?;
-    assert_ne!(retried.id, failed.id);
+    assert_eq!(retried.id, failed.id);
     let manifests: Vec<(String, String)> = sqlx::query_as(
         "SELECT job_id, state FROM scan_manifests
          WHERE library_id = ? ORDER BY created_at, id",
@@ -741,17 +748,18 @@ async fn failed_manifest_discovery_retry_uses_a_fresh_incomplete_safe_snapshot()
     .bind(library.id.to_string())
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(manifests.len(), 2);
-    assert!(
-        manifests
-            .iter()
-            .any(|(job_id, state)| { job_id == &failed.id && state == "FAILED" })
+    assert_eq!(
+        manifests,
+        vec![(failed.id.clone(), "DISCOVERING".to_owned())]
     );
-    assert!(
-        manifests
-            .iter()
-            .any(|(job_id, state)| { job_id == &retried.id && state == "DISCOVERING" })
-    );
+    let resumed_root_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&failed.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(resumed_root_state, "SCANNING");
     let pending_frontiers: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scan_manifest_directories
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
@@ -761,6 +769,154 @@ async fn failed_manifest_discovery_retry_uses_a_fresh_incomplete_safe_snapshot()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(pending_frontiers, 1);
+    jobs.run_to_completion(&failed.id, 1, None).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let child = root.join("Nested");
+    tokio::fs::create_dir_all(&child).await?;
+    tokio::fs::write(root.join("Root.Movie.2024.mkv"), b"root").await?;
+    tokio::fs::write(child.join("Nested.Movie.2025.mkv"), b"nested").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 root path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    assert_eq!(jobs.run_batch(&job.id, 1).await?.status, "RUNNING");
+    let before_restart: (String, i64, i64, String) = sqlx::query_as(
+        "SELECT manifest.state, manifest.observed_file_count,
+                (SELECT COUNT(*) FROM scan_manifest_directories directory
+                 WHERE directory.manifest_id = manifest.id AND directory.state = 'PENDING'),
+                root.state
+         FROM scan_manifests manifest
+         JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
+         WHERE manifest.job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        before_restart,
+        ("DISCOVERING".to_owned(), 1, 1, "SCANNING".to_owned())
+    );
+
+    database.cancel_incomplete_jobs_for_shutdown().await?;
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.status, "PENDING");
+    let after_resume: (String, i64, i64) = sqlx::query_as(
+        "SELECT manifest.state, manifest.observed_file_count,
+                (SELECT COUNT(*) FROM scan_manifest_directories directory
+                 WHERE directory.manifest_id = manifest.id AND directory.state = 'PENDING')
+         FROM scan_manifests manifest WHERE manifest.job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after_resume, ("DISCOVERING".to_owned(), 1, 1));
+
+    jobs.run_to_completion(&job.id, 1, None).await?;
+    let completed: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, observed_file_count,
+                (SELECT COUNT(*) FROM scan_manifest_entries entry
+                 WHERE entry.manifest_id = scan_manifests.id)
+         FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(completed, ("COMPLETED".to_owned(), 2, 0));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for path in ["First.Movie.2024.mkv", "Second.Movie.2025.mkv"] {
+        tokio::fs::write(root.join(path), b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 root path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    assert_eq!(jobs.run_batch(&job.id, 100).await?.status, "RUNNING");
+    assert_eq!(jobs.run_batch(&job.id, 100).await?.status, "RUNNING");
+    let first_apply = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(first_apply.status, "RUNNING");
+    assert_eq!(first_apply.processed, 1);
+
+    jobs.cancel(&job.id).await?;
+    let cancelled = jobs.run_batch(&job.id, 1).await?;
+    assert_eq!(cancelled.status, "CANCELLED");
+    let checkpoint: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT state, resume_state,
+                (SELECT COUNT(*) FROM scan_manifest_deltas d
+                 WHERE d.manifest_id = scan_manifests.id AND d.state = 'APPLIED'),
+                (SELECT COUNT(*) FROM scan_manifest_deltas d
+                 WHERE d.manifest_id = scan_manifests.id AND d.state = 'PENDING')
+         FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        checkpoint,
+        ("CANCELLED".to_owned(), "APPLYING".to_owned(), 1, 1)
+    );
+
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    assert_eq!(retried.status, "PENDING");
+    let resumed_state: String =
+        sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(resumed_state, "APPLYING");
+    while !jobs.run_batch(&job.id, 100).await?.completed {}
+    let indexed_counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*),
+                (SELECT COUNT(*) FROM media_sources),
+                (SELECT COUNT(*) FROM scan_manifests WHERE library_id = ?)
+         FROM filesystem_entries WHERE library_root_id = (
+             SELECT id FROM library_roots WHERE library_id = ?
+         )",
+    )
+    .bind(library.id.to_string())
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_counts, (2, 2, 1));
+    jobs.run_to_completion(&job.id, 100, None).await?;
     Ok(())
 }
 
@@ -2307,7 +2463,7 @@ async fn item_scan_only_reconciles_the_source_folder() -> Result<(), Box<dyn std
 }
 
 #[tokio::test]
-async fn failed_scan_retry_reuses_job_progress_and_pending_entries()
+async fn failed_legacy_scan_retry_creates_a_new_manifest_job()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -2367,22 +2523,28 @@ async fn failed_scan_retry_reuses_job_progress_and_pending_entries()
     .await?;
 
     let retried = jobs.retry(&job.id).await?;
-    assert_eq!(retried.id, job.id);
+    assert_ne!(retried.id, job.id);
     assert_eq!(retried.status, "PENDING");
-    assert_eq!(retried.processed_count, 1);
-    let pending_after_retry: i64 = sqlx::query_scalar(
+    let pending_old_entries: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reconciliation_scan_entries
-             WHERE job_id = ? AND status = 'PENDING'",
+         WHERE job_id = ? AND status = 'PENDING'",
     )
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(pending_after_retry, 2);
+    assert_eq!(pending_old_entries, 0, "legacy queue is retired atomically");
+    let retry_manifest_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifests WHERE job_id = ? AND state = 'DISCOVERING'",
+    )
+    .bind(&retried.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(retry_manifest_count, 1);
 
-    jobs.run_to_completion(&job.id, 100, None).await?;
+    jobs.run_to_completion(&retried.id, 100, None).await?;
     let completed: (String, i64, i64) =
         sqlx::query_as("SELECT status, processed_count, total_count FROM scan_jobs WHERE id = ?")
-            .bind(&job.id)
+            .bind(&retried.id)
             .fetch_one(database.pool())
             .await?;
     assert_eq!(completed, ("COMPLETED".to_owned(), 3, 3));
@@ -2454,8 +2616,9 @@ async fn reconciliation_batch_rolls_back_index_and_retries_all_pending_files()
     sqlx::query("DROP TRIGGER fail_reconciliation_target_insert")
         .execute(database.pool())
         .await?;
-    jobs.retry(&job.id).await?;
-    jobs.run_to_completion(&job.id, 100, None).await?;
+    let retried = jobs.retry(&job.id).await?;
+    assert_ne!(retried.id, job.id);
+    jobs.run_to_completion(&retried.id, 100, None).await?;
 
     let completed: (String, i64, i64, i64) = sqlx::query_as(
         "SELECT
@@ -2464,9 +2627,9 @@ async fn reconciliation_batch_rolls_back_index_and_retries_all_pending_files()
              (SELECT total_count FROM scan_jobs WHERE id = ?),
              (SELECT COUNT(*) FROM media_sources)",
     )
-    .bind(&job.id)
-    .bind(&job.id)
-    .bind(&job.id)
+    .bind(&retried.id)
+    .bind(&retried.id)
+    .bind(&retried.id)
     .fetch_one(database.pool())
     .await?;
     assert_eq!(completed, ("COMPLETED".to_owned(), 3, 3, 3));
@@ -2521,16 +2684,26 @@ async fn reconciliation_retry_recovers_target_after_index_commit_precedes_target
         .execute(database.pool())
         .await?;
 
-    jobs.retry(&reconciliation.id).await?;
-    jobs.run_batch(&reconciliation.id, 100).await?;
-    let target: (String, String) = sqlx::query_as(
-        "SELECT change_kind, probe_state
-         FROM scan_job_targets
-         WHERE job_id = ? AND target_type = 'SOURCE'",
-    )
-    .bind(&reconciliation.id)
-    .fetch_one(database.pool())
-    .await?;
+    let retried = jobs.retry(&reconciliation.id).await?;
+    assert_ne!(retried.id, reconciliation.id);
+    let mut target = None;
+    for _ in 0..8 {
+        target = sqlx::query_as::<_, (String, String)>(
+            "SELECT change_kind, probe_state
+             FROM scan_job_targets
+             WHERE job_id = ? AND target_type = 'SOURCE'",
+        )
+        .bind(&retried.id)
+        .fetch_optional(database.pool())
+        .await?;
+        if target.is_some() {
+            break;
+        }
+        if jobs.run_batch(&retried.id, 100).await?.completed {
+            break;
+        }
+    }
+    let target = target.ok_or("manifest retry should persist its changed-source target")?;
     assert_eq!(target, ("CHANGED".to_owned(), "PENDING".to_owned()));
     Ok(())
 }
@@ -3092,19 +3265,20 @@ async fn failed_reconciliation_keeps_checkpoint_for_retry() -> Result<(), Box<dy
     assert_eq!(remaining_work, 1);
 
     let retried = jobs.retry(&job.id).await?;
+    assert_ne!(retried.id, job.id);
     assert_eq!(retried.status, "PENDING");
-    sqlx::query(
-        "UPDATE reconciliation_scan_entries
-         SET relative_path = ?
-         WHERE job_id = ? AND entry_type = 'FILE'",
-    )
-    .bind(valid_relative_path)
-    .bind(&job.id)
-    .execute(database.pool())
-    .await?;
-    jobs.run_to_completion(&job.id, 100, None).await?;
+    assert!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM scan_manifests WHERE job_id = ? AND state = 'DISCOVERING'",
+        )
+        .bind(&retried.id)
+        .fetch_one(database.pool())
+        .await?
+            == 1
+    );
+    jobs.run_to_completion(&retried.id, 100, None).await?;
     let completed_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
-        .bind(&job.id)
+        .bind(&retried.id)
         .fetch_one(database.pool())
         .await?;
     assert_eq!(completed_status, "COMPLETED");

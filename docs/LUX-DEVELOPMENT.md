@@ -6663,10 +6663,10 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 验收：
 
-- [ ] 旧版活动 `RECONCILE_LIBRARY` 任务没有关联 Manifest 时被标记 `CANCELLED`，事件代码明确说明需要新扫描，已完成媒体索引不变。
-- [ ] 重试旧任务创建新全量 Manifest；新 Manifest 任务重试遵循其 discovery/delta checkpoint 并保持幂等。
-- [ ] completed Manifest 的 entries/directories/deltas 被分批清理；可重试失败 checkpoint 按现有保留策略保留，清理循环有界且重复执行安全。
-- [ ] 从当前 SQLite/PostgreSQL schema 升级成功；旧 `reconciliation_scan_entries` 数据不被伪装成完整 Manifest，也不在迁移事务中转换。
+- [x] 旧版活动 `RECONCILE_LIBRARY` 任务没有关联 Manifest 时被标记 `CANCELLED`，事件代码明确说明需要新扫描，已完成媒体索引不变。
+- [x] 重试旧任务创建新全量 Manifest；新 Manifest 任务重试遵循其 discovery/delta checkpoint 并保持幂等。
+- [x] completed Manifest 的 entries/directories/deltas 被分批清理；可重试失败 checkpoint 按现有保留策略保留，清理循环有界且重复执行安全。
+- [x] 从当前 SQLite/PostgreSQL schema 升级成功；旧 `reconciliation_scan_entries` 数据不被伪装成完整 Manifest，也不在迁移事务中转换。
 
 验证：SQLite 空库/已有库迁移、旧活动任务启动恢复、管理员重试与分批清理集成测试。
 

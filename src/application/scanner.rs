@@ -4013,6 +4013,20 @@ impl ScanJobService {
         library_id: LibraryId,
         auto_metadata_match: bool,
     ) -> Result<ScanJob, ScanJobError> {
+        self.create_movie_scan_job_with_metadata_and_legacy_retry(
+            library_id,
+            auto_metadata_match,
+            None,
+        )
+        .await
+    }
+
+    async fn create_movie_scan_job_with_metadata_and_legacy_retry(
+        &self,
+        library_id: LibraryId,
+        auto_metadata_match: bool,
+        legacy_retry_job_id: Option<&str>,
+    ) -> Result<ScanJob, ScanJobError> {
         let library_id_text = library_id.to_string();
         let Some(library) = self.database.find_library(&library_id_text).await? else {
             return Err(ScanJobError::LibraryNotFound);
@@ -4045,7 +4059,13 @@ impl ScanJobService {
         };
         if let Err(error) = self
             .database
-            .create_full_scan_manifest_job(&id, &generation, auto_metadata_match, &manifest)
+            .create_full_scan_manifest_job(
+                &id,
+                &generation,
+                auto_metadata_match,
+                &manifest,
+                legacy_retry_job_id,
+            )
             .await
         {
             if error.is_unique_violation()
@@ -4202,6 +4222,12 @@ impl ScanJobService {
                     .await
                 }
                 "INDEXED" => self.finish_scan_manifest_indexing(&job, &manifest.id).await,
+                "POSTPROCESSING" => Ok(ScanBatchReport {
+                    status: "COMPLETED".to_owned(),
+                    processed: 0,
+                    created_items: 0,
+                    completed: true,
+                }),
                 _ => Err(ScanJobError::Storage(StorageError::Conflict(
                     "scan manifest is not in an executable state".to_owned(),
                 ))),
@@ -7483,6 +7509,13 @@ impl ScanJobService {
                     self.flush_home_after_scan_terminal().await;
                     return Ok(());
                 }
+                if let Err(error) = self
+                    .database
+                    .cleanup_completed_scan_manifest_payloads()
+                    .await
+                {
+                    tracing::warn!(job_id, %error, "completed scan manifest payload cleanup failed");
+                }
                 if completed_job.auto_metadata_match {
                     if let Some(metadata) = metadata {
                         self.schedule_online_metadata_after_scan(job_id, metadata)
@@ -8158,37 +8191,42 @@ impl ScanJobService {
             return Err(ScanJobError::AlreadyActive(active.id));
         }
         if job.job_type == "RECONCILE_LIBRARY" {
-            if job.status == "FAILED"
-                && !job.discovery_completed
-                && self
-                    .database
-                    .get_scan_manifest_by_job(&job.id)
-                    .await?
-                    .is_some_and(|manifest| manifest.state == "FAILED")
-            {
-                return self
-                    .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
-                    .await;
-            }
-            let has_reconciliation_entries = self
-                .database
-                .has_reconciliation_scan_entries(&job.id)
-                .await?;
-            if !has_reconciliation_entries {
-                if self.database.has_scan_job_targets(&job.id).await?
-                    && self.database.retry_scan_job_postprocessing(&job.id).await?
-                {
+            let manifest_stage = self.database.prepare_scan_manifest_retry(&job.id).await?;
+            match manifest_stage.as_deref() {
+                Some("POSTPROCESSING" | "INDEXED") => {
+                    if self.database.retry_scan_job_postprocessing(&job.id).await? {
+                        return self.get_job(&job.id).await;
+                    }
+                    return self
+                        .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
+                        .await;
+                }
+                Some("DISCOVERING" | "READY_TO_DIFF" | "APPLYING") => {
+                    if !self.database.retry_scan_job(&job.id).await? {
+                        return Err(ScanJobError::AlreadyActive(job.id));
+                    }
                     return self.get_job(&job.id).await;
                 }
-                return self
-                    .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
-                    .await;
+                Some("RESET_REQUIRED") | None => {
+                    return self
+                        .create_movie_scan_job_with_metadata_and_legacy_retry(
+                            library_id,
+                            job.auto_metadata_match,
+                            Some(&job.id),
+                        )
+                        .await;
+                }
+                Some("COMPLETED") => {
+                    return self
+                        .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
+                        .await;
+                }
+                Some(stage) => {
+                    return Err(ScanJobError::Storage(StorageError::Conflict(format!(
+                        "unsupported manifest retry stage {stage}"
+                    ))));
+                }
             }
-        }
-        if job.status == "CANCELLED" {
-            return self
-                .create_movie_scan_job_with_metadata(library_id, job.auto_metadata_match)
-                .await;
         }
         if !self.database.retry_scan_job(&job.id).await? {
             return Err(ScanJobError::AlreadyActive(job.id));

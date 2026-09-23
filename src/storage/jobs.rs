@@ -2,6 +2,11 @@ use super::*;
 
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 
+impl Database {
+    pub(crate) const LEGACY_SCAN_REQUIRES_NEW_MANIFEST: &'static str =
+        "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
+}
+
 fn prune_sidecar_directories(mut directories: Vec<String>) -> Vec<String> {
     directories.sort();
     directories.dedup();
@@ -93,13 +98,68 @@ impl Database {
             })?;
         let mut cancelled = 0_u64;
 
+        let legacy_scan_ids: Vec<String> = self
+            .query_scalar(
+                "SELECT id FROM scan_jobs
+                 WHERE job_type = 'RECONCILE_LIBRARY'
+                   AND (
+                       status IN ('PENDING', 'RUNNING')
+                       OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifests WHERE job_id = scan_jobs.id
+                   )",
+            )
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for job_id in &legacy_scan_ids {
+            let result = self
+                .query(
+                    "UPDATE scan_jobs
+                     SET status = 'CANCELLED', cancel_requested = 0, error = ?, cursor = NULL,
+                         current_item = NULL, scan_phase = 'IDLE', finished_at = unixepoch(),
+                         updated_at = unixepoch()
+                     WHERE id = ? AND status IN ('PENDING', 'RUNNING', 'COMPLETED')",
+                )
+                .bind(Self::LEGACY_SCAN_REQUIRES_NEW_MANIFEST)
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            cancelled = cancelled.saturating_add(result.rows_affected());
+            if result.rows_affected() == 1 {
+                self.query(
+                    "INSERT INTO scan_job_events (
+                         id, job_id, level, event_code, message, details_json
+                     ) VALUES (?, ?, 'WARN', ?, ?, '{}')",
+                )
+                .bind(uuid::Uuid::now_v7().to_string())
+                .bind(job_id)
+                .bind(Self::LEGACY_SCAN_REQUIRES_NEW_MANIFEST)
+                .bind("旧版全量扫描没有 Manifest 检查点；请重试以创建新的 Manifest 扫描")
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
         for query in [
             "UPDATE scan_jobs
              SET status = 'CANCELLED', cancel_requested = 0, error = ?, cursor = NULL,
                  current_item = NULL, scan_phase = 'IDLE', finished_at = unixepoch(),
                  updated_at = unixepoch()
-             WHERE status IN ('PENDING', 'RUNNING')
-                OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING')",
+             WHERE (status IN ('PENDING', 'RUNNING')
+                OR (status = 'COMPLETED' AND scan_phase = 'POSTPROCESSING'))",
             "UPDATE strm_probe_jobs
              SET status = 'CANCELLED', cancel_requested = 0, error = ?, finished_at = unixepoch(),
                  updated_at = unixepoch()
@@ -593,6 +653,7 @@ impl Database {
         generation: &str,
         auto_metadata_match: bool,
         manifest: &NewScanManifest<'_>,
+        legacy_retry_job_id: Option<&str>,
     ) -> Result<(), StorageError> {
         if manifest.job_id != id {
             return Err(StorageError::Conflict(
@@ -692,6 +753,100 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        if let Some(legacy_job_id) = legacy_retry_job_id {
+            self.query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, source_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, target_type, target_id, source_id, item_id, change_kind,
+                        CASE WHEN probe_state IN ('PENDING', 'FAILED')
+                             THEN 'PENDING' ELSE probe_state END,
+                        CASE WHEN metadata_state IN ('PENDING', 'FAILED')
+                             THEN 'PENDING' ELSE metadata_state END,
+                        CASE WHEN thumbnail_state IN ('PENDING', 'FAILED')
+                             THEN 'PENDING' ELSE thumbnail_state END
+                 FROM scan_job_targets
+                 WHERE job_id = ?
+                   AND (probe_state IN ('PENDING', 'FAILED')
+                        OR metadata_state IN ('PENDING', 'FAILED')
+                        OR thumbnail_state IN ('PENDING', 'FAILED'))
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(id)
+            .bind(legacy_job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, source_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'SOURCE', source.id, source.id, source.item_id, 'CHANGED',
+                        'PENDING', 'SKIPPED', 'SKIPPED'
+                 FROM reconciliation_scan_entries legacy
+                 JOIN filesystem_entries entry
+                   ON entry.library_root_id = legacy.library_root_id
+                  AND entry.relative_path = legacy.relative_path
+                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
+                 WHERE legacy.job_id = ? AND legacy.entry_type = 'FILE'
+                   AND legacy.status = 'PENDING' AND entry.is_missing = 0
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(id)
+            .bind(legacy_job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 )
+                 SELECT ?, 'ITEM', source.item_id, source.item_id, 'CHANGED',
+                        'SKIPPED', 'PENDING', 'PENDING'
+                 FROM reconciliation_scan_entries legacy
+                 JOIN filesystem_entries entry
+                   ON entry.library_root_id = legacy.library_root_id
+                  AND entry.relative_path = legacy.relative_path
+                 JOIN media_sources source ON source.filesystem_entry_id = entry.id
+                 WHERE legacy.job_id = ? AND legacy.entry_type = 'FILE'
+                   AND legacy.status = 'PENDING' AND entry.is_missing = 0
+                 GROUP BY source.item_id
+                 ON CONFLICT(job_id, target_type, target_id) DO NOTHING",
+            )
+            .bind(id)
+            .bind(legacy_job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query("DELETE FROM scan_job_targets WHERE job_id = ?")
+                .bind(legacy_job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query("DELETE FROM reconciliation_scan_entries WHERE job_id = ?")
+                .bind(legacy_job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
         transaction
             .commit()
             .await
@@ -1348,9 +1503,9 @@ impl Database {
         let mut transaction = self.begin_scan_write_transaction().await?;
         self.query(
             "UPDATE scan_manifests
-             SET state = ?, updated_at = unixepoch()
+             SET resume_state = state, state = ?, updated_at = unixepoch()
              WHERE job_id = ? AND state IN (
-                 'DISCOVERING', 'READY_TO_DIFF', 'APPLYING', 'POSTPROCESSING'
+                 'DISCOVERING', 'READY_TO_DIFF', 'APPLYING', 'INDEXED', 'POSTPROCESSING'
              )",
         )
         .bind(next_state)
@@ -3920,6 +4075,119 @@ impl Database {
         Ok(())
     }
 
+    pub(crate) async fn prepare_scan_manifest_retry(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let manifest: Option<(String, Option<String>)> = self
+            .query_as("SELECT state, resume_state FROM scan_manifests WHERE job_id = ?")
+            .bind(job_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((state, resume_state)) = manifest else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(None);
+        };
+
+        let stage = match state.as_str() {
+            "DISCOVERING" | "READY_TO_DIFF" | "APPLYING" | "INDEXED" | "POSTPROCESSING" => {
+                state.clone()
+            }
+            "FAILED" | "CANCELLED" => match resume_state.as_deref() {
+                Some(
+                    stage @ ("DISCOVERING" | "READY_TO_DIFF" | "APPLYING" | "INDEXED"
+                    | "POSTPROCESSING"),
+                ) => {
+                    let restored = self
+                        .query(
+                            "UPDATE scan_manifests
+                             SET state = ?, resume_state = NULL, error = NULL,
+                                 updated_at = unixepoch()
+                             WHERE job_id = ? AND state = ? AND resume_state = ?",
+                        )
+                        .bind(stage)
+                        .bind(job_id)
+                        .bind(&state)
+                        .bind(stage)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(|source| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source,
+                        })?;
+                    if restored.rows_affected() != 1 {
+                        return Err(StorageError::Conflict(
+                            "scan manifest checkpoint changed while preparing retry".to_owned(),
+                        ));
+                    }
+                    stage.to_owned()
+                }
+                _ => "RESET_REQUIRED".to_owned(),
+            },
+            "COMPLETED" => "COMPLETED".to_owned(),
+            _ => {
+                return Err(StorageError::Conflict(
+                    "scan manifest has an unsupported retry state".to_owned(),
+                ));
+            }
+        };
+
+        if stage == "DISCOVERING" {
+            self.query(
+                "UPDATE scan_manifest_directories
+                 SET state = 'PENDING', error = NULL, updated_at = unixepoch()
+                 WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                   AND state IN ('SCANNING', 'FAILED')",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE scan_manifest_roots
+                 SET state = CASE WHEN EXISTS (
+                         SELECT 1 FROM scan_manifest_directories directory
+                         WHERE directory.manifest_id = scan_manifest_roots.manifest_id
+                           AND directory.library_root_id = scan_manifest_roots.library_root_id
+                           AND directory.state = 'PENDING'
+                     ) THEN 'SCANNING' ELSE 'COMPLETE' END,
+                     error = NULL, finished_at = NULL, updated_at = unixepoch()
+                 WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                   AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(Some(stage))
+    }
+
     async fn record_scan_job_removed_targets_for_entry_ids_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -6244,6 +6512,14 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<bool, StorageError> {
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         let result = self
             .query(
                 "UPDATE scan_jobs
@@ -6265,7 +6541,30 @@ impl Database {
             )
             .bind(id)
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if result.rows_affected() == 1 {
+            self.query(
+                "UPDATE scan_manifests
+                 SET state = 'COMPLETED', resume_state = NULL,
+                     completed_at = COALESCE(completed_at, unixepoch()),
+                     updated_at = unixepoch()
+                 WHERE job_id = ? AND state = 'POSTPROCESSING'",
+            )
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -6343,12 +6642,8 @@ impl Database {
                    AND NOT EXISTS (
                        SELECT 1 FROM reconciliation_scan_entries
                        WHERE job_id = ?
-                   )
-                   AND EXISTS (
-                       SELECT 1 FROM scan_job_targets WHERE job_id = ?
                    )",
             )
-            .bind(id)
             .bind(id)
             .bind(id)
             .execute(&self.pool)
@@ -7619,7 +7914,7 @@ mod tests {
             roots: &roots,
         };
         database
-            .create_full_scan_manifest_job("job", "generation", false, &manifest)
+            .create_full_scan_manifest_job("job", "generation", false, &manifest, None)
             .await?;
         assert!(database.claim_scan_job("job").await?);
         database
@@ -7706,7 +8001,7 @@ mod tests {
             roots: &roots,
         };
         database
-            .create_full_scan_manifest_job("job", "generation", false, &manifest)
+            .create_full_scan_manifest_job("job", "generation", false, &manifest, None)
             .await?;
         assert!(database.claim_scan_job("job").await?);
         let entries = [NewScanManifestEntry {

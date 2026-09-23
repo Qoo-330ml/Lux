@@ -201,7 +201,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 130);
+    assert_eq!(database.schema_version().await?, 131);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -221,7 +221,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 130);
+    assert_eq!(second_database.schema_version().await?, 131);
     second_database.close().await;
     Ok(())
 }
@@ -354,9 +354,189 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_entry_device, 1);
-    assert_eq!(database.schema_version().await?, 130);
+    let manifest_resume_state: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_manifests')
+         WHERE name = 'resume_state'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_resume_state, 1);
+    assert_eq!(database.schema_version().await?, 131);
 
     database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_manifest_payload_cleanup_is_batched_and_preserves_checkpoints()
+-> Result<(), Box<dyn std::error::Error>> {
+    const OBSERVATION_COUNT: i64 = 1_001;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Manifest cleanup", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp_dir.path().join("Movies");
+    fs::create_dir_all(&root_path)?;
+    let root = libraries
+        .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+        .await?
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+    for (job_id, status) in [
+        ("cleanup-completed-manifest-job", "COMPLETED"),
+        ("cleanup-failed-manifest-job", "FAILED"),
+    ] {
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', ?, ?, 'IDLE')",
+        )
+        .bind(job_id)
+        .bind(&library_id)
+        .bind(status)
+        .bind(format!("generation-{job_id}"))
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO scan_manifests (
+             id, job_id, library_id, state, resume_state, root_count,
+             observed_file_count, add_count, applied_delta_count, completed_at
+         ) VALUES
+             ('cleanup-completed-manifest', 'cleanup-completed-manifest-job', ?,
+              'COMPLETED', NULL, 1, ?, ?, ?, unixepoch()),
+             ('cleanup-failed-manifest', 'cleanup-failed-manifest-job', ?,
+              'FAILED', 'APPLYING', 1, 1, 1, 0, NULL)",
+    )
+    .bind(&library_id)
+    .bind(OBSERVATION_COUNT)
+    .bind(OBSERVATION_COUNT)
+    .bind(OBSERVATION_COUNT)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifest_roots (manifest_id, library_root_id, state)
+         VALUES ('cleanup-completed-manifest', ?, 'COMPLETE'),
+                ('cleanup-failed-manifest', ?, 'INCOMPLETE')",
+    )
+    .bind(&root_id)
+    .bind(&root_id)
+    .execute(database.pool())
+    .await?;
+
+    let mut transaction = database.pool().begin().await?;
+    for index in 0..OBSERVATION_COUNT {
+        let relative_path = format!("movie-{index:04}.mkv");
+        let directory_path = format!("folder-{index:04}");
+        sqlx::query(
+            "INSERT INTO scan_manifest_directories (
+                 manifest_id, library_root_id, relative_path, state
+             ) VALUES ('cleanup-completed-manifest', ?, ?, 'COMPLETE')",
+        )
+        .bind(&root_id)
+        .bind(directory_path)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at, fingerprint
+             ) VALUES ('cleanup-completed-manifest', ?, ?, 1, 'FILE', 1, 1, X'01')",
+        )
+        .bind(&root_id)
+        .bind(&relative_path)
+        .execute(&mut *transaction)
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_manifest_deltas (
+                 id, manifest_id, library_root_id, relative_path,
+                 observation_sequence, delta_kind, state
+             ) VALUES (?, 'cleanup-completed-manifest', ?, ?, 1, 'ADD', 'APPLIED')",
+        )
+        .bind(format!("delta-{index:04}"))
+        .bind(&root_id)
+        .bind(relative_path)
+        .execute(&mut *transaction)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO scan_manifest_directories (
+             manifest_id, library_root_id, relative_path, state
+         ) VALUES ('cleanup-failed-manifest', ?, 'retained', 'PENDING')",
+    )
+    .bind(&root_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifest_entries (
+             manifest_id, library_root_id, relative_path, observation_sequence,
+             entry_kind, size, modified_at
+         ) VALUES ('cleanup-failed-manifest', ?, 'retained.mkv', 1, 'FILE', 1, 1)",
+    )
+    .bind(&root_id)
+    .execute(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifest_deltas (
+             id, manifest_id, library_root_id, relative_path,
+             observation_sequence, delta_kind, state
+         ) VALUES ('retained-delta', 'cleanup-failed-manifest', ?, 'retained.mkv',
+                  1, 'ADD', 'PENDING')",
+    )
+    .bind(&root_id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+
+    let report = database
+        .run_database_lifecycle_cleanup()
+        .await?
+        .ok_or("cleanup should report completed manifest payloads")?;
+    assert_eq!(
+        report.scan_manifest_entries_deleted,
+        OBSERVATION_COUNT as u64
+    );
+    assert_eq!(
+        report.scan_manifest_directories_deleted,
+        OBSERVATION_COUNT as u64
+    );
+    assert_eq!(
+        report.scan_manifest_deltas_deleted,
+        OBSERVATION_COUNT as u64
+    );
+
+    let completed_summary: (String, i64, i64) = sqlx::query_as(
+        "SELECT state, observed_file_count, add_count FROM scan_manifests
+         WHERE id = 'cleanup-completed-manifest'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        completed_summary,
+        ("COMPLETED".to_owned(), OBSERVATION_COUNT, OBSERVATION_COUNT)
+    );
+    let retained_checkpoint: (String, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT m.state, m.resume_state,
+                (SELECT COUNT(*) FROM scan_manifest_entries e WHERE e.manifest_id = m.id),
+                (SELECT COUNT(*) FROM scan_manifest_directories d WHERE d.manifest_id = m.id),
+                (SELECT COUNT(*) FROM scan_manifest_deltas x WHERE x.manifest_id = m.id)
+         FROM scan_manifests m WHERE m.id = 'cleanup-failed-manifest'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        retained_checkpoint,
+        ("FAILED".to_owned(), "APPLYING".to_owned(), 1, 1, 1)
+    );
+    assert!(database.run_database_lifecycle_cleanup().await?.is_none());
     Ok(())
 }
 
@@ -461,6 +641,10 @@ async fn full_scan_manifest_upgrade_preserves_existing_scan_data()
         source_dir.join("0130_scan_manifest_entry_device.sql"),
         migration_dir.join("0130_scan_manifest_entry_device.sql"),
     )?;
+    fs::copy(
+        source_dir.join("0131_scan_manifest_resume_state.sql"),
+        migration_dir.join("0131_scan_manifest_resume_state.sql"),
+    )?;
     sqlx::migrate::Migrator::new(migration_dir.clone())
         .await?
         .run(&pool)
@@ -469,7 +653,7 @@ async fn full_scan_manifest_upgrade_preserves_existing_scan_data()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 130);
+    assert_eq!(schema_version, 131);
     let legacy_status: String =
         sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = 'legacy-job'")
             .fetch_one(&pool)
@@ -492,6 +676,13 @@ async fn full_scan_manifest_upgrade_preserves_existing_scan_data()
     .fetch_one(&pool)
     .await?;
     assert_eq!(manifest_entry, (1234, 42, None));
+    let resume_state_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_manifests')
+         WHERE name = 'resume_state'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(resume_state_column, 1);
 
     pool.close().await;
     Ok(())
@@ -518,6 +709,9 @@ async fn postgres_manifest_migration_uses_only_supported_schema_constructs()
     let postgres_device_migration =
         include_str!("../migrations-postgres/0130_scan_manifest_entry_device.sql");
     assert!(!postgres_device_migration.contains("BIGSERIAL"));
+    let postgres_resume_state_migration =
+        include_str!("../migrations-postgres/0131_scan_manifest_resume_state.sql");
+    assert!(!postgres_resume_state_migration.contains("BIGSERIAL"));
     let temp_dir = tempfile::tempdir()?;
     let migration_dir = temp_dir.path().join("migrations");
     fs::create_dir(&migration_dir)?;
@@ -577,6 +771,10 @@ async fn postgres_manifest_migration_uses_only_supported_schema_constructs()
         migration_dir.join("0130_scan_manifest_entry_device.sql"),
         postgres_device_migration.replace("BIGINT", "INTEGER"),
     )?;
+    fs::write(
+        migration_dir.join("0131_scan_manifest_resume_state.sql"),
+        postgres_resume_state_migration,
+    )?;
     sqlx::migrate::Migrator::new(migration_dir)
         .await?
         .run(&pool)
@@ -598,6 +796,13 @@ async fn postgres_manifest_migration_uses_only_supported_schema_constructs()
     .fetch_one(&pool)
     .await?;
     assert_eq!(device_column, 1);
+    let resume_state_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_manifests')
+         WHERE name = 'resume_state'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(resume_state_column, 1);
     let manifest_entry: (i64, i64, Option<i64>) = sqlx::query_as(
         "SELECT size, inode, device FROM scan_manifest_entries
          WHERE manifest_id = 'manifest' AND relative_path = 'movie.mkv'",
@@ -716,7 +921,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 130);
+    assert_eq!(database.schema_version().await?, 131);
     Ok(())
 }
 
@@ -888,7 +1093,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 130);
+    assert_eq!(database.schema_version().await?, 131);
     Ok(())
 }
 
@@ -975,7 +1180,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 130);
+    assert_eq!(database.schema_version().await?, 131);
     database.close().await;
     Ok(())
 }
@@ -1102,7 +1307,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 130);
+    assert_eq!(database.schema_version().await?, 131);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -1284,7 +1489,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 130);
+    assert_eq!(database.schema_version().await?, 131);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
