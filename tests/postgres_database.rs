@@ -111,7 +111,38 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 125);
+    assert_eq!(database.schema_version().await?, 128);
+    let manifest_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name IN (
+               'scan_manifests', 'scan_manifest_roots', 'scan_manifest_directories',
+               'scan_manifest_entries', 'scan_manifest_deltas'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_tables, 5);
+    let manifest_fingerprint_type: String = sqlx::query_scalar(
+        "SELECT data_type
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'scan_manifest_entries'
+           AND column_name = 'fingerprint'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_fingerprint_type, "bytea");
+    let manifest_frontier_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_scan_manifest_directories_frontier'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_frontier_index, 1);
     let has_password_type: String = sqlx::query_scalar(
         "SELECT data_type
          FROM information_schema.columns

@@ -2141,7 +2141,7 @@ services:
 | LUX-262 | Lux-plugins/plugins/org.lux.bing-daily-background/、Lux-plugins/index.json、Lux-plugins/tests/；独立必应每日图片插件（完成来源与许可验证后） |
 | LUX-263 | Lux-plugins/plugins/org.lux.tmdb-trending-background/、Lux-plugins/index.json、Lux-plugins/tests/；独立 TMDb 日榜电影+剧集混合海报插件 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
-| LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/jobs.rs、tests/storage.rs；跨数据库 Manifest 存储合同 |
+| LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；持久化目录发现与文件观察 |
 | LUX-267 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/media.rs、src/storage/repository.rs、tests/scanning_jobs.rs；Manifest 差异与安全 apply |
 | LUX-268 | src/application/scanner.rs、src/application/home.rs、src/storage/jobs.rs、tests/scanning_jobs.rs、tests/webhooks.rs；索引完成和首页快照时序 |
@@ -6601,7 +6601,7 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 依赖：LUX-264。
 
-实现文件：`migrations/0128_full_scan_manifest.sql`、`migrations-postgres/0128_full_scan_manifest.sql`、`src/storage/repository.rs`、`src/storage/jobs.rs`、`tests/storage.rs`。
+实现文件：`migrations/0128_full_scan_manifest.sql`、`migrations-postgres/0128_full_scan_manifest.sql`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`。
 
 #### LUX-266：持久化 Manifest 目录发现与观察
 
