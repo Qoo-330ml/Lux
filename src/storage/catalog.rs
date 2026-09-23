@@ -1418,7 +1418,7 @@ impl Database {
                  FROM candidates
                  WHERE resume_runtime_ticks > 0
                    AND position_ticks * 100 < resume_runtime_ticks * ?
-                 ORDER BY last_played_at DESC, sort_title, id
+                 ORDER BY last_played_at DESC NULLS LAST, sort_title, id
                  LIMIT ? OFFSET ?
              )
              SELECT mi.id AS item_id, mi.library_id, mi.item_type,
@@ -1454,7 +1454,8 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             ORDER BY ranked.last_played_at DESC, ranked.sort_title, ranked.id,
+             ORDER BY ranked.last_played_at DESC NULLS LAST,
+                      ranked.sort_title, ranked.id,
                       ms.id, mt.stream_index"
         );
         let mut binds = Vec::with_capacity(query.item_types.len() + query.library_ids.len() + 5);

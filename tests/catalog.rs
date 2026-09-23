@@ -1,6 +1,8 @@
 use luxd::{
     api::{AppState, app_with_state},
     application::{
+        access::{AccessPrincipal, MediaAccessService},
+        catalog::CatalogService,
         libraries::LibraryService,
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
@@ -10,6 +12,7 @@ use luxd::{
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
     config::Config,
+    domain::ids::UserId,
     library::LibraryKind,
     storage::Database,
 };
@@ -1440,6 +1443,87 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
 
     assert_ne!(admin.id, viewer.id);
     server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn continue_watching_orders_recent_progress_before_legacy_null_dates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("admin", "Admin", "correct password")
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Resume Ordering", LibraryKind::Movie, false)
+        .await?;
+
+    for index in 0..10 {
+        let item_id = uuid::Uuid::now_v7().to_string();
+        let title = format!("Legacy Resume Movie {index:02}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, runtime_ticks,
+                identification_status, has_available_source
+            ) VALUES (?, ?, 'MOVIE', ?, ?, 36000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .bind(&title)
+        .bind(title.to_lowercase())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                user_id, item_id, position_ticks, is_played, last_played_at
+            ) VALUES (?, ?, 6000000000, 0, NULL)",
+        )
+        .bind(admin.id.to_string())
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let fresh_item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, runtime_ticks,
+            identification_status, has_available_source
+        ) VALUES (?, ?, 'MOVIE', 'Fresh Resume Movie', 'fresh resume movie',
+                  36000000000, 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&fresh_item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+            user_id, item_id, position_ticks, is_played, last_played_at
+        ) VALUES (?, ?, 6000000000, 0, 100)",
+    )
+    .bind(admin.id.to_string())
+    .bind(&fresh_item_id)
+    .execute(database.pool())
+    .await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let page = catalog
+        .list_continue_watching(
+            AccessPrincipal::new(UserId::new(), true),
+            &admin.id.to_string(),
+            0,
+            10,
+        )
+        .await?;
+
+    assert_eq!(page.total, 11);
+    assert_eq!(page.items.len(), 10);
+    assert_eq!(page.items[0].id, fresh_item_id);
+    database.close().await;
     Ok(())
 }
 

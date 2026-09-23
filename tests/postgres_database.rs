@@ -379,6 +379,95 @@ async fn postgres_strm_probe_job_accepts_boolean_options() -> Result<(), Box<dyn
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_resume_order_puts_recent_timestamp_before_legacy_nulls()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("postgres-admin", "PostgreSQL Admin", "test-password")
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library(
+            &format!("PostgreSQL resume {}", Uuid::now_v7()),
+            luxd::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+
+    let mut legacy_item_ids = Vec::new();
+    for index in 0..10 {
+        let item_id = Uuid::now_v7().to_string();
+        let title = format!("Legacy Resume Movie {index:02}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, runtime_ticks,
+                identification_status, has_available_source
+            ) VALUES ($1, $2, 'MOVIE', $3, $4, 36000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .bind(&title)
+        .bind(title.to_lowercase())
+        .execute(database.pool())
+        .await?;
+        legacy_item_ids.push(item_id);
+    }
+
+    let fresh_item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, runtime_ticks,
+            identification_status, has_available_source
+        ) VALUES ($1, $2, 'MOVIE', 'Fresh Resume Movie', 'fresh resume movie',
+                  36000000000, 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&fresh_item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let user_id = admin.id.to_string();
+    for item_id in legacy_item_ids {
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                user_id, item_id, position_ticks, is_played, last_played_at
+            ) VALUES ($1, $2, 6000000000, 0, NULL)",
+        )
+        .bind(&user_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO user_item_state (
+            user_id, item_id, position_ticks, is_played, last_played_at
+        ) VALUES ($1, $2, 6000000000, 0, 100)",
+    )
+    .bind(&user_id)
+    .bind(&fresh_item_id)
+    .execute(database.pool())
+    .await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let page = catalog
+        .list_continue_watching(AccessPrincipal::new(UserId::new(), true), &user_id, 0, 10)
+        .await?;
+
+    assert_eq!(page.total, 11);
+    assert_eq!(page.items.len(), 10);
+    assert_eq!(page.items[0].id, fresh_item_id);
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_metadata_priority_locks_images_and_people_regression()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
