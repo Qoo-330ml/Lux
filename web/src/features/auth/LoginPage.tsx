@@ -180,10 +180,6 @@ export function LoginPage() {
               {login.error.message}
             </p>
           ) : null}
-
-          <footer className="lux-auth-footer-notice">
-            支持 Lux &amp; Emby 媒体库 · 端到端安全连接
-          </footer>
         </motion.div>
       </section>
     </main>
