@@ -10,6 +10,7 @@ const POSTER_WIDTH_PERCENT = 78;
 const POSTER_HORIZONTAL_PADDING = 40;
 const MIN_POSTER_COLUMNS = 3;
 const MAX_POSTER_COLUMNS = 5;
+const POSTER_COLUMN_WIDTH_PERCENT = POSTER_WIDTH_PERCENT / MIN_POSTER_COLUMNS;
 
 function getPosterColumnCount(width: number) {
   const availableWidth = Math.max(0, width - POSTER_HORIZONTAL_PADDING);
@@ -79,7 +80,7 @@ export function LoginPage() {
     },
     Array.from({ length: posterColumnCount }, () => []),
   );
-  const posterColumnWidth = `${POSTER_WIDTH_PERCENT / posterColumnCount}%`;
+  const posterColumnWidth = `${POSTER_COLUMN_WIDTH_PERCENT}%`;
 
   return (
     <main className="lux-auth-screen lux-auth-split-layout">

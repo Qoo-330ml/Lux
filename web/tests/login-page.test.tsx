@@ -109,7 +109,7 @@ describe("LoginPage session state", () => {
     )).toBe("4");
     expect(container.querySelector<HTMLDivElement>(".lux-auth-poster-waterfall")?.style.getPropertyValue(
       "--lux-auth-poster-column-width",
-    )).toBe("19.5%");
+    )).toBe("26%");
   });
 
   it("keeps the fixed poster wall when the background request fails", async () => {
