@@ -51,12 +51,34 @@ const settings = {
   },
 };
 
+function loginBackgroundPlugin(overrides: Record<string, unknown> = {}) {
+  return {
+    id: "org.lux.tmdb-trending-background",
+    name: "TMDb 日榜海报",
+    description: "每日电影与剧集趋势",
+    category: "login_background",
+    capabilities: ["login_background.get"],
+    status: "READY",
+    running: false,
+    lastError: null,
+    installed: true,
+    enabled: true,
+    configured: true,
+    available: true,
+    configurable: false,
+    configFields: [],
+    configSource: "NONE" as const,
+    ...overrides,
+  };
+}
+
 describe("AdminSettingsPage network proxy", () => {
   let container: HTMLDivElement;
   let root: Root;
 
   beforeEach(() => {
     vi.spyOn(api, "adminSettings").mockResolvedValue(settings);
+    vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [] });
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -193,7 +215,7 @@ describe("AdminSettingsPage network proxy", () => {
 
     const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
     expect(select?.value).toBe("STATIC");
-    expect(container.textContent).toContain("未登录页面公开展示");
+    expect(container.textContent).not.toContain("未登录页面公开展示");
     await act(async () => {
       select!.value = "RECENTLY_ADDED";
       select!.dispatchEvent(new Event("change", { bubbles: true }));
@@ -203,6 +225,100 @@ describe("AdminSettingsPage network proxy", () => {
     });
 
     expect(update).toHaveBeenCalledWith({ loginBackgroundSource: "RECENTLY_ADDED" });
+    expect(container.textContent).toContain("未登录页面公开展示");
+  });
+
+  it("offers only installed, enabled and available login background plugins", async () => {
+    vi.mocked(api.adminPlugins).mockResolvedValue({
+      plugins: [
+        loginBackgroundPlugin(),
+        loginBackgroundPlugin({ id: "not-installed", name: "未安装", installed: false }),
+        loginBackgroundPlugin({ id: "disabled", name: "已停用", enabled: false }),
+        loginBackgroundPlugin({ id: "unavailable", name: "不可用", available: false }),
+        loginBackgroundPlugin({ id: "wrong-capability", name: "非背景插件", capabilities: ["metadata.scrape"] }),
+      ],
+    });
+    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
+      ...settings,
+      loginBackgroundSource: "PLUGIN:org.lux.tmdb-trending-background",
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
+    const optionLabels = Array.from(select?.options ?? []).map((option) => option.textContent);
+    expect(optionLabels).toContain("TMDb 日榜海报");
+    expect(optionLabels).not.toContain("未安装");
+    expect(optionLabels).not.toContain("已停用");
+    expect(optionLabels).not.toContain("不可用");
+    expect(optionLabels).not.toContain("非背景插件");
+
+    await act(async () => {
+      select!.value = "PLUGIN:org.lux.tmdb-trending-background";
+      select!.dispatchEvent(new Event("change", { bubbles: true }));
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("保存登录页背景"))
+        ?.click();
+    });
+    expect(update).toHaveBeenCalledWith({
+      loginBackgroundSource: "PLUGIN:org.lux.tmdb-trending-background",
+    });
+  });
+
+  it("keeps an unavailable saved plugin visible without blocking other settings", async () => {
+    const savedPluginSource = "PLUGIN:org.lux.bing-daily-background" as const;
+    vi.mocked(api.adminSettings).mockResolvedValue({
+      ...settings,
+      loginBackgroundSource: savedPluginSource,
+      loginBackgroundSourceStatus: "PLUGIN_UNAVAILABLE",
+    });
+    vi.mocked(api.adminPlugins).mockResolvedValue({
+      plugins: [loginBackgroundPlugin({ id: "available", name: "可用背景" })],
+    });
+    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminSettingsPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
+    const unavailableOption = Array.from(select?.options ?? []).find((option) => option.value === savedPluginSource);
+    expect(select?.value).toBe(savedPluginSource);
+    expect(unavailableOption?.disabled).toBe(true);
+    expect(container.textContent).toContain("所选背景插件当前不可用");
+    expect(Array.from(select?.options ?? []).some((option) => option.textContent === "可用背景")).toBe(true);
+
+    await act(async () => {
+      container.querySelector<HTMLInputElement>("input[aria-label='显示媒体库待确认标记']")?.click();
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("保存设置"))
+        ?.click();
+    });
+    expect(update).toHaveBeenCalledWith(expect.objectContaining({
+      mediaStrategy: expect.objectContaining({ showMetadataPending: false }),
+    }));
   });
 
   it("shows the shared API key in server settings", async () => {
