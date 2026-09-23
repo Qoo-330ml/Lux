@@ -176,7 +176,7 @@ impl HomeService {
         let continue_watching = self
             .inner
             .catalog
-            .list_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
+            .list_home_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
             .await
             .map_err(HomeError::Catalog)?;
         Ok(Arc::new(HomeSnapshot {
@@ -822,5 +822,150 @@ mod tests {
             .await
             .expect("fresh home snapshot");
         assert_eq!(second.continue_watching.items[0].id, item_id);
+    }
+
+    #[tokio::test]
+    async fn home_continue_watching_keeps_only_latest_incomplete_episode_per_series() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let admin = SetupService::new(database.clone())
+            .expect("setup service")
+            .complete("Admin", "Admin", "correct password")
+            .await
+            .expect("admin user");
+        let access = MediaAccessService::new(database.clone());
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Mixed", LibraryKind::Mixed, false)
+            .await
+            .expect("mixed library");
+        let user_id = admin.id.to_string();
+
+        let series_a_id = uuid::Uuid::now_v7().to_string();
+        let series_b_id = uuid::Uuid::now_v7().to_string();
+        for (series_id, title, sort_title) in [
+            (&series_a_id, "Series A", "series a"),
+            (&series_b_id, "Series B", "series b"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'SERIES', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(series_id)
+            .bind(library.id.to_string())
+            .bind(title)
+            .bind(sort_title)
+            .execute(database.pool())
+            .await
+            .expect("series item");
+        }
+
+        let fixtures = [
+            (
+                Some(series_a_id.as_str()),
+                "EPISODE",
+                Some(1_i64),
+                Some(8_i64),
+                "Series A S01E08",
+                300_i64,
+            ),
+            (
+                Some(series_a_id.as_str()),
+                "EPISODE",
+                Some(2),
+                Some(1),
+                "Series A S02E01",
+                400,
+            ),
+            (
+                Some(series_a_id.as_str()),
+                "EPISODE",
+                Some(2),
+                Some(4),
+                "Series A S02E04",
+                200,
+            ),
+            (
+                Some(series_b_id.as_str()),
+                "EPISODE",
+                Some(1),
+                Some(1),
+                "Series B S01E01",
+                350,
+            ),
+            (None, "MOVIE", None, None, "Standalone Movie", 500),
+            (None, "MOVIE", None, None, "Another Movie", 450),
+        ];
+        let mut item_ids = Vec::new();
+        for (series_id, item_type, season_number, episode_number, title, last_played_at) in fixtures
+        {
+            let item_id = uuid::Uuid::now_v7().to_string();
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, series_id, season_number,
+                    episode_number, title, sort_title, runtime_ticks,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 36000000000, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(&item_id)
+            .bind(library.id.to_string())
+            .bind(item_type)
+            .bind(series_id)
+            .bind(season_number)
+            .bind(episode_number)
+            .bind(title)
+            .bind(title.to_lowercase())
+            .execute(database.pool())
+            .await
+            .expect("episode item");
+            sqlx::query(
+                "INSERT INTO user_item_state (
+                    user_id, item_id, position_ticks, is_played, last_played_at
+                 ) VALUES (?, ?, 6000000000, 0, ?)",
+            )
+            .bind(&user_id)
+            .bind(&item_id)
+            .bind(last_played_at)
+            .execute(database.pool())
+            .await
+            .expect("episode resume state");
+            item_ids.push(item_id);
+        }
+
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access.clone()),
+            libraries,
+        );
+        let principal = AccessPrincipal::new(admin.id, true);
+        let library_ids = access
+            .accessible_library_ids(principal)
+            .await
+            .expect("accessible libraries");
+        let snapshot = home
+            .snapshot(principal, library_ids)
+            .await
+            .expect("home snapshot");
+
+        let items = &snapshot.continue_watching.items;
+        assert_eq!(snapshot.continue_watching.total, 4);
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().any(|item| item.id == item_ids[2]));
+        assert!(items.iter().any(|item| item.id == item_ids[3]));
+        assert!(items.iter().any(|item| item.id == item_ids[4]));
+        assert!(items.iter().any(|item| item.id == item_ids[5]));
+        assert!(!items.iter().any(|item| item.id == item_ids[0]));
+        assert!(!items.iter().any(|item| item.id == item_ids[1]));
+
+        let emby_resume = CatalogService::new(database, access)
+            .list_continue_watching(principal, &user_id, 0, 10)
+            .await
+            .expect("Emby resume items");
+        assert_eq!(emby_resume.total, 6);
+        assert_eq!(emby_resume.items.len(), 6);
     }
 }

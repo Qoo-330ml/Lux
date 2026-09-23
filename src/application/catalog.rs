@@ -789,6 +789,41 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        self.list_continue_watching_for_library_ids_with_grouping(
+            library_ids,
+            user_id,
+            offset,
+            limit,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn list_home_continue_watching_for_library_ids(
+        &self,
+        library_ids: &[String],
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<CatalogPage, CatalogError> {
+        self.list_continue_watching_for_library_ids_with_grouping(
+            library_ids,
+            user_id,
+            offset,
+            limit,
+            true,
+        )
+        .await
+    }
+
+    async fn list_continue_watching_for_library_ids_with_grouping(
+        &self,
+        library_ids: &[String],
+        user_id: &str,
+        offset: i64,
+        limit: i64,
+        latest_episode_per_series: bool,
+    ) -> Result<CatalogPage, CatalogError> {
         let played_percent = self.database.user_played_percent(user_id).await?;
         let (_, minimum_ticks) = self.database.resume_settings().await?;
         let item_types = ["MOVIE", "EPISODE"];
@@ -800,19 +835,23 @@ impl CatalogService {
                 &item_types,
                 played_percent,
                 minimum_ticks,
+                latest_episode_per_series,
             )
             .await?;
         let rows = self
             .database
-            .list_resume_items(&ResumeItemsQuery {
-                user_id,
-                library_ids,
-                item_types: &item_types,
-                played_percent,
-                minimum_ticks,
-                offset,
-                limit,
-            })
+            .list_resume_items(
+                &ResumeItemsQuery {
+                    user_id,
+                    library_ids,
+                    item_types: &item_types,
+                    played_percent,
+                    minimum_ticks,
+                    offset,
+                    limit,
+                },
+                latest_episode_per_series,
+            )
             .await?;
         Ok(CatalogPage {
             items: assemble_items(rows),
