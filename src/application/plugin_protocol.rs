@@ -799,6 +799,7 @@ impl PluginRequest {
 pub enum LoginBackgroundContentKind {
     PosterFeed,
     HeroImage,
+    SinglePoster,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -852,7 +853,11 @@ impl LoginBackgroundRpcResult {
         if result.items.len() > MAX_LOGIN_BACKGROUND_ITEMS {
             return Err(LoginBackgroundRpcValidationError::TooManyItems);
         }
-        if result.content_kind == LoginBackgroundContentKind::HeroImage && result.items.len() != 1 {
+        if matches!(
+            result.content_kind,
+            LoginBackgroundContentKind::HeroImage | LoginBackgroundContentKind::SinglePoster
+        ) && result.items.len() != 1
+        {
             return Err(LoginBackgroundRpcValidationError::InvalidItemCount);
         }
         for item in &result.items {

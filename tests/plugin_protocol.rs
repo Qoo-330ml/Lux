@@ -339,6 +339,46 @@ fn accepts_exactly_one_item_for_a_hero_image_result() {
 }
 
 #[test]
+fn accepts_exactly_one_item_for_a_single_poster_result() {
+    let manifest = login_background_test_manifest();
+    let result = LoginBackgroundRpcResult::validate(
+        json!({
+            "contentKind": "SINGLE_POSTER",
+            "sourceName": "TMDb Daily Trending",
+            "items": [{"imageUrl": "https://images.example.com/poster.jpg"}]
+        }),
+        &manifest,
+    )
+    .expect("a single poster result should validate");
+
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(
+        serde_json::to_value(result)
+            .expect("single poster result should serialize")["contentKind"],
+        "SINGLE_POSTER"
+    );
+
+    for items in [
+        json!([]),
+        json!([
+            {"imageUrl": "https://images.example.com/first.jpg"},
+            {"imageUrl": "https://images.example.com/second.jpg"}
+        ]),
+    ] {
+        let error = LoginBackgroundRpcResult::validate(
+            json!({
+                "contentKind": "SINGLE_POSTER",
+                "sourceName": "TMDb Daily Trending",
+                "items": items
+            }),
+            &manifest,
+        )
+        .expect_err("single poster results must contain exactly one item");
+        assert_eq!(error, LoginBackgroundRpcValidationError::InvalidItemCount);
+    }
+}
+
+#[test]
 fn rejects_invalid_login_background_rpc_shapes_and_urls() {
     let manifest = login_background_test_manifest();
     let base = json!({
