@@ -3,11 +3,13 @@ use luxd::application::plugin_protocol::{
     ChapterDetectRpcRequest, ChapterDetectRpcResult, ChapterFingerprintRpcEpisode,
     ChapterLookupRpcEpisode, ChapterLookupRpcRequest, DANMAKU_MATCH_CAPABILITY,
     DANMAKU_MATCH_METHOD, DanmakuMatchRpcRequest, DanmakuMatchRpcResult, DanmakuMatchStatus,
-    IP_LOCATION_CAPABILITY, IpLocationRpcResult, MediaProbeRpcResult, PLUGIN_API_VERSION,
-    PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK, PLUGIN_CATEGORY_NOTIFICATION,
-    PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR, PLUGIN_TYPE_DANMAKU,
-    PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, PluginManifest, PluginRequest,
-    STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult, StrmResolveStatus,
+    IP_LOCATION_CAPABILITY, IpLocationRpcResult, LoginBackgroundContentKind,
+    LoginBackgroundRpcResult, LoginBackgroundRpcValidationError, MediaProbeRpcResult,
+    PLUGIN_API_VERSION, PLUGIN_CATEGORY_MEDIA, PLUGIN_CATEGORY_NETWORK,
+    PLUGIN_CATEGORY_NOTIFICATION, PLUGIN_FORMAT_VERSION, PLUGIN_TYPE_CHAPTER_DETECTOR,
+    PLUGIN_TYPE_DANMAKU, PLUGIN_TYPE_IP_LOCATION, PLUGIN_TYPE_STRM_RESOLVER, PluginManifest,
+    PluginRequest, STRM_RESOLVE_CAPABILITY, StrmResolveRpcRequest, StrmResolveRpcResult,
+    StrmResolveStatus,
 };
 use serde_json::json;
 
@@ -150,6 +152,321 @@ fn accepts_a_media_probe_plugin_manifest() {
     );
     assert_eq!(manifest.config_fields[1].input_type, "number");
     assert_eq!(manifest.config_fields[1].default_value, Some(json!(2)));
+}
+
+#[test]
+fn accepts_a_login_background_manifest_with_declared_image_hosts() {
+    let manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.login-background-example",
+        "name": "Login background example",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "permissions": {
+            "network": ["api.example.com"],
+            "imageHosts": ["images.example.com"],
+            "filesystem": []
+        },
+        "files": []
+    }))
+    .expect("login background manifest should validate");
+
+    assert_eq!(manifest.plugin_type, "login_background");
+    assert_eq!(manifest.category, "UTILITY");
+    assert_eq!(manifest.capabilities, ["login_background.get"]);
+    assert_eq!(manifest.permissions.image_hosts, ["images.example.com"]);
+}
+
+#[test]
+fn rejects_login_background_capability_on_metadata_plugins() {
+    let error = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-login-background",
+        "name": "Invalid metadata background plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "capabilities": ["metadata.search", "login_background.get"],
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect_err("metadata plugin must not claim login background capability");
+
+    assert!(error.to_string().contains("login_background.get"));
+}
+
+#[test]
+fn rejects_invalid_login_background_manifest_category_capabilities_and_hosts() {
+    let valid = json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.login-background-test",
+        "name": "Login background test",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    });
+
+    for (key, value) in [
+        ("category", json!("MEDIA")),
+        (
+            "capabilities",
+            json!(["login_background.get", "metadata.search"]),
+        ),
+        ("permissions", json!({"imageHosts": ["localhost"]})),
+        ("permissions", json!({"imageHosts": ["10.0.0.1"]})),
+        ("permissions", json!({"imageHosts": ["*.example.com"]})),
+        ("permissions", json!({"imageHosts": ["single-label"]})),
+        (
+            "permissions",
+            json!({"imageHosts": ["image_host.example.com"]}),
+        ),
+        (
+            "permissions",
+            json!({"imageHosts": ["-images.example.com"]}),
+        ),
+        (
+            "permissions",
+            json!({"imageHosts": ["images-.example.com"]}),
+        ),
+        (
+            "permissions",
+            json!({"imageHosts": ["images.example.com:8443"]}),
+        ),
+        ("permissions", json!({})),
+    ] {
+        let mut invalid = valid.clone();
+        invalid[key] = value;
+        assert!(
+            PluginManifest::from_value(invalid).is_err(),
+            "invalid login background manifest field {key} should be rejected"
+        );
+    }
+
+    let invalid_other_type = json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-media-probe-background",
+        "name": "Invalid media probe background",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "media_probe",
+        "category": "MEDIA",
+        "capabilities": ["media.probe", "login_background.get"],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    });
+    assert!(PluginManifest::from_value(invalid_other_type).is_err());
+}
+
+#[test]
+fn accepts_versioned_login_background_sdk_manifest_and_result_fixtures() {
+    let manifest_value = serde_json::from_str(include_str!(
+        "fixtures/plugin-sdk/login-background/manifest-v1.json"
+    ))
+    .expect("manifest fixture should be JSON");
+    let manifest = PluginManifest::from_value(manifest_value)
+        .expect("login background manifest fixture should validate");
+    let result_value = serde_json::from_str(include_str!(
+        "fixtures/plugin-sdk/login-background/poster-feed-v1.json"
+    ))
+    .expect("RPC result fixture should be JSON");
+    let result = LoginBackgroundRpcResult::validate(result_value, &manifest)
+        .expect("login background RPC fixture should validate");
+
+    assert_eq!(result.content_kind, LoginBackgroundContentKind::PosterFeed);
+    assert_eq!(result.source_name, "Example catalog");
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(result.items[0].title.as_deref(), Some("Example film"));
+}
+
+#[test]
+fn preserves_legacy_manifest_serialization_and_reserves_image_hosts() {
+    let legacy_manifest = PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.legacy",
+        "name": "Legacy plugin",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "permissions": {"network": [], "filesystem": []},
+        "files": []
+    }))
+    .expect("legacy plugin manifest should validate");
+    let serialized =
+        serde_json::to_value(legacy_manifest).expect("legacy manifest should serialize");
+    assert!(serialized["permissions"].get("imageHosts").is_none());
+
+    let metadata_with_image_hosts = json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.invalid-metadata-images",
+        "name": "Invalid metadata image host declaration",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "metadata",
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    });
+    assert!(PluginManifest::from_value(metadata_with_image_hosts).is_err());
+}
+
+#[test]
+fn accepts_exactly_one_item_for_a_hero_image_result() {
+    let manifest = login_background_test_manifest();
+    let result = LoginBackgroundRpcResult::validate(
+        json!({
+            "contentKind": "HERO_IMAGE",
+            "sourceName": "Bing",
+            "items": [{"imageUrl": "https://images.example.com/today.jpg"}]
+        }),
+        &manifest,
+    )
+    .expect("one hero image should validate");
+
+    assert_eq!(result.content_kind, LoginBackgroundContentKind::HeroImage);
+    assert_eq!(result.items.len(), 1);
+}
+
+#[test]
+fn rejects_invalid_login_background_rpc_shapes_and_urls() {
+    let manifest = login_background_test_manifest();
+    let base = json!({
+        "contentKind": "POSTER_FEED",
+        "sourceName": "Example catalog",
+        "items": [{"imageUrl": "https://images.example.com/poster.jpg"}]
+    });
+    let invalid_values = [
+        json!({
+            "contentKind": "UNKNOWN",
+            "sourceName": "Example catalog",
+            "items": []
+        }),
+        json!({
+            "contentKind": "POSTER_FEED",
+            "sourceName": "Example catalog",
+            "items": [],
+            "html": "<script>alert(1)</script>"
+        }),
+        json!({
+            "contentKind": "HERO_IMAGE",
+            "sourceName": "Example catalog",
+            "items": []
+        }),
+        json!({
+            "contentKind": "HERO_IMAGE",
+            "sourceName": "Example catalog",
+            "items": [
+                {"imageUrl": "https://images.example.com/a.jpg"},
+                {"imageUrl": "https://images.example.com/b.jpg"}
+            ]
+        }),
+        json!({
+            "contentKind": "POSTER_FEED",
+            "sourceName": "Example catalog",
+            "items": [
+                {"imageUrl": "http://images.example.com/poster.jpg"}
+            ]
+        }),
+        json!({
+            "contentKind": "POSTER_FEED",
+            "sourceName": "Example catalog",
+            "items": [
+                {"imageUrl": "https://user:password@images.example.com/poster.jpg"}
+            ]
+        }),
+        json!({
+            "contentKind": "POSTER_FEED",
+            "sourceName": "Example catalog",
+            "items": [{"imageUrl": "https://127.0.0.1/poster.jpg"}]
+        }),
+        json!({
+            "contentKind": "POSTER_FEED",
+            "sourceName": "Example catalog",
+            "items": [{"imageUrl": "https://localhost/poster.jpg"}]
+        }),
+        json!({
+            "contentKind": "POSTER_FEED",
+            "sourceName": "Example catalog",
+            "items": [{"imageUrl": "https://images.example.com.evil.invalid/poster.jpg"}]
+        }),
+        json!({
+            "contentKind": "POSTER_FEED",
+            "sourceName": "Example catalog",
+            "items": [{"imageUrl": "https://images.example.com/poster.jpg#fragment"}]
+        }),
+    ];
+
+    for value in invalid_values {
+        assert!(
+            LoginBackgroundRpcResult::validate(value, &manifest).is_err(),
+            "invalid login background result should be rejected"
+        );
+    }
+
+    let mut over_limit = base;
+    over_limit["items"] = json!(
+        (0..=40)
+            .map(|index| json!({"imageUrl": format!("https://images.example.com/{index}.jpg")}))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        LoginBackgroundRpcResult::validate(over_limit, &manifest).unwrap_err(),
+        LoginBackgroundRpcValidationError::TooManyItems
+    );
+}
+
+#[test]
+fn rejects_oversized_and_control_character_login_background_data() {
+    let manifest = login_background_test_manifest();
+    let oversized = json!({
+        "contentKind": "POSTER_FEED",
+        "sourceName": "Example catalog",
+        "items": [{
+            "imageUrl": format!("https://images.example.com/{}", "x".repeat(260 * 1024))
+        }]
+    });
+    assert_eq!(
+        LoginBackgroundRpcResult::validate(oversized, &manifest).unwrap_err(),
+        LoginBackgroundRpcValidationError::ResultTooLarge
+    );
+
+    let control_character = json!({
+        "contentKind": "POSTER_FEED",
+        "sourceName": "Example\nCatalog",
+        "items": []
+    });
+    assert_eq!(
+        LoginBackgroundRpcResult::validate(control_character, &manifest).unwrap_err(),
+        LoginBackgroundRpcValidationError::InvalidText
+    );
+}
+
+fn login_background_test_manifest() -> PluginManifest {
+    PluginManifest::from_value(json!({
+        "formatVersion": PLUGIN_FORMAT_VERSION,
+        "id": "org.lux.login-background-test",
+        "name": "Login background test",
+        "version": "1.0.0",
+        "apiVersion": PLUGIN_API_VERSION,
+        "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+        "type": "login_background",
+        "category": "UTILITY",
+        "capabilities": ["login_background.get"],
+        "permissions": {"imageHosts": ["images.example.com"]},
+        "files": []
+    }))
+    .expect("test login background manifest should validate")
 }
 
 #[test]

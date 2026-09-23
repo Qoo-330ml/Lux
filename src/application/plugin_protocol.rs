@@ -4,6 +4,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use url::{Host, Url};
 
 use super::schedule::validate_cron;
 
@@ -14,6 +15,7 @@ pub const PLUGIN_CATEGORY_MEDIA: &str = "MEDIA";
 pub const PLUGIN_CATEGORY_NETWORK: &str = "NETWORK";
 pub const PLUGIN_CATEGORY_NOTIFICATION: &str = "NOTIFICATION";
 pub const PLUGIN_CATEGORY_MIGRATION: &str = "MIGRATION";
+pub const PLUGIN_CATEGORY_UTILITY: &str = "UTILITY";
 pub const PLUGIN_TYPE_MEDIA_PROBE: &str = "media_probe";
 pub const PLUGIN_TYPE_IP_LOCATION: &str = "ip_location";
 pub const PLUGIN_TYPE_STRM_RESOLVER: &str = "strm_resolver";
@@ -21,6 +23,7 @@ pub const PLUGIN_TYPE_CHAPTER_DETECTOR: &str = "chapter_detector";
 pub const PLUGIN_TYPE_NOTIFICATION: &str = "notification";
 pub const PLUGIN_TYPE_DATA_MIGRATION: &str = "data_migration";
 pub const PLUGIN_TYPE_DANMAKU: &str = "danmaku";
+pub const PLUGIN_TYPE_LOGIN_BACKGROUND: &str = "login_background";
 pub const MEDIA_PROBE_CAPABILITY: &str = "media.probe";
 pub const IP_LOCATION_CAPABILITY: &str = "ip.location";
 pub const STRM_RESOLVE_CAPABILITY: &str = "strm.resolve";
@@ -30,6 +33,7 @@ pub const MEDIA_SOURCE_KIND_LOCAL_FILE: &str = "LOCAL_FILE";
 pub const MEDIA_SOURCE_KIND_STRM_URL: &str = "STRM_URL";
 pub const NOTIFICATION_SEND_CAPABILITY: &str = "notification.send";
 pub const DANMAKU_MATCH_CAPABILITY: &str = "danmaku.match";
+pub const LOGIN_BACKGROUND_GET_CAPABILITY: &str = "login_background.get";
 pub const EMBY_MIGRATION_CAPABILITY: &str = "migration.emby";
 pub const METADATA_SEARCH_CAPABILITY: &str = "metadata.search";
 pub const METADATA_GET_CAPABILITY: &str = "metadata.get";
@@ -43,6 +47,10 @@ pub const CHAPTER_DETECT_METHOD: &str = "chapters.detect";
 pub const CHAPTER_LOOKUP_METHOD: &str = "chapters.lookup";
 pub const NOTIFICATION_SEND_METHOD: &str = "notification.send";
 pub const DANMAKU_MATCH_METHOD: &str = "danmaku.match";
+pub const LOGIN_BACKGROUND_GET_METHOD: &str = "login_background.get";
+pub const MAX_LOGIN_BACKGROUND_RESULT_BYTES: usize = 256 * 1024;
+pub const MAX_LOGIN_BACKGROUND_ITEMS: usize = 40;
+pub const MAX_LOGIN_BACKGROUND_IMAGE_URL_BYTES: usize = 2048;
 pub const MIGRATION_TEST_METHOD: &str = "migration.test";
 pub const MIGRATION_LIST_USERS_METHOD: &str = "migration.list_users";
 pub const MIGRATION_LIST_ITEMS_METHOD: &str = "migration.list_items";
@@ -118,8 +126,42 @@ impl PluginManifest {
         if let Some(provider_key) = self.provider_key.as_deref() {
             validate_identifier("providerKey", provider_key, 64)?;
         }
+        if self.plugin_type != PLUGIN_TYPE_LOGIN_BACKGROUND {
+            if self
+                .capabilities
+                .iter()
+                .any(|capability| capability == LOGIN_BACKGROUND_GET_CAPABILITY)
+            {
+                return Err(PluginManifestError::Invalid(
+                    "only login_background plugins may declare login_background.get".to_owned(),
+                ));
+            }
+            if !self.permissions.image_hosts.is_empty() {
+                return Err(PluginManifestError::Invalid(
+                    "only login_background plugins may declare imageHosts".to_owned(),
+                ));
+            }
+        }
         match self.plugin_type.as_str() {
             "metadata" => {}
+            PLUGIN_TYPE_LOGIN_BACKGROUND => {
+                if self.category != PLUGIN_CATEGORY_UTILITY {
+                    return Err(PluginManifestError::Invalid(
+                        "login background plugins must use the UTILITY category".to_owned(),
+                    ));
+                }
+                if self.capabilities.as_slice() != [LOGIN_BACKGROUND_GET_CAPABILITY] {
+                    return Err(PluginManifestError::Invalid(
+                        "login background plugins must declare only login_background.get"
+                            .to_owned(),
+                    ));
+                }
+                if self.permissions.image_hosts.is_empty() {
+                    return Err(PluginManifestError::Invalid(
+                        "login background plugins must declare imageHosts".to_owned(),
+                    ));
+                }
+            }
             PLUGIN_TYPE_MEDIA_PROBE => {
                 if self.category != PLUGIN_CATEGORY_MEDIA {
                     return Err(PluginManifestError::Invalid(
@@ -620,12 +662,15 @@ pub struct PluginPermissions {
     #[serde(default)]
     pub network: Vec<String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub image_hosts: Vec<String>,
+    #[serde(default)]
     pub filesystem: Vec<String>,
 }
 
 impl PluginPermissions {
     fn validate(&self) -> Result<(), PluginManifestError> {
-        if self.network.len() > 32 || self.filesystem.len() > 16 {
+        if self.network.len() > 32 || self.image_hosts.len() > 32 || self.filesystem.len() > 16 {
             return Err(PluginManifestError::Invalid(
                 "manifest declares too many permissions".to_owned(),
             ));
@@ -638,11 +683,69 @@ impl PluginPermissions {
                 )));
             }
         }
+        for host in &self.image_hosts {
+            normalize_login_background_image_host(host)?;
+        }
         for path in &self.filesystem {
             validate_identifier("filesystem permission", path, 64)?;
         }
         Ok(())
     }
+}
+
+fn normalize_login_background_image_host(host: &str) -> Result<String, PluginManifestError> {
+    if host.is_empty()
+        || host.len() > 253
+        || host.trim() != host
+        || !host.is_ascii()
+        || host.contains(['/', '@', ':', '?', '#', '*'])
+        || host.ends_with('.')
+    {
+        return Err(PluginManifestError::Invalid(
+            "invalid login background image host".to_owned(),
+        ));
+    }
+
+    let url = Url::parse(&format!("https://{host}")).map_err(|_| {
+        PluginManifestError::Invalid("invalid login background image host".to_owned())
+    })?;
+    if url.port().is_some()
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(PluginManifestError::Invalid(
+            "invalid login background image host".to_owned(),
+        ));
+    }
+
+    let Some(Host::Domain(domain)) = url.host() else {
+        return Err(PluginManifestError::Invalid(
+            "IP literals are not supported as login background image hosts".to_owned(),
+        ));
+    };
+    let domain = domain.to_ascii_lowercase();
+    let labels = domain.split('.').collect::<Vec<_>>();
+    if domain == "localhost"
+        || domain.ends_with(".localhost")
+        || domain.ends_with(".local")
+        || domain.ends_with(".internal")
+        || labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || !label.as_bytes()[0].is_ascii_alphanumeric()
+                || !label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        })
+    {
+        return Err(PluginManifestError::Invalid(
+            "local image hosts are not supported".to_owned(),
+        ));
+    }
+    Ok(domain)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -690,6 +793,157 @@ impl PluginRequest {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum LoginBackgroundContentKind {
+    PosterFeed,
+    HeroImage,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginBackgroundRpcItem {
+    pub image_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copyright_notice: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct LoginBackgroundRpcResult {
+    pub content_kind: LoginBackgroundContentKind,
+    pub source_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub copyright_notice: Option<String>,
+    pub items: Vec<LoginBackgroundRpcItem>,
+}
+
+impl LoginBackgroundRpcResult {
+    pub fn validate(
+        value: Value,
+        manifest: &PluginManifest,
+    ) -> Result<Self, LoginBackgroundRpcValidationError> {
+        if manifest.plugin_type != PLUGIN_TYPE_LOGIN_BACKGROUND
+            || manifest.category != PLUGIN_CATEGORY_UTILITY
+            || manifest.capabilities.as_slice() != [LOGIN_BACKGROUND_GET_CAPABILITY]
+            || manifest.permissions.image_hosts.is_empty()
+        {
+            return Err(LoginBackgroundRpcValidationError::InvalidProvider);
+        }
+
+        let encoded = serde_json::to_vec(&value)
+            .map_err(|_| LoginBackgroundRpcValidationError::InvalidPayload)?;
+        if encoded.len() > MAX_LOGIN_BACKGROUND_RESULT_BYTES {
+            return Err(LoginBackgroundRpcValidationError::ResultTooLarge);
+        }
+        let result = serde_json::from_value::<Self>(value)
+            .map_err(|_| LoginBackgroundRpcValidationError::InvalidPayload)?;
+        if !is_valid_login_background_text(&result.source_name, 128)
+            || result
+                .copyright_notice
+                .as_deref()
+                .is_some_and(|notice| !is_valid_login_background_text(notice, 512))
+        {
+            return Err(LoginBackgroundRpcValidationError::InvalidText);
+        }
+        if result.items.len() > MAX_LOGIN_BACKGROUND_ITEMS {
+            return Err(LoginBackgroundRpcValidationError::TooManyItems);
+        }
+        if result.content_kind == LoginBackgroundContentKind::HeroImage && result.items.len() != 1 {
+            return Err(LoginBackgroundRpcValidationError::InvalidItemCount);
+        }
+        for item in &result.items {
+            if item
+                .title
+                .as_deref()
+                .is_some_and(|title| !is_valid_login_background_text(title, 256))
+                || item
+                    .copyright_notice
+                    .as_deref()
+                    .is_some_and(|notice| !is_valid_login_background_text(notice, 512))
+            {
+                return Err(LoginBackgroundRpcValidationError::InvalidText);
+            }
+            validate_login_background_image_url(&item.image_url, manifest)?;
+        }
+        Ok(result)
+    }
+}
+
+fn is_valid_login_background_text(value: &str, max_chars: usize) -> bool {
+    !value.trim().is_empty()
+        && value.chars().count() <= max_chars
+        && !value.chars().any(char::is_control)
+}
+
+fn validate_login_background_image_url(
+    image_url: &str,
+    manifest: &PluginManifest,
+) -> Result<(), LoginBackgroundRpcValidationError> {
+    if image_url.len() > MAX_LOGIN_BACKGROUND_IMAGE_URL_BYTES {
+        return Err(LoginBackgroundRpcValidationError::InvalidImageUrl);
+    }
+    let url =
+        Url::parse(image_url).map_err(|_| LoginBackgroundRpcValidationError::InvalidImageUrl)?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.port().is_some()
+    {
+        return Err(LoginBackgroundRpcValidationError::InvalidImageUrl);
+    }
+    let Some(Host::Domain(domain)) = url.host() else {
+        return Err(LoginBackgroundRpcValidationError::InvalidImageUrl);
+    };
+    let domain = normalize_login_background_image_host(domain)
+        .map_err(|_| LoginBackgroundRpcValidationError::InvalidImageUrl)?;
+    let is_declared = manifest
+        .permissions
+        .image_hosts
+        .iter()
+        .any(|declared_host| {
+            normalize_login_background_image_host(declared_host)
+                .is_ok_and(|declared_host| declared_host == domain)
+        });
+    if !is_declared {
+        return Err(LoginBackgroundRpcValidationError::UndeclaredImageHost);
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoginBackgroundRpcValidationError {
+    InvalidProvider,
+    InvalidPayload,
+    ResultTooLarge,
+    TooManyItems,
+    InvalidItemCount,
+    InvalidText,
+    InvalidImageUrl,
+    UndeclaredImageHost,
+}
+
+impl fmt::Display for LoginBackgroundRpcValidationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let message = match self {
+            Self::InvalidProvider => "plugin is not a login background provider",
+            Self::InvalidPayload => "invalid login background RPC result",
+            Self::ResultTooLarge => "login background RPC result exceeds the size limit",
+            Self::TooManyItems => "login background RPC result has too many items",
+            Self::InvalidItemCount => "hero image result must contain exactly one item",
+            Self::InvalidText => "login background attribution text is invalid",
+            Self::InvalidImageUrl => "login background image URL is unsafe or invalid",
+            Self::UndeclaredImageHost => "login background image host is not declared",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for LoginBackgroundRpcValidationError {}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]

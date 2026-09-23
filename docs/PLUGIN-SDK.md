@@ -146,8 +146,8 @@ metadata 插件启动时只通过 `LUX_PLUGIN_CONFIG_PATH` 获得自己的配置
 `LUX_CONFIG_DIR`。缺少专属配置文件时，插件应使用自身默认值。`LUX_CONFIG_DIR` 只适用于仍有明确兼容
 需求的非 metadata 插件，不能被 metadata 插件依赖。
 
-`type` 当前允许 `metadata`、`media_probe`、`ip_location`、`strm_resolver`、`chapter_detector` 和
-`data_migration`。媒体探测插件必须同时声明
+`type` 当前允许 `metadata`、`media_probe`、`ip_location`、`strm_resolver`、`chapter_detector`、
+`data_migration`、`danmaku` 和 `login_background`。媒体探测插件必须同时声明
 `category: "MEDIA"` 和 `capabilities: ["media.probe"]`。例如商店中的
 `org.lux.strm-media-info` 使用以下 manifest 核心字段：
 
@@ -253,6 +253,7 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   空的已确认来源库范围表示无需发起该用户的状态请求。当前 `historyCapability: "ITEM_STATE"` 只表示条目聚合状态，不得生成假的历史事件。
 - `migration.authenticate_user`：仅在 Lux 用户首次登录迁移账户时接收一次用户名和密码，向 Emby 验证后只返回成功及
   脱敏用户身份；插件不得返回或持久化 Emby access token、密码或完整认证响应。
+- `login_background.get`：使用空对象参数获取登录页背景数据；不得接收媒体库 ID、媒体标题、路径、URL、用户数据或任务对象。
 - 迁移插件必须声明 `type: "data_migration"`、`category: "MIGRATION"` 和 `capabilities: ["migration.emby"]`。
   宿主负责迁移任务、映射、导入、幂等、恢复和历史事件落库；插件不能访问 Lux 数据库、媒体目录或任务对象。
 - `plugin.shutdown`：请求插件优雅退出。
@@ -263,6 +264,58 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
 媒体库动态填充选项，不把媒体库 ID 或路径写死在插件包中。片头片尾插件不得用 `libraryIds` 配置媒体库归属；
 媒体库通过 Lux API 的 `chapterSourceId` 选择数据源。管理 API 返回的 `configValues` 只允许包含非敏感当前值。
+
+### 登录页背景数据合同（API v1）
+
+登录背景提供者必须声明 `type: "login_background"`、`category: "UTILITY"` 和唯一能力
+`login_background.get`。该能力不能附加到 metadata 刮削器或其他插件类型。manifest 用
+`permissions.imageHosts` 单独声明浏览器将直接请求的 HTTPS 图片域名；它与插件进程的
+`permissions.network` 出站主机列表用途不同。图片主机必须是精确 DNS 域名，不支持通配符、IP
+字面量、本地域名或端口。
+
+版本化 manifest 示例：
+
+```json
+{
+  "formatVersion": 1,
+  "id": "org.lux.example-login-background",
+  "name": "Example login background",
+  "version": "1.0.0",
+  "apiVersion": 1,
+  "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+  "type": "login_background",
+  "category": "UTILITY",
+  "capabilities": ["login_background.get"],
+  "permissions": {
+    "network": ["api.example.com"],
+    "imageHosts": ["images.example.com"],
+    "filesystem": []
+  },
+  "files": []
+}
+```
+
+宿主以空对象作为方法参数调用 `login_background.get`。其 `result` 示例：
+
+```json
+{
+  "contentKind": "POSTER_FEED",
+  "sourceName": "Example catalog",
+  "copyrightNotice": "Example catalog image attribution",
+  "items": [{
+    "imageUrl": "https://images.example.com/posters/example.jpg",
+    "title": "Example film",
+    "copyrightNotice": "© Example rights holder"
+  }]
+}
+```
+
+`contentKind` 只允许 `POSTER_FEED`（0–40 项）或 `HERO_IMAGE`（恰好 1 项）。响应 JSON 最大
+256 KiB，每条图片 URL 最大 2048 字节。图片 URL 必须是无凭据、无片段的 HTTPS URL，且主机必须与
+`permissions.imageHosts` 中某一域名精确匹配；拒绝 localhost、本地域名和 IP 字面量。未知字段、
+超量条目、含控制字符或超长的署名文本会被拒绝。`sourceName` 为必填纯文本；版权字段及每项
+`title`/`copyrightNotice` 为可选纯文本。空 `POSTER_FEED` 不代表可展示内容，宿主应按背景来源的
+降级策略处理。插件只能提供数据，所有文字呈现、海报瀑布流、裁切、遮罩和鸣谢交互均由 Lux 实现。
 
 插件配置通过 `PUT /api/v1/admin/plugins/{pluginId}/config` 保存。媒体探测插件通过
 `POST /api/v1/admin/plugins/org.lux.strm-media-info/run` 按已保存配置创建后台任务；旧的
