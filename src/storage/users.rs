@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
 const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
+const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
 
 impl Database {
     pub(crate) async fn has_users(&self) -> Result<bool, StorageError> {
@@ -1604,6 +1605,54 @@ impl Database {
             source,
         })
     }
+
+    pub(crate) async fn upsert_login_background_plugin_cache(
+        &self,
+        plugin_id: &str,
+        payload_json: &str,
+        refreshed_at: i64,
+    ) -> Result<(), StorageError> {
+        if payload_json.len() > MAX_LOGIN_BACKGROUND_CACHE_BYTES || refreshed_at <= 0 {
+            return Err(StorageError::Serialization(
+                "login background cache value is outside the allowed bounds".to_owned(),
+            ));
+        }
+        self.query(
+            "INSERT INTO login_background_plugin_cache (plugin_id, payload_json, refreshed_at)
+             VALUES (?, ?, ?)
+             ON CONFLICT(plugin_id) DO UPDATE SET
+                 payload_json = excluded.payload_json,
+                 refreshed_at = excluded.refreshed_at",
+        )
+        .bind(plugin_id)
+        .bind(payload_json)
+        .bind(refreshed_at)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn login_background_plugin_cache(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Option<(String, i64)>, StorageError> {
+        self.query_as::<(String, i64)>(
+            "SELECT payload_json, refreshed_at
+             FROM login_background_plugin_cache
+             WHERE plugin_id = ?",
+        )
+        .bind(plugin_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
 }
 
 fn is_sqlite_lock_error(error: &StorageError) -> bool {
@@ -1633,6 +1682,51 @@ mod tests {
         })
         .await?;
         Ok((temp_dir, database))
+    }
+
+    #[tokio::test]
+    async fn login_background_plugin_cache_upserts_and_reads_latest_payload()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let plugin_id = "org.lux.background-cache-test";
+        database.install_plugin(plugin_id).await?;
+
+        database
+            .upsert_login_background_plugin_cache(plugin_id, "{\"sourceName\":\"first\"}", 100)
+            .await?;
+        database
+            .upsert_login_background_plugin_cache(plugin_id, "{\"sourceName\":\"latest\"}", 200)
+            .await?;
+
+        assert_eq!(
+            database.login_background_plugin_cache(plugin_id).await?,
+            Some(("{\"sourceName\":\"latest\"}".to_owned(), 200))
+        );
+        assert_eq!(
+            database
+                .login_background_plugin_cache("org.lux.missing")
+                .await?,
+            None
+        );
+        assert!(
+            database
+                .upsert_login_background_plugin_cache("org.lux.missing", "{}", 300)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .upsert_login_background_plugin_cache(plugin_id, "{}", 0)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .upsert_login_background_plugin_cache(plugin_id, &"x".repeat(262_145), 300,)
+                .await
+                .is_err()
+        );
+        Ok(())
     }
 
     #[tokio::test]
