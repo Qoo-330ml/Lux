@@ -47,11 +47,24 @@ export type AuthSession = {
   serverName?: string | null;
 };
 
-export type LoginBackgroundSource = "STATIC" | "RECENTLY_ADDED";
+export type LoginBackgroundSource = "STATIC" | "RECENTLY_ADDED" | `PLUGIN:${string}`;
 
-export type LoginBackgroundResponse = {
-  source: LoginBackgroundSource;
-  images: string[];
+export type LoginBackgroundItem = {
+  imageUrl: string;
+  title?: string;
+  copyrightNotice?: string;
+};
+
+export type LoginBackgroundResponse =
+  | { source: "STATIC" | "RECENTLY_ADDED"; images: string[] }
+  | PluginLoginBackgroundResponse;
+
+export type PluginLoginBackgroundResponse = {
+  source: `PLUGIN:${string}`;
+  contentKind: "POSTER_FEED" | "HERO_IMAGE";
+  sourceName: string;
+  copyrightNotice?: string;
+  items: LoginBackgroundItem[];
 };
 
 export type AdminApiKey = {
@@ -924,6 +937,7 @@ export type AdminSettings = {
   resumeMinTicks: number;
   forceAdminLibraryOrder?: boolean;
   loginBackgroundSource: LoginBackgroundSource;
+  loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;
   networkProxy?: AdminNetworkProxySettings;
 };

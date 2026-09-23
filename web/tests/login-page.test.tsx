@@ -40,7 +40,7 @@ describe("LoginPage session state", () => {
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-    act(() => {
+    await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
           <LoginPage />
@@ -69,7 +69,7 @@ describe("LoginPage session state", () => {
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 
-    act(() => {
+    await act(async () => {
       root.render(
         <QueryClientProvider client={queryClient}>
           <LoginPage />
@@ -77,13 +77,156 @@ describe("LoginPage session state", () => {
       );
     });
 
-    await vi.waitFor(() => {
-      expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(5);
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(5);
+      });
     });
     expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(5);
     expect(container.querySelector<HTMLDivElement>(".lux-auth-poster-waterfall")?.style.getPropertyValue(
       "--lux-auth-poster-column-width",
     )).toBe("26%");
+  });
+
+  it("renders plugin poster feeds inside the existing waterfall and exposes TMDb credits", async () => {
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "PLUGIN:org.lux.tmdb-trending-background",
+      contentKind: "POSTER_FEED",
+      sourceName: "TMDb 日榜",
+      copyrightNotice: "TMDb 图片来源",
+      items: [
+        { imageUrl: "https://image.tmdb.org/t/p/w500/one.jpg", title: "电影一" },
+        { imageUrl: "https://image.tmdb.org/t/p/w500/two.jpg", title: "剧集二" },
+      ],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelectorAll(".lux-auth-poster-waterfall img")).toHaveLength(2);
+      });
+    });
+    expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(5);
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-waterfall img")?.src)
+      .toContain("https://image.tmdb.org/t/p/w500/one.jpg");
+    expect(container.querySelector<HTMLDetailsElement>(".lux-auth-credits")?.textContent)
+      .toContain("TMDB");
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-tmdb-mark")?.src)
+      .toBe("https://www.themoviedb.org/assets/2/v4/logos/v2/blue_long_2-9665a76b1ae401a510ec1e0ca40ddcb3b0cfe45f1d51b77a308fea0845885648.svg");
+    expect(container.textContent).not.toContain("TMDb 图片来源");
+  });
+
+  it("renders plugin hero images with source attribution and falls back after an image error", async () => {
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "PLUGIN:org.lux.bing-daily-background",
+      contentKind: "HERO_IMAGE",
+      sourceName: "Bing 每日图片",
+      copyrightNotice: "摄影者与版权信息",
+      items: [{ imageUrl: "https://images.example.com/today.jpg", title: "今日主题" }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector<HTMLImageElement>(".lux-auth-hero-image")?.src)
+          .toContain("https://images.example.com/today.jpg");
+      });
+    });
+    expect(container.textContent).toContain("摄影者与版权信息");
+    expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
+
+    await act(async () => {
+      container.querySelector<HTMLImageElement>(".lux-auth-hero-image")
+        ?.dispatchEvent(new Event("error"));
+    });
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.getAttribute("src"))
+      .toBe("/lux-poster-wall.jpg");
+    expect(container.querySelector(".lux-auth-hero-image")).toBeNull();
+  });
+
+  it("falls back to the fixed wall when a plugin poster fails to load", async () => {
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "PLUGIN:org.lux.tmdb-trending-background",
+      contentKind: "POSTER_FEED",
+      sourceName: "TMDb 日榜",
+      items: [{ imageUrl: "https://image.tmdb.org/t/p/w500/broken.jpg", title: "失效海报" }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+    let poster: HTMLImageElement | null = null;
+    await act(async () => {
+      await vi.waitFor(() => {
+        poster = container.querySelector<HTMLImageElement>(".lux-auth-poster-waterfall img");
+        expect(poster?.src).toContain("https://image.tmdb.org/t/p/w500/broken.jpg");
+      });
+    });
+
+    await act(async () => {
+      poster?.dispatchEvent(new Event("error"));
+    });
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.getAttribute("src"))
+      .toBe("/lux-poster-wall.jpg");
+    expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
+  });
+
+  it("falls back to the fixed wall when a plugin feed is empty", async () => {
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "PLUGIN:org.lux.tmdb-trending-background",
+      contentKind: "POSTER_FEED",
+      sourceName: "TMDb 日榜",
+      items: [],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.getAttribute("src"))
+          .toBe("/lux-poster-wall.jpg");
+      });
+    });
   });
 
   it("keeps the fixed poster wall when the background request fails", async () => {
@@ -101,9 +244,11 @@ describe("LoginPage session state", () => {
       );
     });
 
-    await vi.waitFor(() => {
-      expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.getAttribute("src"))
-        .toBe("/lux-poster-wall.jpg");
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.getAttribute("src"))
+          .toBe("/lux-poster-wall.jpg");
+      });
     });
     expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
   });

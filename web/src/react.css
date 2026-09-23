@@ -756,6 +756,18 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-auth-poster-waterfall-column:nth-child(5) { margin-top: -60%; }
 .lux-auth-poster-waterfall img { display: block; width: 100%; height: auto; flex: 0 0 auto; border: 1px solid rgba(255,255,255,.16); border-radius: 14px; object-fit: cover; opacity: .94; box-shadow: 0 18px 32px rgba(0,0,0,.38); filter: saturate(.96) contrast(1.04); }
 .lux-auth-visual-fade { position: absolute; top: 0; bottom: 0; right: 0; width: 140px; background: linear-gradient(to right, transparent, #090a0f); pointer-events: none; }
+.lux-auth-hero-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; }
+.lux-auth-hero-shade { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(8,9,15,.42), transparent 62%), linear-gradient(0deg, rgba(8,9,15,.48), transparent 34%); pointer-events: none; }
+.lux-auth-background-credit { position: absolute; z-index: 15; left: 24px; bottom: 58px; display: grid; gap: 3px; max-width: min(54%, 480px); color: rgba(255,255,255,.82); font-size: .72rem; line-height: 1.45; text-shadow: 0 1px 8px rgba(0,0,0,.9); }
+.lux-auth-background-credit span + span { color: rgba(255,255,255,.68); }
+.lux-auth-credits { position: absolute; z-index: 20; left: 24px; bottom: 18px; color: rgba(255,255,255,.78); font-size: .72rem; }
+.lux-auth-credits summary { width: fit-content; cursor: pointer; text-underline-offset: 3px; }
+.lux-auth-credits summary:hover { color: #fff; }
+.lux-auth-credits summary:focus-visible { outline: 2px solid #fff; outline-offset: 4px; }
+.lux-auth-credits-panel { position: absolute; bottom: calc(100% + 10px); left: 0; width: min(320px, calc(100vw - 48px)); padding: 14px; border: 1px solid rgba(255,255,255,.16); border-radius: 10px; color: rgba(255,255,255,.8); background: rgba(12,13,20,.94); box-shadow: 0 12px 36px rgba(0,0,0,.38); line-height: 1.5; }
+.lux-auth-credits-panel a { display: inline-flex; align-items: center; gap: 9px; color: #fff; text-decoration: none; }
+.lux-auth-tmdb-mark { display: block; width: 78px; height: auto; max-height: 22px; box-sizing: content-box; padding: 3px 6px; border-radius: 4px; background: #fff; object-fit: contain; }
+.lux-auth-credits-panel p { margin: 8px 0 0; font-size: .68rem; }
 .lux-auth-panel { flex: 0 0 500px; width: 500px; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 40px 48px; background: #090a0f; z-index: 10; position: relative; }
 .lux-auth-split-layout .lux-auth-card { position: relative; width: min(100%, 390px); padding: 36px 32px; border: 1px solid rgba(255,255,255,.08); border-radius: 24px; background: rgba(21, 21, 27, .95); box-shadow: 0 24px 60px rgba(0,0,0,.7); backdrop-filter: blur(24px); }
 .lux-auth-header { margin-bottom: 24px; }
@@ -777,6 +789,8 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-auth-submit-btn:disabled { opacity: .6; cursor: not-allowed; }
 @media (max-width: 1024px) {
   .lux-auth-brand-badge { top: 24px; left: 24px; }
+  .lux-auth-credits { top: 24px; right: 24px; bottom: auto; left: auto; }
+  .lux-auth-credits-panel { top: calc(100% + 10px); right: 0; bottom: auto; left: auto; }
   .lux-auth-visual { display: none; }
   .lux-auth-panel { flex: 1; width: 100%; padding: 24px; }
 }
@@ -1682,6 +1696,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 .lux-network-proxy-help, .lux-network-proxy-status { margin: -10px 0 0; color: var(--lux-subtle); font-size: .72rem; line-height: 1.55; }
 .lux-network-proxy-status { color: var(--lux-muted); }
 .lux-login-background-warning { margin: -10px 0 0; color: #f3c788; font-size: .72rem; line-height: 1.55; }
+.lux-login-background-status { margin: -10px 0 0; color: var(--lux-muted); font-size: .72rem; line-height: 1.55; }
+.lux-login-background-status.is-error { color: #f3aab8; }
 .lux-network-proxy-actions { display: flex; flex-wrap: wrap; gap: 8px; }
 .lux-network-proxy-diagnostics { display: grid; gap: 12px; margin-top: 17px; padding-top: 17px; border-top: 1px solid var(--lux-line-soft); }
 .lux-network-proxy-egress { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
