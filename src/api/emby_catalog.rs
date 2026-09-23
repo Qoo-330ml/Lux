@@ -189,6 +189,33 @@ pub(super) fn emby_detail_fields(fields: Option<&str>) -> Option<String> {
     (!filtered.is_empty()).then(|| filtered.join(","))
 }
 
+/// Emby item detail responses include the media-source summary even when a
+/// client supplies a narrow Fields projection. Keep that detail behavior
+/// separate from catalog list projections, which continue honoring Fields.
+pub(super) fn emby_item_detail_response_fields(fields: Option<&str>) -> Option<String> {
+    let mut fields = emby_detail_fields(fields)?
+        .split(',')
+        .map(str::trim)
+        .filter(|field| !field.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for required in [
+        "MediaSources",
+        "RunTimeTicks",
+        "Container",
+        "Size",
+        "Bitrate",
+    ] {
+        if !fields
+            .iter()
+            .any(|field| field.eq_ignore_ascii_case(required))
+        {
+            fields.push(required.to_owned());
+        }
+    }
+    Some(fields.join(","))
+}
+
 pub(super) fn normalize_emby_item_type(value: &str) -> Option<String> {
     match value.trim().to_ascii_lowercase().as_str() {
         "movie" => Some("MOVIE".to_owned()),
@@ -2415,6 +2442,7 @@ pub(super) async fn emby_item_response(
     if item_id == principal.user_id.to_string() {
         return emby_user_root_response(state, principal).await;
     }
+    let response_fields = emby_item_detail_response_fields(fields);
     let internal_item_id = emby_internal_id(item_id);
     if let Ok(library_id) = internal_item_id.parse::<crate::domain::ids::LibraryId>()
         && let Some(libraries) = state.libraries.as_ref()
@@ -2492,7 +2520,7 @@ pub(super) async fn emby_item_response(
                     nfo: None,
                     can_download,
                     can_delete,
-                    fields,
+                    fields: response_fields.as_deref(),
                     primary_image_aspect_ratio: None,
                     include_top_level_media_streams: true,
                     unplayed_item_count,
@@ -2579,7 +2607,7 @@ pub(super) async fn emby_item_response(
                     nfo: nfo.as_ref(),
                     can_download,
                     can_delete,
-                    fields,
+                    fields: response_fields.as_deref(),
                     primary_image_aspect_ratio: aspect_ratio,
                     include_top_level_media_streams: true,
                     unplayed_item_count,
