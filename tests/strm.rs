@@ -328,10 +328,17 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .await?;
     assert_eq!(profiled_playback.status(), reqwest::StatusCode::OK);
     let profiled_playback_body = profiled_playback.json::<Value>().await?;
-    assert!(profiled_playback_body["MediaSources"][0]["DirectStreamUrl"].is_null());
+    let profiled_direct_url = profiled_playback_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing profiled direct stream URL")?;
+    assert!(profiled_direct_url.starts_with(&format!("/Videos/{remote_public_item_id}/stream")));
+    assert!(profiled_direct_url.contains(&format!("MediaSourceId={remote_source_id}")));
+    assert!(profiled_direct_url.contains(&format!("&api_key={token}")));
+    assert!(profiled_direct_url.contains("&UserId=admin"));
+    assert!(profiled_direct_url.contains("luxPlayback"));
     assert_eq!(
         profiled_playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
-        false
+        true
     );
 
     let playback = client
