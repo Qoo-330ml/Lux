@@ -15,6 +15,15 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.1",
+    date: "2026-09-23",
+    sections: [
+      { kind: "fixed", items: [
+        "修复“继续观看”中旧数据的 last_played_at 为空时排在新播放进度之前的问题；空日期记录现在置后，最近观看内容稳定优先显示。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.0",
     date: "2026-09-23",
     sections: [
