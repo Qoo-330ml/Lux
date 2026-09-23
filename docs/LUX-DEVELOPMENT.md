@@ -2134,6 +2134,11 @@ services:
 | LUX-255 | docs/LUX-DEVELOPMENT.md、docs/API.md、docs/COMPATIBILITY.md、src/api/users.rs、src/api/admin_handlers.rs、tests/lux_api_auth.rs、tests/admin_api_key.rs；Lux 用户级客户端令牌与第三方首页 API |
 | LUX-256 | docs/LUX-DEVELOPMENT.md、src/application/thumbnail_policy.rs、src/application/thumbnails.rs、src/application/candidates.rs、src/application/strm_probe.rs、src/storage/、src/api/admin_handlers.rs、web/src/features/admin/AdminLibrariesPage.tsx、web/src/lib/api/types.ts、web/src/react.css、tests/、web/tests/；媒体库缩略图刮削模式与截图优先级 |
 | LUX-258 | docs/LUX-DEVELOPMENT.md、src/storage/users.rs、src/api/admin_handlers.rs、src/api/users.rs、web/src/features/admin/AdminSettingsPage.tsx、web/src/features/auth/LoginPage.tsx、web/src/lib/api/、tests/、web/tests/；登录页背景来源选择（固定海报墙或媒体库最新添加） |
+| LUX-259 | docs/PLUGIN-SDK.md、src/application/plugin_protocol.rs、src/application/plugins.rs、tests/plugins.rs、docs/；登录页背景插件类型与有界数据 RPC 合同 |
+| LUX-260 | migrations/、migrations-postgres/、src/application/、src/storage/、src/api/users.rs、src/api/admin_handlers.rs、tests/、docs/；登录背景插件的后台刷新、缓存、来源选择与公开接口 |
+| LUX-261 | web/src/features/auth/LoginPage.tsx、web/src/features/admin/AdminSettingsPage.tsx、web/src/app/、web/src/lib/api/、web/tests/、docs/；插件来源选择、瀑布流/大图布局和来源鸣谢 |
+| LUX-262 | Lux-plugins/plugins/org.lux.bing-daily-background/、Lux-plugins/index.json、Lux-plugins/tests/；独立必应每日图片插件（完成来源与许可验证后） |
+| LUX-263 | Lux-plugins/plugins/org.lux.tmdb-trending-background/、Lux-plugins/index.json、Lux-plugins/tests/；独立 TMDb 日榜电影+剧集混合海报插件 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6419,6 +6424,136 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 - 不实现 TMDb 热门、TMDb 高分或 Top 250；这些需要后续外置插件榜单发现能力和后台缓存任务。
 - 不改变现有用户媒体库 ACL；该设置明确开启后，登录页展示的海报属于管理员主动选择的公开展示资源。
+
+注：本条只限定 LUX-258 当时的实现范围。后续登录背景插件能力由 LUX-259 至 LUX-263 单独定义和验收，不回溯改变 LUX-258 的验收结果。
+
+#### LUX-259：登录页背景插件类型与数据 RPC 合同
+
+范围：为 Plugin SDK 增加专用 `login_background` 插件类型和 `login_background.get` 能力，定义 provider-neutral、严格有界的数据响应。插件只能提供图片 URL 和必要的来源署名元数据；布局、CSS、HTML、脚本和登录页文案仍由 Lux 主程序决定。必应与 TMDb 插件必须是各自独立的插件包和配置，不扩展或复用 `org.lux.tmdb` 元数据插件的运行时配置。
+
+验收：
+
+- [ ] manifest 校验只允许合法的 `login_background` 类型/能力组合；普通元数据刮削器不能因此被当作登录背景提供者。
+- [ ] `login_background.get` 响应只包含 `contentKind`（`POSTER_FEED` 或 `HERO_IMAGE`）、有界 `items`，以及纯文本的来源/版权署名字段；不接受 HTML、CSS、脚本或任意组件定义。
+- [ ] `POSTER_FEED` 最多 40 项，`HERO_IMAGE` 恰好 1 项；每项图片必须是 HTTPS，限制长度并校验域名属于该插件声明的图片主机；拒绝凭据、localhost、私网/链路本地 IP 和非 HTTP(S) 地址。
+- [ ] 插件超时、畸形响应、超量响应和未知内容类型均产生可诊断的 provider 错误，不影响 Lux 主进程、其他插件或现有静态背景。
+- [ ] `docs/PLUGIN-SDK.md` 给出 manifest、RPC 请求/响应、URL 安全和署名字段的版本化示例。
+
+验证：
+
+- `cargo test --locked --test plugins`
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --test plugins --all-features -- -D warnings`
+- 外部插件 SDK fixture/manifest/RPC 合同测试。
+
+依赖：LUX-142、LUX-258。
+
+明确不做：
+
+- 不在本任务新增管理员界面、公开背景 API、刷新调度、持久化缓存或任一供应商插件。
+- 插件不允许注入登录页代码、改变 Lux 的视觉布局或直接读取 Lux 数据库/媒体库。
+
+#### LUX-260：登录背景插件缓存与宿主接口
+
+范围：由 Lux 主程序管理动态插件来源的选择、后台刷新和有限缓存。扩展现有 `loginBackgroundSource` 为 `STATIC`、`RECENTLY_ADDED` 或 `PLUGIN:<plugin-id>`；插件调用只由受限后台 worker 执行，未登录的 `GET /api/v1/auth/login-background` 只读已校验缓存，绝不在请求路径启动插件或访问第三方网络。不可用、未启用、无有效缓存或刷新失败时回退固定海报墙，并保留管理员所选来源以便恢复后生效。
+
+验收：
+
+- [ ] 已安装、已启用、可用且声明 `login_background` 的插件才可被选作来源；设置写入仍需管理员鉴权和 CSRF。
+- [ ] 插件在首次启用/切换后由后台异步刷新，并至少每日刷新一次；失败采用有界退避，接口在刷新期间读取旧缓存，缓存超过 48 小时则回退 `STATIC`。
+- [ ] SQLite 与 PostgreSQL 持久化有界、已校验的插件数据缓存；只缓存数据合同，不下载、重编码或复制图片二进制。
+- [ ] 公开接口按宿主固定 DTO 返回来源、经校验的 `contentKind`、最多 40 个 HTTPS 图片 URL 和必要署名；不透传插件原始 JSON、凭据、媒体标题、文件路径或库信息。
+- [ ] 插件卸载/禁用、进程崩溃、超时、DNS/上游故障和空结果均回退静态墙；管理员端能看出所选插件不可用，而不是静默改写所选配置。
+- [ ] 用户代理直接请求已声明的图片 CDN；系统不提供任意 URL 代理，不因登录请求造成 SSRF，也不把第三方 URL 作为认证或授权依据。
+- [ ] 数据 TTL 与第三方许可一致；TMDb 数据保留远低于其六个月缓存上限。
+
+验证：
+
+- `cargo test --locked --test login_background --test plugins`
+- 新增 SQLite/PostgreSQL cache migration 与空库迁移测试。
+- `cargo fmt --all -- --check`
+- `cargo clippy --locked --all-targets --all-features -- -D warnings`
+
+依赖：LUX-259、LUX-258。
+
+明确不做：
+
+- 不在未登录 API 请求路径调用插件、TMDb 或必应，不创建无限增长的图片缓存。
+- 不生成本地压缩版海报、不逐项转码媒体库新资源、不做通用第三方图片代理。
+
+#### LUX-261：登录背景管理与两种宿主布局
+
+范围：在服务器设置中列出当前已安装且可用的登录背景插件来源；登录页只按 Lux 固定模板渲染插件数据。海报流继续复用现有倾斜瀑布流；宽幅图片使用宿主内置的单幅大图布局。增加可访问的“关于/鸣谢”入口承载 TMDb 品牌和法定来源说明；TMDb 说明不放回登录按钮下方。必应当日图片的摄影者/版权信息只在背景区域以低干扰形式展示。
+
+验收：
+
+- [ ] 管理员可选固定海报墙、媒体库最新添加、必应每日图片或 TMDb 日榜海报；未安装/不可用插件不会被错误展示为可用选项，并清楚提示启用和公开访问的风险。
+- [ ] `POSTER_FEED` 使用既有五列紧凑倾斜瀑布流和当前位置/留白，不改变尺寸、列距、倾斜角、交错规则；`HERO_IMAGE` 用 Lux 自带 CSS 呈现，不加载插件自定义 UI。
+- [ ] 登录页 API 错误、空海报、图片 404、插件失效时保持完整可登录状态并显示静态背景。
+- [ ] 登录卡片按钮下不新增“支持 Lux/Emby”或供应商免责声明；TMDb 规定的 logo 与文字放在可访问的“关于/鸣谢”区域，且 TMDb 标识不比 Lux 品牌更显著。
+- [ ] 必应图片按来源许可要求展示其每日图片标题/摄影者/版权信息；若宿主不能遵守许可，不显示该来源。
+- [ ] 登录页对读屏器、键盘和窄视口保持可用，背景图不抢焦点且不影响表单自动填充。
+
+验证：
+
+- `pnpm --dir web test -- --run web/tests/login-page.test.tsx web/tests/admin-settings.test.tsx web/tests/api-client.test.ts`
+- `pnpm --dir web build`
+- Playwright 桌面/窄屏检查四种来源、降级路径、图片加载失败、控制台和网络请求；不得把 mock 结果描述成已部署验证。
+
+依赖：LUX-259、LUX-260、LUX-110。
+
+明确不做：
+
+- 不让插件注入任意前端代码或自定义主题；不改变既有登录表单和按钮下方留白。
+- 不生成或上传媒体库图片衍生文件。
+
+#### LUX-262：独立必应每日图片插件
+
+范围：在外部 `Lux-plugins` 仓库实现单独发布、单独配置的必应每日图片提供者，只返回一张宽幅大图及其当日来源署名。编码前先审查 GitHub 和 Lux-plugins 中现有可复用实现，核对许可证、依赖、维护状态及安全/运行时适配性，并记录复用或不复用的理由。开发前必须确认供应端点受支持、地区行为稳定，并确认其服务条款允许将图片作为第三方应用的登录背景展示；不可将网页抓取或未公开端点作为已受支持 API。
+
+验收：
+
+- [ ] 必应来源与许可验证记录在插件仓库文档；如无受支持且许可允许的来源，停止插件发布并向项目所有者报告，不绕过限制。
+- [ ] GitHub 复用审查完成并记录：可在许可证兼容时改造已有解析/请求代码；不依赖第三方托管 API/容器；代码许可证不能替代 Bing 图片展示授权。
+- [ ] 插件使用独立 manifest、独立 ID、独立配置和独立版本；不依赖 TMDb 插件或 TMDb 凭据。
+- [ ] 只返回当前日可用的一张 HTTPS 大图和纯文本标题/摄影者/版权署名；处理市场差异、许可限制和缺图时返回明确可恢复错误。
+- [ ] 测试使用固定 fixture/mock，不要求 CI 访问必应真实网络；包通过 Lux SDK manifest/RPC 校验。
+- [ ] 外部插件仓库完成 ARM64 与 x86_64 构建、SHA-256、商店目录和发布验证后，Lux 商店才显示该选项。
+
+验证：外部仓库的 Rust 单测、fixture 网络测试、`cargo fmt --all -- --check`、双架构构建、ZIP/manifest/hash 检验和 `index.json` 校验。
+
+依赖：LUX-259、LUX-260、LUX-261；来源与许可调查为进入编码阶段的前置门。
+
+明确不做：
+
+- 不爬取 Bing 页面 DOM，不请求未经确认授权的历史图片归档，不绕过图片下载限制。
+- 不在插件中打包日图图片、不生成本地压缩文件。
+
+#### LUX-263：独立 TMDb 日榜电影+剧集海报插件
+
+范围：在外部 `Lux-plugins` 仓库实现单独发布、单独配置的 TMDb 登录背景插件。编码前先审查 GitHub 上的 Rust TMDb 客户端和 Lux-plugins 现有 `TmdbClient`，在接口覆盖、依赖/运行时匹配、许可证与维护状态通过后优先复用或小范围抽取；记录最终选择。只请求 TMDb Trending All 日榜（`/3/trending/all/day`），在插件内过滤为电影和剧集并保留 TMDb 原排序，最多提供 40 张可用海报。插件不复用、读取或依赖现有 `org.lux.tmdb` 元数据插件配置。
+
+验收：
+
+- [ ] API 固定使用 `time_window=day` 和 Trending All 混合入口；只保留 `media_type=movie` 或 `tv` 且有 `poster_path` 的项目，过滤人物及无海报项目，按原榜单顺序去重并限制 40 项。
+- [ ] 图片 URL 使用 TMDb 图片 CDN 支持的标准尺寸，优先使用适合海报墙的 `w500`；只生成 URL，不下载或重新编码图片。
+- [ ] 该插件具有独立 package ID、独立 manifest 和独立插件配置/密钥；密钥只在插件进程中使用，不读 `org.lux.tmdb` 配置，不返回 RPC/API，也不写日志。
+- [ ] GitHub/仓库内代码复用审查有记录；若采用第三方 crate/代码，验证其 Trending All/day 响应字段、Rust/Tokio/reqwest 兼容性和许可证；只复用通用客户端代码，不复用元数据插件运行时配置或生命周期。
+- [ ] 仅缓存榜单结构所需的图片引用和刷新时间；支持超时、限流、空榜、缺失海报和 TMDb 故障，并通过宿主静态回退恢复登录页。
+- [ ] 在 Lux“关于/鸣谢”区域展示获准 TMDb Logo 及要求的非背书声明；页面不暗示 TMDb 赞助或认证 Lux。
+- [ ] 上线前确认实际部署用途符合 TMDb API 许可；商业使用必须先取得书面许可，未确认时不发布/启用该 provider。
+- [ ] 测试覆盖 movie/tv/person、缺图、重复项、顺序和上限；不依赖真实 TMDb 网络。
+- [ ] 外部插件仓库完成 ARM64 与 x86_64 构建、SHA-256、商店目录和发布验证后，Lux 商店才显示该选项。
+
+验证：外部仓库的 Rust 单测、mock HTTP fixture、`cargo fmt --all -- --check`、双架构构建、ZIP/manifest/hash 检验和 `index.json` 校验。
+
+依赖：LUX-259、LUX-260、LUX-261。
+
+明确不做：
+
+- 不提供周榜、热门榜、评分榜或 Top 250；不混入人物、季或集。
+- 不把本插件合并进 `org.lux.tmdb`，不复用其设置或运行时进程。
+- 不转码媒体库海报、不镜像 TMDb 图片二进制、不长期缓存 TMDb 响应。
 
 ## 26. 风险与缓解
 
