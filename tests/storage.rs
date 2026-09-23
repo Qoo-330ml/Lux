@@ -201,7 +201,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -221,7 +221,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 128);
+    assert_eq!(second_database.schema_version().await?, 129);
     second_database.close().await;
     Ok(())
 }
@@ -347,7 +347,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .await?;
     assert!(manifest_schema.contains("'DISCOVERING'"));
     assert!(manifest_schema.contains("'POSTPROCESSING'"));
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
 
     database.close().await;
     Ok(())
@@ -599,7 +599,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
     Ok(())
 }
 
@@ -771,7 +771,56 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
+    Ok(())
+}
+
+#[tokio::test]
+async fn login_background_plugin_cache_schema_is_available_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'login_background_plugin_cache'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(table_count, 1);
+
+    sqlx::query("INSERT INTO installed_plugins (plugin_id) VALUES ('org.lux.background-test')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO login_background_plugin_cache (plugin_id, payload_json, refreshed_at)
+         VALUES ('org.lux.background-test', '{}', 100)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let oversized_payload = "x".repeat(262_145);
+    let oversized_insert = sqlx::query(
+        "INSERT INTO login_background_plugin_cache (plugin_id, payload_json, refreshed_at)
+         VALUES ('org.lux.background-test', ?, 101)",
+    )
+    .bind(oversized_payload)
+    .execute(database.pool())
+    .await;
+    assert!(oversized_insert.is_err());
+
+    sqlx::query("DELETE FROM installed_plugins WHERE plugin_id = 'org.lux.background-test'")
+        .execute(database.pool())
+        .await?;
+    let remaining_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM login_background_plugin_cache")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_rows, 0);
     Ok(())
 }
 
@@ -809,7 +858,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
     database.close().await;
     Ok(())
 }
@@ -936,7 +985,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -1118,7 +1167,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

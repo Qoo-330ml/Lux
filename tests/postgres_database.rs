@@ -111,7 +111,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 128);
+    assert_eq!(database.schema_version().await?, 129);
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -124,6 +124,44 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_tables, 5);
+    let login_background_cache_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name = 'login_background_plugin_cache'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(login_background_cache_tables, 1);
+
+    sqlx::query("INSERT INTO installed_plugins (plugin_id) VALUES ('org.lux.background-test')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO login_background_plugin_cache (plugin_id, payload_json, refreshed_at)
+         VALUES ('org.lux.background-test', '{}', 100)",
+    )
+    .execute(database.pool())
+    .await?;
+    let oversized_payload = "x".repeat(262_145);
+    assert!(
+        sqlx::query(
+            "INSERT INTO login_background_plugin_cache (plugin_id, payload_json, refreshed_at)
+             VALUES ('org.lux.background-test', $1, 101)",
+        )
+        .bind(oversized_payload)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    sqlx::query("DELETE FROM installed_plugins WHERE plugin_id = 'org.lux.background-test'")
+        .execute(database.pool())
+        .await?;
+    let remaining_login_background_cache_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM login_background_plugin_cache")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining_login_background_cache_rows, 0);
     let manifest_fingerprint_type: String = sqlx::query_scalar(
         "SELECT data_type
          FROM information_schema.columns
