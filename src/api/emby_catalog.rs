@@ -1556,7 +1556,30 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
         }
         items.push(value);
     }
+    emby_apply_strm_item_paths(catalog, &catalog_items, &mut items).await?;
     Ok(items)
+}
+
+async fn emby_apply_strm_item_paths(
+    catalog: &CatalogService,
+    items: &[CatalogItem],
+    values: &mut [Value],
+) -> Result<(), StatusCode> {
+    if !values.iter().any(|value| value.get("Path").is_some()) {
+        return Ok(());
+    }
+    let filesystem_paths = catalog
+        .strm_item_filesystem_paths(items)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    for (item, value) in items.iter().zip(values) {
+        if let Some(path) = filesystem_paths.get(&item.id)
+            && let Value::Object(object) = value
+        {
+            object.insert("Path".to_owned(), json!(path));
+        }
+    }
+    Ok(())
 }
 
 async fn emby_unplayed_episode_counts(
@@ -1956,6 +1979,16 @@ pub(super) async fn emby_single_id_lookup_response(
     {
         let source = sources.remove(index);
         sources.insert(0, source);
+    }
+    if emby_apply_strm_item_paths(
+        catalog,
+        std::slice::from_ref(&item),
+        std::slice::from_mut(&mut item_json),
+    )
+    .await
+    .is_err()
+    {
+        return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
     if emby_fields_include(query.fields.as_deref(), "People") {
         let actors = match state.people.as_ref() {
@@ -2451,7 +2484,7 @@ pub(super) async fn emby_item_response(
                     Ok(count) => count,
                     Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
                 };
-            let item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
+            let mut item_json = emby_catalog_item_json_with_state_and_aspect_ratio(
                 &item,
                 &state.server_id,
                 None,
@@ -2465,6 +2498,16 @@ pub(super) async fn emby_item_response(
                     unplayed_item_count,
                 },
             );
+            if emby_apply_strm_item_paths(
+                catalog,
+                std::slice::from_ref(&item),
+                std::slice::from_mut(&mut item_json),
+            )
+            .await
+            .is_err()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             Json(item_json).into_response()
         }
         Some(mut item) => {
@@ -2542,6 +2585,16 @@ pub(super) async fn emby_item_response(
                     unplayed_item_count,
                 },
             );
+            if emby_apply_strm_item_paths(
+                catalog,
+                std::slice::from_ref(&item),
+                std::slice::from_mut(&mut item_json),
+            )
+            .await
+            .is_err()
+            {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
             if work_plan.read_people
                 && let Value::Object(object) = &mut item_json
             {
@@ -3179,8 +3232,9 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         ]);
         // Emby always emits the item's creation/modification timestamps and a
         // filesystem path on detail DTOs. Lux ids are UUIDv7, so the embedded
-        // timestamp is the real item creation time; the path is a stable,
-        // harmless label because Lux never reveals real local paths.
+        // timestamp is the real item creation time; the path is a stable
+        // placeholder unless the authorized Emby STRM projection can supply
+        // the indexed `.strm` file path.
         if let Some(created) = emby_timestamp(item.added_at) {
             object.insert("DateCreated".to_owned(), json!(created));
         }
@@ -3840,9 +3894,9 @@ pub(super) fn emby_playback_container_name(container: &str) -> &str {
     }
 }
 
-/// Emby exposes a filesystem-shaped path on item DTOs. Keep STRM entries
-/// recognizable as `.strm` files without exposing the real filesystem path or
-/// the external playback target; proxies consume the source-level `Path`.
+/// Fallback path for Emby item DTOs. Authorized STRM DTOs replace this label
+/// with the indexed `.strm` filesystem path; media-source paths remain the
+/// external playback target.
 pub(super) fn emby_safe_path(item: &CatalogItem, default_source: Option<&CatalogSource>) -> String {
     let title = &item.title;
     if matches!(

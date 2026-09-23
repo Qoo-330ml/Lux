@@ -3553,6 +3553,51 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_strm_source_paths_by_ids(
+        &self,
+        source_ids: &[String],
+    ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
+        let mut paths = Vec::new();
+        for source_ids in source_ids.chunks(500) {
+            let placeholders = std::iter::repeat_n("?", source_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
+                        lr.canonical_path AS root_path, fe.relative_path
+                 FROM media_sources ms
+                 JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                 JOIN library_roots lr ON lr.id = fe.library_root_id
+                 WHERE ms.source_kind = 'STRM_URL'
+                   AND fe.is_missing = 0
+                   AND ms.id IN ({placeholders})
+                 ORDER BY ms.item_id, ms.is_default DESC, ms.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for source_id in source_ids {
+                statement = statement.bind(source_id);
+            }
+            paths.extend(
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .into_iter()
+                    .map(|row| StoredMediaSourcePath {
+                        source_id: row.get("source_id"),
+                        item_id: row.get("item_id"),
+                        probe_status: row.get("probe_status"),
+                        root_path: row.get("root_path"),
+                        relative_path: row.get("relative_path"),
+                    }),
+            );
+        }
+        Ok(paths)
+    }
+
     pub(crate) async fn find_authorized_playback_source(
         &self,
         item_id: &str,

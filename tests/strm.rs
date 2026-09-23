@@ -114,8 +114,14 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
             .bind(&path_item_id)
             .fetch_one(database.pool())
             .await?;
-    let expected_remote_item_path = format!("/media/{}/Remote Movie.strm", library.id);
-    let expected_path_item_path = format!("/media/{}/Path Movie.strm", library.id);
+    let expected_remote_item_path = tokio::fs::canonicalize(root.join("Remote.Movie.2024.strm"))
+        .await?
+        .to_string_lossy()
+        .into_owned();
+    let expected_path_item_path = tokio::fs::canonicalize(root.join("Path.Movie.2026.strm"))
+        .await?
+        .to_string_lossy()
+        .into_owned();
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let proxy_listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -229,6 +235,29 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         remote_source_id
     );
     assert_eq!(popcorn_detail_body["Path"], expected_remote_item_path);
+
+    let remote_item_list = client
+        .get(format!("http://{address}/Items"))
+        .query(&[
+            ("IncludeItemTypes", "Movie"),
+            ("Recursive", "true"),
+            ("Fields", "Path"),
+            ("Limit", "20"),
+        ])
+        .header("X-Emby-Token", &token)
+        .send()
+        .await?;
+    assert_eq!(remote_item_list.status(), reqwest::StatusCode::OK);
+    let remote_item_list_body = remote_item_list.json::<Value>().await?;
+    let remote_list_item = remote_item_list_body["Items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["Id"] == remote_public_item_id)
+        })
+        .ok_or("remote STRM item missing from Emby list")?;
+    assert_eq!(remote_list_item["Path"], expected_remote_item_path);
 
     let public_detail = client
         .get(format!("http://{address}/Items/{remote_public_item_id}"))

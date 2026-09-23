@@ -5630,8 +5630,8 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 
 #### LUX-234：通用外部代理的 URL 型 `.strm` 交接与 Emby 数字条目 ID
 
-范围：修正 URL 型 `.strm` 与本地路径型 `.strm` 在第三方媒体代理场景下的 Emby 播放源合同。两种目标都保留原始
-条目 `Path` 和 `MediaSources[].Path`；在 `PlaybackInfo` 中使用标准带短期票据的 `DirectStreamUrl`，并使用
+范围：修正 URL 型 `.strm` 与本地路径型 `.strm` 在第三方媒体代理场景下的 Emby 播放源合同。Emby 条目 `Path`
+返回该条目已索引的 `.strm` 文件系统路径，`MediaSources[].Path` 保留 STRM 原始目标；在 `PlaybackInfo` 中使用标准带短期票据的 `DirectStreamUrl`，并使用
 `Protocol=File`、`IsRemote=false` 的代理兼容表示。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型目标的
 `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby 用户 token 作为 `api_key` 写入同一签名 URL；本地文件和 SMB/FTP
 解析源不携带长期 token。无论提示取值如何，Lux 都要求短期票据，使具备自身映射或 302 能力的外部代理可以从原始 `Path`
@@ -5652,7 +5652,7 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 
 验收：
 
-- [x] URL 与路径型 `.strm` 的 Emby 条目 `Path` 和 `MediaSources[].Path` 均保留原始目标，且 `PlaybackInfo` 中代理交接所需的
+- [x] URL 与路径型 `.strm` 的 Emby 条目 `Path` 返回已索引的 `.strm` 文件系统路径，`MediaSources[].Path` 保留原始目标；路径只通过已授权条目 DTO 暴露。`PlaybackInfo` 中代理交接所需的
       `Protocol`、`IsRemote`、标准带短期票据的 `DirectStreamUrl` 和权限行为一致；URL/路径型 `.strm` 对所有第三方播放器的
       `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby 用户 token 作为 `api_key` 写入签名 URL；本地文件和 SMB/FTP
       解析源不携带长期 token。
@@ -5661,7 +5661,7 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 - [x] 扫描、`PlaybackInfo` 和外部代理交接测试不访问原始目标；不新增数据库字段、迁移、媒体字节代理、转码或具体代理适配。
 - [x] Emby 兼容层对已有和新建媒体条目统一输出稳定纯数字 ID；输入边界兼容数字 ID 与历史 UUID，内部数据库和 Lux API 不变。
 - [x] 数字 ID 兼容覆盖标准媒体详情、目录父子查询、PlaybackInfo、视频/字幕/图片/下载入口、进度回调以及已看/收藏操作；
-      SMB/FTP 的目标解析和 URL/Path STRM 的原始 `Path` 保持不变。
+      SMB/FTP 的目标解析和 URL/Path STRM 的 `MediaSources[].Path` 原始目标保持不变。
 
 验证：
 

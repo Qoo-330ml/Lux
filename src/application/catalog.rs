@@ -1093,6 +1093,57 @@ impl CatalogService {
         Ok(Some(item))
     }
 
+    pub(crate) async fn strm_item_filesystem_paths(
+        &self,
+        items: &[CatalogItem],
+    ) -> Result<HashMap<String, String>, CatalogError> {
+        let source_to_item = items
+            .iter()
+            .filter_map(|item| {
+                let source = item
+                    .media_sources
+                    .iter()
+                    .find(|source| source.is_default)
+                    .or_else(|| item.media_sources.first())?;
+                (source.source_kind == "STRM_URL").then(|| (source.id.clone(), item.id.clone()))
+            })
+            .collect::<HashMap<_, _>>();
+        if source_to_item.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let source_ids = source_to_item.keys().cloned().collect::<Vec<_>>();
+        let stored_paths = self
+            .database
+            .list_strm_source_paths_by_ids(&source_ids)
+            .await?;
+        let mut item_paths = HashMap::new();
+        for stored_path in stored_paths {
+            let Some(item_id) = source_to_item.get(&stored_path.source_id) else {
+                continue;
+            };
+            let root = std::path::Path::new(&stored_path.root_path);
+            let relative = std::path::Path::new(&stored_path.relative_path);
+            if !root.is_absolute()
+                || relative.as_os_str().is_empty()
+                || !relative
+                    .components()
+                    .all(|component| matches!(component, std::path::Component::Normal(_)))
+            {
+                continue;
+            }
+            let full_path = root.join(relative);
+            if !full_path.starts_with(root) {
+                continue;
+            }
+            let Some(full_path) = full_path.to_str() else {
+                continue;
+            };
+            item_paths.insert(item_id.clone(), full_path.to_owned());
+        }
+        Ok(item_paths)
+    }
+
     pub(crate) async fn find_items(
         &self,
         principal: AccessPrincipal,
