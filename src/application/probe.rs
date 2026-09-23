@@ -144,6 +144,15 @@ pub fn parse_probe_json(bytes: &[u8]) -> Result<MediaProbeResult, ProbeError> {
                 ));
             }
             let tags = stream.get("tags").and_then(Value::as_object);
+            let mut details = ffprobe_stream_details(stream);
+            if let Some(disposition) = disposition
+                && disposition.contains_key("hearing_impaired")
+            {
+                details.insert(
+                    "IsHearingImpaired".to_owned(),
+                    Value::Bool(bool_field(disposition, "hearing_impaired")),
+                );
+            }
             streams.push(MediaStreamResult {
                 stream_index,
                 stream_type,
@@ -156,7 +165,7 @@ pub fn parse_probe_json(bytes: &[u8]) -> Result<MediaProbeResult, ProbeError> {
                 is_forced: disposition
                     .and_then(|value| integer_field(value, "forced"))
                     .is_some_and(|value| value != 0),
-                details: ffprobe_stream_details(stream),
+                details,
             });
         }
     }

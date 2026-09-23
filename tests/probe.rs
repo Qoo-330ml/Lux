@@ -73,6 +73,27 @@ fn probe_json_keeps_container_duration_bitrate_and_media_streams() {
 }
 
 #[test]
+fn ffprobe_preserves_hearing_impaired_subtitle_disposition() {
+    let result = parse_probe_json(
+        br#"{
+            "streams": [{
+                "index": 2,
+                "codec_type": "subtitle",
+                "codec_name": "subrip",
+                "tags": {"language": "eng", "title": "SDH"},
+                "disposition": {"default": 0, "forced": 0, "hearing_impaired": 1}
+            }]
+        }"#,
+    )
+    .expect("valid ffprobe subtitle stream");
+
+    assert_eq!(
+        result.streams[0].details.get("IsHearingImpaired"),
+        Some(&serde_json::json!(true))
+    );
+}
+
+#[test]
 fn malformed_probe_json_is_rejected() {
     assert!(matches!(
         parse_probe_json(br#"{"format":{"duration":"not-a-number"}}"#),

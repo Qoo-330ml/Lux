@@ -4338,11 +4338,7 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("und");
-    let display_title = stream
-        .title
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or(emby_stream_type(&stream.stream_type));
+    let display_title = emby_media_stream_display_title(stream);
     let mut value = json!({
         "Index": stream.index,
         "Type": emby_stream_type(&stream.stream_type),
@@ -4366,6 +4362,119 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
         }
     }
     value
+}
+
+fn emby_media_stream_display_title(stream: &crate::application::catalog::CatalogStream) -> String {
+    let stream_type = emby_stream_type(&stream.stream_type);
+    let title = stream
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if !matches!(stream_type, "Audio" | "Subtitle") {
+        return title.unwrap_or(stream_type).to_owned();
+    }
+
+    let language = stream
+        .details
+        .get("DisplayLanguage")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| stream.language.as_deref().and_then(emby_language_name));
+    let codec = stream
+        .codec
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_uppercase());
+
+    let mut parts = Vec::new();
+    if let Some(language) = language {
+        parts.push(language);
+    }
+    if stream_type == "Audio" {
+        if let Some(codec) = codec {
+            parts.push(codec);
+        }
+        if let Some(layout) = stream
+            .details
+            .get("ChannelLayout")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            let layout = layout.split('(').next().unwrap_or(layout).trim();
+            if !layout.is_empty() {
+                parts.push(layout.to_owned());
+            }
+        } else if let Some(channels) = stream
+            .details
+            .get("Channels")
+            .and_then(emby_integer_value)
+            .and_then(|value| value.as_i64())
+        {
+            parts.push(format!("{channels} channels"));
+        }
+    } else if let Some(codec) = codec {
+        parts.push(format!("({codec})"));
+    }
+
+    let mut display_title = parts.join(" ");
+    if let Some(title) = title.filter(|value| !value.eq_ignore_ascii_case(stream_type)) {
+        if display_title.is_empty() {
+            display_title.push_str(title);
+        } else if !display_title
+            .to_ascii_lowercase()
+            .contains(&title.to_ascii_lowercase())
+        {
+            if title
+                .to_ascii_lowercase()
+                .contains(&display_title.to_ascii_lowercase())
+            {
+                display_title = title.to_owned();
+            } else {
+                display_title.push(' ');
+                display_title.push_str(title);
+            }
+        }
+    }
+
+    if display_title.is_empty() {
+        title.unwrap_or(stream_type).to_owned()
+    } else {
+        display_title
+    }
+}
+
+fn emby_language_name(language: &str) -> Option<String> {
+    let language = language.trim();
+    if language.is_empty() || language.eq_ignore_ascii_case("und") {
+        return None;
+    }
+    let name = match language.to_ascii_lowercase().as_str() {
+        "en" | "eng" => "English",
+        "zh" | "chi" | "zho" => "Chinese",
+        "ja" | "jpn" => "Japanese",
+        "ko" | "kor" => "Korean",
+        "ar" | "ara" => "Arabic",
+        "de" | "deu" | "ger" => "German",
+        "es" | "spa" => "Spanish",
+        "fr" | "fra" | "fre" => "French",
+        "hi" | "hin" => "Hindi",
+        "id" | "ind" => "Indonesian",
+        "it" | "ita" => "Italian",
+        "nl" | "nld" | "dut" => "Dutch",
+        "pl" | "pol" => "Polish",
+        "pt" | "por" => "Portuguese",
+        "ru" | "rus" => "Russian",
+        "th" | "tha" => "Thai",
+        "tr" | "tur" => "Turkish",
+        "vi" | "vie" => "Vietnamese",
+        _ => return Some(language.to_owned()),
+    };
+    Some(name.to_owned())
 }
 
 pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Option<Value> {
@@ -4735,11 +4844,69 @@ pub(super) fn emby_stream_type(stream_type: &str) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use axum::http::StatusCode;
+    use serde_json::json;
 
     use super::{
-        EmbyItemsQuery, catalog_filter_from_emby, emby_page_params, emby_playback_container_name,
+        EmbyItemsQuery, catalog_filter_from_emby, emby_media_stream_json, emby_page_params,
+        emby_playback_container_name,
     };
+
+    use crate::application::catalog::CatalogStream;
+
+    #[test]
+    fn emby_media_stream_title_includes_available_audio_and_subtitle_details() {
+        let audio = CatalogStream {
+            index: 1,
+            stream_type: "AUDIO".to_owned(),
+            codec: Some("eac3".to_owned()),
+            language: Some("eng".to_owned()),
+            title: None,
+            is_external: false,
+            is_default: true,
+            is_forced: false,
+            details: BTreeMap::from([
+                ("BitRate".to_owned(), json!(768_000)),
+                ("ChannelLayout".to_owned(), json!("5.1(side)")),
+                ("Channels".to_owned(), json!(6)),
+                (
+                    "Profile".to_owned(),
+                    json!("Dolby Digital Plus + Dolby Atmos"),
+                ),
+                ("SampleRate".to_owned(), json!(48_000)),
+            ]),
+        };
+
+        let audio = emby_media_stream_json(&audio);
+        assert_eq!(audio["DisplayTitle"], "English EAC3 5.1");
+        assert_eq!(audio["Language"], "eng");
+        assert_eq!(audio["BitRate"], 768_000);
+        assert_eq!(audio["ChannelLayout"], "5.1(side)");
+        assert_eq!(audio["Channels"], 6);
+        assert_eq!(audio["Profile"], "Dolby Digital Plus + Dolby Atmos");
+        assert_eq!(audio["SampleRate"], 48_000);
+
+        let subtitle = CatalogStream {
+            index: 2,
+            stream_type: "SUBTITLE".to_owned(),
+            codec: Some("subrip".to_owned()),
+            language: Some("eng".to_owned()),
+            title: Some("SDH".to_owned()),
+            is_external: false,
+            is_default: false,
+            is_forced: false,
+            details: BTreeMap::from([("IsHearingImpaired".to_owned(), json!(true))]),
+        };
+
+        let subtitle = emby_media_stream_json(&subtitle);
+        assert_eq!(subtitle["DisplayTitle"], "English (SUBRIP) SDH");
+        assert_eq!(subtitle["Language"], "eng");
+        assert_eq!(subtitle["IsHearingImpaired"], true);
+        assert_eq!(subtitle["IsDefault"], false);
+        assert_eq!(subtitle["IsForced"], false);
+    }
 
     #[test]
     fn playback_media_source_uses_emby_mkv_wire_name() {
