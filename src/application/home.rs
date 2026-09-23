@@ -102,6 +102,7 @@ struct CachedSharedSnapshot {
 struct ScanInvalidationState {
     scheduled: bool,
     dirty: bool,
+    refreshing: bool,
 }
 
 struct HomeServiceInner {
@@ -303,22 +304,40 @@ impl HomeService {
         self.inner.catalog.invalidate_library_pages();
     }
 
-    pub(crate) async fn flush_scan_invalidation(&self) {
+    pub(crate) async fn flush_scan_invalidation(&self) -> bool {
         let should_refresh = {
             let mut state = self.inner.scan_invalidation.lock().await;
-            if !state.scheduled {
+            if state.refreshing || (!state.scheduled && !state.dirty) {
                 false
             } else {
-                let dirty = state.dirty;
                 state.scheduled = false;
                 state.dirty = false;
-                dirty
+                state.refreshing = true;
+                true
             }
         };
-        if should_refresh {
-            self.inner.scan_refresh_epoch.fetch_add(1, Ordering::AcqRel);
-            self.refresh_cached_entries(true).await;
+        if !should_refresh {
+            return false;
         }
+
+        let scan_refresh_epoch = self
+            .inner
+            .scan_refresh_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        let refreshed = self.refresh_cached_entries(true).await;
+        let versions_unchanged = self.inner.generation.load(Ordering::Acquire) == generation
+            && self.inner.scan_refresh_epoch.load(Ordering::Acquire) == scan_refresh_epoch;
+
+        let mut state = self.inner.scan_invalidation.lock().await;
+        state.refreshing = false;
+        if !refreshed || !versions_unchanged || state.scheduled || state.dirty {
+            state.scheduled = true;
+            state.dirty = true;
+            return false;
+        }
+        true
     }
 
     fn schedule_refresh(&self) {
@@ -396,9 +415,22 @@ impl HomeService {
         Ok(snapshot)
     }
 
-    async fn refresh_cached_entries(&self, force: bool) {
+    async fn refresh_cached_entries(&self, force: bool) -> bool {
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+        let mut refreshed_all = true;
         if let Err(error) = self.refresh_shared_snapshot(force).await {
             tracing::warn!(%error, "failed to refresh shared home snapshot");
+            if force {
+                return false;
+            }
+            refreshed_all = false;
+        }
+        if force
+            && (self.inner.generation.load(Ordering::Acquire) != generation
+                || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch)
+        {
+            return false;
         }
         let entries = self
             .inner
@@ -415,14 +447,24 @@ impl HomeService {
                 entry.compute_lock.try_lock().ok()
             };
             let Some(_compute_guard) = compute_guard else {
+                if force {
+                    refreshed_all = false;
+                }
                 continue;
             };
-            let generation = self.inner.generation.load(Ordering::Acquire);
-            let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+            let entry_generation = self.inner.generation.load(Ordering::Acquire);
+            let entry_scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+            if force
+                && (entry_generation != generation
+                    || entry_scan_refresh_epoch != scan_refresh_epoch)
+            {
+                refreshed_all = false;
+                continue;
+            }
             let cached = entry.value.lock().await;
             if !force
                 && cached.as_ref().is_some_and(|cached| {
-                    cached.generation == generation
+                    cached.generation == entry_generation
                         && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
                 })
             {
@@ -436,20 +478,29 @@ impl HomeService {
             };
             match result {
                 Some(Ok(snapshot))
-                    if self.inner.generation.load(Ordering::Acquire) == generation
+                    if self.inner.generation.load(Ordering::Acquire) == entry_generation
                         && self.inner.scan_refresh_epoch.load(Ordering::Acquire)
-                            == scan_refresh_epoch =>
+                            == entry_scan_refresh_epoch =>
                 {
                     *entry.value.lock().await = Some(CachedSnapshot {
-                        generation,
+                        generation: entry_generation,
                         refreshed_at: Instant::now(),
                         snapshot: Arc::new(snapshot),
                     });
                 }
-                Some(Ok(_)) | None => self.schedule_refresh(),
-                Some(Err(error)) => tracing::debug!(%error, "home cache refresh failed"),
+                Some(Ok(_)) | None => {
+                    refreshed_all = false;
+                    self.schedule_refresh();
+                }
+                Some(Err(error)) => {
+                    refreshed_all = false;
+                    tracing::debug!(%error, "home cache refresh failed");
+                }
             }
         }
+        refreshed_all
+            && self.inner.generation.load(Ordering::Acquire) == generation
+            && self.inner.scan_refresh_epoch.load(Ordering::Acquire) == scan_refresh_epoch
     }
 
     async fn build_cached_snapshot(
@@ -665,7 +716,7 @@ mod tests {
         home.invalidate_scan_batch().await;
         assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
 
-        home.flush_scan_invalidation().await;
+        assert!(home.flush_scan_invalidation().await);
         assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
 
         let after_scan = home
@@ -674,8 +725,36 @@ mod tests {
             .expect("user snapshot after scan");
         assert!(!std::ptr::eq(first.as_ref(), after_scan.as_ref()));
 
-        home.flush_scan_invalidation().await;
+        assert!(!home.flush_scan_invalidation().await);
         assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_flush_without_pending_invalidation_is_a_noop() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+        let principal = AccessPrincipal::new(UserId::new(), false);
+        let first = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("initial user snapshot");
+
+        assert!(!home.flush_scan_invalidation().await);
+
+        let after_noop = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("user snapshot after no-op flush");
+        assert!(std::ptr::eq(first.as_ref(), after_noop.as_ref()));
     }
 
     #[tokio::test]

@@ -3610,8 +3610,9 @@ impl ScanJobService {
 
     async fn flush_home_after_scan_terminal(&self) {
         if let Some(home) = &self.home {
-            home.flush_scan_invalidation().await;
-            self.user_events.publish_home_now().await;
+            if home.flush_scan_invalidation().await {
+                self.user_events.publish_home_now().await;
+            }
         }
     }
 
@@ -3645,7 +3646,7 @@ impl ScanJobService {
     }
 
     async fn cancel_running_job(&self, job_id: &str) -> Result<ScanBatchReport, ScanJobError> {
-        if self.database.find_scan_job(job_id).await?.is_none() {
+        let Some(job) = self.database.find_scan_job(job_id).await? else {
             self.clear_cancellation_flag(job_id);
             self.flush_home_after_scan_terminal().await;
             return Ok(ScanBatchReport {
@@ -3654,7 +3655,7 @@ impl ScanJobService {
                 created_items: 0,
                 completed: true,
             });
-        }
+        };
         self.database
             .finish_scan_manifest(job_id, "CANCELLED")
             .await?;
@@ -3665,6 +3666,11 @@ impl ScanJobService {
         self.database
             .finish_scan_job(job_id, "CANCELLED", None)
             .await?;
+        if job.scan_phase != "POSTPROCESSING"
+            && let Some(home) = &self.home
+        {
+            home.invalidate_scan_batch().await;
+        }
         self.flush_home_after_scan_terminal().await;
         self.record_event(job_id, "INFO", "JOB_CANCELLED", "任务已取消", "{}")
             .await;
@@ -5213,6 +5219,10 @@ impl ScanJobService {
                 .await;
         }
         self.clear_cancellation_flag(&job.id);
+        if let Some(home) = &self.home {
+            home.invalidate_scan_batch().await;
+        }
+        self.flush_home_after_scan_terminal().await;
         Ok(ScanBatchReport {
             status: "COMPLETED".to_owned(),
             processed: 0,
@@ -6647,6 +6657,11 @@ impl ScanJobService {
         self.database
             .finish_scan_job(&job.id, "FAILED", Some(&error.to_string()))
             .await?;
+        if job.scan_phase != "POSTPROCESSING"
+            && let Some(home) = &self.home
+        {
+            home.invalidate_scan_batch().await;
+        }
         self.record_event(&job.id, "ERROR", error_code, "扫描任务失败", "{}")
             .await;
         let failed_job = self.database.find_scan_job(&job.id).await?;
@@ -6679,6 +6694,11 @@ impl ScanJobService {
         self.database
             .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
             .await?;
+        if job.scan_phase != "POSTPROCESSING"
+            && let Some(home) = &self.home
+        {
+            home.invalidate_scan_batch().await;
+        }
         self.record_event(job_id, "ERROR", error_code, "扫描任务失败", "{}")
             .await;
         let failed_job = self.database.find_scan_job(job_id).await?;
@@ -7345,6 +7365,7 @@ impl ScanJobService {
                 }
             };
             if report.processed > 0
+                && !report.completed
                 && let Some(home) = &self.home
             {
                 home.invalidate_scan_batch().await;
@@ -7411,10 +7432,7 @@ impl ScanJobService {
                         false
                     };
                     self.run_auto_library_cover_after_scan(job_id).await?;
-                    if let Some(home) = &self.home {
-                        home.flush_scan_invalidation().await;
-                        self.user_events.publish_home_now().await;
-                    }
+                    self.flush_home_after_scan_terminal().await;
                     self.publish_media_added_event(&completed_job, created_items)
                         .await;
                     if !strm_probe_scheduled {
@@ -7471,10 +7489,7 @@ impl ScanJobService {
                             .await;
                     }
                 }
-                if let Some(home) = &self.home {
-                    home.flush_scan_invalidation().await;
-                    self.user_events.publish_home_now().await;
-                }
+                self.flush_home_after_scan_terminal().await;
                 self.publish_media_added_event(&completed_job, created_items)
                     .await;
             }
@@ -9310,11 +9325,115 @@ fn throughput_per_second(items: usize, elapsed_ms: u128) -> u64 {
 mod tests {
     use super::{
         ManifestDirectoryReader, ManifestRemovalOutcome, MixedClassification,
-        MixedClassificationCache, NewScanManifestEntry, classify_manifest_removal_outcomes,
-        classify_mixed_file, manifest_root_identity_matches, media_source_folder,
-        normalize_incremental_path, read_manifest_strm_target, safe_scan_activity_label,
-        stat_manifest_relative_file_sync, stat_manifest_root_sync,
+        MixedClassificationCache, NewScanManifestEntry, ScanJobService,
+        classify_manifest_removal_outcomes, classify_mixed_file, manifest_root_identity_matches,
+        media_source_folder, normalize_incremental_path, read_manifest_strm_target,
+        safe_scan_activity_label, stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
+
+    #[tokio::test]
+    async fn full_manifest_scan_refreshes_home_once_before_postprocessing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{
+                access::{AccessPrincipal, MediaAccessService},
+                admin_events::{UserEventHub, UserEventScope},
+                catalog::CatalogService,
+                home::HomeService,
+                libraries::LibraryService,
+                setup::SetupService,
+                webhooks::WebhookService,
+            },
+            config::Config,
+            library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let admin = SetupService::new(database.clone())?
+            .complete("Admin", "Admin", "correct password")
+            .await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, true)
+            .await?;
+        let root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&root).await?;
+        tokio::fs::write(root.join("Home.Refresh.2025.mkv"), b"fixture").await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-UTF-8 root path")?)
+            .await?;
+
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), MediaAccessService::new(database.clone())),
+            libraries,
+        );
+        let principal = AccessPrincipal::new(admin.id, true);
+        let library_ids = [library.id.to_string()];
+        let before = home.snapshot(principal, library_ids.to_vec()).await?;
+        assert_eq!(before.recently_added.total, 0);
+
+        let user_events = UserEventHub::new();
+        let mut receiver = user_events.subscribe();
+        let webhooks = WebhookService::new(database.clone(), config.config_dir.clone())?;
+        webhooks
+            .create_destination(
+                "Scan completion test",
+                "http://127.0.0.1:8098/hook",
+                true,
+                true,
+                &["SCAN_COMPLETED".to_owned()],
+                None,
+            )
+            .await?;
+        let jobs = ScanJobService::new(database.clone())
+            .with_home(home.clone())
+            .with_user_events(user_events)
+            .with_webhooks(webhooks);
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        loop {
+            let report = jobs.run_batch(&job.id, 100).await?;
+            if report.completed {
+                assert_eq!(report.status, "COMPLETED");
+                break;
+            }
+        }
+
+        let stored_job = database
+            .find_scan_job(&job.id)
+            .await?
+            .ok_or("scan job disappeared")?;
+        assert_eq!(stored_job.scan_phase, "POSTPROCESSING");
+        assert_eq!(receiver.try_recv(), Ok(UserEventScope::Home));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        let scan_completed_events: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM notification_events
+             WHERE event_type = 'SCAN_COMPLETED' AND dedupe_key = ?",
+        )
+        .bind(format!("scan:{}:SCAN_COMPLETED", job.id))
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(scan_completed_events, 1);
+        let after_index = home.snapshot(principal, library_ids.to_vec()).await?;
+        assert_eq!(after_index.recently_added.total, 1);
+
+        let repeated_postprocessing_batch = jobs.run_batch(&job.id, 100).await?;
+        assert_eq!(repeated_postprocessing_batch.status, "COMPLETED");
+
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+        Ok(())
+    }
 
     #[cfg(any(
         target_os = "linux",
