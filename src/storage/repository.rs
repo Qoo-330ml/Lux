@@ -74,6 +74,8 @@ const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 const BATCH_INSERT_CHUNK_SIZE: usize = 100;
 // Four binds per reconciliation row keep 200 rows below SQLite's historical 999-variable limit.
 const SCAN_DML_CHUNK_SIZE: usize = 200;
+// Eight binds per delta row keep each insert batch below SQLite's historical 999-variable limit.
+const SCAN_MANIFEST_DELTA_BATCH_SIZE: usize = 100;
 const RECOMMENDATION_RATING_CACHE_TTL_SECONDS: i64 = 30 * 86_400;
 const DATABASE_POOL_MAX_CONNECTIONS_ENV: &str = "LUX_DB_MAX_CONNECTIONS";
 const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
@@ -1018,6 +1020,52 @@ pub(crate) struct StoredScanJob {
     pub(crate) auto_metadata_match: bool,
     pub(crate) current_item: Option<String>,
     pub(crate) scan_phase: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // LUX-266 wires these values into the persisted discovery worker.
+pub(crate) struct NewScanManifestRoot<'a> {
+    pub(crate) library_root_id: &'a str,
+    pub(crate) is_available: bool,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // LUX-266 wires these values into the persisted discovery worker.
+pub(crate) struct NewScanManifest<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) job_id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) roots: &'a [NewScanManifestRoot<'a>],
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // LUX-267 supplies computed reconciliation deltas through this boundary.
+pub(crate) struct NewScanManifestDelta<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) observation_sequence: Option<i64>,
+    pub(crate) delta_kind: &'a str,
+    pub(crate) base_filesystem_entry_id: Option<&'a str>,
+    pub(crate) base_fingerprint: Option<&'a [u8]>,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // LUX-266 reads progress while recovering persisted discovery work.
+pub(crate) struct StoredScanManifest {
+    pub(crate) id: String,
+    pub(crate) job_id: String,
+    pub(crate) library_id: String,
+    pub(crate) state: String,
+    pub(crate) root_count: i64,
+    pub(crate) discovered_directory_count: i64,
+    pub(crate) completed_directory_count: i64,
+    pub(crate) observed_file_count: i64,
+    pub(crate) add_count: i64,
+    pub(crate) change_count: i64,
+    pub(crate) remove_count: i64,
+    pub(crate) reappeared_count: i64,
+    pub(crate) applied_delta_count: i64,
 }
 
 #[derive(Debug)]

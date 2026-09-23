@@ -50,6 +50,17 @@ fn sidecar_target_query(values: &str) -> String {
     )
 }
 
+fn valid_scan_manifest_transition(expected: &str, next: &str) -> bool {
+    matches!(
+        (expected, next),
+        ("DISCOVERING", "READY_TO_DIFF" | "FAILED" | "CANCELLED")
+            | ("READY_TO_DIFF", "APPLYING" | "FAILED" | "CANCELLED")
+            | ("APPLYING", "INDEXED" | "FAILED" | "CANCELLED")
+            | ("INDEXED", "POSTPROCESSING" | "COMPLETED" | "FAILED")
+            | ("POSTPROCESSING", "COMPLETED" | "FAILED" | "CANCELLED")
+    )
+}
+
 impl Database {
     /// Marks every unfinished persistent background job as cancelled.
     ///
@@ -438,6 +449,448 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    #[allow(dead_code)] // LUX-266 starts new full scans through this persistence boundary.
+    pub(crate) async fn create_scan_manifest(
+        &self,
+        manifest: &NewScanManifest<'_>,
+    ) -> Result<(), StorageError> {
+        if manifest.roots.is_empty() {
+            return Err(StorageError::Conflict(
+                "a full-scan manifest requires at least one root".to_owned(),
+            ));
+        }
+        let root_count = i64::try_from(manifest.roots.len())
+            .map_err(|_| StorageError::Conflict("manifest root count overflow".to_owned()))?;
+        let mut unique_roots = std::collections::HashSet::with_capacity(manifest.roots.len());
+        if manifest
+            .roots
+            .iter()
+            .any(|root| !unique_roots.insert(root.library_root_id))
+        {
+            return Err(StorageError::Conflict(
+                "manifest root list contains duplicates".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let existing: Option<(String, String)> = self
+            .query_as("SELECT id, library_id FROM scan_manifests WHERE job_id = ?")
+            .bind(manifest.job_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some((existing_id, existing_library_id)) = existing {
+            if existing_id != manifest.id || existing_library_id != manifest.library_id {
+                return Err(StorageError::Conflict(
+                    "scan job is already associated with a different manifest".to_owned(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(());
+        }
+
+        let created = self
+            .query(
+                "INSERT INTO scan_manifests (id, job_id, library_id, state, root_count)
+                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', ?
+                 FROM scan_jobs sj
+                 WHERE sj.id = ? AND sj.library_id = ?
+                   AND sj.job_type = 'RECONCILE_LIBRARY'
+                   AND sj.status IN ('PENDING', 'RUNNING')",
+            )
+            .bind(manifest.id)
+            .bind(root_count)
+            .bind(manifest.job_id)
+            .bind(manifest.library_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if created.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "manifest must reference an existing full-scan job in the same library".to_owned(),
+            ));
+        }
+
+        let mut available_root_count = 0_i64;
+        for root in manifest.roots {
+            let state = if root.is_available {
+                "PENDING"
+            } else {
+                "UNAVAILABLE"
+            };
+            let created_root = self
+                .query(
+                    "INSERT INTO scan_manifest_roots (
+                         manifest_id, library_root_id, state, directory_count, finished_at
+                     )
+                     SELECT ?, lr.id, ?, ?, CASE WHEN ? = 0 THEN unixepoch() END
+                     FROM library_roots lr
+                     WHERE lr.id = ? AND lr.library_id = ?",
+                )
+                .bind(manifest.id)
+                .bind(state)
+                .bind(i64::from(root.is_available))
+                .bind(i64::from(root.is_available))
+                .bind(root.library_root_id)
+                .bind(manifest.library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if created_root.rows_affected() != 1 {
+                return Err(StorageError::Conflict(format!(
+                    "library root {} does not belong to the manifest library",
+                    root.library_root_id
+                )));
+            }
+            if root.is_available {
+                self.query(
+                    "INSERT INTO scan_manifest_directories (
+                         manifest_id, library_root_id, relative_path, state
+                     ) VALUES (?, ?, '', 'PENDING')",
+                )
+                .bind(manifest.id)
+                .bind(root.library_root_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                available_root_count += 1;
+            }
+        }
+
+        self.query(
+            "UPDATE scan_manifests
+             SET discovered_directory_count = ?, updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(available_root_count)
+        .bind(manifest.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    #[allow(dead_code)] // LUX-266 uses this to resume and report manifest progress.
+    pub(crate) async fn get_scan_manifest(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredScanManifest>, StorageError> {
+        self.query(
+            "SELECT id, job_id, library_id, state, root_count,
+                    discovered_directory_count, completed_directory_count,
+                    observed_file_count, add_count, change_count, remove_count,
+                    reappeared_count, applied_delta_count
+             FROM scan_manifests WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredScanManifest {
+                id: row.get("id"),
+                job_id: row.get("job_id"),
+                library_id: row.get("library_id"),
+                state: row.get("state"),
+                root_count: row.get("root_count"),
+                discovered_directory_count: row.get("discovered_directory_count"),
+                completed_directory_count: row.get("completed_directory_count"),
+                observed_file_count: row.get("observed_file_count"),
+                add_count: row.get("add_count"),
+                change_count: row.get("change_count"),
+                remove_count: row.get("remove_count"),
+                reappeared_count: row.get("reappeared_count"),
+                applied_delta_count: row.get("applied_delta_count"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // Lifecycle owners use this compare-and-swap in LUX-266 onward.
+    pub(crate) async fn transition_scan_manifest_state(
+        &self,
+        id: &str,
+        expected_state: &str,
+        next_state: &str,
+    ) -> Result<bool, StorageError> {
+        if expected_state == next_state {
+            return Ok(false);
+        }
+        if !valid_scan_manifest_transition(expected_state, next_state) {
+            return Err(StorageError::Conflict(
+                "invalid scan manifest state transition".to_owned(),
+            ));
+        }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let result = self
+            .query(
+                "UPDATE scan_manifests
+                 SET state = ?, updated_at = unixepoch(),
+                     indexed_at = CASE WHEN ? = 'INDEXED'
+                         THEN COALESCE(indexed_at, unixepoch()) ELSE indexed_at END,
+                     completed_at = CASE WHEN ? = 'COMPLETED'
+                         THEN COALESCE(completed_at, unixepoch()) ELSE completed_at END
+                 WHERE id = ? AND state = ?",
+            )
+            .bind(next_state)
+            .bind(next_state)
+            .bind(next_state)
+            .bind(id)
+            .bind(expected_state)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    #[allow(dead_code)] // LUX-267 writes the computed manifest delta set through this boundary.
+    pub(crate) async fn insert_scan_manifest_deltas(
+        &self,
+        manifest_id: &str,
+        deltas: &[NewScanManifestDelta<'_>],
+    ) -> Result<usize, StorageError> {
+        if deltas.is_empty() {
+            return Ok(0);
+        }
+
+        let mut unique_paths = std::collections::HashSet::with_capacity(deltas.len());
+        for delta in deltas {
+            if !unique_paths.insert((delta.library_root_id, delta.relative_path)) {
+                return Err(StorageError::Conflict(
+                    "manifest delta batch contains duplicate root paths".to_owned(),
+                ));
+            }
+            let valid_delta = match delta.delta_kind {
+                "ADD" => {
+                    delta.observation_sequence.is_some()
+                        && delta.base_filesystem_entry_id.is_none()
+                        && delta.base_fingerprint.is_none()
+                }
+                "CHANGE" | "REAPPEARED" => {
+                    delta.observation_sequence.is_some() && delta.base_filesystem_entry_id.is_some()
+                }
+                "REMOVE" => {
+                    delta.observation_sequence.is_none() && delta.base_filesystem_entry_id.is_some()
+                }
+                _ => false,
+            };
+            if !valid_delta {
+                return Err(StorageError::Conflict(
+                    "manifest delta payload does not match its kind".to_owned(),
+                ));
+            }
+        }
+
+        let mut inserted_count = 0_usize;
+        for chunk in deltas.chunks(SCAN_MANIFEST_DELTA_BATCH_SIZE) {
+            let mut transaction = self.begin_scan_write_transaction().await?;
+            let locked: Option<String> = self
+                .query_scalar(
+                    "UPDATE scan_manifests SET updated_at = updated_at
+                     WHERE id = ? AND state = 'READY_TO_DIFF'
+                     RETURNING state",
+                )
+                .bind(manifest_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if locked.as_deref() != Some("READY_TO_DIFF") {
+                return Err(StorageError::Conflict(
+                    "manifest is not ready to accept difference rows".to_owned(),
+                ));
+            }
+
+            let tuple = "(?, ?, ?, ?, ?, ?, ?)";
+            let values = std::iter::repeat_n(tuple, chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let verify_query = format!(
+                "WITH incoming (
+                     id, library_root_id, relative_path, observation_sequence,
+                     delta_kind, base_filesystem_entry_id, base_fingerprint
+                 ) AS (VALUES {values})
+                 SELECT stored.id
+                 FROM incoming
+                 JOIN scan_manifest_deltas stored
+                   ON stored.manifest_id = ?
+                  AND stored.library_root_id = incoming.library_root_id
+                  AND stored.relative_path = incoming.relative_path
+                 WHERE stored.id <> incoming.id
+                    OR NOT (
+                        stored.observation_sequence = incoming.observation_sequence
+                        OR (stored.observation_sequence IS NULL
+                            AND incoming.observation_sequence IS NULL)
+                    )
+                    OR stored.delta_kind <> incoming.delta_kind
+                    OR NOT (
+                        stored.base_filesystem_entry_id = incoming.base_filesystem_entry_id
+                        OR (stored.base_filesystem_entry_id IS NULL
+                            AND incoming.base_filesystem_entry_id IS NULL)
+                    )
+                    OR NOT (
+                        stored.base_fingerprint = incoming.base_fingerprint
+                        OR (stored.base_fingerprint IS NULL
+                            AND incoming.base_fingerprint IS NULL)
+                    )
+                 LIMIT 1"
+            );
+            let mut verify = self.query_scalar(sqlx::AssertSqlSafe(verify_query));
+            for delta in chunk {
+                verify = verify
+                    .bind(delta.id)
+                    .bind(delta.library_root_id)
+                    .bind(delta.relative_path)
+                    .bind(delta.observation_sequence)
+                    .bind(delta.delta_kind)
+                    .bind(delta.base_filesystem_entry_id)
+                    .bind(delta.base_fingerprint);
+            }
+            let conflicting_row: Option<String> = verify
+                .bind(manifest_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if conflicting_row.is_some() {
+                return Err(StorageError::Conflict(
+                    "manifest delta retry disagrees with its persisted baseline".to_owned(),
+                ));
+            }
+
+            let insert_values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let insert_query = format!(
+                "INSERT INTO scan_manifest_deltas (
+                     id, manifest_id, library_root_id, relative_path,
+                     observation_sequence, delta_kind, base_filesystem_entry_id, base_fingerprint
+                 ) VALUES {insert_values}
+                 ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING
+                 RETURNING delta_kind"
+            );
+            let mut insert = self.query(sqlx::AssertSqlSafe(insert_query));
+            for delta in chunk {
+                insert = insert
+                    .bind(delta.id)
+                    .bind(manifest_id)
+                    .bind(delta.library_root_id)
+                    .bind(delta.relative_path)
+                    .bind(delta.observation_sequence)
+                    .bind(delta.delta_kind)
+                    .bind(delta.base_filesystem_entry_id)
+                    .bind(delta.base_fingerprint);
+            }
+            let inserted_kinds: Vec<String> = insert
+                .fetch_all(&mut *transaction)
+                .await
+                .map(|rows| rows.into_iter().map(|row| row.get("delta_kind")).collect())
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let mut counts = [0_i64; 4];
+            for kind in &inserted_kinds {
+                let index = match kind.as_str() {
+                    "ADD" => 0,
+                    "CHANGE" => 1,
+                    "REMOVE" => 2,
+                    "REAPPEARED" => 3,
+                    _ => {
+                        return Err(StorageError::Conflict(
+                            "database returned an unknown manifest delta kind".to_owned(),
+                        ));
+                    }
+                };
+                counts[index] += 1;
+            }
+            if inserted_kinds.is_empty() {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                continue;
+            }
+            self.query(
+                "UPDATE scan_manifests
+                 SET add_count = add_count + ?, change_count = change_count + ?,
+                     remove_count = remove_count + ?, reappeared_count = reappeared_count + ?,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND state = 'READY_TO_DIFF'",
+            )
+            .bind(counts[0])
+            .bind(counts[1])
+            .bind(counts[2])
+            .bind(counts[3])
+            .bind(manifest_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            inserted_count = inserted_count
+                .checked_add(inserted_kinds.len())
+                .ok_or_else(|| {
+                    StorageError::Conflict("manifest delta count overflow".to_owned())
+                })?;
+        }
+        Ok(inserted_count)
     }
 
     pub(crate) async fn enable_scan_job_auto_metadata_match(
@@ -5224,7 +5677,219 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::{prune_sidecar_directories, sidecar_target_query};
+    use super::{
+        Database, NewScanManifest, NewScanManifestDelta, NewScanManifestRoot,
+        prune_sidecar_directories, sidecar_target_query,
+    };
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn scan_manifest_creation_is_atomic_and_idempotent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        for (id, available) in [("root-available", 1_i64), ("root-unavailable", 0_i64)] {
+            database
+                .query(
+                    "INSERT INTO library_roots (
+                         id, library_id, canonical_path, display_path, is_available, is_writable
+                     ) VALUES (?, 'lib', ?, ?, ?, 0)",
+                )
+                .bind(id)
+                .bind(format!("/{id}"))
+                .bind(format!("/{id}"))
+                .bind(available)
+                .execute(database.pool())
+                .await?;
+        }
+        database
+            .query(
+                "WITH RECURSIVE root_numbers(n) AS (
+                     SELECT 1 UNION ALL SELECT n + 1 FROM root_numbers WHERE n < 250
+                 )
+                 INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 )
+                 SELECT 'bulk-root-' || n, 'lib', '/bulk/' || n, '/bulk/' || n, 1, 0
+                 FROM root_numbers",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .create_scan_job("job", "lib", "RECONCILE_LIBRARY", "generation", 0, false)
+            .await?;
+
+        let bulk_root_ids: Vec<String> = (1..=250)
+            .map(|number| format!("bulk-root-{number}"))
+            .collect();
+        let mut roots = vec![
+            NewScanManifestRoot {
+                library_root_id: "root-available",
+                is_available: true,
+            },
+            NewScanManifestRoot {
+                library_root_id: "root-unavailable",
+                is_available: false,
+            },
+        ];
+        roots.extend(
+            bulk_root_ids
+                .iter()
+                .map(|library_root_id| NewScanManifestRoot {
+                    library_root_id,
+                    is_available: true,
+                }),
+        );
+        let manifest = NewScanManifest {
+            id: "manifest",
+            job_id: "job",
+            library_id: "lib",
+            roots: &roots,
+        };
+        database.create_scan_manifest(&manifest).await?;
+        database.create_scan_manifest(&manifest).await?;
+
+        let stored = database
+            .get_scan_manifest("manifest")
+            .await?
+            .ok_or("manifest was not stored")?;
+        assert_eq!(stored.id, "manifest");
+        assert_eq!(stored.job_id, "job");
+        assert_eq!(stored.library_id, "lib");
+        assert_eq!(stored.state, "DISCOVERING");
+        assert_eq!(stored.root_count, 252);
+        assert_eq!(stored.discovered_directory_count, 251);
+        assert_eq!(stored.completed_directory_count, 0);
+        assert_eq!(stored.observed_file_count, 0);
+        assert_eq!(stored.remove_count, 0);
+        assert_eq!(stored.applied_delta_count, 0);
+
+        let root_states: Vec<(String, String)> = database
+            .query_as(
+                "SELECT library_root_id, state FROM scan_manifest_roots
+                 WHERE manifest_id = ? AND library_root_id IN ('root-available', 'root-unavailable')
+                 ORDER BY library_root_id",
+            )
+            .bind("manifest")
+            .fetch_all(database.pool())
+            .await?;
+        assert_eq!(
+            root_states,
+            vec![
+                ("root-available".to_owned(), "PENDING".to_owned()),
+                ("root-unavailable".to_owned(), "UNAVAILABLE".to_owned()),
+            ]
+        );
+        let initial_frontiers: i64 = database
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_manifest_directories
+                 WHERE manifest_id = 'manifest' AND state = 'PENDING'",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(initial_frontiers, 251);
+
+        assert!(
+            database
+                .transition_scan_manifest_state("manifest", "DISCOVERING", "READY_TO_DIFF")
+                .await?
+        );
+        let delta_ids: Vec<String> = (1..=250).map(|number| format!("delta-{number}")).collect();
+        let delta_paths: Vec<String> = (1..=250)
+            .map(|number| format!("missing-{number}.mkv"))
+            .collect();
+        let baseline_fingerprint = [1_u8, 2, 3];
+        let deltas: Vec<NewScanManifestDelta<'_>> = delta_ids
+            .iter()
+            .zip(&delta_paths)
+            .map(|(id, relative_path)| NewScanManifestDelta {
+                id,
+                library_root_id: "root-available",
+                relative_path,
+                observation_sequence: None,
+                delta_kind: "REMOVE",
+                base_filesystem_entry_id: Some("baseline-entry"),
+                base_fingerprint: Some(&baseline_fingerprint),
+            })
+            .collect();
+        assert_eq!(
+            database
+                .insert_scan_manifest_deltas("manifest", &deltas)
+                .await?,
+            250
+        );
+        assert_eq!(
+            database
+                .insert_scan_manifest_deltas("manifest", &deltas)
+                .await?,
+            0
+        );
+        let conflicting_retry = [NewScanManifestDelta {
+            id: "different-delta-id",
+            library_root_id: "root-available",
+            relative_path: &delta_paths[0],
+            observation_sequence: None,
+            delta_kind: "REMOVE",
+            base_filesystem_entry_id: Some("different-baseline-entry"),
+            base_fingerprint: Some(&baseline_fingerprint),
+        }];
+        assert!(
+            database
+                .insert_scan_manifest_deltas("manifest", &conflicting_retry)
+                .await
+                .is_err()
+        );
+        database
+            .query(
+                "INSERT INTO scan_manifest_entries (
+                     manifest_id, library_root_id, relative_path, observation_sequence,
+                     entry_kind, size, modified_at
+                 ) VALUES ('manifest', 'root-available', 'odd-add.mkv', 1, 'FILE', 10, 20)",
+            )
+            .execute(database.pool())
+            .await?;
+        let malformed_add = [NewScanManifestDelta {
+            id: "malformed-add",
+            library_root_id: "root-available",
+            relative_path: "odd-add.mkv",
+            observation_sequence: Some(1),
+            delta_kind: "ADD",
+            base_filesystem_entry_id: None,
+            base_fingerprint: Some(&baseline_fingerprint),
+        }];
+        assert!(
+            database
+                .insert_scan_manifest_deltas("manifest", &malformed_add)
+                .await
+                .is_err()
+        );
+        let stored = database
+            .get_scan_manifest("manifest")
+            .await?
+            .ok_or("manifest disappeared after delta writes")?;
+        assert_eq!(stored.remove_count, 250);
+        assert!(
+            database
+                .transition_scan_manifest_state("manifest", "READY_TO_DIFF", "APPLYING")
+                .await?
+        );
+        assert!(
+            database
+                .transition_scan_manifest_state("manifest", "DISCOVERING", "APPLYING")
+                .await
+                .is_err()
+        );
+        database.close().await;
+        Ok(())
+    }
 
     #[test]
     fn sidecar_target_query_uses_indexable_directory_ranges() {
