@@ -142,9 +142,9 @@ metadata 插件还应声明稳定的 `providerKey`，并可声明用于旧配置
 `pluginId` 只表示安装/运行时实现身份，不能代替 provider namespace。provider ID 是不透明字符串，不能
 要求所有 provider 都使用数字 ID。Lux 主程序只实现 metadata RPC v1，不编译上游 provider 的 HTTP client。
 
-metadata 插件启动时只通过 `LUX_PLUGIN_CONFIG_PATH` 获得自己的配置文件路径；该进程不会收到
+metadata 与 `login_background` 插件启动时只通过 `LUX_PLUGIN_CONFIG_PATH` 获得自己的配置文件路径；该进程不会收到
 `LUX_CONFIG_DIR`。缺少专属配置文件时，插件应使用自身默认值。`LUX_CONFIG_DIR` 只适用于仍有明确兼容
-需求的非 metadata 插件，不能被 metadata 插件依赖。
+需求的非 metadata、非登录背景插件，不能被这两类插件依赖。
 
 `type` 当前允许 `metadata`、`media_probe`、`ip_location`、`strm_resolver`、`chapter_detector`、
 `data_migration`、`danmaku` 和 `login_background`。媒体探测插件必须同时声明
@@ -316,6 +316,8 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 超量条目、含控制字符或超长的署名文本会被拒绝。`sourceName` 为必填纯文本；版权字段及每项
 `title`/`copyrightNotice` 为可选纯文本。空 `POSTER_FEED` 不代表可展示内容，宿主应按背景来源的
 降级策略处理。插件只能提供数据，所有文字呈现、海报瀑布流、裁切、遮罩和鸣谢交互均由 Lux 实现。
+
+所选登录背景插件只由 Lux 后台 worker 调用：首次选择、安装/启用或配置更新后会异步刷新，之后至少每日检查一次；失败采用有界退避。Lux 持久化经校验的响应 JSON（每个插件缓存条目不超过 256 KiB），不下载或复制图片字节；登录页公开接口仅读缓存，缓存超过 48 小时、插件未安装/启用/可用或刷新失败且无有效缓存时回退固定背景。刷新期间仍可使用 48 小时内的旧缓存。管理员可见稳定的来源状态，但不会收到插件内部错误详情。插件卸载时其缓存随安装记录一并删除。
 
 插件配置通过 `PUT /api/v1/admin/plugins/{pluginId}/config` 保存。媒体探测插件通过
 `POST /api/v1/admin/plugins/org.lux.strm-media-info/run` 按已保存配置创建后台任务；旧的
