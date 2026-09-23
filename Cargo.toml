@@ -1,6 +1,6 @@
 [package]
 name = "luxd"
-version = "0.4.15"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Lux personal media server"

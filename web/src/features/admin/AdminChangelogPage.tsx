@@ -15,6 +15,18 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.0",
+    date: "2026-09-23",
+    sections: [
+      { kind: "changed", items: [
+        "Emby 音轨和字幕轨道详情现在会组合显示可用的语言、编码、声道布局及轨道原始标题，ffprobe 识别到听障字幕时也会提供对应标记。",
+      ] },
+      { kind: "fixed", items: [
+        "修复不同播放会话的进度相互覆盖问题：同一会话仍按进度递增保存，新会话可以正确更新或回退续播位置，较旧会话迟到的回调不会覆盖当前进度。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.15",
     date: "2026-09-23",
     sections: [
