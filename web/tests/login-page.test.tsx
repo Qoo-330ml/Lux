@@ -51,7 +51,7 @@ describe("LoginPage session state", () => {
     await act(async () => {
       await vi.waitFor(() => {
         expect(container.querySelectorAll(".lux-auth-poster-waterfall img")).toHaveLength(2);
-        expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(3);
+        expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(5);
       });
     });
     expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-waterfall img")?.src)
@@ -59,23 +59,7 @@ describe("LoginPage session state", () => {
     expect(container.querySelector(".lux-auth-poster-wall")).toBeNull();
   });
 
-  it("adds poster columns when the waterfall has room", async () => {
-    let resizeObserverCallback: ((entries: Array<{ contentRect: { width: number } }>) => void) | undefined;
-    class FakeResizeObserver {
-      constructor(callback: unknown) {
-        resizeObserverCallback = callback as (entries: Array<{ contentRect: { width: number } }>) => void;
-      }
-
-      observe() {}
-
-      disconnect() {}
-    }
-    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
-    Object.defineProperty(window, "ResizeObserver", {
-      configurable: true,
-      value: FakeResizeObserver,
-      writable: true,
-    });
+  it("keeps all five poster columns rendered regardless of available width", async () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "RECENTLY_ADDED",
       images: Array.from({ length: 8 }, (_, index) => `/poster-${index + 1}.jpg`),
@@ -94,19 +78,9 @@ describe("LoginPage session state", () => {
     });
 
     await vi.waitFor(() => {
-      expect(resizeObserverCallback).toBeTypeOf("function");
-      expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(3);
+      expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(5);
     });
-    act(() => {
-      resizeObserverCallback?.([{ contentRect: { width: 900 } }]);
-    });
-    await vi.waitFor(() => {
-      expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(4);
-    });
-    expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(4);
-    expect(container.querySelector<HTMLDivElement>(".lux-auth-poster-waterfall")?.style.getPropertyValue(
-      "--lux-auth-poster-column-count",
-    )).toBe("4");
+    expect(container.querySelectorAll(".lux-auth-poster-waterfall-column")).toHaveLength(5);
     expect(container.querySelector<HTMLDivElement>(".lux-auth-poster-waterfall")?.style.getPropertyValue(
       "--lux-auth-poster-column-width",
     )).toBe("26%");
