@@ -192,7 +192,7 @@ Lux 的核心价值不是功能数量，而是：
   /config/metadata/library/<shard>/<item-id>/。媒体目录已有 NFO 和图片仍保留且优先，历史
   metadata 资源不自动搬迁。
 - 新建媒体库首次添加可用根路径并完成扫描后，若媒体库配置了刮削器，自动按主/备用角色和高置信度选择最佳候选，再按补充角色补齐缺失元数据，写回元数据并按该媒体库的图像策略下载所需图片；用户无需逐条进入管理后台确认。
-- 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。全量扫描时，媒体文件夹完成视频源入库后即可进入首页；本地 NFO/图片登记由独立有界后台 worker 并行补齐，不等待整库扫描完成。
+- 手动“扫描媒体库文件”只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削；管理员可以单独执行“元数据匹配/刷新元数据”。全量扫描期间首页继续读取上一份稳定快照；所有可用根路径的 Manifest 索引及缺失确认提交后立即切换首页快照，不等待本地 NFO、probe、封面或缩略图等后处理完成。NFO/图片登记由独立有界后台 worker 并行补齐。
 - 媒体详情页或媒体卡片上的“扫描所在文件夹”只扫描该媒体现有媒体源所在的文件夹；媒体库管理页上的“扫描媒体库文件”才扫描整个媒体库。两者都只做文件系统调和、媒体探测和本地 NFO/图片索引，不自动发起在线刮削。
 - 管理员从媒体库入口手动执行“整库元数据匹配”时，使用与新库首次处理相同的自动选择、NFO 写回和图片下载流程；低置信度条目仍进入待处理队列。
 - 回写使用临时文件、刷盘和原子重命名；失败时显示可重试状态，不谎报成功。
@@ -441,7 +441,7 @@ Lux 的核心价值不是功能数量，而是：
 - 全量校验可暂停、恢复和取消。
 - 服务重启时，遗留的未完成扫描作业标记为 `CANCELLED`；持久化游标只用于同一进程内的批次提交和
   管理员主动重试，不作为重启后的自动恢复依据。
-- 全量校验期间前台 API 读取旧索引，并逐批看到原子更新。
+- 全量校验期间首页继续读取上一份稳定快照；Manifest 差异按有界事务提交，只有全部可用根路径发现完成、差异安全应用和缺失确认完成后才原子替换首页快照。其他列表查询只读取已提交的数据库批次。
 - 临时挂载失效不得立刻删除整个媒体库；先标记根路径不可用并暂停删除判定。
 
 ### 5.4 资源目标
@@ -2139,6 +2139,13 @@ services:
 | LUX-261 | web/src/features/auth/LoginPage.tsx、web/src/features/admin/AdminSettingsPage.tsx、web/src/app/、web/src/lib/api/、web/tests/、docs/；插件来源选择、瀑布流/大图布局和来源鸣谢 |
 | LUX-262 | Lux-plugins/plugins/org.lux.bing-daily-background/、Lux-plugins/index.json、Lux-plugins/tests/；独立必应每日图片插件（完成来源与许可验证后） |
 | LUX-263 | Lux-plugins/plugins/org.lux.tmdb-trending-background/、Lux-plugins/index.json、Lux-plugins/tests/；独立 TMDb 日榜电影+剧集混合海报插件 |
+| LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
+| LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/jobs.rs、tests/storage.rs；跨数据库 Manifest 存储合同 |
+| LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；持久化目录发现与文件观察 |
+| LUX-267 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/media.rs、src/storage/repository.rs、tests/scanning_jobs.rs；Manifest 差异与安全 apply |
+| LUX-268 | src/application/scanner.rs、src/application/home.rs、src/storage/jobs.rs、tests/scanning_jobs.rs、tests/webhooks.rs；索引完成和首页快照时序 |
+| LUX-269 | src/storage/repository.rs、src/storage/jobs.rs、src/storage/database_cleanup.rs、tests/scanning_jobs.rs、tests/storage.rs；升级、重试和有界清理 |
+| LUX-270 | tests/postgres_database.rs、tests/storage.rs、docs/PERFORMANCE.md、docs/COMPATIBILITY.md；SQLite/PostgreSQL 兼容与性能阶段门 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -3782,22 +3789,19 @@ ffprobe、本地 NFO/图片、缩略图、自动封面和在线元数据调度�
 扫描任务持久化当前安全显示名和阶段；发现目录、索引文件、收尾、完成、失败和取消会通过
 管理员 SSE 的 `jobs` 作用域刷新任务摘要。新增同源 `GET /api/v1/events`，只允许已登录的
 Lux Web 用户，发送不携带业务数据的 `ready` 与 `invalidate` 事件。扫描索引提交后发布
-`home` 作用域：扫描批次只标记首页 dirty，扫描终态在后台快照刷新完成后发送；普通用户 Web
+`home` 作用域：扫描批次只标记首页 dirty；成功全量扫描在 Manifest 索引和缺失确认完成后、后处理开始前刷新快照并发送；失败或取消时刷新已提交的安全状态后发送；普通用户 Web
 客户端收到后失效首页、媒体库列表和当前媒体库分页缓存；
 断线时继续保留低频轮询兜底。该端点不向 Emby 兼容 API 或未认证请求开放。
 
-实施说明（2026-09-22）：扫描批次只将首页标记为 dirty，并清理目录列表页缓存；不改变当前
-首页 generation、不同步重建用户级首页快照，也不在中间批次发布用户 `home` 事件。扫描终态
-（完成、失败或取消）时，先在后台强制刷新共享快照和已有用户级快照，再一次性发布 `home`
-事件；普通用户操作仍使用同步首页失效。用户级快照构建期间如果与终态刷新并发，旧构建结果
-不得覆盖已发布的新快照。
+实施说明（Manifest 扫描）：扫描批次只将首页标记为 dirty，并清理目录列表页缓存；不改变当前
+首页 generation，也不同步重建用户级首页快照。成功全量扫描在所有可用根路径完成发现、差异应用和缺失确认后，先在后台强制刷新共享快照和已有用户级快照，再一次性发布 `home` 事件；该时点早于 NFO、probe、封面和缩略图后处理完成。失败或取消时只刷新已提交的安全状态，不对不完整根路径执行缺失删除。普通用户操作仍使用同步首页失效。用户级快照构建期间如果与扫描刷新并发，旧构建结果不得覆盖已发布的新快照。
 
 验收：
 
 - [ ] 任意普通 Lux Web 页面在管理员会话下显示全局活动扫描入口和实时进度。
 - [ ] 当前条目摘要经过 basename/相对显示名清理，不包含完整路径、`.strm` URL、token 或 query string。
-- [ ] 扫描批次期间普通用户继续读取旧首页快照；扫描终态在新共享/用户级快照替换完成后使
-  普通用户首页、媒体库列表刷新，事件不携带业务数据。
+- [ ] 全量扫描批次期间普通用户继续读取旧首页快照；Manifest 索引和缺失确认完成后、后处理完成前，在新共享/用户级快照替换后发布一次 `home` 事件；失败或取消只反映已提交的安全状态，事件不携带业务数据。
+- [ ] 现有 `ScanCompleted` webhook 与 `JOB_COMPLETED` 继续表示索引完成；后处理仍使用 `scan_phase=POSTPROCESSING`，结束后进入 `IDLE`，不新增公开 webhook 或改变 Emby 合同。
 - [ ] 管理员 SSE、普通用户事件流分别完成鉴权、ready、刷新和断线退化测试。
 - [ ] Rust/Web 测试、格式化、Clippy 和 Web 构建通过，并记录 ARM 本机 `uname -m`。
 
@@ -5519,7 +5523,7 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 
 #### LUX-230：全量扫描中的本地旁车流水线
 
-全量扫描按媒体文件夹持续建立可用视频源。一个文件夹的视频源和扫描目标提交后，条目立即可被首页查询；
+全量扫描按媒体文件夹持续建立可用视频源。单个文件夹的视频源和扫描目标在有界事务中提交；用户首页在扫描期间保持上一份稳定快照，完整 Manifest 索引和缺失确认完成后统一切换；
 本地 NFO、海报、背景图和其他已存在的本地图片由独立、有界的旁车 worker 并行读取并写入索引，扫描 worker
 立即继续下一个文件夹。旁车 worker 不进行在线匹配、不调用 TMDb、不下载缺失图片，也不持有文件扫描互斥锁。
 
@@ -5529,7 +5533,7 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 
 验收：
 
-- [x] 全量扫描中，首个媒体文件夹完成视频源入库后即可出现在首页，不等待其他文件夹或整库文件阶段完成。
+- [ ] 全量扫描期间首页保持上一份稳定快照；所有可用根路径完成 Manifest 索引和缺失确认后、后处理完成前，首页原子切换到已提交目录结果。
 - [x] 本地旁车读取与下一个文件夹的发现、索引并行执行；旁车慢或失败不阻塞扫描进度。
 - [x] 已存在的本地 NFO、海报和图片只读取并登记，不发起在线匹配、TMDb 请求或缺失图片下载。
 - [x] 首页在旁车处理期间返回 `localMetadataPending`，无图片时显示可访问的占位等待状态；旁车完成后首页刷新并显示本地图片、标题、年份和简介。
@@ -6554,6 +6558,134 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 - 不提供周榜、热门榜、评分榜或 Top 250；不混入人物、季或集。
 - 不把本插件合并进 `org.lux.tmdb`，不复用其设置或运行时进程。
 - 不转码媒体库海报、不镜像 TMDb 图片二进制、不长期缓存 TMDb 响应。
+
+### 阶段 21：全量扫描 Manifest 与索引/后处理完成语义
+
+全量扫描使用独立的持久化 Manifest 表达目录发现、文件系统观察、根路径覆盖状态和待应用差异。Manifest 以 `filesystem_entries` 为比较基准，通过有界事务生成并应用差异；每批媒体索引、文件系统索引、后处理目标、差异状态和进度原子提交。所有可用根路径的发现及缺失确认完成后，成功扫描立即刷新首页稳定快照并发布 `home` 事件，之后 NFO、probe、封面和缩略图继续后台处理。
+
+本阶段不增加公开扫描状态或 webhook。现有 `ScanCompleted` 与 `JOB_COMPLETED` 表示索引完成；任务在 `POSTPROCESSING` 时仍可通过现有任务阶段字段观察后处理，完成后进入 `IDLE`。升级仅新增结构，不在 migration 中遍历文件系统或转换旧队列；启动时将没有 Manifest 的旧版活动全量任务安全取消，并保留任务诊断记录，管理员重试会创建新 Manifest 扫描。
+
+Manifest observation 一经写入不可原地修改；应用新增或变化条目前进行二次 stat/fingerprint 校验，必要时追加 observation。差异应用对 `filesystem_entries` 的基线 ID/fingerprint 做 CAS，防止全量任务覆盖后完成的增量扫描。只有完整可用根路径允许生成缺失删除；删除前再次确认文件状态。SQLite 与 PostgreSQL 共用 SQL 行为和一致性语义，禁止在核心路径依赖 PostgreSQL 专属批量导入/更新语法或长事务。
+
+#### LUX-264：确定 Manifest 与扫描完成语义
+
+范围：消除产品说明、LUX-187 与 LUX-230 对首页可见时点的冲突，固定 Manifest 生命周期、数据库边界、完成事件语义、升级和重试合同，并记录 ADR-043。该任务只更新规格和架构决策，不改变运行时行为。
+
+验收：
+
+- [x] 首页在扫描期间继续读取旧稳定快照；成功全量扫描在 Manifest 索引和缺失确认完成后切换快照，不等待后处理。
+- [x] `ScanCompleted` webhook 与 `JOB_COMPLETED` 表示索引完成，`POSTPROCESSING`/`IDLE` 延续现有任务阶段，不新增公开事件/API 或更改 Emby 合同。
+- [x] 文档规定五类 Manifest 持久化数据、根覆盖安全条件、不可变 observation、delta CAS、SQLite/PostgreSQL 共用 SQL、旧版活动任务升级和清理策略。
+- [x] ADR-043 与开发规格记录相同决定；`git diff --check` 通过。
+
+验证：`git diff --check`。
+
+依赖：LUX-154、LUX-187、LUX-230、LUX-246。
+
+实现文件：`docs/LUX-DEVELOPMENT.md`、`docs/decisions/043-full-scan-manifest.md`。
+
+#### LUX-265：Manifest schema 与跨数据库存储合同
+
+范围：新增 `scan_manifests`、`scan_manifest_roots`、`scan_manifest_directories`、`scan_manifest_entries`、`scan_manifest_deltas` 五类持久化数据及 SQLite/PostgreSQL 一致的约束、索引、Rust 存储类型和有界写入接口。Manifest 状态为 `DISCOVERING`、`READY_TO_DIFF`、`APPLYING`、`INDEXED`、`POSTPROCESSING`、`COMPLETED`、`FAILED`、`CANCELLED`；根路径状态为 `PENDING`、`SCANNING`、`COMPLETE`、`UNAVAILABLE`、`INCOMPLETE`。目录 frontier、不可变 observation 和 delta 各自维护状态，不能复用一个含义不明的状态字段。
+
+验收：
+
+- [ ] 空库初始化与从当前 schema 升级均建立五类 Manifest 数据，SQLite/PostgreSQL 结构语义一致。
+- [ ] observation 以 Manifest、root、relative path 和 observation 序号唯一标识；已有 observation 只能追加新版本，不能覆盖。
+- [ ] delta 保存基线 `filesystem_entries` ID 与 fingerprint，状态变化和扫描进度可幂等、有界地提交。
+- [ ] 测试覆盖外键/唯一约束、状态约束、分页索引和 SQLite 参数上限；核心 SQL 无 PostgreSQL 专属语法。
+
+验证：`cargo test --locked --test storage`；PostgreSQL migration 集成测试；`cargo fmt --all -- --check`。
+
+依赖：LUX-264。
+
+实现文件：`migrations/0128_full_scan_manifest.sql`、`migrations-postgres/0128_full_scan_manifest.sql`、`src/storage/repository.rs`、`src/storage/jobs.rs`、`tests/storage.rs`。
+
+#### LUX-266：持久化 Manifest 目录发现与观察
+
+范围：全量扫描的目录 frontier 和文件 observation 改由 Manifest 持久化；发现事务同时提交 observation、子目录 frontier、目录完成状态、root 计数和任务进度。发现仍按既有资源限制和批次运行，创建任务不访问文件系统，实时增量扫描优先级与现有扫描锁规则保持不变。
+
+验收：
+
+- [ ] 每个目录的发现结果按有界事务持久化，进程关闭或扫描取消后，已提交 frontier/observation 不丢失。
+- [ ] 根路径分别记录完整、不可用或不完整；只有完整发现的根路径可进入后续缺失判定。
+- [ ] 同一路径再次观察会追加 observation 版本；发现失败、取消和重试不会把未提交工作标成完成。
+- [ ] 现有 `reconciliation_scan_entries` 路径不再承载新 Manifest 全量发现；旧记录保留给升级兼容和历史清理。
+
+验证：`cargo test --locked --test scanning_jobs`；SQLite 批次/取消/恢复覆盖。
+
+依赖：LUX-265。
+
+实现文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`、`docs/PERFORMANCE.md`。
+
+#### LUX-267：Manifest 差异计算与安全应用
+
+范围：从 Manifest observations 与 `filesystem_entries` 生成新增、变化、未变化、缺失和重新出现差异；新增/变化文件应用前二次校验；按基线 ID/fingerprint CAS 应用批次，并让文件系统条目、媒体索引、扫描后处理目标、delta 和进度在同一短事务中提交。
+
+验收：
+
+- [ ] 差异仅以 `library_root_id + relative_path` 对照 `filesystem_entries`，不以 `media_items` 单独推断删除。
+- [ ] 未变化条目不重复写入媒体/文件系统索引；完整可用根路径中的缺失文件在第二次 stat 确认后才删除。
+- [ ] 根路径 unavailable/incomplete、取消、I/O 错误和持续变化均不会造成批量删除或覆盖较新的增量写入。
+- [ ] 任意批次失败回滚时，媒体索引、targets、delta 状态和进度保持一致；失败任务 checkpoint 可重试。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test storage`；回滚与全量/增量竞争测试。
+
+依赖：LUX-266。
+
+实现文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/media.rs`、`src/storage/repository.rs`、`tests/scanning_jobs.rs`。
+
+#### LUX-268：索引完成、后处理与首页原子切换
+
+范围：成功全量扫描在 Manifest 索引、缺失确认和索引事务完成后进入现有 `POSTPROCESSING`，先刷新共享/用户首页快照并发布 `home`，再运行 probe、NFO、封面和缩略图后处理。保留现有 `ScanCompleted` webhook 与 `JOB_COMPLETED` 时点；后处理结束进入 `IDLE`，失败时不撤销索引或重发索引完成通知。失败/取消时只刷新已提交的安全状态。
+
+验收：
+
+- [ ] 扫描批次期间继续返回旧首页快照；成功索引完成后，新快照全部替换成功才发布一次 `home` 事件。
+- [ ] `ScanCompleted` 与 `JOB_COMPLETED` 在后处理前触发；后处理失败可重试未完成 targets，不重复执行全量发现或重复发布完成 webhook。
+- [ ] 旧快照并发构建不能覆盖新 generation；失败/取消路径不对不完整 root 执行缺失删除。
+- [ ] NFO/图片等后处理完成后仍可按现有局部失效行为刷新条目元数据；没有后处理工作时不产生无效首页 generation。
+
+验证：`cargo test --locked --test scanning_jobs --test webhooks`，并运行相关 home/catalog 测试。
+
+依赖：LUX-267。
+
+实现文件：`src/application/scanner.rs`、`src/application/home.rs`、`src/storage/jobs.rs`、`tests/scanning_jobs.rs`、`tests/webhooks.rs`。
+
+#### LUX-269：升级、重试与 Manifest 清理
+
+范围：升级启动时识别没有 Manifest 的旧版活动全量任务，保留诊断记录并安全取消；管理员重试时创建新 Manifest。新 Manifest 的失败/取消任务按已提交 checkpoint 重试。完成后的 Manifest 路径内容按有界批次清理，仅保留不含媒体路径的统计摘要。migration 不访问文件系统、不回填完整媒体库、不删除旧表。
+
+验收：
+
+- [ ] 旧版活动 `RECONCILE_LIBRARY` 任务没有关联 Manifest 时被标记 `CANCELLED`，事件代码明确说明需要新扫描，已完成媒体索引不变。
+- [ ] 重试旧任务创建新全量 Manifest；新 Manifest 任务重试遵循其 discovery/delta checkpoint 并保持幂等。
+- [ ] completed Manifest 的 entries/directories/deltas 被分批清理；可重试失败 checkpoint 按现有保留策略保留，清理循环有界且重复执行安全。
+- [ ] 从当前 SQLite/PostgreSQL schema 升级成功；旧 `reconciliation_scan_entries` 数据不被伪装成完整 Manifest，也不在迁移事务中转换。
+
+验证：SQLite 空库/已有库迁移、旧活动任务启动恢复、管理员重试与分批清理集成测试。
+
+依赖：LUX-265、LUX-268。
+
+实现文件：`src/storage/repository.rs`、`src/storage/jobs.rs`、`src/storage/database_cleanup.rs`、`tests/scanning_jobs.rs`、`tests/storage.rs`。
+
+#### LUX-270：SQLite/PostgreSQL 兼容与扫描性能阶段门
+
+范围：以同一组语义测试验证两种后端的 migration、bounded DML、重试/删除安全和首页事件顺序；使用代表性媒体库对比当前扫描路径与 Manifest 路径的 SQL/DML 数量、扫描吞吐、批次耗时、SQLite 锁等待、PostgreSQL WAL/锁等待和前台 p95。仅在 PostgreSQL 测试环境实际运行后记录其运行时结果。
+
+验收：
+
+- [ ] SQLite 空库、已有库升级和完整全量扫描覆盖通过；PostgreSQL 空库迁移、已有库升级和扫描存储集成测试通过。
+- [ ] 两种后端执行相同的根路径保护、delta/CAS、取消、重试、索引完成与后处理事件合同。
+- [ ] `docs/PERFORMANCE.md` 记录数据规模、命令、硬件、数据库后端及优化前后可比指标；不得以 SQLite ARM64 数值推断 PostgreSQL/NAS 性能。
+- [ ] `docs/COMPATIBILITY.md` 记录扫描完成 webhook、任务阶段和首页事件时序；不改变外部 API/Emby 合同。
+- [ ] 完成阶段 21 全部 Rust 检查、兼容性/性能记录和本机 `uname -m`，等待项目所有者确认后再进入后续阶段。
+
+验证：`cargo build --locked`、相关 Rust 集成测试、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
+
+依赖：LUX-265 至 LUX-269。
+
+实现文件：`tests/postgres_database.rs`、`tests/storage.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`。
 
 ## 26. 风险与缓解
 
