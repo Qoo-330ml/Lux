@@ -15,6 +15,19 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.4.14",
+    date: "2026-09-23",
+    sections: [
+      { kind: "added", items: [
+        "登录页媒体库动态背景最多展示 40 张海报，海报墙可覆盖更完整的视觉区域。",
+      ] },
+      { kind: "changed", items: [
+        "调整登录页海报墙的位置并将倾斜角度设为 9°，扩大海报覆盖区域。",
+        "登录表单改用 Lux 白色强调色，并移除页脚提示文案，使登录界面更简洁统一。",
+      ] },
+    ],
+  },
+  {
     version: "0.4.13",
     date: "2026-09-22",
     sections: [
