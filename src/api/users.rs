@@ -13,7 +13,7 @@ use crate::{
     },
 };
 
-const MAX_LOGIN_BACKGROUND_IMAGES: i64 = 18;
+const MAX_LOGIN_BACKGROUND_IMAGES: i64 = 40;
 
 pub(super) async fn live() -> Json<Value> {
     Json(json!({ "status": "ok" }))
