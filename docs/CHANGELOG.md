@@ -18,11 +18,11 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ### Fixed
 
-- 修复 Emby STRM 外部直链播放的交接流程；认证后直接将原始地址重定向给客户端，避免 Lux 预探测负载均衡重定向并保留客户端的请求上下文。
+- 修复 Emby STRM 外部直链播放的交接流程；Emby 标准视频入口认证后以 302 将原始地址交给客户端，避免 Lux 预探测负载均衡重定向；Lux 自有受保护回退入口继续使用 307。
 - 修复 Emby STRM 媒体详情的路径兼容性；条目 `Path` 返回已索引的 `.strm` 文件路径，`MediaSources[].Path` 仍保留 STRM 目标，同时 URL 型 STRM 在 `PlaybackInfo` 中正确标记为远程可播放媒体。
 - 修复 Emby 对 Matroska 容器的兼容性；将 `matroska,webm` 规范化为 `mkv`，并生成带 `.mkv` 后缀的播放入口，避免第三方代理降级到无后缀流地址。
 - 统一 Emby PlaybackInfo 对 Matroska 别名的容器返回值为 `mkv`，确保客户端和外部代理选择标准的 `.mkv` 播放入口。
-- 修复带设备配置的 URL 型 STRM 播放协商；继续返回包含代理用户提示和短期票据的 Lux `DirectStreamUrl`，避免 FileBar 自行构造播放地址时丢失 NextEmby 用户上下文。
+- 修复带设备配置的 URL 型 STRM 播放协商；签名 Lux `DirectStreamUrl` 除代理用户提示和短期票据外，还携带请求中的 `DeviceId`，帮助外部代理关联播放上下文。
 - 修复 URL 型 STRM 在设备配置容器不匹配时被误判为需要服务器转码的问题；兼容 `mkv`、`matroska` 和 `matroska,webm` 别名，继续交给外部代理直放。
 - 修复 Emby 直播放地址缺少 `PlaySessionId` 和 `static=true` 参数的问题；第三方代理现在可以正确识别并切换对应的播放流。
 - 修复 URL/路径型 `.strm` 媒体源未声明兼容转码能力的问题；现在向外部 Emby 播放代理保留 `SupportsTranscoding`，同时不会在 Lux 本地创建 HLS 转码会话或伪造转码地址。

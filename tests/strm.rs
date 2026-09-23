@@ -210,6 +210,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .as_str()
         .ok_or("missing admin-key direct stream URL")?;
     assert!(!admin_key_direct_url.contains(&admin_api_key));
+    assert!(!admin_key_direct_url.contains("&DeviceId="));
 
     let popcorn_detail = client
         .get(format!(
@@ -374,6 +375,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .get(format!(
             "http://{address}/Items/{remote_item_id}/PlaybackInfo"
         ))
+        .header("X-Emby-Device-Id", "nextemby-device")
         .query(&[("api_key", token.as_str())])
         .send()
         .await?;
@@ -470,10 +472,8 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .header(reqwest::header::USER_AGENT, "VidHub/9.0 (iPhone; iOS 18.0)")
         .send()
         .await?;
-    assert_eq!(
-        signed_remote_stream.status(),
-        reqwest::StatusCode::TEMPORARY_REDIRECT
-    );
+    assert_eq!(signed_remote_stream.status(), reqwest::StatusCode::FOUND);
+    assert!(remote_direct_url.contains("&DeviceId=nextemby-device"));
     assert_eq!(
         signed_remote_stream.headers()[reqwest::header::LOCATION],
         expected_remote_location.as_str()
@@ -502,10 +502,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .header(reqwest::header::USER_AGENT, player_user_agent)
         .send()
         .await?;
-    assert_eq!(
-        senplayer_stream.status(),
-        reqwest::StatusCode::TEMPORARY_REDIRECT
-    );
+    assert_eq!(senplayer_stream.status(), reqwest::StatusCode::FOUND);
     assert_eq!(
         senplayer_stream.headers()[reqwest::header::LOCATION],
         expected_remote_location.as_str()
@@ -522,7 +519,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .await?;
     assert_eq!(
         numeric_senplayer_stream.status(),
-        reqwest::StatusCode::TEMPORARY_REDIRECT
+        reqwest::StatusCode::FOUND
     );
     assert_eq!(
         numeric_senplayer_stream.headers()[reqwest::header::LOCATION],
@@ -557,7 +554,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .await?;
     assert_eq!(
         duplicate_source_query_stream.status(),
-        reqwest::StatusCode::TEMPORARY_REDIRECT
+        reqwest::StatusCode::FOUND
     );
     assert_eq!(
         duplicate_source_query_stream.headers()[reqwest::header::LOCATION],
@@ -588,10 +585,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
         .header(reqwest::header::USER_AGENT, player_user_agent)
         .send()
         .await?;
-    assert_eq!(
-        unmatched_video_path.status(),
-        reqwest::StatusCode::TEMPORARY_REDIRECT
-    );
+    assert_eq!(unmatched_video_path.status(), reqwest::StatusCode::FOUND);
     assert_eq!(
         unmatched_video_path.headers()[reqwest::header::LOCATION],
         expected_remote_location.as_str()

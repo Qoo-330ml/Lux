@@ -4223,6 +4223,7 @@ pub(super) fn emby_signed_direct_stream_url(
     user: &UserRecord,
     play_session_id: &str,
     api_key: Option<&str>,
+    device_id: &str,
 ) -> Option<String> {
     let expires_at = current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
     let user_id = user.id.to_string();
@@ -4237,6 +4238,10 @@ pub(super) fn emby_signed_direct_stream_url(
     // Emby's standard video endpoint requires the PlaybackInfo session ID and
     // uses `static=true` to select direct streaming. External proxies use the
     // same context to associate the independent media request with playback.
+    if !device_id.is_empty() && !device_id.eq_ignore_ascii_case("unknown") {
+        url.push_str("&DeviceId=");
+        url.push_str(&percent_encode_filename(device_id));
+    }
     url.push_str("&PlaySessionId=");
     url.push_str(&percent_encode_filename(play_session_id));
     url.push_str("&static=true");

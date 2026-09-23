@@ -149,8 +149,9 @@ fi
             .as_str()
             .ok_or("missing signed direct stream URL")?;
         assert!(direct_url.starts_with(&format!(
-            "/Videos/{emby_item_id}/stream?MediaSourceId={source_id}&UserId="
+            "/Videos/{emby_item_id}/stream?MediaSourceId={source_id}&"
         )));
+        assert!(direct_url.contains("&UserId="));
         assert!(direct_url.contains("&luxPlayback"));
         assert_ne!(direct_url, target);
         assert_eq!(

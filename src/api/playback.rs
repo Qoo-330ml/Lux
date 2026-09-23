@@ -265,6 +265,7 @@ pub(super) async fn emby_playback_info(
                             } else {
                                 None
                             },
+                            &device_id,
                         )
                     {
                         object.insert("DirectStreamUrl".to_owned(), json!(url));

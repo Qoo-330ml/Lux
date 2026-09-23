@@ -120,7 +120,7 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
 - Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径按 Lux 进程实际可读性处理，不要求落在当前媒体库根目录内。扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
-- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；两者的代理兼容表示均使用原始 `Path`、`Protocol=File` 和 `IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 统一将 `AddApiKeyToDirectStreamUrl` 设为 `true`，并在签名 URL 中携带本次标准 Emby token 的 `api_key`；本地文件和 SMB/FTP 解析源不携带长期 token。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；直接访问 Lux 的播放入口时，本地路径仍由 Lux 读取，HTTP(S) 目标仍由 Lux 使用播放器 User-Agent 有限解析重定向后返回 307，作为兼容回退；扫描和 `PlaybackInfo` 不访问目标。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
+- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；HTTP(S) URL 型目标使用 `Protocol=Http`、`IsRemote=true`，本地路径型目标使用 `Protocol=File`、`IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 统一将 `AddApiKeyToDirectStreamUrl` 设为 `true`，并在签名 URL 中携带本次标准 Emby token 的 `api_key`；请求中有设备 ID 时，也将其作为标准 `DeviceId` 提示带入 URL。本地文件和 SMB/FTP 解析源不携带长期 token。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；Emby 标准视频入口对 HTTP(S) URL 型目标直接返回 302 到原始目标，不在服务器端预探测；Lux 自有播放回退继续使用播放器 User-Agent 有限解析重定向并返回 307。扫描和 `PlaybackInfo` 不访问目标。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
@@ -130,7 +130,7 @@ Lux 的核心价值不是功能数量，而是：
   仅在客户端明确声明 `mp4`/`fmp4` 时使用 fMP4。两类 HLS 清单和分片都只存在于播放会话临时目录，不生成永久媒体副本。
 - `.strm` 只能使用档位 0。直连或重定向失败时直接返回不支持，不允许 Remux、音频转码、视频转码、HLS、代理媒体字节或在用户请求中对远程目标运行 ffprobe/ffmpeg。
 - 本地文件通过带鉴权的 HTTP GET/HEAD 和单区间 Range 请求传输。`.strm` 的本地目标可以位于媒体库根目录之外；目标必须是 Lux 进程实际可读取、canonicalize 后存在的普通文件，且不会把目录或另一个 `.strm` 当作视频返回。
-- URL 和本地路径型 `.strm` 在 `Path` 保留原始目标；`PlaybackInfo` 对这两类目标的 `DirectStreamUrl` 使用标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，可额外携带标准 `UserId` 供外部代理关联播放身份；`UserId` 不承担授权。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 的 `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby token 作为 `api_key` 写入签名 URL；本地文件和 SMB/FTP 解析源不携带长期 token。Lux 仍强制验证 HMAC 票据。外部播放代理从原始 `Path` 提取映射或 302 信息，客户端始终请求当前公网代理域名而不是 `.strm` 中的内网地址。Lux 仍保留直接访问 URL 型 `.strm` 时使用播放器 User-Agent 有限解析重定向并返回 307 的兼容回退；不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 继续使用 Lux 的协议解析器和受保护播放入口；空目标和其他协议不可播放。
+- URL 和本地路径型 `.strm` 在 `Path` 保留原始目标；`PlaybackInfo` 对这两类目标的 `DirectStreamUrl` 使用标准 `/Videos/{数字ItemId}/stream[.Container]?MediaSourceId=...` 入口并附带短期 Lux 播放票据，可额外携带标准 `UserId` 与请求中的 `DeviceId` 供外部代理关联播放身份；这些提示字段不承担授权。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 的 `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby token 作为 `api_key` 写入签名 URL；本地文件和 SMB/FTP 解析源不携带长期 token。Lux 仍强制验证 HMAC 票据。外部播放代理从原始 `Path` 提取映射或 302 信息，客户端始终请求当前公网代理域名而不是 `.strm` 中的内网地址。Emby 标准入口对 HTTP(S) URL 型 `.strm` 返回 302 并原样交接目标；Lux 自有播放回退仍使用播放器 User-Agent 有限解析重定向并返回 307，不代理媒体字节。Lux Web 的 Direct Play 计划对 URL 和路径型 `.strm` 都同时提供代理入口和签名 Lux 入口，播放器优先使用代理入口，失败后回退到签名入口；未经过代理的 Lux Web 请求仍不会绕过权限。SMB/FTP 继续使用 Lux 的协议解析器和受保护播放入口；空目标和其他协议不可播放。
 - 浏览器原生无法播放时，先尝试已有的客户端 HEVC/MKV fallback；本地文件仍不可播放时再按浏览器能力选择服务端档位 1～4。客户端 fallback 不计入服务端档位。
 - 暴露本地文件中的内嵌字幕轨以及同目录外挂字幕。
 - 外挂字幕至少识别 srt、ass、ssa、vtt、sub、sup/pgs 等常见格式。
@@ -5631,8 +5631,8 @@ source-scoped 字幕端点按需抽取文本字幕；远程 HTTP(S) Matroska 在
 #### LUX-234：通用外部代理的 URL 型 `.strm` 交接与 Emby 数字条目 ID
 
 范围：修正 URL 型 `.strm` 与本地路径型 `.strm` 在第三方媒体代理场景下的 Emby 播放源合同。Emby 条目 `Path`
-返回该条目已索引的 `.strm` 文件系统路径，`MediaSources[].Path` 保留 STRM 原始目标；在 `PlaybackInfo` 中使用标准带短期票据的 `DirectStreamUrl`，并使用
-`Protocol=File`、`IsRemote=false` 的代理兼容表示。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型目标的
+返回该条目已索引的 `.strm` 文件系统路径，`MediaSources[].Path` 保留 STRM 原始目标；在 `PlaybackInfo` 中使用标准带短期票据的 `DirectStreamUrl`；HTTP(S) URL 型目标使用
+`Protocol=Http`、`IsRemote=true`，本地路径型目标使用 `Protocol=File`、`IsRemote=false`。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型目标的
 `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby 用户 token 作为 `api_key` 写入同一签名 URL；本地文件和 SMB/FTP
 解析源不携带长期 token。无论提示取值如何，Lux 都要求短期票据，使具备自身映射或 302 能力的外部代理可以从原始 `Path`
 提取信息并优先接管播放。这样客户端请求始终回到当前公网代理域名，不会直接访问 `.strm` 中的内网 302 地址。
@@ -5646,18 +5646,18 @@ Lux 内部 UUID、数据库关系和 Lux 原生 `/api/v1` ID 保持不变。所�
 并继续接受历史 UUID 请求。Emby DTO 中的 `Id`、`ItemId`、`ParentId`、`SeriesId`、`SeasonId`、媒体库条目 ID、
 图片引用 ID 和标准视频 URL 使用数字表示；媒体源自身的 `MediaSourceId` 不在本次转换范围内。
 
-直接请求 Lux 的兼容回退保持不变：路径型目标由 Lux 按相对路径或绝对路径读取本地普通文件，URL 型目标由 Lux
-使用入站播放器 User-Agent 有限跟随重定向并返回 307；外部代理接管时不应请求 Lux 的 URL 解析回退入口。SMB/FTP
+Emby 标准视频入口的 URL 型 `.strm` 交接返回 302，并将原始 HTTP(S) 目标交给客户端；路径型目标由 Lux 按相对路径或绝对路径读取本地普通文件。
+Lux 自有播放回退保持使用入站播放器 User-Agent 有限跟随重定向并返回 307；外部代理接管时不应请求该回退入口。SMB/FTP
 解析器和其他不支持的目标不在本任务内改变。
 
 验收：
 
 - [x] URL 与路径型 `.strm` 的 Emby 条目 `Path` 返回已索引的 `.strm` 文件系统路径，`MediaSources[].Path` 保留原始目标；路径只通过已授权条目 DTO 暴露。`PlaybackInfo` 中代理交接所需的
-      `Protocol`、`IsRemote`、标准带短期票据的 `DirectStreamUrl` 和权限行为一致；URL/路径型 `.strm` 对所有第三方播放器的
+      `Protocol`、`IsRemote`、标准带短期票据的 `DirectStreamUrl` 和权限行为一致；Emby URL 型 `.strm` 交接返回 302，签名直放 URL 带入已识别的 `DeviceId`；URL/路径型 `.strm` 对所有第三方播放器的
       `AddApiKeyToDirectStreamUrl=true`，并将本次标准 Emby 用户 token 作为 `api_key` 写入签名 URL；本地文件和 SMB/FTP
       解析源不携带长期 token。
 - [x] URL 与路径型 `.strm` 的 Lux Web Direct Play 计划均提供标准 `proxyUrl`；播放器继续在代理失败时回退到签名 Lux URL。
-- [x] Lux 直连 URL 型 `.strm` 仍按播放器 User-Agent 返回有限 307；直连路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。
+- [x] Emby URL 型 `.strm` 入口返回 302；Lux 自有 URL 型 `.strm` 回退仍按播放器 User-Agent 有限解析并返回 307；路径型 `.strm` 仍提供本地 Range/HEAD 文件响应。
 - [x] 扫描、`PlaybackInfo` 和外部代理交接测试不访问原始目标；不新增数据库字段、迁移、媒体字节代理、转码或具体代理适配。
 - [x] Emby 兼容层对已有和新建媒体条目统一输出稳定纯数字 ID；输入边界兼容数字 ID 与历史 UUID，内部数据库和 Lux API 不变。
 - [x] 数字 ID 兼容覆盖标准媒体详情、目录父子查询、PlaybackInfo、视频/字幕/图片/下载入口、进度回调以及已看/收藏操作；

@@ -2240,7 +2240,7 @@ async fn serve_media_file_internal(
                 if request.pass_through_external_url {
                     // Do not consume a load-balanced redirect with Lux's
                     // server-side Range: bytes=0-0 probe.
-                    return redirect_strm_playback(&external_url);
+                    return redirect_emby_strm_playback(&external_url);
                 }
                 let Some(resolver) = state.strm_playback.as_ref() else {
                     return StatusCode::SERVICE_UNAVAILABLE.into_response();
@@ -2312,11 +2312,19 @@ async fn serve_media_file_internal(
 }
 
 pub(super) fn redirect_strm_playback(location: &str) -> Response {
+    redirect_strm_playback_with_status(location, StatusCode::TEMPORARY_REDIRECT)
+}
+
+fn redirect_emby_strm_playback(location: &str) -> Response {
+    redirect_strm_playback_with_status(location, StatusCode::FOUND)
+}
+
+fn redirect_strm_playback_with_status(location: &str, status: StatusCode) -> Response {
     let Some(location) = normalize_strm_http_location(location) else {
         return StatusCode::BAD_GATEWAY.into_response();
     };
     match Response::builder()
-        .status(StatusCode::TEMPORARY_REDIRECT)
+        .status(status)
         .header("Location", location)
         .body(Body::empty())
     {
