@@ -201,7 +201,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 129);
+    assert_eq!(database.schema_version().await?, 130);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -221,7 +221,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 129);
+    assert_eq!(second_database.schema_version().await?, 130);
     second_database.close().await;
     Ok(())
 }
@@ -347,7 +347,14 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .await?;
     assert!(manifest_schema.contains("'DISCOVERING'"));
     assert!(manifest_schema.contains("'POSTPROCESSING'"));
-    assert_eq!(database.schema_version().await?, 129);
+    let manifest_entry_device: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_manifest_entries')
+         WHERE name = 'device'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_entry_device, 1);
+    assert_eq!(database.schema_version().await?, 130);
 
     database.close().await;
     Ok(())
@@ -419,7 +426,42 @@ async fn full_scan_manifest_upgrade_preserves_existing_scan_data()
         source_dir.join("0128_full_scan_manifest.sql"),
         migration_dir.join("0128_full_scan_manifest.sql"),
     )?;
-    sqlx::migrate::Migrator::new(migration_dir)
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+
+    sqlx::query(
+        "INSERT INTO scan_manifests (id, job_id, library_id, state)
+         VALUES ('legacy-manifest', 'legacy-job', 'legacy-library', 'DISCOVERING')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifest_roots (manifest_id, library_root_id, state)
+         VALUES ('legacy-manifest', 'legacy-root', 'COMPLETE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifest_entries (
+             manifest_id, library_root_id, relative_path, observation_sequence,
+             entry_kind, size, modified_at, inode, fingerprint
+         ) VALUES ('legacy-manifest', 'legacy-root', 'movie.mkv', 1,
+                   'FILE', 1234, 100, 42, X'010203')",
+    )
+    .execute(&pool)
+    .await?;
+
+    fs::copy(
+        source_dir.join("0129_login_background_plugin_cache.sql"),
+        migration_dir.join("0129_login_background_plugin_cache.sql"),
+    )?;
+    fs::copy(
+        source_dir.join("0130_scan_manifest_entry_device.sql"),
+        migration_dir.join("0130_scan_manifest_entry_device.sql"),
+    )?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
         .await?
         .run(&pool)
         .await?;
@@ -427,7 +469,7 @@ async fn full_scan_manifest_upgrade_preserves_existing_scan_data()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 128);
+    assert_eq!(schema_version, 130);
     let legacy_status: String =
         sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = 'legacy-job'")
             .fetch_one(&pool)
@@ -442,7 +484,14 @@ async fn full_scan_manifest_upgrade_preserves_existing_scan_data()
     let manifests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM scan_manifests")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(manifests, 0);
+    assert_eq!(manifests, 1);
+    let manifest_entry: (i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT size, inode, device FROM scan_manifest_entries
+         WHERE manifest_id = 'legacy-manifest' AND relative_path = 'movie.mkv'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(manifest_entry, (1234, 42, None));
 
     pool.close().await;
     Ok(())
@@ -466,14 +515,68 @@ async fn postgres_manifest_migration_uses_only_supported_schema_constructs()
             "DEFAULT (EXTRACT(EPOCH FROM NOW())::INTEGER)",
             "DEFAULT (unixepoch())",
         );
+    let postgres_device_migration =
+        include_str!("../migrations-postgres/0130_scan_manifest_entry_device.sql");
+    assert!(!postgres_device_migration.contains("BIGSERIAL"));
     let temp_dir = tempfile::tempdir()?;
     let migration_dir = temp_dir.path().join("migrations");
     fs::create_dir(&migration_dir)?;
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::query("CREATE TABLE libraries (id TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE TABLE library_roots (id TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await?;
+    sqlx::query("CREATE TABLE scan_jobs (id TEXT PRIMARY KEY)")
+        .execute(&pool)
+        .await?;
     fs::write(
         migration_dir.join("0128_full_scan_manifest.sql"),
         sqlite_compatible_migration,
     )?;
-    let pool = sqlx::SqlitePool::connect("sqlite::memory:").await?;
+    sqlx::migrate::Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+
+    sqlx::query("INSERT INTO libraries (id) VALUES ('library')")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO library_roots (id) VALUES ('root')")
+        .execute(&pool)
+        .await?;
+    sqlx::query("INSERT INTO scan_jobs (id) VALUES ('job')")
+        .execute(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifests (id, job_id, library_id, state)
+         VALUES ('manifest', 'job', 'library', 'DISCOVERING')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifest_roots (manifest_id, library_root_id, state)
+         VALUES ('manifest', 'root', 'COMPLETE')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifest_entries (
+             manifest_id, library_root_id, relative_path, observation_sequence,
+             entry_kind, size, modified_at, inode, fingerprint
+         ) VALUES ('manifest', 'root', 'movie.mkv', 1, 'FILE', 987, 100, 42, X'010203')",
+    )
+    .execute(&pool)
+    .await?;
+
+    fs::write(
+        migration_dir.join("0130_scan_manifest_entry_device.sql"),
+        postgres_device_migration.replace("BIGINT", "INTEGER"),
+    )?;
     sqlx::migrate::Migrator::new(migration_dir)
         .await?
         .run(&pool)
@@ -488,6 +591,20 @@ async fn postgres_manifest_migration_uses_only_supported_schema_constructs()
     .fetch_one(&pool)
     .await?;
     assert_eq!(tables, 5);
+    let device_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_manifest_entries')
+         WHERE name = 'device'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(device_column, 1);
+    let manifest_entry: (i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT size, inode, device FROM scan_manifest_entries
+         WHERE manifest_id = 'manifest' AND relative_path = 'movie.mkv'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(manifest_entry, (987, 42, None));
     pool.close().await;
     Ok(())
 }
@@ -599,7 +716,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 129);
+    assert_eq!(database.schema_version().await?, 130);
     Ok(())
 }
 
@@ -771,7 +888,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 129);
+    assert_eq!(database.schema_version().await?, 130);
     Ok(())
 }
 
@@ -858,7 +975,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 129);
+    assert_eq!(database.schema_version().await?, 130);
     database.close().await;
     Ok(())
 }
@@ -985,7 +1102,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 129);
+    assert_eq!(database.schema_version().await?, 130);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -1167,7 +1284,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 129);
+    assert_eq!(database.schema_version().await?, 130);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

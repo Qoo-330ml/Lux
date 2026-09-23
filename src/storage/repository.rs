@@ -1047,6 +1047,80 @@ pub(crate) struct NewScanManifestDelta<'a> {
     pub(crate) base_fingerprint: Option<&'a [u8]>,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct NewScanManifestSidecarEntry {
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NewScanManifestUnresolvedFile {
+    pub(crate) item_id: String,
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) source_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Vec<u8>,
+    pub(crate) title: String,
+    pub(crate) identity_key: String,
+    pub(crate) source_kind: String,
+    pub(crate) container: String,
+    pub(crate) external_url: Option<String>,
+    pub(crate) strm_target_kind: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ManifestExistingFileUpdate<'a> {
+    pub(crate) filesystem_entry_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) base_fingerprint: Option<&'a [u8]>,
+    pub(crate) expected_missing: bool,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: &'a [u8],
+    pub(crate) generation: &'a str,
+    pub(crate) source_kind: &'a str,
+    pub(crate) edition_name: Option<&'a str>,
+    pub(crate) quality_label: Option<&'a str>,
+    pub(crate) container: &'a str,
+    pub(crate) external_url: Option<&'a str>,
+    pub(crate) strm_target_kind: Option<&'a str>,
+}
+
+pub(crate) struct ManifestDeltaBatchCommit<'a> {
+    pub(crate) job_id: &'a str,
+    pub(crate) manifest_id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) generation: &'a str,
+    pub(crate) deltas: &'a [StoredScanManifestDelta],
+    pub(crate) unstable_delta_ids: &'a [String],
+    pub(crate) movie_files: &'a [NewMovieFile],
+    pub(crate) episode_files: &'a [NewEpisodeFile],
+    pub(crate) unresolved_files: &'a [NewScanManifestUnresolvedFile],
+    pub(crate) sidecar_entries: &'a [NewScanManifestSidecarEntry],
+    pub(crate) removed_media_paths: &'a [String],
+    pub(crate) removed_sidecar_paths: &'a [String],
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManifestDeltaBatchCommitResult {
+    pub(crate) applied_count: usize,
+    pub(crate) conflict_count: usize,
+    pub(crate) unstable_count: usize,
+    pub(crate) created_items: usize,
+    pub(crate) metadata_targets_changed: bool,
+    pub(crate) removed_count: usize,
+}
+
 #[derive(Debug)]
 #[allow(dead_code)] // LUX-267 consumes the persisted diff and apply counters.
 pub(crate) struct StoredScanManifest {
@@ -1058,11 +1132,47 @@ pub(crate) struct StoredScanManifest {
     pub(crate) discovered_directory_count: i64,
     pub(crate) completed_directory_count: i64,
     pub(crate) observed_file_count: i64,
+    pub(crate) unchanged_count: i64,
     pub(crate) add_count: i64,
     pub(crate) change_count: i64,
     pub(crate) remove_count: i64,
     pub(crate) reappeared_count: i64,
     pub(crate) applied_delta_count: i64,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestDiffCandidate {
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) observation_sequence: i64,
+    pub(crate) delta_kind: String,
+    pub(crate) base_filesystem_entry_id: Option<String>,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+    pub(crate) base_entry_kind: Option<String>,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestRemovalCandidate {
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) base_filesystem_entry_id: String,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanManifestDelta {
+    pub(crate) id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) observation_sequence: Option<i64>,
+    pub(crate) delta_kind: String,
+    pub(crate) base_filesystem_entry_id: Option<String>,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+    pub(crate) entry_kind: Option<String>,
+    pub(crate) size: Option<i64>,
+    pub(crate) modified_at: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Debug)]
@@ -1071,6 +1181,7 @@ pub(crate) struct NewScanManifestEntry {
     pub(crate) entry_kind: String,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
 }

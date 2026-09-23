@@ -466,6 +466,246 @@ impl Database {
         })
     }
 
+    pub(crate) async fn apply_manifest_existing_file_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        update: ManifestExistingFileUpdate<'_>,
+    ) -> Result<bool, StorageError> {
+        let ManifestExistingFileUpdate {
+            filesystem_entry_id,
+            library_root_id,
+            relative_path,
+            base_fingerprint,
+            expected_missing,
+            size,
+            modified_at,
+            inode,
+            fingerprint,
+            generation,
+            source_kind,
+            edition_name,
+            quality_label,
+            container,
+            external_url,
+            strm_target_kind,
+        } = update;
+        let result = self
+            .query(
+                "UPDATE filesystem_entries
+                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                     last_seen_generation = ?, is_missing = 0, updated_at = unixepoch()
+                 WHERE id = ? AND library_root_id = ? AND relative_path = ?
+                   AND entry_kind = 'FILE' AND is_missing = ?
+                   AND (fingerprint = ? OR (fingerprint IS NULL AND ? IS NULL))",
+            )
+            .bind(size)
+            .bind(modified_at)
+            .bind(inode)
+            .bind(fingerprint)
+            .bind(generation)
+            .bind(filesystem_entry_id)
+            .bind(library_root_id)
+            .bind(relative_path)
+            .bind(database_flag(expected_missing))
+            .bind(base_fingerprint)
+            .bind(base_fingerprint)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if result.rows_affected() != 1 {
+            return Ok(false);
+        }
+        self.query(
+            "UPDATE media_sources
+             SET source_kind = ?, size = ?, container = ?, edition_name = ?,
+                 quality_label = ?, external_url = ?, strm_target_kind = ?,
+                 probe_status = 'PENDING', probe_error = NULL, updated_at = unixepoch()
+             WHERE filesystem_entry_id = ?",
+        )
+        .bind(source_kind)
+        .bind(size)
+        .bind(container)
+        .bind(edition_name)
+        .bind(quality_label)
+        .bind(external_url)
+        .bind(strm_target_kind)
+        .bind(filesystem_entry_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "DELETE FROM media_chapters
+             WHERE media_source_id IN (
+                 SELECT id FROM media_sources WHERE filesystem_entry_id = ?
+             )",
+        )
+        .bind(filesystem_entry_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if expected_missing {
+            self.restore_media_items_for_filesystem_entries(
+                transaction,
+                &[filesystem_entry_id.to_owned()],
+            )
+            .await?;
+        }
+        Ok(true)
+    }
+
+    pub(crate) async fn insert_manifest_sidecar_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_root_id: &str,
+        generation: &str,
+        entry: &NewScanManifestSidecarEntry,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size,
+                 modified_at, inode, fingerprint, last_seen_generation, is_missing
+             ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(&entry.filesystem_entry_id)
+        .bind(library_root_id)
+        .bind(&entry.relative_path)
+        .bind(entry.size)
+        .bind(entry.modified_at)
+        .bind(entry.inode)
+        .bind(&entry.fingerprint)
+        .bind(generation)
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn insert_manifest_unresolved_file_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        file: &NewScanManifestUnresolvedFile,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size,
+                 modified_at, inode, fingerprint, last_seen_generation, is_missing
+             ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)",
+        )
+        .bind(&file.filesystem_entry_id)
+        .bind(library_root_id)
+        .bind(&file.relative_path)
+        .bind(file.size)
+        .bind(file.modified_at)
+        .bind(file.inode)
+        .bind(&file.fingerprint)
+        .bind(generation)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let parent_id = self
+            .ensure_movie_parent_folder_in_transaction(
+                &mut *transaction,
+                library_id,
+                library_root_id,
+                &file.relative_path,
+            )
+            .await?;
+        let existing_item_id = self
+            .query_scalar::<String>(
+                "SELECT id FROM media_items
+                 WHERE library_id = ? AND identity_key = ? LIMIT 1",
+            )
+            .bind(library_id)
+            .bind(&file.identity_key)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let item_id = if let Some(item_id) = existing_item_id {
+            self.query(
+                "UPDATE media_items
+                 SET item_type = 'UNRESOLVED', parent_id = ?, title = ?, sort_title = ?,
+                     original_title = ?, identification_status = 'PENDING', removed_at = NULL,
+                     updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(parent_id.as_deref())
+            .bind(&file.title)
+            .bind(file.title.to_lowercase())
+            .bind(&file.title)
+            .bind(&item_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            item_id
+        } else {
+            self.query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, title, sort_title,
+                     original_title, identification_status, identity_key
+                 ) VALUES (?, ?, 'UNRESOLVED', ?, ?, ?, ?, 'PENDING', ?)",
+            )
+            .bind(&file.item_id)
+            .bind(library_id)
+            .bind(parent_id.as_deref())
+            .bind(&file.title)
+            .bind(file.title.to_lowercase())
+            .bind(&file.title)
+            .bind(&file.identity_key)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            file.item_id.clone()
+        };
+        self.query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, container, size,
+                 external_url, strm_target_kind, is_default, probe_status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING')",
+        )
+        .bind(&file.source_id)
+        .bind(item_id)
+        .bind(&file.source_kind)
+        .bind(&file.filesystem_entry_id)
+        .bind(&file.container)
+        .bind(file.size)
+        .bind(file.external_url.as_deref())
+        .bind(file.strm_target_kind.as_deref())
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     async fn ensure_movie_parent_folder_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,

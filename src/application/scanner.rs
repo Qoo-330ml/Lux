@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
+    io::Read,
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -57,12 +58,14 @@ use crate::{
     domain::ids::{FilesystemEntryId, ItemId, LibraryId, SourceId},
     observability::resources::ResourceMetrics,
     storage::{
-        Database, FilesystemEntryMove, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem,
-        NewMediaItem, NewMediaSource, NewMovieFile, NewScanJobEvent, NewScanManifest,
-        NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestRoot,
-        ReconciliationBatchCommit, StorageError, StoredEpisodeIdentityCandidate,
-        StoredFilesystemEntry, StoredLibraryRoot, StoredReconciliationScanEntry, StoredScanJob,
-        StoredScanJobPath, movie_parent_folder_identity,
+        Database, FilesystemEntryMove, ManifestDeltaBatchCommit, NewEpisodeFile,
+        NewFilesystemEntry, NewHierarchyItem, NewMediaItem, NewMediaSource, NewMovieFile,
+        NewScanJobEvent, NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk,
+        NewScanManifestEntry, NewScanManifestRoot, NewScanManifestSidecarEntry,
+        NewScanManifestUnresolvedFile, ReconciliationBatchCommit, StorageError,
+        StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
+        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
+        movie_parent_folder_identity,
     },
 };
 
@@ -78,6 +81,87 @@ struct ManifestDirectoryBatch {
     completed: bool,
 }
 
+enum PreparedManifestFile {
+    Movie(NewMovieFile),
+    Episode(NewEpisodeFile),
+    Unresolved(NewScanManifestUnresolvedFile),
+}
+
+#[derive(Clone, Copy)]
+enum ManifestRemovalOutcome {
+    Missing,
+    Present,
+    PathIoError,
+    InvalidPath,
+    RootIdentityChanged,
+}
+
+#[derive(Default)]
+struct ManifestRemovalDecision {
+    confirmed_missing_ids: Vec<String>,
+    unstable_ids: Vec<String>,
+    root_identity_lost: bool,
+}
+
+fn classify_manifest_removal_outcomes(
+    outcomes: &[(String, ManifestRemovalOutcome)],
+) -> ManifestRemovalDecision {
+    let root_identity_lost = outcomes
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, ManifestRemovalOutcome::RootIdentityChanged));
+    let any_path_io_error = outcomes
+        .iter()
+        .any(|(_, outcome)| matches!(outcome, ManifestRemovalOutcome::PathIoError));
+    if root_identity_lost || any_path_io_error {
+        return ManifestRemovalDecision {
+            confirmed_missing_ids: Vec::new(),
+            unstable_ids: outcomes.iter().map(|(id, _)| id.clone()).collect(),
+            root_identity_lost,
+        };
+    }
+
+    let mut decision = ManifestRemovalDecision::default();
+    for (id, outcome) in outcomes {
+        match outcome {
+            ManifestRemovalOutcome::Missing => decision.confirmed_missing_ids.push(id.clone()),
+            ManifestRemovalOutcome::Present
+            | ManifestRemovalOutcome::InvalidPath
+            | ManifestRemovalOutcome::PathIoError
+            | ManifestRemovalOutcome::RootIdentityChanged => {
+                decision.unstable_ids.push(id.clone());
+            }
+        }
+    }
+    decision
+}
+
+impl PreparedManifestFile {
+    fn matches_observation(&self, observation: &NewScanManifestEntry) -> bool {
+        match self {
+            Self::Movie(file) => {
+                file.relative_path == observation.relative_path
+                    && file.size == observation.size
+                    && file.modified_at == observation.modified_at
+                    && file.fingerprint == observation.fingerprint
+            }
+            Self::Episode(file) => {
+                file.relative_path == observation.relative_path
+                    && file.size == observation.size
+                    && file.modified_at == observation.modified_at
+                    && file.inode == observation.inode
+                    && file.fingerprint == observation.fingerprint
+            }
+            Self::Unresolved(file) => {
+                file.relative_path == observation.relative_path
+                    && file.size == observation.size
+                    && file.modified_at == observation.modified_at
+                    && file.inode == observation.inode
+                    && file.fingerprint == observation.fingerprint
+            }
+        }
+    }
+}
+
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -89,6 +173,7 @@ struct ManifestDirectoryReader {
     relative_directory: String,
     _directory: std::fs::File,
     entries: *mut libc::DIR,
+    root_observation: NewScanManifestEntry,
     directory_observation: NewScanManifestEntry,
 }
 
@@ -126,14 +211,32 @@ impl ManifestDirectoryReader {
                 source,
             })?;
 
-        for component in root_path
-            .components()
-            .chain(Path::new(relative_directory).components())
-        {
+        for component in root_path.components() {
             let Component::Normal(name) = component else {
                 if matches!(component, Component::RootDir) {
                     continue;
                 }
+                return Err(ScannerError::InvalidRelativePath(
+                    relative_directory.to_owned(),
+                ));
+            };
+            directory = open_manifest_directory_component(
+                directory.as_raw_fd(),
+                name,
+                &display_path,
+                relative_directory,
+            )?;
+        }
+
+        let root_metadata = directory.metadata().map_err(|source| ScannerError::Io {
+            path: root_path.to_owned(),
+            source,
+        })?;
+        let root_observation =
+            manifest_entry_observation(String::new(), "DIRECTORY", &root_metadata, root_path)?;
+
+        for component in Path::new(relative_directory).components() {
+            let Component::Normal(name) = component else {
                 return Err(ScannerError::InvalidRelativePath(
                     relative_directory.to_owned(),
                 ));
@@ -182,6 +285,7 @@ impl ManifestDirectoryReader {
             relative_directory: relative_directory.to_owned(),
             _directory: directory,
             entries,
+            root_observation,
             directory_observation,
         })
     }
@@ -317,6 +421,342 @@ impl Drop for ManifestDirectoryReader {
     }
 }
 
+async fn stat_manifest_relative_file(
+    root_path: PathBuf,
+    relative_path: String,
+    expected_root_device: Option<i64>,
+    expected_root_inode: Option<i64>,
+) -> Result<Option<NewScanManifestEntry>, ScannerError> {
+    let display_path = root_path.clone();
+    tokio::task::spawn_blocking(move || {
+        stat_manifest_relative_file_sync(
+            &root_path,
+            &relative_path,
+            expected_root_device,
+            expected_root_inode,
+        )
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: display_path,
+        source: std::io::Error::other(source.to_string()),
+    })?
+}
+
+async fn read_manifest_strm_target(
+    root_path: PathBuf,
+    relative_path: String,
+    expected_root_device: Option<i64>,
+    expected_root_inode: Option<i64>,
+    expected_observation: NewScanManifestEntry,
+) -> Result<StrmTarget, ScannerError> {
+    let display_path = root_path.join(&relative_path);
+    tokio::task::spawn_blocking(move || {
+        read_manifest_strm_target_sync(
+            &root_path,
+            &relative_path,
+            expected_root_device,
+            expected_root_inode,
+            &expected_observation,
+        )
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: display_path.clone(),
+        source: std::io::Error::other(source.to_string()),
+    })?
+}
+
+async fn stat_manifest_root(root_path: PathBuf) -> Result<NewScanManifestEntry, ScannerError> {
+    let display_path = root_path.clone();
+    tokio::task::spawn_blocking(move || stat_manifest_root_sync(&root_path))
+        .await
+        .map_err(|source| ScannerError::Io {
+            path: display_path,
+            source: std::io::Error::other(source.to_string()),
+        })?
+}
+
+fn stat_manifest_root_sync(root_path: &Path) -> Result<NewScanManifestEntry, ScannerError> {
+    ManifestDirectoryReader::open(root_path, "").map(|reader| reader.root_observation.clone())
+}
+
+fn manifest_root_identity_matches(
+    expected_device: Option<i64>,
+    expected_inode: Option<i64>,
+    observed: &NewScanManifestEntry,
+) -> bool {
+    match (expected_device, expected_inode) {
+        (Some(device), Some(inode)) => {
+            observed.device == Some(device) && observed.inode == Some(inode)
+        }
+        // Without a stable root identity, a replacement mount or directory cannot be
+        // distinguished from the original root. Never authorize reconciliation deletes.
+        (None, None) => false,
+        _ => false,
+    }
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn stat_manifest_relative_file_sync(
+    root_path: &Path,
+    relative_path: &str,
+    expected_root_device: Option<i64>,
+    expected_root_inode: Option<i64>,
+) -> Result<Option<NewScanManifestEntry>, ScannerError> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    }
+    let Some(file_name) = relative.file_name() else {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    };
+    let parent = relative.parent().and_then(Path::to_str).unwrap_or_default();
+    let reader = match ManifestDirectoryReader::open(root_path, parent) {
+        Ok(reader) => reader,
+        Err(ScannerError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            let root_observation = stat_manifest_root_sync(root_path)?;
+            if manifest_root_identity_matches(
+                expected_root_device,
+                expected_root_inode,
+                &root_observation,
+            ) {
+                return Ok(None);
+            }
+            return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+        }
+        Err(error) => return Err(error),
+    };
+    if !manifest_root_identity_matches(
+        expected_root_device,
+        expected_root_inode,
+        &reader.root_observation,
+    ) {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+    let file_name = std::ffi::CString::new(file_name.as_bytes())
+        .map_err(|_| ScannerError::InvalidRelativePath(relative_path.to_owned()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the parent descriptor is live and file_name/stat remain valid for the call.
+    let result = unsafe {
+        libc::fstatat(
+            reader._directory.as_raw_fd(),
+            file_name.as_ptr(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if result < 0 {
+        let source = std::io::Error::last_os_error();
+        if source.kind() == std::io::ErrorKind::NotFound {
+            return Ok(None);
+        }
+        return Err(ScannerError::Io {
+            path: root_path.join(relative_path),
+            source,
+        });
+    }
+    // SAFETY: fstatat initialized the struct on success.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    }
+    manifest_entry_observation_from_stat(
+        relative_path.to_owned(),
+        "FILE",
+        &stat,
+        &root_path.join(relative_path),
+    )
+    .map(Some)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn stat_manifest_relative_file_sync(
+    root_path: &Path,
+    relative_path: &str,
+    expected_root_device: Option<i64>,
+    expected_root_inode: Option<i64>,
+) -> Result<Option<NewScanManifestEntry>, ScannerError> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    }
+    let parent = relative.parent().and_then(Path::to_str).unwrap_or_default();
+    let reader = match ManifestDirectoryReader::open(root_path, parent) {
+        Ok(reader) => reader,
+        Err(ScannerError::Io { source, .. })
+            if matches!(
+                source.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            let root_observation = stat_manifest_root_sync(root_path)?;
+            if manifest_root_identity_matches(
+                expected_root_device,
+                expected_root_inode,
+                &root_observation,
+            ) {
+                return Ok(None);
+            }
+            return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+        }
+        Err(error) => return Err(error),
+    };
+    if !manifest_root_identity_matches(
+        expected_root_device,
+        expected_root_inode,
+        &reader.root_observation,
+    ) {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+    let path = root_path.join(relative);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => return Err(ScannerError::Io { path, source }),
+    };
+    if !metadata.file_type().is_file() {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    }
+    manifest_entry_observation(relative_path.to_owned(), "FILE", &metadata, &path).map(Some)
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn read_manifest_strm_target_sync(
+    root_path: &Path,
+    relative_path: &str,
+    expected_root_device: Option<i64>,
+    expected_root_inode: Option<i64>,
+    expected_observation: &NewScanManifestEntry,
+) -> Result<StrmTarget, ScannerError> {
+    let relative = Path::new(relative_path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    }
+    let Some(file_name) = relative.file_name() else {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    };
+    let parent = relative.parent().and_then(Path::to_str).unwrap_or_default();
+    let reader = ManifestDirectoryReader::open(root_path, parent)?;
+    if !manifest_root_identity_matches(
+        expected_root_device,
+        expected_root_inode,
+        &reader.root_observation,
+    ) {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+    let file_name = std::ffi::CString::new(file_name.as_bytes())
+        .map_err(|_| ScannerError::InvalidRelativePath(relative_path.to_owned()))?;
+    // O_NOFOLLOW closes the stat/read symlink race; O_NONBLOCK prevents a replaced FIFO
+    // from blocking this bounded blocking worker before fstat can reject it.
+    // SAFETY: the parent descriptor is live and file_name is a NUL-terminated C string.
+    let descriptor = unsafe {
+        libc::openat(
+            reader._directory.as_raw_fd(),
+            file_name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+        )
+    };
+    if descriptor < 0 {
+        return Err(ScannerError::Io {
+            path: root_path.join(relative_path),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: descriptor is newly opened and ownership transfers to File.
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+    // SAFETY: the descriptor is live and stat is writable for fstat.
+    if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+        return Err(ScannerError::Io {
+            path: root_path.join(relative_path),
+            source: std::io::Error::last_os_error(),
+        });
+    }
+    // SAFETY: successful fstat initialized the struct.
+    let stat = unsafe { stat.assume_init() };
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    }
+    let observed = manifest_entry_observation_from_stat(
+        relative_path.to_owned(),
+        "FILE",
+        &stat,
+        &root_path.join(relative_path),
+    )?;
+    if !manifest_file_observation_matches(expected_observation, &observed) {
+        return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
+    }
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|source| ScannerError::Io {
+            path: root_path.join(relative_path),
+            source,
+        })?;
+    Ok(classify_strm_target(&contents))
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
+fn read_manifest_strm_target_sync(
+    _root_path: &Path,
+    relative_path: &str,
+    _expected_root_device: Option<i64>,
+    _expected_root_inode: Option<i64>,
+    _expected_observation: &NewScanManifestEntry,
+) -> Result<StrmTarget, ScannerError> {
+    Err(ScannerError::InvalidRelativePath(relative_path.to_owned()))
+}
+
+fn manifest_file_observation_matches(
+    expected: &NewScanManifestEntry,
+    observed: &NewScanManifestEntry,
+) -> bool {
+    expected.relative_path == observed.relative_path
+        && expected.entry_kind == observed.entry_kind
+        && expected.size == observed.size
+        && expected.modified_at == observed.modified_at
+        && expected.device == observed.device
+        && expected.inode == observed.inode
+        && expected.fingerprint == observed.fingerprint
+}
+
 #[cfg(any(
     target_os = "linux",
     target_os = "android",
@@ -366,6 +806,7 @@ struct ManifestDirectoryReader {
     relative_directory: String,
     directory_path: PathBuf,
     entries: std::fs::ReadDir,
+    root_observation: NewScanManifestEntry,
     directory_observation: NewScanManifestEntry,
 }
 
@@ -377,6 +818,27 @@ struct ManifestDirectoryReader {
 )))]
 impl ManifestDirectoryReader {
     fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
+        let canonical_root_path =
+            std::fs::canonicalize(root_path).map_err(|source| ScannerError::Io {
+                path: root_path.to_owned(),
+                source,
+            })?;
+        if canonical_root_path != root_path {
+            return Err(ScannerError::InvalidRelativePath(
+                root_path.to_string_lossy().into_owned(),
+            ));
+        }
+        let root_metadata =
+            std::fs::metadata(&canonical_root_path).map_err(|source| ScannerError::Io {
+                path: canonical_root_path.clone(),
+                source,
+            })?;
+        let root_observation = manifest_entry_observation(
+            String::new(),
+            "DIRECTORY",
+            &root_metadata,
+            &canonical_root_path,
+        )?;
         let directory_path = root_path.join(relative_directory);
         let canonical_directory_path =
             std::fs::canonicalize(&directory_path).map_err(|source| ScannerError::Io {
@@ -411,6 +873,7 @@ impl ManifestDirectoryReader {
             relative_directory: relative_directory.to_owned(),
             directory_path: canonical_directory_path,
             entries,
+            root_observation,
             directory_observation,
         })
     }
@@ -2338,6 +2801,27 @@ impl LibraryScanner {
         path: &Path,
         folder_provider_ids: Option<&BTreeMap<String, String>>,
     ) -> Result<Option<NewMovieFile>, ScannerError> {
+        self.prepare_new_movie_file_with_strm_target(root_path, path, folder_provider_ids, None)
+            .await
+    }
+
+    async fn prepare_manifest_movie_file(
+        &self,
+        root_path: &Path,
+        path: &Path,
+        strm_target: Option<StrmTarget>,
+    ) -> Result<Option<NewMovieFile>, ScannerError> {
+        self.prepare_new_movie_file_with_strm_target(root_path, path, None, strm_target)
+            .await
+    }
+
+    async fn prepare_new_movie_file_with_strm_target(
+        &self,
+        root_path: &Path,
+        path: &Path,
+        folder_provider_ids: Option<&BTreeMap<String, String>>,
+        manifest_strm_target: Option<StrmTarget>,
+    ) -> Result<Option<NewMovieFile>, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
         };
@@ -2359,7 +2843,10 @@ impl LibraryScanner {
         let provider_ids_json = provider_ids_json(&provider_ids);
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
-            Some(read_strm_target(path).await?)
+            Some(match manifest_strm_target {
+                Some(target) => target,
+                None => read_strm_target(path).await?,
+            })
         } else {
             None
         };
@@ -2426,6 +2913,28 @@ impl LibraryScanner {
         root_path: &Path,
         path: &Path,
     ) -> Result<Option<NewEpisodeFile>, ScannerError> {
+        self.prepare_new_episode_file_with_strm_target(root_id, root_path, path, None)
+            .await
+    }
+
+    async fn prepare_manifest_episode_file(
+        &self,
+        root_id: &str,
+        root_path: &Path,
+        path: &Path,
+        strm_target: Option<StrmTarget>,
+    ) -> Result<Option<NewEpisodeFile>, ScannerError> {
+        self.prepare_new_episode_file_with_strm_target(root_id, root_path, path, strm_target)
+            .await
+    }
+
+    async fn prepare_new_episode_file_with_strm_target(
+        &self,
+        root_id: &str,
+        root_path: &Path,
+        path: &Path,
+        manifest_strm_target: Option<StrmTarget>,
+    ) -> Result<Option<NewEpisodeFile>, ScannerError> {
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
             return Ok(None);
         };
@@ -2434,7 +2943,10 @@ impl LibraryScanner {
         };
         let is_strm = is_strm_file(path);
         let strm_target = if is_strm {
-            Some(read_strm_target(path).await?)
+            Some(match manifest_strm_target {
+                Some(target) => target,
+                None => read_strm_target(path).await?,
+            })
         } else {
             None
         };
@@ -2508,6 +3020,85 @@ impl LibraryScanner {
             container,
             external_url: external_url.map(str::to_owned),
         }))
+    }
+
+    async fn prepare_manifest_unresolved_file(
+        &self,
+        root: &StoredLibraryRoot,
+        root_path: &Path,
+        path: &Path,
+        manifest_strm_target: Option<StrmTarget>,
+    ) -> Result<NewScanManifestUnresolvedFile, ScannerError> {
+        let relative_path = path
+            .strip_prefix(root_path)
+            .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+            .to_str()
+            .ok_or(ScannerError::NonUtf8Path)?
+            .to_owned();
+        let is_strm = is_strm_file(path);
+        let strm_target = if is_strm {
+            Some(match manifest_strm_target {
+                Some(target) => target,
+                None => read_strm_target(path).await?,
+            })
+        } else {
+            None
+        };
+        let metadata = fs::metadata(path)
+            .await
+            .map_err(|source| ScannerError::Io {
+                path: path.to_owned(),
+                source,
+            })?;
+        let size = i64::try_from(metadata.len())
+            .map_err(|_| ScannerError::FileSizeOverflow(path.to_owned()))?;
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
+            .unwrap_or(0);
+        let (device, inode) = file_identity(&metadata);
+        let fingerprint =
+            compute_file_fingerprint(&relative_path, size, modified_at, device, inode);
+        let file_stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Unresolved");
+        let cleaned_title = clean_hierarchy_title(file_stem);
+        let title = if cleaned_title.is_empty() {
+            "Unresolved".to_owned()
+        } else {
+            cleaned_title
+        };
+        let container = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        Ok(NewScanManifestUnresolvedFile {
+            item_id: ItemId::new().to_string(),
+            filesystem_entry_id: FilesystemEntryId::new().to_string(),
+            source_id: SourceId::new().to_string(),
+            identity_key: format!("unresolved:{}:{relative_path}", root.id),
+            relative_path,
+            size,
+            modified_at,
+            inode: inode.and_then(|value| i64::try_from(value).ok()),
+            fingerprint,
+            title,
+            source_kind: if is_strm {
+                "STRM_URL".to_owned()
+            } else {
+                "LOCAL_FILE".to_owned()
+            },
+            container,
+            external_url: strm_target.as_ref().and_then(|target| target.value.clone()),
+            strm_target_kind: strm_target
+                .as_ref()
+                .map(strm_target_kind_name)
+                .map(str::to_owned),
+        })
     }
 
     async fn prepare_new_episode_files(
@@ -3579,18 +4170,38 @@ impl ScanJobService {
             return self.cancel_running_job(job_id).await;
         }
 
-        if !job.discovery_completed {
-            if let Some(manifest) = self.database.get_scan_manifest_by_job(&job.id).await? {
-                return self
-                    .run_scan_manifest_discovery_batch(
+        if let Some(manifest) = self.database.get_scan_manifest_by_job(&job.id).await? {
+            return match manifest.state.as_str() {
+                "DISCOVERING" => {
+                    self.run_scan_manifest_discovery_batch(
                         &job,
                         &manifest.id,
                         batch_size,
                         &cancellation,
-                        stream_files_during_discovery,
+                        false,
                     )
-                    .await;
-            }
+                    .await
+                }
+                "READY_TO_DIFF" => {
+                    self.run_scan_manifest_diff_batch(&job, &manifest.id, &cancellation)
+                        .await
+                }
+                "APPLYING" => {
+                    self.run_scan_manifest_apply_batch(
+                        &job,
+                        &manifest.id,
+                        batch_size,
+                        &cancellation,
+                    )
+                    .await
+                }
+                "INDEXED" => self.finish_scan_manifest_indexing(&job, &manifest.id).await,
+                _ => Err(ScanJobError::Storage(StorageError::Conflict(
+                    "scan manifest is not in an executable state".to_owned(),
+                ))),
+            };
+        }
+        if !job.discovery_completed {
             return self
                 .run_reconciliation_discovery_batch(
                     &job,
@@ -3876,6 +4487,737 @@ impl ScanJobService {
             processed: 0,
             created_items: 0,
             completed: false,
+        })
+    }
+
+    async fn run_scan_manifest_diff_batch(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        cancellation: &AtomicBool,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        for root in self.database.list_library_roots(&job.library_id).await? {
+            if self
+                .cancellation_requested(&job.id, false, cancellation)
+                .await?
+            {
+                return self.cancel_running_job(&job.id).await;
+            }
+            let Some((state, expected_device, expected_inode)) = self
+                .database
+                .get_scan_manifest_root_identity(manifest_id, &root.id)
+                .await?
+            else {
+                continue;
+            };
+            if state != "COMPLETE" {
+                continue;
+            }
+            let root_path = PathBuf::from(&root.canonical_path);
+            let root_matches_snapshot = match stat_manifest_root(root_path).await {
+                Ok(observed) => {
+                    manifest_root_identity_matches(expected_device, expected_inode, &observed)
+                }
+                Err(_) => false,
+            };
+            if !root_matches_snapshot {
+                self.database
+                    .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
+                    .await?;
+                self.record_event(
+                    &job.id,
+                    "WARN",
+                    "ROOT_UNAVAILABLE",
+                    "媒体库根目录在发现完成后发生变化，已跳过该根路径的差异应用",
+                    "{}",
+                )
+                .await;
+            }
+        }
+        self.update_activity(&job.id, Some("文件差异计算"), "FINALIZING")
+            .await?;
+        let page_size = i64::try_from(BACKGROUND_SCAN_BATCH_SIZE).unwrap_or(i64::MAX);
+        let mut after_library_root_id: Option<String> = None;
+        let mut after_relative_path: Option<String> = None;
+        loop {
+            if self
+                .cancellation_requested(&job.id, false, cancellation)
+                .await?
+            {
+                return self.cancel_running_job(&job.id).await;
+            }
+            let candidates = self
+                .database
+                .list_scan_manifest_diff_candidates(
+                    manifest_id,
+                    after_library_root_id.as_deref(),
+                    after_relative_path.as_deref(),
+                    page_size,
+                )
+                .await?;
+            let Some(last_candidate) = candidates.last() else {
+                break;
+            };
+            let delta_ids = candidates
+                .iter()
+                .map(|_| Uuid::now_v7().to_string())
+                .collect::<Vec<_>>();
+            let mut deltas = Vec::with_capacity(candidates.len());
+            for (candidate, id) in candidates.iter().zip(&delta_ids) {
+                if candidate.delta_kind != "ADD"
+                    && (candidate.base_filesystem_entry_id.is_none()
+                        || candidate.base_entry_kind.as_deref() != Some("FILE"))
+                {
+                    return Err(StorageError::Conflict(
+                        "manifest difference has an invalid filesystem baseline".to_owned(),
+                    )
+                    .into());
+                }
+                deltas.push(NewScanManifestDelta {
+                    id,
+                    library_root_id: &candidate.library_root_id,
+                    relative_path: &candidate.relative_path,
+                    observation_sequence: Some(candidate.observation_sequence),
+                    delta_kind: &candidate.delta_kind,
+                    base_filesystem_entry_id: candidate.base_filesystem_entry_id.as_deref(),
+                    base_fingerprint: candidate.base_fingerprint.as_deref(),
+                });
+            }
+            self.database
+                .insert_scan_manifest_deltas(manifest_id, &deltas)
+                .await?;
+            after_library_root_id = Some(last_candidate.library_root_id.clone());
+            after_relative_path = Some(last_candidate.relative_path.clone());
+        }
+
+        after_library_root_id = None;
+        after_relative_path = None;
+        loop {
+            if self
+                .cancellation_requested(&job.id, false, cancellation)
+                .await?
+            {
+                return self.cancel_running_job(&job.id).await;
+            }
+            let candidates = self
+                .database
+                .list_scan_manifest_removal_candidates(
+                    manifest_id,
+                    after_library_root_id.as_deref(),
+                    after_relative_path.as_deref(),
+                    page_size,
+                )
+                .await?;
+            let Some(last_candidate) = candidates.last() else {
+                break;
+            };
+            let delta_ids = candidates
+                .iter()
+                .map(|_| Uuid::now_v7().to_string())
+                .collect::<Vec<_>>();
+            let deltas = candidates
+                .iter()
+                .zip(&delta_ids)
+                .map(|(candidate, id)| NewScanManifestDelta {
+                    id,
+                    library_root_id: &candidate.library_root_id,
+                    relative_path: &candidate.relative_path,
+                    observation_sequence: None,
+                    delta_kind: "REMOVE",
+                    base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                    base_fingerprint: candidate.base_fingerprint.as_deref(),
+                })
+                .collect::<Vec<_>>();
+            self.database
+                .insert_scan_manifest_deltas(manifest_id, &deltas)
+                .await?;
+            after_library_root_id = Some(last_candidate.library_root_id.clone());
+            after_relative_path = Some(last_candidate.relative_path.clone());
+        }
+
+        if !self
+            .database
+            .finish_scan_manifest_diff(manifest_id, &job.id)
+            .await?
+        {
+            if self
+                .cancellation_requested(&job.id, false, cancellation)
+                .await?
+            {
+                return self.cancel_running_job(&job.id).await;
+            }
+            self.record_event(
+                &job.id,
+                "WARN",
+                "MANIFEST_DIFF_RETRY",
+                "扫描期间文件索引发生变化，将重新计算差异",
+                "{}",
+            )
+            .await;
+            return Ok(ScanBatchReport {
+                status: "RUNNING".to_owned(),
+                processed: 0,
+                created_items: 0,
+                completed: false,
+            });
+        }
+        let manifest = self
+            .database
+            .get_scan_manifest(manifest_id)
+            .await?
+            .ok_or_else(|| StorageError::Conflict("scan manifest disappeared".to_owned()))?;
+        self.record_event(
+            &job.id,
+            "INFO",
+            "MANIFEST_DIFF_COMPLETED",
+            "文件差异计算完成",
+            &format!(
+                r#"{{"add":{},"change":{},"remove":{},"reappeared":{},"unchanged":{}}}"#,
+                manifest.add_count,
+                manifest.change_count,
+                manifest.remove_count,
+                manifest.reappeared_count,
+                manifest.unchanged_count
+            ),
+        )
+        .await;
+        Ok(ScanBatchReport {
+            status: "RUNNING".to_owned(),
+            processed: 0,
+            created_items: 0,
+            completed: false,
+        })
+    }
+
+    async fn run_scan_manifest_apply_batch(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        batch_size: usize,
+        cancellation: &AtomicBool,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        let deltas = self
+            .database
+            .list_pending_scan_manifest_deltas(
+                manifest_id,
+                i64::try_from(batch_size).unwrap_or(i64::MAX),
+            )
+            .await?;
+        if deltas.is_empty() {
+            return self.finish_scan_manifest_indexing(job, manifest_id).await;
+        }
+        self.update_activity(
+            &job.id,
+            deltas.last().map(|delta| delta.relative_path.as_str()),
+            "INDEXING",
+        )
+        .await?;
+        let library = self
+            .database
+            .find_library(&job.library_id)
+            .await?
+            .ok_or(ScanJobError::LibraryNotFound)?;
+        let root_ids = deltas
+            .iter()
+            .map(|delta| delta.library_root_id.clone())
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let roots = self.database.list_library_roots_by_ids(&root_ids).await?;
+        let mut processed = 0_usize;
+        let mut created_items = 0_usize;
+        for root_id in root_ids {
+            if self
+                .cancellation_requested(&job.id, false, cancellation)
+                .await?
+            {
+                return self.cancel_running_job(&job.id).await;
+            }
+            let root_deltas = deltas
+                .iter()
+                .filter(|delta| delta.library_root_id == root_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            let Some(root) = roots.get(&root_id) else {
+                let unstable_delta_ids = root_deltas
+                    .iter()
+                    .map(|delta| delta.id.clone())
+                    .collect::<Vec<_>>();
+                let result = self
+                    .database
+                    .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
+                        job_id: &job.id,
+                        manifest_id,
+                        library_id: &job.library_id,
+                        library_root_id: &root_id,
+                        generation: &job.generation,
+                        deltas: &root_deltas,
+                        unstable_delta_ids: &unstable_delta_ids,
+                        movie_files: &[],
+                        episode_files: &[],
+                        unresolved_files: &[],
+                        sidecar_entries: &[],
+                        removed_media_paths: &[],
+                        removed_sidecar_paths: &[],
+                    })
+                    .await?;
+                processed = processed.saturating_add(
+                    result
+                        .applied_count
+                        .saturating_add(result.conflict_count)
+                        .saturating_add(result.unstable_count),
+                );
+                continue;
+            };
+            let root_path = PathBuf::from(&root.canonical_path);
+            let root_identity = self
+                .database
+                .get_scan_manifest_root_identity(manifest_id, &root_id)
+                .await?;
+            let root_is_same_object = match root_identity.as_ref() {
+                Some((state, expected_device, expected_inode)) if state == "COMPLETE" => {
+                    match stat_manifest_root(root_path.clone()).await {
+                        Ok(observed) => manifest_root_identity_matches(
+                            *expected_device,
+                            *expected_inode,
+                            &observed,
+                        ),
+                        Err(_) => false,
+                    }
+                }
+                _ => false,
+            };
+            if !root_is_same_object {
+                self.database
+                    .mark_scan_manifest_root_unavailable(manifest_id, &root_id)
+                    .await?;
+                let unstable_delta_ids = root_deltas
+                    .iter()
+                    .map(|delta| delta.id.clone())
+                    .collect::<Vec<_>>();
+                let result = self
+                    .database
+                    .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
+                        job_id: &job.id,
+                        manifest_id,
+                        library_id: &job.library_id,
+                        library_root_id: &root_id,
+                        generation: &job.generation,
+                        deltas: &root_deltas,
+                        unstable_delta_ids: &unstable_delta_ids,
+                        movie_files: &[],
+                        episode_files: &[],
+                        unresolved_files: &[],
+                        sidecar_entries: &[],
+                        removed_media_paths: &[],
+                        removed_sidecar_paths: &[],
+                    })
+                    .await?;
+                processed = processed.saturating_add(
+                    result
+                        .applied_count
+                        .saturating_add(result.conflict_count)
+                        .saturating_add(result.unstable_count),
+                );
+                continue;
+            }
+            let (expected_root_device, expected_root_inode) = root_identity
+                .as_ref()
+                .map(|(_, device, inode)| (*device, *inode))
+                .unwrap_or((None, None));
+            let mut movie_files = Vec::new();
+            let mut episode_files = Vec::new();
+            let mut unresolved_files = Vec::new();
+            let mut sidecar_entries = Vec::new();
+            let mut unstable_delta_ids = Vec::new();
+            let mut removed_media_paths = Vec::new();
+            let mut removed_sidecar_paths = Vec::new();
+            let mut removal_candidates = Vec::new();
+            let mut positive_observations = Vec::new();
+            let mut mixed_cache = MixedClassificationCache::default();
+            let mut root_identity_lost = false;
+
+            for delta in &root_deltas {
+                if cancellation.load(Ordering::Acquire) {
+                    return self.cancel_running_job(&job.id).await;
+                }
+                if delta.delta_kind == "REMOVE" {
+                    removal_candidates.push(delta.clone());
+                    continue;
+                }
+                let Some(expected_fingerprint) = delta.fingerprint.as_deref() else {
+                    unstable_delta_ids.push(delta.id.clone());
+                    continue;
+                };
+                let observed = match stat_manifest_relative_file(
+                    root_path.clone(),
+                    delta.relative_path.clone(),
+                    expected_root_device,
+                    expected_root_inode,
+                )
+                .await
+                {
+                    Ok(Some(observed))
+                        if observed.fingerprint.as_slice() == expected_fingerprint
+                            && Some(observed.size) == delta.size
+                            && Some(observed.modified_at) == delta.modified_at
+                            && observed.inode == delta.inode =>
+                    {
+                        observed
+                    }
+                    Err(ScannerError::RootIdentityChanged(_)) => {
+                        root_identity_lost = true;
+                        unstable_delta_ids.push(delta.id.clone());
+                        continue;
+                    }
+                    Ok(_) | Err(_) => {
+                        unstable_delta_ids.push(delta.id.clone());
+                        continue;
+                    }
+                };
+                positive_observations.push((
+                    delta.id.clone(),
+                    delta.relative_path.clone(),
+                    observed.clone(),
+                ));
+                if !is_supported_movie_file(Path::new(&delta.relative_path)) {
+                    if is_supported_sidecar_file(Path::new(&delta.relative_path))
+                        && delta.delta_kind == "ADD"
+                    {
+                        sidecar_entries.push(NewScanManifestSidecarEntry {
+                            filesystem_entry_id: FilesystemEntryId::new().to_string(),
+                            relative_path: delta.relative_path.clone(),
+                            size: observed.size,
+                            modified_at: observed.modified_at,
+                            inode: observed.inode,
+                            fingerprint: observed.fingerprint,
+                        });
+                    }
+                    continue;
+                }
+                let path = root_path.join(&delta.relative_path);
+                let classification = match library.kind.as_str() {
+                    "MOVIE" => {
+                        if parse_movie_filename(
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or_default(),
+                        )
+                        .is_some()
+                        {
+                            MixedClassification::Movie
+                        } else {
+                            MixedClassification::Unresolved
+                        }
+                    }
+                    "SERIES" => {
+                        if parse_episode_filename(
+                            path.file_name()
+                                .and_then(|name| name.to_str())
+                                .unwrap_or_default(),
+                        )
+                        .is_some()
+                        {
+                            MixedClassification::Episode
+                        } else {
+                            MixedClassification::Unresolved
+                        }
+                    }
+                    _ => classify_mixed_file(&root_path, &path, &mut mixed_cache).await,
+                };
+                let manifest_strm_target = if is_strm_file(&path) {
+                    match read_manifest_strm_target(
+                        root_path.clone(),
+                        delta.relative_path.clone(),
+                        expected_root_device,
+                        expected_root_inode,
+                        observed.clone(),
+                    )
+                    .await
+                    {
+                        Ok(target) => Some(target),
+                        Err(ScannerError::RootIdentityChanged(_)) => {
+                            root_identity_lost = true;
+                            unstable_delta_ids.push(delta.id.clone());
+                            continue;
+                        }
+                        Err(_) => {
+                            unstable_delta_ids.push(delta.id.clone());
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                let prepared = match classification {
+                    MixedClassification::Movie => self
+                        .scanner
+                        .prepare_manifest_movie_file(&root_path, &path, manifest_strm_target)
+                        .await
+                        .map(|file| file.map(PreparedManifestFile::Movie)),
+                    MixedClassification::Episode => self
+                        .scanner
+                        .prepare_manifest_episode_file(
+                            &root_id,
+                            &root_path,
+                            &path,
+                            manifest_strm_target,
+                        )
+                        .await
+                        .map(|file| file.map(PreparedManifestFile::Episode)),
+                    MixedClassification::Unresolved => self
+                        .scanner
+                        .prepare_manifest_unresolved_file(
+                            root,
+                            &root_path,
+                            &path,
+                            manifest_strm_target,
+                        )
+                        .await
+                        .map(|file| Some(PreparedManifestFile::Unresolved(file))),
+                };
+                let prepared = match prepared {
+                    Ok(Some(file)) if file.matches_observation(&observed) => file,
+                    Ok(_) | Err(_) => {
+                        unstable_delta_ids.push(delta.id.clone());
+                        continue;
+                    }
+                };
+                match prepared {
+                    PreparedManifestFile::Movie(file) => movie_files.push(file),
+                    PreparedManifestFile::Episode(file) => episode_files.push(file),
+                    PreparedManifestFile::Unresolved(file) => unresolved_files.push(file),
+                }
+            }
+
+            for (delta_id, relative_path, expected) in &positive_observations {
+                if root_identity_lost {
+                    break;
+                }
+                match stat_manifest_relative_file(
+                    root_path.clone(),
+                    relative_path.clone(),
+                    expected_root_device,
+                    expected_root_inode,
+                )
+                .await
+                {
+                    Ok(Some(observed))
+                        if manifest_file_observation_matches(expected, &observed) => {}
+                    Err(ScannerError::RootIdentityChanged(_)) => {
+                        root_identity_lost = true;
+                    }
+                    Ok(_) | Err(_) => {
+                        unstable_delta_ids.push(delta_id.clone());
+                        movie_files.retain(|file| file.relative_path != *relative_path);
+                        episode_files.retain(|file| file.relative_path != *relative_path);
+                        unresolved_files.retain(|file| file.relative_path != *relative_path);
+                        sidecar_entries.retain(|entry| entry.relative_path != *relative_path);
+                    }
+                }
+            }
+
+            if !root_identity_lost {
+                let root_still_matches =
+                    stat_manifest_root(root_path.clone())
+                        .await
+                        .is_ok_and(|observed| {
+                            manifest_root_identity_matches(
+                                expected_root_device,
+                                expected_root_inode,
+                                &observed,
+                            )
+                        });
+                root_identity_lost = !root_still_matches;
+            }
+
+            if !root_identity_lost {
+                let mut removal_outcomes = Vec::with_capacity(removal_candidates.len());
+                for delta in &removal_candidates {
+                    let outcome = match stat_manifest_relative_file(
+                        root_path.clone(),
+                        delta.relative_path.clone(),
+                        expected_root_device,
+                        expected_root_inode,
+                    )
+                    .await
+                    {
+                        Ok(None) => ManifestRemovalOutcome::Missing,
+                        Ok(Some(_)) => ManifestRemovalOutcome::Present,
+                        Err(ScannerError::RootIdentityChanged(_)) => {
+                            root_identity_lost = true;
+                            ManifestRemovalOutcome::RootIdentityChanged
+                        }
+                        Err(ScannerError::Io { .. }) => ManifestRemovalOutcome::PathIoError,
+                        Err(_) => ManifestRemovalOutcome::InvalidPath,
+                    };
+                    removal_outcomes.push((delta.id.clone(), outcome));
+                    if root_identity_lost {
+                        break;
+                    }
+                }
+                let decision = classify_manifest_removal_outcomes(&removal_outcomes);
+                root_identity_lost |= decision.root_identity_lost;
+                unstable_delta_ids.extend(decision.unstable_ids);
+                if !root_identity_lost {
+                    for delta in &removal_candidates {
+                        if !decision
+                            .confirmed_missing_ids
+                            .iter()
+                            .any(|id| id == &delta.id)
+                        {
+                            continue;
+                        }
+                        if is_supported_movie_file(Path::new(&delta.relative_path)) {
+                            removed_media_paths.push(delta.relative_path.clone());
+                        }
+                        if is_supported_sidecar_file(Path::new(&delta.relative_path)) {
+                            removed_sidecar_paths.push(delta.relative_path.clone());
+                        }
+                    }
+                }
+            }
+
+            if root_identity_lost {
+                self.database
+                    .mark_scan_manifest_root_unavailable(manifest_id, &root_id)
+                    .await?;
+                unstable_delta_ids.extend(root_deltas.iter().map(|delta| delta.id.clone()));
+                movie_files.clear();
+                episode_files.clear();
+                unresolved_files.clear();
+                sidecar_entries.clear();
+                removed_media_paths.clear();
+                removed_sidecar_paths.clear();
+            }
+            unstable_delta_ids.sort();
+            unstable_delta_ids.dedup();
+
+            let result = self
+                .database
+                .commit_scan_manifest_delta_batch(&ManifestDeltaBatchCommit {
+                    job_id: &job.id,
+                    manifest_id,
+                    library_id: &job.library_id,
+                    library_root_id: &root_id,
+                    generation: &job.generation,
+                    deltas: &root_deltas,
+                    unstable_delta_ids: &unstable_delta_ids,
+                    movie_files: &movie_files,
+                    episode_files: &episode_files,
+                    unresolved_files: &unresolved_files,
+                    sidecar_entries: &sidecar_entries,
+                    removed_media_paths: &removed_media_paths,
+                    removed_sidecar_paths: &removed_sidecar_paths,
+                })
+                .await?;
+            processed = processed.saturating_add(
+                result
+                    .applied_count
+                    .saturating_add(result.conflict_count)
+                    .saturating_add(result.unstable_count),
+            );
+            created_items = created_items.saturating_add(result.created_items);
+            if result.metadata_targets_changed {
+                self.notify_local_metadata_worker(&job.id);
+            }
+        }
+
+        if self
+            .cancellation_requested(&job.id, false, cancellation)
+            .await?
+        {
+            return self.cancel_running_job(&job.id).await;
+        }
+        if self
+            .database
+            .list_pending_scan_manifest_deltas(manifest_id, 1)
+            .await?
+            .is_empty()
+        {
+            let mut report = self.finish_scan_manifest_indexing(job, manifest_id).await?;
+            report.processed = report.processed.saturating_add(processed);
+            report.created_items = report.created_items.saturating_add(created_items);
+            return Ok(report);
+        }
+        Ok(ScanBatchReport {
+            status: "RUNNING".to_owned(),
+            processed,
+            created_items,
+            completed: false,
+        })
+    }
+
+    async fn finish_scan_manifest_indexing(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        let manifest = self
+            .database
+            .get_scan_manifest(manifest_id)
+            .await?
+            .ok_or_else(|| StorageError::Conflict("scan manifest disappeared".to_owned()))?;
+        if manifest.state == "APPLYING"
+            && !self
+                .database
+                .transition_scan_manifest_state(manifest_id, "APPLYING", "INDEXED")
+                .await?
+        {
+            return Err(StorageError::Conflict(
+                "manifest could not enter indexed state".to_owned(),
+            )
+            .into());
+        }
+        let roots = self.database.list_library_roots(&job.library_id).await?;
+        for root in roots {
+            self.database
+                .update_root_scan_cursor(&root.id, None)
+                .await?;
+        }
+        self.database
+            .update_library_last_scan(&job.library_id)
+            .await?;
+        self.database
+            .clear_reconciliation_scan_entries(&job.id)
+            .await?;
+        self.database.mark_scan_job_postprocessing(&job.id).await?;
+        let transitioned = self
+            .database
+            .transition_scan_manifest_state(manifest_id, "INDEXED", "POSTPROCESSING")
+            .await?;
+        if !transitioned && manifest.state != "POSTPROCESSING" {
+            return Err(StorageError::Conflict(
+                "manifest could not enter postprocessing state".to_owned(),
+            )
+            .into());
+        }
+        self.record_event(&job.id, "INFO", "JOB_COMPLETED", "任务已完成", "{}")
+            .await;
+        let completed_job = self.database.find_scan_job(&job.id).await?;
+        if let Some(completed_job) = completed_job.as_ref() {
+            let removed_count = self
+                .database
+                .count_applied_scan_manifest_removals(manifest_id)
+                .await?;
+            if removed_count > 0 {
+                self.publish_webhook_event_with_data(
+                    completed_job,
+                    WebhookEventType::MediaRemoved,
+                    None,
+                    json!({ "removedCount": removed_count }),
+                )
+                .await;
+            }
+            self.publish_webhook_event(completed_job, WebhookEventType::ScanCompleted, None)
+                .await;
+        }
+        self.clear_cancellation_flag(&job.id);
+        Ok(ScanBatchReport {
+            status: "COMPLETED".to_owned(),
+            processed: 0,
+            created_items: 0,
+            completed: true,
         })
     }
 
@@ -7344,6 +8686,7 @@ fn manifest_entry_observation(
         entry_kind: entry_kind.to_owned(),
         size,
         modified_at,
+        device: device.and_then(|device| i64::try_from(device).ok()),
         inode: inode.and_then(|inode| i64::try_from(inode).ok()),
         fingerprint,
     })
@@ -7386,6 +8729,7 @@ fn manifest_entry_observation_from_stat(
         entry_kind: entry_kind.to_owned(),
         size,
         modified_at,
+        device: device.and_then(|device| i64::try_from(device).ok()),
         inode: i64::try_from(inode).ok(),
         fingerprint,
     })
@@ -7877,6 +9221,7 @@ fn safe_scan_activity_label(relative_path: &str) -> Option<String> {
 pub enum ScannerError {
     LibraryNotFound,
     InvalidRootId(String),
+    RootIdentityChanged(PathBuf),
     InvalidItemId(String),
     InvalidRelativePath(String),
     NonUtf8Path,
@@ -7893,6 +9238,7 @@ impl ScannerError {
         match self {
             Self::LibraryNotFound => "LIBRARY_NOT_FOUND",
             Self::InvalidRootId(_) => "INVALID_ROOT_ID",
+            Self::RootIdentityChanged(_) => "ROOT_IDENTITY_CHANGED",
             Self::InvalidItemId(_) => "INVALID_ITEM_ID",
             Self::InvalidRelativePath(_) => "INVALID_RELATIVE_PATH",
             Self::NonUtf8Path => "NON_UTF8_PATH",
@@ -7908,6 +9254,13 @@ impl fmt::Display for ScannerError {
         match self {
             Self::LibraryNotFound => formatter.write_str("library not found"),
             Self::InvalidRootId(error) => write!(formatter, "invalid library root ID: {error}"),
+            Self::RootIdentityChanged(path) => {
+                write!(
+                    formatter,
+                    "library root changed during scan: {}",
+                    path.display()
+                )
+            }
             Self::InvalidItemId(error) => write!(formatter, "invalid media item ID: {error}"),
             Self::InvalidRelativePath(error) => write!(formatter, "invalid relative path: {error}"),
             Self::NonUtf8Path => formatter.write_str("path is not valid UTF-8"),
@@ -7929,6 +9282,7 @@ impl std::error::Error for ScannerError {
             Self::Storage(error) => Some(error),
             Self::LibraryNotFound
             | Self::InvalidRootId(_)
+            | Self::RootIdentityChanged(_)
             | Self::InvalidItemId(_)
             | Self::InvalidRelativePath(_)
             | Self::NonUtf8Path
@@ -7955,9 +9309,11 @@ fn throughput_per_second(items: usize, elapsed_ms: u128) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        ManifestDirectoryReader, MixedClassification, MixedClassificationCache,
-        classify_mixed_file, media_source_folder, normalize_incremental_path,
-        safe_scan_activity_label,
+        ManifestDirectoryReader, ManifestRemovalOutcome, MixedClassification,
+        MixedClassificationCache, NewScanManifestEntry, classify_manifest_removal_outcomes,
+        classify_mixed_file, manifest_root_identity_matches, media_source_folder,
+        normalize_incremental_path, read_manifest_strm_target, safe_scan_activity_label,
+        stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
 
     #[cfg(any(
@@ -7992,6 +9348,85 @@ mod tests {
                 .any(|entry| entry.relative_path.is_empty())
         );
         Ok(())
+    }
+
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    ))]
+    #[tokio::test]
+    async fn manifest_strm_read_rejects_same_inode_replaced_by_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let library_path = temp_dir.path().join("Library");
+        std::fs::create_dir(&library_path)?;
+        let root = std::fs::canonicalize(library_path)?;
+        let strm_path = root.join("Example.Movie.2025.strm");
+        std::fs::write(&strm_path, "https://example.invalid/video")?;
+        let external_path = temp_dir.path().join("Moved.strm");
+        let root_observation = stat_manifest_root_sync(&root)?;
+        let observation = stat_manifest_relative_file_sync(
+            &root,
+            "Example.Movie.2025.strm",
+            root_observation.device,
+            root_observation.inode,
+        )?
+        .expect("STRM file observation");
+
+        std::fs::rename(&strm_path, &external_path)?;
+        std::os::unix::fs::symlink(&external_path, &strm_path)?;
+
+        let result = read_manifest_strm_target(
+            root,
+            "Example.Movie.2025.strm".to_owned(),
+            root_observation.device,
+            root_observation.inode,
+            observation,
+        )
+        .await;
+        assert!(result.is_err(), "manifest read must not follow the symlink");
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_removal_confirmation_rejects_reappeared_paths() {
+        let decision = classify_manifest_removal_outcomes(&[
+            ("reappeared".to_owned(), ManifestRemovalOutcome::Present),
+            ("still-missing".to_owned(), ManifestRemovalOutcome::Missing),
+        ]);
+
+        assert_eq!(decision.confirmed_missing_ids, vec!["still-missing"]);
+        assert_eq!(decision.unstable_ids, vec!["reappeared"]);
+        assert!(!decision.root_identity_lost);
+    }
+
+    #[test]
+    fn manifest_removal_io_error_invalidates_all_sibling_deletes() {
+        let decision = classify_manifest_removal_outcomes(&[
+            ("missing".to_owned(), ManifestRemovalOutcome::Missing),
+            ("unreadable".to_owned(), ManifestRemovalOutcome::PathIoError),
+        ]);
+
+        assert!(decision.confirmed_missing_ids.is_empty());
+        assert_eq!(decision.unstable_ids, vec!["missing", "unreadable"]);
+        assert!(!decision.root_identity_lost);
+    }
+
+    #[test]
+    fn manifest_root_without_stable_identity_is_never_authoritative() {
+        let observed = NewScanManifestEntry {
+            relative_path: String::new(),
+            entry_kind: "DIRECTORY".to_owned(),
+            size: 0,
+            modified_at: 0,
+            device: None,
+            inode: None,
+            fingerprint: Vec::new(),
+        };
+
+        assert!(!manifest_root_identity_matches(None, None, &observed));
     }
 
     #[test]

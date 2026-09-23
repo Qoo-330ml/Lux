@@ -709,7 +709,7 @@ impl Database {
         self.query(
             "SELECT id, job_id, library_id, state, root_count,
                     discovered_directory_count, completed_directory_count,
-                    observed_file_count, add_count, change_count, remove_count,
+                    observed_file_count, unchanged_count, add_count, change_count, remove_count,
                     reappeared_count, applied_delta_count
              FROM scan_manifests WHERE id = ?",
         )
@@ -726,6 +726,7 @@ impl Database {
                 discovered_directory_count: row.get("discovered_directory_count"),
                 completed_directory_count: row.get("completed_directory_count"),
                 observed_file_count: row.get("observed_file_count"),
+                unchanged_count: row.get("unchanged_count"),
                 add_count: row.get("add_count"),
                 change_count: row.get("change_count"),
                 remove_count: row.get("remove_count"),
@@ -746,7 +747,7 @@ impl Database {
         self.query(
             "SELECT id, job_id, library_id, state, root_count,
                     discovered_directory_count, completed_directory_count,
-                    observed_file_count, add_count, change_count, remove_count,
+                    observed_file_count, unchanged_count, add_count, change_count, remove_count,
                     reappeared_count, applied_delta_count
              FROM scan_manifests WHERE job_id = ?",
         )
@@ -763,6 +764,7 @@ impl Database {
                 discovered_directory_count: row.get("discovered_directory_count"),
                 completed_directory_count: row.get("completed_directory_count"),
                 observed_file_count: row.get("observed_file_count"),
+                unchanged_count: row.get("unchanged_count"),
                 add_count: row.get("add_count"),
                 change_count: row.get("change_count"),
                 remove_count: row.get("remove_count"),
@@ -920,7 +922,50 @@ impl Database {
                 })?;
         }
 
-        // Eleven binds per observation keep each statement below SQLite's historical 999 cap.
+        let file_paths = chunk
+            .entries
+            .iter()
+            .filter(|entry| entry.entry_kind == "FILE")
+            .map(|entry| entry.relative_path.as_str())
+            .collect::<Vec<_>>();
+        let mut known_file_paths = std::collections::HashSet::new();
+        for paths in file_paths.chunks(SCAN_DML_CHUNK_SIZE) {
+            if paths.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT DISTINCT relative_path FROM scan_manifest_entries
+                 WHERE manifest_id = ? AND library_root_id = ? AND entry_kind = 'FILE'
+                   AND relative_path IN ({placeholders})"
+            );
+            let mut statement = self
+                .query(sqlx::AssertSqlSafe(query))
+                .bind(chunk.manifest_id)
+                .bind(chunk.library_root_id);
+            for path in paths {
+                statement = statement.bind(path);
+            }
+            known_file_paths.extend(
+                statement
+                    .fetch_all(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .into_iter()
+                    .map(|row| row.get::<String, _>("relative_path")),
+            );
+        }
+        let inserted_file_count = file_paths
+            .iter()
+            .filter(|path| !known_file_paths.contains(**path))
+            .count();
+
+        // Twelve binds per observation keep each statement below SQLite's historical 999 cap.
         for entries in chunk.entries.chunks(80) {
             if entries.is_empty() {
                 continue;
@@ -930,7 +975,7 @@ impl Database {
                         (SELECT COALESCE(MAX(observation_sequence), 0) + 1
                          FROM scan_manifest_entries
                          WHERE manifest_id = ? AND library_root_id = ? AND relative_path = ?),
-                        ?, ?, ?, ?, ?, unixepoch()",
+                        ?, ?, ?, ?, ?, ?, unixepoch()",
                 entries.len(),
             )
             .collect::<Vec<_>>()
@@ -938,7 +983,7 @@ impl Database {
             let query = format!(
                 "INSERT INTO scan_manifest_entries (
                      manifest_id, library_root_id, relative_path, observation_sequence,
-                     entry_kind, size, modified_at, inode, fingerprint, observed_at
+                     entry_kind, size, modified_at, device, inode, fingerprint, observed_at
                  ) {selects}"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -953,6 +998,7 @@ impl Database {
                     .bind(&entry.entry_kind)
                     .bind(entry.size)
                     .bind(entry.modified_at)
+                    .bind(entry.device)
                     .bind(entry.inode)
                     .bind(&entry.fingerprint);
             }
@@ -964,28 +1010,6 @@ impl Database {
                     source,
                 })?;
         }
-
-        let media_files = chunk
-            .entries
-            .iter()
-            .filter(|entry| entry.entry_kind == "FILE")
-            .map(|entry| entry.relative_path.clone())
-            .collect::<Vec<_>>();
-        let inserted_file_count = self
-            .insert_reconciliation_directory_entries(
-                &mut transaction,
-                chunk.job_id,
-                chunk.library_root_id,
-                &[],
-                &media_files,
-            )
-            .await?;
-        self.increment_reconciliation_total_count_in_transaction(
-            &mut transaction,
-            chunk.job_id,
-            inserted_file_count,
-        )
-        .await?;
 
         let inserted_file_count_i64 = i64::try_from(inserted_file_count)
             .map_err(|_| StorageError::Conflict("manifest file count overflow".to_owned()))?;
@@ -1132,9 +1156,22 @@ impl Database {
              SET state = 'UNAVAILABLE', error = 'filesystem root could not be read',
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE manifest_id = ? AND library_root_id = ?
-               AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+               AND state IN ('PENDING', 'SCANNING', 'COMPLETE', 'INCOMPLETE')",
         )
         .bind(manifest_id)
+        .bind(library_root_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE library_roots
+             SET is_available = 0, last_checked_at = unixepoch(),
+                 unavailable_since = COALESCE(unavailable_since, unixepoch())
+             WHERE id = ?",
+        )
         .bind(library_root_id)
         .execute(&mut *transaction)
         .await
@@ -1163,6 +1200,37 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })
+    }
+
+    pub(crate) async fn get_scan_manifest_root_identity(
+        &self,
+        manifest_id: &str,
+        library_root_id: &str,
+    ) -> Result<Option<(String, Option<i64>, Option<i64>)>, StorageError> {
+        self.query_as(
+            "SELECT root.state, observed.device, observed.inode
+             FROM scan_manifest_roots root
+             LEFT JOIN scan_manifest_entries observed
+               ON observed.manifest_id = root.manifest_id
+              AND observed.library_root_id = root.library_root_id
+              AND observed.relative_path = ''
+              AND observed.observation_sequence = (
+                  SELECT MAX(latest.observation_sequence)
+                  FROM scan_manifest_entries latest
+                  WHERE latest.manifest_id = root.manifest_id
+                    AND latest.library_root_id = root.library_root_id
+                    AND latest.relative_path = ''
+              )
+             WHERE root.manifest_id = ? AND root.library_root_id = ?",
+        )
+        .bind(manifest_id)
+        .bind(library_root_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn finish_scan_manifest_discovery(
@@ -1202,11 +1270,8 @@ impl Database {
             ));
         }
         let discovered_file_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM reconciliation_scan_entries
-                 WHERE job_id = ? AND entry_type = 'FILE'",
-            )
-            .bind(job_id)
+            .query_scalar("SELECT observed_file_count FROM scan_manifests WHERE id = ?")
+            .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -1364,6 +1429,967 @@ impl Database {
                 source,
             })?;
         Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn list_scan_manifest_diff_candidates(
+        &self,
+        manifest_id: &str,
+        after_library_root_id: Option<&str>,
+        after_relative_path: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<StoredScanManifestDiffCandidate>, StorageError> {
+        self.query(
+            "WITH latest AS (
+                 SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
+                 FROM scan_manifest_entries
+                 WHERE manifest_id = ?
+                 GROUP BY library_root_id, relative_path
+             )
+             SELECT observed.library_root_id, observed.relative_path,
+                    observed.observation_sequence,
+                    CASE WHEN fe.id IS NULL THEN 'ADD'
+                         WHEN fe.is_missing = 1 THEN 'REAPPEARED'
+                         ELSE 'CHANGE' END AS delta_kind,
+                    fe.id AS base_filesystem_entry_id,
+                    fe.fingerprint AS base_fingerprint,
+                    fe.entry_kind AS base_entry_kind,
+                    fe.is_missing AS base_is_missing
+             FROM latest
+             JOIN scan_manifest_entries observed
+               ON observed.manifest_id = ?
+              AND observed.library_root_id = latest.library_root_id
+              AND observed.relative_path = latest.relative_path
+              AND observed.observation_sequence = latest.sequence
+             JOIN scan_manifest_roots root
+               ON root.manifest_id = observed.manifest_id
+              AND root.library_root_id = observed.library_root_id
+              AND root.state = 'COMPLETE'
+             LEFT JOIN filesystem_entries fe
+               ON fe.library_root_id = observed.library_root_id
+              AND fe.relative_path = observed.relative_path
+             WHERE observed.entry_kind = 'FILE'
+               AND (observed.library_root_id > ?
+                    OR (observed.library_root_id = ? AND observed.relative_path > ?))
+               AND (fe.id IS NULL OR fe.is_missing = 1 OR fe.fingerprint IS NULL
+                    OR observed.fingerprint IS NULL OR fe.fingerprint <> observed.fingerprint)
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_manifest_deltas delta
+                   WHERE delta.manifest_id = observed.manifest_id
+                     AND delta.library_root_id = observed.library_root_id
+                     AND delta.relative_path = observed.relative_path
+               )
+             ORDER BY observed.library_root_id, observed.relative_path
+             LIMIT ?",
+        )
+        .bind(manifest_id)
+        .bind(manifest_id)
+        .bind(after_library_root_id.unwrap_or_default())
+        .bind(after_library_root_id.unwrap_or_default())
+        .bind(after_relative_path.unwrap_or_default())
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredScanManifestDiffCandidate {
+                    library_root_id: row.get("library_root_id"),
+                    relative_path: row.get("relative_path"),
+                    observation_sequence: row.get("observation_sequence"),
+                    delta_kind: row.get("delta_kind"),
+                    base_filesystem_entry_id: row.get("base_filesystem_entry_id"),
+                    base_fingerprint: row.get("base_fingerprint"),
+                    base_entry_kind: row.get("base_entry_kind"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_manifest_removal_candidates(
+        &self,
+        manifest_id: &str,
+        after_library_root_id: Option<&str>,
+        after_relative_path: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<StoredScanManifestRemovalCandidate>, StorageError> {
+        self.query(
+            "WITH latest AS (
+                 SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
+                 FROM scan_manifest_entries
+                 WHERE manifest_id = ?
+                 GROUP BY library_root_id, relative_path
+             ), latest_files AS (
+                 SELECT latest.library_root_id, latest.relative_path
+                 FROM latest
+                 JOIN scan_manifest_entries observed
+                   ON observed.manifest_id = ?
+                  AND observed.library_root_id = latest.library_root_id
+                  AND observed.relative_path = latest.relative_path
+                  AND observed.observation_sequence = latest.sequence
+                  AND observed.entry_kind = 'FILE'
+             )
+             SELECT fe.library_root_id, fe.relative_path, fe.id AS base_filesystem_entry_id,
+                    fe.fingerprint AS base_fingerprint
+             FROM filesystem_entries fe
+             JOIN scan_manifest_roots root
+               ON root.manifest_id = ?
+              AND root.library_root_id = fe.library_root_id
+              AND root.state = 'COMPLETE'
+             WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+               AND (fe.library_root_id > ?
+                    OR (fe.library_root_id = ? AND fe.relative_path > ?))
+               AND NOT EXISTS (
+                   SELECT 1 FROM latest_files latest
+                   WHERE latest.library_root_id = fe.library_root_id
+                     AND latest.relative_path = fe.relative_path
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_manifest_deltas delta
+                   WHERE delta.manifest_id = ?
+                     AND delta.library_root_id = fe.library_root_id
+                     AND delta.relative_path = fe.relative_path
+               )
+             ORDER BY fe.library_root_id, fe.relative_path
+             LIMIT ?",
+        )
+        .bind(manifest_id)
+        .bind(manifest_id)
+        .bind(manifest_id)
+        .bind(after_library_root_id.unwrap_or_default())
+        .bind(after_library_root_id.unwrap_or_default())
+        .bind(after_relative_path.unwrap_or_default())
+        .bind(manifest_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredScanManifestRemovalCandidate {
+                    library_root_id: row.get("library_root_id"),
+                    relative_path: row.get("relative_path"),
+                    base_filesystem_entry_id: row.get("base_filesystem_entry_id"),
+                    base_fingerprint: row.get("base_fingerprint"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_scan_manifest_diff(
+        &self,
+        manifest_id: &str,
+        job_id: &str,
+    ) -> Result<bool, StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let remaining_changes: i64 = self
+            .query_scalar(
+                "WITH latest AS (
+                     SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
+                     FROM scan_manifest_entries
+                     WHERE manifest_id = ?
+                     GROUP BY library_root_id, relative_path
+                 ), latest_files AS (
+                     SELECT latest.library_root_id, latest.relative_path
+                     FROM latest
+                     JOIN scan_manifest_entries observed
+                       ON observed.manifest_id = ?
+                      AND observed.library_root_id = latest.library_root_id
+                      AND observed.relative_path = latest.relative_path
+                      AND observed.observation_sequence = latest.sequence
+                      AND observed.entry_kind = 'FILE'
+                 ), candidates AS (
+                     SELECT observed.library_root_id, observed.relative_path
+                     FROM latest
+                     JOIN scan_manifest_entries observed
+                       ON observed.manifest_id = ?
+                      AND observed.library_root_id = latest.library_root_id
+                      AND observed.relative_path = latest.relative_path
+                      AND observed.observation_sequence = latest.sequence
+                     JOIN scan_manifest_roots root
+                       ON root.manifest_id = observed.manifest_id
+                      AND root.library_root_id = observed.library_root_id
+                      AND root.state = 'COMPLETE'
+                     LEFT JOIN filesystem_entries fe
+                       ON fe.library_root_id = observed.library_root_id
+                      AND fe.relative_path = observed.relative_path
+                     WHERE observed.entry_kind = 'FILE'
+                       AND (fe.id IS NULL OR fe.is_missing = 1 OR fe.fingerprint IS NULL
+                            OR observed.fingerprint IS NULL OR fe.fingerprint <> observed.fingerprint)
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_manifest_deltas delta
+                           WHERE delta.manifest_id = observed.manifest_id
+                             AND delta.library_root_id = observed.library_root_id
+                             AND delta.relative_path = observed.relative_path
+                       )
+                     UNION ALL
+                     SELECT fe.library_root_id, fe.relative_path
+                     FROM filesystem_entries fe
+                     JOIN scan_manifest_roots root
+                       ON root.manifest_id = ?
+                      AND root.library_root_id = fe.library_root_id
+                      AND root.state = 'COMPLETE'
+                     WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                       AND NOT EXISTS (
+                           SELECT 1 FROM latest_files latest
+                           WHERE latest.library_root_id = fe.library_root_id
+                             AND latest.relative_path = fe.relative_path
+                       )
+                       AND NOT EXISTS (
+                           SELECT 1 FROM scan_manifest_deltas delta
+                           WHERE delta.manifest_id = ?
+                             AND delta.library_root_id = fe.library_root_id
+                             AND delta.relative_path = fe.relative_path
+                       )
+                 )
+                 SELECT COUNT(*) FROM candidates",
+            )
+            .bind(manifest_id)
+            .bind(manifest_id)
+            .bind(manifest_id)
+            .bind(manifest_id)
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if remaining_changes > 0 {
+            return Ok(false);
+        }
+        let unchanged_count: i64 = self
+            .query_scalar(
+                "WITH latest AS (
+                     SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
+                     FROM scan_manifest_entries
+                     WHERE manifest_id = ?
+                     GROUP BY library_root_id, relative_path
+                 )
+                 SELECT COUNT(*)
+                 FROM latest
+                 JOIN scan_manifest_entries observed
+                   ON observed.manifest_id = ?
+                  AND observed.library_root_id = latest.library_root_id
+                  AND observed.relative_path = latest.relative_path
+                  AND observed.observation_sequence = latest.sequence
+                  AND observed.entry_kind = 'FILE'
+                 JOIN scan_manifest_roots root
+                   ON root.manifest_id = observed.manifest_id
+                  AND root.library_root_id = observed.library_root_id
+                  AND root.state = 'COMPLETE'
+                 JOIN filesystem_entries fe
+                   ON fe.library_root_id = observed.library_root_id
+                  AND fe.relative_path = observed.relative_path
+                  AND fe.entry_kind = 'FILE'
+                  AND fe.is_missing = 0
+                  AND fe.fingerprint = observed.fingerprint",
+            )
+            .bind(manifest_id)
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let manifest_update = self
+            .query(
+                "UPDATE scan_manifests
+                 SET state = 'APPLYING', unchanged_count = ?, updated_at = unixepoch()
+                 WHERE id = ? AND state = 'READY_TO_DIFF'",
+            )
+            .bind(unchanged_count)
+            .bind(manifest_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if manifest_update.rows_affected() != 1 {
+            return Ok(false);
+        }
+        let total_count: i64 = self
+            .query_scalar(
+                "SELECT unchanged_count + add_count + change_count + remove_count + reappeared_count
+                 FROM scan_manifests WHERE id = ?",
+            )
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let job_update = self
+            .query(
+                "UPDATE scan_jobs
+                 SET processed_count = ?, total_count = ?, updated_at = unixepoch()
+                 WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
+            )
+            .bind(unchanged_count)
+            .bind(total_count)
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if job_update.rows_affected() != 1 {
+            return Err(StorageError::Conflict(
+                "scan job stopped before manifest diff completion".to_owned(),
+            ));
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn list_pending_scan_manifest_deltas(
+        &self,
+        manifest_id: &str,
+        limit: i64,
+    ) -> Result<Vec<StoredScanManifestDelta>, StorageError> {
+        self.query(
+            "SELECT delta.id, delta.library_root_id, delta.relative_path,
+                    delta.observation_sequence, delta.delta_kind,
+                    delta.base_filesystem_entry_id, delta.base_fingerprint,
+                    observed.entry_kind, observed.size, observed.modified_at,
+                    observed.inode, observed.fingerprint
+             FROM scan_manifest_deltas delta
+             LEFT JOIN scan_manifest_entries observed
+               ON observed.manifest_id = delta.manifest_id
+              AND observed.library_root_id = delta.library_root_id
+              AND observed.relative_path = delta.relative_path
+              AND observed.observation_sequence = delta.observation_sequence
+             WHERE delta.manifest_id = ? AND delta.state = 'PENDING'
+             ORDER BY delta.library_root_id, delta.relative_path
+             LIMIT ?",
+        )
+        .bind(manifest_id)
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredScanManifestDelta {
+                    id: row.get("id"),
+                    library_root_id: row.get("library_root_id"),
+                    relative_path: row.get("relative_path"),
+                    observation_sequence: row.get("observation_sequence"),
+                    delta_kind: row.get("delta_kind"),
+                    base_filesystem_entry_id: row.get("base_filesystem_entry_id"),
+                    base_fingerprint: row.get("base_fingerprint"),
+                    entry_kind: row.get("entry_kind"),
+                    size: row.get("size"),
+                    modified_at: row.get("modified_at"),
+                    inode: row.get("inode"),
+                    fingerprint: row.get("fingerprint"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn count_applied_scan_manifest_removals(
+        &self,
+        manifest_id: &str,
+    ) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT COUNT(*) FROM scan_manifest_deltas
+             WHERE manifest_id = ? AND delta_kind = 'REMOVE' AND state = 'APPLIED'",
+        )
+        .bind(manifest_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn commit_scan_manifest_delta_batch(
+        &self,
+        batch: &ManifestDeltaBatchCommit<'_>,
+    ) -> Result<ManifestDeltaBatchCommitResult, StorageError> {
+        if batch.deltas.is_empty() {
+            return Ok(ManifestDeltaBatchCommitResult::default());
+        }
+        if batch
+            .deltas
+            .iter()
+            .any(|delta| delta.library_root_id != batch.library_root_id)
+        {
+            return Err(StorageError::Conflict(
+                "manifest apply batch cannot span library roots".to_owned(),
+            ));
+        }
+        let delta_ids = batch
+            .deltas
+            .iter()
+            .map(|delta| delta.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        if batch
+            .unstable_delta_ids
+            .iter()
+            .any(|id| !delta_ids.contains(id.as_str()))
+        {
+            return Err(StorageError::Conflict(
+                "manifest unstable set contains an entry outside the batch".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let active_job: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_jobs
+                 WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
+            )
+            .bind(batch.job_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let manifest_state: Option<String> = self
+            .query_scalar("SELECT state FROM scan_manifests WHERE id = ? AND job_id = ?")
+            .bind(batch.manifest_id)
+            .bind(batch.job_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if active_job != 1 || manifest_state.as_deref() != Some("APPLYING") {
+            return Err(StorageError::Conflict(
+                "manifest batch requires an active applying scan".to_owned(),
+            ));
+        }
+        let root_state: Option<String> = self
+            .query_scalar(
+                "SELECT state FROM scan_manifest_roots
+                 WHERE manifest_id = ? AND library_root_id = ?",
+            )
+            .bind(batch.manifest_id)
+            .bind(batch.library_root_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let movie_files = batch
+            .movie_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file))
+            .collect::<HashMap<_, _>>();
+        let episode_files = batch
+            .episode_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file))
+            .collect::<HashMap<_, _>>();
+        let unresolved_files = batch
+            .unresolved_files
+            .iter()
+            .map(|file| (file.relative_path.as_str(), file))
+            .collect::<HashMap<_, _>>();
+        let sidecar_entries = batch
+            .sidecar_entries
+            .iter()
+            .map(|entry| (entry.relative_path.as_str(), entry))
+            .collect::<HashMap<_, _>>();
+        let unstable_ids = batch
+            .unstable_delta_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::HashSet<_>>();
+
+        let mut result = ManifestDeltaBatchCommitResult::default();
+        let mut new_paths = Vec::new();
+        let mut changed_paths = Vec::new();
+        let mut removed_media_paths = Vec::new();
+        let mut changed_sidecar_paths = Vec::new();
+        let mut removed_sidecar_paths = Vec::new();
+        let mut removed_media_entry_ids = Vec::new();
+        for delta in batch.deltas {
+            let mut state = "APPLIED";
+            let mut error = None;
+            let force_unstable = unstable_ids.contains(delta.id.as_str())
+                || root_state.as_deref() != Some("COMPLETE");
+            if force_unstable {
+                state = "UNSTABLE";
+                error = Some(if root_state.as_deref() == Some("COMPLETE") {
+                    "filesystem observation changed or became unavailable before apply"
+                } else {
+                    "library root is no longer complete and available"
+                });
+                result.unstable_count = result.unstable_count.saturating_add(1);
+            } else {
+                let expected_baseline = delta.base_filesystem_entry_id.as_deref();
+                let expected_fingerprint = delta.base_fingerprint.as_deref();
+                let expected_missing = delta.delta_kind == "REAPPEARED";
+                let observation = delta
+                    .observation_sequence
+                    .map(|_| {
+                        Ok((
+                            delta.entry_kind.as_deref().ok_or_else(|| {
+                                StorageError::Conflict(
+                                    "manifest delta observation is missing its entry kind"
+                                        .to_owned(),
+                                )
+                            })?,
+                            delta.size.ok_or_else(|| {
+                                StorageError::Conflict(
+                                    "manifest delta observation is missing its size".to_owned(),
+                                )
+                            })?,
+                            delta.modified_at.ok_or_else(|| {
+                                StorageError::Conflict(
+                                    "manifest delta observation is missing its modified time"
+                                        .to_owned(),
+                                )
+                            })?,
+                            delta.inode,
+                            delta.fingerprint.as_deref().ok_or_else(|| {
+                                StorageError::Conflict(
+                                    "manifest delta observation is missing its fingerprint"
+                                        .to_owned(),
+                                )
+                            })?,
+                        ))
+                    })
+                    .transpose()?;
+
+                let applied = match delta.delta_kind.as_str() {
+                    "ADD" => {
+                        let Some((entry_kind, size, modified_at, inode, fingerprint)) = observation
+                        else {
+                            return Err(StorageError::Conflict(
+                                "add delta is missing its observation".to_owned(),
+                            ));
+                        };
+                        if entry_kind != "FILE" || expected_baseline.is_some() {
+                            return Err(StorageError::Conflict(
+                                "add delta has an invalid observation or baseline".to_owned(),
+                            ));
+                        }
+                        let exists: i64 = self
+                            .query_scalar(
+                                "SELECT COUNT(*) FROM filesystem_entries
+                                 WHERE library_root_id = ? AND relative_path = ?",
+                            )
+                            .bind(batch.library_root_id)
+                            .bind(&delta.relative_path)
+                            .fetch_one(&mut *transaction)
+                            .await
+                            .map_err(|source| StorageError::Sqlx {
+                                path: self.path.clone(),
+                                source,
+                            })?;
+                        if exists != 0 {
+                            false
+                        } else if let Some(file) = movie_files.get(delta.relative_path.as_str()) {
+                            result.created_items = result.created_items.saturating_add(
+                                self.insert_movie_files_batch_in_transaction(
+                                    &mut transaction,
+                                    batch.library_id,
+                                    batch.library_root_id,
+                                    batch.generation,
+                                    std::slice::from_ref(*file),
+                                )
+                                .await?,
+                            );
+                            new_paths.push(delta.relative_path.clone());
+                            true
+                        } else if let Some(file) = episode_files.get(delta.relative_path.as_str()) {
+                            result.created_items = result.created_items.saturating_add(
+                                self.insert_episode_files_batch_in_transaction(
+                                    &mut transaction,
+                                    batch.library_id,
+                                    batch.library_root_id,
+                                    batch.generation,
+                                    std::slice::from_ref(*file),
+                                )
+                                .await?,
+                            );
+                            new_paths.push(delta.relative_path.clone());
+                            true
+                        } else if let Some(file) =
+                            unresolved_files.get(delta.relative_path.as_str())
+                        {
+                            self.insert_manifest_unresolved_file_in_transaction(
+                                &mut transaction,
+                                batch.library_id,
+                                batch.library_root_id,
+                                batch.generation,
+                                file,
+                            )
+                            .await?;
+                            result.created_items = result.created_items.saturating_add(1);
+                            new_paths.push(delta.relative_path.clone());
+                            true
+                        } else if let Some(entry) =
+                            sidecar_entries.get(delta.relative_path.as_str())
+                        {
+                            self.insert_manifest_sidecar_in_transaction(
+                                &mut transaction,
+                                batch.library_root_id,
+                                batch.generation,
+                                entry,
+                            )
+                            .await?;
+                            changed_sidecar_paths.push(delta.relative_path.clone());
+                            let _ = (size, modified_at, inode, fingerprint);
+                            true
+                        } else {
+                            return Err(StorageError::Conflict(
+                                "manifest add delta has no prepared filesystem record".to_owned(),
+                            ));
+                        }
+                    }
+                    "CHANGE" | "REAPPEARED" => {
+                        let Some(filesystem_entry_id) = expected_baseline else {
+                            return Err(StorageError::Conflict(
+                                "change delta has no baseline entry".to_owned(),
+                            ));
+                        };
+                        let Some((entry_kind, size, modified_at, inode, fingerprint)) = observation
+                        else {
+                            return Err(StorageError::Conflict(
+                                "change delta is missing its observation".to_owned(),
+                            ));
+                        };
+                        if entry_kind != "FILE" {
+                            return Err(StorageError::Conflict(
+                                "change delta observation is not a file".to_owned(),
+                            ));
+                        }
+                        let applied = if let Some(file) =
+                            movie_files.get(delta.relative_path.as_str())
+                        {
+                            self.apply_manifest_existing_file_in_transaction(
+                                &mut transaction,
+                                ManifestExistingFileUpdate {
+                                    filesystem_entry_id,
+                                    library_root_id: batch.library_root_id,
+                                    relative_path: &delta.relative_path,
+                                    base_fingerprint: expected_fingerprint,
+                                    expected_missing,
+                                    size,
+                                    modified_at,
+                                    inode,
+                                    fingerprint,
+                                    generation: batch.generation,
+                                    source_kind: &file.source_kind,
+                                    edition_name: file.edition_name.as_deref(),
+                                    quality_label: file.quality_label.as_deref(),
+                                    container: &file.container,
+                                    external_url: file.external_url.as_deref(),
+                                    strm_target_kind: file.strm_target_kind.as_deref(),
+                                },
+                            )
+                            .await?
+                        } else if let Some(file) = episode_files.get(delta.relative_path.as_str()) {
+                            self.apply_manifest_existing_file_in_transaction(
+                                &mut transaction,
+                                ManifestExistingFileUpdate {
+                                    filesystem_entry_id,
+                                    library_root_id: batch.library_root_id,
+                                    relative_path: &delta.relative_path,
+                                    base_fingerprint: expected_fingerprint,
+                                    expected_missing,
+                                    size,
+                                    modified_at,
+                                    inode,
+                                    fingerprint,
+                                    generation: batch.generation,
+                                    source_kind: &file.source_kind,
+                                    edition_name: file.edition_name.as_deref(),
+                                    quality_label: file.quality_label.as_deref(),
+                                    container: &file.container,
+                                    external_url: file.external_url.as_deref(),
+                                    strm_target_kind: file.strm_target_kind.as_deref(),
+                                },
+                            )
+                            .await?
+                        } else if let Some(file) =
+                            unresolved_files.get(delta.relative_path.as_str())
+                        {
+                            self.apply_manifest_existing_file_in_transaction(
+                                &mut transaction,
+                                ManifestExistingFileUpdate {
+                                    filesystem_entry_id,
+                                    library_root_id: batch.library_root_id,
+                                    relative_path: &delta.relative_path,
+                                    base_fingerprint: expected_fingerprint,
+                                    expected_missing,
+                                    size,
+                                    modified_at,
+                                    inode,
+                                    fingerprint,
+                                    generation: batch.generation,
+                                    source_kind: &file.source_kind,
+                                    edition_name: None,
+                                    quality_label: None,
+                                    container: &file.container,
+                                    external_url: file.external_url.as_deref(),
+                                    strm_target_kind: file.strm_target_kind.as_deref(),
+                                },
+                            )
+                            .await?
+                        } else {
+                            self.query(
+                                "UPDATE filesystem_entries
+                                 SET size = ?, modified_at = ?, inode = ?, fingerprint = ?,
+                                     last_seen_generation = ?, is_missing = 0,
+                                     updated_at = unixepoch()
+                                 WHERE id = ? AND library_root_id = ? AND relative_path = ?
+                                   AND entry_kind = 'FILE' AND is_missing = ?
+                                   AND (fingerprint = ? OR (fingerprint IS NULL AND ? IS NULL))",
+                            )
+                            .bind(size)
+                            .bind(modified_at)
+                            .bind(inode)
+                            .bind(fingerprint)
+                            .bind(batch.generation)
+                            .bind(filesystem_entry_id)
+                            .bind(batch.library_root_id)
+                            .bind(&delta.relative_path)
+                            .bind(database_flag(expected_missing))
+                            .bind(expected_fingerprint)
+                            .bind(expected_fingerprint)
+                            .execute(&mut *transaction)
+                            .await
+                            .map_err(|source| StorageError::Sqlx {
+                                path: self.path.clone(),
+                                source,
+                            })?
+                            .rows_affected()
+                                == 1
+                        };
+                        if applied {
+                            if movie_files.contains_key(delta.relative_path.as_str())
+                                || episode_files.contains_key(delta.relative_path.as_str())
+                                || unresolved_files.contains_key(delta.relative_path.as_str())
+                            {
+                                changed_paths.push(delta.relative_path.clone());
+                            } else {
+                                changed_sidecar_paths.push(delta.relative_path.clone());
+                            }
+                        }
+                        applied
+                    }
+                    "REMOVE" => {
+                        let Some(filesystem_entry_id) = expected_baseline else {
+                            return Err(StorageError::Conflict(
+                                "remove delta has no baseline entry".to_owned(),
+                            ));
+                        };
+                        let updated = self
+                            .query(
+                                "UPDATE filesystem_entries
+                                 SET is_missing = 1, updated_at = unixepoch()
+                                 WHERE id = ? AND library_root_id = ? AND relative_path = ?
+                                   AND entry_kind = 'FILE' AND is_missing = 0
+                                   AND (fingerprint = ? OR (fingerprint IS NULL AND ? IS NULL))",
+                            )
+                            .bind(filesystem_entry_id)
+                            .bind(batch.library_root_id)
+                            .bind(&delta.relative_path)
+                            .bind(expected_fingerprint)
+                            .bind(expected_fingerprint)
+                            .execute(&mut *transaction)
+                            .await
+                            .map_err(|source| StorageError::Sqlx {
+                                path: self.path.clone(),
+                                source,
+                            })?
+                            .rows_affected()
+                            == 1;
+                        if updated {
+                            if batch.removed_media_paths.contains(&delta.relative_path) {
+                                removed_media_paths.push(delta.relative_path.clone());
+                                removed_media_entry_ids.push(filesystem_entry_id.to_owned());
+                            }
+                            if batch.removed_sidecar_paths.contains(&delta.relative_path) {
+                                removed_sidecar_paths.push(delta.relative_path.clone());
+                            }
+                            result.removed_count = result.removed_count.saturating_add(1);
+                        }
+                        updated
+                    }
+                    _ => {
+                        return Err(StorageError::Conflict(
+                            "manifest delta has an unknown kind".to_owned(),
+                        ));
+                    }
+                };
+                if applied {
+                    result.applied_count = result.applied_count.saturating_add(1);
+                } else {
+                    state = "CONFLICT";
+                    error = Some("filesystem entry changed after manifest diff was computed");
+                    result.conflict_count = result.conflict_count.saturating_add(1);
+                }
+            }
+
+            let updated = self
+                .query(
+                    "UPDATE scan_manifest_deltas
+                     SET state = ?, error = ?, attempt_count = attempt_count + 1,
+                         updated_at = unixepoch()
+                     WHERE id = ? AND manifest_id = ? AND state = 'PENDING'",
+                )
+                .bind(state)
+                .bind(error)
+                .bind(&delta.id)
+                .bind(batch.manifest_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if updated.rows_affected() != 1 {
+                return Err(StorageError::Conflict(
+                    "manifest delta changed before its batch commit".to_owned(),
+                ));
+            }
+        }
+
+        for paths in new_paths.chunks(SCAN_DML_CHUNK_SIZE) {
+            result.metadata_targets_changed |= self
+                .record_scan_job_targets_in_transaction(
+                    &mut transaction,
+                    batch.job_id,
+                    batch.library_root_id,
+                    paths,
+                    "NEW",
+                )
+                .await?;
+        }
+        for paths in changed_paths.chunks(SCAN_DML_CHUNK_SIZE) {
+            result.metadata_targets_changed |= self
+                .record_scan_job_targets_in_transaction(
+                    &mut transaction,
+                    batch.job_id,
+                    batch.library_root_id,
+                    paths,
+                    "CHANGED",
+                )
+                .await?;
+        }
+        for paths in [&changed_sidecar_paths, &removed_sidecar_paths] {
+            let directories = prune_sidecar_directories(
+                paths
+                    .iter()
+                    .filter_map(|path| {
+                        Path::new(path)
+                            .parent()
+                            .and_then(|parent| parent.to_str())
+                            .map(|parent| {
+                                if parent.is_empty() {
+                                    ".".to_owned()
+                                } else {
+                                    parent.to_owned()
+                                }
+                            })
+                    })
+                    .collect(),
+            );
+            result.metadata_targets_changed |= self
+                .record_scan_job_sidecar_targets_in_transaction(
+                    &mut transaction,
+                    batch.job_id,
+                    batch.library_root_id,
+                    &directories,
+                )
+                .await?;
+        }
+        self.record_scan_job_removed_targets_for_entry_ids_in_transaction(
+            &mut transaction,
+            batch.job_id,
+            &removed_media_entry_ids,
+        )
+        .await?;
+        if !removed_media_paths.is_empty() {
+            self.refresh_removed_media_items_in_transaction(
+                &mut transaction,
+                batch.library_root_id,
+            )
+            .await?;
+        }
+        let processed_count = result
+            .applied_count
+            .saturating_add(result.conflict_count)
+            .saturating_add(result.unstable_count);
+        if processed_count > 0 {
+            let processed_count_i64 = i64::try_from(processed_count).map_err(|_| {
+                StorageError::Conflict("manifest progress count overflow".to_owned())
+            })?;
+            self.query(
+                "UPDATE scan_manifests
+                 SET applied_delta_count = applied_delta_count + ?, updated_at = unixepoch()
+                 WHERE id = ? AND state = 'APPLYING'",
+            )
+            .bind(
+                i64::try_from(result.applied_count).map_err(|_| {
+                    StorageError::Conflict("manifest apply count overflow".to_owned())
+                })?,
+            )
+            .bind(batch.manifest_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            let update = self
+                .query(
+                    "UPDATE scan_jobs
+                     SET processed_count = processed_count + ?, updated_at = unixepoch()
+                     WHERE id = ? AND status = 'RUNNING' AND cancel_requested = 0",
+                )
+                .bind(processed_count_i64)
+                .bind(batch.job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if update.rows_affected() != 1 {
+                return Err(StorageError::Conflict(
+                    "scan job stopped during manifest delta apply".to_owned(),
+                ));
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result)
     }
 
     #[allow(dead_code)] // LUX-267 writes the computed manifest delta set through this boundary.
@@ -2890,6 +3916,56 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
+        }
+        Ok(())
+    }
+
+    async fn record_scan_job_removed_targets_for_entry_ids_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        job_id: &str,
+        filesystem_entry_ids: &[String],
+    ) -> Result<(), StorageError> {
+        if filesystem_entry_ids.is_empty() {
+            return Ok(());
+        }
+        for ids in filesystem_entry_ids.chunks(SCAN_DML_CHUNK_SIZE) {
+            let placeholders = std::iter::repeat_n("?", ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            for (columns, values) in [
+                (
+                    "target_id, source_id, item_id, change_kind, probe_state,
+                     metadata_state, thumbnail_state",
+                    "?, 'SOURCE', ms.id, ms.id, ms.item_id, 'REMOVED', 'SKIPPED', 'SKIPPED', 'SKIPPED'",
+                ),
+                (
+                    "target_id, item_id, change_kind, probe_state,
+                     metadata_state, thumbnail_state",
+                    "?, 'ITEM', ms.item_id, ms.item_id, 'REMOVED', 'SKIPPED', 'SKIPPED', 'SKIPPED'",
+                ),
+            ] {
+                let query = format!(
+                    "INSERT INTO scan_job_targets (
+                         job_id, target_type, {columns}
+                     )
+                     SELECT {values}
+                     FROM media_sources ms
+                     WHERE ms.filesystem_entry_id IN ({placeholders})
+                     ON CONFLICT(job_id, target_type, target_id) DO NOTHING"
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(job_id);
+                for id in ids {
+                    statement = statement.bind(id);
+                }
+                statement
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            }
         }
         Ok(())
     }
@@ -6555,6 +7631,7 @@ mod tests {
             entry_kind: "DIRECTORY".to_owned(),
             size: 0,
             modified_at: 0,
+            device: None,
             inode: None,
             fingerprint: Vec::new(),
         }];
@@ -6637,6 +7714,7 @@ mod tests {
             entry_kind: "DIRECTORY".to_owned(),
             size: 0,
             modified_at: 0,
+            device: None,
             inode: None,
             fingerprint: Vec::new(),
         }];

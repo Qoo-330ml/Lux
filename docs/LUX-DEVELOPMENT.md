@@ -6630,9 +6630,9 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 验收：
 
 - [ ] 差异仅以 `library_root_id + relative_path` 对照 `filesystem_entries`，不以 `media_items` 单独推断删除。
-- [ ] 未变化条目不重复写入媒体/文件系统索引；完整可用根路径中的缺失文件在第二次 stat 确认后才删除。
+- [ ] 未变化条目不重复写入媒体/文件系统索引；缺失文件只有在完整根路径二次校验 device/inode 身份并确认文件不存在后才删除。
 - [ ] 根路径 unavailable/incomplete、取消、I/O 错误和持续变化均不会造成批量删除或覆盖较新的增量写入。
-- [ ] 任意批次失败回滚时，媒体索引、targets、delta 状态和进度保持一致；失败任务 checkpoint 可重试。
+- [ ] 任意批次失败回滚时，媒体索引、targets、delta 状态和进度保持一致，未提交 delta 保持 PENDING；Manifest 失败任务的重试入口与启动恢复由 LUX-269 交付。
 
 验证：`cargo test --locked --test scanning_jobs --test scanner --test storage`；回滚与全量/增量竞争测试。
 
