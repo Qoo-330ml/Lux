@@ -1441,6 +1441,7 @@ pub(super) async fn handle_emby_playback_event(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            state.user_events.publish_home_coalesced().await;
             if state_name != "STOPPED"
                 && let Some(session_id) = emby_transcode_session_id
                 && let Some(service) = state.web_playback.as_ref()

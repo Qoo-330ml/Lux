@@ -12,7 +12,7 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
-use reqwest::header::AUTHORIZATION;
+use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::{net::TcpListener, sync::mpsc};
 
@@ -22,8 +22,21 @@ fn emby_public_id(id: &str) -> String {
         .unwrap_or_else(|_| id.to_owned())
 }
 
+fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let (pair, _) = value.split_once(';')?;
+            let (cookie_name, cookie_value) = pair.split_once('=')?;
+            (cookie_name == name).then(|| cookie_value.to_owned())
+        })
+        .expect("expected cookie")
+}
+
 #[tokio::test]
-async fn playback_webhooks_emit_edges_and_throttled_progress()
+async fn playback_webhooks_and_home_events_follow_emby_progress()
 -> Result<(), Box<dyn std::error::Error>> {
     let (sender, mut receiver) = mpsc::channel::<Bytes>(8);
     let receiver_app = Router::new()
@@ -149,6 +162,25 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
     }));
     assert!(started.get("userId").is_none());
 
+    let web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(web_login.headers(), "lux_session"),
+        cookie_value(web_login.headers(), "lux_csrf")
+    );
+    let mut user_events = client
+        .get(format!("{base_url}/api/v1/events"))
+        .header(COOKIE, cookies)
+        .send()
+        .await?;
+    assert_eq!(user_events.status(), reqwest::StatusCode::OK);
+    let ready_frame = user_events.chunk().await?.ok_or("missing ready frame")?;
+    assert!(String::from_utf8(ready_frame.to_vec())?.contains("event: ready"));
+
     let paused = client
         .post(format!("{base_url}/Sessions/Playing/Progress"))
         .header("X-Emby-Token", &token)
@@ -163,6 +195,15 @@ async fn playback_webhooks_emit_edges_and_throttled_progress()
         .send()
         .await?;
     assert_eq!(paused.status(), reqwest::StatusCode::NO_CONTENT);
+    let home_event =
+        tokio::time::timeout(std::time::Duration::from_millis(1_500), user_events.chunk())
+            .await??
+            .ok_or("missing home invalidation after Emby progress")?;
+    let home_event = String::from_utf8(home_event.to_vec())?;
+    assert_eq!(
+        home_event.trim(),
+        "event: invalidate\ndata: {\"scope\":\"home\"}"
+    );
     assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
     let paused_event: Value =
         serde_json::from_slice(&receiver.recv().await.ok_or("missing paused event")?)?;
