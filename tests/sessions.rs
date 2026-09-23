@@ -21,7 +21,7 @@ fn emby_public_id(id: &str) -> String {
 }
 
 #[tokio::test]
-async fn playback_events_are_idempotent_and_positions_never_regress()
+async fn playback_events_preserve_same_session_order_and_allow_new_session_rewind()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -203,6 +203,15 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     let (high, low) = tokio::join!(high_request, low);
     assert_eq!(high??.status(), reqwest::StatusCode::NO_CONTENT);
     assert_eq!(low?.status(), reqwest::StatusCode::NO_CONTENT);
+    let same_session_position: i64 = sqlx::query_scalar(
+        "SELECT position_ticks FROM user_item_state
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(same_session_position, 900);
 
     let sessions = client
         .get(format!("{base_url}/Sessions"))
@@ -516,7 +525,7 @@ async fn playback_events_are_idempotent_and_positions_never_regress()
     .bind(&item_id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(position, 900);
+    assert_eq!(position, 100);
 
     let web_login = client
         .post(format!("{base_url}/api/v1/auth/login"))

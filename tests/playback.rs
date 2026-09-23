@@ -513,6 +513,70 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
     assert_eq!(item_state, (300, 0));
 
     sqlx::query(
+        "UPDATE user_item_state SET last_played_at = 100
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let rewound = client
+        .post(format!("{playback_base}/Stopped"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "vidhub-rewound-session",
+            "PositionTicks": 200,
+            "RunTimeTicks": 1_000,
+            "DeviceId": "vidhub-device",
+        }))
+        .send()
+        .await?;
+    assert_eq!(rewound.status(), reqwest::StatusCode::NO_CONTENT);
+    let rewound_state = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT position_ticks, last_played_at FROM user_item_state
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(rewound_state.0, 200);
+    assert!(
+        rewound_state
+            .1
+            .is_some_and(|last_played_at| last_played_at > 100)
+    );
+
+    let stale_session_progress = client
+        .post(format!("{playback_base}/Progress"))
+        .header("X-Emby-Token", &token)
+        .json(&json!({
+            "ItemId": emby_item_id,
+            "MediaSourceId": source_id,
+            "PlaySessionId": "vidhub-playback-session",
+            "PositionTicks": 500,
+            "RunTimeTicks": 1_000,
+            "DeviceId": "vidhub-device",
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        stale_session_progress.status(),
+        reqwest::StatusCode::NO_CONTENT
+    );
+    let after_stale_session = sqlx::query_as::<_, (i64, Option<i64>)>(
+        "SELECT position_ticks, last_played_at FROM user_item_state
+         WHERE user_id = ? AND item_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after_stale_session, rewound_state);
+
+    sqlx::query(
         "INSERT INTO user_playback_settings (user_id, played_percent)
          VALUES (?, 80)
          ON CONFLICT(user_id) DO UPDATE SET played_percent = excluded.played_percent",

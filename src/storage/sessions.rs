@@ -128,28 +128,58 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let same_session = "user_item_state.last_play_session_id = excluded.last_play_session_id";
+        let newer_session = "(user_item_state.last_play_session_id IS NULL OR EXISTS (
+            SELECT 1
+            FROM playback_sessions incoming
+            LEFT JOIN playback_sessions previous
+              ON previous.user_id = user_item_state.user_id
+             AND previous.play_session_id = user_item_state.last_play_session_id
+            WHERE incoming.user_id = excluded.user_id
+              AND incoming.item_id = excluded.item_id
+              AND incoming.play_session_id = excluded.last_play_session_id
+              AND (
+                  previous.id IS NULL
+                  OR incoming.started_at > previous.started_at
+                  OR (incoming.started_at = previous.started_at AND incoming.id > previous.id)
+              )
+        ))";
         let user_item_state_query = format!(
-            "INSERT INTO user_item_state (user_id, item_id, position_ticks, last_played_at)
-             VALUES (?, ?, ?, unixepoch())
+            "INSERT INTO user_item_state (
+                user_id, item_id, position_ticks, last_played_at, last_play_session_id
+             ) VALUES (?, ?, ?, unixepoch(), ?)
              ON CONFLICT(user_id, item_id) DO UPDATE SET
-                 position_ticks = {max_function}(user_item_state.position_ticks, excluded.position_ticks),
-                 last_played_at = CASE
-                     WHEN excluded.position_ticks > user_item_state.position_ticks
-                     THEN excluded.last_played_at ELSE user_item_state.last_played_at END,
-                 version = user_item_state.version + CASE
-                     WHEN excluded.position_ticks > user_item_state.position_ticks THEN 1 ELSE 0 END"
+                position_ticks = CASE
+                    WHEN {same_session}
+                    THEN {max_function}(user_item_state.position_ticks, excluded.position_ticks)
+                    ELSE excluded.position_ticks END,
+                last_played_at = CASE
+                    WHEN {same_session} AND excluded.position_ticks <= user_item_state.position_ticks
+                    THEN user_item_state.last_played_at
+                    ELSE excluded.last_played_at END,
+                last_play_session_id = excluded.last_play_session_id,
+                version = user_item_state.version + CASE
+                    WHEN {same_session} AND excluded.position_ticks <= user_item_state.position_ticks
+                    THEN 0 ELSE 1 END
+             WHERE {same_session} OR {newer_session}
+             RETURNING last_play_session_id"
         );
-        self.query(sqlx::AssertSqlSafe(user_item_state_query))
+        let persisted_session = self
+            .query(sqlx::AssertSqlSafe(user_item_state_query))
             .bind(event.user_id)
             .bind(event.item_id)
             .bind(event.position_ticks)
-            .execute(&mut *transaction)
+            .bind(event.play_session_id)
+            .fetch_optional(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-        if auto_played {
+        let event_session_is_current = persisted_session.as_ref().is_some_and(|row| {
+            row.get::<String, _>("last_play_session_id") == event.play_session_id
+        });
+        if auto_played && event_session_is_current {
             self.query(
                 "UPDATE user_item_state
                  SET is_played = 1,
