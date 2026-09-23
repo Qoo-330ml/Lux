@@ -3826,15 +3826,15 @@ pub(super) fn emby_container_name(container: &str) -> &str {
     }
 }
 
-/// Emby's PlaybackInfo wire value for Matroska is `matroska`. Keep the
-/// existing `mkv` normalization for URL suffixes, which are separate from
-/// the media-source capability field.
+/// Emby's PlaybackInfo wire value for Matroska uses the `mkv` file extension.
+/// Normalize all probe aliases so clients and external Emby proxies select
+/// the standard `/Videos/.../stream.mkv` entrypoint.
 pub(super) fn emby_playback_container_name(container: &str) -> &str {
     if ["mkv", "matroska", "matroska,webm"]
         .iter()
         .any(|value| container.eq_ignore_ascii_case(value))
     {
-        "matroska"
+        "mkv"
     } else {
         emby_container_name(container)
     }
@@ -4655,10 +4655,10 @@ mod tests {
     };
 
     #[test]
-    fn playback_media_source_uses_emby_matroska_wire_name() {
-        assert_eq!(emby_playback_container_name("mkv"), "matroska");
-        assert_eq!(emby_playback_container_name("matroska"), "matroska");
-        assert_eq!(emby_playback_container_name("matroska,webm"), "matroska");
+    fn playback_media_source_uses_emby_mkv_wire_name() {
+        assert_eq!(emby_playback_container_name("mkv"), "mkv");
+        assert_eq!(emby_playback_container_name("matroska"), "mkv");
+        assert_eq!(emby_playback_container_name("matroska,webm"), "mkv");
         assert_eq!(emby_playback_container_name("mp4"), "mp4");
     }
 
