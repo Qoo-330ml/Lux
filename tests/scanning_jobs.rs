@@ -538,6 +538,98 @@ async fn manifest_apply_does_not_overwrite_a_newer_incremental_filesystem_entry(
 }
 
 #[tokio::test]
+async fn manifest_add_conflicts_with_incremental_entry_claimed_after_diff()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Race.Movie.2024.mkv"), b"racing add").await?;
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let manifest = jobs.create_movie_scan_job(library.id).await?;
+    advance_manifest_to_applying(&database, &jobs, &manifest.id).await?;
+
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id,
+                relative_path: "Race.Movie.2024.mkv".to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&incremental.id, 100, None).await?;
+    let incremental_status: String =
+        sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+            .bind(&incremental.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(incremental_status, "COMPLETED");
+    let filesystem_entry_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE relative_path = 'Race.Movie.2024.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        filesystem_entry_count, 1,
+        "incremental scan did not claim the path"
+    );
+    let before_manifest_apply: (String, String, i64) = sqlx::query_as(
+        "SELECT entry.id, entry.last_seen_generation, COUNT(source.id)
+         FROM filesystem_entries entry
+         LEFT JOIN media_sources source ON source.filesystem_entry_id = entry.id
+         WHERE entry.relative_path = 'Race.Movie.2024.mkv'
+         GROUP BY entry.id, entry.last_seen_generation",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(before_manifest_apply.2, 1);
+
+    while !jobs.run_batch(&manifest.id, 100).await?.completed {}
+
+    let delta_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_deltas
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+           AND relative_path = 'Race.Movie.2024.mkv'",
+    )
+    .bind(&manifest.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(delta_state, "CONFLICT");
+
+    jobs.run_to_completion(&manifest.id, 100, None).await?;
+
+    let after_manifest_apply: (String, String, i64) = sqlx::query_as(
+        "SELECT entry.id, entry.last_seen_generation, COUNT(source.id)
+         FROM filesystem_entries entry
+         LEFT JOIN media_sources source ON source.filesystem_entry_id = entry.id
+         WHERE entry.relative_path = 'Race.Movie.2024.mkv'
+         GROUP BY entry.id, entry.last_seen_generation",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after_manifest_apply, before_manifest_apply);
+    Ok(())
+}
+
+#[tokio::test]
 async fn failed_manifest_delta_batch_rolls_back_index_targets_delta_and_progress()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

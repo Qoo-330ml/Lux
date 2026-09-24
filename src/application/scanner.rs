@@ -4919,10 +4919,6 @@ impl ScanJobService {
                         sidecar_entries.push(NewScanManifestSidecarEntry {
                             filesystem_entry_id: FilesystemEntryId::new().to_string(),
                             relative_path: delta.relative_path.clone(),
-                            size: observed.size,
-                            modified_at: observed.modified_at,
-                            inode: observed.inode,
-                            fingerprint: observed.fingerprint,
                         });
                     }
                     continue;
@@ -9382,7 +9378,7 @@ mod tests {
                 setup::SetupService,
                 webhooks::WebhookService,
             },
-            config::Config,
+            config::{Config, DatabaseConfiguration, PostgresConnection},
             library::LibraryKind,
             storage::Database,
         };
@@ -9392,7 +9388,36 @@ mod tests {
             http_addr: "127.0.0.1:8097".parse()?,
             config_dir: temp_dir.path().join("config"),
         };
-        let database = Database::connect(&config).await?;
+        let postgres_backend =
+            std::env::var("LUX_SCAN_TEST_BACKEND").is_ok_and(|backend| backend == "postgres");
+        let database = if postgres_backend {
+            let database_name = std::env::var("POSTGRES_TEST_DATABASE")?;
+            if matches!(
+                database_name.as_str(),
+                "postgres" | "template0" | "template1"
+            ) {
+                return Err("POSTGRES_TEST_DATABASE must name a disposable empty database".into());
+            }
+            Database::connect_with_configuration(
+                &config,
+                &DatabaseConfiguration::Postgres(PostgresConnection {
+                    host: std::env::var("POSTGRES_TEST_HOST")
+                        .unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                    port: std::env::var("POSTGRES_TEST_PORT")
+                        .unwrap_or_else(|_| "55432".to_owned())
+                        .parse()?,
+                    database: database_name,
+                    username: std::env::var("POSTGRES_TEST_USER")
+                        .unwrap_or_else(|_| "lux".to_owned()),
+                    password: std::env::var("POSTGRES_TEST_PASSWORD")
+                        .unwrap_or_else(|_| "lux-test-password".to_owned()),
+                    ssl_mode: "disable".to_owned(),
+                }),
+            )
+            .await?
+        } else {
+            Database::connect(&config).await?
+        };
         let admin = SetupService::new(database.clone())?
             .complete("Admin", "Admin", "correct password")
             .await?;
@@ -9452,13 +9477,16 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
-        let scan_completed_events: i64 = sqlx::query_scalar(
+        let dedupe_placeholder = if postgres_backend { "$1" } else { "?" };
+        let scan_completed_query = format!(
             "SELECT COUNT(*) FROM notification_events
-             WHERE event_type = 'SCAN_COMPLETED' AND dedupe_key = ?",
-        )
-        .bind(format!("scan:{}:SCAN_COMPLETED", job.id))
-        .fetch_one(database.pool())
-        .await?;
+             WHERE event_type = 'SCAN_COMPLETED' AND dedupe_key = {dedupe_placeholder}"
+        );
+        let scan_completed_events: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(scan_completed_query))
+                .bind(format!("scan:{}:SCAN_COMPLETED", job.id))
+                .fetch_one(database.pool())
+                .await?;
         assert_eq!(scan_completed_events, 1);
         let after_index = home.snapshot(principal, library_ids.to_vec()).await?;
         assert_eq!(after_index.recently_added.total, 1);

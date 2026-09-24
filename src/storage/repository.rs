@@ -1051,10 +1051,15 @@ pub(crate) struct NewScanManifestDelta<'a> {
 pub(crate) struct NewScanManifestSidecarEntry {
     pub(crate) filesystem_entry_id: String,
     pub(crate) relative_path: String,
+}
+
+pub(crate) struct NewScanManifestFilesystemEntry<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) relative_path: &'a str,
     pub(crate) size: i64,
     pub(crate) modified_at: i64,
     pub(crate) inode: Option<i64>,
-    pub(crate) fingerprint: Vec<u8>,
+    pub(crate) fingerprint: &'a [u8],
 }
 
 #[derive(Clone, Debug)]

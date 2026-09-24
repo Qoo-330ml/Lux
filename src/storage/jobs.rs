@@ -1594,13 +1594,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredScanManifestDiffCandidate>, StorageError> {
         self.query(
-            "WITH latest AS (
-                 SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
-                 FROM scan_manifest_entries
-                 WHERE manifest_id = ?
-                 GROUP BY library_root_id, relative_path
-             )
-             SELECT observed.library_root_id, observed.relative_path,
+            "SELECT observed.library_root_id, observed.relative_path,
                     observed.observation_sequence,
                     CASE WHEN fe.id IS NULL THEN 'ADD'
                          WHEN fe.is_missing = 1 THEN 'REAPPEARED'
@@ -1609,12 +1603,7 @@ impl Database {
                     fe.fingerprint AS base_fingerprint,
                     fe.entry_kind AS base_entry_kind,
                     fe.is_missing AS base_is_missing
-             FROM latest
-             JOIN scan_manifest_entries observed
-               ON observed.manifest_id = ?
-              AND observed.library_root_id = latest.library_root_id
-              AND observed.relative_path = latest.relative_path
-              AND observed.observation_sequence = latest.sequence
+             FROM scan_manifest_entries observed
              JOIN scan_manifest_roots root
                ON root.manifest_id = observed.manifest_id
               AND root.library_root_id = observed.library_root_id
@@ -1622,9 +1611,18 @@ impl Database {
              LEFT JOIN filesystem_entries fe
                ON fe.library_root_id = observed.library_root_id
               AND fe.relative_path = observed.relative_path
-             WHERE observed.entry_kind = 'FILE'
-               AND (observed.library_root_id > ?
-                    OR (observed.library_root_id = ? AND observed.relative_path > ?))
+             WHERE observed.manifest_id = ?
+               AND observed.entry_kind = 'FILE'
+               AND (observed.library_root_id, observed.relative_path) > (?, ?)
+               AND observed.observation_sequence = (
+                   SELECT latest.observation_sequence
+                   FROM scan_manifest_entries latest
+                   WHERE latest.manifest_id = observed.manifest_id
+                     AND latest.library_root_id = observed.library_root_id
+                     AND latest.relative_path = observed.relative_path
+                   ORDER BY latest.observation_sequence DESC
+                   LIMIT 1
+               )
                AND (fe.id IS NULL OR fe.is_missing = 1 OR fe.fingerprint IS NULL
                     OR observed.fingerprint IS NULL OR fe.fingerprint <> observed.fingerprint)
                AND NOT EXISTS (
@@ -1637,8 +1635,6 @@ impl Database {
              LIMIT ?",
         )
         .bind(manifest_id)
-        .bind(manifest_id)
-        .bind(after_library_root_id.unwrap_or_default())
         .bind(after_library_root_id.unwrap_or_default())
         .bind(after_relative_path.unwrap_or_default())
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
@@ -1671,22 +1667,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredScanManifestRemovalCandidate>, StorageError> {
         self.query(
-            "WITH latest AS (
-                 SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
-                 FROM scan_manifest_entries
-                 WHERE manifest_id = ?
-                 GROUP BY library_root_id, relative_path
-             ), latest_files AS (
-                 SELECT latest.library_root_id, latest.relative_path
-                 FROM latest
-                 JOIN scan_manifest_entries observed
-                   ON observed.manifest_id = ?
-                  AND observed.library_root_id = latest.library_root_id
-                  AND observed.relative_path = latest.relative_path
-                  AND observed.observation_sequence = latest.sequence
-                  AND observed.entry_kind = 'FILE'
-             )
-             SELECT fe.library_root_id, fe.relative_path, fe.id AS base_filesystem_entry_id,
+            "SELECT fe.library_root_id, fe.relative_path, fe.id AS base_filesystem_entry_id,
                     fe.fingerprint AS base_fingerprint
              FROM filesystem_entries fe
              JOIN scan_manifest_roots root
@@ -1694,13 +1675,16 @@ impl Database {
               AND root.library_root_id = fe.library_root_id
               AND root.state = 'COMPLETE'
              WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
-               AND (fe.library_root_id > ?
-                    OR (fe.library_root_id = ? AND fe.relative_path > ?))
-               AND NOT EXISTS (
-                   SELECT 1 FROM latest_files latest
-                   WHERE latest.library_root_id = fe.library_root_id
-                     AND latest.relative_path = fe.relative_path
-               )
+               AND (fe.library_root_id, fe.relative_path) > (?, ?)
+               AND COALESCE((
+                   SELECT observed.entry_kind
+                   FROM scan_manifest_entries observed
+                   WHERE observed.manifest_id = ?
+                     AND observed.library_root_id = fe.library_root_id
+                     AND observed.relative_path = fe.relative_path
+                   ORDER BY observed.observation_sequence DESC
+                   LIMIT 1
+               ), '') <> 'FILE'
                AND NOT EXISTS (
                    SELECT 1 FROM scan_manifest_deltas delta
                    WHERE delta.manifest_id = ?
@@ -1711,11 +1695,9 @@ impl Database {
              LIMIT ?",
         )
         .bind(manifest_id)
-        .bind(manifest_id)
-        .bind(manifest_id)
-        .bind(after_library_root_id.unwrap_or_default())
         .bind(after_library_root_id.unwrap_or_default())
         .bind(after_relative_path.unwrap_or_default())
+        .bind(manifest_id)
         .bind(manifest_id)
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .fetch_all(&self.pool)
@@ -1744,28 +1726,9 @@ impl Database {
         let mut transaction = self.begin_scan_write_transaction().await?;
         let remaining_changes: i64 = self
             .query_scalar(
-                "WITH latest AS (
-                     SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
-                     FROM scan_manifest_entries
-                     WHERE manifest_id = ?
-                     GROUP BY library_root_id, relative_path
-                 ), latest_files AS (
-                     SELECT latest.library_root_id, latest.relative_path
-                     FROM latest
-                     JOIN scan_manifest_entries observed
-                       ON observed.manifest_id = ?
-                      AND observed.library_root_id = latest.library_root_id
-                      AND observed.relative_path = latest.relative_path
-                      AND observed.observation_sequence = latest.sequence
-                      AND observed.entry_kind = 'FILE'
-                 ), candidates AS (
-                     SELECT observed.library_root_id, observed.relative_path
-                     FROM latest
-                     JOIN scan_manifest_entries observed
-                       ON observed.manifest_id = ?
-                      AND observed.library_root_id = latest.library_root_id
-                      AND observed.relative_path = latest.relative_path
-                      AND observed.observation_sequence = latest.sequence
+                "SELECT
+                    (SELECT COUNT(*)
+                     FROM scan_manifest_entries observed
                      JOIN scan_manifest_roots root
                        ON root.manifest_id = observed.manifest_id
                       AND root.library_root_id = observed.library_root_id
@@ -1773,7 +1736,17 @@ impl Database {
                      LEFT JOIN filesystem_entries fe
                        ON fe.library_root_id = observed.library_root_id
                       AND fe.relative_path = observed.relative_path
-                     WHERE observed.entry_kind = 'FILE'
+                     WHERE observed.manifest_id = ?
+                       AND observed.entry_kind = 'FILE'
+                       AND observed.observation_sequence = (
+                           SELECT latest.observation_sequence
+                           FROM scan_manifest_entries latest
+                           WHERE latest.manifest_id = observed.manifest_id
+                             AND latest.library_root_id = observed.library_root_id
+                             AND latest.relative_path = observed.relative_path
+                           ORDER BY latest.observation_sequence DESC
+                           LIMIT 1
+                       )
                        AND (fe.id IS NULL OR fe.is_missing = 1 OR fe.fingerprint IS NULL
                             OR observed.fingerprint IS NULL OR fe.fingerprint <> observed.fingerprint)
                        AND NOT EXISTS (
@@ -1781,30 +1754,31 @@ impl Database {
                            WHERE delta.manifest_id = observed.manifest_id
                              AND delta.library_root_id = observed.library_root_id
                              AND delta.relative_path = observed.relative_path
-                       )
-                     UNION ALL
-                     SELECT fe.library_root_id, fe.relative_path
+                       ))
+                    +
+                    (SELECT COUNT(*)
                      FROM filesystem_entries fe
                      JOIN scan_manifest_roots root
                        ON root.manifest_id = ?
                       AND root.library_root_id = fe.library_root_id
                       AND root.state = 'COMPLETE'
                      WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
-                       AND NOT EXISTS (
-                           SELECT 1 FROM latest_files latest
-                           WHERE latest.library_root_id = fe.library_root_id
-                             AND latest.relative_path = fe.relative_path
-                       )
+                       AND COALESCE((
+                           SELECT observed.entry_kind
+                           FROM scan_manifest_entries observed
+                           WHERE observed.manifest_id = ?
+                             AND observed.library_root_id = fe.library_root_id
+                             AND observed.relative_path = fe.relative_path
+                           ORDER BY observed.observation_sequence DESC
+                           LIMIT 1
+                       ), '') <> 'FILE'
                        AND NOT EXISTS (
                            SELECT 1 FROM scan_manifest_deltas delta
                            WHERE delta.manifest_id = ?
                              AND delta.library_root_id = fe.library_root_id
                              AND delta.relative_path = fe.relative_path
-                       )
-                 )
-                 SELECT COUNT(*) FROM candidates",
+                       ))",
             )
-            .bind(manifest_id)
             .bind(manifest_id)
             .bind(manifest_id)
             .bind(manifest_id)
@@ -1820,20 +1794,8 @@ impl Database {
         }
         let unchanged_count: i64 = self
             .query_scalar(
-                "WITH latest AS (
-                     SELECT library_root_id, relative_path, MAX(observation_sequence) AS sequence
-                     FROM scan_manifest_entries
-                     WHERE manifest_id = ?
-                     GROUP BY library_root_id, relative_path
-                 )
-                 SELECT COUNT(*)
-                 FROM latest
-                 JOIN scan_manifest_entries observed
-                   ON observed.manifest_id = ?
-                  AND observed.library_root_id = latest.library_root_id
-                  AND observed.relative_path = latest.relative_path
-                  AND observed.observation_sequence = latest.sequence
-                  AND observed.entry_kind = 'FILE'
+                "SELECT COUNT(*)
+                 FROM scan_manifest_entries observed
                  JOIN scan_manifest_roots root
                    ON root.manifest_id = observed.manifest_id
                   AND root.library_root_id = observed.library_root_id
@@ -1843,9 +1805,19 @@ impl Database {
                   AND fe.relative_path = observed.relative_path
                   AND fe.entry_kind = 'FILE'
                   AND fe.is_missing = 0
-                  AND fe.fingerprint = observed.fingerprint",
+                  AND fe.fingerprint = observed.fingerprint
+                 WHERE observed.manifest_id = ?
+                   AND observed.entry_kind = 'FILE'
+                   AND observed.observation_sequence = (
+                       SELECT latest.observation_sequence
+                       FROM scan_manifest_entries latest
+                       WHERE latest.manifest_id = observed.manifest_id
+                         AND latest.library_root_id = observed.library_root_id
+                         AND latest.relative_path = observed.relative_path
+                       ORDER BY latest.observation_sequence DESC
+                       LIMIT 1
+                   )",
             )
-            .bind(manifest_id)
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
@@ -2077,13 +2049,122 @@ impl Database {
             .map(String::as_str)
             .collect::<std::collections::HashSet<_>>();
 
+        let mut add_filesystem_entries = Vec::new();
+        if root_state.as_deref() == Some("COMPLETE") {
+            for delta in batch.deltas.iter().filter(|delta| {
+                delta.delta_kind == "ADD" && !unstable_ids.contains(delta.id.as_str())
+            }) {
+                if delta.observation_sequence.is_none() {
+                    return Err(StorageError::Conflict(
+                        "add delta is missing its observation".to_owned(),
+                    ));
+                }
+                let entry_kind = delta.entry_kind.as_deref().ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest delta observation is missing its entry kind".to_owned(),
+                    )
+                })?;
+                let size = delta.size.ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest delta observation is missing its size".to_owned(),
+                    )
+                })?;
+                let modified_at = delta.modified_at.ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest delta observation is missing its modified time".to_owned(),
+                    )
+                })?;
+                let fingerprint = delta.fingerprint.as_deref().ok_or_else(|| {
+                    StorageError::Conflict(
+                        "manifest delta observation is missing its fingerprint".to_owned(),
+                    )
+                })?;
+                if entry_kind != "FILE" || delta.base_filesystem_entry_id.is_some() {
+                    return Err(StorageError::Conflict(
+                        "add delta has an invalid observation or baseline".to_owned(),
+                    ));
+                }
+                let filesystem_entry_id = movie_files
+                    .get(delta.relative_path.as_str())
+                    .map(|file| file.filesystem_entry_id.as_str())
+                    .or_else(|| {
+                        episode_files
+                            .get(delta.relative_path.as_str())
+                            .map(|file| file.filesystem_entry_id.as_str())
+                    })
+                    .or_else(|| {
+                        unresolved_files
+                            .get(delta.relative_path.as_str())
+                            .map(|file| file.filesystem_entry_id.as_str())
+                    })
+                    .or_else(|| {
+                        sidecar_entries
+                            .get(delta.relative_path.as_str())
+                            .map(|entry| entry.filesystem_entry_id.as_str())
+                    })
+                    .ok_or_else(|| {
+                        StorageError::Conflict(
+                            "manifest add delta has no prepared filesystem record".to_owned(),
+                        )
+                    })?;
+                add_filesystem_entries.push(NewScanManifestFilesystemEntry {
+                    id: filesystem_entry_id,
+                    relative_path: &delta.relative_path,
+                    size,
+                    modified_at,
+                    inode: delta.inode,
+                    fingerprint,
+                });
+            }
+        }
+        let claimed_add_paths = self
+            .claim_manifest_add_filesystem_entries_in_transaction(
+                &mut transaction,
+                batch.library_root_id,
+                batch.generation,
+                &add_filesystem_entries,
+            )
+            .await?;
+        let claimed_movie_files = batch
+            .movie_files
+            .iter()
+            .filter(|file| claimed_add_paths.contains(&file.relative_path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let claimed_episode_files = batch
+            .episode_files
+            .iter()
+            .filter(|file| claimed_add_paths.contains(&file.relative_path))
+            .cloned()
+            .collect::<Vec<_>>();
+
         let mut result = ManifestDeltaBatchCommitResult::default();
+        result.created_items = self
+            .insert_movie_files_without_filesystem_entries_in_transaction(
+                &mut transaction,
+                batch.library_id,
+                batch.library_root_id,
+                batch.generation,
+                &claimed_movie_files,
+            )
+            .await?;
+        result.created_items = result.created_items.saturating_add(
+            self.insert_episode_files_without_filesystem_entries_in_transaction(
+                &mut transaction,
+                batch.library_id,
+                batch.library_root_id,
+                batch.generation,
+                &claimed_episode_files,
+            )
+            .await?,
+        );
         let mut new_paths = Vec::new();
         let mut changed_paths = Vec::new();
         let mut removed_media_paths = Vec::new();
         let mut changed_sidecar_paths = Vec::new();
         let mut removed_sidecar_paths = Vec::new();
         let mut removed_media_entry_ids = Vec::new();
+        let mut delta_updates = Vec::with_capacity(batch.deltas.len());
         for delta in batch.deltas {
             let mut state = "APPLIED";
             let mut error = None;
@@ -2135,8 +2216,7 @@ impl Database {
 
                 let applied = match delta.delta_kind.as_str() {
                     "ADD" => {
-                        let Some((entry_kind, size, modified_at, inode, fingerprint)) = observation
-                        else {
+                        let Some((entry_kind, _, _, _, _)) = observation else {
                             return Err(StorageError::Conflict(
                                 "add delta is missing its observation".to_owned(),
                             ));
@@ -2146,73 +2226,28 @@ impl Database {
                                 "add delta has an invalid observation or baseline".to_owned(),
                             ));
                         }
-                        let exists: i64 = self
-                            .query_scalar(
-                                "SELECT COUNT(*) FROM filesystem_entries
-                                 WHERE library_root_id = ? AND relative_path = ?",
-                            )
-                            .bind(batch.library_root_id)
-                            .bind(&delta.relative_path)
-                            .fetch_one(&mut *transaction)
-                            .await
-                            .map_err(|source| StorageError::Sqlx {
-                                path: self.path.clone(),
-                                source,
-                            })?;
-                        if exists != 0 {
+                        if !claimed_add_paths.contains(&delta.relative_path) {
                             false
-                        } else if let Some(file) = movie_files.get(delta.relative_path.as_str()) {
-                            result.created_items = result.created_items.saturating_add(
-                                self.insert_movie_files_batch_in_transaction(
-                                    &mut transaction,
-                                    batch.library_id,
-                                    batch.library_root_id,
-                                    batch.generation,
-                                    std::slice::from_ref(*file),
-                                )
-                                .await?,
-                            );
-                            new_paths.push(delta.relative_path.clone());
-                            true
-                        } else if let Some(file) = episode_files.get(delta.relative_path.as_str()) {
-                            result.created_items = result.created_items.saturating_add(
-                                self.insert_episode_files_batch_in_transaction(
-                                    &mut transaction,
-                                    batch.library_id,
-                                    batch.library_root_id,
-                                    batch.generation,
-                                    std::slice::from_ref(*file),
-                                )
-                                .await?,
-                            );
+                        } else if movie_files.contains_key(delta.relative_path.as_str())
+                            || episode_files.contains_key(delta.relative_path.as_str())
+                        {
                             new_paths.push(delta.relative_path.clone());
                             true
                         } else if let Some(file) =
                             unresolved_files.get(delta.relative_path.as_str())
                         {
-                            self.insert_manifest_unresolved_file_in_transaction(
+                            self.materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
                                 &mut transaction,
                                 batch.library_id,
                                 batch.library_root_id,
-                                batch.generation,
                                 file,
                             )
                             .await?;
                             result.created_items = result.created_items.saturating_add(1);
                             new_paths.push(delta.relative_path.clone());
                             true
-                        } else if let Some(entry) =
-                            sidecar_entries.get(delta.relative_path.as_str())
-                        {
-                            self.insert_manifest_sidecar_in_transaction(
-                                &mut transaction,
-                                batch.library_root_id,
-                                batch.generation,
-                                entry,
-                            )
-                            .await?;
+                        } else if sidecar_entries.contains_key(delta.relative_path.as_str()) {
                             changed_sidecar_paths.push(delta.relative_path.clone());
-                            let _ = (size, modified_at, inode, fingerprint);
                             true
                         } else {
                             return Err(StorageError::Conflict(
@@ -2406,24 +2441,44 @@ impl Database {
                 }
             }
 
-            let updated = self
-                .query(
-                    "UPDATE scan_manifest_deltas
-                     SET state = ?, error = ?, attempt_count = attempt_count + 1,
-                         updated_at = unixepoch()
-                     WHERE id = ? AND manifest_id = ? AND state = 'PENDING'",
-                )
-                .bind(state)
-                .bind(error)
-                .bind(&delta.id)
-                .bind(batch.manifest_id)
+            delta_updates.push((delta.id.as_str(), state, error));
+        }
+
+        for chunk in delta_updates.chunks(SCAN_MANIFEST_DELTA_BATCH_SIZE) {
+            let state_cases = std::iter::repeat_n("WHEN ? THEN ?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(" ");
+            let error_cases = state_cases.clone();
+            let ids = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE scan_manifest_deltas
+                 SET state = CASE id {state_cases} ELSE state END,
+                     error = CASE id {error_cases} ELSE error END,
+                     attempt_count = attempt_count + 1,
+                     updated_at = unixepoch()
+                 WHERE manifest_id = ? AND state = 'PENDING' AND id IN ({ids})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (id, state, _) in chunk {
+                statement = statement.bind(id).bind(state);
+            }
+            for (id, _, error) in chunk {
+                statement = statement.bind(id).bind(error);
+            }
+            statement = statement.bind(batch.manifest_id);
+            for (id, _, _) in chunk {
+                statement = statement.bind(id);
+            }
+            let updated = statement
                 .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?;
-            if updated.rows_affected() != 1 {
+            if usize::try_from(updated.rows_affected()).ok() != Some(chunk.len()) {
                 return Err(StorageError::Conflict(
                     "manifest delta changed before its batch commit".to_owned(),
                 ));

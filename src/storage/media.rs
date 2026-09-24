@@ -562,64 +562,57 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) async fn insert_manifest_sidecar_in_transaction(
+    pub(crate) async fn claim_manifest_add_filesystem_entries_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_root_id: &str,
         generation: &str,
-        entry: &NewScanManifestSidecarEntry,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO filesystem_entries (
-                 id, library_root_id, relative_path, entry_kind, size,
-                 modified_at, inode, fingerprint, last_seen_generation, is_missing
-             ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)",
-        )
-        .bind(&entry.filesystem_entry_id)
-        .bind(library_root_id)
-        .bind(&entry.relative_path)
-        .bind(entry.size)
-        .bind(entry.modified_at)
-        .bind(entry.inode)
-        .bind(&entry.fingerprint)
-        .bind(generation)
-        .execute(&mut **transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        entries: &[NewScanManifestFilesystemEntry<'_>],
+    ) -> Result<HashSet<String>, StorageError> {
+        let mut inserted_paths = HashSet::with_capacity(entries.len());
+        for chunk in entries.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "INSERT INTO filesystem_entries (
+                    id, library_root_id, relative_path, entry_kind, size,
+                    modified_at, inode, fingerprint, last_seen_generation, is_missing
+                ) VALUES {values}
+                ON CONFLICT(library_root_id, relative_path) DO NOTHING
+                RETURNING relative_path"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for entry in chunk {
+                statement = statement
+                    .bind(entry.id)
+                    .bind(library_root_id)
+                    .bind(entry.relative_path)
+                    .bind(entry.size)
+                    .bind(entry.modified_at)
+                    .bind(entry.inode)
+                    .bind(entry.fingerprint)
+                    .bind(generation);
+            }
+            let rows = statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            inserted_paths.extend(rows.into_iter().map(|row| row.get("relative_path")));
+        }
+        Ok(inserted_paths)
     }
 
-    pub(crate) async fn insert_manifest_unresolved_file_in_transaction(
+    pub(crate) async fn materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
         library_root_id: &str,
-        generation: &str,
         file: &NewScanManifestUnresolvedFile,
     ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO filesystem_entries (
-                 id, library_root_id, relative_path, entry_kind, size,
-                 modified_at, inode, fingerprint, last_seen_generation, is_missing
-             ) VALUES (?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)",
-        )
-        .bind(&file.filesystem_entry_id)
-        .bind(library_root_id)
-        .bind(&file.relative_path)
-        .bind(file.size)
-        .bind(file.modified_at)
-        .bind(file.inode)
-        .bind(&file.fingerprint)
-        .bind(generation)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
         let parent_id = self
             .ensure_movie_parent_folder_in_transaction(
                 &mut *transaction,
@@ -1236,6 +1229,45 @@ impl Database {
         generation: &str,
         files: &[NewMovieFile],
     ) -> Result<usize, StorageError> {
+        self.insert_movie_files_batch_in_transaction_inner(
+            transaction,
+            library_id,
+            library_root_id,
+            generation,
+            files,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn insert_movie_files_without_filesystem_entries_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewMovieFile],
+    ) -> Result<usize, StorageError> {
+        self.insert_movie_files_batch_in_transaction_inner(
+            transaction,
+            library_id,
+            library_root_id,
+            generation,
+            files,
+            false,
+        )
+        .await
+    }
+
+    async fn insert_movie_files_batch_in_transaction_inner(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewMovieFile],
+        insert_filesystem_entries: bool,
+    ) -> Result<usize, StorageError> {
         if files.is_empty() {
             return Ok(0);
         }
@@ -1256,35 +1288,38 @@ impl Database {
             .map(|(item_id, item)| (item_id.clone(), item.provider_ids_json.clone()))
             .collect::<HashMap<_, _>>();
 
-        for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
-            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "INSERT INTO filesystem_entries (
+        if insert_filesystem_entries {
+            for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
+                let values =
+                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                let query = format!(
+                    "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
                     modified_at, inode, fingerprint, last_seen_generation, is_missing
                 ) VALUES {values}"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for file in chunk {
-                statement = statement
-                    .bind(&file.filesystem_entry_id)
-                    .bind(library_root_id)
-                    .bind(&file.relative_path)
-                    .bind(file.size)
-                    .bind(file.modified_at)
-                    .bind(Option::<i64>::None)
-                    .bind(&file.fingerprint)
-                    .bind(generation);
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                for file in chunk {
+                    statement = statement
+                        .bind(&file.filesystem_entry_id)
+                        .bind(library_root_id)
+                        .bind(&file.relative_path)
+                        .bind(file.size)
+                        .bind(file.modified_at)
+                        .bind(Option::<i64>::None)
+                        .bind(&file.fingerprint)
+                        .bind(generation);
+                }
+                statement
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
             }
-            statement
-                .execute(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
         }
 
         let mut new_items = Vec::new();
@@ -1506,39 +1541,81 @@ impl Database {
         generation: &str,
         files: &[NewEpisodeFile],
     ) -> Result<usize, StorageError> {
+        self.insert_episode_files_batch_in_transaction_inner(
+            transaction,
+            library_id,
+            library_root_id,
+            generation,
+            files,
+            true,
+        )
+        .await
+    }
+
+    pub(crate) async fn insert_episode_files_without_filesystem_entries_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewEpisodeFile],
+    ) -> Result<usize, StorageError> {
+        self.insert_episode_files_batch_in_transaction_inner(
+            transaction,
+            library_id,
+            library_root_id,
+            generation,
+            files,
+            false,
+        )
+        .await
+    }
+
+    async fn insert_episode_files_batch_in_transaction_inner(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        library_root_id: &str,
+        generation: &str,
+        files: &[NewEpisodeFile],
+        insert_filesystem_entries: bool,
+    ) -> Result<usize, StorageError> {
         if files.is_empty() {
             return Ok(0);
         }
 
-        for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
-            let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "INSERT INTO filesystem_entries (
+        if insert_filesystem_entries {
+            for chunk in files.chunks(BATCH_INSERT_CHUNK_SIZE) {
+                let values =
+                    std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, 0)", chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                let query = format!(
+                    "INSERT INTO filesystem_entries (
                     id, library_root_id, relative_path, entry_kind, size,
                     modified_at, inode, fingerprint, last_seen_generation, is_missing
                 ) VALUES {values}"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for file in chunk {
-                statement = statement
-                    .bind(&file.filesystem_entry_id)
-                    .bind(library_root_id)
-                    .bind(&file.relative_path)
-                    .bind(file.size)
-                    .bind(file.modified_at)
-                    .bind(file.inode)
-                    .bind(&file.fingerprint)
-                    .bind(generation);
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                for file in chunk {
+                    statement = statement
+                        .bind(&file.filesystem_entry_id)
+                        .bind(library_root_id)
+                        .bind(&file.relative_path)
+                        .bind(file.size)
+                        .bind(file.modified_at)
+                        .bind(file.inode)
+                        .bind(&file.fingerprint)
+                        .bind(generation);
+                }
+                statement
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
             }
-            statement
-                .execute(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
         }
 
         let mut series_rows = BTreeMap::<String, BatchHierarchyRow>::new();
