@@ -49,6 +49,9 @@ export function LoginPage() {
   const pluginHeroItem = pluginBackground?.contentKind === "HERO_IMAGE"
     ? pluginBackground.items[0]
     : undefined;
+  const singlePosterItem = pluginBackground?.contentKind === "SINGLE_POSTER"
+    ? pluginBackground.items[0]
+    : undefined;
   const backgroundKey = [
     background?.source ?? "STATIC",
     ...(background?.source === "RECENTLY_ADDED"
@@ -90,7 +93,16 @@ export function LoginPage() {
 
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-label="登录页背景">
-        {heroItem ? (
+        {singlePosterItem ? (
+          <img
+            className="lux-auth-single-poster"
+            src={singlePosterItem.imageUrl}
+            alt=""
+            aria-hidden="true"
+            loading="eager"
+            onError={markBackgroundFailed}
+          />
+        ) : heroItem ? (
           <>
             <img
               className="lux-auth-hero-image"
@@ -135,7 +147,7 @@ export function LoginPage() {
             loading="eager"
           />
         )}
-        <div className="lux-auth-visual-fade" />
+        {singlePosterItem ? null : <div className="lux-auth-visual-fade" />}
       </section>
 
       {tmdbSource ? (

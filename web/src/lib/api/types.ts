@@ -61,7 +61,7 @@ export type LoginBackgroundResponse =
 
 export type PluginLoginBackgroundResponse = {
   source: `PLUGIN:${string}`;
-  contentKind: "POSTER_FEED" | "HERO_IMAGE";
+  contentKind: "POSTER_FEED" | "HERO_IMAGE" | "SINGLE_POSTER";
   sourceName: string;
   copyrightNotice?: string;
   items: LoginBackgroundItem[];

@@ -127,6 +127,39 @@ describe("LoginPage session state", () => {
     expect(container.textContent).not.toContain("TMDb 图片来源");
   });
 
+  it("renders a single plugin poster intact without using the feed or hero layout", async () => {
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "PLUGIN:org.lux.tmdb-trending-background",
+      contentKind: "SINGLE_POSTER",
+      sourceName: "TMDb 日榜",
+      items: [{ imageUrl: "https://image.tmdb.org/t/p/w500/trending.jpg", title: "日榜电影" }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector<HTMLImageElement>(".lux-auth-single-poster")?.src)
+          .toContain("https://image.tmdb.org/t/p/w500/trending.jpg");
+      });
+    });
+    expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
+    expect(container.querySelector(".lux-auth-hero-image")).toBeNull();
+    expect(container.querySelector(".lux-auth-visual-fade")).toBeNull();
+    expect(container.querySelector<HTMLDetailsElement>(".lux-auth-credits")?.textContent)
+      .toContain("TMDB");
+  });
+
   it("renders plugin hero images with source attribution and falls back after an image error", async () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.bing-daily-background",
