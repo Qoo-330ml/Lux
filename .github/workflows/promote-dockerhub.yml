@@ -9,7 +9,7 @@ env:
 
 jobs:
   promote:
-    name: Promote test to latest and version
+    name: Promote latest to version
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -18,6 +18,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Read Lux version
         id: version
@@ -38,18 +40,14 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Promote test manifest to latest and version
+      - name: Promote latest manifest to version tag
         shell: bash
         run: |
           set -euo pipefail
-          source_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:test"
-          latest_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:latest"
+          source_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:latest"
           version_image="docker.io/${IMAGE_NAMESPACE}/${IMAGE_NAME}:v${{ steps.version.outputs.version }}"
 
           docker buildx imagetools inspect "$source_image"
-          docker buildx imagetools create \
-            --tag "$latest_image" \
-            "$source_image"
           docker buildx imagetools create \
             --tag "$version_image" \
             "$source_image"

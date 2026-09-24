@@ -81,9 +81,9 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 
 ### Docker Hub 镜像
 
-`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证，在 `main` 推送时分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。runtime 依赖按 `RUNTIME_IMAGE_TAG` 发布到独立的 `lux-runtime` 仓库：每个架构只有在对应版本标签不存在时才构建，应用构建随后解析该架构镜像的 digest，并以 `image@digest` 引用。只有在 Debian/FFmpeg 依赖变化时才提升 `RUNTIME_IMAGE_TAG`；普通应用更新不会重新生成 runtime 层。应用镜像仍会携带 runtime 层，Docker Hub 会按 layer digest 复用它。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`，runtime 镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux-runtime`。
+`.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证；推送 `test` 分支时发布 Docker Hub `test` 标签，推送 `main` 分支时发布 `latest` 标签。两种分支都分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。runtime 依赖按 `RUNTIME_IMAGE_TAG` 发布到独立的 `lux-runtime` 仓库：每个架构只有在对应版本标签不存在时才构建，应用构建随后解析该架构镜像的 digest，并以 `image@digest` 引用。只有在 Debian/FFmpeg 依赖变化时才提升 `RUNTIME_IMAGE_TAG`；普通应用更新不会重新生成 runtime 层。应用镜像仍会携带 runtime 层，Docker Hub 会按 layer digest 复用它。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`，runtime 镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux-runtime`。
 
-确认测试镜像可发布后，在 GitHub Actions 手动运行 `.github/workflows/promote-dockerhub.yml`，它会把 Docker Hub 上的 `test` 多架构 manifest 晋级为 `latest` 和版本标签。当前 Docker Hub 构建 workflow 只自动维护 `test`，不会自动发布 `latest` 或版本标签；部署时应优先使用版本标签或 digest。
+在 GitHub Actions 手动运行 `.github/workflows/promote-dockerhub.yml`，可将 `main` 当前版本的 `latest` 多架构 manifest 复制为语义化版本标签；该操作不会覆盖 `latest`。部署时应优先使用版本标签或 digest。
 
 建议显式设置：
 

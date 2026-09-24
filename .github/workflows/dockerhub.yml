@@ -4,9 +4,11 @@ on:
   push:
     branches:
       - main
+      - test
   pull_request:
     branches:
       - main
+      - test
 
 # A push can be delivered more than once. Serialize registry writes for the
 # same ref so concurrent runs cannot overwrite architecture tags while a
@@ -68,7 +70,8 @@ jobs:
             suffix=-${{ matrix.arch }}
           tags: |
             type=ref,event=pr
-            type=raw,value=test,enable={{is_default_branch}}
+            type=raw,value=test,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/test' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Resolve immutable runtime image
         id: runtime
@@ -215,7 +218,8 @@ jobs:
         with:
           images: docker.io/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=test,enable={{is_default_branch}}
+            type=raw,value=test,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/test' }}
+            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
 
       - name: Merge architecture manifests
         shell: bash
