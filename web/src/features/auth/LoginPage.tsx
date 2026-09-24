@@ -49,7 +49,7 @@ export function LoginPage() {
   const pluginHeroItem = pluginBackground?.contentKind === "HERO_IMAGE"
     ? pluginBackground.items[0]
     : undefined;
-  const singlePosterItem = pluginBackground?.contentKind === "SINGLE_POSTER"
+  const pluginSinglePosterItem = pluginBackground?.contentKind === "SINGLE_POSTER"
     ? pluginBackground.items[0]
     : undefined;
   const backgroundKey = [
@@ -66,6 +66,7 @@ export function LoginPage() {
       ? background.images.filter((image) => image.trim().length > 0)
       : pluginPosterItems.map((item) => item.imageUrl);
   const heroItem = backgroundFailed ? undefined : pluginHeroItem;
+  const singlePosterItem = backgroundFailed ? undefined : pluginSinglePosterItem;
   const tmdbSource = background?.source === "PLUGIN:org.lux.tmdb-trending-background";
   const markBackgroundFailed = () => setFailedBackgroundKey(backgroundKey);
   const posterColumns = posterImages.reduce<Array<Array<{ image: string; index: number }>>>(

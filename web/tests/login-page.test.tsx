@@ -158,6 +158,14 @@ describe("LoginPage session state", () => {
     expect(container.querySelector(".lux-auth-visual-fade")).toBeNull();
     expect(container.querySelector<HTMLDetailsElement>(".lux-auth-credits")?.textContent)
       .toContain("TMDB");
+
+    await act(async () => {
+      container.querySelector<HTMLImageElement>(".lux-auth-single-poster")
+        ?.dispatchEvent(new Event("error"));
+    });
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.src)
+      .toContain("/lux-poster-wall.jpg");
+    expect(container.querySelector(".lux-auth-single-poster")).toBeNull();
   });
 
   it("renders plugin hero images with source attribution and falls back after an image error", async () => {
