@@ -800,6 +800,7 @@ pub enum LoginBackgroundContentKind {
     PosterFeed,
     HeroImage,
     SinglePoster,
+    SingleImage,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -810,6 +811,10 @@ pub struct LoginBackgroundRpcItem {
     pub title: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub copyright_notice: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribution_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub license_url: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -855,7 +860,9 @@ impl LoginBackgroundRpcResult {
         }
         if matches!(
             result.content_kind,
-            LoginBackgroundContentKind::HeroImage | LoginBackgroundContentKind::SinglePoster
+            LoginBackgroundContentKind::HeroImage
+                | LoginBackgroundContentKind::SinglePoster
+                | LoginBackgroundContentKind::SingleImage
         ) && result.items.len() != 1
         {
             return Err(LoginBackgroundRpcValidationError::InvalidItemCount);
@@ -872,10 +879,49 @@ impl LoginBackgroundRpcResult {
             {
                 return Err(LoginBackgroundRpcValidationError::InvalidText);
             }
+            for link in [item.attribution_url.as_deref(), item.license_url.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                validate_login_background_link_url(link, manifest)?;
+            }
             validate_login_background_image_url(&item.image_url, manifest)?;
         }
         Ok(result)
     }
+}
+
+fn validate_login_background_link_url(
+    value: &str,
+    manifest: &PluginManifest,
+) -> Result<(), LoginBackgroundRpcValidationError> {
+    if value.len() > MAX_LOGIN_BACKGROUND_IMAGE_URL_BYTES {
+        return Err(LoginBackgroundRpcValidationError::InvalidAttributionUrl);
+    }
+    let url =
+        Url::parse(value).map_err(|_| LoginBackgroundRpcValidationError::InvalidAttributionUrl)?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+        || url.port().is_some()
+    {
+        return Err(LoginBackgroundRpcValidationError::InvalidAttributionUrl);
+    }
+    let Some(Host::Domain(domain)) = url.host() else {
+        return Err(LoginBackgroundRpcValidationError::InvalidAttributionUrl);
+    };
+    let domain = normalize_login_background_image_host(domain)
+        .map_err(|_| LoginBackgroundRpcValidationError::InvalidAttributionUrl)?;
+    if !manifest
+        .permissions
+        .network
+        .iter()
+        .any(|declared_host| declared_host.eq_ignore_ascii_case(&domain))
+    {
+        return Err(LoginBackgroundRpcValidationError::InvalidAttributionUrl);
+    }
+    Ok(())
 }
 
 fn is_valid_login_background_text(value: &str, max_chars: usize) -> bool {
@@ -930,6 +976,7 @@ pub enum LoginBackgroundRpcValidationError {
     InvalidText,
     InvalidImageUrl,
     UndeclaredImageHost,
+    InvalidAttributionUrl,
 }
 
 impl fmt::Display for LoginBackgroundRpcValidationError {
@@ -939,10 +986,11 @@ impl fmt::Display for LoginBackgroundRpcValidationError {
             Self::InvalidPayload => "invalid login background RPC result",
             Self::ResultTooLarge => "login background RPC result exceeds the size limit",
             Self::TooManyItems => "login background RPC result has too many items",
-            Self::InvalidItemCount => "hero image result must contain exactly one item",
+            Self::InvalidItemCount => "single image result must contain exactly one item",
             Self::InvalidText => "login background attribution text is invalid",
             Self::InvalidImageUrl => "login background image URL is unsafe or invalid",
             Self::UndeclaredImageHost => "login background image host is not declared",
+            Self::InvalidAttributionUrl => "login background attribution URL is unsafe or invalid",
         };
         formatter.write_str(message)
     }

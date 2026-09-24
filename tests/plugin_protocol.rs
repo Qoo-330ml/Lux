@@ -287,6 +287,17 @@ fn accepts_versioned_login_background_sdk_manifest_and_result_fixtures() {
     assert_eq!(result.source_name, "Example catalog");
     assert_eq!(result.items.len(), 1);
     assert_eq!(result.items[0].title.as_deref(), Some("Example film"));
+
+    let single_image_value = serde_json::from_str(include_str!(
+        "fixtures/plugin-sdk/login-background/single-image-v1.json"
+    ))
+    .expect("single image RPC fixture should be JSON");
+    let single_image = LoginBackgroundRpcResult::validate(single_image_value, &manifest)
+        .expect("single image RPC fixture should validate");
+    assert_eq!(single_image.content_kind, LoginBackgroundContentKind::SingleImage);
+    assert_eq!(single_image.items.len(), 1);
+    assert!(single_image.items[0].attribution_url.is_some());
+    assert!(single_image.items[0].license_url.is_some());
 }
 
 #[test]
@@ -374,6 +385,61 @@ fn accepts_exactly_one_item_for_a_single_poster_result() {
         )
         .expect_err("single poster results must contain exactly one item");
         assert_eq!(error, LoginBackgroundRpcValidationError::InvalidItemCount);
+    }
+}
+
+#[test]
+fn accepts_a_single_original_image_with_allowlisted_attribution_links() {
+    let manifest = login_background_test_manifest();
+    let result = LoginBackgroundRpcResult::validate(
+        json!({
+            "contentKind": "SINGLE_IMAGE",
+            "sourceName": "Wikimedia Commons · Picture of the Day",
+            "items": [{
+                "imageUrl": "https://images.example.com/today.jpg",
+                "title": "Example wildlife photograph",
+                "copyrightNotice": "By Example Photographer · CC BY-SA 4.0",
+                "attributionUrl": "https://commons.wikimedia.org/wiki/File:Example.jpg",
+                "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0/"
+            }]
+        }),
+        &manifest,
+    )
+    .expect("a single image with declared attribution links should validate");
+
+    assert_eq!(result.content_kind, LoginBackgroundContentKind::SingleImage);
+    assert_eq!(result.items.len(), 1);
+    assert_eq!(
+        result.items[0].attribution_url.as_deref(),
+        Some("https://commons.wikimedia.org/wiki/File:Example.jpg")
+    );
+    assert_eq!(
+        result.items[0].license_url.as_deref(),
+        Some("https://creativecommons.org/licenses/by-sa/4.0/")
+    );
+}
+
+#[test]
+fn rejects_unlisted_or_insecure_attribution_links() {
+    let manifest = login_background_test_manifest();
+    for (field, url) in [
+        ("attributionUrl", "http://commons.wikimedia.org/wiki/File:Example.jpg"),
+        ("attributionUrl", "https://attacker.invalid/File:Example.jpg"),
+        ("licenseUrl", "https://attacker.invalid/license"),
+        ("licenseUrl", "https://user:pass@creativecommons.org/licenses/by/4.0/"),
+    ] {
+        let mut item = json!({"imageUrl": "https://images.example.com/today.jpg"});
+        item[field] = json!(url);
+        let error = LoginBackgroundRpcResult::validate(
+            json!({
+                "contentKind": "SINGLE_IMAGE",
+                "sourceName": "Wikimedia Commons",
+                "items": [item]
+            }),
+            &manifest,
+        )
+        .expect_err("untrusted attribution links must be rejected");
+        assert_eq!(error, LoginBackgroundRpcValidationError::InvalidAttributionUrl);
     }
 }
 
@@ -502,7 +568,10 @@ fn login_background_test_manifest() -> PluginManifest {
         "type": "login_background",
         "category": "UTILITY",
         "capabilities": ["login_background.get"],
-        "permissions": {"imageHosts": ["images.example.com"]},
+        "permissions": {
+            "network": ["commons.wikimedia.org", "creativecommons.org"],
+            "imageHosts": ["images.example.com"]
+        },
         "files": []
     }))
     .expect("test login background manifest should validate")

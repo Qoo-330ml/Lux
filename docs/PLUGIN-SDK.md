@@ -287,8 +287,8 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
   "category": "UTILITY",
   "capabilities": ["login_background.get"],
   "permissions": {
-    "network": ["api.example.com"],
-    "imageHosts": ["images.example.com"],
+    "network": ["api.example.com", "commons.wikimedia.org", "creativecommons.org"],
+    "imageHosts": ["images.example.com", "thumb.wikimedia.org"],
     "filesystem": []
   },
   "files": []
@@ -310,12 +310,30 @@ Actions 在 `ubuntu-24.04` 与 `ubuntu-24.04-arm` runner 上分别构建。Relea
 }
 ```
 
-`contentKind` 只允许 `POSTER_FEED`（0–40 项）、`HERO_IMAGE`（恰好 1 项）或 `SINGLE_POSTER`（恰好 1 项）。响应 JSON 最大
+每日单图来源可返回 `SINGLE_IMAGE`，署名与许可证链接必须由插件列入 `permissions.network`：
+
+```json
+{
+  "contentKind": "SINGLE_IMAGE",
+  "sourceName": "Wikimedia Commons · Picture of the Day",
+  "items": [{
+    "imageUrl": "https://thumb.wikimedia.org/example.jpg",
+    "title": "Example photograph",
+    "copyrightNotice": "By Example Photographer · CC BY-SA 4.0",
+    "attributionUrl": "https://commons.wikimedia.org/wiki/File:Example.jpg",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0/"
+  }]
+}
+```
+
+`contentKind` 只允许 `POSTER_FEED`（0–40 项）、`HERO_IMAGE`（恰好 1 项）、`SINGLE_POSTER` 或 `SINGLE_IMAGE`（后两者恰好 1 项）。响应 JSON 最大
 256 KiB，每条图片 URL 最大 2048 字节。图片 URL 必须是无凭据、无片段的 HTTPS URL，且主机必须与
 `permissions.imageHosts` 中某一域名精确匹配；拒绝 localhost、本地域名和 IP 字面量。未知字段、
 超量条目、含控制字符或超长的署名文本会被拒绝。`sourceName` 为必填纯文本；版权字段及每项
-`title`/`copyrightNotice` 为可选纯文本。空 `POSTER_FEED` 不代表可展示内容，宿主应按背景来源的
-降级策略处理。`SINGLE_POSTER` 用于原比例完整呈现一张海报；宿主不得裁切、旋转、拼贴或在海报图像上叠加遮罩。插件只能提供数据，所有文字呈现、海报瀑布流、图像布局和鸣谢交互均由 Lux 实现。
+`title`/`copyrightNotice` 为可选纯文本。每项也可带 `attributionUrl` 和 `licenseUrl`：两者必须为
+HTTPS、无凭据/片段/端口的 URL，主机必须与 `permissions.network` 中某一域名精确匹配；宿主只按文本链接显示，永不将其作为服务端请求目标。
+空 `POSTER_FEED` 不代表可展示内容，宿主应按背景来源的
+降级策略处理。`SINGLE_POSTER` 用于原比例完整呈现一张海报；`SINGLE_IMAGE` 用于原比例完整呈现带署名的单张图片。两种单图布局均不得裁切、旋转、拼贴、压暗或在图像上叠加遮罩；署名与许可链接作为独立宿主文字呈现。插件只能提供数据，所有文字呈现、海报瀑布流、图像布局和鸣谢交互均由 Lux 实现。
 
 所选登录背景插件只由 Lux 后台 worker 调用：首次选择、安装/启用或配置更新后会异步刷新，之后至少每日检查一次；失败采用有界退避。Lux 持久化经校验的响应 JSON（每个插件缓存条目不超过 256 KiB），不下载或复制图片字节；登录页公开接口仅读缓存，缓存超过 48 小时、插件未安装/启用/可用或刷新失败且无有效缓存时回退固定背景。刷新期间仍可使用 48 小时内的旧缓存。管理员可见稳定的来源状态，但不会收到插件内部错误详情。插件卸载时其缓存随安装记录一并删除。
 
