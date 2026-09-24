@@ -1770,7 +1770,8 @@ impl Database {
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                             mi.title, mi.sort_title,
                             mi.original_title, mi.overview, mi.production_year,
-                            mi.rating, mi.rating_source, mi.runtime_ticks
+                            mi.rating, mi.rating_source, mi.runtime_ticks,
+                            mi.added_at, mi.updated_at
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.library_id = ? AND mi.item_type <> 'FOLDER'
@@ -1822,7 +1823,8 @@ impl Database {
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                             mi.title, mi.sort_title,
                             mi.original_title, mi.overview, mi.production_year,
-                            mi.rating, mi.rating_source, mi.runtime_ticks
+                            mi.rating, mi.rating_source, mi.runtime_ticks,
+                            mi.added_at, mi.updated_at
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                      WHERE mi.item_type <> 'FOLDER'
