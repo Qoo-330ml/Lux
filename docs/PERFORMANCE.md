@@ -168,6 +168,34 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 - 每条 observation 使用 11 个绑定参数，按 80 条/语句（最多 880 binds）写入；子目录按 200 条（600 binds）写入；为保持本任务增量独立，已发现文件暂由旧文件索引工作队列承接，按 200 条（最多 800 binds）写入。LUX-267 完成 Manifest delta apply 后再移除这段过渡桥接。
 - `cargo test --locked --test scanning_jobs` 覆盖 1,025 个文件的跨批次发现、observation 指纹/重观察版本、取消时保留已提交 frontier，以及 root 不可用后恢复。该测试证明正确性和 SQLite 批次边界，不是耗时/吞吐基准；此任务未运行 release benchmark，也不据此声称扫描速度提升或推断 PostgreSQL/NAS 性能。
 
+## LUX-270 Manifest SQLite/PostgreSQL 阶段门
+
+2026-09-24 在本机 ARM64（`uname -m=arm64`，Rust `aarch64`）使用相同的固定 fixture 运行 release 基准。fixture 为 60,000 个文件、600 个目录，SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。基准二进制报告的基线提交为 `4802c939`，测量包含其后的 LUX-270 工作树改动；数据仅用于同一 ARM64 开发机对照。
+
+| 后端 | Manifest 首扫 | batches / p50 / p95 | SQL / DML | 无变化重扫 | 50 并发管理请求 p95 / 目录列表 p95 | 锁 / WAL |
+|---|---:|---|---:|---:|---:|---|
+| SQLite | 15.796 s | 640 / 23 ms / 28 ms | 30,581 / 13,870 | 1.289 s（41 batches） | 241 ms / 337 ms | `busy_timeout=5000 ms`；154 次 `BEGIN IMMEDIATE` admission 样本：p50 21 µs、p95 10,058 µs、max 10,113 µs、0 次错误 |
+| PostgreSQL 16（本地临时容器） | 142.229 s | 640 / 82 ms / 505 ms | 32,436 / 13,870 | 10.589 s（41 batches） | 272 ms / 641 ms | 写入 WAL 596,331,453 bytes；5,197 次锁等待采样，观察到的最大 waiter 数为 0 |
+
+两组均处理 60,000 个新文件；PostgreSQL 数据库为该次测试专用空库。执行命令：
+
+```bash
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+scripts/run-performance.sh
+
+LUX_PERF_BACKEND=postgres \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+POSTGRES_TEST_HOST=127.0.0.1 \
+POSTGRES_TEST_PORT=55432 \
+POSTGRES_TEST_DATABASE=your_disposable_empty_database \
+POSTGRES_TEST_USER=your_test_user \
+scripts/run-performance.sh
+```
+
+同日以相同 fixture 在提交 `4802c939` 重跑 SQLite LUX-045 直接扫描：2.105 s、3,254 SQL、2,404 DML；LUX-270 最初的 SQLite Manifest 实现为 202.468 s、506,457 SQL、310,870 DML。此次 Manifest 批量 CAS/Delta 更新与索引化最新观察分页后，相比最初 SQLite Manifest 版本首扫约快 12.8 倍，SQL 约减少 16.6 倍，DML 约减少 22.4 倍。Manifest 首扫仍比直接扫描基线慢；两条路径的持久化与安全语义不同，不能将它们当作同一工作量下的等价耗时。PostgreSQL 结果仅为本机临时容器单次观测，不能将 ARM64 数值外推至 NAS/x86_64。SQLite 锁 admission canary 会每 100 ms 尝试一次 `BEGIN IMMEDIATE` 并立即提交，采样本身可能轻微扰动扫描；PostgreSQL 锁采样通过 `pg_stat_activity` 读取，SQL 计数中排除了这些监控查询。
+
 ## Web Bilibili 弹幕解析
 
 基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。输入包含 5,000 条合法弹幕和一个超过 4 MiB 的 ASCII XML；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。

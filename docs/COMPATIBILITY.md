@@ -158,6 +158,14 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 
 SQLite 与 PostgreSQL 共用有界 `INSERT`/`SELECT`/`UNION ALL`/`ON CONFLICT` 写入，不依赖 COPY、临时表或 PostgreSQL 专属核心 SQL。SQLite 集成测试覆盖多批次与取消/失败保留；PostgreSQL Manifest migration 的结构静态检查通过，但本次没有可用的 PostgreSQL 服务，因此不宣称已完成 PostgreSQL runtime 验证；该验证留到 LUX-270。
 
+## LUX-270 全量扫描 Manifest 兼容合同
+
+SQLite 与 PostgreSQL 均使用同一套 Manifest 状态与安全合同：只对完整且身份未变化的 root 确认缺失；差异按 `library_root_id + relative_path` 与 `filesystem_entries` 比较；应用时按基线 ID/fingerprint 做 CAS；取消/失败保留已提交 checkpoint，新 Manifest 可从 checkpoint 重试。升级不会把旧 `reconciliation_scan_entries` 伪装成完整 Manifest，也不会在 migration 中扫描文件系统或回填全库；没有 Manifest 的旧活动全量任务安全取消，用户重试时创建新 Manifest。SQLite 与 PostgreSQL 集成测试覆盖 root 替换保护、增量扫描竞争、delta 冲突、取消/恢复、旧 schema 升级以及完成状态。
+
+完成时序对两后端相同，且不改变 API、Webhook DTO 或 Emby 合同：扫描期间首页继续读取旧快照；Manifest 索引与缺失确认提交后，任务进入 `status=COMPLETED, scan_phase=POSTPROCESSING`，刷新首页快照并发布一次 `home`，同时按既有时点发出 `ScanCompleted` webhook 和 `JOB_COMPLETED` INFO 运行事件；随后 NFO、probe、封面和缩略图继续后台处理，全部完成后阶段转为 `IDLE`。同一 `full_manifest_scan_refreshes_home_once_before_postprocessing` 集成用例已分别在 SQLite 与 PostgreSQL 专用空库执行，验证旧快照/新快照、单次 `home`、索引完成时 webhook 落库及后处理不重复发事件。INFO 运行事件按现有策略不写入 `scan_job_events` 表；PostgreSQL 根路径/CAS/取消恢复/旧版本升级由 `tests/postgres_database.rs` 覆盖。
+
+验证：`cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`（7/7）；`cargo test --locked --test scanning_jobs manifest_`（21/21）；首页时序用例在 SQLite 与 PostgreSQL 各通过 1/1。PostgreSQL 首页时序复测需先准备一次性空库，例如：`LUX_SCAN_TEST_BACKEND=postgres POSTGRES_TEST_DATABASE=lux_lux270_home cargo test --locked --lib application::scanner::tests::full_manifest_scan_refreshes_home_once_before_postprocessing -- --exact`。相同 60,000 文件 fixture 的 SQLite/PostgreSQL 指标、测量命令和硬件限制见 [`docs/PERFORMANCE.md`](PERFORMANCE.md) 的 LUX-270 记录。PostgreSQL 测试使用本机临时容器和专用空库，不代表生产 NAS/远程磁盘性能。
+
 ## 目标矩阵
 
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |

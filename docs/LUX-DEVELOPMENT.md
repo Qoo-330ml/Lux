@@ -6680,17 +6680,17 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 验收：
 
-- [ ] SQLite 空库、已有库升级和完整全量扫描覆盖通过；PostgreSQL 空库迁移、已有库升级和扫描存储集成测试通过。
-- [ ] 两种后端执行相同的根路径保护、delta/CAS、取消、重试、索引完成与后处理事件合同。
-- [ ] `docs/PERFORMANCE.md` 记录数据规模、命令、硬件、数据库后端及优化前后可比指标；不得以 SQLite ARM64 数值推断 PostgreSQL/NAS 性能。
-- [ ] `docs/COMPATIBILITY.md` 记录扫描完成 webhook、任务阶段和首页事件时序；不改变外部 API/Emby 合同。
+- [x] SQLite 空库、已有库升级和完整全量扫描覆盖通过；PostgreSQL 空库迁移、已有库升级和扫描存储集成测试通过。
+- [x] 两种后端执行相同的根路径保护、delta/CAS、取消、重试、索引完成与后处理事件合同。
+- [x] `docs/PERFORMANCE.md` 记录数据规模、命令、硬件、数据库后端及优化前后可比指标；不得以 SQLite ARM64 数值推断 PostgreSQL/NAS 性能。
+- [x] `docs/COMPATIBILITY.md` 记录扫描完成 webhook、任务阶段和首页事件时序；不改变外部 API/Emby 合同。
 - [ ] 完成阶段 21 全部 Rust 检查、兼容性/性能记录和本机 `uname -m`，等待项目所有者确认后再进入后续阶段。
 
 验证：`cargo build --locked`、相关 Rust 集成测试、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
 
 依赖：LUX-265 至 LUX-269。
 
-实现文件：`tests/postgres_database.rs`、`tests/storage.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`。
+实现文件：`src/application/scanner.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`tests/storage.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`。
 
 ## 26. 风险与缓解
 

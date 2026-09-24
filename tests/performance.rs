@@ -2,7 +2,10 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -24,7 +27,7 @@ use luxd::{
         libraries::LibraryService,
         probe::{FfprobeRunner, MediaProbeService},
         reidentify::{MetadataRefreshMode, MetadataReidentifyService},
-        scanner::LibraryScanner,
+        scanner::{LibraryScanner, ScanJobService},
         scraper::{
             ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
             ScraperFuture, ScraperGetRequest, ScraperImage, ScraperImageRequest,
@@ -35,7 +38,7 @@ use luxd::{
         setup::SetupService,
     },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
-    config::Config,
+    config::{Config, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
     observability::resources::ResourceMetrics,
     storage::Database,
@@ -43,6 +46,14 @@ use luxd::{
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::json;
 use tokio::net::TcpListener;
+use tracing::{
+    Event, Subscriber,
+    field::{Field, Visit},
+};
+use tracing_subscriber::{
+    layer::{Context, Layer},
+    prelude::*,
+};
 
 const FOREGROUND_REQUESTS: usize = 50;
 const INCREMENTAL_FILES: usize = 100;
@@ -55,6 +66,240 @@ const METADATA_BENCHMARK_PNG: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
+#[derive(Default)]
+struct QueryStatementCounts {
+    statements: AtomicUsize,
+    dml_statements: AtomicUsize,
+}
+
+impl QueryStatementCounts {
+    fn reset(&self) {
+        self.statements.store(0, Ordering::Relaxed);
+        self.dml_statements.store(0, Ordering::Relaxed);
+    }
+
+    fn snapshot(&self) -> (usize, usize) {
+        (
+            self.statements.load(Ordering::Relaxed),
+            self.dml_statements.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[derive(Default)]
+struct QuerySummaryVisitor {
+    summary: Option<String>,
+}
+
+impl Visit for QuerySummaryVisitor {
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "summary" {
+            self.summary = Some(value.to_owned());
+        }
+    }
+
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "summary" {
+            self.summary = Some(format!("{value:?}").trim_matches('"').to_owned());
+        }
+    }
+}
+
+struct QueryStatementLayer(Arc<QueryStatementCounts>);
+
+fn is_dml_statement_summary(summary: &str) -> bool {
+    let normalized = summary
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_uppercase();
+    if ["INSERT ", "UPDATE ", "DELETE ", "REPLACE ", "TRUNCATE "]
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
+    {
+        return true;
+    }
+    normalized.starts_with("WITH ")
+        && [
+            " INSERT INTO ",
+            " UPDATE ",
+            " DELETE FROM ",
+            " REPLACE INTO ",
+            " TRUNCATE ",
+        ]
+        .iter()
+        .any(|keyword| normalized.contains(keyword))
+}
+
+#[test]
+fn query_counter_classifies_dml_statements_inside_common_table_expressions() {
+    assert!(is_dml_statement_summary(
+        "WITH sidecar_directories(directory) AS (VALUES (?)) INSERT INTO scan_job_targets"
+    ));
+    assert!(!is_dml_statement_summary(
+        "WITH latest AS (SELECT path FROM scan_manifest_entries) SELECT path FROM latest"
+    ));
+}
+
+impl<S> Layer<S> for QueryStatementLayer
+where
+    S: Subscriber,
+{
+    fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        if event.metadata().target() != "sqlx::query" {
+            return;
+        }
+        self.0.statements.fetch_add(1, Ordering::Relaxed);
+        let mut visitor = QuerySummaryVisitor::default();
+        event.record(&mut visitor);
+        let summary = visitor
+            .summary
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_uppercase();
+        if is_dml_statement_summary(&summary) {
+            self.0.dml_statements.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn performance_query_statement_counts() -> Arc<QueryStatementCounts> {
+    static COUNTS: OnceLock<Arc<QueryStatementCounts>> = OnceLock::new();
+    static INSTALLATION: OnceLock<Result<(), String>> = OnceLock::new();
+    let counts = COUNTS
+        .get_or_init(|| Arc::new(QueryStatementCounts::default()))
+        .clone();
+    let installation = INSTALLATION.get_or_init(|| {
+        tracing_subscriber::registry()
+            .with(QueryStatementLayer(counts.clone()))
+            .try_init()
+            .map_err(|error| error.to_string())
+    });
+    assert!(
+        installation.is_ok(),
+        "could not install SQLx statement counter: {installation:?}"
+    );
+    counts
+}
+
+struct PostgresLockWaitMonitor {
+    stop: Arc<AtomicBool>,
+    samples: Arc<AtomicUsize>,
+    maximum_waiters: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+struct SqliteLockWaitMonitor {
+    stop: Arc<AtomicBool>,
+    waits_us: Arc<Mutex<Vec<u128>>>,
+    errors: Arc<AtomicUsize>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+fn start_sqlite_lock_wait_monitor(pool: sqlx::AnyPool) -> SqliteLockWaitMonitor {
+    let stop = Arc::new(AtomicBool::new(false));
+    let waits_us = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::new(AtomicUsize::new(0));
+    let monitor_stop = stop.clone();
+    let monitor_waits = waits_us.clone();
+    let monitor_errors = errors.clone();
+    let task = tokio::spawn(async move {
+        while !monitor_stop.load(Ordering::Relaxed) {
+            let started = Instant::now();
+            match pool.begin_with("BEGIN IMMEDIATE").await {
+                Ok(transaction) => {
+                    let wait_us = started.elapsed().as_micros();
+                    match monitor_waits.lock() {
+                        Ok(mut waits) => waits.push(wait_us),
+                        Err(poisoned) => poisoned.into_inner().push(wait_us),
+                    }
+                    if transaction.commit().await.is_err() {
+                        monitor_errors.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                Err(_) => {
+                    let wait_us = started.elapsed().as_micros();
+                    match monitor_waits.lock() {
+                        Ok(mut waits) => waits.push(wait_us),
+                        Err(poisoned) => poisoned.into_inner().push(wait_us),
+                    }
+                    monitor_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    });
+    SqliteLockWaitMonitor {
+        stop,
+        waits_us,
+        errors,
+        task,
+    }
+}
+
+impl SqliteLockWaitMonitor {
+    async fn stop(self) -> (Vec<u128>, usize) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.task.await;
+        let waits = match self.waits_us.lock() {
+            Ok(waits) => waits.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        (waits, self.errors.load(Ordering::Relaxed))
+    }
+}
+
+fn start_postgres_lock_wait_monitor(pool: sqlx::AnyPool) -> PostgresLockWaitMonitor {
+    let stop = Arc::new(AtomicBool::new(false));
+    let samples = Arc::new(AtomicUsize::new(0));
+    let maximum_waiters = Arc::new(AtomicUsize::new(0));
+    let monitor_stop = stop.clone();
+    let monitor_samples = samples.clone();
+    let monitor_maximum_waiters = maximum_waiters.clone();
+    let task = tokio::spawn(async move {
+        while !monitor_stop.load(Ordering::Relaxed) {
+            if let Ok(waiters) = sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM pg_stat_activity
+                 WHERE datname = current_database()
+                   AND wait_event_type = 'Lock'
+                   AND pid <> pg_backend_pid()",
+            )
+            .fetch_one(&pool)
+            .await
+                && let Ok(waiters) = usize::try_from(waiters)
+            {
+                monitor_samples.fetch_add(1, Ordering::Relaxed);
+                monitor_maximum_waiters.fetch_max(waiters, Ordering::Relaxed);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
+    PostgresLockWaitMonitor {
+        stop,
+        samples,
+        maximum_waiters,
+        task,
+    }
+}
+
+impl PostgresLockWaitMonitor {
+    async fn stop(self) -> (usize, usize) {
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = self.task.await;
+        (
+            self.samples.load(Ordering::Relaxed),
+            self.maximum_waiters.load(Ordering::Relaxed),
+        )
+    }
+}
+
+async fn postgres_wal_bytes(database: &Database) -> Result<u64, sqlx::Error> {
+    let wal_bytes: String = sqlx::query_scalar("SELECT wal_bytes::text FROM pg_stat_wal")
+        .fetch_one(database.pool())
+        .await?;
+    Ok(wal_bytes.parse().unwrap_or_default())
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run with scripts/run-performance.sh for the LUX-045 ARM64 gate"]
 async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,6 +307,7 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     let file_count: usize = env::var("LUX_PERF_FILE_COUNT")?.parse()?;
     assert!(file_count >= 60_000, "LUX-045 requires at least 60k files");
     assert!(media_root.join(".lux-fixture.json").is_file());
+    let statement_counts = performance_query_statement_counts();
 
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -115,12 +361,34 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     );
 
     let scanner = LibraryScanner::new(database.clone());
+    statement_counts.reset();
     let first_started = Instant::now();
     let first = scanner.scan_movie_library(library.id).await?;
     let first_ms = first_started.elapsed().as_millis();
+    let (first_scan_statement_count, first_scan_dml_count) = statement_counts.snapshot();
     assert_eq!(first.discovered_files, file_count);
     assert_eq!(first.created_items, file_count);
     assert_eq!(first.created_sources, file_count);
+
+    if env::var_os("LUX_PERF_SCAN_ONLY").is_some() {
+        println!(
+            "LUX-045 DIRECT RESULT {}",
+            serde_json::to_string(&json!({
+                "commit": luxd::COMMIT,
+                "architecture": std::env::consts::ARCH,
+                "databaseBackend": "sqlite",
+                "fileCount": file_count,
+                "firstScanMs": first_ms,
+                "discoveredFiles": first.discovered_files,
+                "createdItems": first.created_items,
+                "createdSources": first.created_sources,
+                "sqlStatementCount": first_scan_statement_count,
+                "dmlStatementCount": first_scan_dml_count,
+            }))?
+        );
+        server.abort();
+        return Ok(());
+    }
 
     let unchanged_started = Instant::now();
     let scanner_for_unchanged = scanner.clone();
@@ -219,6 +487,8 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
             "architecture": std::env::consts::ARCH,
             "fileCount": file_count,
             "firstScanMs": first_ms,
+            "firstScanSqlStatementCount": first_scan_statement_count,
+            "firstScanDmlStatementCount": first_scan_dml_count,
             "unchangedRescanMs": unchanged_ms,
             "incrementalDirectoryFiles": 100 + INCREMENTAL_FILES,
             "incrementalScanMs": incremental_ms,
@@ -235,6 +505,305 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
             "nonPendingProbeCount": non_pending_probe_count,
             "metadataFingerprintCount": metadata_fingerprint_count,
             "targetForegroundP95Ms": 1000,
+        }))?
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "run with scripts/run-performance.sh for the LUX-270 Manifest job gate"]
+async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+    let media_root = PathBuf::from(env::var("LUX_PERF_MEDIA_ROOT")?);
+    let file_count: usize = env::var("LUX_PERF_FILE_COUNT")?.parse()?;
+    assert!(
+        file_count >= 100,
+        "LUX-270 requires at least one full batch"
+    );
+    assert!(media_root.join(".lux-fixture.json").is_file());
+
+    let statement_counts = performance_query_statement_counts();
+    let backend = env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
+    let database_configuration = match backend.as_str() {
+        "sqlite" => DatabaseConfiguration::Sqlite,
+        "postgres" => {
+            let database = match env::var("POSTGRES_TEST_DATABASE") {
+                Ok(database)
+                    if !database.is_empty()
+                        && !matches!(database.as_str(), "postgres" | "template0" | "template1") =>
+                {
+                    database
+                }
+                _ => {
+                    return Err(
+                        "POSTGRES_TEST_DATABASE must name a disposable non-system database".into(),
+                    );
+                }
+            };
+            DatabaseConfiguration::Postgres(PostgresConnection {
+                host: env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+                port: env::var("POSTGRES_TEST_PORT")
+                    .unwrap_or_else(|_| "55432".to_owned())
+                    .parse()?,
+                database,
+                username: env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+                password: env::var("POSTGRES_TEST_PASSWORD")
+                    .unwrap_or_else(|_| "lux-test-password".to_owned()),
+                ssl_mode: "disable".to_owned(),
+            })
+        }
+        unsupported => {
+            return Err(format!(
+                "unsupported LUX_PERF_BACKEND {unsupported:?}; expected sqlite or postgres"
+            )
+            .into());
+        }
+    };
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(&config, &database_configuration).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Admin", "performance-only password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("LUX-270 Manifest Performance", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-utf8 fixture path")?,
+        )
+        .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .pool_max_idle_per_host(FOREGROUND_REQUESTS)
+        .build()?;
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "admin",
+            "password": "performance-only password"
+        }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let cookies = format!(
+        "lux_session={}",
+        cookie_value(login.headers(), "lux_session")
+    );
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let postgres_wal_before = if backend == "postgres" {
+        Some(postgres_wal_bytes(&database).await?)
+    } else {
+        None
+    };
+    let sqlite_busy_timeout_ms = if backend == "sqlite" {
+        Some(
+            sqlx::query_scalar::<_, i64>("PRAGMA busy_timeout")
+                .fetch_one(database.pool())
+                .await?,
+        )
+    } else {
+        None
+    };
+    statement_counts.reset();
+    let postgres_lock_monitor =
+        (backend == "postgres").then(|| start_postgres_lock_wait_monitor(database.pool().clone()));
+    let sqlite_lock_monitor =
+        (backend == "sqlite").then(|| start_sqlite_lock_wait_monitor(database.pool().clone()));
+
+    let first_scan_started = Instant::now();
+    let mut first_batch_durations = Vec::new();
+    let mut first_scan_processed = 0_usize;
+    loop {
+        let batch_started = Instant::now();
+        let report = jobs.run_batch(&job.id, 100).await?;
+        first_batch_durations.push(batch_started.elapsed().as_millis());
+        first_scan_processed += report.processed;
+        if report.completed {
+            break;
+        }
+    }
+    let manifest_index_ms = first_scan_started.elapsed().as_millis();
+    let (postgres_lock_wait_samples, postgres_max_lock_waiters) =
+        if let Some(monitor) = postgres_lock_monitor {
+            monitor.stop().await
+        } else {
+            (0, 0)
+        };
+    let (sqlite_lock_wait_us, sqlite_lock_wait_errors) = if let Some(monitor) = sqlite_lock_monitor
+    {
+        monitor.stop().await
+    } else {
+        (Vec::new(), 0)
+    };
+    let (raw_statement_count, dml_statement_count) = statement_counts.snapshot();
+    let scan_statement_count = raw_statement_count.saturating_sub(postgres_lock_wait_samples);
+    let max_scan_statement_count = file_count.saturating_mul(2).saturating_add(100);
+    let max_scan_dml_count = file_count.saturating_add(100);
+    assert!(
+        scan_statement_count <= max_scan_statement_count,
+        "Manifest scan issued {scan_statement_count} SQL statements for {file_count} files; limit is {max_scan_statement_count}"
+    );
+    assert!(
+        dml_statement_count <= max_scan_dml_count,
+        "Manifest scan issued {dml_statement_count} DML statements for {file_count} files; limit is {max_scan_dml_count}"
+    );
+    let postgres_wal_after = if backend == "postgres" {
+        Some(postgres_wal_bytes(&database).await?)
+    } else {
+        None
+    };
+    let job_id_placeholder = if backend == "postgres" { "$1" } else { "?" };
+    let initial_manifest_query = format!(
+        "SELECT state, observed_file_count, unchanged_count, add_count
+         FROM scan_manifests WHERE job_id = {job_id_placeholder}"
+    );
+    let initial_manifest: (String, i64, i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(initial_manifest_query))
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(initial_manifest.0, "POSTPROCESSING");
+    assert_eq!(initial_manifest.1, file_count as i64);
+    assert_eq!(initial_manifest.3, file_count as i64);
+
+    let rescan_job = jobs.create_movie_scan_job(library.id).await?;
+    let rescan_started = Instant::now();
+    let first_rescan_batch = jobs.run_batch(&rescan_job.id, 100).await?;
+    let mut rescan_batch_durations = vec![rescan_started.elapsed().as_millis()];
+    assert!(
+        !first_rescan_batch.completed,
+        "the unchanged rescan fixture must span multiple batches"
+    );
+    let background_jobs = jobs.clone();
+    let rescan_job_id = rescan_job.id.clone();
+    let rescan_handle = tokio::spawn(async move {
+        let mut processed = first_rescan_batch.processed;
+        loop {
+            let batch_started = Instant::now();
+            let report = match background_jobs.run_batch(&rescan_job_id, 100).await {
+                Ok(report) => report,
+                Err(error) => return Err(error.to_string()),
+            };
+            rescan_batch_durations.push(batch_started.elapsed().as_millis());
+            processed += report.processed;
+            if report.completed {
+                return Ok((processed, rescan_batch_durations));
+            }
+        }
+    });
+    tokio::task::yield_now().await;
+    let scan_running_before_api = !rescan_handle.is_finished();
+    let foreground_ms = measure_get_requests(
+        &client,
+        &format!("{base_url}/api/v1/admin/libraries"),
+        &cookies,
+        "Manifest foreground",
+    )
+    .await?;
+    let catalog_list_ms = measure_get_requests(
+        &client,
+        &format!(
+            "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
+            library.id
+        ),
+        &cookies,
+        "Manifest catalog list",
+    )
+    .await?;
+    let (rescan_processed, rescan_batch_durations) = rescan_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(std::io::Error::other)?;
+    let rescan_ms = rescan_started.elapsed().as_millis();
+    let batch_p50_ms = percentile(&first_batch_durations, 50);
+    let batch_p95_ms = percentile(&first_batch_durations, 95);
+    let foreground_p95_ms = percentile(&foreground_ms, 95);
+    let catalog_list_p95_ms = percentile(&catalog_list_ms, 95);
+
+    let rescan_manifest_query = format!(
+        "SELECT state, observed_file_count, unchanged_count, add_count
+         FROM scan_manifests WHERE job_id = {job_id_placeholder}"
+    );
+    let rescan_manifest: (String, i64, i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(rescan_manifest_query))
+            .bind(&rescan_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(rescan_manifest.0, "POSTPROCESSING");
+    assert_eq!(rescan_manifest.1, file_count as i64);
+    assert_eq!(rescan_manifest.2, file_count as i64);
+    assert_eq!(rescan_manifest.3, 0);
+    assert!(
+        scan_running_before_api,
+        "Manifest scan ended before foreground sampling"
+    );
+
+    println!(
+        "LUX-270 MANIFEST RESULT {}",
+        serde_json::to_string(&json!({
+            "commit": luxd::COMMIT,
+            "architecture": std::env::consts::ARCH,
+            "databaseBackend": backend,
+            "fileCount": file_count,
+            "manifestIndexMs": manifest_index_ms,
+            "manifestFilesProcessed": first_scan_processed,
+            "manifestBatchCount": first_batch_durations.len(),
+            "batchP50Ms": batch_p50_ms,
+            "batchP95Ms": batch_p95_ms,
+            "manifestSqlStatementCount": scan_statement_count,
+            "manifestDmlStatementCount": dml_statement_count,
+            "postgresWalBytesWritten": postgres_wal_before
+                .zip(postgres_wal_after)
+                .map(|(before, after)| after.saturating_sub(before)),
+            "postgresLockWaitSampleCount": (backend == "postgres")
+                .then_some(postgres_lock_wait_samples),
+            "postgresMaxObservedLockWaiters": (backend == "postgres")
+                .then_some(postgres_max_lock_waiters),
+            "sqliteLockAcquisitionSampleCount": (backend == "sqlite")
+                .then_some(sqlite_lock_wait_us.len()),
+            "sqliteLockAcquisitionP50Us": (backend == "sqlite")
+                .then(|| percentile(&sqlite_lock_wait_us, 50)),
+            "sqliteLockAcquisitionP95Us": (backend == "sqlite")
+                .then(|| percentile(&sqlite_lock_wait_us, 95)),
+            "sqliteLockAcquisitionMaxUs": (backend == "sqlite")
+                .then_some(sqlite_lock_wait_us.iter().copied().max().unwrap_or_default()),
+            "sqliteLockAcquisitionErrors": (backend == "sqlite")
+                .then_some(sqlite_lock_wait_errors),
+            "sqliteBusyTimeoutMs": sqlite_busy_timeout_ms,
+            "foregroundDuringScan": scan_running_before_api,
+            "foregroundRequestCount": FOREGROUND_REQUESTS,
+            "foregroundP95Ms": foreground_p95_ms,
+            "catalogListP95Ms": catalog_list_p95_ms,
+            "unchangedRescanMs": rescan_ms,
+            "unchangedRescanBatchCount": rescan_batch_durations.len(),
+            "unchangedRescanProcessed": rescan_processed,
+            "manifestState": initial_manifest.0,
+            "manifestObservedFiles": initial_manifest.1,
+            "manifestAddedFiles": initial_manifest.3,
+            "sqlStatementCountNote": "SQLx statement events counted; PostgreSQL pg_stat_activity monitor SELECTs excluded. SQLite lock monitor acquires BEGIN IMMEDIATE every 100ms and commits immediately; its statements are included if surfaced by SQLx instrumentation. DML count classifies INSERT/UPDATE/DELETE/REPLACE/TRUNCATE summaries, including common-table-expression writes."
         }))?
     );
 

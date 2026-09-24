@@ -13,6 +13,12 @@ python3 tools/catalog-fixture/generate.py \
   --files "${LUX_PERF_FILE_COUNT:-60000}" \
   --directories "${LUX_PERF_DIRECTORY_COUNT:-600}"
 
+test_filter="${LUX_PERF_TEST_FILTER:-}"
+cargo_args=(--release --locked --test performance)
+if [[ -n "$test_filter" ]]; then
+  cargo_args+=("$test_filter")
+fi
+
 LUX_PERF_MEDIA_ROOT="$work_dir/catalog" \
 LUX_PERF_FILE_COUNT="${LUX_PERF_FILE_COUNT:-60000}" \
-cargo test --release --locked --test performance -- --ignored --nocapture --test-threads=1
+cargo test "${cargo_args[@]}" -- --ignored --nocapture --test-threads=1
