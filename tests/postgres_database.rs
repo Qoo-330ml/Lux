@@ -1,4 +1,4 @@
-use std::env;
+use std::{env, fs};
 
 use luxd::{
     application::{
@@ -10,9 +10,11 @@ use luxd::{
         metadata::MetadataEnricher,
         people::PeopleService,
         plugins::PluginService,
-        scanner::LibraryScanner,
+        scanner::{IncrementalScanChange, LibraryScanner, ScanJobService},
         setup::SetupService,
         strm_probe::{StrmProbeOptions, StrmProbeService},
+        watch::ChangeKind,
+        webhooks::WebhookService,
     },
     auth::sessions::WebAuthService,
     config::{Config, DatabaseConfiguration, PostgresConnection},
@@ -83,6 +85,27 @@ async fn drop_postgres_test_database(
     Ok(())
 }
 
+async fn advance_postgres_manifest_to_applying(
+    database: &Database,
+    jobs: &ScanJobService,
+    job_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..16 {
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(database.pool())
+                .await?;
+        if state == "APPLYING" {
+            return Ok(());
+        }
+        if jobs.run_batch(job_id, 1).await?.completed {
+            return Err("Manifest completed before entering APPLYING".into());
+        }
+    }
+    Err("Manifest did not enter APPLYING within the test batch bound".into())
+}
+
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
@@ -124,6 +147,15 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_tables, 5);
+    let manifest_resume_state_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'scan_manifests' AND column_name = 'resume_state'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_resume_state_column, 1);
     let login_background_cache_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -269,7 +301,10 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     assert_eq!(scan_target_index_predicates.len(), 3);
     for indexdef in scan_target_index_predicates {
         assert!(
-            indexdef.contains("IN ('PENDING', 'FAILED')"),
+            indexdef.contains("IN ('PENDING', 'FAILED')")
+                || indexdef
+                    .replace("::text", "")
+                    .contains("ANY (ARRAY['PENDING', 'FAILED'])"),
             "unexpected index: {indexdef}"
         );
     }
@@ -372,6 +407,364 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
         .await?;
     assert_eq!(page.total, 1);
     assert_eq!(page.items[0].id, item_id);
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+
+    let source_migrations =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    let old_schema_migrations = temp_dir.path().join("migrations-v130");
+    fs::create_dir(&old_schema_migrations)?;
+    for entry in fs::read_dir(source_migrations)? {
+        let entry = entry?;
+        if entry.file_name() != "0131_scan_manifest_resume_state.sql" {
+            fs::copy(entry.path(), old_schema_migrations.join(entry.file_name()))?;
+        }
+    }
+
+    let migration_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    sqlx::migrate::Migrator::new(old_schema_migrations.as_path())
+        .await?
+        .run(&migration_pool)
+        .await?;
+
+    let media_root = temp_dir.path().join("legacy-media");
+    fs::create_dir_all(&media_root)?;
+    fs::write(media_root.join("Legacy.Movie.2024.mkv"), b"legacy fixture")?;
+    let canonical_media_root = fs::canonicalize(&media_root)?;
+    let library_id = Uuid::now_v7().to_string();
+    let root_id = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ($1, $2, 'MOVIE')")
+        .bind(&library_id)
+        .bind("PostgreSQL Manifest Upgrade")
+        .execute(&migration_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ($1, $2, $3, $3, 1, 1)",
+    )
+    .bind(&root_id)
+    .bind(&library_id)
+    .bind(
+        canonical_media_root
+            .to_str()
+            .ok_or("non-UTF-8 media root")?,
+    )
+    .execute(&migration_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_jobs (
+             id, library_id, job_type, status, generation, discovery_completed, scan_phase
+         ) VALUES ('legacy-postgres-scan', $1, 'RECONCILE_LIBRARY', 'RUNNING',
+                   'legacy-generation', 0, 'DISCOVERY')",
+    )
+    .bind(&library_id)
+    .execute(&migration_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO reconciliation_scan_entries (
+             job_id, library_root_id, relative_path, entry_type
+         ) VALUES ('legacy-postgres-scan', $1, 'Legacy.Movie.2024.mkv', 'FILE')",
+    )
+    .bind(&root_id)
+    .execute(&migration_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_jobs (
+             id, library_id, job_type, status, generation, discovery_completed, scan_phase
+         ) VALUES ('existing-manifest-job', $1, 'RECONCILE_LIBRARY', 'COMPLETED',
+                   'completed-generation', 1, 'IDLE')",
+    )
+    .bind(&library_id)
+    .execute(&migration_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO scan_manifests (
+             id, job_id, library_id, state, observed_file_count, add_count
+         ) VALUES ('existing-manifest', 'existing-manifest-job', $1, 'COMPLETED', 9, 7)",
+    )
+    .bind(&library_id)
+    .execute(&migration_pool)
+    .await?;
+    migration_pool.close().await;
+
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    assert_eq!(database.schema_version().await?, 131);
+    let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT state, resume_state, observed_file_count, add_count
+         FROM scan_manifests WHERE id = 'existing-manifest'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(migrated_manifest, ("COMPLETED".to_owned(), None, 9, 7));
+    let legacy_queue_before_retry: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = 'legacy-postgres-scan'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(legacy_queue_before_retry, 1);
+
+    assert_eq!(database.cancel_incomplete_jobs_for_shutdown().await?, 1);
+    let legacy_state: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error FROM scan_jobs WHERE id = 'legacy-postgres-scan'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        legacy_state,
+        (
+            "CANCELLED".to_owned(),
+            Some("LEGACY_SCAN_REQUIRES_NEW_MANIFEST".to_owned())
+        )
+    );
+    database.run_database_lifecycle_cleanup().await?;
+    let legacy_queue_after_cleanup: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM reconciliation_scan_entries
+         WHERE job_id = 'legacy-postgres-scan'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(legacy_queue_after_cleanup, 1);
+
+    let jobs = ScanJobService::new(database.clone());
+    let retry = jobs.retry("legacy-postgres-scan").await?;
+    assert_ne!(retry.id, "legacy-postgres-scan");
+    jobs.run_to_completion(&retry.id, 100, None).await?;
+    let manifest_summary: (String, Option<String>, i64, i64, i64) = sqlx::query_as(
+        "SELECT manifest.state, manifest.resume_state, manifest.observed_file_count,
+                (SELECT COUNT(*) FROM scan_manifest_entries entry
+                 WHERE entry.manifest_id = manifest.id),
+                (SELECT COUNT(*) FROM scan_manifest_deltas delta
+                 WHERE delta.manifest_id = manifest.id)
+         FROM scan_manifests manifest WHERE manifest.job_id = $1",
+    )
+    .bind(&retry.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_summary, ("COMPLETED".to_owned(), None, 1, 0, 0));
+    let indexed_files: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = $1 AND entry_kind = 'FILE' AND is_missing = 0",
+    )
+    .bind(root_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_files, 1);
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_manifest_cas_resume_and_root_replacement_safety()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library(
+            &format!("PostgreSQL Manifest CAS {}", Uuid::now_v7()),
+            luxd::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let media_root = temp_dir.path().join("media");
+    fs::create_dir(&media_root)?;
+    fs::write(media_root.join("A.Movie.2024.mkv"), b"incremental wins")?;
+    fs::write(media_root.join("B.Movie.2025.mkv"), b"manifest adds")?;
+    let root_id = libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF-8 media root")?,
+        )
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let webhooks = WebhookService::new(database.clone(), config.config_dir.clone())?;
+    let event_types = vec!["SCAN_COMPLETED".to_owned()];
+    webhooks
+        .create_destination(
+            "PostgreSQL scan completion",
+            "https://example.com/lux-hook",
+            true,
+            false,
+            &event_types,
+            None,
+        )
+        .await?;
+    let jobs = ScanJobService::new(database.clone()).with_webhooks(webhooks);
+    let manifest_job = jobs.create_movie_scan_job(library.id).await?;
+    advance_postgres_manifest_to_applying(&database, &jobs, &manifest_job.id).await?;
+
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_id.clone(),
+                relative_path: "A.Movie.2024.mkv".to_owned(),
+                kind: ChangeKind::Create,
+            }],
+        )
+        .await?;
+    jobs.run_to_completion(&incremental.id, 100, None).await?;
+    let incremental_entry: (String, String, i64) = sqlx::query_as(
+        "SELECT entry.id, entry.last_seen_generation, COUNT(source.id)
+         FROM filesystem_entries entry
+         LEFT JOIN media_sources source ON source.filesystem_entry_id = entry.id
+         WHERE entry.library_root_id = $1 AND entry.relative_path = $2
+         GROUP BY entry.id, entry.last_seen_generation",
+    )
+    .bind(&root_id)
+    .bind("A.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(incremental_entry.2, 1);
+
+    let first_apply = jobs.run_batch(&manifest_job.id, 1).await?;
+    assert_eq!(first_apply.processed, 1);
+    let raced_delta: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_deltas
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = $1)
+           AND relative_path = 'A.Movie.2024.mkv'",
+    )
+    .bind(&manifest_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(raced_delta, "CONFLICT");
+    jobs.cancel(&manifest_job.id).await?;
+    let cancelled = jobs.run_batch(&manifest_job.id, 1).await?;
+    assert_eq!(cancelled.status, "CANCELLED");
+    let checkpoint: (String, Option<String>, i64) = sqlx::query_as(
+        "SELECT state, resume_state, applied_delta_count
+         FROM scan_manifests WHERE job_id = $1",
+    )
+    .bind(&manifest_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        checkpoint,
+        ("CANCELLED".to_owned(), Some("APPLYING".to_owned()), 0)
+    );
+
+    let resumed = jobs.retry(&manifest_job.id).await?;
+    assert_eq!(resumed.id, manifest_job.id);
+    assert_eq!(resumed.status, "PENDING");
+    while !jobs.run_batch(&manifest_job.id, 100).await?.completed {}
+
+    let index_completion: (String, String) =
+        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = $1")
+            .bind(&manifest_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        index_completion,
+        ("COMPLETED".to_owned(), "POSTPROCESSING".to_owned())
+    );
+    let scan_completed_events: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events
+         WHERE event_type = 'SCAN_COMPLETED' AND payload_json::jsonb->>'jobId' = $1",
+    )
+    .bind(&manifest_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        scan_completed_events, 1,
+        "PostgreSQL persists ScanCompleted at index completion"
+    );
+    let indexed_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources source
+         JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+         WHERE entry.library_root_id = $1 AND entry.is_missing = 0",
+    )
+    .bind(&root_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_sources, 2);
+    let after_manifest_apply: (String, String, i64) = sqlx::query_as(
+        "SELECT entry.id, entry.last_seen_generation, COUNT(source.id)
+         FROM filesystem_entries entry
+         LEFT JOIN media_sources source ON source.filesystem_entry_id = entry.id
+         WHERE entry.library_root_id = $1 AND entry.relative_path = $2
+         GROUP BY entry.id, entry.last_seen_generation",
+    )
+    .bind(&root_id)
+    .bind("A.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after_manifest_apply, incremental_entry);
+    jobs.run_to_completion(&manifest_job.id, 100, None).await?;
+    let scan_completed_after_postprocessing: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM notification_events
+         WHERE event_type = 'SCAN_COMPLETED' AND payload_json::jsonb->>'jobId' = $1",
+    )
+    .bind(&manifest_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(scan_completed_after_postprocessing, 1);
+    let completed_stage: (String, String) =
+        sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = $1")
+            .bind(&manifest_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(completed_stage, ("COMPLETED".to_owned(), "IDLE".to_owned()));
+
+    fs::remove_file(media_root.join("A.Movie.2024.mkv"))?;
+    let replacement_job = jobs.create_movie_scan_job(library.id).await?;
+    advance_postgres_manifest_to_applying(&database, &jobs, &replacement_job.id).await?;
+    let moved_root = temp_dir.path().join("original-media");
+    fs::rename(&media_root, &moved_root)?;
+    fs::create_dir(&media_root)?;
+    fs::write(
+        media_root.join("Replacement.Movie.2030.mkv"),
+        b"replacement root",
+    )?;
+    jobs.run_to_completion(&replacement_job.id, 100, None)
+        .await?;
+    let replaced_root_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = $1)
+           AND library_root_id = $2",
+    )
+    .bind(&replacement_job.id)
+    .bind(&root_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(replaced_root_state, "UNAVAILABLE");
+    let original_entry_missing: i64 = sqlx::query_scalar(
+        "SELECT is_missing FROM filesystem_entries
+         WHERE library_root_id = $1 AND relative_path = 'A.Movie.2024.mkv'",
+    )
+    .bind(&root_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(original_entry_missing, 0);
+
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
