@@ -92,7 +92,7 @@ describe("LoginPage session state", () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.tmdb-trending-background",
       contentKind: "POSTER_FEED",
-      sourceName: "TMDb 日榜",
+      sourceName: "TMDb 日榜横幅",
       copyrightNotice: "TMDb 图片来源",
       items: [
         { imageUrl: "https://image.tmdb.org/t/p/w500/one.jpg", title: "电影一" },
@@ -131,7 +131,7 @@ describe("LoginPage session state", () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.tmdb-trending-background",
       contentKind: "SINGLE_POSTER",
-      sourceName: "TMDb 日榜",
+      sourceName: "TMDb 日榜横幅",
       items: [{ imageUrl: "https://image.tmdb.org/t/p/w500/trending.jpg", title: "日榜电影" }],
     });
     container = document.createElement("div");
@@ -267,7 +267,7 @@ describe("LoginPage session state", () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.tmdb-trending-background",
       contentKind: "POSTER_FEED",
-      sourceName: "TMDb 日榜",
+      sourceName: "TMDb 日榜横幅",
       items: [{ imageUrl: "https://image.tmdb.org/t/p/w500/broken.jpg", title: "失效海报" }],
     });
     container = document.createElement("div");
@@ -302,7 +302,7 @@ describe("LoginPage session state", () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.tmdb-trending-background",
       contentKind: "POSTER_FEED",
-      sourceName: "TMDb 日榜",
+      sourceName: "TMDb 日榜横幅",
       items: [],
     });
     container = document.createElement("div");

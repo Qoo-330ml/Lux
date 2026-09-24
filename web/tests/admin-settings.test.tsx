@@ -54,8 +54,8 @@ const settings = {
 function loginBackgroundPlugin(overrides: Record<string, unknown> = {}) {
   return {
     id: "org.lux.tmdb-trending-background",
-    name: "TMDb 日榜海报",
-    description: "每日电影与剧集趋势",
+    name: "TMDb 日榜横幅背景",
+    description: "每日电影与剧集横幅",
     category: "login_background",
     capabilities: ["login_background.get"],
     status: "READY",
@@ -259,7 +259,7 @@ describe("AdminSettingsPage network proxy", () => {
 
     const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
     const optionLabels = Array.from(select?.options ?? []).map((option) => option.textContent);
-    expect(optionLabels).toContain("TMDb 日榜海报");
+    expect(optionLabels).toContain("TMDb 日榜横幅背景");
     expect(optionLabels).not.toContain("未安装");
     expect(optionLabels).not.toContain("已停用");
     expect(optionLabels).not.toContain("不可用");

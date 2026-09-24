@@ -2139,7 +2139,7 @@ services:
 | LUX-260 | migrations/、migrations-postgres/、src/application/、src/storage/、src/api/users.rs、src/api/admin_handlers.rs、tests/、docs/；登录背景插件的后台刷新、缓存、来源选择与公开接口 |
 | LUX-261 | web/src/features/auth/LoginPage.tsx、web/src/features/admin/AdminSettingsPage.tsx、web/src/app/、web/src/lib/api/、web/tests/、docs/；插件来源选择、瀑布流/大图布局和来源鸣谢 |
 | LUX-262 | Lux-plugins/src/bin/lux-plugin-wikimedia-potd-background.rs、manifests/org.lux.wikimedia-potd-background.json、tests/、docs/；经逐图许可筛选的 Wikimedia Commons 每日图片插件（必应来源不满足许可门槛） |
-| LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集混合海报插件 |
+| LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集横幅图插件 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；持久化目录发现与文件观察 |
@@ -6523,13 +6523,13 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 验收：
 
-- [ ] 插件仓库记录 Bing 来源审查与 Commons API/许可选择；不请求 Bing 未公开/个人壁纸端点、不依赖第三方 Bing API/容器。
-- [ ] 只访问 `commons.wikimedia.org` 官方 Action API 获取当日 POTD 文件名及文件元数据，并使用 `iiurlwidth=1920` 获取上游缩略图；不抓取 HTML 页面或由 Lux 下载图片字节。
-- [ ] 仅接受公共领域、CC0、CC BY 或 CC BY-SA 许可，拒绝 NC、ND、未知许可及缺少作者/作品页等署名信息的资源；许可 URL 与作品页 URL 必须由 API 返回并通过宿主 manifest 主机校验。
-- [ ] 插件使用独立 ID、manifest 和包版本；返回一张 `thumb.wikimedia.org` HTTPS 缩略图 URL、纯文本标题/作者/许可，以及作品页和许可证链接；图片不裁切、编辑、重编码或拼贴。
-- [ ] 缺失当日模板、无图、许可证不允许、元数据畸形及 Commons 网络错误均返回可恢复错误，宿主回退静态海报墙。
-- [ ] fixture 与 mock HTTP 测试覆盖 UTC 日期模板、作者 HTML 转纯文本、许可白名单/拒绝清单、图片 URL 主机、署名链接和空结果，不访问真实 Commons。
-- [ ] Commons 来源逐图许可筛选、ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 校验通过后，将独立插件登记到 `plugins.json`；插件仓库 main 分支的 release workflow 负责发布包并生成 `index.json`。此授权仅适用于 Commons，不适用于未经授权的 Bing 图片。
+- [x] 插件仓库记录 Bing 来源审查与 Commons API/许可选择；不请求 Bing 未公开/个人壁纸端点、不依赖第三方 Bing API/容器。
+- [x] 只访问 `commons.wikimedia.org` 官方 Action API 获取当日 POTD 文件名及文件元数据，并使用 `iiurlwidth=1920` 获取上游缩略图；不抓取 HTML 页面或由 Lux 下载图片字节。
+- [x] 仅接受公共领域、CC0、CC BY 或 CC BY-SA 许可，拒绝 NC、ND、未知许可及缺少作者/作品页等署名信息的资源；许可 URL 与作品页 URL 必须由 API 返回并通过宿主 manifest 主机校验。
+- [x] 插件使用独立 ID、manifest 和包版本；返回一张 `thumb.wikimedia.org` HTTPS 缩略图 URL、纯文本标题/作者/许可，以及作品页和许可证链接；图片不裁切、编辑、重编码或拼贴。
+- [x] 缺失当日模板、无图、许可证不允许、元数据畸形及 Commons 网络错误均返回可恢复错误，宿主回退静态海报墙。
+- [x] fixture 与 mock HTTP 测试覆盖 UTC 日期模板、作者 HTML 转纯文本、许可白名单/拒绝清单、图片 URL 主机、署名链接和空结果，不访问真实 Commons。
+- [x] Commons 来源逐图许可筛选、ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 校验通过后，将独立插件登记到 `plugins.json`；插件仓库 main 分支的 release workflow 负责发布包并生成 `index.json`。此授权仅适用于 Commons，不适用于未经授权的 Bing 图片。
 
 验证：外部仓库的 Rust 单测、SDK 合同测试、mock HTTP fixture、`cargo fmt --all -- --check`、双架构构建和 ZIP/manifest/hash 检验。
 
@@ -6546,15 +6546,15 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 验收：
 
-- [ ] API 固定使用 `time_window=day` 和 Trending All 混合入口；只保留 `media_type=movie` 或 `tv` 且有有效 `backdrop_path` 的项目，过滤人物及无横幅项目，按原榜单顺序选中第一项；不将海报作为回退。
-- [ ] 只返回一张 `https://image.tmdb.org/t/p/w1280/…` 图片 CDN URL；只生成 URL，不下载或重新编码图片。宿主以 `SINGLE_IMAGE` 原比例完整呈现，不裁切、旋转、遮罩或拼贴。
-- [ ] 该插件具有独立 package ID、独立 manifest 和独立插件配置；使用现有 `TmdbClient` 编译内嵌 fallback key，不再要求管理员提供另一把 API key。key 不读 `org.lux.tmdb` 插件配置、不由 Lux API/RPC 返回，也不写日志。
-- [ ] 记录复用仓库内 `TmdbClient` 的审查结果：Trending All/day 响应字段、Rust/Tokio/reqwest 兼容性及许可证；不复用元数据插件运行时配置或生命周期。
-- [ ] 仅缓存榜单结构所需的图片引用和刷新时间；支持超时、限流、空榜、缺失海报和 TMDb 故障，并通过宿主静态回退恢复登录页。
-- [ ] 在 Lux“关于/鸣谢”区域展示获准 TMDb Logo 及要求的非背书声明；页面不暗示 TMDb 赞助或认证 Lux。
-- [ ] 上线前确认实际部署用途符合 TMDb API 许可；商业使用必须先取得书面许可，未确认时不发布/启用该 provider。插件配置应显式要求管理员确认已核对适用许可，但确认开关不替代许可本身。
-- [ ] 测试覆盖 movie/tv/person、缺少 backdrop、海报不回退、恶意路径、榜单顺序和首个有效项；mock HTTP 验证只请求日榜且不依赖真实 TMDb 网络。
-- [ ] 插件登记到外部仓库正式目录；仓库自动完成 ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 和目录校验后，Lux 商店才显示该选项。
+- [x] API 固定使用 `time_window=day` 和 Trending All 混合入口；只保留 `media_type=movie` 或 `tv` 且有有效 `backdrop_path` 的项目，过滤人物及无横幅项目，按原榜单顺序选中第一项；不将海报作为回退。
+- [x] 只返回一张 `https://image.tmdb.org/t/p/w1280/…` 图片 CDN URL；只生成 URL，不下载或重新编码图片。宿主以 `SINGLE_IMAGE` 原比例完整呈现，不裁切、旋转、遮罩或拼贴。
+- [x] 该插件具有独立 package ID、独立 manifest 和独立插件配置；使用现有 `TmdbClient` 编译内嵌 fallback key，不再要求管理员提供另一把 API key。key 不读 `org.lux.tmdb` 插件配置、不由 Lux API/RPC 返回，也不写日志。
+- [x] 记录复用仓库内 `TmdbClient` 的审查结果：Trending All/day 响应字段、Rust/Tokio/reqwest 兼容性及许可证；不复用元数据插件运行时配置或生命周期。
+- [x] 仅缓存榜单结构所需的图片引用和刷新时间；支持超时、限流、空榜、缺失海报和 TMDb 故障，并通过宿主静态回退恢复登录页。
+- [x] 在 Lux“关于/鸣谢”区域展示获准 TMDb Logo 及要求的非背书声明；页面不暗示 TMDb 赞助或认证 Lux。
+- [x] 上线前确认实际部署用途符合 TMDb API 许可；商业使用必须先取得书面许可，未确认时不发布/启用该 provider。插件配置显式要求管理员确认已核对适用许可，确认开关不替代许可本身。
+- [x] 测试覆盖 movie/tv/person、缺少 backdrop、海报不回退、恶意路径、榜单顺序和首个有效项；mock HTTP 验证只请求日榜且不依赖真实 TMDb 网络。
+- [x] 插件登记到外部仓库正式目录；仓库自动完成 ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 和目录校验后，Lux 商店目录可提供该选项。
 
 验证：外部仓库的 Rust 单测、mock HTTP fixture、`cargo fmt --all -- --check`、插件 Clippy、双架构构建、ZIP/manifest/hash 检验和 `index.json` 校验。
 
