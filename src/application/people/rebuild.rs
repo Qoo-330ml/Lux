@@ -6,21 +6,33 @@ impl PeopleService {
         person_id: &str,
         display_name: &str,
     ) -> Result<PathBuf, PeopleError> {
+        if let Some(path) = self
+            .find_existing_person_manifest_path(person_id, display_name)
+            .await?
+        {
+            return Ok(path);
+        }
+        lux_person_directory(&self.config_dir, display_name, person_id)
+            .map_err(PeopleError::from)
+            .map(|path| path.join(PERSON_MANIFEST))
+    }
+
+    /// Looks up an existing manifest without falling back to a new Lux person
+    /// directory, so callers can handle people that only have local IDs.
+    pub(super) async fn find_existing_person_manifest_path(
+        &self,
+        person_id: &str,
+        display_name: &str,
+    ) -> Result<Option<PathBuf>, PeopleError> {
         let root = metadata_root(&self.config_dir)
             .join(LEGACY_PEOPLE_DIR)
             .join("person");
         let mut initials = match fs::read_dir(&root).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                if let Some(path) = self
+                return self
                     .find_person_manifest_path_from_index(person_id, display_name)
-                    .await?
-                {
-                    return Ok(path);
-                }
-                return lux_person_directory(&self.config_dir, display_name, person_id)
-                    .map_err(PeopleError::from)
-                    .map(|path| path.join(PERSON_MANIFEST));
+                    .await;
             }
             Err(source) => return Err(PeopleError::Io { path: root, source }),
         };
@@ -63,19 +75,12 @@ impl PeopleService {
                     continue;
                 };
                 if manifest.lux_person_id == person_id {
-                    return Ok(candidate_path);
+                    return Ok(Some(candidate_path));
                 }
             }
         }
-        if let Some(path) = self
-            .find_person_manifest_path_from_index(person_id, display_name)
-            .await?
-        {
-            return Ok(path);
-        }
-        lux_person_directory(&self.config_dir, display_name, person_id)
-            .map_err(PeopleError::from)
-            .map(|path| path.join(PERSON_MANIFEST))
+        self.find_person_manifest_path_from_index(person_id, display_name)
+            .await
     }
 
     pub(super) async fn find_person_manifest_path_from_index(
