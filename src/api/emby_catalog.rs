@@ -236,7 +236,6 @@ pub(super) fn catalog_filter_from_values(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
     metadata_pending: bool,
-    min_date_last_saved: Option<i64>,
 ) -> CatalogFilter {
     let item_types = item_types
         .map(|values| {
@@ -274,7 +273,7 @@ pub(super) fn catalog_filter_from_values(
         years,
         is_played,
         is_favorite,
-        min_date_last_saved,
+        min_date_last_saved: None,
         metadata_pending,
         sort_by: match sort_by {
             Some(value)
@@ -314,8 +313,8 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
         false,
-        query.min_date_last_saved,
     );
+    filter.min_date_last_saved = query.min_date_last_saved;
     let requested_filters = query.filters.as_deref().unwrap_or_default();
     if requested_filters
         .split(',')

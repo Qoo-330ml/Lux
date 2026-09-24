@@ -2791,8 +2791,7 @@ impl Database {
             })?
         } else {
             None
-        }
-        .or_else(|| None);
+        };
         let library_id = match library_id {
             Some(library_id) => library_id,
             None => self
