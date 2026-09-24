@@ -1,0 +1,62 @@
+name: Sync test to main
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: sync-test-to-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Create or update sync pull request
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Create or update test-to-main pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          HEAD_BRANCH: test
+          BASE_BRANCH: main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pr_number="$(gh pr list \
+            --repo "$REPOSITORY" \
+            --state open \
+            --base "$BASE_BRANCH" \
+            --head "${GITHUB_REPOSITORY_OWNER}:$HEAD_BRANCH" \
+            --json number \
+            --jq '.[0].number // empty')"
+
+          pr_body_file="$RUNNER_TEMP/sync-test-to-main-pr.md"
+          cat > "$pr_body_file" <<'EOF'
+          This PR syncs the latest contents of `test` into `main`.
+
+          Review the changes before merging. Merging this PR triggers the normal `main` publication workflow.
+          EOF
+
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" \
+              --repo "$REPOSITORY" \
+              --title "Sync test to main" \
+              --body-file "$pr_body_file"
+            pr_url="$(gh pr view "$pr_number" --repo "$REPOSITORY" --json url --jq .url)"
+          else
+            pr_url="$(gh pr create \
+              --repo "$REPOSITORY" \
+              --base "$BASE_BRANCH" \
+              --head "$HEAD_BRANCH" \
+              --title "Sync test to main" \
+              --body-file "$pr_body_file")"
+          fi
+
+          echo "Sync pull request: $pr_url" >> "$GITHUB_STEP_SUMMARY"
