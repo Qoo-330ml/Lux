@@ -29,16 +29,21 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
         .expect("expected cookie")
 }
 
+#[derive(Default)]
+struct ItemHierarchy<'a> {
+    parent_id: Option<&'a str>,
+    series_id: Option<&'a str>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+}
+
 async fn insert_item(
     database: &Database,
     id: &str,
     library_id: &str,
     item_type: &str,
     title: &str,
-    parent_id: Option<&str>,
-    series_id: Option<&str>,
-    season_number: Option<i64>,
-    episode_number: Option<i64>,
+    hierarchy: ItemHierarchy<'_>,
     has_available_source: bool,
 ) -> Result<(), sqlx::Error> {
     sqlx::query(
@@ -51,10 +56,10 @@ async fn insert_item(
     .bind(id)
     .bind(library_id)
     .bind(item_type)
-    .bind(parent_id)
-    .bind(series_id)
-    .bind(season_number)
-    .bind(episode_number)
+    .bind(hierarchy.parent_id)
+    .bind(hierarchy.series_id)
+    .bind(hierarchy.season_number)
+    .bind(hierarchy.episode_number)
     .bind(title)
     .bind(title.to_lowercase())
     .bind(i64::from(has_available_source))
@@ -138,10 +143,7 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "MOVIE",
         "电影主条目",
-        None,
-        None,
-        None,
-        None,
+        ItemHierarchy::default(),
         true,
     )
     .await?;
@@ -151,10 +153,7 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "MOVIE",
         "电影其他版本",
-        None,
-        None,
-        None,
-        None,
+        ItemHierarchy::default(),
         true,
     )
     .await?;
@@ -183,10 +182,7 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "SERIES",
         "剧集主条目",
-        None,
-        None,
-        None,
-        None,
+        ItemHierarchy::default(),
         false,
     )
     .await?;
@@ -196,10 +192,7 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "SERIES",
         "剧集其他版本",
-        None,
-        None,
-        None,
-        None,
+        ItemHierarchy::default(),
         false,
     )
     .await?;
@@ -209,10 +202,12 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "SEASON",
         "Season 01",
-        Some(&series_primary),
-        Some(&series_primary),
-        Some(1),
-        None,
+        ItemHierarchy {
+            parent_id: Some(&series_primary),
+            series_id: Some(&series_primary),
+            season_number: Some(1),
+            ..ItemHierarchy::default()
+        },
         false,
     )
     .await?;
@@ -222,10 +217,12 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "SEASON",
         "Season 01",
-        Some(&series_secondary),
-        Some(&series_secondary),
-        Some(1),
-        None,
+        ItemHierarchy {
+            parent_id: Some(&series_secondary),
+            series_id: Some(&series_secondary),
+            season_number: Some(1),
+            ..ItemHierarchy::default()
+        },
         false,
     )
     .await?;
@@ -235,10 +232,12 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "SEASON",
         "Season 02",
-        Some(&series_secondary),
-        Some(&series_secondary),
-        Some(2),
-        None,
+        ItemHierarchy {
+            parent_id: Some(&series_secondary),
+            series_id: Some(&series_secondary),
+            season_number: Some(2),
+            ..ItemHierarchy::default()
+        },
         false,
     )
     .await?;
@@ -248,10 +247,12 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "EPISODE",
         "第一集",
-        Some(&primary_season),
-        Some(&series_primary),
-        Some(1),
-        Some(1),
+        ItemHierarchy {
+            parent_id: Some(&primary_season),
+            series_id: Some(&series_primary),
+            season_number: Some(1),
+            episode_number: Some(1),
+        },
         true,
     )
     .await?;
@@ -261,10 +262,12 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "EPISODE",
         "第一集其他版本",
-        Some(&secondary_season_overlap),
-        Some(&series_secondary),
-        Some(1),
-        Some(1),
+        ItemHierarchy {
+            parent_id: Some(&secondary_season_overlap),
+            series_id: Some(&series_secondary),
+            season_number: Some(1),
+            episode_number: Some(1),
+        },
         true,
     )
     .await?;
@@ -274,10 +277,12 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
         &library_id,
         "EPISODE",
         "第二季第一集",
-        Some(&secondary_season_extra),
-        Some(&series_secondary),
-        Some(2),
-        Some(1),
+        ItemHierarchy {
+            parent_id: Some(&secondary_season_extra),
+            series_id: Some(&series_secondary),
+            season_number: Some(2),
+            episode_number: Some(1),
+        },
         true,
     )
     .await?;
