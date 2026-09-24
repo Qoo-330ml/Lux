@@ -6529,7 +6529,7 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 - [ ] 插件使用独立 ID、manifest 和包版本；返回一张 `thumb.wikimedia.org` HTTPS 缩略图 URL、纯文本标题/作者/许可，以及作品页和许可证链接；图片不裁切、编辑、重编码或拼贴。
 - [ ] 缺失当日模板、无图、许可证不允许、元数据畸形及 Commons 网络错误均返回可恢复错误，宿主回退静态海报墙。
 - [ ] fixture 与 mock HTTP 测试覆盖 UTC 日期模板、作者 HTML 转纯文本、许可白名单/拒绝清单、图片 URL 主机、署名链接和空结果，不访问真实 Commons。
-- [ ] 外部插件仓库完成 ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 校验后，再评估正式目录发布；此任务不自动发布或添加目录条目。
+- [ ] Commons 来源逐图许可筛选、ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 校验通过后，将独立插件登记到 `plugins.json`；插件仓库 main 分支的 release workflow 负责发布包并生成 `index.json`。此授权仅适用于 Commons，不适用于未经授权的 Bing 图片。
 
 验证：外部仓库的 Rust 单测、SDK 合同测试、mock HTTP fixture、`cargo fmt --all -- --check`、双架构构建和 ZIP/manifest/hash 检验。
 
