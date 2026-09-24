@@ -6495,7 +6495,7 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 验收：
 
-- [ ] 管理员可选固定海报墙、媒体库最新添加、Wikimedia Commons 每日图片或 TMDb 日榜海报；未安装/不可用插件不会被错误展示为可用选项，并清楚提示启用和公开访问的风险。
+- [ ] 管理员可选固定海报墙、媒体库最新添加、Wikimedia Commons 每日图片或 TMDb 日榜横幅图；未安装/不可用插件不会被错误展示为可用选项，并清楚提示启用和公开访问的风险。
 - [ ] `POSTER_FEED` 使用既有五列紧凑倾斜瀑布流和当前位置/留白，不改变尺寸、列距、倾斜角、交错规则；`HERO_IMAGE` 用 Lux 自带 CSS 呈现，不加载插件自定义 UI。
 - [ ] `SINGLE_POSTER` 只展示一张完整原比例海报，不裁切、旋转、拼贴或叠加遮罩；由宿主固定布局在左侧视觉区呈现，不改变既有海报瀑布流。
 - [ ] `SINGLE_IMAGE` 只展示一张完整原比例图片，不裁切、旋转、拼贴、压暗或叠加遮罩；作品署名与许可作为独立、可访问的外链呈现。
@@ -6540,29 +6540,30 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 - 不使用许可未知、NC 或 ND 图片，不将 API 返回 HTML 当成宿主 UI。
 - 不在插件中打包、下载或重编码日图图片。
 
-#### LUX-263：独立 TMDb 日榜电影+剧集海报插件
+#### LUX-263：独立 TMDb 日榜电影+剧集横幅图插件
 
-范围：在外部 `Lux-plugins` 仓库实现单独发布、单独配置的 TMDb 登录背景插件。编码前先审查 GitHub 上的 Rust TMDb 客户端和 Lux-plugins 现有 `TmdbClient`，在接口覆盖、依赖/运行时匹配、许可证与维护状态通过后优先复用或小范围抽取；记录最终选择。只请求 TMDb Trending All 日榜（`/3/trending/all/day`），在插件内按原排序过滤电影和剧集并返回榜单中第一张有效海报，使用 `SINGLE_POSTER`，不生成海报墙或其他衍生拼贴。插件不复用、读取或依赖现有 `org.lux.tmdb` 元数据插件配置。
+范围：在外部 `Lux-plugins` 仓库实现单独发布、单独配置的 TMDb 登录背景插件。优先复用仓库现有 `TmdbClient` 和其已批准的内嵌 fallback API key；该 key 编译进背景插件，但不读取 `org.lux.tmdb` 元数据插件配置、不放入 manifest、不由 Lux API/RPC 返回或写入日志。只请求 TMDb Trending All 日榜（`/3/trending/all/day`），按原排序过滤电影和剧集，并返回榜单中第一张有效 `backdrop_path` 横幅图，使用 `SINGLE_IMAGE` 完整原比例展示；不生成海报墙或其他衍生拼贴。
 
 验收：
 
-- [ ] API 固定使用 `time_window=day` 和 Trending All 混合入口；只保留 `media_type=movie` 或 `tv` 且有有效 `poster_path` 的项目，过滤人物及无海报项目，按原榜单顺序选中第一项。
-- [ ] 只返回一张 TMDb 图片 CDN 的 `w500` 海报 URL；只生成 URL，不下载或重新编码图片。宿主以原比例完整呈现这张海报，不裁切、旋转、遮罩或拼贴。
-- [ ] 该插件具有独立 package ID、独立 manifest 和独立插件配置/密钥；密钥只在插件进程中使用，不读 `org.lux.tmdb` 配置，不返回 RPC/API，也不写日志。
-- [ ] GitHub/仓库内代码复用审查有记录；若采用第三方 crate/代码，验证其 Trending All/day 响应字段、Rust/Tokio/reqwest 兼容性和许可证；只复用通用客户端代码，不复用元数据插件运行时配置或生命周期。
+- [ ] API 固定使用 `time_window=day` 和 Trending All 混合入口；只保留 `media_type=movie` 或 `tv` 且有有效 `backdrop_path` 的项目，过滤人物及无横幅项目，按原榜单顺序选中第一项；不将海报作为回退。
+- [ ] 只返回一张 `https://image.tmdb.org/t/p/w1280/…` 图片 CDN URL；只生成 URL，不下载或重新编码图片。宿主以 `SINGLE_IMAGE` 原比例完整呈现，不裁切、旋转、遮罩或拼贴。
+- [ ] 该插件具有独立 package ID、独立 manifest 和独立插件配置；使用现有 `TmdbClient` 编译内嵌 fallback key，不再要求管理员提供另一把 API key。key 不读 `org.lux.tmdb` 插件配置、不由 Lux API/RPC 返回，也不写日志。
+- [ ] 记录复用仓库内 `TmdbClient` 的审查结果：Trending All/day 响应字段、Rust/Tokio/reqwest 兼容性及许可证；不复用元数据插件运行时配置或生命周期。
 - [ ] 仅缓存榜单结构所需的图片引用和刷新时间；支持超时、限流、空榜、缺失海报和 TMDb 故障，并通过宿主静态回退恢复登录页。
 - [ ] 在 Lux“关于/鸣谢”区域展示获准 TMDb Logo 及要求的非背书声明；页面不暗示 TMDb 赞助或认证 Lux。
 - [ ] 上线前确认实际部署用途符合 TMDb API 许可；商业使用必须先取得书面许可，未确认时不发布/启用该 provider。插件配置应显式要求管理员确认已核对适用许可，但确认开关不替代许可本身。
-- [ ] 测试覆盖 movie/tv/person、缺图、重复项、顺序和上限；不依赖真实 TMDb 网络。
-- [ ] 外部插件仓库完成 ARM64 与 x86_64 构建、SHA-256、商店目录和发布验证后，Lux 商店才显示该选项。
+- [ ] 测试覆盖 movie/tv/person、缺少 backdrop、海报不回退、恶意路径、榜单顺序和首个有效项；mock HTTP 验证只请求日榜且不依赖真实 TMDb 网络。
+- [ ] 插件登记到外部仓库正式目录；仓库自动完成 ARM64 与 x86_64 构建、SHA-256、ZIP/manifest 和目录校验后，Lux 商店才显示该选项。
 
-验证：外部仓库的 Rust 单测、mock HTTP fixture、`cargo fmt --all -- --check`、双架构构建、ZIP/manifest/hash 检验和 `index.json` 校验。
+验证：外部仓库的 Rust 单测、mock HTTP fixture、`cargo fmt --all -- --check`、插件 Clippy、双架构构建、ZIP/manifest/hash 检验和 `index.json` 校验。
 
 依赖：LUX-259、LUX-260、LUX-261。
 
 明确不做：
 
-- 不提供周榜、热门榜、评分榜或 Top 250；不混入人物、季或集。
+- 不提供周榜、热门榜、评分榜或 Top 250；不混入人物、季或集；不使用 poster 海报路径。
+- 使用范围为非商业；如实际部署涉及商业用途，必须先取得 TMDb 书面许可。插件配置中的许可核对项不构成 TMDb 授权。
 - 不把本插件合并进 `org.lux.tmdb`，不复用其设置或运行时进程。
 - 不转码媒体库海报、不镜像 TMDb 图片二进制、不长期缓存 TMDb 响应。
 
