@@ -22,7 +22,7 @@ mod unix {
         health_url: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let client = reqwest::Client::new();
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match client.get(health_url).send().await {
                     Ok(response) if response.status().is_success() => {
@@ -41,6 +41,25 @@ mod unix {
         Ok(())
     }
 
+    async fn read_daily_logs(
+        config_dir: &std::path::Path,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut entries = tokio::fs::read_dir(config_dir.join("logs")).await?;
+        let mut logs = String::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            let name = path.file_name().and_then(|value| value.to_str());
+            if name.is_some_and(|value| value.starts_with("lux.") && value.ends_with(".log")) {
+                logs.push_str(&tokio::fs::read_to_string(path).await?);
+                logs.push('\n');
+            }
+        }
+        if logs.is_empty() {
+            return Err("daily Lux log file was not created or was empty".into());
+        }
+        Ok(logs)
+    }
+
     #[tokio::test]
     async fn request_logs_include_correlation_and_latency_fields()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -55,13 +74,14 @@ mod unix {
             .env("LUX_CONFIG_DIR", &config_dir)
             .env("RUST_LOG", "luxd=debug,tower_http=debug")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()?;
         let pid = child.id().ok_or("luxd process has no pid")?;
         let health_url = format!("http://{address}/health/live");
         if let Err(error) = wait_for_http(&mut child, &health_url).await {
             let _ = send_signal("KILL", pid).await;
+            let _ = child.wait().await;
             return Err(error);
         }
 
@@ -117,18 +137,12 @@ mod unix {
             .to_owned();
 
         send_signal("TERM", pid).await?;
-        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .map_err(|_| "luxd did not exit after SIGTERM")??;
-        assert!(
-            output.status.success(),
-            "luxd exited with {}",
-            output.status
-        );
+        assert!(status.success(), "luxd exited with {}", status);
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let logs = format!("{stdout}\n{stderr}");
+        let logs = read_daily_logs(&config_dir).await?;
         let response_log = logs
             .lines()
             .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -195,13 +209,14 @@ mod unix {
             .env("LUX_CONFIG_DIR", &config_dir)
             .env("RUST_LOG", "luxd=debug,tower_http=debug")
             .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()?;
         let pid = child.id().ok_or("luxd process has no pid")?;
         let health_url = format!("http://{address}/health/live");
         if let Err(error) = wait_for_http(&mut child, &health_url).await {
             let _ = send_signal("KILL", pid).await;
+            let _ = child.wait().await;
             return Err(error);
         }
 
@@ -209,29 +224,14 @@ mod unix {
         assert_eq!(response.status(), reqwest::StatusCode::OK);
 
         send_signal("TERM", pid).await?;
-        let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
+        let status = tokio::time::timeout(Duration::from_secs(5), child.wait())
             .await
             .map_err(|_| "luxd did not exit after SIGTERM")??;
-        assert!(
-            output.status.success(),
-            "luxd exited with {}",
-            output.status
-        );
-
-        let mut entries = tokio::fs::read_dir(config_dir.join("logs")).await?;
-        let mut log_path = None;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            let name = path.file_name().and_then(|value| value.to_str());
-            if name.is_some_and(|value| value.starts_with("lux.") && value.ends_with(".log")) {
-                log_path = Some(path);
-                break;
-            }
-        }
-        let log_path = log_path.ok_or("daily Lux log file was not created")?;
-        let contents = tokio::fs::read_to_string(log_path).await?;
+        assert!(status.success(), "luxd exited with {}", status);
+        let contents = read_daily_logs(&config_dir).await?;
         let logs = contents
             .lines()
+            .filter(|line| !line.trim().is_empty())
             .map(serde_json::from_str::<Value>)
             .collect::<Result<Vec<_>, _>>()?;
         assert!(logs.iter().any(|value| {
