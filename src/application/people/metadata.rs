@@ -236,10 +236,22 @@ impl PeopleService {
             .into_iter()
             .find_map(|credit| credit.lux_person_id)
             .unwrap_or_else(|| person_id.to_owned());
-        let manifest_path = self
-            .find_person_manifest_path(&manifest_person_id, &update.name)
-            .await?;
-        let (locked_fields, existing_metadata) = match read_people_file(&manifest_path).await? {
+        // People discovered only from local NFO credits have `local-*` IDs and
+        // no Lux manifest yet; treat them as unlocked instead of failing.
+        let manifest_path = if manifest_person_id.starts_with("lux-") {
+            Some(
+                self.find_person_manifest_path(&manifest_person_id, &update.name)
+                    .await?,
+            )
+        } else {
+            self.find_existing_person_manifest_path(&manifest_person_id, &update.name)
+                .await?
+        };
+        let manifest_bytes = match &manifest_path {
+            Some(path) => read_people_file(path).await?,
+            None => None,
+        };
+        let (locked_fields, existing_metadata) = match manifest_bytes {
             Some(bytes) => {
                 let manifest = serde_json::from_slice::<PersonManifest>(&bytes)
                     .map_err(|source| PeopleError::Serialization(source.to_string()))?;

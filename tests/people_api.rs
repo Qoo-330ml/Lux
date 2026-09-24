@@ -3,7 +3,7 @@ use luxd::{
     api::{AppState, app_with_state},
     application::{
         libraries::LibraryService,
-        metadata_paths::{library_item_directory, lux_person_directory},
+        metadata_paths::{library_item_directory, lux_person_directory, people_directory},
         people::{ActorCredit, PeopleService, PersonMetadata},
         scanner::LibraryScanner,
         setup::SetupService,
@@ -1702,4 +1702,117 @@ fn cookie_value(headers: &HeaderMap, name: &str) -> String {
         .find_map(|value| value.strip_prefix(&format!("{name}=")))
         .unwrap_or_default()
         .to_owned()
+}
+
+#[tokio::test]
+async fn emby_item_update_accepts_local_only_actor() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Local Actor Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Local.Actor.Movie.2024.mkv"), b"movie").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+
+    // NFO actors without any provider ID are indexed under a `local-*` ID and
+    // never receive a Lux person manifest.
+    let relation_path = library_item_directory(&config.config_dir, &item_id)?.join("people.json");
+    tokio::fs::create_dir_all(relation_path.parent().ok_or("missing relation dir")?).await?;
+    tokio::fs::write(
+        &relation_path,
+        serde_json::to_vec(&json!({
+            "schemaVersion": 2,
+            "actors": [
+                {
+                    "id": null,
+                    "name": "本地演员",
+                    "provider": "",
+                    "order": 0
+                }
+            ]
+        }))?,
+    )
+    .await?;
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    assert!(people.rebuild_person_credit_index().await? > 0);
+    let person_id: String = sqlx::query_scalar(
+        "SELECT person_id FROM person_credits WHERE item_id = ? AND person_name = ?",
+    )
+    .bind(&item_id)
+    .bind("本地演员")
+    .fetch_one(database.pool())
+    .await?;
+    assert!(person_id.starts_with("local-"));
+
+    let key = luxd::auth::admin_api_key::AdminApiKeyService::new(
+        config.config_dir.clone(),
+        database.clone(),
+    )
+    .rotate()
+    .await?;
+    let config_dir = config.config_dir.clone();
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config, database, setup, web_auth, emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::new();
+
+    let person_update = client
+        .post(format!(
+            "http://{address}/emby/Items/{person_id}?api_key={key}"
+        ))
+        .json(&json!({
+            "Name": "本地演员",
+            "Id": person_id,
+            "Type": "Person",
+            "Overview": "MDC 补全的演员简介",
+            "BirthDate": "1995-05-06",
+            "ProviderIds": {
+                "Javdb": "abc123"
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(person_update.status(), reqwest::StatusCode::OK);
+    let person_update_body: serde_json::Value = person_update.json().await?;
+    assert_eq!(person_update_body["Id"], person_id.as_str());
+    assert_eq!(person_update_body["Overview"], "MDC 补全的演员简介");
+    assert_eq!(person_update_body["BirthDate"], "1995-05-06");
+
+    let person_nfo =
+        people_directory(&config_dir, "本地演员", "local", &person_id)?.join("person.nfo");
+    let person_nfo_body = tokio::fs::read_to_string(person_nfo).await?;
+    assert!(person_nfo_body.contains("<name>本地演员</name>"));
+    assert!(person_nfo_body.contains("<biography>MDC 补全的演员简介</biography>"));
+    assert!(person_nfo_body.contains("<birthday>1995-05-06</birthday>"));
+
+    server.abort();
+    Ok(())
 }
