@@ -628,21 +628,36 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         None
     };
     statement_counts.reset();
-    let postgres_lock_monitor =
-        (backend == "postgres").then(|| start_postgres_lock_wait_monitor(database.pool().clone()));
-    let sqlite_lock_monitor =
-        (backend == "sqlite").then(|| start_sqlite_lock_wait_monitor(database.pool().clone()));
+    let lock_monitor_enabled = env::var_os("LUX_PERF_DISABLE_LOCK_MONITOR").is_none();
+    let postgres_lock_monitor = (backend == "postgres" && lock_monitor_enabled)
+        .then(|| start_postgres_lock_wait_monitor(database.pool().clone()));
+    let sqlite_lock_monitor = (backend == "sqlite" && lock_monitor_enabled)
+        .then(|| start_sqlite_lock_wait_monitor(database.pool().clone()));
 
     let first_scan_started = Instant::now();
     let mut first_batch_durations = Vec::new();
     let mut first_scan_processed = 0_usize;
+    let mut phase = "DISCOVERING".to_owned();
+    let mut phase_durations = BTreeMap::<String, u128>::new();
+    let mut phase_batch_counts = BTreeMap::<String, usize>::new();
     loop {
         let batch_started = Instant::now();
         let report = jobs.run_batch(&job.id, 100).await?;
-        first_batch_durations.push(batch_started.elapsed().as_millis());
+        let batch_duration = batch_started.elapsed().as_millis();
+        first_batch_durations.push(batch_duration);
+        *phase_durations.entry(phase.clone()).or_default() += batch_duration;
+        *phase_batch_counts.entry(phase.clone()).or_default() += 1;
         first_scan_processed += report.processed;
         if report.completed {
             break;
+        }
+        if report.processed == 0 {
+            phase = sqlx::query_scalar::<_, String>(
+                "SELECT state FROM scan_manifests WHERE job_id = ?",
+            )
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
         }
     }
     let manifest_index_ms = first_scan_started.elapsed().as_millis();
@@ -771,6 +786,8 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "manifestIndexMs": manifest_index_ms,
             "manifestFilesProcessed": first_scan_processed,
             "manifestBatchCount": first_batch_durations.len(),
+            "manifestPhaseMs": phase_durations,
+            "manifestPhaseBatchCounts": phase_batch_counts,
             "batchP50Ms": batch_p50_ms,
             "batchP95Ms": batch_p95_ms,
             "manifestSqlStatementCount": scan_statement_count,
@@ -782,15 +799,16 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
                 .then_some(postgres_lock_wait_samples),
             "postgresMaxObservedLockWaiters": (backend == "postgres")
                 .then_some(postgres_max_lock_waiters),
-            "sqliteLockAcquisitionSampleCount": (backend == "sqlite")
+            "sqliteLockMonitorEnabled": (backend == "sqlite").then_some(lock_monitor_enabled),
+            "sqliteLockAcquisitionSampleCount": (backend == "sqlite" && lock_monitor_enabled)
                 .then_some(sqlite_lock_wait_us.len()),
-            "sqliteLockAcquisitionP50Us": (backend == "sqlite")
+            "sqliteLockAcquisitionP50Us": (backend == "sqlite" && lock_monitor_enabled)
                 .then(|| percentile(&sqlite_lock_wait_us, 50)),
-            "sqliteLockAcquisitionP95Us": (backend == "sqlite")
+            "sqliteLockAcquisitionP95Us": (backend == "sqlite" && lock_monitor_enabled)
                 .then(|| percentile(&sqlite_lock_wait_us, 95)),
-            "sqliteLockAcquisitionMaxUs": (backend == "sqlite")
+            "sqliteLockAcquisitionMaxUs": (backend == "sqlite" && lock_monitor_enabled)
                 .then_some(sqlite_lock_wait_us.iter().copied().max().unwrap_or_default()),
-            "sqliteLockAcquisitionErrors": (backend == "sqlite")
+            "sqliteLockAcquisitionErrors": (backend == "sqlite" && lock_monitor_enabled)
                 .then_some(sqlite_lock_wait_errors),
             "sqliteBusyTimeoutMs": sqlite_busy_timeout_ms,
             "foregroundDuringScan": scan_running_before_api,
