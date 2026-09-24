@@ -6686,7 +6686,7 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 - [x] 两种后端执行相同的根路径保护、delta/CAS、取消、重试、索引完成与后处理事件合同。
 - [x] `docs/PERFORMANCE.md` 记录数据规模、命令、硬件、数据库后端及优化前后可比指标；不得以 SQLite ARM64 数值推断 PostgreSQL/NAS 性能。
 - [x] `docs/COMPATIBILITY.md` 记录扫描完成 webhook、任务阶段和首页事件时序；不改变外部 API/Emby 合同。
-- [ ] 完成阶段 21 全部 Rust 检查、兼容性/性能记录和本机 `uname -m`，等待项目所有者确认后再进入后续阶段。
+- [x] 完成阶段 21 全部 Rust 检查、兼容性/性能记录和本机 `uname -m`，等待项目所有者确认后再进入后续阶段。
 
 验证：`cargo build --locked`、相关 Rust 集成测试、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`uname -m`。
 
