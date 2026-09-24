@@ -353,8 +353,7 @@ fn accepts_exactly_one_item_for_a_single_poster_result() {
 
     assert_eq!(result.items.len(), 1);
     assert_eq!(
-        serde_json::to_value(result)
-            .expect("single poster result should serialize")["contentKind"],
+        serde_json::to_value(result).expect("single poster result should serialize")["contentKind"],
         "SINGLE_POSTER"
     );
 
