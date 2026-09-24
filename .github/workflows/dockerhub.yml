@@ -9,12 +9,13 @@ on:
     branches:
       - main
       - test
+  workflow_call:
 
 # A push can be delivered more than once. Serialize registry writes for the
 # same ref so concurrent runs cannot overwrite architecture tags while a
 # manifest is being assembled.
 concurrency:
-  group: dockerhub-${{ github.workflow }}-${{ github.ref }}
+  group: dockerhub-${{ github.ref }}
   cancel-in-progress: false
 
 env:
@@ -70,8 +71,8 @@ jobs:
             suffix=-${{ matrix.arch }}
           tags: |
             type=ref,event=pr
-            type=raw,value=test,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/test' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=test,enable=${{ github.ref == 'refs/heads/test' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Resolve immutable runtime image
         id: runtime
@@ -218,8 +219,8 @@ jobs:
         with:
           images: docker.io/${{ env.IMAGE_NAMESPACE }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=test,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/test' }}
-            type=raw,value=latest,enable=${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+            type=raw,value=test,enable=${{ github.ref == 'refs/heads/test' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
 
       - name: Merge architecture manifests
         shell: bash

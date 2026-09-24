@@ -4,8 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
-  pull-requests: write
+  contents: write
 
 concurrency:
   group: sync-test-to-main
@@ -13,50 +12,43 @@ concurrency:
 
 jobs:
   sync:
-    name: Create or update sync pull request
+    name: Merge test into main
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
+    outputs:
+      updated: ${{ steps.sync.outputs.updated }}
 
     steps:
-      - name: Create or update test-to-main pull request
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          HEAD_BRANCH: test
-          BASE_BRANCH: main
+      - name: Check out main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Merge and push test to main
+        id: sync
         shell: bash
         run: |
           set -euo pipefail
 
-          pr_number="$(gh pr list \
-            --repo "$REPOSITORY" \
-            --state open \
-            --base "$BASE_BRANCH" \
-            --head "${GITHUB_REPOSITORY_OWNER}:$HEAD_BRANCH" \
-            --json number \
-            --jq '.[0].number // empty')"
-
-          pr_body_file="$RUNNER_TEMP/sync-test-to-main-pr.md"
-          cat > "$pr_body_file" <<'EOF'
-          This PR syncs the latest contents of `test` into `main`.
-
-          Review the changes before merging. Merging this PR triggers the normal `main` publication workflow.
-          EOF
-
-          if [[ -n "$pr_number" ]]; then
-            gh pr edit "$pr_number" \
-              --repo "$REPOSITORY" \
-              --title "Sync test to main" \
-              --body-file "$pr_body_file"
-            pr_url="$(gh pr view "$pr_number" --repo "$REPOSITORY" --json url --jq .url)"
-          else
-            pr_url="$(gh pr create \
-              --repo "$REPOSITORY" \
-              --base "$BASE_BRANCH" \
-              --head "$HEAD_BRANCH" \
-              --title "Sync test to main" \
-              --body-file "$pr_body_file")"
+          git fetch origin main test
+          git reset --hard origin/main
+          if git merge-base --is-ancestor origin/test origin/main; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "test is already included in main."
+            exit 0
           fi
 
-          echo "Sync pull request: $pr_url" >> "$GITHUB_STEP_SUMMARY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git merge --no-ff --no-edit origin/test
+          git push origin HEAD:main
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Publish latest from main
+    needs: sync
+    if: needs.sync.outputs.updated == 'true'
+    uses: ./.github/workflows/dockerhub.yml
+    secrets: inherit
