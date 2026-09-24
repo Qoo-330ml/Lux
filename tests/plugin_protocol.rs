@@ -294,7 +294,10 @@ fn accepts_versioned_login_background_sdk_manifest_and_result_fixtures() {
     .expect("single image RPC fixture should be JSON");
     let single_image = LoginBackgroundRpcResult::validate(single_image_value, &manifest)
         .expect("single image RPC fixture should validate");
-    assert_eq!(single_image.content_kind, LoginBackgroundContentKind::SingleImage);
+    assert_eq!(
+        single_image.content_kind,
+        LoginBackgroundContentKind::SingleImage
+    );
     assert_eq!(single_image.items.len(), 1);
     assert!(single_image.items[0].attribution_url.is_some());
     assert!(single_image.items[0].license_url.is_some());
@@ -423,10 +426,19 @@ fn accepts_a_single_original_image_with_allowlisted_attribution_links() {
 fn rejects_unlisted_or_insecure_attribution_links() {
     let manifest = login_background_test_manifest();
     for (field, url) in [
-        ("attributionUrl", "http://commons.wikimedia.org/wiki/File:Example.jpg"),
-        ("attributionUrl", "https://attacker.invalid/File:Example.jpg"),
+        (
+            "attributionUrl",
+            "http://commons.wikimedia.org/wiki/File:Example.jpg",
+        ),
+        (
+            "attributionUrl",
+            "https://attacker.invalid/File:Example.jpg",
+        ),
         ("licenseUrl", "https://attacker.invalid/license"),
-        ("licenseUrl", "https://user:pass@creativecommons.org/licenses/by/4.0/"),
+        (
+            "licenseUrl",
+            "https://user:pass@creativecommons.org/licenses/by/4.0/",
+        ),
     ] {
         let mut item = json!({"imageUrl": "https://images.example.com/today.jpg"});
         item[field] = json!(url);
@@ -439,7 +451,10 @@ fn rejects_unlisted_or_insecure_attribution_links() {
             &manifest,
         )
         .expect_err("untrusted attribution links must be rejected");
-        assert_eq!(error, LoginBackgroundRpcValidationError::InvalidAttributionUrl);
+        assert_eq!(
+            error,
+            LoginBackgroundRpcValidationError::InvalidAttributionUrl
+        );
     }
 }
 
