@@ -532,6 +532,13 @@ pub(super) fn actor_id_from_stored_actor(actor: &StoredActor) -> String {
         .unwrap_or_else(|| local_actor_id(&actor.name, actor.character.as_deref()))
 }
 
+pub(super) fn actor_id_is_name_derived(actor: &StoredActor) -> bool {
+    !actor.id.as_deref().is_some_and(is_valid_person_id)
+        && !actor.identities.iter().any(|identity| {
+            is_valid_person_id(&identity.provider) && is_valid_person_id(&identity.id)
+        })
+}
+
 pub(super) fn actor_provider_from_stored_actor(actor: &StoredActor) -> Option<String> {
     if actor.id.as_deref().is_some_and(is_valid_person_id)
         && !actor.provider.is_empty()

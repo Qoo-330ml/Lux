@@ -1813,6 +1813,37 @@ async fn emby_item_update_accepts_local_only_actor() -> Result<(), Box<dyn std::
     assert!(person_nfo_body.contains("<biography>MDC 补全的演员简介</biography>"));
     assert!(person_nfo_body.contains("<birthday>1995-05-06</birthday>"));
 
+    // Renaming must keep the name-derived local ID stable.
+    let person_rename = client
+        .post(format!(
+            "http://{address}/emby/Items/{person_id}?api_key={key}"
+        ))
+        .json(&json!({
+            "Name": "本地演员新名",
+            "Id": person_id,
+            "Type": "Person",
+            "Overview": "改名后的演员简介"
+        }))
+        .send()
+        .await?;
+    assert_eq!(person_rename.status(), reqwest::StatusCode::OK);
+    let person_rename_body: serde_json::Value = person_rename.json().await?;
+    assert_eq!(person_rename_body["Id"], person_id.as_str());
+    assert_eq!(person_rename_body["Name"], "本地演员新名");
+    assert_eq!(person_rename_body["Overview"], "改名后的演员简介");
+
+    let renamed_detail = client
+        .get(format!(
+            "http://{address}/emby/Items/{person_id}?api_key={key}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(renamed_detail.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        renamed_detail.json::<serde_json::Value>().await?["Name"],
+        "本地演员新名"
+    );
+
     server.abort();
     Ok(())
 }

@@ -284,6 +284,11 @@ impl PeopleService {
                     continue;
                 }
                 if !locked_fields.contains("name") || actor.name.trim().is_empty() {
+                    // Local-only IDs are derived from the name, so pin the current ID
+                    // before renaming to keep the Emby item ID stable.
+                    if actor.name != update.name && actor_id_is_name_derived(actor) {
+                        actor.id = Some(person_id.to_owned());
+                    }
                     actor.name = update.name.clone();
                 }
                 actor.person = Some(metadata_update_respecting_locks(
