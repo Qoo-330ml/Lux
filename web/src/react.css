@@ -758,9 +758,15 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 .lux-auth-visual-fade { position: absolute; top: 0; bottom: 0; right: 0; width: 140px; background: linear-gradient(to right, transparent, #090a0f); pointer-events: none; }
 .lux-auth-hero-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; }
 .lux-auth-single-poster { display: block; max-width: min(76%, 560px); max-height: 82vh; width: auto; height: auto; object-fit: contain; object-position: center; pointer-events: none; user-select: none; }
+.lux-auth-single-image-content { display: flex; max-width: 82%; max-height: 90vh; align-items: center; flex-direction: column; gap: 10px; }
+.lux-auth-single-image { display: block; max-width: min(100%, 760px); max-height: 74vh; width: auto; height: auto; object-fit: contain; object-position: center; pointer-events: none; user-select: none; }
 .lux-auth-hero-shade { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(8,9,15,.42), transparent 62%), linear-gradient(0deg, rgba(8,9,15,.48), transparent 34%); pointer-events: none; }
 .lux-auth-background-credit { position: absolute; z-index: 15; left: 24px; bottom: 58px; display: grid; gap: 3px; max-width: min(54%, 480px); color: rgba(255,255,255,.82); font-size: .72rem; line-height: 1.45; text-shadow: 0 1px 8px rgba(0,0,0,.9); }
+.lux-auth-single-image-content .lux-auth-background-credit { position: static; z-index: auto; align-self: flex-start; max-width: 100%; text-shadow: none; }
 .lux-auth-background-credit span + span { color: rgba(255,255,255,.68); }
+.lux-auth-background-credit a { width: fit-content; color: rgba(255,255,255,.76); text-decoration: underline; text-decoration-color: rgba(255,255,255,.42); text-underline-offset: 2px; }
+.lux-auth-background-credit a:hover { color: #fff; }
+.lux-auth-background-credit a:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
 .lux-auth-credits { position: absolute; z-index: 20; left: 24px; bottom: 18px; color: rgba(255,255,255,.78); font-size: .72rem; }
 .lux-auth-credits summary { width: fit-content; cursor: pointer; text-underline-offset: 3px; }
 .lux-auth-credits summary:hover { color: #fff; }

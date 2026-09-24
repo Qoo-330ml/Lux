@@ -52,6 +52,9 @@ export function LoginPage() {
   const pluginSinglePosterItem = pluginBackground?.contentKind === "SINGLE_POSTER"
     ? pluginBackground.items[0]
     : undefined;
+  const pluginSingleImageItem = pluginBackground?.contentKind === "SINGLE_IMAGE"
+    ? pluginBackground.items[0]
+    : undefined;
   const backgroundKey = [
     background?.source ?? "STATIC",
     ...(background?.source === "RECENTLY_ADDED"
@@ -67,6 +70,7 @@ export function LoginPage() {
       : pluginPosterItems.map((item) => item.imageUrl);
   const heroItem = backgroundFailed ? undefined : pluginHeroItem;
   const singlePosterItem = backgroundFailed ? undefined : pluginSinglePosterItem;
+  const singleImageItem = backgroundFailed ? undefined : pluginSingleImageItem;
   const tmdbSource = background?.source === "PLUGIN:org.lux.tmdb-trending-background";
   const markBackgroundFailed = () => setFailedBackgroundKey(backgroundKey);
   const posterColumns = posterImages.reduce<Array<Array<{ image: string; index: number }>>>(
@@ -103,6 +107,21 @@ export function LoginPage() {
             loading="eager"
             onError={markBackgroundFailed}
           />
+        ) : singleImageItem ? (
+          <div className="lux-auth-single-image-content">
+            <img
+              className="lux-auth-single-image"
+              src={singleImageItem.imageUrl}
+              alt=""
+              aria-hidden="true"
+              loading="eager"
+              onError={markBackgroundFailed}
+            />
+            <LoginBackgroundCredit
+              item={singleImageItem}
+              sourceName={pluginBackground?.sourceName}
+            />
+          </div>
         ) : heroItem ? (
           <>
             <img
@@ -114,12 +133,11 @@ export function LoginPage() {
               onError={markBackgroundFailed}
             />
             <div className="lux-auth-hero-shade" aria-hidden="true" />
-            <div className="lux-auth-background-credit" aria-live="polite">
-              <span>{heroItem.title ?? pluginBackground?.sourceName}</span>
-              {heroItem.copyrightNotice ?? pluginBackground?.copyrightNotice
-                ? <span>{heroItem.copyrightNotice ?? pluginBackground?.copyrightNotice}</span>
-                : null}
-            </div>
+            <LoginBackgroundCredit
+              item={heroItem}
+              sourceName={pluginBackground?.sourceName}
+              copyrightNotice={pluginBackground?.copyrightNotice}
+            />
           </>
         ) : posterImages.length > 0 ? (
           <div
@@ -148,7 +166,7 @@ export function LoginPage() {
             loading="eager"
           />
         )}
-        {singlePosterItem ? null : <div className="lux-auth-visual-fade" />}
+        {singlePosterItem || singleImageItem ? null : <div className="lux-auth-visual-fade" />}
       </section>
 
       {tmdbSource ? (
@@ -261,5 +279,29 @@ export function LoginPage() {
         </motion.div>
       </section>
     </main>
+  );
+}
+
+function LoginBackgroundCredit({
+  item,
+  sourceName,
+  copyrightNotice,
+}: {
+  item: PluginLoginBackgroundResponse["items"][number];
+  sourceName?: string;
+  copyrightNotice?: string;
+}) {
+  const title = item.title ?? sourceName;
+  const notice = item.copyrightNotice ?? copyrightNotice;
+  return (
+    <div className="lux-auth-background-credit" aria-live="polite">
+      {title ? item.attributionUrl ? (
+        <a href={item.attributionUrl} target="_blank" rel="noopener noreferrer">{title}</a>
+      ) : <span>{title}</span> : null}
+      {notice ? <span>{notice}</span> : null}
+      {item.licenseUrl && item.licenseUrl !== item.attributionUrl ? (
+        <a href={item.licenseUrl} target="_blank" rel="noopener noreferrer">查看许可证</a>
+      ) : null}
+    </div>
   );
 }

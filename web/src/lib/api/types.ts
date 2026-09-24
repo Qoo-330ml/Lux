@@ -53,6 +53,8 @@ export type LoginBackgroundItem = {
   imageUrl: string;
   title?: string;
   copyrightNotice?: string;
+  attributionUrl?: string;
+  licenseUrl?: string;
 };
 
 export type LoginBackgroundResponse =
@@ -61,7 +63,7 @@ export type LoginBackgroundResponse =
 
 export type PluginLoginBackgroundResponse = {
   source: `PLUGIN:${string}`;
-  contentKind: "POSTER_FEED" | "HERO_IMAGE" | "SINGLE_POSTER";
+  contentKind: "POSTER_FEED" | "HERO_IMAGE" | "SINGLE_POSTER" | "SINGLE_IMAGE";
   sourceName: string;
   copyrightNotice?: string;
   items: LoginBackgroundItem[];

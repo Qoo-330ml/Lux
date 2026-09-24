@@ -168,6 +168,62 @@ describe("LoginPage session state", () => {
     expect(container.querySelector(".lux-auth-single-poster")).toBeNull();
   });
 
+  it("renders an original single image with clickable work and license attribution", async () => {
+    vi.mocked(api.loginBackground).mockResolvedValue({
+      source: "PLUGIN:org.lux.wikimedia-potd-background",
+      contentKind: "SINGLE_IMAGE",
+      sourceName: "Wikimedia Commons · Picture of the Day",
+      items: [{
+        imageUrl: "https://thumb.wikimedia.org/potd.jpg",
+        title: "Violet-backed starling",
+        copyrightNotice: "By Charles J. Sharp · CC BY-SA 4.0",
+        attributionUrl: "https://commons.wikimedia.org/wiki/File:Potd.jpg",
+        licenseUrl: "https://creativecommons.org/licenses/by-sa/4.0/",
+      }],
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <LoginPage />
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => {
+        expect(container.querySelector<HTMLImageElement>(".lux-auth-single-image")?.src)
+          .toContain("https://thumb.wikimedia.org/potd.jpg");
+      });
+    });
+    expect(container.querySelector(".lux-auth-single-image-content")
+      ?.contains(container.querySelector(".lux-auth-single-image"))).toBe(true);
+    expect(container.querySelector(".lux-auth-single-image-content")
+      ?.contains(container.querySelector(".lux-auth-background-credit"))).toBe(true);
+    const links = container.querySelectorAll<HTMLAnchorElement>(".lux-auth-background-credit a");
+    expect([...links].map((link) => link.href)).toEqual([
+      "https://commons.wikimedia.org/wiki/File:Potd.jpg",
+      "https://creativecommons.org/licenses/by-sa/4.0/",
+    ]);
+    expect([...links].every((link) => link.target === "_blank" && link.rel.includes("noreferrer")))
+      .toBe(true);
+    expect(container.querySelector(".lux-auth-visual-fade")).toBeNull();
+    expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
+    expect(container.querySelector(".lux-auth-hero-image")).toBeNull();
+
+    await act(async () => {
+      container.querySelector<HTMLImageElement>(".lux-auth-single-image")
+        ?.dispatchEvent(new Event("error"));
+    });
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.src)
+      .toContain("/lux-poster-wall.jpg");
+    expect(container.querySelector(".lux-auth-single-image-content")).toBeNull();
+  });
+
   it("renders plugin hero images with source attribution and falls back after an image error", async () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.bing-daily-background",
