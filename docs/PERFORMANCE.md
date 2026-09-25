@@ -275,6 +275,21 @@ scripts/run-performance.sh
 
 在 target-page / file-batch 参数整理后，用同一 SQLite fixture 又做三次 release spot check：索引完成 **2.913 / 2.005 / 2.042 s**，target 物化 **562 / 534 / 542 ms**，无变化重扫 **920 / 940 / 949 ms**，SQL/DML 为 **675 / 677 / 675 / 209**，target 数仍为 120,000。中位数分别为 2.042 s、542 ms、940 ms；首轮 2.913 s 是这一组三次的高值，因此保留完整样本供后续复测，不以它替换上面的五轮 SQLite 与三轮 PostgreSQL跨后端比较表。按这组三次 spot-check 中位数与历史 1.994 s 单次旧扫描参照相比，高 48 ms（约 2.4%）；仍不能把不同持久化/恢复语义的单次旧值视为严格同口径验收线。
 
+### LUX-271 v3 资源感知扫描与目录 reader 实验
+
+2026-09-25 在本机 ARM64（`uname -m=arm64`，Rust 1.97.1）使用同一 60,000 文件 / 600 目录 fixture，SHA-256 为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。基准构建提交为 `3f18aca1` 加工作树改动，关闭锁采样器。最终代码采用单 reader 顺序发现；基准报告的准备并发为 9，目录 reader 并发为 1。SQLite 与 PostgreSQL 均处理 13 个扫描批次、10 个正向提交批次和 120,000 个 postprocessing target。
+
+| 后端 | 索引完成：各轮 / 中位数 | DISCOVERING / 正向准备 / 正向提交中位数 | target 物化中位数 | 无变化重扫中位数 | batch p50 / p95 中位数 | 前台 p95 / 目录列表 p95 中位数 | SQL / DML | WAL 中位数 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite，最终 sequential reader | 2.549 / 2.094 / 2.232 s；**2.232 s** | 2.224 / 0.592 / 1.247 s | 596 ms | 967 ms | 227 / 253 ms | 242 / 350 ms | 675 / 209 | — |
+| PostgreSQL 16，最终 sequential reader | 55.841 / 9.078 / 16.646 s；**16.646 s** | 16.629 / 0.623 / 8.777 s | 2.875 s | 3.913 s | 928 / 3,944 ms | 270 / 595 ms | 692 / 209 | 215,871,368 bytes |
+
+`DISCOVERING` 包含目录读取、frontier 和 checkpoint；正向准备与事务写入另有 tracing 计时。两后端的首扫样本波动明显。相较 LUX-270 基线，SQLite 索引中位数从 2.018 s 到 2.232 s、前台 p95 从 234 ms 到 242 ms、无变化重扫从 925 ms 到 967 ms；PostgreSQL 索引中位数从 9.657 s 到 16.646 s、前台 p95 从 257 ms 到 270 ms、无变化重扫从 3.743 s 到 3.913 s。该组数据没有通过 LUX-271 的性能门，也不能据此推断 NAS/x86_64 性能。
+
+曾试过两路目录 reader。早期未限制 live reader 数的三轮中位数为 SQLite 2.114 s、PostgreSQL 9.606 s，但代码可能同时保留 64 个目录 reader，也未覆盖空目录替换后的身份复核，因此不能作为可接受结果。把 reader 数限制为两路并补完安全检查后，PostgreSQL 在新建独立数据库中的首扫观测为 10.511、15.855、55.030、14.632 s，波动过大，无法证明稳定收益。为遵守“没有可重复收益时不保留并发复杂度”的验收要求，最终代码移除了并行目录 reader；数据库写入全程仍为单写者。
+
+LUX-271 的扫描配置优先级和目录替换安全检查已保留；并行目录 I/O 的性能验收未通过，项目尚不能据此关闭阶段 22。以上只代表本机 ARM64 与临时 PostgreSQL 16 容器。
+
 ## Web Bilibili 弹幕解析
 
 基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。输入包含 5,000 条合法弹幕和一个超过 4 MiB 的 ASCII XML；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。

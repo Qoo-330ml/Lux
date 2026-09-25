@@ -105,14 +105,6 @@ struct ManifestDiscoveryDirectoryResult {
     created_items: usize,
 }
 
-struct ActiveManifestDirectory {
-    relative_directory: String,
-    reader: Option<ManifestDirectoryReader>,
-    root_observation: NewScanManifestEntry,
-    directory_observation: NewScanManifestEntry,
-    completed: bool,
-}
-
 enum PreparedManifestFile {
     Movie(NewMovieFile),
     Episode(NewEpisodeFile),
@@ -165,6 +157,7 @@ struct ManifestRootDiscoveryContext<'a> {
     cancellation: &'a AtomicBool,
     stream_files_during_discovery: bool,
     library_kind: &'a str,
+    preparation_concurrency: usize,
     expected_root_identity: Option<(i64, i64)>,
 }
 
@@ -173,6 +166,7 @@ struct ManifestPositiveIndexPreparationContext<'a> {
     root: &'a StoredLibraryRoot,
     relative_directory: &'a str,
     library_kind: &'a str,
+    preparation_concurrency: usize,
     baselines: &'a HashMap<String, StoredScanManifestFilesystemBaseline>,
     expected_root_identity: Option<(i64, i64)>,
     expected_root_observation: &'a NewScanManifestEntry,
@@ -333,71 +327,87 @@ unsafe impl Send for ManifestDirectoryReader {}
     target_os = "macos",
     target_os = "ios"
 ))]
+fn open_manifest_directory_identity(
+    root_path: &Path,
+    relative_directory: &str,
+) -> Result<(std::fs::File, NewScanManifestEntry, NewScanManifestEntry), ScannerError> {
+    if !root_path.is_absolute() {
+        return Err(ScannerError::InvalidRelativePath(
+            root_path.to_string_lossy().into_owned(),
+        ));
+    }
+    let display_path = root_path.join(relative_directory);
+    let mut directory = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|source| ScannerError::Io {
+            path: PathBuf::from("/"),
+            source,
+        })?;
+
+    for component in root_path.components() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(ScannerError::InvalidRelativePath(
+                relative_directory.to_owned(),
+            ));
+        };
+        directory = open_manifest_directory_component(
+            directory.as_raw_fd(),
+            name,
+            &display_path,
+            relative_directory,
+        )?;
+    }
+
+    let root_metadata = directory.metadata().map_err(|source| ScannerError::Io {
+        path: root_path.to_owned(),
+        source,
+    })?;
+    let root_observation =
+        manifest_entry_observation(String::new(), "DIRECTORY", &root_metadata, root_path)?;
+
+    for component in Path::new(relative_directory).components() {
+        let Component::Normal(name) = component else {
+            return Err(ScannerError::InvalidRelativePath(
+                relative_directory.to_owned(),
+            ));
+        };
+        directory = open_manifest_directory_component(
+            directory.as_raw_fd(),
+            name,
+            &display_path,
+            relative_directory,
+        )?;
+    }
+
+    let metadata = directory.metadata().map_err(|source| ScannerError::Io {
+        path: display_path.clone(),
+        source,
+    })?;
+    let directory_observation = manifest_entry_observation(
+        relative_directory.to_owned(),
+        "DIRECTORY",
+        &metadata,
+        &display_path,
+    )?;
+    Ok((directory, root_observation, directory_observation))
+}
+
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
 impl ManifestDirectoryReader {
     fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
-        if !root_path.is_absolute() {
-            return Err(ScannerError::InvalidRelativePath(
-                root_path.to_string_lossy().into_owned(),
-            ));
-        }
         let display_path = root_path.join(relative_directory);
-        let mut directory = std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open("/")
-            .map_err(|source| ScannerError::Io {
-                path: PathBuf::from("/"),
-                source,
-            })?;
-
-        for component in root_path.components() {
-            let Component::Normal(name) = component else {
-                if matches!(component, Component::RootDir) {
-                    continue;
-                }
-                return Err(ScannerError::InvalidRelativePath(
-                    relative_directory.to_owned(),
-                ));
-            };
-            directory = open_manifest_directory_component(
-                directory.as_raw_fd(),
-                name,
-                &display_path,
-                relative_directory,
-            )?;
-        }
-
-        let root_metadata = directory.metadata().map_err(|source| ScannerError::Io {
-            path: root_path.to_owned(),
-            source,
-        })?;
-        let root_observation =
-            manifest_entry_observation(String::new(), "DIRECTORY", &root_metadata, root_path)?;
-
-        for component in Path::new(relative_directory).components() {
-            let Component::Normal(name) = component else {
-                return Err(ScannerError::InvalidRelativePath(
-                    relative_directory.to_owned(),
-                ));
-            };
-            directory = open_manifest_directory_component(
-                directory.as_raw_fd(),
-                name,
-                &display_path,
-                relative_directory,
-            )?;
-        }
-
-        let metadata = directory.metadata().map_err(|source| ScannerError::Io {
-            path: display_path.clone(),
-            source,
-        })?;
-        let directory_observation = manifest_entry_observation(
-            relative_directory.to_owned(),
-            "DIRECTORY",
-            &metadata,
-            &display_path,
-        )?;
+        let (directory, root_observation, directory_observation) =
+            open_manifest_directory_identity(root_path, relative_directory)?;
         // SAFETY: directory owns a valid descriptor, and fcntl does not take ownership.
         let entries_fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if entries_fd < 0 {
@@ -847,6 +857,101 @@ fn open_manifest_directory_for_final_check(
         }
         Err(error) => Err(error),
     }
+}
+
+async fn verify_manifest_directory_observation(
+    root_path: PathBuf,
+    expected_root_observation: NewScanManifestEntry,
+    expected_directory_observation: NewScanManifestEntry,
+) -> Result<(), ScannerError> {
+    let display_path = root_path.clone();
+    tokio::task::spawn_blocking(move || {
+        verify_manifest_directory_observation_sync(
+            &root_path,
+            &expected_root_observation,
+            &expected_directory_observation,
+        )
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: display_path,
+        source: std::io::Error::other(source.to_string()),
+    })?
+}
+
+async fn verify_manifest_directory_observations(
+    root_path: PathBuf,
+    observations: Vec<(NewScanManifestEntry, NewScanManifestEntry)>,
+) -> Result<(), ScannerError> {
+    let display_path = root_path.clone();
+    tokio::task::spawn_blocking(move || {
+        for (expected_root_observation, expected_directory_observation) in observations {
+            verify_manifest_directory_observation_sync(
+                &root_path,
+                &expected_root_observation,
+                &expected_directory_observation,
+            )?;
+        }
+        Ok(())
+    })
+    .await
+    .map_err(|source| ScannerError::Io {
+        path: display_path,
+        source: std::io::Error::other(source.to_string()),
+    })?
+}
+
+fn verify_manifest_directory_observation_sync(
+    root_path: &Path,
+    expected_root_observation: &NewScanManifestEntry,
+    expected_directory_observation: &NewScanManifestEntry,
+) -> Result<(), ScannerError> {
+    let canonical_root = std::fs::canonicalize(root_path).map_err(|source| ScannerError::Io {
+        path: root_path.to_owned(),
+        source,
+    })?;
+    let root_metadata =
+        std::fs::symlink_metadata(root_path).map_err(|source| ScannerError::Io {
+            path: root_path.to_owned(),
+            source,
+        })?;
+    if canonical_root != root_path || !root_metadata.is_dir() {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+    let current_root =
+        manifest_entry_observation(String::new(), "DIRECTORY", &root_metadata, root_path)?;
+    if !manifest_root_identity_matches(
+        expected_root_observation.device,
+        expected_root_observation.inode,
+        &current_root,
+    ) {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+
+    let directory_path = root_path.join(&expected_directory_observation.relative_path);
+    let canonical_directory =
+        std::fs::canonicalize(&directory_path).map_err(|source| ScannerError::Io {
+            path: directory_path.clone(),
+            source,
+        })?;
+    let directory_metadata =
+        std::fs::symlink_metadata(&directory_path).map_err(|source| ScannerError::Io {
+            path: directory_path.clone(),
+            source,
+        })?;
+    if canonical_directory != directory_path || !directory_metadata.is_dir() {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+    let current_directory = manifest_entry_observation(
+        expected_directory_observation.relative_path.clone(),
+        "DIRECTORY",
+        &directory_metadata,
+        &directory_path,
+    )?;
+    if !manifest_directory_observation_matches(expected_directory_observation, &current_directory) {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+    Ok(())
 }
 
 async fn stat_manifest_directory_file_batch(
@@ -4943,6 +5048,7 @@ impl ScanJobService {
             cancellation,
             stream_files_during_discovery,
             library_kind,
+            preparation_concurrency,
             expected_root_identity,
         } = context;
         if cancellation.load(Ordering::Acquire) {
@@ -5024,6 +5130,7 @@ impl ScanJobService {
                             root,
                             relative_directory,
                             library_kind,
+                            preparation_concurrency,
                             baselines: &baselines,
                             expected_root_identity,
                             expected_root_observation: &root_observation,
@@ -5054,6 +5161,10 @@ impl ScanJobService {
                         completed_directory,
                     },
                     cancellation,
+                    stream_files_during_discovery,
+                    root_path.clone(),
+                    root_observation.clone(),
+                    directory_observation.clone(),
                 )
                 .await?
             else {
@@ -5079,6 +5190,7 @@ impl ScanJobService {
             root,
             relative_directory,
             library_kind,
+            preparation_concurrency,
             baselines,
             expected_root_identity,
             expected_root_observation,
@@ -5121,7 +5233,7 @@ impl ScanJobService {
         let mut classification_cache = MixedClassificationCache::default();
         let mut unchanged_paths = Vec::new();
         let mut preparation_tasks = tokio::task::JoinSet::new();
-        let preparation_concurrency = self.scanner.scan_concurrency.max(1);
+        let preparation_concurrency = preparation_concurrency.max(1);
         let mut positive_indexes = Vec::new();
         let mut root_identity_lost = false;
 
@@ -5315,8 +5427,37 @@ impl ScanJobService {
         let cancellation = context.cancellation;
         let stream_files_during_discovery = context.stream_files_during_discovery;
         let root_path = PathBuf::from(&root.canonical_path);
-        let mut active_directories = Vec::with_capacity(relative_directories.len());
+        let reader_batch_size = if stream_files_during_discovery {
+            MANIFEST_STREAMED_INDEX_BATCH_SIZE
+        } else {
+            DISCOVERY_ENTRY_BATCH_SIZE
+        };
+        let pending_entry_limit = if stream_files_during_discovery {
+            MANIFEST_STREAMED_ENTRY_BATCH_SIZE
+        } else {
+            DISCOVERY_ENTRY_BATCH_SIZE.saturating_add(1)
+        };
+        if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "lux::scan_performance",
+                phase = "directory_read_budget",
+                preparation_concurrency = context.preparation_concurrency as u64,
+                directory_read_concurrency = 1_u64,
+                directory_count = relative_directories.len() as u64,
+                reader_batch_size = reader_batch_size as u64,
+                "manifest directory reader concurrency budget"
+            );
+        }
+
+        let mut result = ManifestDiscoveryDirectoryResult::default();
+        let mut pending_chunks = Vec::new();
+        let mut pending_entry_count = 0_usize;
+        let mut pending_file_count = 0_usize;
+        let mut pending_child_count = 0_usize;
         for relative_directory in relative_directories {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             let relative = Path::new(relative_directory);
             if relative.is_absolute()
                 || relative.components().any(|component| {
@@ -5335,7 +5476,7 @@ impl ScanJobService {
             }
             let open_root_path = root_path.clone();
             let open_relative_directory = relative_directory.clone();
-            let reader = tokio::task::spawn_blocking(move || {
+            let mut reader = tokio::task::spawn_blocking(move || {
                 ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
             })
             .await
@@ -5345,69 +5486,41 @@ impl ScanJobService {
             })??;
             let root_observation = reader.root_observation.clone();
             let directory_observation = reader.directory_observation.clone();
-            active_directories.push(ActiveManifestDirectory {
-                relative_directory: relative_directory.clone(),
-                reader: Some(reader),
-                root_observation,
-                directory_observation,
-                completed: false,
-            });
-        }
 
-        let mut result = ManifestDiscoveryDirectoryResult::default();
-        let reader_batch_size = if stream_files_during_discovery {
-            MANIFEST_STREAMED_INDEX_BATCH_SIZE
-        } else {
-            DISCOVERY_ENTRY_BATCH_SIZE
-        };
-        let pending_entry_limit = if stream_files_during_discovery {
-            MANIFEST_STREAMED_ENTRY_BATCH_SIZE
-        } else {
-            DISCOVERY_ENTRY_BATCH_SIZE
-        };
-        while active_directories
-            .iter()
-            .any(|directory| !directory.completed)
-        {
-            let mut pending_chunks = Vec::new();
-            let mut pending_entry_count = 0_usize;
-            let mut pending_file_count = 0_usize;
-            let mut pending_child_count = 0_usize;
-            for directory in active_directories
-                .iter_mut()
-                .filter(|directory| !directory.completed)
-            {
+            loop {
                 if cancellation.load(Ordering::Acquire) {
                     return Ok(None);
                 }
-                let reader = directory.reader.take().ok_or_else(|| ScannerError::Io {
-                    path: root_path.clone(),
-                    source: std::io::Error::other("manifest directory reader lost its checkpoint"),
-                })?;
-                let (reader, batch) =
+                let (next_reader, batch) =
                     tokio::task::spawn_blocking(move || reader.next_batch(reader_batch_size))
                         .await
                         .map_err(|source| ScannerError::Io {
                             path: root_path.clone(),
                             source: std::io::Error::other(source.to_string()),
                         })??;
-                directory.reader = Some(reader);
-                directory.completed = batch.completed;
+                reader = next_reader;
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
                 if !batch.completed
                     && batch.child_directories.is_empty()
                     && batch.entries.is_empty()
                 {
                     continue;
                 }
-                let next_entry_count = pending_entry_count.saturating_add(batch.entries.len());
-                let batch_file_count = batch
-                    .entries
+
+                let mut child_directories = batch.child_directories;
+                let mut entries = batch.entries;
+                child_directories.sort_unstable();
+                entries
+                    .sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+                let batch_file_count = entries
                     .iter()
                     .filter(|entry| entry.entry_kind == "FILE")
                     .count();
+                let next_entry_count = pending_entry_count.saturating_add(entries.len());
                 let next_file_count = pending_file_count.saturating_add(batch_file_count);
-                let next_child_count =
-                    pending_child_count.saturating_add(batch.child_directories.len());
+                let next_child_count = pending_child_count.saturating_add(child_directories.len());
                 if !pending_chunks.is_empty()
                     && (next_entry_count > pending_entry_limit
                         || stream_files_during_discovery
@@ -5431,23 +5544,17 @@ impl ScanJobService {
                     pending_file_count = 0;
                     pending_child_count = 0;
                 }
-                let mut child_directories = batch.child_directories;
-                let mut entries = batch.entries;
-                child_directories.sort_unstable();
-                entries
-                    .sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
+
                 pending_entry_count = pending_entry_count.saturating_add(entries.len());
                 pending_file_count = pending_file_count.saturating_add(batch_file_count);
                 pending_child_count = pending_child_count.saturating_add(child_directories.len());
                 pending_chunks.push(PendingManifestDirectoryChunk {
-                    relative_directory: directory.relative_directory.clone(),
-                    root_observation: directory.root_observation.clone(),
-                    directory_observation: directory.directory_observation.clone(),
+                    relative_directory: relative_directory.clone(),
+                    root_observation: root_observation.clone(),
+                    directory_observation: directory_observation.clone(),
                     child_directories,
                     entries,
-                    completed_directory: batch
-                        .completed
-                        .then(|| directory.relative_directory.clone()),
+                    completed_directory: batch.completed.then(|| relative_directory.clone()),
                 });
                 if pending_entry_count >= pending_entry_limit
                     || stream_files_during_discovery
@@ -5471,21 +5578,24 @@ impl ScanJobService {
                     pending_file_count = 0;
                     pending_child_count = 0;
                 }
+                if batch.completed {
+                    break;
+                }
             }
-            if !pending_chunks.is_empty() {
-                let Some(commit_result) = self
-                    .commit_pending_manifest_directory_chunks(context, &pending_chunks)
-                    .await?
-                else {
-                    return Ok(None);
-                };
-                result.observed_file_count = result.observed_file_count.saturating_add(
-                    usize::try_from(commit_result.observed_file_count).unwrap_or(usize::MAX),
-                );
-                result.created_items = result
-                    .created_items
-                    .saturating_add(commit_result.created_items);
-            }
+        }
+        if !pending_chunks.is_empty() {
+            let Some(commit_result) = self
+                .commit_pending_manifest_directory_chunks(context, &pending_chunks)
+                .await?
+            else {
+                return Ok(None);
+            };
+            result.observed_file_count = result.observed_file_count.saturating_add(
+                usize::try_from(commit_result.observed_file_count).unwrap_or(usize::MAX),
+            );
+            result.created_items = result
+                .created_items
+                .saturating_add(commit_result.created_items);
         }
         Ok(Some(result))
     }
@@ -5502,6 +5612,7 @@ impl ScanJobService {
             cancellation,
             stream_files_during_discovery,
             library_kind,
+            preparation_concurrency,
             expected_root_identity,
         } = context;
         let file_paths = chunks
@@ -5510,7 +5621,7 @@ impl ScanJobService {
             .filter(|entry| entry.entry_kind == "FILE")
             .map(|entry| entry.relative_path.clone())
             .collect::<Vec<_>>();
-        let baselines = if stream_files_during_discovery {
+        let baselines = if stream_files_during_discovery && !file_paths.is_empty() {
             self.database
                 .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
                 .await?
@@ -5520,6 +5631,9 @@ impl ScanJobService {
         let mut positive_indexes_by_chunk = Vec::with_capacity(chunks.len());
         let mut unchanged_paths_by_chunk = Vec::with_capacity(chunks.len());
         for chunk in chunks {
+            if cancellation.load(Ordering::Acquire) {
+                return Ok(None);
+            }
             if stream_files_during_discovery {
                 let Some((positive_indexes, unchanged_paths)) = self
                     .prepare_manifest_discovery_positive_indexes(
@@ -5527,6 +5641,7 @@ impl ScanJobService {
                             root,
                             relative_directory: &chunk.relative_directory,
                             library_kind,
+                            preparation_concurrency,
                             baselines: &baselines,
                             expected_root_identity,
                             expected_root_observation: &chunk.root_observation,
@@ -5546,7 +5661,30 @@ impl ScanJobService {
                 unchanged_paths_by_chunk.push(Vec::new());
             }
         }
-        let chunks = chunks
+        if stream_files_during_discovery {
+            let observations = chunks
+                .iter()
+                .zip(&positive_indexes_by_chunk)
+                .filter(|(_, positive_indexes)| positive_indexes.is_empty())
+                .map(|(chunk, _)| {
+                    (
+                        chunk.root_observation.clone(),
+                        chunk.directory_observation.clone(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if !observations.is_empty() {
+                if cancellation.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+                verify_manifest_directory_observations(
+                    PathBuf::from(&root.canonical_path),
+                    observations,
+                )
+                .await?;
+            }
+        }
+        let stored_chunks = chunks
             .iter()
             .zip(&positive_indexes_by_chunk)
             .zip(&unchanged_paths_by_chunk)
@@ -5563,13 +5701,16 @@ impl ScanJobService {
                 },
             )
             .collect::<Vec<_>>();
-        let has_positive_indexes = chunks
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let has_positive_indexes = stored_chunks
             .iter()
             .any(|chunk| !chunk.positive_indexes.is_empty());
         let transaction_started = Instant::now();
         let commit_result = self
             .database
-            .commit_scan_manifest_discovery_chunks(&chunks)
+            .commit_scan_manifest_discovery_chunks(&stored_chunks)
             .await;
         if has_positive_indexes
             && tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG)
@@ -5605,7 +5746,22 @@ impl ScanJobService {
         &self,
         chunk: &NewScanManifestDiscoveryChunk<'_>,
         cancellation: &AtomicBool,
+        stream_files_during_discovery: bool,
+        root_path: PathBuf,
+        root_observation: NewScanManifestEntry,
+        directory_observation: NewScanManifestEntry,
     ) -> Result<Option<ManifestDiscoveryCommitResult>, ScannerError> {
+        if stream_files_during_discovery && chunk.positive_indexes.is_empty() {
+            verify_manifest_directory_observation(
+                root_path,
+                root_observation,
+                directory_observation,
+            )
+            .await?;
+        }
+        if cancellation.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let has_positive_indexes = !chunk.positive_indexes.is_empty();
         let transaction_started = Instant::now();
         let commit_result = self
@@ -5659,12 +5815,20 @@ impl ScanJobService {
             .database
             .list_scan_manifest_directories(manifest_id, limit)
             .await?;
-        let library_kind = self
+        let library = self
             .database
             .find_library(&job.library_id)
             .await?
-            .ok_or(ScanJobError::LibraryNotFound)?
-            .kind;
+            .ok_or(ScanJobError::LibraryNotFound)?;
+        let library_kind = library.kind;
+        let preparation_concurrency = self
+            .effective_scan_concurrency(configured_scan_concurrency(
+                self.scan_concurrency_override,
+                Some(library.scan_concurrency),
+                self.default_scan_concurrency,
+            ))
+            .await
+            .max(1);
         self.update_activity(
             &job.id,
             directories
@@ -5709,6 +5873,7 @@ impl ScanJobService {
                 cancellation,
                 stream_files_during_discovery,
                 library_kind: &library_kind,
+                preparation_concurrency,
                 expected_root_identity,
             };
             let discovered = if relative_directories.len() == 1 {
@@ -6878,16 +7043,11 @@ impl ScanJobService {
         let library_kind = library
             .as_ref()
             .map_or("MOVIE", |library| library.kind.as_str());
-        let scan_concurrency = self
-            .scan_concurrency_override
-            .map(|value| value as i64)
-            .unwrap_or_else(|| {
-                library
-                    .as_ref()
-                    .map_or(self.default_scan_concurrency as i64, |library| {
-                        library.scan_concurrency
-                    })
-            });
+        let scan_concurrency = configured_scan_concurrency(
+            self.scan_concurrency_override,
+            library.as_ref().map(|library| library.scan_concurrency),
+            self.default_scan_concurrency,
+        );
         let batch = self
             .database
             .list_reconciliation_scan_entries(
@@ -10898,16 +11058,164 @@ fn throughput_per_second(items: usize, elapsed_ms: u128) -> u64 {
     u64::try_from(rate).unwrap_or(u64::MAX)
 }
 
+fn configured_scan_concurrency(
+    global_override: Option<usize>,
+    library_concurrency: Option<i64>,
+    default_concurrency: usize,
+) -> i64 {
+    let configured = global_override
+        .map(|value| i64::try_from(value).unwrap_or(i64::MAX))
+        .or(library_concurrency)
+        .unwrap_or_else(|| i64::try_from(default_concurrency).unwrap_or(i64::MAX));
+    configured.max(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        ManifestDirectoryReader, ManifestRemovalOutcome, MixedClassification,
-        MixedClassificationCache, NewScanManifestEntry, ScanJobService, ScannerError,
-        classify_manifest_removal_outcomes, classify_mixed_file, manifest_root_identity_matches,
-        media_source_folder, normalize_incremental_path, read_manifest_strm_target,
-        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
-        stat_manifest_relative_file_sync, stat_manifest_root_sync,
+        ManifestDirectoryReader, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
+        MixedClassification, MixedClassificationCache, NewScanManifestDiscoveryChunk,
+        NewScanManifestEntry, PendingManifestDirectoryChunk, ScanJobService, ScannerError,
+        classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
+        manifest_root_identity_matches, media_source_folder, normalize_incremental_path,
+        read_manifest_strm_target, safe_scan_activity_label,
+        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
+        stat_manifest_root_sync,
     };
+
+    #[test]
+    fn configured_scan_concurrency_prefers_global_override_then_library_value() {
+        assert_eq!(configured_scan_concurrency(Some(8), Some(4), 16), 8);
+        assert_eq!(configured_scan_concurrency(None, Some(4), 16), 4);
+        assert_eq!(configured_scan_concurrency(None, None, 16), 16);
+    }
+
+    #[tokio::test]
+    async fn manifest_single_chunk_commit_rejects_replaced_empty_directory()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root_path = temp_dir.path().join("Movies");
+        let bucket_path = root_path.join("Bucket");
+        std::fs::create_dir_all(&bucket_path)?;
+        let root_path = std::fs::canonicalize(root_path)?;
+        let bucket_path = root_path.join("Bucket");
+        let root_record = libraries
+            .add_root(library.id, root_path.to_str().ok_or("non-utf8 path")?)
+            .await?
+            .root;
+        let root = database
+            .find_library_root(&root_record.id.to_string())
+            .await?
+            .ok_or("stored library root is missing")?;
+
+        let reader = ManifestDirectoryReader::open(&root_path, "Bucket")?;
+        let root_observation = reader.root_observation.clone();
+        let directory_observation = reader.directory_observation.clone();
+        let (reader, batch) = reader.next_batch(16)?;
+        drop(reader);
+        std::fs::rename(&bucket_path, root_path.join("Bucket.old"))?;
+        std::fs::create_dir(&bucket_path)?;
+
+        let service = ScanJobService::new(database);
+        let cancellation = std::sync::atomic::AtomicBool::new(false);
+        let child_directories = batch.child_directories;
+        let entries = batch.entries;
+        let incomplete_chunk = PendingManifestDirectoryChunk {
+            relative_directory: "Bucket".to_owned(),
+            root_observation: root_observation.clone(),
+            directory_observation: directory_observation.clone(),
+            child_directories: child_directories.clone(),
+            entries: entries.clone(),
+            completed_directory: None,
+        };
+        let result = service
+            .commit_pending_manifest_directory_chunks(
+                ManifestRootDiscoveryContext {
+                    job_id: "replacement-test-job",
+                    manifest_id: "replacement-test-manifest",
+                    root: &root,
+                    cancellation: &cancellation,
+                    stream_files_during_discovery: true,
+                    library_kind: "MOVIE",
+                    preparation_concurrency: 1,
+                    expected_root_identity: root_observation.device.zip(root_observation.inode),
+                },
+                &[incomplete_chunk],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ScannerError::RootIdentityChanged(_))),
+            "incomplete unchanged-only chunks must not checkpoint after directory replacement"
+        );
+
+        let batched_chunk = PendingManifestDirectoryChunk {
+            relative_directory: "Bucket".to_owned(),
+            root_observation: root_observation.clone(),
+            directory_observation: directory_observation.clone(),
+            child_directories: child_directories.clone(),
+            entries: entries.clone(),
+            completed_directory: Some("Bucket".to_owned()),
+        };
+        let result = service
+            .commit_pending_manifest_directory_chunks(
+                ManifestRootDiscoveryContext {
+                    job_id: "replacement-test-job",
+                    manifest_id: "replacement-test-manifest",
+                    root: &root,
+                    cancellation: &cancellation,
+                    stream_files_during_discovery: true,
+                    library_kind: "MOVIE",
+                    preparation_concurrency: 1,
+                    expected_root_identity: root_observation.device.zip(root_observation.inode),
+                },
+                &[batched_chunk],
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ScannerError::RootIdentityChanged(_))),
+            "batched discovery must reject an empty directory replacement"
+        );
+
+        let single_chunk = NewScanManifestDiscoveryChunk {
+            manifest_id: "replacement-test-manifest",
+            job_id: "replacement-test-job",
+            library_root_id: &root.id,
+            child_directories: &child_directories,
+            entries: &entries,
+            positive_indexes: &[],
+            unchanged_paths: &[],
+            completed_directory: Some("Bucket"),
+        };
+        let result = service
+            .commit_scan_manifest_discovery_chunk(
+                &single_chunk,
+                &cancellation,
+                true,
+                root_path,
+                root_observation,
+                directory_observation,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(ScannerError::RootIdentityChanged(_))),
+            "single-directory discovery must reject an empty directory replacement"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn full_manifest_scan_refreshes_home_once_before_postprocessing()

@@ -2147,6 +2147,7 @@ services:
 | LUX-268 | src/application/scanner.rs、src/application/home.rs、src/storage/jobs.rs、tests/scanning_jobs.rs、tests/webhooks.rs；索引完成和首页快照时序 |
 | LUX-269 | src/storage/repository.rs、src/storage/jobs.rs、src/storage/database_cleanup.rs、tests/scanning_jobs.rs、tests/storage.rs；升级、重试和有界清理 |
 | LUX-270 | tests/postgres_database.rs、tests/storage.rs、docs/PERFORMANCE.md、docs/COMPATIBILITY.md；SQLite/PostgreSQL 兼容与性能阶段门 |
+| LUX-271 | src/application/scanner.rs、tests/scanning_jobs.rs、tests/performance.rs、docs/PERFORMANCE.md；v3 资源感知并发与有界目录预读 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6699,6 +6700,29 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 依赖：LUX-265 至 LUX-269。
 
 实现文件：`src/application/scanner.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`tests/storage.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`。
+
+### 阶段 22：v3 全量扫描 I/O 并发优化
+
+阶段 21 已建立 format 3 正向索引、持久化 checkpoint、双数据库兼容和约 2 秒 SQLite 索引完成基线。后续优化只增加文件系统发现/准备的有界重叠，并让 v3 使用现有每库并发和资源反馈策略；SQLite/PostgreSQL 写入仍由扫描锁串行提交，观察、正向索引、目录 frontier 和进度的原子事务合同不变。
+
+#### LUX-271：v3 资源感知准备并发与目录读取评估
+
+范围：discovery format 3 的正向索引准备使用全局 `LUX_SCAN_CONCURRENCY` 覆盖、媒体库 `scanConcurrency` 和当前资源反馈确定有效并发。Manifest delta apply（包括 REMOVE）和旧 workflow 的文件准备不在本任务范围。曾测试最多 2 路同根目录 reader；在没有稳定双后端收益、且需要收紧 reader 资源和目录身份校验后，最终实现保留单 enumerator 顺序发现，并在目录间聚合有界数据库批次。正向文件 recheck 可以短暂打开一个串行 reader；发现和 recheck 同时活跃的 reader 总数不超过 2。数据库写入仍串行，观察、正向索引、目录 frontier 和进度保持原子 checkpoint；不改变 SQLite/PostgreSQL schema、公有 API、CAS、完整根删除门槛或首页/完成事件时序。
+
+验收：
+
+- [x] discovery format 3 新增/变化文件准备使用全局覆盖、库级设置和资源反馈确定的有效并发；全局覆盖优先，环境未设置时保留库级值，范围为 1–1024。
+- [x] 最终实现每次只保留一个 enumerator；正向文件 recheck 最多再开一个临时 reader。单批次观察条目不超过 8,001（8,000 条枚举预算加一个合成目录观察），低于 8,192；目录 frontier 与提交顺序可恢复。
+- [x] 目录取消、替换或发生 I/O 错误时，不提交对应未完成 frontier 或部分正向索引；已提交页可幂等恢复，增量扫描优先级与 readiness barrier 保持不变。
+- [ ] 对 60,000 文件 / 600 目录夹具，SQLite 和 PostgreSQL 各三轮 release 复测；记录发现、正向准备、事务提交、索引完成、target 物化、无变化重扫、前台 p95、SQL/DML、WAL。至少一个后端的索引中位数下降，另一后端、重扫与前台 p95 无超过 5% 的回归；未通过该门，不保留目录并行复杂度。
+
+阶段结果：并行目录 reader 实验已完成并从最终实现移除；现有三轮结果未证明性能门通过。等待项目所有者确认是否为 PostgreSQL v3 写入路径另立优化任务，不进入下一阶段。
+
+验证：`cargo test --locked --test scanning_jobs --test scanner --test storage`、`cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`、`scripts/run-performance.sh` 的 SQLite/PostgreSQL 三轮基准，以及完整 Rust 阶段门。
+
+依赖：LUX-265 至 LUX-270。
+
+实现文件：`src/application/scanner.rs`、`tests/performance.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
 
 ## 26. 风险与缓解
 

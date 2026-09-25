@@ -76,6 +76,8 @@ struct QueryStatementCounts {
     manifest_transaction_ms: AtomicUsize,
     manifest_apply_timing_batches: AtomicUsize,
     manifest_positive_commit_batches: AtomicUsize,
+    manifest_preparation_concurrency: AtomicUsize,
+    manifest_directory_read_concurrency: AtomicUsize,
 }
 
 impl QueryStatementCounts {
@@ -87,6 +89,10 @@ impl QueryStatementCounts {
         self.manifest_apply_timing_batches
             .store(0, Ordering::Relaxed);
         self.manifest_positive_commit_batches
+            .store(0, Ordering::Relaxed);
+        self.manifest_preparation_concurrency
+            .store(0, Ordering::Relaxed);
+        self.manifest_directory_read_concurrency
             .store(0, Ordering::Relaxed);
         self.dml_summaries
             .lock()
@@ -116,6 +122,15 @@ impl QueryStatementCounts {
     fn manifest_positive_commit_batch_count(&self) -> usize {
         self.manifest_positive_commit_batches
             .load(Ordering::Relaxed)
+    }
+
+    fn manifest_directory_concurrency_snapshot(&self) -> (usize, usize) {
+        (
+            self.manifest_preparation_concurrency
+                .load(Ordering::Relaxed),
+            self.manifest_directory_read_concurrency
+                .load(Ordering::Relaxed),
+        )
     }
 
     fn dml_summary_snapshot(&self) -> Vec<(usize, String)> {
@@ -153,6 +168,8 @@ struct QuerySummaryVisitor {
     application_ms: Option<u64>,
     transaction_ms: Option<u64>,
     phase: Option<String>,
+    preparation_concurrency: Option<u64>,
+    directory_read_concurrency: Option<u64>,
 }
 
 impl Visit for QuerySummaryVisitor {
@@ -160,6 +177,8 @@ impl Visit for QuerySummaryVisitor {
         match field.name() {
             "application_ms" => self.application_ms = Some(value),
             "transaction_ms" => self.transaction_ms = Some(value),
+            "preparation_concurrency" => self.preparation_concurrency = Some(value),
+            "directory_read_concurrency" => self.directory_read_concurrency = Some(value),
             _ => {}
         }
     }
@@ -248,6 +267,21 @@ where
         if event.metadata().target() == "lux::scan_performance" {
             let mut visitor = QuerySummaryVisitor::default();
             event.record(&mut visitor);
+            if visitor.phase.as_deref() == Some("directory_read_budget") {
+                if let Some(concurrency) = visitor.preparation_concurrency {
+                    self.0.manifest_preparation_concurrency.fetch_max(
+                        usize::try_from(concurrency).unwrap_or(usize::MAX),
+                        Ordering::Relaxed,
+                    );
+                }
+                if let Some(concurrency) = visitor.directory_read_concurrency {
+                    self.0.manifest_directory_read_concurrency.fetch_max(
+                        usize::try_from(concurrency).unwrap_or(usize::MAX),
+                        Ordering::Relaxed,
+                    );
+                }
+                return;
+            }
             if visitor.phase.as_deref() == Some("positive_commit") {
                 self.0
                     .manifest_positive_commit_batches
@@ -849,6 +883,8 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     );
     let (manifest_application_ms, manifest_transaction_ms, manifest_apply_timing_batches) =
         statement_counts.manifest_apply_timing_snapshot();
+    let (manifest_preparation_concurrency, manifest_directory_read_concurrency) =
+        statement_counts.manifest_directory_concurrency_snapshot();
     let (postgres_lock_wait_samples, postgres_max_lock_waiters) =
         if let Some(monitor) = postgres_lock_monitor {
             monitor.stop().await
@@ -1127,6 +1163,8 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "manifestPositiveCommitMs": manifest_transaction_ms,
             "manifestPositiveTimingEventCount": manifest_apply_timing_batches,
             "manifestPositiveCommitBatchCount": positive_commit_batch_count,
+            "manifestPreparationConcurrency": manifest_preparation_concurrency,
+            "manifestDirectoryReadConcurrency": manifest_directory_read_concurrency,
             "postprocessingTargetMaterializationMs": postprocessing_target_materialization_ms,
             "postprocessingTargetSqlStatementCount": postprocessing_target_sql_count,
             "postprocessingTargetDmlStatementCount": postprocessing_target_dml_count,
