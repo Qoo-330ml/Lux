@@ -2148,6 +2148,10 @@ services:
 | LUX-269 | src/storage/repository.rs、src/storage/jobs.rs、src/storage/database_cleanup.rs、tests/scanning_jobs.rs、tests/storage.rs；升级、重试和有界清理 |
 | LUX-270 | tests/postgres_database.rs、tests/storage.rs、docs/PERFORMANCE.md、docs/COMPATIBILITY.md；SQLite/PostgreSQL 兼容与性能阶段门 |
 | LUX-271 | src/application/scanner.rs、tests/scanning_jobs.rs、tests/performance.rs、docs/PERFORMANCE.md；v3 资源感知并发与有界目录预读 |
+| LUX-272 | src/application/scanner.rs、src/storage/jobs.rs、tests/performance.rs、docs/PERFORMANCE.md；全量扫描分阶段耗时与阻塞剖析 |
+| LUX-273 | src/application/scanner.rs、tests/scanning_jobs.rs、tests/performance.rs、docs/PERFORMANCE.md；滚动式双 reader 有界预读与准备流水线 |
+| LUX-274 | src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs、tests/performance.rs、docs/PERFORMANCE.md；SQLite/PostgreSQL 共同写入路径降本 |
+| LUX-275 | tests/performance.rs、docs/LUX-DEVELOPMENT.md、docs/PERFORMANCE.md、docs/COMPATIBILITY.md；全链路性能与阶段门 |
 
 ### 阶段 0：仓库和工程纪律
 
@@ -6703,26 +6707,89 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 ### 阶段 22：v3 全量扫描 I/O 并发优化
 
-阶段 21 已建立 format 3 正向索引、持久化 checkpoint、双数据库兼容和约 2 秒 SQLite 索引完成基线。后续优化只增加文件系统发现/准备的有界重叠，并让 v3 使用现有每库并发和资源反馈策略；SQLite/PostgreSQL 写入仍由扫描锁串行提交，观察、正向索引、目录 frontier 和进度的原子事务合同不变。
+阶段 21 已建立 format 3 正向索引、持久化 checkpoint 和双数据库兼容。目标是缩短 60,000 文件从目录发现到索引入库的全链路时间，减少 per-file/批次 SQL 往返，并让扫描跨多线程重叠 I/O 与准备而不阻塞前台 API。按 LUX-272（分阶段测量）、LUX-273（滚动式有界读前与准备流水线）、LUX-274（共同写入路径）和 LUX-275（端到端门）执行。SQLite/PostgreSQL 仍共用 SQL 语义，每个 Manifest 只由一个事务 writer 提交；CAS、原子 checkpoint、完整根删除门槛和首页事件顺序不得改变。目标是两后端 60k 首扫中位数都快于 LUX-270 基线 SQLite 2.018 s / PostgreSQL 9.657 s，同时重扫与扫描期间前台 p95 不回退超过 5%。
 
 #### LUX-271：v3 资源感知准备并发与目录读取评估
 
-范围：discovery format 3 的正向索引准备使用全局 `LUX_SCAN_CONCURRENCY` 覆盖、媒体库 `scanConcurrency` 和当前资源反馈确定有效并发。Manifest delta apply（包括 REMOVE）和旧 workflow 的文件准备不在本任务范围。曾测试最多 2 路同根目录 reader；在没有稳定双后端收益、且需要收紧 reader 资源和目录身份校验后，最终实现保留单 enumerator 顺序发现，并在目录间聚合有界数据库批次。正向文件 recheck 可以短暂打开一个串行 reader；发现和 recheck 同时活跃的 reader 总数不超过 2。数据库写入仍串行，观察、正向索引、目录 frontier 和进度保持原子 checkpoint；不改变 SQLite/PostgreSQL schema、公有 API、CAS、完整根删除门槛或首页/完成事件时序。
+范围：discovery format 3 的正向索引准备使用全局 `LUX_SCAN_CONCURRENCY` 覆盖、媒体库 `scanConcurrency` 和当前资源反馈确定有效并发。曾测试成对目录读取但没有得到稳定收益；最后修复了取消、目录身份和预算合同，并暂留顺序枚举和跨目录有界提交。该提交是阶段基础，不代表端到端性能验收已完成；后续任务会重测并替换当前读入调度。
 
 验收：
 
 - [x] discovery format 3 新增/变化文件准备使用全局覆盖、库级设置和资源反馈确定的有效并发；全局覆盖优先，环境未设置时保留库级值，范围为 1–1024。
-- [x] 最终实现每次只保留一个 enumerator；正向文件 recheck 最多再开一个临时 reader。单批次观察条目不超过 8,001（8,000 条枚举预算加一个合成目录观察），低于 8,192；目录 frontier 与提交顺序可恢复。
+- [x] 当前实现顺序枚举；成对 reader 实验不留在正式路径。单批次观察条目不超过 8,001（8,000 条枚举预算加一个合成目录观察），低于 8,192；目录 frontier 与提交顺序可恢复。
 - [x] 目录取消、替换或发生 I/O 错误时，不提交对应未完成 frontier 或部分正向索引；已提交页可幂等恢复，增量扫描优先级与 readiness barrier 保持不变。
-- [ ] 对 60,000 文件 / 600 目录夹具，SQLite 和 PostgreSQL 各三轮 release 复测；记录发现、正向准备、事务提交、索引完成、target 物化、无变化重扫、前台 p95、SQL/DML、WAL。至少一个后端的索引中位数下降，另一后端、重扫与前台 p95 无超过 5% 的回归；未通过该门，不保留目录并行复杂度。
 
-阶段结果：并行目录 reader 实验已完成并从最终实现移除；现有三轮结果未证明性能门通过。等待项目所有者确认是否为 PostgreSQL v3 写入路径另立优化任务，不进入下一阶段。
+LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader 试验替代扫描入库端到端指标。
 
 验证：`cargo test --locked --test scanning_jobs --test scanner --test storage`、`cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`、`scripts/run-performance.sh` 的 SQLite/PostgreSQL 三轮基准，以及完整 Rust 阶段门。
 
 依赖：LUX-265 至 LUX-270。
 
 实现文件：`src/application/scanner.rs`、`tests/performance.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+#### LUX-272：全量扫描分阶段耗时与阻塞剖析
+
+范围：给 60k `ScanJobService` 基准增加低基数阶段计时，分别记录目录打开、readdir/stat、基线查询、正向分类/文件准备/recheck、数据库事务校验/目录 frontier/known-path/observation/正向索引/presence ledger/checkpoint/commit、索引完成、target 物化、无变化重扫和扫描期间前台请求。报告累计阶段耗时与墙钟时间、阶段调用数、峰值活跃 reader/准备任务、批次数、SQL/DML 和 WAL；明确并发阶段累计耗时可重叠。测试路径/日志不得暴露媒体名、用户数据、完整路径或连接信息。仅增加诊断，不改扫描行为、数据库 schema 或 API。
+
+验收：
+
+- [ ] 每一轮 60k SQLite/PostgreSQL 基准可以区分目录打开与枚举、基线读、文件准备、事务各写入段/commit 的累计时间与次数，并同时保留关键路径的墙钟时间。
+- [ ] 计时使用微秒、固定阶段名、测试/诊断低基数事件；阶段时长总和不得冒充墙钟时间，并明确表示并发阶段的累计耗时可能重叠。
+- [ ] 三轮结果记录硬件、fixture checksum、并发峰值、批次、SQL/DML、WAL、target、无变化重扫和前台 p95；不据单次异常值下结论。
+
+验证：scoped `cargo test --locked --test performance query_counter_classifies_dml_statements_inside_common_table_expressions`、SQLite/PostgreSQL 各一次 60k 烟测、`cargo fmt --all -- --check`、Clippy。
+
+依赖：LUX-271。
+
+实现文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。
+
+#### LUX-273：滚动式双 reader 有界预读
+
+范围：基于 LUX-272 的分项证据，在 format 3 discovery 内用滚动窗口同时枚举最多两个不同目录，并在 reader/目录批完成时立刻从持久化 frontier 补入后续目录。读取、prepare 与 commit 通过有界队列形成多线程流水线；累计未提交 observation 和准备结果不超过 8,192，不先打开整个 64-directory page，也不因同一慢目录阻塞另一 reader。结果按 root/relative-path 稳定顺序交给单 writer 批次事务；取消、根/目录替换、I/O 错误、增量优先级与 readiness barrier 语义不变。
+
+验收：
+
+- [ ] 最多两个 enumerator handle、最多两个并发 directory read；正向准备并发受全局/库级/资源反馈约束。测试峰值和读/准备重叠，而不只测试配置上限。
+- [ ] 在途 observation、prepared index、channel payload 和未提交 child frontier 总量有统一硬上限；consumer 能在读取继续时准备上一批，writer 能在后续 I/O 继续时提交已就绪批次，storage 仍是单 writer。
+- [ ] 测试覆盖长目录与小目录混合、慢目录、取消、替换目录、无 positive/unchanged 页、重试恢复和小于/大于单批预算；frontier、CAS、缺失保护、target gate 与旧 workflow 不变。
+- [ ] 与顺序 reader 用相同 60k fixture 做 SQLite/PostgreSQL 各三轮 A/B；只有两个后端首扫中位数都改善且满足 LUX-275 前台/重扫回归阈值才保留流水线，否则移除预读代码。
+
+验证：`cargo test --locked --lib application::scanner::tests`、`cargo test --locked --test scanning_jobs --test scanner --test storage`、SQLite 60k 三轮及 PostgreSQL 60k 烟测、fmt、Clippy。
+
+依赖：LUX-272。
+
+实现文件：`src/application/scanner.rs`、`tests/scanning_jobs.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。
+
+#### LUX-274：SQLite/PostgreSQL 共同写入路径降本
+
+范围：用 LUX-272 的事务阶段时间和 SQL/DML/WAL 证据，优化 format 3 新增/变化项的共同 storage 写入路径，减少重复 bind/SQL 往返、触发器工作或事务内逐 chunk 查询。先采用 SQLx `Any` 可执行的 bounded batch/upsert 方案；不得引入 PostgreSQL 专属 `COPY`、并行同 Manifest 写事务或改变 SQLite/PostgreSQL 数据语义。若优化需要 schema/index 调整，先拆出独立子任务并验证空库与升级 migration。
+
+验收：
+
+- [ ] 明确列出被优化的热阶段及优化前 SQL/DML、事务、WAL 证据；只修改有观测支撑的瓶颈。
+- [ ] SQLite/PostgreSQL 使用相同数据合同；CAS、正向索引、frontier、进度、seen ledger 和 checkpoint 仍同事务提交，失败整体回滚且幂等重试。
+- [ ] 对 60k fixtures 至少三轮复测写入阶段、总索引完成、WAL/SQL/DML、无变化重扫及前台 p95；不牺牲 SQLite 指标换取单 backend 收益。
+
+验证：相关 `storage`/`scanning_jobs` 测试、`postgres_database` ignored 集成目标、SQLite/PostgreSQL 60k 基准、fmt、build、Clippy。
+
+依赖：LUX-272；如依赖 LUX-273 的数据形态，则在 LUX-273 完成后执行。
+
+实现文件：`src/storage/jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。
+
+#### LUX-275：全链路扫描性能与阶段门
+
+范围：以最终 discovery、准备与 storage 路径运行 60,000 files / 600 directories 的 SQLite/PostgreSQL 各三轮 release 基准，作为阶段 22 完成判定。除索引完成外，必须评估 120,000 targets、无变化重扫、批次尾延迟、扫描期间 50 并发前台请求、SQL/DML、WAL 和锁等待。`LUX_SCAN_CONCURRENCY` 与媒体库设置值均须证明有效多任务运行、有界、可受资源反馈降档；不得在 Tokio core 线程执行阻塞 I/O，不声称 NAS/x86 性能。
+
+验收：
+
+- [ ] SQLite 和 PostgreSQL 的全扫描索引中位数都相对同机 LUX-270 基线有稳定改善；无变化重扫和前台 p95 均不回退超过 5%，且 batch p95 无明显长尾恶化。
+- [ ] 取消、root 替换、错误回滚/重试、CAS、target readiness、首页快照与事件时序的安全测试全部通过。
+- [ ] 记录各阶段三轮中位数、分布、总墙钟、fixture、硬件、数据库配置和命令；运行 build、all-targets、fmt、Clippy 与 PostgreSQL integration gate。
+- [ ] 通过性能门后更新 COMPATIBILITY/PERFORMANCE，等待项目所有者确认阶段 22；未通过则保留阶段为开放，不进入下一阶段。
+
+依赖：LUX-273、LUX-274。
+
+实现文件：`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 26. 风险与缓解
 
