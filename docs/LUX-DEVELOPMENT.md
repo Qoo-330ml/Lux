@@ -6569,7 +6569,7 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 ### 阶段 21：全量扫描 Manifest 与索引/后处理完成语义
 
-全量扫描使用独立的持久化 Manifest 表达目录发现、文件系统观察、根路径覆盖状态和待应用差异。Manifest 以 `filesystem_entries` 为比较基准，通过有界事务生成并应用差异；每批媒体索引、文件系统索引、后处理目标、差异状态和进度原子提交。所有可用根路径的发现及缺失确认完成后，成功扫描立即刷新首页稳定快照并发布 `home` 事件，之后 NFO、probe、封面和缩略图继续后台处理。
+全量扫描使用持久化 Manifest 表达目录发现、不可变文件系统观察和根路径覆盖状态。新版扫描在有界发现事务中同时提交 observation、CAS 保护的正向文件/媒体索引、目录 frontier 和进度；不再为每个新增/变化文件持久化并二次应用正向 delta。正向索引使用 `last_seen_generation` 和 change kind 作为持久检查点，`scan_job_targets` 在索引完成后按根路径游标分批物化，且必须在 probe/NFO/缩略图 worker 启动前完成。只有根路径完整可用后才生成缺失候选，并在二次文件状态确认及基线 CAS 后删除。所有可用根路径完成索引与缺失确认后，成功扫描刷新首页稳定快照并发布 `home` 事件及 `ScanCompleted`；target 物化和其余后处理继续后台执行。升级前已存在的旧版 Manifest 任务由带版本号的旧执行器继续恢复。
 
 本阶段不增加公开扫描状态或 webhook。现有 `ScanCompleted` 与 `JOB_COMPLETED` 表示索引完成；任务在 `POSTPROCESSING` 时仍可通过现有任务阶段字段观察后处理，完成后进入 `IDLE`。升级仅新增结构，不在 migration 中遍历文件系统或转换旧队列；启动时将没有 Manifest 的旧版活动全量任务安全取消，并保留任务诊断记录，管理员重试会创建新 Manifest 扫描。
 
@@ -6594,14 +6594,14 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 #### LUX-265：Manifest schema 与跨数据库存储合同
 
-范围：新增 `scan_manifests`、`scan_manifest_roots`、`scan_manifest_directories`、`scan_manifest_entries`、`scan_manifest_deltas` 五类持久化数据及 SQLite/PostgreSQL 一致的约束、索引、Rust 存储类型和有界写入接口。Manifest 状态为 `DISCOVERING`、`READY_TO_DIFF`、`APPLYING`、`INDEXED`、`POSTPROCESSING`、`COMPLETED`、`FAILED`、`CANCELLED`；根路径状态为 `PENDING`、`SCANNING`、`COMPLETE`、`UNAVAILABLE`、`INCOMPLETE`。目录 frontier、不可变 observation 和 delta 各自维护状态，不能复用一个含义不明的状态字段。
+范围：新增 `scan_manifests`、`scan_manifest_roots`、`scan_manifest_directories`、`scan_manifest_entries`、`scan_manifest_deltas` 五类持久化数据及 SQLite/PostgreSQL 一致的约束、索引、Rust 存储类型和有界写入接口。Manifest 保存工作流版本；旧版任务保持旧恢复语义，新建任务使用流式正向索引工作流。根路径维护事务内分配的 observation 序号，避免每条文件 observation 执行相关 `MAX(sequence)` 查询。Manifest 状态为 `DISCOVERING`、`READY_TO_DIFF`、`APPLYING`、`INDEXED`、`POSTPROCESSING`、`COMPLETED`、`FAILED`、`CANCELLED`；根路径状态为 `PENDING`、`SCANNING`、`COMPLETE`、`UNAVAILABLE`、`INCOMPLETE`。
 
 验收：
 
-- [ ] 空库初始化与从当前 schema 升级均建立五类 Manifest 数据，SQLite/PostgreSQL 结构语义一致。
-- [ ] observation 以 Manifest、root、relative path 和 observation 序号唯一标识；已有 observation 只能追加新版本，不能覆盖。
-- [ ] delta 保存基线 `filesystem_entries` ID 与 fingerprint，状态变化和扫描进度可幂等、有界地提交。
-- [ ] 测试覆盖外键/唯一约束、状态约束、分页索引和 SQLite 参数上限；核心 SQL 无 PostgreSQL 专属语法。
+- [x] 空库初始化与从当前 schema 升级均建立五类 Manifest 数据及追加式 workflow/sequence 字段，SQLite/PostgreSQL 结构语义一致；既有 Manifest 默认由旧执行器恢复。
+- [x] observation 以 Manifest、root、relative path 和 observation 序号唯一标识；已有 observation 只能追加新版本，不能覆盖。
+- [x] 旧版 delta 保持原合同；新版只持久化 destructive REMOVE 候选，保存基线 `filesystem_entries` ID 与 fingerprint，状态变化和扫描进度可幂等、有界地提交。
+- [x] 测试覆盖外键/唯一约束、状态约束、分页索引和 SQLite 参数上限；核心 SQL 无 PostgreSQL 专属语法。
 
 验证：`cargo test --locked --test storage`；PostgreSQL migration 集成测试；`cargo fmt --all -- --check`。
 
@@ -6611,14 +6611,14 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 #### LUX-266：持久化 Manifest 目录发现与观察
 
-范围：全量扫描的目录 frontier 和文件 observation 改由 Manifest 持久化；发现事务同时提交 observation、子目录 frontier、目录完成状态、root 计数和任务进度。发现仍按既有资源限制和批次运行，创建任务不访问文件系统，实时增量扫描优先级与现有扫描锁规则保持不变。
+范围：全量扫描的目录 frontier 和文件 observation 改由 Manifest 持久化；新工作流的发现事务同时提交 observation、子目录 frontier、目录完成状态、root 计数和任务进度。创建任务不访问文件系统，实时增量扫描优先级与现有扫描锁规则保持不变。
 
 验收：
 
-- [ ] 每个目录的发现结果按有界事务持久化，进程关闭或扫描取消后，已提交 frontier/observation 不丢失。
-- [ ] 根路径分别记录完整、不可用或不完整；只有完整发现的根路径可进入后续缺失判定。
-- [ ] 同一路径再次观察会追加 observation 版本；发现失败、取消和重试不会把未提交工作标成完成。
-- [ ] 现有 `reconciliation_scan_entries` 路径不再承载新 Manifest 全量发现；旧记录保留给升级兼容和历史清理。
+- [x] 每个目录的发现结果按有界事务持久化，进程关闭或扫描取消后，已提交 frontier/observation 不丢失。
+- [x] 根路径分别记录完整、不可用或不完整；只有完整发现的根路径可进入后续缺失判定。
+- [x] 同一路径再次观察会追加 observation 版本；发现失败、取消和重试不会把未提交工作标成完成。
+- [x] 现有 `reconciliation_scan_entries` 路径不再承载新 Manifest 全量发现；旧记录保留给升级兼容和历史清理。
 
 验证：`cargo test --locked --test scanning_jobs`；SQLite 批次/取消/恢复覆盖。
 
@@ -6628,14 +6628,18 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 #### LUX-267：Manifest 差异计算与安全应用
 
-范围：从 Manifest observations 与 `filesystem_entries` 生成新增、变化、未变化、缺失和重新出现差异；新增/变化文件应用前二次校验；按基线 ID/fingerprint CAS 应用批次，并让文件系统条目、媒体索引、扫描后处理目标、delta 和进度在同一短事务中提交。
+范围：新建 discovery format 3。成功新增/变化/重新出现的正向索引以 `filesystem_entries.last_seen_generation` 与 `last_seen_change_kind` 标记本次扫描；`scan_manifest_seen_paths` 只保存已观察但未被本次正向索引成功标记的文件（如未变化、准备不稳定或 CAS 冲突路径）。root 与目录身份仍保留完整 observation。发现批次中的文件 stat/fingerprint 保留在内存供二次校验和 CAS 使用，并与 `filesystem_entries`/媒体索引、必要的 presence ledger、目录 frontier 和进度原子提交。`scan_job_targets` 不在正向索引事务写入；索引完成后按持久化的每根路径游标分批物化，所有根路径的 target checkpoint 原子就绪前不得启动 probe/NFO/缩略图 worker。该阶段重试必须保持已完成 target 状态，并以数据库屏障阻止增量扫描改写尚未物化的全量 generation。完整 root 的 REMOVE 候选要求 generation 不匹配且不存在 seen-path 记录；删除前仍须确认路径缺失并按基线 ID/fingerprint CAS。既有 workflow 1/2 与 discovery format 2 继续使用原观察行和原执行器。
 
 验收：
 
-- [ ] 差异仅以 `library_root_id + relative_path` 对照 `filesystem_entries`，不以 `media_items` 单独推断删除。
-- [ ] 未变化条目不重复写入媒体/文件系统索引；缺失文件只有在完整根路径二次校验 device/inode 身份并确认文件不存在后才删除。
-- [ ] 根路径 unavailable/incomplete、取消、I/O 错误和持续变化均不会造成批量删除或覆盖较新的增量写入。
-- [ ] 任意批次失败回滚时，媒体索引、targets、delta 状态和进度保持一致，未提交 delta 保持 PENDING；Manifest 失败任务的重试入口与启动恢复由 LUX-269 交付。
+- [x] 正向差异仅以 `library_root_id + relative_path` 对照 `filesystem_entries`，不以 `media_items` 单独推断删除；未变化条目不重复写媒体/文件系统索引或 targets。
+- [x] v3 新增/变化/重新出现的正向索引与 presence ledger、目录 observation、frontier 和进度同事务提交；失败回滚后无部分索引或 ledger，崩溃恢复可幂等重走已提交目录。
+- [x] `scan_job_targets` 在索引完成后按每根路径游标分批物化；target 行与游标原子提交，旧 workflow/discovery format 默认跳过此阶段，新 v3 Manifest 明确从未就绪开始。
+- [x] 所有根路径的 target 游标完成与 Manifest `targets_ready` 屏障在同一终结事务提交；probe/NFO/缩略图 worker 和并发增量扫描均等待此屏障，重试不重置已完成 target 状态。
+- [x] target 物化覆盖不完整/不可用根路径上已安全提交的正向索引，但每个消费页都核对扫描根路径身份；根替换时不推进该根游标，等待恢复后继续。
+- [x] 只有完整、仍匹配 device/inode 的根路径可生成 REMOVE 候选；删除前确认路径缺失，并以基线 ID/fingerprint CAS；根路径 unavailable/incomplete、取消或 I/O 错误不删除。
+- [x] 扫描中的安全正向提交可见于普通列表，但首页快照仍只在索引/缺失确认结束后切换；正向提交不得覆盖并发增量结果。
+- [x] v3 REMOVE delta 与索引、targets 和进度原子提交；旧版未完成 Manifest 任务仍按旧 discovery format 与 delta PENDING/APPLIED 合同恢复。
 
 验证：`cargo test --locked --test scanning_jobs --test scanner --test storage`；回滚与全量/增量竞争测试。
 
@@ -6645,14 +6649,15 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 #### LUX-268：索引完成、后处理与首页原子切换
 
-范围：成功全量扫描在 Manifest 索引、缺失确认和索引事务完成后进入现有 `POSTPROCESSING`，先刷新共享/用户首页快照并发布 `home`，再运行 probe、NFO、封面和缩略图后处理。保留现有 `ScanCompleted` webhook 与 `JOB_COMPLETED` 时点；后处理结束进入 `IDLE`，失败时不撤销索引或重发索引完成通知。失败/取消时只刷新已提交的安全状态。
+范围：成功全量扫描在 Manifest 索引、缺失确认和索引事务完成后进入现有 `POSTPROCESSING`，先刷新共享/用户首页快照并发布 `home` 及 `ScanCompleted`/`JOB_COMPLETED`，再物化 v3 的 `scan_job_targets`，最后运行 probe、NFO、封面和缩略图后处理。后处理结束进入 `IDLE`；target 物化或后处理失败不撤销索引或重发索引完成通知，重试从 target 游标继续。失败/取消时只刷新已提交的安全状态。
 
 验收：
 
-- [ ] 扫描批次期间继续返回旧首页快照；成功索引完成后，新快照全部替换成功才发布一次 `home` 事件。
-- [ ] `ScanCompleted` 与 `JOB_COMPLETED` 在后处理前触发；后处理失败可重试未完成 targets，不重复执行全量发现或重复发布完成 webhook。
-- [ ] 旧快照并发构建不能覆盖新 generation；失败/取消路径不对不完整 root 执行缺失删除。
-- [ ] NFO/图片等后处理完成后仍可按现有局部失效行为刷新条目元数据；没有后处理工作时不产生无效首页 generation。
+- [x] 扫描批次期间继续返回旧首页快照；成功索引完成后，新快照全部替换成功才发布一次 `home` 事件。
+- [x] `ScanCompleted` 与 `JOB_COMPLETED` 在后处理前触发；后处理失败可重试未完成 targets，不重复执行全量发现或重复发布完成 webhook。
+- [x] 旧快照并发构建不能覆盖新 generation；失败/取消路径不对不完整 root 执行缺失删除。
+- [x] v3 target 物化发生在索引完成与 worker 消费之间；断点续跑可恢复，增量扫描不能越过未就绪屏障，根路径更换时保持 target 工作待重试。
+- [x] NFO/图片等后处理完成后仍可按现有局部失效行为刷新条目元数据；没有后处理工作时不产生无效首页 generation。
 
 验证：`cargo test --locked --test scanning_jobs --test webhooks`，并运行相关 home/catalog 测试。
 

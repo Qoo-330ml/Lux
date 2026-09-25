@@ -2,7 +2,7 @@
 
 ## 状态
 
-已接受
+已接受；文件级 observation 的存储方式由 ADR-044 修订，既有 discovery format 1/2 合同保留。
 
 ## 日期
 
@@ -16,12 +16,18 @@ LUX-154、LUX-187、LUX-230 对目录发现、首页可见时点和快照刷新�
 
 ## 决策
 
-- 全量扫描拥有独立的持久化 Manifest 模型，包含 Manifest 生命周期、逐根路径覆盖状态、持久目录 frontier、不可变文件系统 observations 和待应用 deltas。
+- 全量扫描拥有独立的持久化 Manifest 模型，包含 Manifest 生命周期、逐根路径覆盖状态、持久目录 frontier、不可变文件系统 observations 和版本化的 apply 策略。
 - `filesystem_entries` 继续作为当前文件系统索引事实来源。Manifest 通过 `library_root_id + relative_path` 与它比较，不从 `media_items` 单独推导删除。
-- Manifest observation 不原地覆盖。扫描应用时对新增/变化文件再次 stat/fingerprint；对索引基线 ID 和 fingerprint 做 CAS，避免全量扫描覆盖并发增量结果。
+- Manifest observation 不原地覆盖。新版在发现批次内批量读取 `filesystem_entries` 基线，对新增/变化/重新出现文件再次 stat/fingerprint；在提交事务中对基线 ID 和 fingerprint 做 CAS，避免全量扫描覆盖并发增量结果。
+- 正向索引融合到有界发现事务：observation/presence、文件系统/媒体索引、目录 frontier 和进度全部提交或全部回滚。正向 ADD/CHANGE 不再各自写入和更新一条持久 delta；批次提交本身就是可恢复 checkpoint。新版 file presence format 与 workflow version 分开版本化，细节见 ADR-044；升级前的活动 Manifest 保留原执行器和恢复合同。
+- v3 的 SOURCE/ITEM postprocessing targets 不阻塞索引事务。索引及安全缺失确认完成后，target worker 按 root/path 游标批量物化 targets；每页 target 写入与 root 游标原子提交，最后一页同时设置所有 root 与 Manifest 的 ready barrier。probe/NFO/thumbnail worker 只能在 barrier 就绪后启动。
+- v3 以数据库中的未就绪 Manifest 作为增量扫描准入屏障。全量 postprocessing target 物化和可消费前，增量扫描不能改写相同 filesystem generation；旧 workflow/discovery format 的任务默认视为 targets 已就绪。
 - 只有完整发现且当前可用的根路径可以生成缺失 delta；删除前保留第二次文件状态确认。不可用、不完整、取消或 I/O 失败都不能触发该根路径的批量删除。
-- 文件系统索引、媒体索引、后处理 targets、delta 状态和任务进度在有界短事务中原子提交。
+- 新版只为 destructive REMOVE 持久化 delta；文件系统索引、媒体索引、REMOVE 状态和进度在有界短事务中原子提交。postprocessing targets 在索引完成后独立分批生成，不重置冲突已存在的 target 状态。
+- 普通列表可以读取已提交的安全正向批次；首页仍保留旧稳定快照，直至全部可用根路径完成索引及缺失确认。已提交的正向索引不因后续 root unavailable 或取消而回滚，但该 root 永不据此执行删除。
 - SQLite 和 PostgreSQL 共用相同的存储状态机及核心 SQL 能力，不依赖 PostgreSQL 专属 COPY、`UPDATE ... FROM`、临时表或跨库扫描长事务。
+- `scan_manifest_entries` 的主键已覆盖按 manifest/root/path/sequence 查找；不得再创建同列序的重复辅助索引，以免每条 observation 重复维护 B-tree。Migration 0134 同步移除该冗余索引。
+- 新 discovery format 的文件存在性由 ADR-044 的紧凑 presence ledger 表示；本 ADR 中逐文件完整 observation 的合同适用于旧 discovery format 1/2。
 - `ScanCompleted` webhook 和 `JOB_COMPLETED` 继续表示索引完成；现有 `POSTPROCESSING` 阶段表示后台后处理仍在运行，完成后转为 `IDLE`。不增加公开 webhook、API 状态或 Emby 合同。
 - 成功全量索引结束后，先重建并原子替换共享及已有用户首页快照，再发布无业务载荷的 `home` 事件。失败/取消只公布已提交的安全状态；后处理的局部元数据更新继续按现有机制触发首页失效。
 - 升级迁移只新增结构，不访问文件系统、不回填全库、不把旧队列伪装成 Manifest。启动时将没有 Manifest 的旧版活动全量任务标记为 `CANCELLED` 并保留诊断信息；管理员重试创建新 Manifest。新 Manifest 的可重试失败/取消任务保留 checkpoint；已完成 Manifest 的路径内容按有界批次清除，只保留不含路径的摘要。
@@ -40,11 +46,16 @@ LUX-154、LUX-187、LUX-230 对目录发现、首页可见时点和快照刷新�
 
 这会令 SQLite 和 PostgreSQL 的事务/错误处理分叉。先使用两种后端都支持的有界批次，只有跨后端基准明确证明必要时，另行评估可选优化。
 
+### 每个文件一个正向 delta 的两阶段 apply
+
+把 60,000 个 ADD 分别写成 delta，再在后续阶段重新加载、校验、索引并更新每条 delta 状态，会重复存储路径/基线并增加完整扫描的数据库往返。新版在发现事务中完成安全的正向写入，以该事务和目录 frontier 作为恢复边界；只有需要删除既有条目的 REMOVE 候选仍进入 delta 表。该方案减少正向 delta 的持久写入，但保留不可变 observations、文件二次校验、CAS、目录恢复点和完整根删除门槛。
+
 ## 后果
 
 - Manifest 新增 schema、storage 类型、状态转换、恢复与分批清理逻辑，必须有 SQLite 与 PostgreSQL 的等价迁移和测试。
-- 文件索引可以批量提交，首页则在 Manifest 完整索引点稳定切换；用户不用等待 NFO、probe 或缩略图完成。
-- 旧版活动全量任务不会被不完整观察数据错误转换或继续跑旧扫描代码；管理员需要重新发起一次 Manifest 全量扫描。
+- 新版新文件可随有界 discovery 批次提交；普通目录列表可看到已提交的正向结果，首页则在 Manifest 完整索引点稳定切换。用户不用等待 NFO、probe 或缩略图完成。
+- 升级只增加 workflow version 和每 root 序号分配字段；已有活动 Manifest 仍由旧执行器恢复，不在升级时重算、删除或伪造其 delta 状态。
+- 没有关联 Manifest 的旧版活动全量任务不会被不完整观察数据错误转换；仍按现有启动恢复规则安全取消并要求管理员重新发起扫描。有关联旧 workflow version 的 Manifest 则由对应旧执行器继续恢复。
 - 本机 SQLite/ARM 性能不能证明 PostgreSQL、x86 NAS 或生产媒体盘性能，性能记录必须标明实际后端和硬件。
 
 ## 验收依据

@@ -70,12 +70,32 @@ const METADATA_BENCHMARK_PNG: &[u8] = &[
 struct QueryStatementCounts {
     statements: AtomicUsize,
     dml_statements: AtomicUsize,
+    dml_summaries: Mutex<std::collections::HashMap<String, usize>>,
+    unclassified_cte_summaries: Mutex<std::collections::HashMap<String, usize>>,
+    manifest_application_ms: AtomicUsize,
+    manifest_transaction_ms: AtomicUsize,
+    manifest_apply_timing_batches: AtomicUsize,
+    manifest_positive_commit_batches: AtomicUsize,
 }
 
 impl QueryStatementCounts {
     fn reset(&self) {
         self.statements.store(0, Ordering::Relaxed);
         self.dml_statements.store(0, Ordering::Relaxed);
+        self.manifest_application_ms.store(0, Ordering::Relaxed);
+        self.manifest_transaction_ms.store(0, Ordering::Relaxed);
+        self.manifest_apply_timing_batches
+            .store(0, Ordering::Relaxed);
+        self.manifest_positive_commit_batches
+            .store(0, Ordering::Relaxed);
+        self.dml_summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.unclassified_cte_summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 
     fn snapshot(&self) -> (usize, usize) {
@@ -84,17 +104,71 @@ impl QueryStatementCounts {
             self.dml_statements.load(Ordering::Relaxed),
         )
     }
+
+    fn manifest_apply_timing_snapshot(&self) -> (usize, usize, usize) {
+        (
+            self.manifest_application_ms.load(Ordering::Relaxed),
+            self.manifest_transaction_ms.load(Ordering::Relaxed),
+            self.manifest_apply_timing_batches.load(Ordering::Relaxed),
+        )
+    }
+
+    fn manifest_positive_commit_batch_count(&self) -> usize {
+        self.manifest_positive_commit_batches
+            .load(Ordering::Relaxed)
+    }
+
+    fn dml_summary_snapshot(&self) -> Vec<(usize, String)> {
+        let summaries = self
+            .dml_summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut summaries = summaries
+            .iter()
+            .map(|(summary, count)| (*count, summary.clone()))
+            .collect::<Vec<_>>();
+        summaries.sort_unstable_by_key(|summary| std::cmp::Reverse(summary.0));
+        summaries.truncate(20);
+        summaries
+    }
+
+    fn unclassified_cte_summary_snapshot(&self) -> Vec<(usize, String)> {
+        let summaries = self
+            .unclassified_cte_summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut summaries = summaries
+            .iter()
+            .map(|(summary, count)| (*count, summary.clone()))
+            .collect::<Vec<_>>();
+        summaries.sort_unstable_by_key(|summary| std::cmp::Reverse(summary.0));
+        summaries.truncate(20);
+        summaries
+    }
 }
 
 #[derive(Default)]
 struct QuerySummaryVisitor {
     summary: Option<String>,
+    application_ms: Option<u64>,
+    transaction_ms: Option<u64>,
+    phase: Option<String>,
 }
 
 impl Visit for QuerySummaryVisitor {
+    fn record_u64(&mut self, field: &Field, value: u64) {
+        match field.name() {
+            "application_ms" => self.application_ms = Some(value),
+            "transaction_ms" => self.transaction_ms = Some(value),
+            _ => {}
+        }
+    }
+
     fn record_str(&mut self, field: &Field, value: &str) {
         if field.name() == "summary" {
             self.summary = Some(value.to_owned());
+        } else if field.name() == "phase" {
+            self.phase = Some(value.to_owned());
         }
     }
 
@@ -119,6 +193,16 @@ fn is_dml_statement_summary(summary: &str) -> bool {
     {
         return true;
     }
+    let incoming_observation_cte = normalized
+        .starts_with("WITH INCOMING (RELATIVE_PATH, OBSERVATION_SEQUENCE")
+        || normalized.starts_with("WITH INCOMING ( RELATIVE_PATH, OBSERVATION_SEQUENCE");
+    let truncated_path_observation_cte = normalized.starts_with("WITH INCOMING (RELATIVE_PATH, …")
+        || normalized.starts_with("WITH INCOMING ( RELATIVE_PATH, …");
+    let truncated_seen_paths_cte =
+        normalized.starts_with("WITH INCOMING_SEEN_PATHS(RELATIVE_PATH) AS (VALUES …");
+    if incoming_observation_cte || truncated_path_observation_cte || truncated_seen_paths_cte {
+        return true;
+    }
     normalized.starts_with("WITH ")
         && [
             " INSERT INTO ",
@@ -139,6 +223,21 @@ fn query_counter_classifies_dml_statements_inside_common_table_expressions() {
     assert!(!is_dml_statement_summary(
         "WITH latest AS (SELECT path FROM scan_manifest_entries) SELECT path FROM latest"
     ));
+    assert!(is_dml_statement_summary(
+        "WITH incoming (relative_path, observation_sequence) AS (VALUES (?, ?)) INSERT INTO scan_manifest_entries SELECT * FROM incoming"
+    ));
+    assert!(is_dml_statement_summary(
+        "WITH incoming ( relative_path, observation_sequence, entry_kind, size, modified_at, device, inode, fingerprint)"
+    ));
+    assert!(!is_dml_statement_summary(
+        "WITH incoming (relative_path) AS (VALUES (?)) SELECT path FROM scan_manifest_deltas"
+    ));
+    assert!(!is_dml_statement_summary(
+        "WITH incoming (relative_path) AS (VALUES (?)) SELECT relative_path FROM scan_manifest_entries"
+    ));
+    assert!(is_dml_statement_summary(
+        "WITH incoming_seen_paths(relative_path) AS (VALUES …"
+    ));
 }
 
 impl<S> Layer<S> for QueryStatementLayer
@@ -146,6 +245,27 @@ where
     S: Subscriber,
 {
     fn on_event(&self, event: &Event<'_>, _context: Context<'_, S>) {
+        if event.metadata().target() == "lux::scan_performance" {
+            let mut visitor = QuerySummaryVisitor::default();
+            event.record(&mut visitor);
+            if visitor.phase.as_deref() == Some("positive_commit") {
+                self.0
+                    .manifest_positive_commit_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            self.0.manifest_application_ms.fetch_add(
+                usize::try_from(visitor.application_ms.unwrap_or_default()).unwrap_or(usize::MAX),
+                Ordering::Relaxed,
+            );
+            self.0.manifest_transaction_ms.fetch_add(
+                usize::try_from(visitor.transaction_ms.unwrap_or_default()).unwrap_or(usize::MAX),
+                Ordering::Relaxed,
+            );
+            self.0
+                .manifest_apply_timing_batches
+                .fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         if event.metadata().target() != "sqlx::query" {
             return;
         }
@@ -159,6 +279,21 @@ where
             .to_ascii_uppercase();
         if is_dml_statement_summary(&summary) {
             self.0.dml_statements.fetch_add(1, Ordering::Relaxed);
+            *self
+                .0
+                .dml_summaries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(summary)
+                .or_default() += 1;
+        } else if summary.starts_with("WITH ") {
+            *self
+                .0
+                .unclassified_cte_summaries
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(summary)
+                .or_default() += 1;
         }
     }
 }
@@ -329,7 +464,6 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
             media_root.to_str().ok_or("non-utf8 fixture path")?,
         )
         .await?;
-
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(
@@ -521,7 +655,14 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         file_count >= 100,
         "LUX-270 requires at least one full batch"
     );
-    assert!(media_root.join(".lux-fixture.json").is_file());
+    let fixture_manifest_path = media_root.join(".lux-fixture.json");
+    assert!(fixture_manifest_path.is_file());
+    let fixture_manifest: serde_json::Value =
+        serde_json::from_slice(&fs::read(fixture_manifest_path)?)?;
+    let directory_count = fixture_manifest["directoryCount"]
+        .as_u64()
+        .and_then(|count| usize::try_from(count).ok())
+        .ok_or("fixture directoryCount is missing or invalid")?;
 
     let statement_counts = performance_query_statement_counts();
     let backend = env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".to_owned());
@@ -566,6 +707,29 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect_with_configuration(&config, &database_configuration).await?;
+    if backend == "sqlite"
+        && let Some(mode) = env::var_os("LUX_PERF_SQLITE_SYNCHRONOUS")
+    {
+        let mode = mode.to_string_lossy().to_ascii_uppercase();
+        if !matches!(mode.as_str(), "OFF" | "NORMAL" | "FULL") {
+            return Err(format!(
+                "unsupported LUX_PERF_SQLITE_SYNCHRONOUS {mode:?}; expected OFF, NORMAL, or FULL"
+            )
+            .into());
+        }
+        sqlx::query(sqlx::AssertSqlSafe(format!("PRAGMA synchronous = {mode}")))
+            .execute(database.pool())
+            .await?;
+    }
+    let sqlite_synchronous_level = if backend == "sqlite" {
+        Some(
+            sqlx::query_scalar::<_, i64>("PRAGMA synchronous")
+                .fetch_one(database.pool())
+                .await?,
+        )
+    } else {
+        None
+    };
     let setup = SetupService::new(database.clone())?;
     setup
         .complete("Admin", "Admin", "performance-only password")
@@ -580,6 +744,22 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             media_root.to_str().ok_or("non-utf8 fixture path")?,
         )
         .await?;
+    let derived_index_triggers_disabled =
+        backend == "sqlite" && env::var_os("LUX_PERF_DISABLE_DERIVED_INDEX_TRIGGERS").is_some();
+    if derived_index_triggers_disabled {
+        for trigger in [
+            "media_items_search_ai",
+            "media_items_search_au",
+            "media_items_search_ad",
+            "media_item_provider_ids_ai",
+            "media_item_provider_ids_au",
+        ] {
+            let query = format!("DROP TRIGGER IF EXISTS {trigger}");
+            sqlx::query(sqlx::AssertSqlSafe(query))
+                .execute(database.pool())
+                .await?;
+        }
+    }
 
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -640,9 +820,10 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let mut phase = "DISCOVERING".to_owned();
     let mut phase_durations = BTreeMap::<String, u128>::new();
     let mut phase_batch_counts = BTreeMap::<String, usize>::new();
+    let job_id_placeholder = if backend == "postgres" { "$1" } else { "?" };
     loop {
         let batch_started = Instant::now();
-        let report = jobs.run_batch(&job.id, 100).await?;
+        let report = jobs.run_batch(&job.id, 500).await?;
         let batch_duration = batch_started.elapsed().as_millis();
         first_batch_durations.push(batch_duration);
         *phase_durations.entry(phase.clone()).or_default() += batch_duration;
@@ -652,15 +833,22 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             break;
         }
         if report.processed == 0 {
-            phase = sqlx::query_scalar::<_, String>(
-                "SELECT state FROM scan_manifests WHERE job_id = ?",
-            )
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
+            let state_query =
+                format!("SELECT state FROM scan_manifests WHERE job_id = {job_id_placeholder}");
+            phase = sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(state_query))
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
         }
     }
     let manifest_index_ms = first_scan_started.elapsed().as_millis();
+    assert_eq!(
+        phase_batch_counts.get("APPLYING"),
+        Some(&1),
+        "a no-removal streamed scan should only finalize the apply phase once"
+    );
+    let (manifest_application_ms, manifest_transaction_ms, manifest_apply_timing_batches) =
+        statement_counts.manifest_apply_timing_snapshot();
     let (postgres_lock_wait_samples, postgres_max_lock_waiters) =
         if let Some(monitor) = postgres_lock_monitor {
             monitor.stop().await
@@ -674,9 +862,81 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         (Vec::new(), 0)
     };
     let (raw_statement_count, dml_statement_count) = statement_counts.snapshot();
+    let dml_summary_counts = statement_counts.dml_summary_snapshot();
+    let unclassified_cte_summaries = statement_counts.unclassified_cte_summary_snapshot();
     let scan_statement_count = raw_statement_count.saturating_sub(postgres_lock_wait_samples);
-    let max_scan_statement_count = file_count.saturating_mul(2).saturating_add(100);
-    let max_scan_dml_count = file_count.saturating_add(100);
+    let scan_job_target_statement_count = dml_summary_counts
+        .iter()
+        .filter(|(_, summary)| summary.contains("INSERT INTO SCAN_JOB_TARGETS"))
+        .map(|(count, _)| count)
+        .sum::<usize>();
+    let positive_commit_batch_count = statement_counts.manifest_positive_commit_batch_count();
+    let max_positive_commit_batch_count =
+        file_count.div_ceil(8_000) + directory_count.div_ceil(200) + 5;
+    assert!(
+        positive_commit_batch_count <= max_positive_commit_batch_count,
+        "streamed positive indexes should checkpoint no more than 8,000 files per transaction; transactions={positive_commit_batch_count}, upper_bound={max_positive_commit_batch_count}"
+    );
+    assert_eq!(
+        scan_job_target_statement_count, 0,
+        "index-completion measurement must not include postprocessing target materialization"
+    );
+    let media_item_insert_count = dml_summary_counts
+        .iter()
+        .filter(|(_, summary)| summary.starts_with("INSERT INTO MEDIA_ITEMS"))
+        .map(|(count, _)| count)
+        .sum::<usize>();
+    let media_source_insert_count = dml_summary_counts
+        .iter()
+        .filter(|(_, summary)| summary.starts_with("INSERT INTO MEDIA_SOURCES"))
+        .map(|(count, _)| count)
+        .sum::<usize>();
+    let filesystem_entry_insert_count = dml_summary_counts
+        .iter()
+        .filter(|(_, summary)| summary.starts_with("INSERT INTO FILESYSTEM_ENTRIES"))
+        .map(|(count, _)| count)
+        .sum::<usize>();
+    assert_eq!(
+        media_item_insert_count,
+        media_source_insert_count + positive_commit_batch_count,
+        "movie rows should batch alongside sources, with one parent-folder insert per positive batch"
+    );
+    let max_index_insert_statements = positive_commit_batch_count.saturating_mul(5);
+    for (table, statement_count) in [
+        ("media_sources", media_source_insert_count),
+        ("filesystem_entries", filesystem_entry_insert_count),
+    ] {
+        assert!(
+            statement_count <= max_index_insert_statements,
+            "Manifest positive-index transactions should batch {table} inserts; got {statement_count} statements for {positive_commit_batch_count} transactions"
+        );
+    }
+    assert!(
+        media_item_insert_count <= positive_commit_batch_count.saturating_mul(6),
+        "Manifest positive-index transactions should batch movie and parent-folder inserts; got {media_item_insert_count} statements for {positive_commit_batch_count} transactions"
+    );
+    for prefix in [
+        "INSERT INTO SCAN_MANIFEST_DELTAS",
+        "UPDATE SCAN_MANIFEST_DELTAS SET STATE",
+        "UPDATE SCAN_MANIFESTS SET ADD_COUNT",
+    ] {
+        let statement_count = dml_summary_counts
+            .iter()
+            .filter(|(_, summary)| summary.starts_with(prefix))
+            .map(|(count, _)| count)
+            .sum::<usize>();
+        assert_eq!(
+            statement_count, 0,
+            "positive streamed indexing must not persist per-file deltas: {prefix}"
+        );
+    }
+    let max_scan_statement_count = file_count
+        .saturating_mul(2)
+        .saturating_add(directory_count.saturating_mul(3))
+        .saturating_add(100);
+    let max_scan_dml_count = file_count
+        .saturating_add(directory_count.saturating_mul(3))
+        .saturating_add(100);
     assert!(
         scan_statement_count <= max_scan_statement_count,
         "Manifest scan issued {scan_statement_count} SQL statements for {file_count} files; limit is {max_scan_statement_count}"
@@ -690,7 +950,6 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     } else {
         None
     };
-    let job_id_placeholder = if backend == "postgres" { "$1" } else { "?" };
     let initial_manifest_query = format!(
         "SELECT state, observed_file_count, unchanged_count, add_count
          FROM scan_manifests WHERE job_id = {job_id_placeholder}"
@@ -703,10 +962,56 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     assert_eq!(initial_manifest.0, "POSTPROCESSING");
     assert_eq!(initial_manifest.1, file_count as i64);
     assert_eq!(initial_manifest.3, file_count as i64);
+    let initial_presence_query = format!(
+        "SELECT manifest.discovery_format_version,
+                (SELECT COUNT(*) FROM scan_manifest_seen_paths seen
+                 WHERE seen.manifest_id = manifest.id),
+                (SELECT COUNT(*) FROM scan_manifest_entries entry
+                 WHERE entry.manifest_id = manifest.id AND entry.entry_kind = 'FILE'),
+                (SELECT COUNT(*) FROM filesystem_entries entry
+                 JOIN scan_manifest_roots root
+                   ON root.manifest_id = manifest.id
+                  AND root.library_root_id = entry.library_root_id
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 WHERE entry.entry_kind = 'FILE'
+                   AND entry.last_seen_generation = job.generation)
+         FROM scan_manifests manifest WHERE manifest.job_id = {job_id_placeholder}"
+    );
+    let initial_presence: (i64, i64, i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(initial_presence_query))
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(initial_presence, (3, 0, 0, file_count as i64));
+    statement_counts.reset();
+    let target_materialization_started = Instant::now();
+    jobs.materialize_manifest_postprocessing_targets(&job.id)
+        .await?;
+    let postprocessing_target_materialization_ms =
+        target_materialization_started.elapsed().as_millis();
+    let (postprocessing_target_sql_count, postprocessing_target_dml_count) =
+        statement_counts.snapshot();
+    let postprocessing_target_count_query =
+        format!("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = {job_id_placeholder}");
+    let postprocessing_target_count: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(postprocessing_target_count_query))
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(postprocessing_target_count, (file_count * 2) as i64);
+    let targets_ready_query = format!(
+        "SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = {job_id_placeholder}"
+    );
+    let targets_ready: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(targets_ready_query))
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(targets_ready, 1);
 
+    statement_counts.reset();
     let rescan_job = jobs.create_movie_scan_job(library.id).await?;
     let rescan_started = Instant::now();
-    let first_rescan_batch = jobs.run_batch(&rescan_job.id, 100).await?;
+    let first_rescan_batch = jobs.run_batch(&rescan_job.id, 500).await?;
     let mut rescan_batch_durations = vec![rescan_started.elapsed().as_millis()];
     assert!(
         !first_rescan_batch.completed,
@@ -718,7 +1023,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         let mut processed = first_rescan_batch.processed;
         loop {
             let batch_started = Instant::now();
-            let report = match background_jobs.run_batch(&rescan_job_id, 100).await {
+            let report = match background_jobs.run_batch(&rescan_job_id, 500).await {
                 Ok(report) => report,
                 Err(error) => return Err(error.to_string()),
             };
@@ -771,27 +1076,69 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     assert_eq!(rescan_manifest.1, file_count as i64);
     assert_eq!(rescan_manifest.2, file_count as i64);
     assert_eq!(rescan_manifest.3, 0);
+    let rescan_presence_query = format!(
+        "SELECT discovery_format_version,
+                (SELECT COUNT(*) FROM scan_manifest_seen_paths seen
+                 WHERE seen.manifest_id = manifest.id),
+                (SELECT COUNT(*) FROM filesystem_entries entry
+                 JOIN scan_manifest_roots root
+                   ON root.manifest_id = manifest.id
+                  AND root.library_root_id = entry.library_root_id
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 WHERE entry.entry_kind = 'FILE'
+                   AND entry.last_seen_generation = job.generation)
+         FROM scan_manifests manifest WHERE manifest.job_id = {job_id_placeholder}"
+    );
+    let rescan_presence: (i64, i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(rescan_presence_query))
+            .bind(&rescan_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(rescan_presence, (3, file_count as i64, 0));
+    jobs.materialize_manifest_postprocessing_targets(&rescan_job.id)
+        .await?;
     assert!(
         scan_running_before_api,
         "Manifest scan ended before foreground sampling"
     );
+    let manifest_presence = json!({
+        "discoveryFormatVersion": initial_presence.0,
+        "seenPathCount": initial_presence.1,
+        "fileObservationCount": initial_presence.2,
+        "generationMarkedPathCount": initial_presence.3,
+        "rescanDiscoveryFormatVersion": rescan_presence.0,
+        "rescanSeenPathCount": rescan_presence.1,
+        "rescanGenerationMarkedPathCount": rescan_presence.2,
+    });
 
-    println!(
-        "LUX-270 MANIFEST RESULT {}",
-        serde_json::to_string(&json!({
+    let report_sections = [
+        json!({
             "commit": luxd::COMMIT,
             "architecture": std::env::consts::ARCH,
             "databaseBackend": backend,
+            "derivedIndexTriggersDisabled": derived_index_triggers_disabled,
             "fileCount": file_count,
             "manifestIndexMs": manifest_index_ms,
             "manifestFilesProcessed": first_scan_processed,
             "manifestBatchCount": first_batch_durations.len(),
             "manifestPhaseMs": phase_durations,
             "manifestPhaseBatchCounts": phase_batch_counts,
+            "manifestPositivePreparationMs": manifest_application_ms,
+            "manifestPositiveCommitMs": manifest_transaction_ms,
+            "manifestPositiveTimingEventCount": manifest_apply_timing_batches,
+            "manifestPositiveCommitBatchCount": positive_commit_batch_count,
+            "postprocessingTargetMaterializationMs": postprocessing_target_materialization_ms,
+            "postprocessingTargetSqlStatementCount": postprocessing_target_sql_count,
+            "postprocessingTargetDmlStatementCount": postprocessing_target_dml_count,
+            "postprocessingTargetCount": postprocessing_target_count,
             "batchP50Ms": batch_p50_ms,
             "batchP95Ms": batch_p95_ms,
+        }),
+        json!({
             "manifestSqlStatementCount": scan_statement_count,
             "manifestDmlStatementCount": dml_statement_count,
+            "manifestDmlSummaryCounts": dml_summary_counts,
+            "unclassifiedCteSummaries": unclassified_cte_summaries,
             "postgresWalBytesWritten": postgres_wal_before
                 .zip(postgres_wal_after)
                 .map(|(before, after)| after.saturating_sub(before)),
@@ -811,6 +1158,9 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "sqliteLockAcquisitionErrors": (backend == "sqlite" && lock_monitor_enabled)
                 .then_some(sqlite_lock_wait_errors),
             "sqliteBusyTimeoutMs": sqlite_busy_timeout_ms,
+            "sqliteSynchronousLevel": sqlite_synchronous_level,
+        }),
+        json!({
             "foregroundDuringScan": scan_running_before_api,
             "foregroundRequestCount": FOREGROUND_REQUESTS,
             "foregroundP95Ms": foreground_p95_ms,
@@ -821,8 +1171,22 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "manifestState": initial_manifest.0,
             "manifestObservedFiles": initial_manifest.1,
             "manifestAddedFiles": initial_manifest.3,
+            "manifestPresence": manifest_presence,
             "sqlStatementCountNote": "SQLx statement events counted; PostgreSQL pg_stat_activity monitor SELECTs excluded. SQLite lock monitor acquires BEGIN IMMEDIATE every 100ms and commits immediately; its statements are included if surfaced by SQLx instrumentation. DML count classifies INSERT/UPDATE/DELETE/REPLACE/TRUNCATE summaries, including common-table-expression writes."
-        }))?
+        }),
+    ];
+    let mut report = serde_json::Map::new();
+    for section in report_sections {
+        report.extend(
+            section
+                .as_object()
+                .ok_or("performance result section must be an object")?
+                .clone(),
+        );
+    }
+    println!(
+        "LUX-270 MANIFEST RESULT {}",
+        serde_json::to_string(&serde_json::Value::Object(report))?
     );
 
     server.abort();

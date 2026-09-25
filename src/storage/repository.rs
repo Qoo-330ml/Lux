@@ -47,6 +47,11 @@ mod sessions;
 #[path = "users.rs"]
 mod users;
 
+// A 2,000-file manifest checkpoint uses at most 22,000 bind values for media_sources,
+// below SQLx's bundled SQLite variable limit (32,766) and PostgreSQL's limit (65,535).
+const MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 2_000;
+const MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE: usize = 8_000;
+
 pub use database_cleanup::DatabaseLifecycleCleanupReport;
 pub(crate) use device_pairings::DevicePairingRedeemResult;
 
@@ -1053,6 +1058,23 @@ pub(crate) struct NewScanManifestSidecarEntry {
     pub(crate) relative_path: String,
 }
 
+#[derive(Clone)]
+pub(crate) enum NewScanManifestIndexedFile {
+    Movie(NewMovieFile),
+    Episode(NewEpisodeFile),
+    Unresolved(NewScanManifestUnresolvedFile),
+    Sidecar(NewScanManifestSidecarEntry),
+}
+
+#[derive(Clone)]
+pub(crate) struct NewScanManifestPositiveIndex {
+    pub(crate) relative_path: String,
+    pub(crate) delta_kind: String,
+    pub(crate) base_filesystem_entry_id: Option<String>,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+    pub(crate) file: NewScanManifestIndexedFile,
+}
+
 pub(crate) struct NewScanManifestFilesystemEntry<'a> {
     pub(crate) id: &'a str,
     pub(crate) relative_path: &'a str,
@@ -1060,6 +1082,7 @@ pub(crate) struct NewScanManifestFilesystemEntry<'a> {
     pub(crate) modified_at: i64,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
+    pub(crate) last_seen_change_kind: Option<&'a str>,
 }
 
 #[derive(Clone, Debug)]
@@ -1092,6 +1115,7 @@ pub(crate) struct ManifestExistingFileUpdate<'a> {
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: &'a [u8],
     pub(crate) generation: &'a str,
+    pub(crate) last_seen_change_kind: Option<&'a str>,
     pub(crate) source_kind: &'a str,
     pub(crate) edition_name: Option<&'a str>,
     pub(crate) quality_label: Option<&'a str>,
@@ -1133,6 +1157,8 @@ pub(crate) struct StoredScanManifest {
     pub(crate) job_id: String,
     pub(crate) library_id: String,
     pub(crate) state: String,
+    pub(crate) workflow_version: i64,
+    pub(crate) discovery_format_version: i64,
     pub(crate) root_count: i64,
     pub(crate) discovered_directory_count: i64,
     pub(crate) completed_directory_count: i64,
@@ -1143,6 +1169,36 @@ pub(crate) struct StoredScanManifest {
     pub(crate) remove_count: i64,
     pub(crate) reappeared_count: i64,
     pub(crate) applied_delta_count: i64,
+    pub(crate) postprocessing_targets_ready: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestPostprocessingRoot {
+    pub(crate) library_root_id: String,
+    pub(crate) canonical_path: String,
+    pub(crate) expected_device: Option<i64>,
+    pub(crate) expected_inode: Option<i64>,
+    pub(crate) target_stage: String,
+    pub(crate) target_cursor: Option<String>,
+    pub(crate) has_stage_rows: bool,
+    pub(crate) has_positive_rows: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ManifestPostprocessingTargetBatchResult {
+    pub(crate) targets_changed: bool,
+    pub(crate) targets_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ManifestPostprocessingTargetPage<'a> {
+    pub(crate) job_id: &'a str,
+    pub(crate) manifest_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) generation: &'a str,
+    pub(crate) target_stage: &'a str,
+    pub(crate) target_cursor: Option<&'a str>,
+    pub(crate) page_size: usize,
 }
 
 #[derive(Debug)]
@@ -1154,6 +1210,14 @@ pub(crate) struct StoredScanManifestDiffCandidate {
     pub(crate) base_filesystem_entry_id: Option<String>,
     pub(crate) base_fingerprint: Option<Vec<u8>>,
     pub(crate) base_entry_kind: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanManifestFilesystemBaseline {
+    pub(crate) id: String,
+    pub(crate) entry_kind: String,
+    pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) is_missing: bool,
 }
 
 #[derive(Debug)]
@@ -1176,6 +1240,7 @@ pub(crate) struct StoredScanManifestDelta {
     pub(crate) entry_kind: Option<String>,
     pub(crate) size: Option<i64>,
     pub(crate) modified_at: Option<i64>,
+    pub(crate) device: Option<i64>,
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Option<Vec<u8>>,
 }
@@ -1191,14 +1256,22 @@ pub(crate) struct NewScanManifestEntry {
     pub(crate) fingerprint: Vec<u8>,
 }
 
-#[derive(Debug)]
 pub(crate) struct NewScanManifestDiscoveryChunk<'a> {
     pub(crate) manifest_id: &'a str,
     pub(crate) job_id: &'a str,
     pub(crate) library_root_id: &'a str,
     pub(crate) child_directories: &'a [String],
     pub(crate) entries: &'a [NewScanManifestEntry],
+    pub(crate) positive_indexes: &'a [NewScanManifestPositiveIndex],
+    pub(crate) unchanged_paths: &'a [String],
     pub(crate) completed_directory: Option<&'a str>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManifestDiscoveryCommitResult {
+    pub(crate) observed_file_count: i64,
+    pub(crate) created_items: usize,
+    pub(crate) metadata_targets_changed: bool,
 }
 
 #[derive(Debug)]
@@ -1869,6 +1942,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) thumb_image_tag: Option<String>,
     pub(crate) logo_image_tag: Option<String>,
     pub(crate) source_id: Option<String>,
+    pub(crate) source_relative_path: Option<String>,
     pub(crate) source_kind: Option<String>,
     pub(crate) container: Option<String>,
     pub(crate) size: Option<i64>,

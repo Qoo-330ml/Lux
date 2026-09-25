@@ -150,12 +150,30 @@ impl Database {
     pub(crate) async fn cleanup_completed_scan_manifest_payloads(
         &self,
     ) -> Result<DatabaseLifecycleCleanupReport, StorageError> {
+        let scan_manifest_deltas_deleted = self.delete_completed_scan_manifest_deltas().await?;
+        let scan_manifest_entries_deleted = self
+            .delete_completed_scan_manifest_entries()
+            .await?
+            .saturating_add(self.delete_completed_scan_manifest_seen_paths().await?);
+        self.query(
+            "UPDATE scan_manifest_roots SET postprocessing_target_cursor = NULL
+             WHERE postprocessing_target_cursor IS NOT NULL
+               AND manifest_id IN (
+                   SELECT id FROM scan_manifests WHERE state = 'COMPLETED'
+               )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let scan_manifest_directories_deleted =
+            self.delete_completed_scan_manifest_directories().await?;
         Ok(DatabaseLifecycleCleanupReport {
-            scan_manifest_deltas_deleted: self.delete_completed_scan_manifest_deltas().await?,
-            scan_manifest_entries_deleted: self.delete_completed_scan_manifest_entries().await?,
-            scan_manifest_directories_deleted: self
-                .delete_completed_scan_manifest_directories()
-                .await?,
+            scan_manifest_deltas_deleted,
+            scan_manifest_entries_deleted,
+            scan_manifest_directories_deleted,
             ..DatabaseLifecycleCleanupReport::default()
         })
     }
@@ -170,6 +188,36 @@ impl Database {
                          SELECT delta.id
                          FROM scan_manifest_deltas delta
                          JOIN scan_manifests manifest ON manifest.id = delta.manifest_id
+                         WHERE manifest.state = 'COMPLETED'
+                         LIMIT ?
+                     )",
+                )
+                .bind(CLEANUP_BATCH_SIZE)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            deleted = deleted.saturating_add(count);
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_completed_scan_manifest_seen_paths(&self) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        loop {
+            let count = self
+                .query(
+                    "DELETE FROM scan_manifest_seen_paths
+                     WHERE (manifest_id, library_root_id, relative_path) IN (
+                         SELECT seen.manifest_id, seen.library_root_id, seen.relative_path
+                         FROM scan_manifest_seen_paths seen
+                         JOIN scan_manifests manifest ON manifest.id = seen.manifest_id
                          WHERE manifest.state = 'COMPLETED'
                          LIMIT ?
                      )",

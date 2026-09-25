@@ -52,6 +52,8 @@ async fn scan_job_metadata_microbatch_isolates_a_broken_series_target()
             break;
         }
     }
+    jobs.materialize_manifest_postprocessing_targets(&job.id)
+        .await?;
 
     sqlx::query(
         "UPDATE filesystem_entries

@@ -134,19 +134,46 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 131);
+    assert_eq!(database.schema_version().await?, 136);
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
          WHERE table_schema = current_schema()
            AND table_name IN (
                'scan_manifests', 'scan_manifest_roots', 'scan_manifest_directories',
-               'scan_manifest_entries', 'scan_manifest_deltas'
+               'scan_manifest_entries', 'scan_manifest_seen_paths', 'scan_manifest_deltas'
            )",
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(manifest_tables, 5);
+    assert_eq!(manifest_tables, 6);
+    let postprocessing_targets_ready_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'scan_manifests'
+           AND column_name = 'postprocessing_targets_ready'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(postprocessing_targets_ready_column, 1);
+    let root_target_checkpoint_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'scan_manifest_roots'
+           AND column_name IN ('postprocessing_target_stage', 'postprocessing_target_cursor')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(root_target_checkpoint_columns, 2);
+    let positive_change_kind_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'filesystem_entries'
+           AND column_name = 'last_seen_change_kind'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(positive_change_kind_column, 1);
     let manifest_resume_state_column: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.columns
@@ -156,6 +183,15 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state_column, 1);
+    let manifest_discovery_format_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'scan_manifests' AND column_name = 'discovery_format_version'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(manifest_discovery_format_column, 1);
     let login_background_cache_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -430,7 +466,17 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     fs::create_dir(&old_schema_migrations)?;
     for entry in fs::read_dir(source_migrations)? {
         let entry = entry?;
-        if entry.file_name() != "0131_scan_manifest_resume_state.sql" {
+        if !matches!(
+            entry.file_name().to_str(),
+            Some(
+                "0131_scan_manifest_resume_state.sql"
+                    | "0132_streamed_manifest_indexing.sql"
+                    | "0133_skip_redundant_source_availability_update.sql"
+                    | "0134_drop_redundant_manifest_entry_index.sql"
+                    | "0135_manifest_discovery_format_and_seen_paths.sql"
+                    | "0136_manifest_postprocessing_target_checkpoint.sql"
+            )
+        ) {
             fs::copy(entry.path(), old_schema_migrations.join(entry.file_name()))?;
         }
     }
@@ -506,7 +552,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 131);
+    assert_eq!(database.schema_version().await?, 136);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -546,6 +592,35 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     let jobs = ScanJobService::new(database.clone());
     let retry = jobs.retry("legacy-postgres-scan").await?;
     assert_ne!(retry.id, "legacy-postgres-scan");
+    for _ in 0..16 {
+        let manifest_state: String =
+            sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = $1")
+                .bind(&retry.id)
+                .fetch_one(database.pool())
+                .await?;
+        if manifest_state == "READY_TO_DIFF" {
+            break;
+        }
+        assert!(!jobs.run_batch(&retry.id, 100).await?.completed);
+    }
+    let retry_discovery_state: (String, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT manifest.state, manifest.discovery_format_version,
+                (SELECT COUNT(*) FROM scan_manifest_seen_paths seen
+                 WHERE seen.manifest_id = manifest.id),
+                (SELECT COUNT(*) FROM scan_manifest_entries entry
+                 WHERE entry.manifest_id = manifest.id AND entry.entry_kind = 'FILE'),
+                (SELECT COUNT(*) FROM filesystem_entries entry
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 WHERE entry.last_seen_generation = job.generation)
+         FROM scan_manifests manifest WHERE manifest.job_id = $1",
+    )
+    .bind(&retry.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        retry_discovery_state,
+        ("READY_TO_DIFF".to_owned(), 3, 0, 0, 1)
+    );
     jobs.run_to_completion(&retry.id, 100, None).await?;
     let manifest_summary: (String, Option<String>, i64, i64, i64) = sqlx::query_as(
         "SELECT manifest.state, manifest.resume_state, manifest.observed_file_count,
@@ -567,6 +642,22 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(indexed_files, 1);
+
+    fs::remove_file(media_root.join("Legacy.Movie.2024.mkv"))?;
+    let compact_remove_job = jobs.create_movie_scan_job(library_id.parse()?).await?;
+    jobs.run_to_completion(&compact_remove_job.id, 100, None)
+        .await?;
+    let compact_removal_result: (i64, i64, i64) = sqlx::query_as(
+        "SELECT entry.is_missing, manifest.remove_count, manifest.applied_delta_count
+         FROM filesystem_entries entry
+         JOIN scan_manifest_roots root ON root.library_root_id = entry.library_root_id
+         JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+         WHERE manifest.job_id = $1 AND entry.relative_path = 'Legacy.Movie.2024.mkv'",
+    )
+    .bind(&compact_remove_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(compact_removal_result, (1, 1, 1));
 
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
@@ -620,6 +711,14 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
         .await?;
     let jobs = ScanJobService::new(database.clone()).with_webhooks(webhooks);
     let manifest_job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_manifests SET discovery_format_version = 2 WHERE job_id = $1")
+        .bind(&manifest_job.id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 1 WHERE job_id = $1")
+        .bind(&manifest_job.id)
+        .execute(database.pool())
+        .await?;
     advance_postgres_manifest_to_applying(&database, &jobs, &manifest_job.id).await?;
 
     let incremental = jobs
@@ -736,6 +835,10 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
 
     fs::remove_file(media_root.join("A.Movie.2024.mkv"))?;
     let replacement_job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_manifests SET discovery_format_version = 2 WHERE job_id = $1")
+        .bind(&replacement_job.id)
+        .execute(database.pool())
+        .await?;
     advance_postgres_manifest_to_applying(&database, &jobs, &replacement_job.id).await?;
     let moved_root = temp_dir.path().join("original-media");
     fs::rename(&media_root, &moved_root)?;
@@ -764,6 +867,101 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(original_entry_missing, 0);
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_v3_postprocessing_targets_resume_after_root_restore()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library(
+            &format!("PostgreSQL target restore {}", Uuid::now_v7()),
+            luxd::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let root = temp_dir.path().join("media");
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("Restore.Movie.2024.mkv"), b"indexed root")?;
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 media root")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&job.id, 100).await?.completed {
+            break;
+        }
+    }
+    let backup = temp_dir.path().join("media-original");
+    fs::rename(&root, &backup)?;
+    fs::create_dir_all(&root)?;
+    fs::write(root.join("Restore.Movie.2024.mkv"), b"replacement root")?;
+
+    assert!(jobs.run_to_completion(&job.id, 100, None).await.is_err());
+    let failed_checkpoint: (String, String, i64, String, i64) = sqlx::query_as(
+        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready,
+                root.postprocessing_target_stage,
+                (SELECT COUNT(*) FROM scan_job_events event
+                 WHERE event.job_id = job.id AND event.event_code = 'POSTPROCESSING_FAILED')
+         FROM scan_jobs job
+         JOIN scan_manifests manifest ON manifest.job_id = job.id
+         JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
+         WHERE job.id = $1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        failed_checkpoint,
+        (
+            "COMPLETED".to_owned(),
+            "IDLE".to_owned(),
+            0,
+            "NEW".to_owned(),
+            1,
+        )
+    );
+
+    fs::remove_dir_all(&root)?;
+    fs::rename(&backup, &root)?;
+    let retried = jobs.retry(&job.id).await?;
+    assert_eq!(retried.id, job.id);
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let resumed_checkpoint: (String, String, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready,
+                library_root.is_available, job.processed_count,
+                (SELECT COUNT(*) FROM scan_job_targets target WHERE target.job_id = job.id)
+         FROM scan_jobs job
+         JOIN scan_manifests manifest ON manifest.job_id = job.id
+         JOIN library_roots library_root ON library_root.id = $2
+         WHERE job.id = $1",
+    )
+    .bind(&job.id)
+    .bind(&root_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        resumed_checkpoint,
+        ("COMPLETED".to_owned(), "IDLE".to_owned(), 1, 1, 1, 0)
+    );
 
     database.close().await;
     drop_postgres_test_database(&database_name).await?;

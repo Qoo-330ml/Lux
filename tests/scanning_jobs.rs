@@ -58,6 +58,19 @@ async fn seed_legacy_reconciliation_work(
     Ok(())
 }
 
+async fn set_manifest_discovery_format_version(
+    database: &Database,
+    job_id: &str,
+    version: i64,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE scan_manifests SET discovery_format_version = ? WHERE job_id = ?")
+        .bind(version)
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn full_scan_manifest_persists_discovery_and_reobservations_without_directory_work_queue()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -82,6 +95,7 @@ async fn full_scan_manifest_persists_discovery_and_reobservations_without_direct
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &job.id, 2).await?;
     let initial_directory_frontier: Vec<(String, String)> = sqlx::query_as(
         "SELECT library_root_id, relative_path FROM scan_manifest_directories
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
@@ -102,6 +116,12 @@ async fn full_scan_manifest_persists_discovery_and_reobservations_without_direct
 
     let root_batch = jobs.run_batch(&job.id, 1).await?;
     assert_eq!(root_batch.status, "RUNNING");
+    let committed_discovery_total: i64 =
+        sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(committed_discovery_total, 1);
     let directory_states: Vec<(String, String)> = sqlx::query_as(
         "SELECT relative_path, state FROM scan_manifest_directories
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
@@ -127,7 +147,7 @@ async fn full_scan_manifest_persists_discovery_and_reobservations_without_direct
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(manifest_file_observation.0, 1);
+    assert!(manifest_file_observation.0 > 0);
     assert_eq!(manifest_file_observation.1, 3);
     assert!(manifest_file_observation.2 > 0);
     assert_eq!(manifest_file_observation.3, 32);
@@ -165,7 +185,27 @@ async fn full_scan_manifest_persists_discovery_and_reobservations_without_direct
     .bind(&job.id)
     .fetch_all(database.pool())
     .await?;
-    assert_eq!(observation_sequences, vec![1, 2]);
+    assert_eq!(observation_sequences.len(), 2);
+    assert!(observation_sequences[0] > 0);
+    assert!(observation_sequences[1] > observation_sequences[0]);
+    let observation_sequence_high_watermark: i64 = sqlx::query_scalar(
+        "SELECT next_observation_sequence FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let maximum_observation_sequence: i64 = sqlx::query_scalar(
+        "SELECT MAX(observation_sequence) FROM scan_manifest_entries
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        observation_sequence_high_watermark,
+        maximum_observation_sequence
+    );
     let legacy_directory_work: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM reconciliation_scan_entries
          WHERE job_id = ? AND entry_type = 'DIRECTORY'",
@@ -249,6 +289,7 @@ async fn full_scan_manifest_persists_and_applies_path_deltas_without_rewriting_u
     .await?;
 
     let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &reconciliation.id, 2).await?;
     while !jobs.run_batch(&reconciliation.id, 100).await?.completed {}
 
     let deltas: Vec<(String, String, String)> = sqlx::query_as(
@@ -261,28 +302,11 @@ async fn full_scan_manifest_persists_and_applies_path_deltas_without_rewriting_u
     .await?;
     assert_eq!(
         deltas,
-        vec![
-            (
-                "Added.Movie.2024.mkv".to_owned(),
-                "ADD".to_owned(),
-                "APPLIED".to_owned()
-            ),
-            (
-                "Changed.Movie.2023.mkv".to_owned(),
-                "CHANGE".to_owned(),
-                "APPLIED".to_owned()
-            ),
-            (
-                "Reappeared.Movie.2021.mkv".to_owned(),
-                "REAPPEARED".to_owned(),
-                "APPLIED".to_owned()
-            ),
-            (
-                "Removed.Movie.2020.mkv".to_owned(),
-                "REMOVE".to_owned(),
-                "APPLIED".to_owned()
-            ),
-        ]
+        vec![(
+            "Removed.Movie.2020.mkv".to_owned(),
+            "REMOVE".to_owned(),
+            "APPLIED".to_owned()
+        )]
     );
     let manifest_counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
         "SELECT unchanged_count, add_count, change_count, remove_count, reappeared_count
@@ -347,6 +371,7 @@ async fn manifest_uses_latest_directory_observation_when_diffing_file_paths()
     jobs.run_to_completion(&initial.id, 100, None).await?;
 
     let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &reconciliation.id, 2).await?;
     loop {
         let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
             .bind(&reconciliation.id)
@@ -490,6 +515,7 @@ async fn manifest_apply_does_not_overwrite_a_newer_incremental_filesystem_entry(
     tokio::fs::write(&path, b"after incremental write").await?;
 
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &job.id, 2).await?;
     advance_manifest_to_applying(&database, &jobs, &job.id).await?;
     let observed_fingerprint: Vec<u8> = sqlx::query_scalar(
         "SELECT fingerprint FROM scan_manifest_entries
@@ -562,6 +588,7 @@ async fn manifest_add_conflicts_with_incremental_entry_claimed_after_diff()
 
     let jobs = ScanJobService::new(database.clone());
     let manifest = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &manifest.id, 2).await?;
     advance_manifest_to_applying(&database, &jobs, &manifest.id).await?;
 
     let incremental = jobs
@@ -654,6 +681,7 @@ async fn failed_manifest_delta_batch_rolls_back_index_targets_delta_and_progress
     tokio::fs::write(root.join("Atomic.Movie.2024.mkv"), b"must rollback").await?;
 
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &job.id, 2).await?;
     advance_manifest_to_applying(&database, &jobs, &job.id).await?;
     let progress_before: (i64, i64) =
         sqlx::query_as("SELECT processed_count, total_count FROM scan_jobs WHERE id = ?")
@@ -702,6 +730,62 @@ async fn failed_manifest_delta_batch_rolls_back_index_targets_delta_and_progress
     .fetch_one(database.pool())
     .await?;
     assert_eq!(rolled_back_sources, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_apply_uses_requested_bounded_transaction_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    for index in 0..450 {
+        tokio::fs::write(
+            root.join(format!("Batch.Movie.{index:03}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &job.id, 2).await?;
+    advance_manifest_to_applying(&database, &jobs, &job.id).await?;
+
+    let report = jobs.run_batch(&job.id, 500).await?;
+
+    assert_eq!(report.processed, 450);
+    let applied_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_deltas
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+           AND state = 'APPLIED'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(applied_count, 450);
+    let target_counts: (i64, i64) = sqlx::query_as(
+        "SELECT SUM(CASE WHEN target_type = 'SOURCE' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN target_type = 'ITEM' THEN 1 ELSE 0 END)
+         FROM scan_job_targets WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(target_counts.0, 450);
+    assert!((449..=450).contains(&target_counts.1));
     Ok(())
 }
 
@@ -758,14 +842,18 @@ async fn manifest_cancellation_preserves_committed_frontier_and_observations()
             ("NotVisited".to_owned(), "PENDING".to_owned())
         ]
     );
-    let retained_observations: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_manifest_entries
-         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    let retained_payload_counts: (i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM scan_manifest_entries
+              WHERE manifest_id = scan_manifests.id),
+             (SELECT COUNT(*) FROM scan_manifest_seen_paths
+              WHERE manifest_id = scan_manifests.id)
+         FROM scan_manifests WHERE job_id = ?",
     )
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(retained_observations, 3);
+    assert_eq!(retained_payload_counts, (2, 0));
     let root_state: String = sqlx::query_scalar(
         "SELECT state FROM scan_manifest_roots
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
@@ -890,10 +978,12 @@ async fn shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier()
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     assert_eq!(jobs.run_batch(&job.id, 1).await?.status, "RUNNING");
-    let before_restart: (String, i64, i64, String) = sqlx::query_as(
+    let before_restart: (String, i64, i64, i64, String) = sqlx::query_as(
         "SELECT manifest.state, manifest.observed_file_count,
                 (SELECT COUNT(*) FROM scan_manifest_directories directory
                  WHERE directory.manifest_id = manifest.id AND directory.state = 'PENDING'),
+                (SELECT COUNT(*) FROM scan_manifest_seen_paths seen
+                 WHERE seen.manifest_id = manifest.id),
                 root.state
          FROM scan_manifests manifest
          JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
@@ -904,23 +994,25 @@ async fn shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier()
     .await?;
     assert_eq!(
         before_restart,
-        ("DISCOVERING".to_owned(), 1, 1, "SCANNING".to_owned())
+        ("DISCOVERING".to_owned(), 1, 1, 0, "SCANNING".to_owned())
     );
 
     database.cancel_incomplete_jobs_for_shutdown().await?;
     let retried = jobs.retry(&job.id).await?;
     assert_eq!(retried.id, job.id);
     assert_eq!(retried.status, "PENDING");
-    let after_resume: (String, i64, i64) = sqlx::query_as(
+    let after_resume: (String, i64, i64, i64) = sqlx::query_as(
         "SELECT manifest.state, manifest.observed_file_count,
                 (SELECT COUNT(*) FROM scan_manifest_directories directory
-                 WHERE directory.manifest_id = manifest.id AND directory.state = 'PENDING')
+                 WHERE directory.manifest_id = manifest.id AND directory.state = 'PENDING'),
+                (SELECT COUNT(*) FROM scan_manifest_seen_paths seen
+                 WHERE seen.manifest_id = manifest.id)
          FROM scan_manifests manifest WHERE manifest.job_id = ?",
     )
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(after_resume, ("DISCOVERING".to_owned(), 1, 1));
+    assert_eq!(after_resume, ("DISCOVERING".to_owned(), 1, 1, 0));
 
     jobs.run_to_completion(&job.id, 1, None).await?;
     let completed: (String, i64, i64) = sqlx::query_as(
@@ -960,6 +1052,11 @@ async fn cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_format_version(&database, &job.id, 2).await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 1 WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
     assert_eq!(jobs.run_batch(&job.id, 100).await?.status, "RUNNING");
     assert_eq!(jobs.run_batch(&job.id, 100).await?.status, "RUNNING");
     let first_apply = jobs.run_batch(&job.id, 1).await?;
@@ -1072,7 +1169,7 @@ async fn manifest_discovery_rejects_directory_replaced_by_symlink_outside_root()
 }
 
 #[tokio::test]
-async fn full_scan_manifest_keeps_media_unindexed_until_discovery_finishes()
+async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1101,28 +1198,120 @@ async fn full_scan_manifest_keeps_media_unindexed_until_discovery_finishes()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
-    loop {
+    let workflow_version: i64 =
+        sqlx::query_scalar("SELECT workflow_version FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        workflow_version, 2,
+        "new jobs use the streamed apply workflow"
+    );
+    let discovery_format_version: i64 =
+        sqlx::query_scalar("SELECT discovery_format_version FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        discovery_format_version, 3,
+        "new jobs use compact presence observations"
+    );
+    let targets_ready: i64 = sqlx::query_scalar(
+        "SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        targets_ready, 0,
+        "new v3 manifests require target materialization"
+    );
+    let target_stage: String = sqlx::query_scalar(
+        "SELECT postprocessing_target_stage FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?) LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(target_stage, "NEW");
+    let mut visible_items = 0_i64;
+    for _ in 0..100 {
         let manifest_state: String =
             sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
                 .bind(&job.id)
                 .fetch_one(database.pool())
                 .await?;
         if manifest_state != "DISCOVERING" {
-            assert_eq!(manifest_state, "READY_TO_DIFF");
             break;
         }
         jobs.run_batch(&job.id, 1).await?;
-        let visible_items: i64 = sqlx::query_scalar(
+        visible_items = sqlx::query_scalar(
             "SELECT COUNT(*) FROM media_items
              WHERE item_type = 'MOVIE' AND has_available_source = 1 AND removed_at IS NULL",
         )
         .fetch_one(database.pool())
         .await?;
-        assert_eq!(
-            visible_items, 0,
-            "discovery must not publish a partial index"
-        );
+        if visible_items > 0 {
+            assert_eq!(manifest_state, "DISCOVERING");
+            assert!(
+                visible_items < 64,
+                "indexing should remain bounded per batch"
+            );
+            break;
+        }
     }
+    assert!(
+        visible_items > 0,
+        "the discovery worker should commit safe positive indexes before discovery finishes"
+    );
+    let mut manifest_state = String::new();
+    for _ in 0..100 {
+        manifest_state = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+        if manifest_state != "DISCOVERING" {
+            break;
+        }
+        jobs.run_batch(&job.id, 1).await?;
+    }
+    assert_eq!(manifest_state, "READY_TO_DIFF");
+    let file_observation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_entries
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+           AND entry_kind = 'FILE'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let seen_path_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_seen_paths
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let indexed_generation_path_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries entry
+         JOIN scan_jobs job ON job.id = ?
+         WHERE entry.library_root_id = (
+             SELECT library_root_id FROM scan_manifest_roots
+             WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+         ) AND entry.last_seen_generation = job.generation",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let manifest_remove_count: i64 =
+        sqlx::query_scalar("SELECT remove_count FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(file_observation_count, 0);
+    assert_eq!(seen_path_count, 0);
+    assert_eq!(indexed_generation_path_count, 128);
+    assert_eq!(manifest_remove_count, 0);
     jobs.run_to_completion(&job.id, 1, None).await?;
     let visible_items: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_items
@@ -1131,6 +1320,571 @@ async fn full_scan_manifest_keeps_media_unindexed_until_discovery_finishes()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(visible_items, 64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn postprocessing_targets_materialize_after_index_and_keep_new_item_precedence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let changed = root.join("Example.Movie.2024.1080p.mkv");
+    tokio::fs::write(&changed, b"before").await?;
+    tokio::fs::write(root.join("Example.Movie.2024.2160p.mkv"), b"stable").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&first.id, 100, None).await?;
+    tokio::fs::write(&changed, b"after-with-a-new-size").await?;
+    tokio::fs::write(root.join("Example.Movie.2024.720p.mkv"), b"new version").await?;
+
+    let second = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&second.id, 100).await?.completed {
+            break;
+        }
+    }
+    let targets_before_materialization: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&second.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(targets_before_materialization, 0);
+
+    jobs.materialize_manifest_postprocessing_targets(&second.id)
+        .await?;
+    let source_kinds: Vec<String> = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_targets
+         WHERE job_id = ? AND target_type = 'SOURCE' ORDER BY change_kind",
+    )
+    .bind(&second.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(source_kinds, vec!["CHANGED", "NEW"]);
+    let item_kind: String = sqlx::query_scalar(
+        "SELECT change_kind FROM scan_job_targets
+         WHERE job_id = ? AND target_type = 'ITEM'",
+    )
+    .bind(&second.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item_kind, "NEW");
+    let ready: i64 = sqlx::query_scalar(
+        "SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&second.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(ready, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_manifest_removes_a_path_only_after_complete_root_and_absence_check()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Compact manifest", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let media_path = root.join("Compact.Movie.2024.mkv");
+    tokio::fs::write(&media_path, b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 root")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let first_scan = jobs.create_movie_scan_job(library.id).await?;
+    for _ in 0..100 {
+        let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&first_scan.id)
+            .fetch_one(database.pool())
+            .await?;
+        if state == "READY_TO_DIFF" {
+            break;
+        }
+        jobs.run_batch(&first_scan.id, 100).await?;
+    }
+    let seen_before_delete: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_seen_paths seen
+         JOIN scan_manifests manifest ON manifest.id = seen.manifest_id
+         WHERE manifest.job_id = ? AND seen.relative_path = 'Compact.Movie.2024.mkv'",
+    )
+    .bind(&first_scan.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(seen_before_delete, 0);
+    let manifest_format: i64 =
+        sqlx::query_scalar("SELECT discovery_format_version FROM scan_manifests WHERE job_id = ?")
+            .bind(&first_scan.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(manifest_format, 3);
+    jobs.run_to_completion(&first_scan.id, 100, None).await?;
+
+    tokio::fs::remove_file(&media_path).await?;
+    let second_scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&second_scan.id, 100, None).await?;
+
+    let source_state: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT entry.is_missing, item.removed_at IS NOT NULL
+         FROM filesystem_entries entry
+         JOIN media_sources source ON source.filesystem_entry_id = entry.id
+         JOIN media_items item ON item.id = source.item_id
+         WHERE entry.library_root_id = (
+             SELECT id FROM library_roots WHERE library_id = ? LIMIT 1
+         ) AND entry.relative_path = 'Compact.Movie.2024.mkv'",
+    )
+    .bind(library.id.to_string())
+    .fetch_optional(database.pool())
+    .await?;
+    let source_state = source_state.ok_or("missing indexed media source after remove")?;
+    assert_eq!(source_state, (1, 1));
+    let removal_counts: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT remove_count, applied_delta_count
+         FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&second_scan.id)
+    .fetch_optional(database.pool())
+    .await?;
+    let removal_counts = removal_counts.ok_or("missing completed removal manifest")?;
+    assert_eq!(removal_counts, (1, 1));
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_update()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 136);
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Availability.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    let availability_trigger_sql: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger'
+         AND name = 'trg_media_sources_availability_insert'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        availability_trigger_sql.contains("COALESCE"),
+        "unexpected availability trigger: {availability_trigger_sql}"
+    );
+    sqlx::query(
+        "CREATE TABLE availability_trigger_updates (
+             item_id TEXT NOT NULL, previous_value INTEGER NOT NULL, new_value INTEGER NOT NULL
+         )",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER track_availability_trigger_update
+         AFTER UPDATE OF has_available_source ON media_items
+         BEGIN INSERT INTO availability_trigger_updates(item_id, previous_value, new_value)
+               VALUES (NEW.id, OLD.has_available_source, NEW.has_available_source); END",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("CREATE TABLE availability_before_source_insert (value INTEGER NOT NULL)")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER track_availability_before_source_insert
+         BEFORE INSERT ON media_sources
+         BEGIN
+             INSERT INTO availability_before_source_insert(value)
+             SELECT has_available_source FROM media_items WHERE id = NEW.item_id;
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let available_items: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE item_type = 'MOVIE' AND has_available_source = 1 AND removed_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(available_items, 1);
+    let redundant_updates: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT previous_value, new_value FROM availability_trigger_updates")
+            .fetch_all(database.pool())
+            .await?;
+    assert!(
+        redundant_updates.is_empty(),
+        "availability trigger updates: {redundant_updates:?}; trigger SQL: {availability_trigger_sql}"
+    );
+    let initial_available_values: Vec<i64> =
+        sqlx::query_scalar("SELECT value FROM availability_before_source_insert")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(initial_available_values, vec![1]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_manifest_add_does_not_claim_a_concurrent_filesystem_entry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Raced.Movie.2024.mkv"), b"scanned version").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let trigger_sql = format!(
+        "CREATE TRIGGER claim_manifest_add_after_observation
+         AFTER UPDATE ON scan_manifest_directories
+         WHEN NEW.relative_path = '' AND NEW.state = 'COMPLETE'
+           AND NEW.manifest_id = (
+               SELECT id FROM scan_manifests WHERE job_id = '{}'
+           )
+         BEGIN
+             INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 inode, fingerprint, last_seen_generation, is_missing
+             ) VALUES (
+                 'incremental-entry', NEW.library_root_id, 'Raced.Movie.2024.mkv', 'FILE',
+                 777, 888, NULL, X'09080706', 'incremental-generation', 0
+             ) ON CONFLICT(library_root_id, relative_path) DO NOTHING;
+         END",
+        job.id
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(database.pool())
+        .await?;
+
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let filesystem_entry: (String, i64, Vec<u8>, String) = sqlx::query_as(
+        "SELECT id, size, fingerprint, last_seen_generation FROM filesystem_entries
+         WHERE relative_path = 'Raced.Movie.2024.mkv'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        filesystem_entry,
+        (
+            "incremental-entry".to_owned(),
+            777,
+            vec![9, 8, 7, 6],
+            "incremental-generation".to_owned()
+        )
+    );
+    let media_source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_sources WHERE filesystem_entry_id = 'incremental-entry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(media_source_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn streamed_manifest_change_cas_does_not_overwrite_a_newer_incremental_entry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let relative_path = "Raced.Movie.2024.mkv";
+    tokio::fs::write(root.join(relative_path), b"original").await?;
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    tokio::fs::write(root.join(relative_path), b"changed on disk").await?;
+
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = ?")
+        .bind(&reconciliation.id)
+        .fetch_one(database.pool())
+        .await?;
+    let trigger_sql = format!(
+        "CREATE TRIGGER advance_manifest_baseline_after_observation
+         AFTER UPDATE ON scan_manifest_directories
+         WHEN NEW.relative_path = '' AND NEW.state = 'COMPLETE'
+           AND NEW.manifest_id = '{}'
+         BEGIN
+             UPDATE filesystem_entries
+             SET size = 777, modified_at = 888, fingerprint = X'09080706',
+                 last_seen_generation = 'incremental-generation'
+             WHERE library_root_id = NEW.library_root_id
+               AND relative_path = 'Raced.Movie.2024.mkv';
+         END",
+        manifest_id
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(database.pool())
+        .await?;
+
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+
+    let entry: (i64, i64, Vec<u8>, String) = sqlx::query_as(
+        "SELECT size, modified_at, fingerprint, last_seen_generation
+         FROM filesystem_entries WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_id)
+    .bind(relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        entry,
+        (
+            777,
+            888,
+            vec![9, 8, 7, 6],
+            "incremental-generation".to_owned()
+        )
+    );
+    let changed_target_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_job_targets
+         WHERE job_id = ? AND change_kind = 'CHANGED'",
+    )
+    .bind(&reconciliation.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_target_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn manifest_postprocessing_target_batch_rolls_back_targets_and_cursor_together()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Atomic.Movie.2024.mkv"), b"atomic index").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&job.id, 100).await?.completed {
+            break;
+        }
+    }
+    let indexed_rows: (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM filesystem_entries
+              WHERE relative_path = 'Atomic.Movie.2024.mkv'),
+             (SELECT COUNT(*) FROM media_sources source
+              JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+              WHERE entry.relative_path = 'Atomic.Movie.2024.mkv'),
+             (SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(indexed_rows, (1, 1, 0));
+
+    let trigger_sql = format!(
+        "CREATE TRIGGER reject_streamed_manifest_target
+         BEFORE INSERT ON scan_job_targets WHEN NEW.job_id = '{}'
+         BEGIN SELECT RAISE(ABORT, 'injected streamed target failure'); END",
+        job.id
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(database.pool())
+        .await?;
+
+    assert!(
+        jobs.materialize_manifest_postprocessing_targets(&job.id)
+            .await
+            .is_err()
+    );
+    let rolled_back: (i64, i64, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?),
+             (SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?),
+             (SELECT COUNT(*) FROM filesystem_entries WHERE relative_path = 'Atomic.Movie.2024.mkv'),
+             (SELECT postprocessing_target_stage FROM scan_manifest_roots
+              WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)),
+             (SELECT postprocessing_target_cursor FROM scan_manifest_roots
+              WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?))",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(rolled_back, (0, 0, 1, "NEW".to_owned(), None));
+    sqlx::query("DROP TRIGGER reject_streamed_manifest_target")
+        .execute(database.pool())
+        .await?;
+    jobs.materialize_manifest_postprocessing_targets(&job.id)
+        .await?;
+    let completed_targets: (i64, i64, String) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?),
+             (SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?),
+             (SELECT postprocessing_target_stage FROM scan_manifest_roots
+              WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?))",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(completed_targets, (2, 1, "DONE".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn postprocessing_target_materialization_waits_for_the_indexed_root_identity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Identity.Movie.2024.mkv"), b"indexed root").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&job.id, 100).await?.completed {
+            break;
+        }
+    }
+    let backup = temp_dir.path().join("Movies-original");
+    tokio::fs::rename(&root, &backup).await?;
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Identity.Movie.2024.mkv"), b"replacement root").await?;
+
+    assert!(
+        jobs.materialize_manifest_postprocessing_targets(&job.id)
+            .await
+            .is_err()
+    );
+    let paused: (i64, i64, String, Option<String>) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?),
+             (SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?),
+             root.postprocessing_target_stage, root.postprocessing_target_cursor
+         FROM scan_manifest_roots root
+         WHERE root.manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(paused, (0, 0, "NEW".to_owned(), None));
+
+    tokio::fs::remove_dir_all(&root).await?;
+    tokio::fs::rename(&backup, &root).await?;
+    jobs.materialize_manifest_postprocessing_targets(&job.id)
+        .await?;
+    let resumed: (i64, i64, String) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?),
+             (SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?),
+             root.postprocessing_target_stage
+         FROM scan_manifest_roots root
+         WHERE root.manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(resumed, (2, 1, "DONE".to_owned()));
+    let root_available: i64 =
+        sqlx::query_scalar("SELECT is_available FROM library_roots WHERE id = ?")
+            .bind(root_record.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        root_available, 1,
+        "restoring the indexed root clears unavailable state"
+    );
     Ok(())
 }
 
@@ -1210,14 +1964,17 @@ async fn full_scan_clamps_an_unbounded_requested_batch_size()
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-        if state == "APPLYING" {
+        if state == "READY_TO_DIFF" {
             break;
         }
         jobs.run_batch(&job.id, usize::MAX).await?;
     }
-    let first_file_batch = jobs.run_batch(&job.id, usize::MAX).await?;
-
-    assert_eq!(first_file_batch.processed, BACKGROUND_SCAN_BATCH_SIZE);
+    let discovery_progress: i64 =
+        sqlx::query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovery_progress, 101);
     Ok(())
 }
 
@@ -1279,7 +2036,7 @@ async fn unchanged_incremental_media_and_sidecar_skip_postprocessing_targets()
 }
 
 #[tokio::test]
-async fn scan_job_persists_manifest_diff_and_apply_batches_across_workers()
+async fn scan_job_commits_positive_manifest_indexes_during_discovery()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1317,7 +2074,7 @@ async fn scan_job_persists_manifest_diff_and_apply_batches_across_workers()
     let root_discovery = jobs.run_batch(&job.id, 100).await?;
     assert_eq!(root_discovery.processed, 0);
     let child_discovery = jobs.run_batch(&job.id, 100).await?;
-    assert_eq!(child_discovery.processed, 0);
+    assert_eq!(child_discovery.processed, 3);
     let discovered_total: i64 =
         sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
@@ -1328,47 +2085,32 @@ async fn scan_job_persists_manifest_diff_and_apply_batches_across_workers()
         "discovery persists observed-file progress"
     );
 
-    let diff = jobs.run_batch(&job.id, 100).await?;
-    assert_eq!(diff.status, "RUNNING");
-    assert_eq!(diff.processed, 0);
-    let discovered_total: i64 =
-        sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-    assert_eq!(discovered_total, 3);
-
-    let first_batch = jobs.run_batch(&job.id, 1).await?;
-    assert_eq!(first_batch.status, "RUNNING");
-    assert_eq!(first_batch.processed, 1);
-    let activity: (Option<String>, String) =
-        sqlx::query_as("SELECT current_item, scan_phase FROM scan_jobs WHERE id = ?")
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-    assert_eq!(activity.0.as_deref(), Some("Alpha.Movie.2020.mkv"));
-    assert_eq!(activity.1, "INDEXING");
     let visible_items: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_items
          WHERE has_available_source = 1 AND removed_at IS NULL",
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(
-        visible_items, 1,
-        "committed scan batches must be visible immediately"
-    );
+    assert_eq!(visible_items, 3, "positive indexes commit with discovery");
     let persisted: (String, i64, Option<String>) =
         sqlx::query_as("SELECT status, processed_count, cursor FROM scan_jobs WHERE id = ?")
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
     assert_eq!(persisted.0, "RUNNING");
-    assert_eq!(persisted.1, 1);
+    assert_eq!(persisted.1, 3);
     assert_eq!(
         persisted.2, None,
-        "manifest delta pages replace the legacy cursor"
+        "Manifest directory checkpoints replace the legacy cursor"
     );
+    let positive_delta_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_deltas
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(positive_delta_count, 0);
 
     let next_worker = ScanJobService::new(database.clone());
     assert!(
@@ -1378,9 +2120,19 @@ async fn scan_job_persists_manifest_diff_and_apply_batches_across_workers()
             .iter()
             .any(|id| id == &job.id)
     );
-    let second_batch = next_worker.run_batch(&job.id, 1).await?;
-    assert_eq!(second_batch.status, "RUNNING");
-    assert_eq!(second_batch.processed, 1);
+    let removal_diff = next_worker.run_batch(&job.id, 1).await?;
+    assert_eq!(removal_diff.status, "RUNNING");
+    let index_complete = next_worker.run_batch(&job.id, 1).await?;
+    assert!(index_complete.completed);
+    let pre_postprocessing_target_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM scan_job_targets WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        pre_postprocessing_target_count, 0,
+        "v3 SOURCE/ITEM targets are materialized only after indexing completes"
+    );
     let completed = next_worker.run_batch(&job.id, 10).await?;
     assert_eq!(completed.status, "COMPLETED");
     assert!(completed.completed);
@@ -1680,7 +2432,7 @@ async fn cancelling_after_indexing_completion_does_not_cancel_scan()
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-    assert!(target_count > 0);
+    assert_eq!(target_count, 0, "targets are staged after index completion");
 
     jobs.run_to_completion(&job.id, 100, None).await?;
     let final_target_count: i64 =
@@ -1806,7 +2558,7 @@ async fn unchanged_reconciliation_skips_index_targets() -> Result<(), Box<dyn st
             .bind(&first.id)
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(first_target_count, 2);
+    assert_eq!(first_target_count, 0);
     jobs.run_to_completion(&first.id, 100, None).await?;
 
     let second = jobs.create_movie_scan_job(library.id).await?;
@@ -2229,6 +2981,88 @@ async fn deleted_library_scan_worker_exits_as_cancelled_without_touching_media_f
 }
 
 #[tokio::test]
+async fn incremental_scan_waits_until_manifest_targets_are_materialized()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let movie = root.join("Wait.Movie.2024.mkv");
+    tokio::fs::write(&movie, b"first version").await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let full_scan = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&full_scan.id, 100).await?.completed {
+            break;
+        }
+    }
+    let generation: String = sqlx::query_scalar("SELECT generation FROM scan_jobs WHERE id = ?")
+        .bind(&full_scan.id)
+        .fetch_one(database.pool())
+        .await?;
+    tokio::fs::write(&movie, b"second version with another size").await?;
+    let incremental = jobs
+        .enqueue_incremental_changes(
+            library.id,
+            vec![IncrementalScanChange {
+                root_id: root_record.id.to_string(),
+                relative_path: "Wait.Movie.2024.mkv".to_owned(),
+                kind: ChangeKind::Modify,
+            }],
+        )
+        .await?;
+    let incremental_worker = jobs.clone();
+    let incremental_id = incremental.id.clone();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    let mut incremental_task = tokio::spawn(async move {
+        let _ = started_tx.send(());
+        incremental_worker.run_batch(&incremental_id, 1).await
+    });
+    started_rx.await?;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut incremental_task)
+            .await
+            .is_err(),
+        "incremental scan must wait behind the unready full-scan target checkpoint"
+    );
+    let persisted_generation: String = sqlx::query_scalar(
+        "SELECT last_seen_generation FROM filesystem_entries WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Wait.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(persisted_generation, generation);
+
+    jobs.materialize_manifest_postprocessing_targets(&full_scan.id)
+        .await?;
+    let report = tokio::time::timeout(Duration::from_secs(5), incremental_task).await???;
+    assert_eq!(report.processed, 1);
+    let latest_generation: String = sqlx::query_scalar(
+        "SELECT last_seen_generation FROM filesystem_entries WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_record.id.to_string())
+    .bind("Wait.Movie.2024.mkv")
+    .fetch_one(database.pool())
+    .await?;
+    assert_ne!(latest_generation, generation);
+    Ok(())
+}
+
+#[tokio::test]
 async fn active_full_scan_allows_incremental_scan_enqueue() -> Result<(), Box<dyn std::error::Error>>
 {
     let temp_dir = tempfile::tempdir()?;
@@ -2453,7 +3287,7 @@ async fn file_deleted_after_manifest_observation_waits_for_next_scan_confirmatio
 
     let reconciliation = jobs.create_movie_scan_job(library.id).await?;
     let discovery = jobs.run_batch(&reconciliation.id, 100).await?;
-    assert_eq!(discovery.processed, 0);
+    assert_eq!(discovery.processed, 2);
     tokio::fs::remove_file(root.join(deleted_path)).await?;
 
     while !jobs.run_batch(&reconciliation.id, 100).await?.completed {}
@@ -2901,7 +3735,7 @@ async fn reconciliation_job_discovers_once_and_processes_a_persisted_snapshot()
 
     let discovery = jobs.run_batch(&job.id, 1).await?;
     assert_eq!(discovery.status, "RUNNING");
-    assert_eq!(discovery.processed, 0);
+    assert_eq!(discovery.processed, 2);
     assert!(!discovery.completed);
     let discovered_total: i64 =
         sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
@@ -2968,16 +3802,28 @@ async fn manifest_streams_large_directory_discovery_in_bounded_chunks()
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     let discovery = jobs.run_batch(&job.id, 1).await?;
-    assert_eq!(discovery.processed, 0);
-    let pending_files: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM scan_manifest_entries
-         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
-           AND entry_kind = 'FILE'",
+    assert_eq!(discovery.processed, 1_025);
+    let pending_paths: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_seen_paths
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
     )
     .bind(&job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(pending_files, 1_025);
+    assert_eq!(pending_paths, 0);
+    let generation_indexed_paths: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = (
+             SELECT root.library_root_id FROM scan_manifest_roots root
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             WHERE manifest.job_id = ?
+         ) AND last_seen_generation = (SELECT generation FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(&job.id)
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(generation_indexed_paths, 1_025);
     let directory_entries: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scan_manifest_directories
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
@@ -2987,6 +3833,27 @@ async fn manifest_streams_large_directory_discovery_in_bounded_chunks()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(directory_entries, 0);
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let unchanged_job = jobs.create_movie_scan_job(library.id).await?;
+    for _ in 0..100 {
+        let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&unchanged_job.id)
+            .fetch_one(database.pool())
+            .await?;
+        if state == "READY_TO_DIFF" {
+            break;
+        }
+        assert!(!jobs.run_batch(&unchanged_job.id, 100).await?.completed);
+    }
+    let unchanged_paths: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_seen_paths
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&unchanged_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged_paths, 1_025);
+    jobs.run_to_completion(&unchanged_job.id, 100, None).await?;
     Ok(())
 }
 
@@ -3155,7 +4022,7 @@ async fn reconciliation_does_not_mark_files_missing_when_root_disappears_after_d
 
     let reconciliation = jobs.create_movie_scan_job(library.id).await?;
     let discovery = jobs.run_batch(&reconciliation.id, 100).await?;
-    assert_eq!(discovery.processed, 0);
+    assert_eq!(discovery.processed, 1);
     let discovered_total: i64 =
         sqlx::query_scalar("SELECT total_count FROM scan_jobs WHERE id = ?")
             .bind(&reconciliation.id)
@@ -3208,9 +4075,27 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
     let jobs = ScanJobService::new(database.clone());
     let initial = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&initial.id, 100, None).await?;
+    tokio::fs::write(root.join("Keep.Movie.2024.mkv"), b"changed fixture data").await?;
 
     let reconciliation = jobs.create_movie_scan_job(library.id).await?;
-    jobs.run_batch(&reconciliation.id, 100).await?;
+    loop {
+        if jobs.run_batch(&reconciliation.id, 100).await?.completed {
+            break;
+        }
+    }
+    let changed_generation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries entry
+         JOIN scan_jobs job ON job.id = ?
+         WHERE entry.library_root_id = ?
+           AND entry.relative_path = 'Keep.Movie.2024.mkv'
+           AND entry.last_seen_generation = job.generation
+           AND entry.last_seen_change_kind = 'CHANGED'",
+    )
+    .bind(&reconciliation.id)
+    .bind(root_record.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_generation_count, 1);
     let observed_root_identity: (Option<i64>, Option<i64>) = sqlx::query_as(
         "SELECT device, inode FROM scan_manifest_entries
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
@@ -3239,6 +4124,32 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
     }
     #[cfg(not(unix))]
     let _ = observed_root_identity;
+    assert!(
+        jobs.run_to_completion(&reconciliation.id, 100, None)
+            .await
+            .is_err()
+    );
+
+    let postprocessing_failure: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT job.status, job.scan_phase, manifest.postprocessing_targets_ready,
+                (SELECT COUNT(*) FROM scan_job_events event
+                 WHERE event.job_id = job.id AND event.event_code = 'POSTPROCESSING_FAILED')
+         FROM scan_jobs job
+         JOIN scan_manifests manifest ON manifest.job_id = job.id
+         WHERE job.id = ?",
+    )
+    .bind(&reconciliation.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        postprocessing_failure,
+        ("COMPLETED".to_owned(), "IDLE".to_owned(), 0, 1)
+    );
+
+    tokio::fs::remove_dir_all(&root).await?;
+    tokio::fs::rename(&moved_root, &root).await?;
+    let retried = jobs.retry(&reconciliation.id).await?;
+    assert_eq!(retried.id, reconciliation.id);
     jobs.run_to_completion(&reconciliation.id, 100, None)
         .await?;
 
@@ -3272,7 +4183,14 @@ async fn manifest_does_not_remove_entries_when_root_is_replaced_after_discovery(
         manifest_root_state, "UNAVAILABLE",
         "root identity was {observed_root_identity:?}"
     );
-    assert_eq!(root_available, 0);
+    assert_eq!(root_available, 1);
+    let target_ready: i64 = sqlx::query_scalar(
+        "SELECT postprocessing_targets_ready FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&reconciliation.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(target_ready, 1);
     Ok(())
 }
 
@@ -4106,6 +5024,8 @@ async fn pending_postprocessing_targets_make_scan_retryable()
             break;
         }
     }
+    jobs.materialize_manifest_postprocessing_targets(&job.id)
+        .await?;
     sqlx::query(
         "UPDATE filesystem_entries SET is_missing = 1
          WHERE relative_path = 'Pending.Movie.2024.mp4'",
@@ -4469,6 +5389,10 @@ async fn advance_manifest_to_applying(
     jobs: &ScanJobService,
     job_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 1 WHERE job_id = ?")
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
     for _ in 0..16 {
         let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
             .bind(job_id)
