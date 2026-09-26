@@ -5444,6 +5444,7 @@ impl ScanJobService {
                     seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
                         filesystem_entry_id: baseline.id.clone(),
                         relative_path: observation.relative_path.clone(),
+                        fingerprint: observation.fingerprint.clone(),
                     });
                     if is_media || is_sidecar {
                         unchanged_paths.push(observation.relative_path.clone());

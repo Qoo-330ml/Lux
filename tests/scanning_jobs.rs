@@ -1730,6 +1730,202 @@ async fn streamed_manifest_change_cas_does_not_overwrite_a_newer_incremental_ent
 }
 
 #[tokio::test]
+async fn unstable_manifest_observation_that_disappears_is_not_removed_in_same_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let relative_path = "Raced.Movie.2024.mkv";
+    tokio::fs::write(root.join(relative_path), b"original").await?;
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    tokio::fs::write(root.join(relative_path), b"changed on disk").await?;
+
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = ?")
+        .bind(&reconciliation.id)
+        .fetch_one(database.pool())
+        .await?;
+    let trigger_sql = format!(
+        "CREATE TRIGGER advance_manifest_baseline_before_discovery_diff
+         AFTER UPDATE ON scan_manifest_directories
+         WHEN NEW.relative_path = ''
+           AND NEW.state = 'COMPLETE'
+           AND NEW.manifest_id = '{}'
+         BEGIN
+             UPDATE filesystem_entries
+             SET size = 777, modified_at = 888, fingerprint = X'09080706',
+                 last_seen_generation = 'incremental-generation'
+             WHERE library_root_id = NEW.library_root_id
+               AND relative_path = '{}';
+         END",
+        manifest_id, relative_path
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(database.pool())
+        .await?;
+
+    loop {
+        let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&reconciliation.id)
+            .fetch_one(database.pool())
+            .await?;
+        if state == "READY_TO_DIFF" {
+            break;
+        }
+        assert!(!jobs.run_batch(&reconciliation.id, 100).await?.completed);
+    }
+    let seen_path_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_seen_paths
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&reconciliation.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(seen_path_count, 1);
+
+    tokio::fs::remove_file(root.join(relative_path)).await?;
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+
+    let entry: (i64, i64, Vec<u8>, String) = sqlx::query_as(
+        "SELECT is_missing, size, fingerprint, last_seen_generation
+         FROM filesystem_entries WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_id)
+    .bind(relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        entry.0, 0,
+        "residual ledger must suppress same-scan removal"
+    );
+    assert_eq!(entry.1, 777);
+    assert_eq!(entry.2, vec![9, 8, 7, 6]);
+    assert_eq!(entry.3, "incremental-generation");
+    let remove_count: i64 =
+        sqlx::query_scalar("SELECT remove_count FROM scan_manifests WHERE job_id = ?")
+            .bind(&reconciliation.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remove_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_manifest_observation_uses_fingerprint_cas_before_advancing_generation()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    let relative_path = "Stable.Movie.2024.mkv";
+    tokio::fs::write(root.join(relative_path), b"original").await?;
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = ?")
+        .bind(&reconciliation.id)
+        .fetch_one(database.pool())
+        .await?;
+    let trigger_sql = format!(
+        "CREATE TRIGGER advance_unchanged_manifest_baseline_after_observation
+         AFTER UPDATE ON scan_manifest_directories
+         WHEN NEW.relative_path = ''
+           AND NEW.state = 'COMPLETE'
+           AND NEW.manifest_id = '{}'
+         BEGIN
+             UPDATE filesystem_entries
+             SET size = 777, modified_at = 888, fingerprint = X'09080706',
+                 last_seen_generation = 'incremental-generation',
+                 last_seen_change_kind = 'CHANGED'
+             WHERE library_root_id = NEW.library_root_id
+               AND relative_path = '{}';
+         END",
+        manifest_id, relative_path
+    );
+    sqlx::query(sqlx::AssertSqlSafe(trigger_sql))
+        .execute(database.pool())
+        .await?;
+
+    loop {
+        let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&reconciliation.id)
+            .fetch_one(database.pool())
+            .await?;
+        if state == "READY_TO_DIFF" {
+            break;
+        }
+        assert!(!jobs.run_batch(&reconciliation.id, 100).await?.completed);
+    }
+    let seen_path_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_seen_paths
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&reconciliation.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(seen_path_count, 1);
+
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+
+    let entry: (i64, i64, Vec<u8>, String, Option<String>) = sqlx::query_as(
+        "SELECT size, modified_at, fingerprint, last_seen_generation, last_seen_change_kind
+         FROM filesystem_entries WHERE library_root_id = ? AND relative_path = ?",
+    )
+    .bind(root_id)
+    .bind(relative_path)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        entry,
+        (
+            777,
+            888,
+            vec![9, 8, 7, 6],
+            "incremental-generation".to_owned(),
+            Some("CHANGED".to_owned()),
+        )
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn manifest_postprocessing_target_batch_rolls_back_targets_and_cursor_together()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
