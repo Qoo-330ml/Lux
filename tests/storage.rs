@@ -134,6 +134,16 @@ fn postgres_media_source_insert_refresh_only_promotes_unavailable_items() {
 }
 
 #[test]
+fn postgres_media_source_insert_filters_available_items_before_filesystem_lookup() {
+    let migration =
+        include_str!("../migrations-postgres/0142_filter_available_source_promotions.sql");
+
+    assert!(migration.contains("JOIN media_items candidate"));
+    assert!(migration.contains("candidate.has_available_source = 0"));
+    assert!(migration.contains("JOIN filesystem_entries entry"));
+}
+
+#[test]
 fn postgres_media_search_insert_refresh_avoids_redundant_upsert() {
     let migration =
         include_str!("../migrations-postgres/0140_media_search_insert_without_conflict_probe.sql");
