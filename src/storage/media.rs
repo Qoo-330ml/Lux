@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 struct BatchHierarchyRow {
     id: String,
@@ -1796,6 +1797,7 @@ impl Database {
         if files.is_empty() {
             return Ok(0);
         }
+        let movie_folder_refresh_started = Instant::now();
         let mut folder_cache = self
             .prefetch_movie_folders_in_transaction(
                 &mut *transaction,
@@ -1829,9 +1831,25 @@ impl Database {
             },
         )
         .await?;
+        record_manifest_storage_stage(
+            "movie_folder_refresh",
+            movie_folder_refresh_started,
+            files.len(),
+            files.len(),
+            folder_cache.len(),
+        );
+
+        let movie_item_prefetch_started = Instant::now();
         let mut movie_cache = self
             .prefetch_movie_items_in_transaction(&mut *transaction, library_id, files, batch_size)
             .await?;
+        record_manifest_storage_stage(
+            "movie_item_prefetch",
+            movie_item_prefetch_started,
+            movie_cache.len(),
+            files.len(),
+            0,
+        );
         let existing_movie_items = movie_cache
             .values()
             .cloned()
@@ -1915,6 +1933,7 @@ impl Database {
             source_rows.push((index, item_id, is_new_item));
         }
 
+        let movie_item_insert_started = Instant::now();
         for chunk in new_items.chunks(batch_size) {
             let values = std::iter::repeat_n(
                 "(?, ?, 'MOVIE', ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
@@ -1950,6 +1969,13 @@ impl Database {
                     source,
                 })?;
         }
+        record_manifest_storage_stage(
+            "movie_item_insert",
+            movie_item_insert_started,
+            new_items.len(),
+            new_items.len(),
+            0,
+        );
 
         let parent_updates = parent_updates
             .into_iter()
@@ -1975,9 +2001,18 @@ impl Database {
                     })
             })
             .collect::<Vec<_>>();
+        let provider_update_started = Instant::now();
         self.update_movie_provider_ids_in_batches(&mut *transaction, &provider_updates, batch_size)
             .await?;
+        record_manifest_storage_stage(
+            "provider_update",
+            provider_update_started,
+            provider_updates.len(),
+            provider_updates.len(),
+            0,
+        );
 
+        let movie_source_insert_started = Instant::now();
         for chunk in source_rows.chunks(batch_size) {
             let values =
                 std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')", chunk.len())
@@ -2014,6 +2049,15 @@ impl Database {
                     source,
                 })?;
         }
+        record_manifest_storage_stage(
+            "movie_source_insert",
+            movie_source_insert_started,
+            source_rows.len(),
+            source_rows.len(),
+            0,
+        );
+
+        let derived_index_started = Instant::now();
         if movie_cache.values().any(|item| item.removed_at.is_some()) {
             let filesystem_entry_ids = source_rows
                 .iter()
@@ -2060,6 +2104,13 @@ impl Database {
                     source,
                 })?;
         }
+        record_manifest_storage_stage(
+            "derived_index",
+            derived_index_started,
+            source_rows.len(),
+            source_rows.len(),
+            0,
+        );
         Ok(new_items.len())
     }
 

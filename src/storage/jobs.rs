@@ -5,26 +5,6 @@ const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
 const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
 
-fn record_manifest_storage_stage(
-    phase: &'static str,
-    started: Instant,
-    units: usize,
-    files: usize,
-    directories: usize,
-) {
-    if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
-        tracing::debug!(
-            target: "lux::scan_performance",
-            phase,
-            duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            units = u64::try_from(units).unwrap_or(u64::MAX),
-            files = u64::try_from(files).unwrap_or(u64::MAX),
-            directories = u64::try_from(directories).unwrap_or(u64::MAX),
-            "manifest storage stage timing"
-        );
-    }
-}
-
 struct ManifestPostprocessingTargetRange<'a> {
     job_id: &'a str,
     library_root_id: &'a str,

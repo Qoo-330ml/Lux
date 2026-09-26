@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(test)]
@@ -53,6 +53,26 @@ const MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 2_900;
 const POSTGRES_MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 5_000;
 const MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW: usize = 11;
 const MANIFEST_EXISTING_FILE_UPDATE_SQLITE_CHUNK_SIZE: usize = 1_800;
+
+pub(super) fn record_manifest_storage_stage(
+    phase: &'static str,
+    started: Instant,
+    units: usize,
+    files: usize,
+    directories: usize,
+) {
+    if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase,
+            duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            units = u64::try_from(units).unwrap_or(u64::MAX),
+            files = u64::try_from(files).unwrap_or(u64::MAX),
+            directories = u64::try_from(directories).unwrap_or(u64::MAX),
+            "manifest storage stage timing"
+        );
+    }
+}
 const MANIFEST_EXISTING_FILE_UPDATE_POSTGRES_CHUNK_SIZE: usize = 3_800;
 const MANIFEST_EXISTING_FILE_UPDATE_MAX_BIND_VALUES_PER_ROW: usize = 17;
 const SQLITE_MAX_BIND_PARAMETERS: usize = 32_766;
