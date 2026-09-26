@@ -1305,3 +1305,164 @@ async fn postgres_metadata_priority_locks_images_and_people_regression()
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_statement_triggers_refresh_search_and_availability_sets()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let library_id = Uuid::now_v7().to_string();
+    let root_id = Uuid::now_v7().to_string();
+    let item_one = Uuid::now_v7().to_string();
+    let item_two = Uuid::now_v7().to_string();
+    let entry_one = Uuid::now_v7().to_string();
+    let entry_two = Uuid::now_v7().to_string();
+    let source_one = Uuid::now_v7().to_string();
+    let source_two = Uuid::now_v7().to_string();
+    let alias_id = Uuid::now_v7().to_string();
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ($1, 'Triggers', 'MOVIE')")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ($1, $2, '/tmp/trigger-test', '/tmp/trigger-test', 1, 1)",
+    )
+    .bind(&root_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+         id, library_root_id, relative_path, entry_kind, size, modified_at,
+             fingerprint, last_seen_generation, is_missing
+         ) VALUES
+             ($1, $3, 'one.mkv', 'FILE', 1, 1, $4, 'generation', 0),
+             ($2, $3, 'two.mkv', 'FILE', 1, 1, $5, 'generation', 0)",
+    )
+    .bind(&entry_one)
+    .bind(&entry_two)
+    .bind(&root_id)
+    .bind(vec![1_u8; 32])
+    .bind(vec![2_u8; 32])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES
+             ($1, $3, 'MOVIE', 'One', 'one', 'LOCAL_CONFIRMED'),
+             ($2, $3, 'MOVIE', 'Two', 'two', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_one)
+    .bind(&item_two)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    let search_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id IN ($1, $2)")
+            .bind(&item_one)
+            .bind(&item_two)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(search_count, 2);
+
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ($1, $2, 'First Alias', 'first alias')",
+    )
+    .bind(&alias_id)
+    .bind(&item_one)
+    .execute(database.pool())
+    .await?;
+    let alias_text: String =
+        sqlx::query_scalar("SELECT aliases FROM media_search WHERE item_id = $1")
+            .bind(&item_one)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(alias_text, "First Alias");
+
+    sqlx::query(
+        "UPDATE media_items
+         SET title = CASE id WHEN $1 THEN 'One Updated' WHEN $2 THEN 'Two Updated' END
+         WHERE id IN ($1, $2)",
+    )
+    .bind(&item_one)
+    .bind(&item_two)
+    .execute(database.pool())
+    .await?;
+    let preserved_alias: String =
+        sqlx::query_scalar("SELECT aliases FROM media_search WHERE item_id = $1")
+            .bind(&item_one)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved_alias, "First Alias");
+
+    sqlx::query(
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, container, size
+         ) VALUES
+             ($1, $3, 'LOCAL_FILE', $5, 'mkv', 1),
+             ($2, $4, 'LOCAL_FILE', $6, 'mkv', 1)",
+    )
+    .bind(&source_one)
+    .bind(&source_two)
+    .bind(&item_one)
+    .bind(&item_two)
+    .bind(&entry_one)
+    .bind(&entry_two)
+    .execute(database.pool())
+    .await?;
+    let available_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE id IN ($1, $2) AND has_available_source = 1",
+    )
+    .bind(&item_one)
+    .bind(&item_two)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(available_count, 2);
+
+    sqlx::query("UPDATE media_sources SET size = size + 1 WHERE id IN ($1, $2)")
+        .bind(&source_one)
+        .bind(&source_two)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE filesystem_entries SET is_missing = 1 WHERE id IN ($1, $2)")
+        .bind(&entry_one)
+        .bind(&entry_two)
+        .execute(database.pool())
+        .await?;
+    let unavailable_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items
+         WHERE id IN ($1, $2) AND has_available_source = 0",
+    )
+    .bind(&item_one)
+    .bind(&item_two)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unavailable_count, 2);
+
+    sqlx::query("DELETE FROM item_aliases WHERE id = $1")
+        .bind(&alias_id)
+        .execute(database.pool())
+        .await?;
+    let cleared_alias: String =
+        sqlx::query_scalar("SELECT aliases FROM media_search WHERE item_id = $1")
+            .bind(&item_one)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(cleared_alias.is_empty());
+
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
