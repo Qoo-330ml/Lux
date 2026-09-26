@@ -1,8 +1,8 @@
-# ADR-043：全量扫描使用持久化 Manifest
+# ADR-043：全量扫描使用 Manifest 完成语义
 
 ## 状态
 
-已接受；文件级 observation 的存储方式由 ADR-044 修订，既有 discovery format 1/2 合同保留。
+已接受；文件级 observation 的存储方式由 ADR-044 修订，新扫描的目录 frontier 由 ADR-045 修订，既有 discovery format 1/2 与持久化恢复合同保留。
 
 ## 日期
 
@@ -16,14 +16,14 @@ LUX-154、LUX-187、LUX-230 对目录发现、首页可见时点和快照刷新�
 
 ## 决策
 
-- 全量扫描拥有独立的持久化 Manifest 模型，包含 Manifest 生命周期、逐根路径覆盖状态、持久目录 frontier、不可变文件系统 observations 和版本化的 apply 策略。
+- 全量扫描拥有独立的 Manifest 模型，包含 Manifest 生命周期、逐根路径覆盖状态、目录 frontier、不可变文件系统 observations 和版本化的 apply 策略。旧 workflow 保留持久 frontier；新 workflow 的 frontier 模式由 ADR-045 定义。
 - `filesystem_entries` 继续作为当前文件系统索引事实来源。Manifest 通过 `library_root_id + relative_path` 与它比较，不从 `media_items` 单独推导删除。
 - Manifest observation 不原地覆盖。新版在发现批次内批量读取 `filesystem_entries` 基线，对新增/变化/重新出现文件再次 stat/fingerprint；在提交事务中对基线 ID 和 fingerprint 做 CAS，避免全量扫描覆盖并发增量结果。
 - 正向索引融合到有界发现事务：observation/presence、文件系统/媒体索引、目录 frontier 和进度全部提交或全部回滚。正向 ADD/CHANGE 不再各自写入和更新一条持久 delta；批次提交本身就是可恢复 checkpoint。新版 file presence format 与 workflow version 分开版本化，细节见 ADR-044；升级前的活动 Manifest 保留原执行器和恢复合同。
 - v3 的 SOURCE/ITEM postprocessing targets 不阻塞索引事务。索引及安全缺失确认完成后，target worker 按 root/path 游标批量物化 targets；每页 target 写入与 root 游标原子提交，最后一页同时设置所有 root 与 Manifest 的 ready barrier。probe/NFO/thumbnail worker 只能在 barrier 就绪后启动。
 - v3 以数据库中的未就绪 Manifest 作为增量扫描准入屏障。全量 postprocessing target 物化和可消费前，增量扫描不能改写相同 filesystem generation；旧 workflow/discovery format 的任务默认视为 targets 已就绪。
 - 只有完整发现且当前可用的根路径可以生成缺失 delta；删除前保留第二次文件状态确认。不可用、不完整、取消或 I/O 失败都不能触发该根路径的批量删除。
-- 新版只为 destructive REMOVE 持久化 delta；文件系统索引、媒体索引、REMOVE 状态和进度在有界短事务中原子提交。postprocessing targets 在索引完成后独立分批生成，不重置冲突已存在的 target 状态。
+- 新版只为 destructive REMOVE 持久化 delta；文件系统索引、媒体索引、REMOVE 状态和进度在有界短事务中原子提交。postprocessing targets 在索引完成后独立分批生成，不重置冲突已存在的 target 状态。新 workflow 的紧凑 presence 与内存 frontier 细节分别见 ADR-044 和 ADR-045。
 - 普通列表可以读取已提交的安全正向批次；首页仍保留旧稳定快照，直至全部可用根路径完成索引及缺失确认。已提交的正向索引不因后续 root unavailable 或取消而回滚，但该 root 永不据此执行删除。
 - SQLite 和 PostgreSQL 共用相同的存储状态机及核心 SQL 能力，不依赖 PostgreSQL 专属 COPY、`UPDATE ... FROM`、临时表或跨库扫描长事务。
 - `scan_manifest_entries` 的主键已覆盖按 manifest/root/path/sequence 查找；不得再创建同列序的重复辅助索引，以免每条 observation 重复维护 B-tree。Migration 0134 同步移除该冗余索引。

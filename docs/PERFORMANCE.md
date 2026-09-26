@@ -431,3 +431,18 @@ PostgreSQL 候选将总 DML 减少约 27%、SQL 减少约 11%，三类主要批�
 | 0143 工作树 | 14.771 / 13.171 / 14.642 s；**14.642 s** | 4.250 s | 2.378 s | 12.116 s | 272 ms | 419 / 122 | 209,838,782 bytes |
 
 相对同机 0142 A/B，首扫中位数下降约 3.9%，`positive_index_apply` 下降约 4.3%，WAL 下降约 4.3%；无变化重扫增加约 0.1%，前台 p95 增加约 1.9%，均在 5% 回退门槛内。这个改动确认减少了 PostgreSQL 派生写入成本，但绝对首扫仍高于 LUX-270 的 9.657 秒参考，因此不关闭 LUX-275，也不能外推 NAS/x86_64。
+
+### Manifest-lite 目录 frontier A/B（探索性）
+
+2026-09-26 在同一 Apple M4 / 16 GiB ARM64、60,000 个文件 / 600 个目录 fixture 上，对比新扫描默认的 `workflow_version=2`、`discovery_format_version=3`、`discovery_mode=LITE` 与旧持久 frontier 路径。Lite 将目录 frontier 保存在进程内，子目录不写入 `scan_manifest_directories`；format 3 的文件存在性仍使用 `last_seen_generation` 和紧凑 seen-path ledger。SQLite 运行三轮，PostgreSQL 16 使用本机一次性容器运行一轮；旧持久 frontier 也各运行一轮，因此这组数据用于定位收益，不替代 LUX-275 的三轮同构 A/B。
+
+| 后端/路径 | 首扫索引完成 | 正向提交批次；外层批次 | 无变化重扫 | 前台 p95 | WAL / 锁等待 |
+|---|---:|---:|---:|---:|---:|
+| SQLite Lite | 2.606 / 2.673 / 2.862 s；**2.673 s** | 8；11 | 约 1.03 s | 约 239–247 ms | — |
+| SQLite 旧持久 frontier | 4.310 s | — | — | — | — |
+| PostgreSQL 16 Lite | 6.051 s | — | 3.389 s | 274 ms | 225,100,660 bytes；0 |
+| PostgreSQL 16 旧持久 frontier | 14.989 s | — | — | — | — |
+
+Lite 的收益主要来自移除逐目录 frontier 的数据库写入和恢复查询；它不表示 Manifest 的全部语义可以删除。SQLite 当前中位数仍高于 LUX-270 的 2.018 秒参考，PostgreSQL 只有单轮结果，且所有数据只代表本机 ARM64 和临时数据库，不能关闭 LUX-275 或外推 NAS/x86_64。
+
+实现与语义边界见 `docs/decisions/045-manifest-lite-discovery.md`。

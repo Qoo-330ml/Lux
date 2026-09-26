@@ -2142,7 +2142,7 @@ services:
 | LUX-263 | Lux-plugins/src/bin/lux-plugin-tmdb-trending-background.rs、manifests/org.lux.tmdb-trending-background.json、tests/、docs/；独立 TMDb 日榜电影+剧集横幅图插件 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
-| LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；持久化目录发现与文件观察 |
+| LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；兼容持久 frontier 与新 Lite 目录发现 |
 | LUX-267 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/media.rs、src/storage/repository.rs、tests/scanning_jobs.rs；Manifest 差异与安全 apply |
 | LUX-268 | src/application/scanner.rs、src/application/home.rs、src/storage/jobs.rs、tests/scanning_jobs.rs、tests/webhooks.rs；索引完成和首页快照时序 |
 | LUX-269 | src/storage/repository.rs、src/storage/jobs.rs、src/storage/database_cleanup.rs、tests/scanning_jobs.rs、tests/storage.rs；升级、重试和有界清理 |
@@ -6574,11 +6574,11 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 ### 阶段 21：全量扫描 Manifest 与索引/后处理完成语义
 
-全量扫描使用持久化 Manifest 表达目录发现、不可变文件系统观察和根路径覆盖状态。新版扫描在有界发现事务中同时提交 observation、CAS 保护的正向文件/媒体索引、目录 frontier 和进度；不再为每个新增/变化文件持久化并二次应用正向 delta。正向索引使用 `last_seen_generation` 和 change kind 作为持久检查点，`scan_job_targets` 在索引完成后按根路径游标分批物化，且必须在 probe/NFO/缩略图 worker 启动前完成。只有根路径完整可用后才生成缺失候选，并在二次文件状态确认及基线 CAS 后删除。所有可用根路径完成索引与缺失确认后，成功扫描刷新首页稳定快照并发布 `home` 事件及 `ScanCompleted`；target 物化和其余后处理继续后台执行。升级前已存在的旧版 Manifest 任务由带版本号的旧执行器继续恢复。
+全量扫描使用 Manifest 表达目录发现、不可变根路径观察和根路径覆盖状态。新建扫描固定使用 `workflow_version=2`、`discovery_format_version=3`、`discovery_mode=LITE`：目录 frontier 在进程内按有界批次推进，子目录不写入 `scan_manifest_directories`；同一事务仍提交 CAS 保护的正向文件/媒体索引、`last_seen_generation`、紧凑 presence ledger、根状态和进度。旧 workflow 或显式 `PERSISTED` 任务继续使用持久目录 frontier 恢复。扫描不再为每个新增/变化文件持久化并二次应用正向 delta。正向索引使用 `last_seen_generation` 和 change kind 作为持久检查点，`scan_job_targets` 在索引完成后按根路径游标分批物化，且必须在 probe/NFO/缩略图 worker 启动前完成。只有根路径完整可用后才生成缺失候选，并在二次文件状态确认及基线 CAS 后删除。所有可用根路径完成索引与缺失确认后，成功扫描刷新首页稳定快照并发布 `home` 事件及 `ScanCompleted`；target 物化和其余后处理继续后台执行。升级前已存在的旧版 Manifest 任务由带版本号的旧执行器继续恢复。详见 `docs/decisions/044-compact-manifest-seen-paths.md` 与 `docs/decisions/045-manifest-lite-discovery.md`。
 
 本阶段不增加公开扫描状态或 webhook。现有 `ScanCompleted` 与 `JOB_COMPLETED` 表示索引完成；任务在 `POSTPROCESSING` 时仍可通过现有任务阶段字段观察后处理，完成后进入 `IDLE`。升级仅新增结构，不在 migration 中遍历文件系统或转换旧队列；启动时将没有 Manifest 的旧版活动全量任务安全取消，并保留任务诊断记录，管理员重试会创建新 Manifest 扫描。
 
-Manifest observation 一经写入不可原地修改；应用新增或变化条目前进行二次 stat/fingerprint 校验，必要时追加 observation。差异应用对 `filesystem_entries` 的基线 ID/fingerprint 做 CAS，防止全量任务覆盖后完成的增量扫描。只有完整可用根路径允许生成缺失删除；删除前再次确认文件状态。SQLite 与 PostgreSQL 共用 SQL 行为和一致性语义，禁止在核心路径依赖 PostgreSQL 专属批量导入/更新语法或长事务。
+Manifest observation 一经写入不可原地修改；新 Lite 只保留 root/directory identity observation，文件 stat/fingerprint 在 discovery 内存中用于二次安全校验，稳定文件通过 generation/seen-path 状态记录。应用新增或变化条目前进行二次 stat/fingerprint 校验，必要时追加 observation。差异应用对 `filesystem_entries` 的基线 ID/fingerprint 做 CAS，防止全量任务覆盖后完成的增量扫描。只有完整可用根路径允许生成缺失删除；删除前再次确认文件状态。SQLite 与 PostgreSQL 共用 SQL 行为和一致性语义，禁止在核心路径依赖 PostgreSQL 专属批量导入/更新语法或长事务。
 
 #### LUX-264：确定 Manifest 与扫描完成语义
 
@@ -6614,16 +6614,16 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 实现文件：`migrations/0128_full_scan_manifest.sql`、`migrations-postgres/0128_full_scan_manifest.sql`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`。
 
-#### LUX-266：持久化 Manifest 目录发现与观察
+#### LUX-266：Manifest 目录发现与观察
 
-范围：全量扫描的目录 frontier 和文件 observation 改由 Manifest 持久化；新工作流的发现事务同时提交 observation、子目录 frontier、目录完成状态、root 计数和任务进度。创建任务不访问文件系统，实时增量扫描优先级与现有扫描锁规则保持不变。
+范围：旧 workflow 的目录 frontier 和文件 observation 由 Manifest 持久化；新 workflow 使用 ADR-045 的进程内 Lite frontier，并在发现事务中提交 root observation、正向索引、presence/generation、root 计数和任务进度。创建任务不访问文件系统，实时增量扫描优先级与现有扫描锁规则保持不变。
 
 验收：
 
-- [x] 每个目录的发现结果按有界事务持久化，进程关闭或扫描取消后，已提交 frontier/observation 不丢失。
+- [x] 旧 workflow 每个目录的发现结果按有界事务持久化；新 Lite workflow 按有界事务提交正向结果和 root 状态，进程关闭后从任务 root 快照重新发现。
 - [x] 根路径分别记录完整、不可用或不完整；只有完整发现的根路径可进入后续缺失判定。
 - [x] 同一路径再次观察会追加 observation 版本；发现失败、取消和重试不会把未提交工作标成完成。
-- [x] 现有 `reconciliation_scan_entries` 路径不再承载新 Manifest 全量发现；旧记录保留给升级兼容和历史清理。
+- [x] 现有 `reconciliation_scan_entries` 路径不再承载新 Manifest 全量发现；旧记录保留给升级兼容和历史清理。新 Lite workflow 不把子目录 frontier 写入 `scan_manifest_directories`。
 
 验证：`cargo test --locked --test scanning_jobs`；SQLite 批次/取消/恢复覆盖。
 
@@ -6708,7 +6708,7 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 ### 阶段 22：v3 全量扫描 I/O 并发优化
 
-阶段 21 已建立 format 3 正向索引、持久化 checkpoint 和双数据库兼容。目标是缩短 60,000 文件从目录发现到索引入库的全链路时间，减少 per-file/批次 SQL 往返，并让扫描跨多线程重叠 I/O 与准备而不阻塞前台 API。按 LUX-272（分阶段测量）、LUX-273（滚动式有界读前与准备流水线）、LUX-274（共同写入路径）和 LUX-275（端到端门）执行。SQLite/PostgreSQL 仍共用 SQL 语义，每个 Manifest 只由一个事务 writer 提交；CAS、原子 checkpoint、完整根删除门槛和首页事件顺序不得改变。目标是两后端 60k 首扫中位数都快于 LUX-270 基线 SQLite 2.018 s / PostgreSQL 9.657 s，同时重扫与扫描期间前台 p95 不回退超过 5%。
+阶段 21 已建立 format 3 正向索引、紧凑 presence ledger 和双数据库兼容；新扫描默认使用 ADR-045 的 Lite frontier，旧持久 frontier 仅用于兼容恢复。目标是缩短 60,000 文件从目录发现到索引入库的全链路时间，减少 per-file/批次 SQL 往返，并让扫描跨多线程重叠 I/O 与准备而不阻塞前台 API。按 LUX-272（分阶段测量）、LUX-273（滚动式有界读前与准备流水线）、LUX-274（共同写入路径）和 LUX-275（端到端门）执行。SQLite/PostgreSQL 仍共用 SQL 语义，每个 Manifest 只由一个事务 writer 提交；CAS、原子 checkpoint、完整根删除门槛和首页事件顺序不得改变。Lite 的首轮 A/B 已减少目录 frontier 写入和总体耗时，但当前数据仍未关闭 LUX-275 的严格双后端性能门。
 
 #### LUX-271：v3 资源感知准备并发与目录读取评估
 
