@@ -22,6 +22,11 @@ const emptyNetworkProxy: AdminNetworkProxySettings = {
 export function AdminSettingsPage() {
   const queryClient = useQueryClient();
   const settings = useQuery({ queryKey: queryKeys.adminSettings, queryFn: () => api.adminSettings() });
+  const plugins = useQuery({
+    queryKey: queryKeys.adminPlugins,
+    queryFn: () => api.adminPlugins(),
+    staleTime: 30_000,
+  });
   const [minimumMinutes, setMinimumMinutes] = useState("2");
   const [showMetadataPending, setShowMetadataPending] = useState(true);
   const [forceAdminLibraryOrder, setForceAdminLibraryOrder] = useState(false);
@@ -89,6 +94,18 @@ export function AdminSettingsPage() {
   if (settings.error) return <AdminSettingsState label={settings.error.message} error />;
 
   const networkProxy = settings.data.networkProxy ?? emptyNetworkProxy;
+  const loginBackgroundPlugins = (plugins.data?.plugins ?? []).filter((plugin) =>
+    plugin.installed
+    && plugin.enabled
+    && plugin.available
+    && plugin.capabilities?.includes("login_background.get"),
+  );
+  const savedPluginIsAvailable = loginBackgroundPlugins.some(
+    (plugin) => `PLUGIN:${plugin.id}` === loginBackgroundSource,
+  );
+  const loginBackgroundStatusMessage = getLoginBackgroundStatusMessage(
+    settings.data.loginBackgroundSourceStatus,
+  );
   return (
     <div className="lux-admin-page">
       <header className="lux-admin-page-heading">
@@ -157,7 +174,7 @@ export function AdminSettingsPage() {
         <div className="lux-admin-settings-form">
           <label>
             <span>登录页背景来源</span>
-            <small>固定海报墙保持现有登录页视觉；最新添加会按媒体库新增时间展示真实海报。</small>
+            <small>固定海报墙保持现有登录页视觉；最新添加展示电影和剧集海报，插件来源使用 Lux 固定布局。</small>
             <select
               aria-label="登录页背景来源"
               value={loginBackgroundSource}
@@ -168,11 +185,30 @@ export function AdminSettingsPage() {
             >
               <option value="STATIC">固定海报墙</option>
               <option value="RECENTLY_ADDED">媒体库最新添加</option>
+              {loginBackgroundSource.startsWith("PLUGIN:") && !savedPluginIsAvailable ? (
+                <option value={loginBackgroundSource} disabled>
+                  {plugins.isPending ? "正在确认当前插件状态" : plugins.error ? "当前插件状态无法确认" : "当前所选插件不可用"}
+                </option>
+              ) : null}
+              {loginBackgroundPlugins.map((plugin) => (
+                <option key={plugin.id} value={`PLUGIN:${plugin.id}`}>{plugin.name}</option>
+              ))}
             </select>
           </label>
-          <p className="lux-login-background-warning">
-            选择“媒体库最新添加”后，选中的海报会在未登录页面公开展示，请确认这些资源适合公开展示。
-          </p>
+          {plugins.isPending ? (
+            <p className="lux-login-background-status" role="status">正在读取已安装的登录背景插件…</p>
+          ) : null}
+          {plugins.error ? (
+            <p className="lux-login-background-status is-error" role="alert">无法读取已安装的登录背景插件；请检查插件服务后重试。</p>
+          ) : null}
+          {loginBackgroundSource !== "STATIC" ? (
+            <p className="lux-login-background-warning">
+              选择媒体库或插件内容后，背景图片会在未登录页面公开展示，请确认来源和内容适合公开访问。
+            </p>
+          ) : null}
+          {loginBackgroundSource.startsWith("PLUGIN:") && loginBackgroundStatusMessage ? (
+            <p className="lux-login-background-status" role="status">{loginBackgroundStatusMessage}</p>
+          ) : null}
           <button
             className="lux-button lux-button-primary lux-settings-save"
             type="button"
@@ -260,4 +296,28 @@ function NetworkProxyProbeRow({ probe }: { probe: NetworkProxyProbe }) {
 
 function AdminSettingsState({ label, error = false }: { label: string; error?: boolean }) {
   return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "设置加载失败" : "正在加载设置"}</h1><p>{label}</p></section>;
+}
+
+function getLoginBackgroundStatusMessage(status?: string): string | null {
+  switch (status) {
+    case "READY":
+      return null;
+    case "REFRESHING":
+      return "正在获取背景数据；刷新完成前登录页会继续使用固定海报墙。";
+    case "REFRESH_FAILED_USING_CACHE":
+      return "背景刷新暂时失败，登录页正在使用上次缓存。";
+    case "PLUGIN_DISABLED":
+      return "所选背景插件已停用，登录页会回退到固定海报墙；启用后可自动恢复。";
+    case "PLUGIN_NOT_INSTALLED":
+      return "所选背景插件未安装，登录页会回退到固定海报墙；重新安装后可自动恢复。";
+    case "PLUGIN_UNAVAILABLE":
+      return "所选背景插件当前不可用，登录页会回退到固定海报墙；所选来源仍会保留。";
+    case "REFRESH_FAILED":
+    case "PLUGIN_EXECUTION_FAILED":
+    case "INVALID_PLUGIN_RESPONSE":
+    case "EMPTY_PLUGIN_RESPONSE":
+      return "背景数据暂时不可用，登录页会回退到固定海报墙；系统会在后台重试。";
+    default:
+      return "所选背景插件当前不可用，登录页会回退到固定海报墙；所选来源仍会保留。";
+  }
 }

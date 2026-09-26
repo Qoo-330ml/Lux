@@ -15,6 +15,23 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.2",
+    date: "2026-09-26",
+    sections: [
+      { kind: "added", items: [
+        "登录页背景插件支持单张海报或原比例图片，并可展示作品来源与许可署名链接；插件数据经过校验和缓存，来源不可用时回退到内置背景。",
+      ] },
+      { kind: "changed", items: [
+        "首页“继续观看”对同一剧集只展示季号、集号靠后的未完成进度；电影仍逐条显示，Emby Resume 接口继续按单集返回。",
+        "全量扫描改用可恢复的 Manifest 检查点和分批索引/后处理，减少大目录扫描的数据库写入压力，并支持从已提交进度重试。",
+        "Emby 剧集媒体源名称显示文件名而非媒体库路径，视频轨道标题补充来源清晰度信息。",
+      ] },
+      { kind: "fixed", items: [
+        "修复本地人物资料编辑与重命名时的人物标识稳定性问题，允许更新仅存在于本地的演员资料。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.1",
     date: "2026-09-23",
     sections: [

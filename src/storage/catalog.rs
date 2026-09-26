@@ -947,6 +947,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1051,6 +1053,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1240,6 +1244,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1342,6 +1348,7 @@ impl Database {
         item_types: &[&str],
         played_percent: i64,
         minimum_ticks: i64,
+        latest_episode_per_series: bool,
     ) -> Result<i64, StorageError> {
         if library_ids.is_empty() || item_types.is_empty() {
             return Ok(0);
@@ -1353,9 +1360,12 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let runtime_ticks = resume_runtime_ticks_sql();
+        let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let statement_sql = format!(
             "WITH candidates AS (
-                 SELECT us.position_ticks,
+                 SELECT mi.id, mi.item_type, mi.series_id,
+                        mi.season_number, mi.episode_number, mi.sort_title,
+                        us.position_ticks, us.last_played_at,
                         {runtime_ticks} AS resume_runtime_ticks
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -1363,10 +1373,18 @@ impl Database {
                  WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
                    AND us.is_played = 0 AND us.position_ticks >= ?
                    AND mi.library_id IN ({library_placeholders})
+             ), eligible AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at
+                 FROM candidates
+                 WHERE resume_runtime_ticks > 0
+                   AND position_ticks * 100 < resume_runtime_ticks * ?
+             ),
+             ranked AS (
+                 SELECT {resume_rank} AS resume_rank
+                 FROM eligible
              )
-             SELECT COUNT(*) FROM candidates
-             WHERE resume_runtime_ticks > 0
-               AND position_ticks * 100 < resume_runtime_ticks * ?"
+             SELECT COUNT(*) FROM ranked WHERE resume_rank = 1"
         );
         let mut statement = self
             .query_scalar::<i64>(sqlx::AssertSqlSafe(statement_sql))
@@ -1391,6 +1409,7 @@ impl Database {
     pub(crate) async fn list_resume_items(
         &self,
         query: &ResumeItemsQuery<'_>,
+        latest_episode_per_series: bool,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
         if query.library_ids.is_empty() || query.item_types.is_empty() {
             return Ok(Vec::new());
@@ -1402,9 +1421,11 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let runtime_ticks = resume_runtime_ticks_sql();
+        let resume_rank = Self::resume_rank_expression(latest_episode_per_series);
         let statement_sql = format!(
             "WITH candidates AS (
-                 SELECT mi.id, mi.sort_title, us.position_ticks, us.last_played_at,
+                 SELECT mi.id, mi.item_type, mi.series_id, mi.season_number,
+                        mi.episode_number, mi.sort_title, us.position_ticks, us.last_played_at,
                         {runtime_ticks} AS resume_runtime_ticks
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -1413,11 +1434,22 @@ impl Database {
                    AND us.is_played = 0 AND us.position_ticks >= ?
                    AND mi.library_id IN ({library_placeholders})
              ),
-             ranked AS (
-                 SELECT id, sort_title, last_played_at
+             eligible AS (
+                 SELECT id, item_type, series_id, season_number, episode_number,
+                        sort_title, last_played_at
                  FROM candidates
                  WHERE resume_runtime_ticks > 0
                    AND position_ticks * 100 < resume_runtime_ticks * ?
+             ),
+             ranked AS (
+                 SELECT id, sort_title, last_played_at,
+                        {resume_rank} AS resume_rank
+                 FROM eligible
+             ),
+             limited AS (
+                 SELECT id, sort_title, last_played_at
+                 FROM ranked
+                 WHERE resume_rank = 1
                  ORDER BY last_played_at DESC NULLS LAST, sort_title, id
                  LIMIT ? OFFSET ?
              )
@@ -1435,6 +1467,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1444,7 +1478,7 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM ranked
+             FROM limited ranked
              JOIN media_items mi ON mi.id = ranked.id
              LEFT JOIN media_items series ON series.id = mi.series_id
              LEFT JOIN media_sources ms
@@ -1472,6 +1506,20 @@ impl Database {
         binds.push(CatalogBind::Integer(query.limit));
         binds.push(CatalogBind::Integer(query.offset));
         self.fetch_catalog_rows(&statement_sql, &binds).await
+    }
+
+    fn resume_rank_expression(latest_episode_per_series: bool) -> &'static str {
+        if latest_episode_per_series {
+            "ROW_NUMBER() OVER (
+                 PARTITION BY CASE WHEN item_type = 'EPISODE'
+                                   THEN COALESCE(series_id, id) ELSE id END
+                 ORDER BY season_number DESC NULLS LAST,
+                          episode_number DESC NULLS LAST,
+                          last_played_at DESC NULLS LAST, sort_title, id
+             )"
+        } else {
+            "1"
+        }
     }
 
     pub(crate) async fn count_progress_items(
@@ -1553,6 +1601,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1650,6 +1700,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1716,6 +1768,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                          ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        (SELECT fe.relative_path FROM filesystem_entries fe
+                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1730,7 +1784,8 @@ impl Database {
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                             mi.title, mi.sort_title,
                             mi.original_title, mi.overview, mi.production_year,
-                            mi.rating, mi.rating_source, mi.runtime_ticks
+                            mi.rating, mi.rating_source, mi.runtime_ticks,
+                            mi.added_at, mi.updated_at
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.library_id = ? AND mi.item_type <> 'FOLDER'
@@ -1768,6 +1823,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                          ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        (SELECT fe.relative_path FROM filesystem_entries fe
+                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1782,7 +1839,8 @@ impl Database {
                             mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                             mi.title, mi.sort_title,
                             mi.original_title, mi.overview, mi.production_year,
-                            mi.rating, mi.rating_source, mi.runtime_ticks
+                            mi.rating, mi.rating_source, mi.runtime_ticks,
+                            mi.added_at, mi.updated_at
                      FROM media_items mi
                      JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                      WHERE mi.item_type <> 'FOLDER'
@@ -1823,6 +1881,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1874,6 +1934,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                          ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        (SELECT fe.relative_path FROM filesystem_entries fe
+                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -2088,6 +2150,7 @@ impl Database {
                         thumb_image_tag: row.get("thumb_image_tag"),
                         logo_image_tag: row.get("logo_image_tag"),
                         source_id: row.get("source_id"),
+                        source_relative_path: row.try_get("source_relative_path").ok().flatten(),
                         source_kind: row.get("source_kind"),
                         container: row.get("container"),
                         size: row.get("size"),

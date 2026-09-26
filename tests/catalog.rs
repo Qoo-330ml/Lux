@@ -467,7 +467,7 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     assert_eq!(emby_page_body["Items"][0]["ParentId"], emby_alpha_parent_id);
     assert_eq!(
         emby_page_body["Items"][0]["MediaSources"][0]["Container"],
-        "matroska"
+        "mkv"
     );
 
     let provider_filtered = client

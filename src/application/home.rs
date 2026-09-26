@@ -102,6 +102,7 @@ struct CachedSharedSnapshot {
 struct ScanInvalidationState {
     scheduled: bool,
     dirty: bool,
+    refreshing: bool,
 }
 
 struct HomeServiceInner {
@@ -176,7 +177,7 @@ impl HomeService {
         let continue_watching = self
             .inner
             .catalog
-            .list_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
+            .list_home_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
             .await
             .map_err(HomeError::Catalog)?;
         Ok(Arc::new(HomeSnapshot {
@@ -303,22 +304,40 @@ impl HomeService {
         self.inner.catalog.invalidate_library_pages();
     }
 
-    pub(crate) async fn flush_scan_invalidation(&self) {
+    pub(crate) async fn flush_scan_invalidation(&self) -> bool {
         let should_refresh = {
             let mut state = self.inner.scan_invalidation.lock().await;
-            if !state.scheduled {
+            if state.refreshing || (!state.scheduled && !state.dirty) {
                 false
             } else {
-                let dirty = state.dirty;
                 state.scheduled = false;
                 state.dirty = false;
-                dirty
+                state.refreshing = true;
+                true
             }
         };
-        if should_refresh {
-            self.inner.scan_refresh_epoch.fetch_add(1, Ordering::AcqRel);
-            self.refresh_cached_entries(true).await;
+        if !should_refresh {
+            return false;
         }
+
+        let scan_refresh_epoch = self
+            .inner
+            .scan_refresh_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        let refreshed = self.refresh_cached_entries(true).await;
+        let versions_unchanged = self.inner.generation.load(Ordering::Acquire) == generation
+            && self.inner.scan_refresh_epoch.load(Ordering::Acquire) == scan_refresh_epoch;
+
+        let mut state = self.inner.scan_invalidation.lock().await;
+        state.refreshing = false;
+        if !refreshed || !versions_unchanged || state.scheduled || state.dirty {
+            state.scheduled = true;
+            state.dirty = true;
+            return false;
+        }
+        true
     }
 
     fn schedule_refresh(&self) {
@@ -396,9 +415,22 @@ impl HomeService {
         Ok(snapshot)
     }
 
-    async fn refresh_cached_entries(&self, force: bool) {
+    async fn refresh_cached_entries(&self, force: bool) -> bool {
+        let generation = self.inner.generation.load(Ordering::Acquire);
+        let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+        let mut refreshed_all = true;
         if let Err(error) = self.refresh_shared_snapshot(force).await {
             tracing::warn!(%error, "failed to refresh shared home snapshot");
+            if force {
+                return false;
+            }
+            refreshed_all = false;
+        }
+        if force
+            && (self.inner.generation.load(Ordering::Acquire) != generation
+                || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch)
+        {
+            return false;
         }
         let entries = self
             .inner
@@ -415,14 +447,24 @@ impl HomeService {
                 entry.compute_lock.try_lock().ok()
             };
             let Some(_compute_guard) = compute_guard else {
+                if force {
+                    refreshed_all = false;
+                }
                 continue;
             };
-            let generation = self.inner.generation.load(Ordering::Acquire);
-            let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+            let entry_generation = self.inner.generation.load(Ordering::Acquire);
+            let entry_scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+            if force
+                && (entry_generation != generation
+                    || entry_scan_refresh_epoch != scan_refresh_epoch)
+            {
+                refreshed_all = false;
+                continue;
+            }
             let cached = entry.value.lock().await;
             if !force
                 && cached.as_ref().is_some_and(|cached| {
-                    cached.generation == generation
+                    cached.generation == entry_generation
                         && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
                 })
             {
@@ -436,20 +478,29 @@ impl HomeService {
             };
             match result {
                 Some(Ok(snapshot))
-                    if self.inner.generation.load(Ordering::Acquire) == generation
+                    if self.inner.generation.load(Ordering::Acquire) == entry_generation
                         && self.inner.scan_refresh_epoch.load(Ordering::Acquire)
-                            == scan_refresh_epoch =>
+                            == entry_scan_refresh_epoch =>
                 {
                     *entry.value.lock().await = Some(CachedSnapshot {
-                        generation,
+                        generation: entry_generation,
                         refreshed_at: Instant::now(),
                         snapshot: Arc::new(snapshot),
                     });
                 }
-                Some(Ok(_)) | None => self.schedule_refresh(),
-                Some(Err(error)) => tracing::debug!(%error, "home cache refresh failed"),
+                Some(Ok(_)) | None => {
+                    refreshed_all = false;
+                    self.schedule_refresh();
+                }
+                Some(Err(error)) => {
+                    refreshed_all = false;
+                    tracing::debug!(%error, "home cache refresh failed");
+                }
             }
         }
+        refreshed_all
+            && self.inner.generation.load(Ordering::Acquire) == generation
+            && self.inner.scan_refresh_epoch.load(Ordering::Acquire) == scan_refresh_epoch
     }
 
     async fn build_cached_snapshot(
@@ -665,7 +716,7 @@ mod tests {
         home.invalidate_scan_batch().await;
         assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
 
-        home.flush_scan_invalidation().await;
+        assert!(home.flush_scan_invalidation().await);
         assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
 
         let after_scan = home
@@ -674,8 +725,36 @@ mod tests {
             .expect("user snapshot after scan");
         assert!(!std::ptr::eq(first.as_ref(), after_scan.as_ref()));
 
-        home.flush_scan_invalidation().await;
+        assert!(!home.flush_scan_invalidation().await);
         assert_eq!(home.inner.generation.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn scan_flush_without_pending_invalidation_is_a_noop() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+        let principal = AccessPrincipal::new(UserId::new(), false);
+        let first = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("initial user snapshot");
+
+        assert!(!home.flush_scan_invalidation().await);
+
+        let after_noop = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("user snapshot after no-op flush");
+        assert!(std::ptr::eq(first.as_ref(), after_noop.as_ref()));
     }
 
     #[tokio::test]
@@ -822,5 +901,150 @@ mod tests {
             .await
             .expect("fresh home snapshot");
         assert_eq!(second.continue_watching.items[0].id, item_id);
+    }
+
+    #[tokio::test]
+    async fn home_continue_watching_keeps_only_latest_incomplete_episode_per_series() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let admin = SetupService::new(database.clone())
+            .expect("setup service")
+            .complete("Admin", "Admin", "correct password")
+            .await
+            .expect("admin user");
+        let access = MediaAccessService::new(database.clone());
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Mixed", LibraryKind::Mixed, false)
+            .await
+            .expect("mixed library");
+        let user_id = admin.id.to_string();
+
+        let series_a_id = uuid::Uuid::now_v7().to_string();
+        let series_b_id = uuid::Uuid::now_v7().to_string();
+        for (series_id, title, sort_title) in [
+            (&series_a_id, "Series A", "series a"),
+            (&series_b_id, "Series B", "series b"),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'SERIES', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(series_id)
+            .bind(library.id.to_string())
+            .bind(title)
+            .bind(sort_title)
+            .execute(database.pool())
+            .await
+            .expect("series item");
+        }
+
+        let fixtures = [
+            (
+                Some(series_a_id.as_str()),
+                "EPISODE",
+                Some(1_i64),
+                Some(8_i64),
+                "Series A S01E08",
+                300_i64,
+            ),
+            (
+                Some(series_a_id.as_str()),
+                "EPISODE",
+                Some(2),
+                Some(1),
+                "Series A S02E01",
+                400,
+            ),
+            (
+                Some(series_a_id.as_str()),
+                "EPISODE",
+                Some(2),
+                Some(4),
+                "Series A S02E04",
+                200,
+            ),
+            (
+                Some(series_b_id.as_str()),
+                "EPISODE",
+                Some(1),
+                Some(1),
+                "Series B S01E01",
+                350,
+            ),
+            (None, "MOVIE", None, None, "Standalone Movie", 500),
+            (None, "MOVIE", None, None, "Another Movie", 450),
+        ];
+        let mut item_ids = Vec::new();
+        for (series_id, item_type, season_number, episode_number, title, last_played_at) in fixtures
+        {
+            let item_id = uuid::Uuid::now_v7().to_string();
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, series_id, season_number,
+                    episode_number, title, sort_title, runtime_ticks,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 36000000000, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(&item_id)
+            .bind(library.id.to_string())
+            .bind(item_type)
+            .bind(series_id)
+            .bind(season_number)
+            .bind(episode_number)
+            .bind(title)
+            .bind(title.to_lowercase())
+            .execute(database.pool())
+            .await
+            .expect("episode item");
+            sqlx::query(
+                "INSERT INTO user_item_state (
+                    user_id, item_id, position_ticks, is_played, last_played_at
+                 ) VALUES (?, ?, 6000000000, 0, ?)",
+            )
+            .bind(&user_id)
+            .bind(&item_id)
+            .bind(last_played_at)
+            .execute(database.pool())
+            .await
+            .expect("episode resume state");
+            item_ids.push(item_id);
+        }
+
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access.clone()),
+            libraries,
+        );
+        let principal = AccessPrincipal::new(admin.id, true);
+        let library_ids = access
+            .accessible_library_ids(principal)
+            .await
+            .expect("accessible libraries");
+        let snapshot = home
+            .snapshot(principal, library_ids)
+            .await
+            .expect("home snapshot");
+
+        let items = &snapshot.continue_watching.items;
+        assert_eq!(snapshot.continue_watching.total, 4);
+        assert_eq!(items.len(), 4);
+        assert!(items.iter().any(|item| item.id == item_ids[2]));
+        assert!(items.iter().any(|item| item.id == item_ids[3]));
+        assert!(items.iter().any(|item| item.id == item_ids[4]));
+        assert!(items.iter().any(|item| item.id == item_ids[5]));
+        assert!(!items.iter().any(|item| item.id == item_ids[0]));
+        assert!(!items.iter().any(|item| item.id == item_ids[1]));
+
+        let emby_resume = CatalogService::new(database, access)
+            .list_continue_watching(principal, &user_id, 0, 10)
+            .await
+            .expect("Emby resume items");
+        assert_eq!(emby_resume.total, 6);
+        assert_eq!(emby_resume.items.len(), 6);
     }
 }

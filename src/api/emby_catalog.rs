@@ -236,7 +236,6 @@ pub(super) fn catalog_filter_from_values(
     sort_by: Option<&str>,
     sort_order: Option<&str>,
     metadata_pending: bool,
-    min_date_last_saved: Option<i64>,
 ) -> CatalogFilter {
     let item_types = item_types
         .map(|values| {
@@ -274,7 +273,7 @@ pub(super) fn catalog_filter_from_values(
         years,
         is_played,
         is_favorite,
-        min_date_last_saved,
+        min_date_last_saved: None,
         metadata_pending,
         sort_by: match sort_by {
             Some(value)
@@ -314,8 +313,8 @@ pub(super) fn catalog_filter_from_emby(query: &EmbyItemsQuery) -> CatalogFilter 
         query.sort_by.as_deref(),
         query.sort_order.as_deref(),
         false,
-        query.min_date_last_saved,
     );
+    filter.min_date_last_saved = query.min_date_last_saved;
     let requested_filters = query.filters.as_deref().unwrap_or_default();
     if requested_filters
         .split(',')
@@ -3693,7 +3692,13 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
             "MediaStreams".to_owned(),
             Value::Array(
                 default_source
-                    .map(|source| source.streams.iter().map(emby_media_stream_json).collect())
+                    .map(|source| {
+                        source
+                            .streams
+                            .iter()
+                            .map(|stream| emby_media_source_stream_json(source, stream))
+                            .collect()
+                    })
                     .unwrap_or_default(),
             ),
         );
@@ -4125,13 +4130,19 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
         })
         .map(|stream| stream.index)
         .unwrap_or(-1);
-    // Emby's MediaSource DTO requires Name to be a string. STRM sources often
-    // have no edition label, so do not serialize the optional database value
-    // directly as JSON null; retain a stable compatibility name instead.
+    // Emby clients display the media filename as the source label. Keep the
+    // quality and edition labels available in their dedicated DTO fields and
+    // use them only when no filename is available.
     let media_source_name = source
-        .edition_name
+        .file_name
         .as_deref()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            source
+                .edition_name
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+        })
         .or_else(|| {
             source
                 .quality_label
@@ -4196,7 +4207,13 @@ pub(super) fn emby_media_source_json_with_resolver_and_chapters(
     if include_media_streams && let Value::Object(object) = &mut value {
         object.insert(
             "MediaStreams".to_owned(),
-            Value::Array(source.streams.iter().map(emby_media_stream_json).collect()),
+            Value::Array(
+                source
+                    .streams
+                    .iter()
+                    .map(|stream| emby_media_source_stream_json(source, stream))
+                    .collect(),
+            ),
         );
     }
     value
@@ -4360,6 +4377,38 @@ pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::Catal
             };
             object.entry(key.clone()).or_insert(detail);
         }
+    }
+    value
+}
+
+fn emby_media_source_stream_json(
+    source: &crate::application::catalog::CatalogSource,
+    stream: &crate::application::catalog::CatalogStream,
+) -> Value {
+    let mut value = emby_media_stream_json(stream);
+    let quality_label = source
+        .quality_label
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if emby_stream_type(&stream.stream_type) != "Video" {
+        return value;
+    }
+    let Some(quality_label) = quality_label else {
+        return value;
+    };
+
+    let current_title = value
+        .get("DisplayTitle")
+        .and_then(Value::as_str)
+        .unwrap_or("Video");
+    if current_title.eq_ignore_ascii_case("Video") {
+        value["DisplayTitle"] = Value::String(quality_label.to_owned());
+    } else if !current_title
+        .to_ascii_lowercase()
+        .contains(&quality_label.to_ascii_lowercase())
+    {
+        value["DisplayTitle"] = Value::String(format!("{quality_label} {current_title}"));
     }
     value
 }
@@ -4850,11 +4899,47 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        EmbyItemsQuery, catalog_filter_from_emby, emby_media_stream_json, emby_page_params,
-        emby_playback_container_name,
+        EmbyItemsQuery, catalog_filter_from_emby, emby_media_source_json_with_resolver,
+        emby_media_stream_json, emby_page_params, emby_playback_container_name,
     };
 
-    use crate::application::catalog::CatalogStream;
+    use crate::application::catalog::{CatalogSource, CatalogStream};
+
+    #[test]
+    fn emby_media_source_uses_filename_and_reports_quality_on_video_stream() {
+        let source = CatalogSource {
+            id: "source-1".to_owned(),
+            source_kind: "LOCAL_FILE".to_owned(),
+            file_name: Some("Show.S01E02.2160p.WEB-DL.mkv".to_owned()),
+            container: Some("matroska,webm".to_owned()),
+            size: Some(10_100_000_000),
+            external_url: None,
+            edition_name: None,
+            quality_label: Some("2160p".to_owned()),
+            bitrate: Some(25_300_000),
+            duration_ticks: Some(3_200_000_000),
+            is_default: true,
+            probe_status: "READY".to_owned(),
+            streams: vec![CatalogStream {
+                index: 0,
+                stream_type: "VIDEO".to_owned(),
+                codec: Some("hevc".to_owned()),
+                language: None,
+                title: None,
+                is_external: false,
+                is_default: true,
+                is_forced: false,
+                details: BTreeMap::new(),
+            }],
+            chapters: Vec::new(),
+        };
+
+        let json = emby_media_source_json_with_resolver("item-1", &source, true, false);
+
+        assert_eq!(json["Name"], "Show.S01E02.2160p.WEB-DL.mkv");
+        assert_eq!(json["VideoType"], "2160p");
+        assert_eq!(json["MediaStreams"][0]["DisplayTitle"], "2160p");
+    }
 
     #[test]
     fn emby_media_stream_title_includes_available_audio_and_subtitle_details() {

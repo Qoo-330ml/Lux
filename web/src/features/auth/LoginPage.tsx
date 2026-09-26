@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { motion } from "framer-motion";
-import { FormEvent, type CSSProperties, useState } from "react";
+import { FormEvent, type CSSProperties, useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+import type { PluginLoginBackgroundResponse } from "../../lib/api/types";
 
 const POSTER_WIDTH_PERCENT = 78;
 const POSTER_COLUMN_COUNT = 5;
@@ -19,6 +20,7 @@ export function LoginPage() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
+  const [failedBackgroundKey, setFailedBackgroundKey] = useState<string | null>(null);
 
   const login = useMutation({
     mutationFn: () => api.login(username, password),
@@ -36,9 +38,41 @@ export function LoginPage() {
     login.mutate();
   }
 
-  const posterImages = loginBackground.data?.source === "RECENTLY_ADDED"
-    ? loginBackground.data.images.filter((image) => image.trim().length > 0)
+  const background = loginBackground.data;
+  const pluginBackground = background && "contentKind" in background
+    ? background as PluginLoginBackgroundResponse
+    : undefined;
+  const pluginItems = pluginBackground?.items ?? [];
+  const pluginPosterItems = pluginBackground?.contentKind === "POSTER_FEED"
+    ? pluginBackground.items.filter((item) => item.imageUrl.trim().length > 0)
     : [];
+  const pluginHeroItem = pluginBackground?.contentKind === "HERO_IMAGE"
+    ? pluginBackground.items[0]
+    : undefined;
+  const pluginSinglePosterItem = pluginBackground?.contentKind === "SINGLE_POSTER"
+    ? pluginBackground.items[0]
+    : undefined;
+  const pluginSingleImageItem = pluginBackground?.contentKind === "SINGLE_IMAGE"
+    ? pluginBackground.items[0]
+    : undefined;
+  const backgroundKey = [
+    background?.source ?? "STATIC",
+    ...(background?.source === "RECENTLY_ADDED"
+      ? background.images
+      : pluginItems.map((item) => item.imageUrl)),
+  ].join("\n");
+  useEffect(() => setFailedBackgroundKey(null), [backgroundKey]);
+  const backgroundFailed = failedBackgroundKey === backgroundKey;
+  const posterImages = backgroundFailed
+    ? []
+    : background?.source === "RECENTLY_ADDED"
+      ? background.images.filter((image) => image.trim().length > 0)
+      : pluginPosterItems.map((item) => item.imageUrl);
+  const heroItem = backgroundFailed ? undefined : pluginHeroItem;
+  const singlePosterItem = backgroundFailed ? undefined : pluginSinglePosterItem;
+  const singleImageItem = backgroundFailed ? undefined : pluginSingleImageItem;
+  const tmdbSource = background?.source === "PLUGIN:org.lux.tmdb-trending-background";
+  const markBackgroundFailed = () => setFailedBackgroundKey(backgroundKey);
   const posterColumns = posterImages.reduce<Array<Array<{ image: string; index: number }>>>(
     (columns, image, index) => {
       columns[index % POSTER_COLUMN_COUNT].push({ image, index });
@@ -63,8 +97,49 @@ export function LoginPage() {
       </div>
 
       {/* 左侧海报艺术长卷展示区 */}
-      <section className="lux-auth-visual" aria-hidden="true">
-        {posterImages.length > 0 ? (
+      <section className="lux-auth-visual" aria-label="登录页背景">
+        {singlePosterItem ? (
+          <img
+            className="lux-auth-single-poster"
+            src={singlePosterItem.imageUrl}
+            alt=""
+            aria-hidden="true"
+            loading="eager"
+            onError={markBackgroundFailed}
+          />
+        ) : singleImageItem ? (
+          <div className="lux-auth-single-image-content">
+            <img
+              className="lux-auth-single-image"
+              src={singleImageItem.imageUrl}
+              alt=""
+              aria-hidden="true"
+              loading="eager"
+              onError={markBackgroundFailed}
+            />
+            <LoginBackgroundCredit
+              item={singleImageItem}
+              sourceName={pluginBackground?.sourceName}
+            />
+          </div>
+        ) : heroItem ? (
+          <>
+            <img
+              className="lux-auth-hero-image"
+              src={heroItem.imageUrl}
+              alt=""
+              aria-hidden="true"
+              loading="eager"
+              onError={markBackgroundFailed}
+            />
+            <div className="lux-auth-hero-shade" aria-hidden="true" />
+            <LoginBackgroundCredit
+              item={heroItem}
+              sourceName={pluginBackground?.sourceName}
+              copyrightNotice={pluginBackground?.copyrightNotice}
+            />
+          </>
+        ) : posterImages.length > 0 ? (
           <div
             className="lux-auth-poster-waterfall"
             style={{ "--lux-auth-poster-column-width": posterColumnWidth } as CSSProperties}
@@ -73,10 +148,11 @@ export function LoginPage() {
               <div className="lux-auth-poster-waterfall-column" key={`poster-column-${columnIndex}`}>
                 {column.map(({ image, index }) => (
                   <img
-                    key={image}
+                    key={`${image}-${index}`}
                     src={image}
                     alt=""
                     loading={index < 6 ? "eager" : "lazy"}
+                    onError={markBackgroundFailed}
                   />
                 ))}
               </div>
@@ -90,8 +166,28 @@ export function LoginPage() {
             loading="eager"
           />
         )}
-        <div className="lux-auth-visual-fade" />
+        {singlePosterItem || singleImageItem ? null : <div className="lux-auth-visual-fade" />}
       </section>
+
+      {tmdbSource ? (
+        <details className="lux-auth-credits">
+          <summary>关于与鸣谢</summary>
+          <div className="lux-auth-credits-panel">
+            <a href="https://www.themoviedb.org/" target="_blank" rel="noreferrer">
+              <img
+                className="lux-auth-tmdb-mark"
+                src="https://www.themoviedb.org/assets/2/v4/logos/v2/blue_long_2-9665a76b1ae401a510ec1e0ca40ddcb3b0cfe45f1d51b77a308fea0845885648.svg"
+                alt="TMDB"
+                width="78"
+                height="22"
+                loading="lazy"
+              />
+              <span>The Movie Database</span>
+            </a>
+            <p>This product uses TMDB and the TMDB APIs but is not endorsed, certified, or otherwise approved by TMDB.</p>
+          </div>
+        </details>
+      ) : null}
 
       {/* 右侧登录交互面板 */}
       <section className="lux-auth-panel">
@@ -183,5 +279,29 @@ export function LoginPage() {
         </motion.div>
       </section>
     </main>
+  );
+}
+
+function LoginBackgroundCredit({
+  item,
+  sourceName,
+  copyrightNotice,
+}: {
+  item: PluginLoginBackgroundResponse["items"][number];
+  sourceName?: string;
+  copyrightNotice?: string;
+}) {
+  const title = item.title ?? sourceName;
+  const notice = item.copyrightNotice ?? copyrightNotice;
+  return (
+    <div className="lux-auth-background-credit" aria-live="polite">
+      {title ? item.attributionUrl ? (
+        <a href={item.attributionUrl} target="_blank" rel="noopener noreferrer">{title}</a>
+      ) : <span>{title}</span> : null}
+      {notice ? <span>{notice}</span> : null}
+      {item.licenseUrl && item.licenseUrl !== item.attributionUrl ? (
+        <a href={item.licenseUrl} target="_blank" rel="noopener noreferrer">查看许可证</a>
+      ) : null}
+    </div>
   );
 }

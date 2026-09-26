@@ -11,6 +11,9 @@ const SCAN_EVENT_RETENTION_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub struct DatabaseLifecycleCleanupReport {
     pub scan_job_paths_deleted: u64,
     pub reconciliation_entries_deleted: u64,
+    pub scan_manifest_deltas_deleted: u64,
+    pub scan_manifest_entries_deleted: u64,
+    pub scan_manifest_directories_deleted: u64,
     pub scan_job_targets_deleted: u64,
     pub scan_job_events_deleted: u64,
     pub scan_jobs_summarized: u64,
@@ -27,8 +30,16 @@ impl Database {
     ) -> Result<Option<DatabaseLifecycleCleanupReport>, StorageError> {
         self.reset_interrupted_database_cleanup().await?;
         if !self.claim_database_cleanup().await? {
+            let report = self.cleanup_completed_scan_manifest_payloads().await?;
             self.prune_scan_job_events().await?;
-            return Ok(None);
+            return if report.scan_manifest_deltas_deleted > 0
+                || report.scan_manifest_entries_deleted > 0
+                || report.scan_manifest_directories_deleted > 0
+            {
+                Ok(Some(report))
+            } else {
+                Ok(None)
+            };
         }
 
         let cleanup_result = self.perform_database_cleanup().await;
@@ -123,13 +134,170 @@ impl Database {
     async fn perform_database_cleanup(
         &self,
     ) -> Result<DatabaseLifecycleCleanupReport, StorageError> {
+        let manifest_payload = self.cleanup_completed_scan_manifest_payloads().await?;
         Ok(DatabaseLifecycleCleanupReport {
             scan_job_paths_deleted: self.delete_completed_scan_job_paths().await?,
             reconciliation_entries_deleted: self.delete_completed_reconciliation_entries().await?,
+            scan_manifest_deltas_deleted: manifest_payload.scan_manifest_deltas_deleted,
+            scan_manifest_entries_deleted: manifest_payload.scan_manifest_entries_deleted,
+            scan_manifest_directories_deleted: manifest_payload.scan_manifest_directories_deleted,
             scan_job_targets_deleted: self.delete_non_retryable_scan_job_targets().await?,
             scan_job_events_deleted: self.prune_scan_job_events().await?,
             scan_jobs_summarized: self.summarize_terminal_scan_jobs().await?,
         })
+    }
+
+    pub(crate) async fn cleanup_completed_scan_manifest_payloads(
+        &self,
+    ) -> Result<DatabaseLifecycleCleanupReport, StorageError> {
+        let scan_manifest_deltas_deleted = self.delete_completed_scan_manifest_deltas().await?;
+        let scan_manifest_entries_deleted = self
+            .delete_completed_scan_manifest_entries()
+            .await?
+            .saturating_add(self.delete_completed_scan_manifest_seen_paths().await?);
+        self.query(
+            "UPDATE scan_manifest_roots SET postprocessing_target_cursor = NULL
+             WHERE postprocessing_target_cursor IS NOT NULL
+               AND manifest_id IN (
+                   SELECT id FROM scan_manifests WHERE state = 'COMPLETED'
+               )",
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let scan_manifest_directories_deleted =
+            self.delete_completed_scan_manifest_directories().await?;
+        Ok(DatabaseLifecycleCleanupReport {
+            scan_manifest_deltas_deleted,
+            scan_manifest_entries_deleted,
+            scan_manifest_directories_deleted,
+            ..DatabaseLifecycleCleanupReport::default()
+        })
+    }
+
+    async fn delete_completed_scan_manifest_deltas(&self) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        loop {
+            let count = self
+                .query(
+                    "DELETE FROM scan_manifest_deltas
+                     WHERE id IN (
+                         SELECT delta.id
+                         FROM scan_manifest_deltas delta
+                         JOIN scan_manifests manifest ON manifest.id = delta.manifest_id
+                         WHERE manifest.state = 'COMPLETED'
+                         LIMIT ?
+                     )",
+                )
+                .bind(CLEANUP_BATCH_SIZE)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            deleted = deleted.saturating_add(count);
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_completed_scan_manifest_seen_paths(&self) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        loop {
+            let count = self
+                .query(
+                    "DELETE FROM scan_manifest_seen_paths
+                     WHERE (manifest_id, library_root_id, relative_path) IN (
+                         SELECT seen.manifest_id, seen.library_root_id, seen.relative_path
+                         FROM scan_manifest_seen_paths seen
+                         JOIN scan_manifests manifest ON manifest.id = seen.manifest_id
+                         WHERE manifest.state = 'COMPLETED'
+                         LIMIT ?
+                     )",
+                )
+                .bind(CLEANUP_BATCH_SIZE)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            deleted = deleted.saturating_add(count);
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_completed_scan_manifest_entries(&self) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        loop {
+            let count = self
+                .query(
+                    "DELETE FROM scan_manifest_entries
+                     WHERE (manifest_id, library_root_id, relative_path, observation_sequence) IN (
+                         SELECT entry.manifest_id, entry.library_root_id, entry.relative_path,
+                                entry.observation_sequence
+                         FROM scan_manifest_entries entry
+                         JOIN scan_manifests manifest ON manifest.id = entry.manifest_id
+                         WHERE manifest.state = 'COMPLETED'
+                         LIMIT ?
+                     )",
+                )
+                .bind(CLEANUP_BATCH_SIZE)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            deleted = deleted.saturating_add(count);
+        }
+        Ok(deleted)
+    }
+
+    async fn delete_completed_scan_manifest_directories(&self) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        loop {
+            let count = self
+                .query(
+                    "DELETE FROM scan_manifest_directories
+                     WHERE (manifest_id, library_root_id, relative_path) IN (
+                         SELECT directory.manifest_id, directory.library_root_id,
+                                directory.relative_path
+                         FROM scan_manifest_directories directory
+                         JOIN scan_manifests manifest ON manifest.id = directory.manifest_id
+                         WHERE manifest.state = 'COMPLETED'
+                         LIMIT ?
+                     )",
+                )
+                .bind(CLEANUP_BATCH_SIZE)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            deleted = deleted.saturating_add(count);
+        }
+        Ok(deleted)
     }
 
     async fn delete_completed_scan_job_paths(&self) -> Result<u64, StorageError> {
@@ -174,7 +342,9 @@ impl Database {
                          FROM reconciliation_scan_entries rse
                          JOIN scan_jobs sj ON sj.id = rse.job_id
                          WHERE (sj.status = 'COMPLETED' AND sj.scan_phase = 'IDLE')
-                            OR sj.status = 'CANCELLED'
+                            OR (sj.status = 'CANCELLED'
+                                AND COALESCE(sj.error, '') <>
+                                    'LEGACY_SCAN_REQUIRES_NEW_MANIFEST')
                          LIMIT ?
                      )",
                 )

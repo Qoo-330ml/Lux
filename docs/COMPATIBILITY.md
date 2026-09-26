@@ -152,6 +152,24 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 这些测试证明 Lux 服务端的请求路径、权限、状态码、响应字段和资源清理，不替代 Qmby 在 FNOS 部署实例上的完整
 登录、首页、详情、播放、进度和停止请求序列复测。
 
+## LUX-266 全量扫描 Manifest 存储兼容
+
+新建全量扫描时，job、Manifest、root 状态和目录 frontier 同事务创建；扫描发现将文件/目录 stat 与 fingerprint 作为追加式 observation 持久化，目录 frontier 不再写入 `reconciliation_scan_entries`。Unix 扫描逐段从 root directory handle 打开路径组件并拒绝符号链接，再通过已打开目录 handle 枚举，避免目录在校验与打开之间被替换后越出 library root；发现 chunk 与收尾事务都检查取消标记，取消任务不能进入 `READY_TO_DIFF`。已发现的文件索引工作暂由旧表的 FILE 行承接，直到 LUX-267 将差异应用切换到 Manifest。此内部存储变化不改变 Lux、Webhook 或 Emby 公共合同。
+
+SQLite 与 PostgreSQL 共用有界 `INSERT`/`SELECT`/`UNION ALL`/`ON CONFLICT` 写入，不依赖 COPY、临时表或 PostgreSQL 专属核心 SQL。LUX-266 阶段仅完成 SQLite runtime 与 PostgreSQL migration 结构检查；LUX-270 的 PostgreSQL runtime 结果和两后端语义验证见下节。
+
+## LUX-270 全量扫描 Manifest 兼容合同
+
+Migration 0135 新增 discovery format 3 的紧凑存在性 ledger；后续 additive migration 为 v3 正向索引记录 `last_seen_change_kind` 并增加可恢复的 postprocessing-target cursor/readiness。Format 1/2 及其活动执行器保持不变，现存任务按 ready 默认值跳过新 target 阶段；新任务显式启用 v3 target checkpoint。成功正向索引的 path 由 `filesystem_entries.last_seen_generation` 表示；v3 ledger 只保存 `(manifest_id, library_root_id, relative_path)` 且只用于未被正向索引成功标记的观察路径。root/目录身份 observation 仍保留在 `scan_manifest_entries`，ledger、正向索引、目录 frontier 和进度原子提交。SOURCE/ITEM targets 在索引完成事件与首页切换后，按每根路径游标分批物化；全局 ready barrier 与最后一个 root 的完成状态原子提交，所有 metadata/probe/thumbnail worker 等待该 barrier。重试保持已有 target 状态且从已提交游标继续。
+
+SQLite 与 PostgreSQL 均使用同一套 Manifest 状态与安全合同：只对完整且身份未变化的 root 确认缺失；差异按 `library_root_id + relative_path` 与 `filesystem_entries` 比较；应用时按基线 ID/fingerprint 做 CAS；取消/失败保留已提交 checkpoint，新 Manifest 可从 checkpoint 重试。升级不会把旧 `reconciliation_scan_entries` 伪装成完整 Manifest，也不会在 migration 中扫描文件系统或回填全库；没有 Manifest 的旧活动全量任务安全取消，用户重试时创建新 Manifest。SQLite 与 PostgreSQL 集成测试覆盖 root 替换保护、增量扫描竞争、delta 冲突、取消/恢复、旧 schema 升级以及完成状态。
+
+Migration 0134 在 SQLite 与 PostgreSQL 同步删除 `idx_scan_manifest_entries_path`：其列序与 `scan_manifest_entries` 主键完全一致，主键索引继续覆盖 root/path/最新 observation 查询。SQLite `EXPLAIN QUERY PLAN` 回归确认查询仍使用主键索引；PostgreSQL migration 文本与 SQLite 一致。Migration 0135 增加紧凑 v3 presence ledger；Migration 0136 追加 target change kind、每根路径阶段/cursor 和全局 ready barrier。当前 schema version 为 **136**。0136 将旧 Manifest 和 root 的 target 状态默认设为 ready/DONE；新建 format 3 Manifest 显式从未就绪开始，不重建旧表或回填用户数据。
+
+完成时序对两后端相同，且不改变 API、Webhook DTO 或 Emby 合同：扫描期间首页继续读取旧快照；Manifest 索引与缺失确认提交后，任务进入 `status=COMPLETED, scan_phase=POSTPROCESSING`，刷新首页快照并发布一次 `home`，同时按既有时点发出 `ScanCompleted` webhook 和 `JOB_COMPLETED` INFO 运行事件。新 v3 Manifest 随后在后台分批物化 SOURCE/ITEM targets；所有 root cursor 完成的 ready barrier 提交后才启动 NFO、probe、封面和缩略图 worker，全部完成后阶段转为 `IDLE`。format 1/2 活动任务保留原执行器和已创建的 targets。target 物化/处理失败不撤销索引或重发索引完成事件，可从持久游标与未完成 target 状态恢复。INFO 运行事件按现有策略不写入 `scan_job_events` 表；PostgreSQL 根路径/CAS/取消恢复/旧版本升级由 `tests/postgres_database.rs` 覆盖。
+
+验证：0136 完成后 `cargo test --locked --test postgres_database -- --ignored --nocapture --test-threads=1`（8/8），包括 PostgreSQL format 3 根目录恢复、checkpoint 重试和升级扫描；SQLite `scanning_jobs` 69/69、`scanner` 16/16、`storage` 28/28。`cargo test --locked --test webhooks --test catalog` 为 8/8。首页时序用例在 SQLite 与 PostgreSQL 各通过 1/1；阶段门 `cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`cargo test --locked --all-targets` 均通过，机器 `uname -m=arm64`、Rust 1.97.1。两后端 60,000 文件 release 指标见 [`docs/PERFORMANCE.md`](PERFORMANCE.md)。PostgreSQL 测试使用本机 ARM64 临时容器和专用空库，不代表生产 NAS/远程磁盘性能。
+
 ## 目标矩阵
 
 | 客户端 | 版本 | 平台/设备 | 添加服务器 | 登录 | 浏览/详情 | 播放 | 进度/收藏 | 字幕/多版本 | 证据/备注 |
@@ -630,6 +648,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - 2026-08-14 Filmly Android 详情页根因定位：部分媒体源的 `MediaStreams[].Language` 为 JSON `null` 时，爆米花详情页显示“尝试连接时发生错误”；该日期的临时方案曾仅将剧集分集接口对 Filmly User-Agent 的空语言规范化为 `"und"`。该方案已由 2026-08-28 的统一媒体流序列化修复取代。
 - 2026-08-28 Filmly Android 详情页兼容修复：媒体探测结果中的空白/缺失流语言统一输出为 `"und"`，缺失/空白 `DisplayTitle` 按流类型输出 `Video`、`Audio`、`Subtitle` 或 `Unknown`；规则位于统一 Emby `MediaStream` 序列化入口，覆盖分集列表、详情和媒体源响应，不再依赖客户端 User-Agent 后处理。`tests/series_api.rs` 已覆盖空标题的 Filmly 与 VidHub 分集响应。
 - 2026-09-23 Hills Android 媒体轨道细节补齐：Emby `MediaStreams[].DisplayTitle` 在可用时组合语言、编码、声道布局及字幕 SDH 等原始标题；ffprobe 的 `hearing_impaired` disposition 写入 `IsHearingImpaired`，其他已解析音频字段继续作为结构化字段返回。DTO 与 probe 回归已覆盖；部署后的 Hills 真机复测待完成。
+- 2026-09-24 Hills Android 视频源名称对齐：Emby `MediaSources[].Name` 现在优先使用该源文件的 basename，完整媒体库路径不进入 DTO；`MediaStreams[].DisplayTitle` 在视频标题为空或仅为 `Video` 时显示媒体源质量标签（如 `2160p`），已有标题未包含该标签时也会前置补上。DTO 回归已覆盖；部署后的 Hills 真机复测待完成。
 - 2026-08-11 Filmly 2.12.3 首页请求修复：`/Users/{userId}/Items` 现在支持 `ExcludeItemTypes`，未指定递归和类型时按 Emby 根层级返回电影/剧集，列表 DTO 补充用户 `CanDownload` 和请求的 `Chapters` 字段；已用真实请求参数加入剧集层级协议回归，真实设备刷新复测仍待完成。
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。

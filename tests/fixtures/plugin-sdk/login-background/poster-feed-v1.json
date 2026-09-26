@@ -1,0 +1,12 @@
+{
+  "contentKind": "POSTER_FEED",
+  "sourceName": "Example catalog",
+  "copyrightNotice": "Example catalog image attribution",
+  "items": [
+    {
+      "imageUrl": "https://images.example.com/posters/example.jpg",
+      "title": "Example film",
+      "copyrightNotice": "© Example rights holder"
+    }
+  ]
+}

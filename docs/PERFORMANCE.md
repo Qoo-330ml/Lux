@@ -161,6 +161,135 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 - 2026-08-09 的新结果用于当前提交 `c022fcac`；新增电影后台任务的有界文件准备并发、容器 CPU 配额和首页 p95 自适应降档、按根批量写入；基准脚本本身仍是直接扫描路径，不能据此宣称持久化后台任务的精确耗时变化。
 - 2026-08-10 的新结果用于提交 `5e0bef61`；目录聚合请求使用有界背压，50 个并发目录请求全部成功。剧集、合集、Resume、STRM 与弹幕的大数据量回归由对应合成数据库测试覆盖；本机没有用户的真实媒体库，Docker daemon 也未运行，因此该记录不证明目标 NAS 上的峰值 RSS 或任务结束后的 glibc RSS 回收效果。
 
+## LUX-266 Manifest 发现写入边界
+
+- 新建全量扫描时，scan job、Manifest、root 状态和根目录 frontier 在同一短事务中创建；扫描目录只从 Manifest frontier 取出，不再把目录待办写入 `reconciliation_scan_entries`。
+- 每个有界发现 chunk 在同一事务中追加不可变 observation、插入子目录 frontier、更新 Manifest/root/job 计数，并只在成功枚举目录的最终 chunk 标记该目录完成。取消或失败保留已提交 observation/frontier；未完成的 root 标记为 `INCOMPLETE`，不可进入后续缺失判断。
+- 每条 observation 使用 11 个绑定参数，按 80 条/语句（最多 880 binds）写入；子目录按 200 条（600 binds）写入；为保持本任务增量独立，已发现文件暂由旧文件索引工作队列承接，按 200 条（最多 800 binds）写入。LUX-267 完成 Manifest delta apply 后再移除这段过渡桥接。
+- `cargo test --locked --test scanning_jobs` 覆盖 1,025 个文件的跨批次发现、observation 指纹/重观察版本、取消时保留已提交 frontier，以及 root 不可用后恢复。该测试证明正确性和 SQLite 批次边界，不是耗时/吞吐基准；此任务未运行 release benchmark，也不据此声称扫描速度提升或推断 PostgreSQL/NAS 性能。
+
+## LUX-270 Manifest SQLite/PostgreSQL 阶段门
+
+2026-09-24 在本机 ARM64（`uname -m=arm64`，Rust `aarch64`）使用相同的固定 fixture 运行 release 基准。fixture 为 60,000 个文件、600 个目录，SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。基准二进制报告的基线提交为 `4802c939`，测量包含其后的 LUX-270 工作树改动；数据仅用于同一 ARM64 开发机对照。
+
+| 后端 | Manifest 首扫 | batches / p50 / p95 | SQL / DML | 无变化重扫 | 50 并发管理请求 p95 / 目录列表 p95 | 锁 / WAL |
+|---|---:|---|---:|---:|---:|---|
+| SQLite | 15.796 s | 640 / 23 ms / 28 ms | 30,581 / 13,870 | 1.289 s（41 batches） | 241 ms / 337 ms | `busy_timeout=5000 ms`；154 次 `BEGIN IMMEDIATE` admission 样本：p50 21 µs、p95 10,058 µs、max 10,113 µs、0 次错误 |
+| PostgreSQL 16（本地临时容器） | 142.229 s | 640 / 82 ms / 505 ms | 32,436 / 13,870 | 10.589 s（41 batches） | 272 ms / 641 ms | 写入 WAL 596,331,453 bytes；5,197 次锁等待采样，观察到的最大 waiter 数为 0 |
+
+两组均处理 60,000 个新文件；PostgreSQL 数据库为该次测试专用空库。执行命令：
+
+```bash
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+scripts/run-performance.sh
+
+LUX_PERF_BACKEND=postgres \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+POSTGRES_TEST_HOST=127.0.0.1 \
+POSTGRES_TEST_PORT=55432 \
+POSTGRES_TEST_DATABASE=your_disposable_empty_database \
+POSTGRES_TEST_USER=your_test_user \
+scripts/run-performance.sh
+```
+
+同日以相同 fixture 在提交 `4802c939` 重跑 SQLite LUX-045 直接扫描：2.105 s、3,254 SQL、2,404 DML；LUX-270 最初的 SQLite Manifest 实现为 202.468 s、506,457 SQL、310,870 DML。此次 Manifest 批量 CAS/Delta 更新与索引化最新观察分页后，相比最初 SQLite Manifest 版本首扫约快 12.8 倍，SQL 约减少 16.6 倍，DML 约减少 22.4 倍。Manifest 首扫仍比直接扫描基线慢；两条路径的持久化与安全语义不同，不能将它们当作同一工作量下的等价耗时。PostgreSQL 结果仅为本机临时容器单次观测，不能将 ARM64 数值外推至 NAS/x86_64。SQLite 锁 admission canary 会每 100 ms 尝试一次 `BEGIN IMMEDIATE` 并立即提交，采样本身可能轻微扰动扫描；PostgreSQL 锁采样通过 `pg_stat_activity` 读取，SQL 计数中排除了这些监控查询。
+
+### Manifest 首扫优化复测
+
+2026-09-24 在本机 ARM64（`uname -m=arm64`）对同一 60,000 文件 / 600 目录 fixture 连续运行三次 SQLite release 基准，关闭写锁采样器以减少测量扰动。基准二进制显示提交 `ac869321`，扫描代码为其上的工作树修改。
+
+| 场景 | 三次结果 | 中位数 | SQL / DML | 备注 |
+|---|---:|---:|---:|---|
+| Manifest 首扫 | 7.682 / 7.707 / 7.705 s | **7.705 s** | 10,343 / 5,418 | 120 个 500-delta apply 批次；小目录发现合并为 76 个事务；apply 中位数：应用侧 2.569 s、事务 3.786 s |
+| Manifest 无变化重扫 | 1.254 / 1.251 / 1.215 s | **1.251 s** | — | 41 个批次，无索引 apply |
+| 扫描期间前台 50 请求 | p95 231 / 268 / 234 ms | **234 ms** | — | 目录列表 p95 中位数 419 ms |
+| 旧直接扫描器 | 1.994 s | — | 3,254 / 2,404 | 同机、同 fixture 的一次基准；不是与完整 Manifest 任务相同的持久化/恢复工作量 |
+
+本轮对比 Manifest 初版 15.796 s，首扫中位数减少约 51.2%；SQL/DML 从 30,621/13,870 降至 10,343/5,418。与旧直接扫描 1.994 s 相比仍慢约 **3.9 倍**，**未通过“首扫不能比原版慢”的目标**。已测优化包括 500 条有界 apply 事务（SQL 仍按 SQLite 参数安全上限分块）、复用持久化 observation、按扫描并发并行准备且只保留一次最终设备/inode/fingerprint 复核、合并小目录发现 checkpoint、合并差异页事务、独立 500-path target SQL 块，以及按层级批量插入新电影父目录。三次复测中 apply 阶段仍占约 6.5 s，是下一轮主要优化对象。
+
+三次观测有约 1 秒波动，故记录中位数；这些数字只代表本机 ARM64 与 SQLite，不外推 NAS/x86_64 或 PostgreSQL。LUX-267 v2 将以发现事务作为正向索引 checkpoint，避免为每个 ADD/CHANGE 持久化并二次应用 delta；只有完整根路径上的 REMOVE 仍走持久化 delta 与二次确认。当前旧直接扫描 1.994 s 是同 fixture 的性能参照，不代表相同持久化合同；重构目标是在保留不可变 observation、CAS、删除确认、取消恢复和原子 checkpoint 的前提下尽量逼近该参照。新实现须用同一 ARM64/SQLite fixture 三次 release 中位数测量，并另行运行 PostgreSQL 阶段门。
+
+### LUX-267 v2 正向索引与 Manifest 写入复测
+
+2026-09-25 在同一 ARM64（`uname -m=arm64`，Rust 1.97.1）与 SQLite release 环境，对 60,000 个 MKV / 600 个目录 fixture 连续测三次；SHA-256 为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。基准显示代码提交 `ac869321`，包括当前未提交的 LUX-267 修改；关闭 SQLite 写锁采样器。
+
+| 场景 | 三次结果 | 中位数 | SQL / DML | 备注 |
+|---|---:|---:|---:|---|
+| Manifest 首扫 | 3.252 / 2.836 / 2.853 s | **2.853 s** | 4,383 / 2,953 | 13 个外层批次、66 个正向索引事务；正向提交阶段 1.897 / 1.862 / 1.845 s |
+| Manifest 无变化重扫 | 0.966 / 0.959 / 0.968 s | **0.966 s** | — | 13 个批次 |
+| 扫描期间前台 50 请求 | p95 236 / 227 / 228 ms | **228 ms** | — | 目录列表 p95 中位数 346 ms |
+
+当前代码较 2026-09-24 的前一组 Manifest 复测中位数 3.100 s 快约 8%；受单次数据波动影响，不将差值全部归因于代码优化。v2 避免为正向文件构造不会持久化的 delta 对象；0134 另删除与主键列序完全相同的 `idx_scan_manifest_entries_path`。SQL/DML 数量未因此变化，表明本机测量没有清晰分离出该索引带来的耗时收益。旧直接扫描 1.994 s 仍只是较早提交的参照；本轮试跑该旧入口超过 4 分钟仍未完成且未输出首扫结果，已中止，因此没有当前版本的同代码对照。本记录不宣称已达到“不慢于原版”的目标，也不外推 PostgreSQL 或 NAS 性能。
+
+### LUX-267 discovery format 3 混合 presence 复测
+
+2026-09-25 在相同 ARM64/SQLite release 环境与 60,000 MKV / 600 目录 fixture 上运行三次；fixture SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`，代码提交 `ac869321` 加工作树修改，关闭 SQLite 锁采样器。
+
+| 场景 | 三次结果 | 中位数 | SQL / DML | 备注 |
+|---|---:|---:|---:|---|
+| SQLite format 3 首扫 | 3.069 / 2.618 / 2.633 s | **2.633 s** | 3,727 / 2,475 | 66 个 1,000-path 正向事务；format=3、seen-path=0、完整 FILE observation=0、generation 标记 60,000 条 |
+| SQLite format 3 无变化重扫 | 0.936 / 0.956 / 0.960 s | **0.956 s** | — | 13 个批次；seen-path ledger 记录 60,000 条未变化路径，generation 未被重写 |
+| SQLite 扫描期间前台 50 请求 | p95 234 / 230 / 229 ms | **230 ms** | — | 目录列表 p95 中位数 364 ms |
+| PostgreSQL 16 首扫（本机 ARM64 Docker） | 13.180 / 12.617 / 14.148 s | **13.180 s** | 3,802 / 2,475 | 66 个 1,000-path 事务；WAL 297,865,996 / 311,672,541 / 314,576,597 bytes |
+| PostgreSQL 16 无变化重扫 | 4.032 / 4.015 / 4.040 s | **4.032 s** | — | 13 个批次；锁等待采样关闭 |
+| PostgreSQL 16 扫描期间前台 50 请求 | p95 258 / 266 / 259 ms | **259 ms** | — | 目录列表 p95 中位数 635 ms |
+
+与前一组 format 2 首扫中位数 2.853 s 相比，SQLite format 3 快约 **7.7%**，SQL/DML 分别减少约 15.0%/16.2%；无变化重扫由 0.966 s 到 0.956 s。成功正向索引由当前 filesystem generation 标记，因此新库首扫不写 seen-path；未变化、unstable 或 CAS 未成功路径才写 ledger。2,000-path 事务试验首扫中位数 2.653 s，慢于最终保留的 1,000-path 结果，故仍使用 1,000。
+
+PostgreSQL 三次使用不同临时空库，format 3 首扫中位数 13.180 s、无变化重扫 4.032 s；这验证了本机 PostgreSQL 16 Docker 上的真实 migration、写入和删除合同。PG 锁等待采样关闭。历史旧直接扫描 1.994 s 来自较早提交；当前 ARM64/SQLite format 3 的 2.633 s 仍比该参照慢约 32%，本机旧入口超过 4 分钟未完成，未获得当前代码的直接对照。该差异和本机 Docker PG 数字都不外推 NAS/x86_64 或生产挂载盘。
+
+### LUX-267 v3 target checkpoint 与双后端复测
+
+2026-09-25 在相同 ARM64 环境、Rust 1.97.1、60,000 MKV / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）上，对加入 0136 target checkpoint 的工作树进行 release 基准。SQLite 连测五轮并关闭锁采样；PostgreSQL 16.15/aarch64 Docker 连测三轮，每轮使用新建的空数据库并采集锁等待和 WAL。索引耗时到 `POSTPROCESSING`；target 物化单独计时，处理 120,000 个 SOURCE/ITEM target。
+
+| 后端 | 索引完成：各轮 / 中位数 | target 物化：各轮 / 中位数 | 无变化重扫：各轮 / 中位数 | SQL / DML | 前台 50 请求 p95 中位数 | WAL / 锁 |
+|---|---:|---:|---:|---:|---:|---|
+| SQLite | 2.058 / 2.111 / 2.018 / 2.008 / 1.950 s；**2.018 s** | 556 / 531 / 530 / 526 / 546 ms；**531 ms** | 925 / 941 / 936 / 917 / 915 ms；**925 ms** | 673 / 209 | 234 ms | `synchronous=FULL`；锁采样关闭 |
+| PostgreSQL 16 | 8.703 / 9.657 / 10.591 s；**9.657 s** | 2.442 / 2.503 / 2.344 s；**2.442 s** | 3.641 / 5.031 / 3.743 s；**3.743 s** | 692 / 209 | 257 ms | WAL 215,655,557 / 217,383,695 / 219,460,717 bytes；三轮最大 waiter 均为 0 |
+
+两种后端均使用 13 个扫描批次；PostgreSQL 有 10 个正向提交批次，正向提交中位数 7.268 s，准备中位数 607 ms。SQLite 正向提交中位数 1.150 s。PostgreSQL 目录列表 p95 中位数为 605 ms。性能 harness 的 target 计数/ready 查询已改为后端对应的 bind 占位符；此前 PostgreSQL 首轮基准因此报语法错误，该轮不纳入性能样本。
+
+复测命令：
+
+```bash
+LUX_PERF_DISABLE_LOCK_MONITOR=1 \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_DIRECTORY_COUNT=600 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+scripts/run-performance.sh
+
+LUX_PERF_BACKEND=postgres \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_DIRECTORY_COUNT=600 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+POSTGRES_TEST_HOST=127.0.0.1 \
+POSTGRES_TEST_PORT=55432 \
+POSTGRES_TEST_DATABASE=lux_perf_run_1 \
+POSTGRES_TEST_USER=lux \
+scripts/run-performance.sh
+```
+
+历史直接扫描器的 1.994 s 是较早提交的单次参照；本轮 SQLite Manifest 中位数高 24 ms（约 1.2%），且本轮样本范围为 1.950–2.111 s。两条路径的恢复和持久化工作不同，当前数据支持“约 2 秒索引完成”的结果，不能证明完整 Manifest 严格快于旧直接扫描。PostgreSQL 数字只代表本机 ARM64 容器，不推断远程数据库、NAS/x86_64 或生产挂载盘。
+
+在 target-page / file-batch 参数整理后，用同一 SQLite fixture 又做三次 release spot check：索引完成 **2.913 / 2.005 / 2.042 s**，target 物化 **562 / 534 / 542 ms**，无变化重扫 **920 / 940 / 949 ms**，SQL/DML 为 **675 / 677 / 675 / 209**，target 数仍为 120,000。中位数分别为 2.042 s、542 ms、940 ms；首轮 2.913 s 是这一组三次的高值，因此保留完整样本供后续复测，不以它替换上面的五轮 SQLite 与三轮 PostgreSQL跨后端比较表。按这组三次 spot-check 中位数与历史 1.994 s 单次旧扫描参照相比，高 48 ms（约 2.4%）；仍不能把不同持久化/恢复语义的单次旧值视为严格同口径验收线。
+
+### LUX-271 v3 资源感知扫描与目录 reader 实验
+
+2026-09-25 在本机 ARM64（`uname -m=arm64`，Rust 1.97.1）使用同一 60,000 文件 / 600 目录 fixture，SHA-256 为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。基准构建提交为 `3f18aca1` 加工作树改动，关闭锁采样器。最终代码采用单 reader 顺序发现；基准报告的准备并发为 9，目录 reader 并发为 1。SQLite 与 PostgreSQL 均处理 13 个扫描批次、10 个正向提交批次和 120,000 个 postprocessing target。
+
+| 后端 | 索引完成：各轮 / 中位数 | DISCOVERING / 正向准备 / 正向提交中位数 | target 物化中位数 | 无变化重扫中位数 | batch p50 / p95 中位数 | 前台 p95 / 目录列表 p95 中位数 | SQL / DML | WAL 中位数 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite，最终 sequential reader | 2.549 / 2.094 / 2.232 s；**2.232 s** | 2.224 / 0.592 / 1.247 s | 596 ms | 967 ms | 227 / 253 ms | 242 / 350 ms | 675 / 209 | — |
+| PostgreSQL 16，最终 sequential reader | 55.841 / 9.078 / 16.646 s；**16.646 s** | 16.629 / 0.623 / 8.777 s | 2.875 s | 3.913 s | 928 / 3,944 ms | 270 / 595 ms | 692 / 209 | 215,871,368 bytes |
+
+`DISCOVERING` 包含目录读取、frontier 和 checkpoint；正向准备与事务写入另有 tracing 计时。两后端的首扫样本波动明显。相较 LUX-270 基线，SQLite 索引中位数从 2.018 s 到 2.232 s、前台 p95 从 234 ms 到 242 ms、无变化重扫从 925 ms 到 967 ms；PostgreSQL 索引中位数从 9.657 s 到 16.646 s、前台 p95 从 257 ms 到 270 ms、无变化重扫从 3.743 s 到 3.913 s。该组数据没有通过 LUX-271 的性能门，也不能据此推断 NAS/x86_64 性能。
+
+曾试过两路目录 reader。早期未限制 live reader 数的三轮中位数为 SQLite 2.114 s、PostgreSQL 9.606 s，但代码可能同时保留 64 个目录 reader，也未覆盖空目录替换后的身份复核，因此不能作为可接受结果。把 reader 数限制为两路并补完安全检查后，PostgreSQL 在新建独立数据库中的首扫观测为 10.511、15.855、55.030、14.632 s，波动过大，无法证明稳定收益。为遵守“没有可重复收益时不保留并发复杂度”的验收要求，最终代码移除了并行目录 reader；数据库写入全程仍为单写者。
+
+LUX-271 的扫描配置优先级和目录替换安全检查已保留；并行目录 I/O 的性能验收未通过，项目尚不能据此关闭阶段 22。以上只代表本机 ARM64 与临时 PostgreSQL 16 容器。
+
 ## Web Bilibili 弹幕解析
 
 基准脚本为 `scripts/run-danmaku-performance.mjs`，从指定 Git revision 加载优化前解析器，并与当前工作树在相同 Node 进程中交替执行。输入包含 5,000 条合法弹幕和一个超过 4 MiB 的 ASCII XML；每组 5 批、每批 30 个样本，报告各批 p50/p95 的中位数。
@@ -178,3 +307,92 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 - 每次性能优化记录硬件、数据集、命令、提交以及前后结果。
 - 记录中的路径、token、真实外部 URL 和用户数据必须脱敏。
 - SQL 热查询计划记录见 [`docs/SQL-AUDIT.md`](SQL-AUDIT.md)。
+### LUX-272 v3 全量扫描分阶段计时
+
+LUX-272 在 `lux_270_manifest_job_scan_benchmark` 的完整 `ScanJobService` 路径中采集固定阶段名、微秒累计耗时、调用数、p50/p95 和处理单元数。报告的 `manifestIndexMs`、`postprocessingTargetMaterializationMs`、`unchangedRescanMs` 与前台请求 p95 是墙钟指标；`manifestStageTimings`、`targetStageTimings` 和 `unchangedRescanStageTimings` 是分项累计时间。分项可能嵌套或并发重叠，不能相加当作墙钟时间。
+
+发现阶段分为 `directory_open`、`directory_readdir`、`directory_stat`、`directory_batch_total`、`baseline_query`、`positive_classification`、`positive_file_prepare` 和 `positive_file_recheck`。事务阶段分为输入校验、writer admission、Manifest 状态读取、目录 frontier 插入/完成、known-path 查询、root checkpoint、observation 插入、正向索引、presence ledger、Manifest/job 计数 checkpoint、commit 和事务总时间。`activePreparationTasksPeak` 与 `activeDirectoryReadersPeak` 取实测活动任务峰值；预算配置只作为背景值，不代替观测值。
+
+事件只包含固定阶段名、微秒、计数和批次规模，不包含媒体名、路径、用户数据或数据库连接信息。每次 60k 报告必须包含首扫阶段 JSON、target 物化阶段、无变化重扫阶段、扫描墙钟时间、前台 p95、SQL/DML、SQLite 锁等待或 PostgreSQL WAL/锁等待。此阶段只增加诊断，不改变扫描调度或数据库语义。
+
+验证命令（SQLite 与 PostgreSQL 各三轮 60k；每轮 PostgreSQL 使用新建空库）：
+
+```bash
+LUX_PERF_DISABLE_LOCK_MONITOR=1 \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+scripts/run-performance.sh
+
+LUX_PERF_BACKEND=postgres \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+POSTGRES_TEST_HOST=127.0.0.1 \
+POSTGRES_TEST_PORT=55432 \
+POSTGRES_TEST_DATABASE=your_disposable_empty_database \
+POSTGRES_TEST_USER=your_test_user \
+scripts/run-performance.sh
+```
+
+2026-09-26 使用 Apple M4 / 16 GiB（`uname -m=arm64`，Rust 1.97.1），release 构建提交 `32b28d6a`。固定 fixture 为 60,000 个文件 / 600 个目录，SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。SQLite 关闭 lock canary；PostgreSQL 16 使用本机一次性容器并启用 `pg_stat_activity` lock sampler。数据只代表本机 ARM64，不外推 NAS/x86_64。
+
+| 后端 | 首扫索引完成：三轮 / 中位数 | 扫描批次；batch p50 / p95 中位数 | 正向准备 / 正向提交墙钟累计中位数 | target 物化 / 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | SQL / DML 中位数 | WAL / 锁采样 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| SQLite | 2.058 / 2.009 / 2.178 s；**2.058 s** | 13；208 / 264 ms | 523 / 1,208 ms | 546 / 961 ms | 259 / 383 ms | 675 / 209 | canary 关闭 |
+| PostgreSQL 16 | 19.059 / 10.472 / 10.368 s；**10.472 s** | 13；835 / 2,036 ms | 411 / 7,365 ms | 2,523 / 5,145 ms | 281 / 685 ms | 694 / 209 | WAL 216,506,975 bytes；385 个锁等待采样，中位轮观察最大 waiter 数为 0 |
+
+下表是三轮每轮阶段累计微秒的中位数。`directory_batch_total` 包括 reader 批次开销，readdir/stat 是其内部拆分；同理事务总时间包含内部 SQL 阶段，不能把这些行相加成墙钟时间。
+
+| 阶段（累计微秒） | SQLite | PostgreSQL 16 |
+|---|---:|---:|
+| directory open | 39,790 | 66,485 |
+| readdir | 11,919 | 19,425 |
+| stat | 61,034 | 92,844 |
+| directory batch total | 108,250 | 169,312 |
+| baseline query | 17,397 | 2,128,641 |
+| positive classification | 318,442 | 317,933 |
+| positive file preparation | 770,302 | 788,440 |
+| positive file recheck | 120,280 | 153,753 |
+| positive index apply | 950,342 | 6,458,998 |
+| presence ledger | 5,895 | 21,658 |
+| transaction begin | 445 | 4,090 |
+| transaction commit call | 218,952 | 75,649 |
+| transaction total | 1,206,315 | 7,384,819 |
+
+六轮的活动峰值均为 9 个文件准备任务、1 个目录 reader；这测量的是当前实际代码，暂未启用双目录读前。PostgreSQL `baseline_query` 三轮为 10.360 / 1.103 / 2.129 s，缓存和运行抖动明显；正向索引事务 `positive_index_apply` 中位数为 6.459 s，是当前 PG 主要成本之一。相较 LUX-270 的 SQLite 2.018 s / PostgreSQL 9.657 s 参考中位数，本次诊断版本为 2.058 s / 10.472 s，尚未通过阶段性能目标。
+
+### LUX-273 双 reader 流水线 A/B 与回退决定
+
+2026-09-26 在同一 Apple M4 / 16 GiB ARM64、Rust 1.97.1 和 60,000 文件 / 600 目录 fixture 上，对比 LUX-272 顺序 reader 和双 reader、有界 read/prepare/单 writer 流水线各三轮。两组使用相同 fixture SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`；PostgreSQL 使用本机一次性 PostgreSQL 16 容器。
+
+| 后端/实现 | 首扫索引完成：三轮 / 中位数 | SQL / DML 中位数 | 正向提交批次 | target 物化 / 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | WAL 中位数 |
+|---|---:|---:|---:|---:|---:|---:|
+| SQLite 顺序 reader（LUX-272） | 2.058 / 2.009 / 2.178 s；**2.058 s** | 675 / 209 | 10 | 546 / 961 ms | 259 / 383 ms | — |
+| SQLite 流水线 | 1.951 / 2.136 / 1.935 s；**1.951 s** | 832 / 359 | 28 | 598 / 842 ms | 237 / 365 ms | — |
+| PostgreSQL 顺序 reader（LUX-272） | 19.059 / 10.472 / 10.368 s；**10.472 s** | 694 / 209 | 10 | 2,523 / 5,145 ms | 281 / 685 ms | 216,506,975 bytes |
+| PostgreSQL 流水线 | 10.987 / 17.588 / 14.756 s；**14.756 s** | 871 / 359 | 28 | 2,593 / 3,735 ms | 269 / 620 ms | 228,425,152 bytes |
+
+六轮流水线基准均观察到两个活动 reader、两个并发目录读操作以及读/准备、读/提交重叠，在途峰值 7,454 / 8,192。它把 SQLite 首扫中位数缩短约 5.2%，但 SQL 增约 23%、DML 增约 72%；PostgreSQL 首扫中位数慢约 40.9%，SQL 增约 25%、DML 增约 72%，WAL 增约 5.5%。候选代码已按 LUX-273 条件移除：PostgreSQL 没有稳定收益，单后端加速不足以抵消另一后端回退。SQLite 与 PostgreSQL 数据仍只代表这台 ARM64 开发机和本机测试容器。
+
+### LUX-274 正向索引写入子阶段诊断
+
+2026-09-26 在同一 60,000 文件 / 600 目录 fixture 上各运行一轮，基于 `93a9fa3a` 的顺序 reader 路径，只增加固定名称的子阶段计时。单轮数据用于定位热点，不替代 LUX-272/LUX-273 的三轮中位数；PostgreSQL 此轮总耗时波动尤其明显。
+
+| 后端 | 首扫索引 | `positive_index_apply` | add filesystem claim | add movie materialization | SQL / DML | target 物化 / 无变化重扫 | 前台 p95 | WAL |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite | 2.537 s | 0.978 s | 0.196 s | 0.755 s | 675 / 209 | 0.569 / 0.970 s | 234 ms | — |
+| PostgreSQL 16 | 15.808 s | 6.212 s | 0.881 s | 5.260 s | 698 / 209 | 2.673 / 3.815 s | 278 ms | 216,191,375 bytes |
+
+首扫 DML 摘要中，批量 `media_items` 插入 48 次、`media_sources` 插入 38 次、`filesystem_entries` 插入 38 次。PG 锁采样观察到 0 个最大等待者。电影项/来源物化占正向索引阶段的大部分耗时；LUX-274 试验了受参数上限约束的后端批次，SQL 数据合同和事务边界保持不变。单轮 PostgreSQL 数值不能与三轮中位数直接比较。
+
+#### 后端有界批次三轮对比
+
+每轮均使用 60,000 文件 / 600 目录的相同 fixture；LUX-274 顺序 reader 候选分三次使用新建空 PostgreSQL 数据库运行。SQLite 继续使用 2,000 行批次（最多 22,000 个 `media_sources` bind）；PostgreSQL 使用 5,000 行批次（最多 55,000 个 bind，低于 65,535 的参数上限）。SQLite 的 SQL 批次和 DML 数量保持不变。
+
+| 后端/实现 | 首扫索引：三轮 / 中位数 | 正向索引 apply 中位数 | SQL / DML 中位数 | target / 无变化重扫中位数 | 前台 p95 中位数 | WAL 中位数 |
+|---|---:|---:|---:|---:|---:|---:|
+| SQLite LUX-272 基线 | 2.058 / 2.009 / 2.178 s；**2.058 s** | 0.950 s | 675 / 209 | 0.546 / 0.961 s | 259 ms | — |
+| SQLite LUX-274 候选 | 2.539 / 2.111 / 2.146 s；**2.146 s** | 0.969 s | 675 / 209 | 0.570 / 0.986 s | 255 ms | — |
+| PostgreSQL 16 LUX-273 顺序基线 | 19.059 / 10.472 / 10.368 s；**10.472 s** | 6.459 s | 694 / 209 | 2.523 / 5.145 s | 281 ms | 216,506,975 bytes |
+| PostgreSQL 16 LUX-274 候选 | 9.692 / 9.354 / 8.758 s；**9.354 s** | 6.441 s | 616 / 152 | 2.617 / 3.847 s | 271 ms | 222,461,224 bytes |
+
+PostgreSQL 候选将总 DML 减少约 27%、SQL 减少约 11%，三类主要批量写入分别从 48/38/38 次降为 29/19/19 次；索引完成中位数快约 10.7%，无变化重扫快约 25%。WAL 增加约 2.7%，锁等待采样最大 waiter 数仍为 0；正向索引阶段耗时基本持平，说明数据库行/索引写入仍是剩余成本。SQLite 仍走原 2,000 行批次，DML 不变；其首扫中位数比 LUX-272 参考高约 4.3%，target 和无变化重扫分别高约 4.4% 和 2.6%，前台 p95 改善约 1.5%。这组 ARM64 结果不证明 NAS 性能，也没有关闭 LUX-275 的严格双后端性能门。

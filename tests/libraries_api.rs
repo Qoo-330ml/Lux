@@ -1489,10 +1489,23 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         .send()
         .await?;
     assert_eq!(manual_run.status(), reqwest::StatusCode::ACCEPTED);
-    assert_eq!(
-        manual_run.json::<Value>().await?["taskType"],
-        "RECONCILIATION_SCAN"
-    );
+    let manual_run_body = manual_run.json::<Value>().await?;
+    assert_eq!(manual_run_body["taskType"], "RECONCILIATION_SCAN");
+    let scan_job_id = manual_run_body["run"]["jobId"]
+        .as_str()
+        .ok_or("missing scheduled scan job ID")?;
+    let mut scan_status = (String::new(), String::new());
+    for _ in 0..200 {
+        scan_status = sqlx::query_as("SELECT status, scan_phase FROM scan_jobs WHERE id = ?")
+            .bind(scan_job_id)
+            .fetch_one(database.pool())
+            .await?;
+        if scan_status.0 == "COMPLETED" && scan_status.1 == "IDLE" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(scan_status, ("COMPLETED".to_owned(), "IDLE".to_owned()));
 
     let activity = client
         .get(format!("{base_url}/api/v1/admin/task-activity"))

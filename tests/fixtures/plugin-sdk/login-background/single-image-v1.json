@@ -1,0 +1,11 @@
+{
+  "contentKind": "SINGLE_IMAGE",
+  "sourceName": "Wikimedia Commons · Picture of the Day",
+  "items": [{
+    "imageUrl": "https://thumb.wikimedia.org/wikipedia/commons/thumb/example.jpg/1920px-example.jpg",
+    "title": "A featured daily image",
+    "copyrightNotice": "By Example Photographer · CC BY-SA 4.0",
+    "attributionUrl": "https://commons.wikimedia.org/wiki/File:Example.jpg",
+    "licenseUrl": "https://creativecommons.org/licenses/by-sa/4.0/"
+  }]
+}

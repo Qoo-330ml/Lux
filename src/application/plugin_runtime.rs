@@ -21,7 +21,10 @@ use tokio::{
 use uuid::Uuid;
 use zip::ZipArchive;
 
-use super::plugin_protocol::{PluginManifest, PluginManifestError, PluginRequest, PluginResponse};
+use super::plugin_protocol::{
+    PLUGIN_TYPE_LOGIN_BACKGROUND, PluginManifest, PluginManifestError, PluginRequest,
+    PluginResponse,
+};
 
 const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PLUGIN_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
@@ -427,7 +430,10 @@ impl PluginSupervisor {
         let Some(config_dir) = self.config_dir.as_ref() else {
             return PluginConfigAccess::None;
         };
-        if plugin.manifest.plugin_type == "metadata" {
+        if matches!(
+            plugin.manifest.plugin_type.as_str(),
+            "metadata" | PLUGIN_TYPE_LOGIN_BACKGROUND
+        ) {
             PluginConfigAccess::Dedicated(
                 config_dir
                     .join("plugin-config")
@@ -923,4 +929,52 @@ fn sha256_file(path: &Path) -> Result<String, PluginDiscoveryError> {
         hasher.update(&buffer[..count]);
     }
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn login_background_plugins_receive_only_their_dedicated_config_file() {
+        let config_dir = tempfile::tempdir().expect("create test config directory");
+        let manifest = PluginManifest::from_value(json!({
+            "formatVersion": 1,
+            "id": "org.lux.login-background-test",
+            "name": "Login background test",
+            "version": "1.0.0",
+            "apiVersion": 1,
+            "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+            "type": "login_background",
+            "category": "UTILITY",
+            "capabilities": ["login_background.get"],
+            "permissions": {"imageHosts": ["images.example.com"]},
+            "files": []
+        }))
+        .expect("login background manifest validates");
+        let plugin = DiscoveredPlugin {
+            manifest,
+            source_path: config_dir
+                .path()
+                .join("plugins/org.lux.login-background-test"),
+            root_path: config_dir
+                .path()
+                .join("plugins/org.lux.login-background-test"),
+            entrypoint: config_dir
+                .path()
+                .join("plugins/org.lux.login-background-test/binaries/plugin"),
+            is_archive: false,
+        };
+        let supervisor = PluginSupervisor::new(PluginCatalog::default())
+            .with_config_dir(config_dir.path().to_owned());
+
+        assert!(matches!(
+            supervisor.config_access(&plugin, true),
+            PluginConfigAccess::Dedicated(path)
+                if path == config_dir
+                    .path()
+                    .join("plugin-config/org.lux.login-background-test.json")
+        ));
+    }
 }

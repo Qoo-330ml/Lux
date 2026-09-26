@@ -47,6 +47,120 @@ mod sessions;
 #[path = "users.rs"]
 mod users;
 
+// A media_sources row uses 11 bind values. Keep each backend's positive-index batches
+// below its parameter limit while allowing PostgreSQL fewer round trips per transaction.
+const MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 2_900;
+const POSTGRES_MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 5_000;
+const MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW: usize = 11;
+const SQLITE_MAX_BIND_PARAMETERS: usize = 32_766;
+const POSTGRES_MAX_BIND_PARAMETERS: usize = 65_535;
+// Manifest path queries have at most a handful of fixed binds in addition to each path.
+// Keep a generous safety margin below both backend parameter limits.
+const MANIFEST_PATH_QUERY_SQLITE_CHUNK_SIZE: usize = 2_900;
+const MANIFEST_PATH_QUERY_POSTGRES_CHUNK_SIZE: usize = 5_000;
+// A media_items hierarchy row has 15 bound columns; these sizes stay below each backend limit.
+const MEDIA_ITEM_HIERARCHY_SQLITE_CHUNK_SIZE: usize = 2_000;
+const MEDIA_ITEM_HIERARCHY_POSTGRES_CHUNK_SIZE: usize = 4_000;
+const MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW: usize = 15;
+const MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE: usize = 8_000;
+
+pub(crate) fn manifest_positive_index_insert_chunk_size(backend: DatabaseBackend) -> usize {
+    let (chunk_size, max_bind_parameters) = match backend {
+        DatabaseBackend::Sqlite => (
+            MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE,
+            SQLITE_MAX_BIND_PARAMETERS,
+        ),
+        DatabaseBackend::Postgres => (
+            POSTGRES_MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE,
+            POSTGRES_MAX_BIND_PARAMETERS,
+        ),
+    };
+    debug_assert!(
+        chunk_size <= max_bind_parameters / MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW
+    );
+    chunk_size
+}
+
+pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => MANIFEST_PATH_QUERY_SQLITE_CHUNK_SIZE,
+        DatabaseBackend::Postgres => MANIFEST_PATH_QUERY_POSTGRES_CHUNK_SIZE,
+    }
+}
+
+pub(crate) fn media_item_hierarchy_insert_chunk_size(backend: DatabaseBackend) -> usize {
+    let (chunk_size, max_bind_parameters) = match backend {
+        DatabaseBackend::Sqlite => (
+            MEDIA_ITEM_HIERARCHY_SQLITE_CHUNK_SIZE,
+            SQLITE_MAX_BIND_PARAMETERS,
+        ),
+        DatabaseBackend::Postgres => (
+            MEDIA_ITEM_HIERARCHY_POSTGRES_CHUNK_SIZE,
+            POSTGRES_MAX_BIND_PARAMETERS,
+        ),
+    };
+    debug_assert!(chunk_size * MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW <= max_bind_parameters);
+    chunk_size
+}
+
+#[cfg(test)]
+mod manifest_positive_index_batch_tests {
+    use super::{
+        DatabaseBackend, MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW,
+        MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW, POSTGRES_MAX_BIND_PARAMETERS,
+        SQLITE_MAX_BIND_PARAMETERS, manifest_path_query_chunk_size,
+        manifest_positive_index_insert_chunk_size, media_item_hierarchy_insert_chunk_size,
+    };
+
+    #[test]
+    fn backend_batches_respect_query_parameter_limits() {
+        let sqlite_size = manifest_positive_index_insert_chunk_size(DatabaseBackend::Sqlite);
+        let postgres_size = manifest_positive_index_insert_chunk_size(DatabaseBackend::Postgres);
+
+        assert_eq!(sqlite_size, 2_900);
+        assert_eq!(postgres_size, 5_000);
+        assert!(
+            sqlite_size * MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW
+                <= SQLITE_MAX_BIND_PARAMETERS
+        );
+        assert!(
+            postgres_size * MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW
+                <= POSTGRES_MAX_BIND_PARAMETERS
+        );
+        assert!(postgres_size > sqlite_size);
+    }
+
+    #[test]
+    fn manifest_path_batches_are_backend_aware() {
+        assert_eq!(
+            manifest_path_query_chunk_size(DatabaseBackend::Sqlite),
+            2_900
+        );
+        assert_eq!(
+            manifest_path_query_chunk_size(DatabaseBackend::Postgres),
+            5_000
+        );
+    }
+
+    #[test]
+    fn hierarchy_batches_respect_media_item_bind_limits() {
+        let sqlite_size = media_item_hierarchy_insert_chunk_size(DatabaseBackend::Sqlite);
+        let postgres_size = media_item_hierarchy_insert_chunk_size(DatabaseBackend::Postgres);
+
+        assert_eq!(sqlite_size, 2_000);
+        assert_eq!(postgres_size, 4_000);
+        assert!(
+            sqlite_size * MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW
+                <= SQLITE_MAX_BIND_PARAMETERS
+        );
+        assert!(
+            postgres_size * MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW
+                <= POSTGRES_MAX_BIND_PARAMETERS
+        );
+        assert!(postgres_size > sqlite_size);
+    }
+}
+
 pub use database_cleanup::DatabaseLifecycleCleanupReport;
 pub(crate) use device_pairings::DevicePairingRedeemResult;
 
@@ -74,6 +188,8 @@ const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
 const BATCH_INSERT_CHUNK_SIZE: usize = 100;
 // Four binds per reconciliation row keep 200 rows below SQLite's historical 999-variable limit.
 const SCAN_DML_CHUNK_SIZE: usize = 200;
+// Eight binds per delta row keep each insert batch below SQLite's historical 999-variable limit.
+const SCAN_MANIFEST_DELTA_BATCH_SIZE: usize = 100;
 const RECOMMENDATION_RATING_CACHE_TTL_SECONDS: i64 = 30 * 86_400;
 const DATABASE_POOL_MAX_CONNECTIONS_ENV: &str = "LUX_DB_MAX_CONNECTIONS";
 const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
@@ -1020,6 +1136,259 @@ pub(crate) struct StoredScanJob {
     pub(crate) scan_phase: String,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewScanManifestRoot<'a> {
+    pub(crate) library_root_id: &'a str,
+}
+
+#[derive(Debug)]
+pub(crate) struct NewScanManifest<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) job_id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) roots: &'a [NewScanManifestRoot<'a>],
+}
+
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // LUX-267 supplies computed reconciliation deltas through this boundary.
+pub(crate) struct NewScanManifestDelta<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) observation_sequence: Option<i64>,
+    pub(crate) delta_kind: &'a str,
+    pub(crate) base_filesystem_entry_id: Option<&'a str>,
+    pub(crate) base_fingerprint: Option<&'a [u8]>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NewScanManifestSidecarEntry {
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) relative_path: String,
+}
+
+#[derive(Clone)]
+pub(crate) enum NewScanManifestIndexedFile {
+    Movie(NewMovieFile),
+    Episode(NewEpisodeFile),
+    Unresolved(NewScanManifestUnresolvedFile),
+    Sidecar(NewScanManifestSidecarEntry),
+}
+
+#[derive(Clone)]
+pub(crate) struct NewScanManifestPositiveIndex {
+    pub(crate) relative_path: String,
+    pub(crate) delta_kind: String,
+    pub(crate) base_filesystem_entry_id: Option<String>,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+    pub(crate) file: NewScanManifestIndexedFile,
+}
+
+pub(crate) struct NewScanManifestFilesystemEntry<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: &'a [u8],
+    pub(crate) last_seen_change_kind: Option<&'a str>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NewScanManifestUnresolvedFile {
+    pub(crate) item_id: String,
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) source_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Vec<u8>,
+    pub(crate) title: String,
+    pub(crate) identity_key: String,
+    pub(crate) source_kind: String,
+    pub(crate) container: String,
+    pub(crate) external_url: Option<String>,
+    pub(crate) strm_target_kind: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ManifestExistingFileUpdate<'a> {
+    pub(crate) filesystem_entry_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) relative_path: &'a str,
+    pub(crate) base_fingerprint: Option<&'a [u8]>,
+    pub(crate) expected_missing: bool,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: &'a [u8],
+    pub(crate) generation: &'a str,
+    pub(crate) last_seen_change_kind: Option<&'a str>,
+    pub(crate) source_kind: &'a str,
+    pub(crate) edition_name: Option<&'a str>,
+    pub(crate) quality_label: Option<&'a str>,
+    pub(crate) container: &'a str,
+    pub(crate) external_url: Option<&'a str>,
+    pub(crate) strm_target_kind: Option<&'a str>,
+}
+
+pub(crate) struct ManifestDeltaBatchCommit<'a> {
+    pub(crate) job_id: &'a str,
+    pub(crate) manifest_id: &'a str,
+    pub(crate) library_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) generation: &'a str,
+    pub(crate) deltas: &'a [StoredScanManifestDelta],
+    pub(crate) unstable_delta_ids: &'a [String],
+    pub(crate) movie_files: &'a [NewMovieFile],
+    pub(crate) episode_files: &'a [NewEpisodeFile],
+    pub(crate) unresolved_files: &'a [NewScanManifestUnresolvedFile],
+    pub(crate) sidecar_entries: &'a [NewScanManifestSidecarEntry],
+    pub(crate) removed_media_paths: &'a [String],
+    pub(crate) removed_sidecar_paths: &'a [String],
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManifestDeltaBatchCommitResult {
+    pub(crate) applied_count: usize,
+    pub(crate) conflict_count: usize,
+    pub(crate) unstable_count: usize,
+    pub(crate) created_items: usize,
+    pub(crate) metadata_targets_changed: bool,
+    pub(crate) removed_count: usize,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // LUX-267 consumes the persisted diff and apply counters.
+pub(crate) struct StoredScanManifest {
+    pub(crate) id: String,
+    pub(crate) job_id: String,
+    pub(crate) library_id: String,
+    pub(crate) state: String,
+    pub(crate) workflow_version: i64,
+    pub(crate) discovery_format_version: i64,
+    pub(crate) root_count: i64,
+    pub(crate) discovered_directory_count: i64,
+    pub(crate) completed_directory_count: i64,
+    pub(crate) observed_file_count: i64,
+    pub(crate) unchanged_count: i64,
+    pub(crate) add_count: i64,
+    pub(crate) change_count: i64,
+    pub(crate) remove_count: i64,
+    pub(crate) reappeared_count: i64,
+    pub(crate) applied_delta_count: i64,
+    pub(crate) postprocessing_targets_ready: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestPostprocessingRoot {
+    pub(crate) library_root_id: String,
+    pub(crate) canonical_path: String,
+    pub(crate) expected_device: Option<i64>,
+    pub(crate) expected_inode: Option<i64>,
+    pub(crate) target_stage: String,
+    pub(crate) target_cursor: Option<String>,
+    pub(crate) has_stage_rows: bool,
+    pub(crate) has_positive_rows: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct ManifestPostprocessingTargetBatchResult {
+    pub(crate) targets_changed: bool,
+    pub(crate) targets_ready: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ManifestPostprocessingTargetPage<'a> {
+    pub(crate) job_id: &'a str,
+    pub(crate) manifest_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) generation: &'a str,
+    pub(crate) target_stage: &'a str,
+    pub(crate) target_cursor: Option<&'a str>,
+    pub(crate) page_size: usize,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestDiffCandidate {
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) observation_sequence: i64,
+    pub(crate) delta_kind: String,
+    pub(crate) base_filesystem_entry_id: Option<String>,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+    pub(crate) base_entry_kind: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanManifestFilesystemBaseline {
+    pub(crate) id: String,
+    pub(crate) entry_kind: String,
+    pub(crate) fingerprint: Option<Vec<u8>>,
+    pub(crate) is_missing: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestRemovalCandidate {
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) base_filesystem_entry_id: String,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StoredScanManifestDelta {
+    pub(crate) id: String,
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+    pub(crate) observation_sequence: Option<i64>,
+    pub(crate) delta_kind: String,
+    pub(crate) base_filesystem_entry_id: Option<String>,
+    pub(crate) base_fingerprint: Option<Vec<u8>>,
+    pub(crate) entry_kind: Option<String>,
+    pub(crate) size: Option<i64>,
+    pub(crate) modified_at: Option<i64>,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NewScanManifestEntry {
+    pub(crate) relative_path: String,
+    pub(crate) entry_kind: String,
+    pub(crate) size: i64,
+    pub(crate) modified_at: i64,
+    pub(crate) device: Option<i64>,
+    pub(crate) inode: Option<i64>,
+    pub(crate) fingerprint: Vec<u8>,
+}
+
+pub(crate) struct NewScanManifestDiscoveryChunk<'a> {
+    pub(crate) manifest_id: &'a str,
+    pub(crate) job_id: &'a str,
+    pub(crate) library_root_id: &'a str,
+    pub(crate) child_directories: &'a [String],
+    pub(crate) entries: &'a [NewScanManifestEntry],
+    pub(crate) positive_indexes: &'a [NewScanManifestPositiveIndex],
+    pub(crate) unchanged_paths: &'a [String],
+    pub(crate) completed_directory: Option<&'a str>,
+}
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct ManifestDiscoveryCommitResult {
+    pub(crate) observed_file_count: i64,
+    pub(crate) created_items: usize,
+    pub(crate) metadata_targets_changed: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestDirectory {
+    pub(crate) library_root_id: String,
+    pub(crate) relative_path: String,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredScanJobPath {
     pub(crate) library_root_id: String,
@@ -1682,6 +2051,7 @@ pub(crate) struct StoredCatalogRow {
     pub(crate) thumb_image_tag: Option<String>,
     pub(crate) logo_image_tag: Option<String>,
     pub(crate) source_id: Option<String>,
+    pub(crate) source_relative_path: Option<String>,
     pub(crate) source_kind: Option<String>,
     pub(crate) container: Option<String>,
     pub(crate) size: Option<i64>,

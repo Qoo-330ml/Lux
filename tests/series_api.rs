@@ -103,13 +103,18 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     .bind(&episode_id)
     .execute(database.pool())
     .await?;
-    sqlx::query("UPDATE media_sources SET container = ?, size = ?, bitrate = ? WHERE id = ?")
-        .bind("mkv")
-        .bind(123_i64)
-        .bind(456_i64)
-        .bind(&episode_source_id)
-        .execute(database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE media_sources
+         SET container = ?, size = ?, bitrate = ?, quality_label = ?
+         WHERE id = ?",
+    )
+    .bind("mkv")
+    .bind(123_i64)
+    .bind(456_i64)
+    .bind("2160p")
+    .bind(&episode_source_id)
+    .execute(database.pool())
+    .await?;
     sqlx::query(
         "INSERT INTO media_streams
          (id, media_source_id, stream_index, stream_type, codec, title, details_json, is_default)
@@ -420,7 +425,15 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(
         vidhub_episodes_body["Items"][0]["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
-        "Video"
+        "2160p"
+    );
+    assert_eq!(
+        vidhub_episodes_body["Items"][0]["MediaSources"][0]["Name"],
+        "Example.Show.S01E01.mkv"
+    );
+    assert_eq!(
+        vidhub_episodes_body["Items"][0]["MediaSources"][0]["VideoType"],
+        "2160p"
     );
 
     let vidhub_episodes_small_limit = client
@@ -541,7 +554,11 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     );
     assert_eq!(
         filmly_episode["MediaSources"][0]["MediaStreams"][0]["DisplayTitle"],
-        "Video"
+        "2160p"
+    );
+    assert_eq!(
+        filmly_episode["MediaSources"][0]["Name"],
+        "Example.Show.S01E01.mkv"
     );
 
     let episode_primary_image = client
