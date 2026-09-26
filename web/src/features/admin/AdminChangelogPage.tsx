@@ -15,6 +15,16 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.3",
+    date: "2026-09-26",
+    sections: [
+      { kind: "changed", items: [
+        "全量扫描新增轻量 Manifest 发现模式，减少目录 frontier 和逐文件状态写入；批量更新未变化文件，并通过 generation/fingerprint CAS 与删除前复核维持扫描安全。",
+        "批量优化 PostgreSQL 媒体搜索、可用性与 Provider 索引刷新，减少扫描和入库时重复触发的数据库工作；补充扫描阶段耗时诊断信息。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.2",
     date: "2026-09-26",
     sections: [
