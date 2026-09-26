@@ -376,6 +376,183 @@ async fn none_mode_skips_local_thumbnail_generation_without_removing_existing_as
 }
 
 #[tokio::test]
+async fn scraper_first_defers_screenshots_when_an_online_scraper_is_configured()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library_with_scraper(
+            "Movies",
+            LibraryKind::Movie,
+            false,
+            Some("org.lux.tmdb"),
+            false,
+        )
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Deferred Screenshot (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Deferred.Screenshot.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    let scan = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    ScanJobService::new(database.clone())
+        .run_to_completion(&scan.id, 100, None)
+        .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fs::write(&log, "")?;
+    fake_ffmpeg(&fake, &log, 0)?;
+    let report = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5))
+        .generate_library(library.id)
+        .await?;
+
+    assert_eq!(report.generated, 0);
+    assert!(
+        !movie_dir
+            .join("Deferred.Screenshot.2024-poster.jpg")
+            .exists()
+    );
+    assert!(
+        !movie_dir
+            .join("Deferred.Screenshot.2024-thumbnail.jpg")
+            .exists()
+    );
+    assert_eq!(ffmpeg_invocation_count(&fs::read_to_string(log)?), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scraper_first_generates_screenshots_after_three_missing_online_attempts()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library_with_scraper(
+            "Movies",
+            LibraryKind::Movie,
+            false,
+            Some("org.lux.tmdb"),
+            false,
+        )
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Third Attempt (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Third.Attempt.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "INSERT INTO thumbnail_scraper_retries (
+            item_id, status, attempt_count, first_attempt_at, next_retry_at, claimed_until
+         ) VALUES (?, 'COMPLETE', 3, 1000, NULL, NULL)",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fs::write(&log, "")?;
+    fake_ffmpeg(&fake, &log, 0)?;
+    let report = ThumbnailService::with_runner(database, fake, Duration::from_secs(5))
+        .generate_library(library.id)
+        .await?;
+
+    assert_eq!(report.generated, 1);
+    assert!(movie_dir.join("Third.Attempt.2024-poster.jpg").exists());
+    assert!(movie_dir.join("Third.Attempt.2024-thumbnail.jpg").exists());
+    assert_eq!(ffmpeg_invocation_count(&fs::read_to_string(log)?), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scraper_first_does_not_screenshot_when_poster_and_thumb_already_exist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library_with_scraper(
+            "Movies",
+            LibraryKind::Movie,
+            false,
+            Some("org.lux.tmdb"),
+            false,
+        )
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Existing Images (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Existing.Images.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "INSERT INTO thumbnail_scraper_retries (
+            item_id, status, attempt_count, first_attempt_at, next_retry_at, claimed_until
+         ) VALUES (?, 'COMPLETE', 3, 1000, NULL, NULL)",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let scraper_bytes = b"\xFF\xD8scraper\xFF\xD9";
+    for (image_type, file_name) in [
+        ("POSTER", "Existing.Images.2024-poster.jpg"),
+        ("THUMB", "Existing.Images.2024-thumbnail.jpg"),
+    ] {
+        let path = movie_dir.join(file_name);
+        fs::write(&path, scraper_bytes)?;
+        sqlx::query(
+            "INSERT INTO item_images (
+                id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+             ) VALUES (?, ?, ?, 0, ?, ?, 'scraper', 'TMDB')",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(&item_id)
+        .bind(image_type)
+        .bind(path.to_string_lossy().as_ref())
+        .bind(i64::try_from(scraper_bytes.len())?)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fs::write(&log, "")?;
+    fake_ffmpeg(&fake, &log, 0)?;
+    let report = ThumbnailService::with_runner(database, fake, Duration::from_secs(5))
+        .generate_library(library.id)
+        .await?;
+
+    assert_eq!(report.generated, 0);
+    assert_eq!(report.reused, 1);
+    assert_eq!(ffmpeg_invocation_count(&fs::read_to_string(log)?), 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn screenshot_first_replaces_scraper_poster_and_thumbnail_independently()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

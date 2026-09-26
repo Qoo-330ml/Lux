@@ -6351,8 +6351,8 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 
 范围：在全局媒体库策略和单个媒体库覆盖策略中新增 `images.thumbnailScrapingMode`，使用
 `NONE`（不刮削）、`SCREENSHOT_FIRST`（截图优先）和 `SCRAPER_FIRST`（刮削器优先）三个值，默认
-`SCRAPER_FIRST` 以保持已有媒体库行为。该策略同时约束 `POSTER` 与 `THUMB` 两类自动缩略图，
-不新增数据库列，继续复用现有媒体策略 JSON。
+`SCRAPER_FIRST` 以保持已有媒体库行为。该策略同时约束 `POSTER` 与 `THUMB` 两类自动缩略图；
+策略继续复用现有媒体策略 JSON，刮削器优先的重试时刻由持久化队列表记录。
 
 验收：
 
@@ -6361,10 +6361,14 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
       `POSTER`/`THUMB` 截图会按当前策略生成，不要求媒体文件指纹发生变化。
 - [ ] `NONE` 不发起 `POSTER`/`THUMB` 在线刮削，也不生成本地视频或 STRM 视频截图；不删除已有登记图片，
       手工本地图片仍保持最高优先级。
-- [ ] `SCREENSHOT_FIRST` 同时允许元数据刮削和截图生成；成功的 `FFMPEG`/`STRM_FFMPEG` 截图优先于
-      刮削器图片，缺少截图时回退到刮削器图片；`POSTER` 与 `THUMB` 独立判断。
-- [ ] `SCRAPER_FIRST` 保持现有行为：刮削器图片优先，截图只补全缺失图片；刮削器后来获得图片时可以
-      替换截图回退图。
+- [ ] `SCREENSHOT_FIRST` 在资源入库后生成 `FFMPEG`/`STRM_FFMPEG` 截图；每种图片类型已有有效截图后，
+      元数据刮削不得再请求或覆盖该类型的在线图片。截图生成失败或该类型仍无截图时，在线图片可以补位；
+      `POSTER` 与 `THUMB` 独立判断。
+- [ ] `SCRAPER_FIRST` 配置在线刮削器时先尝试在线图片，不立即生成截图；在线图片依次在首次处理、首次后
+      6 小时、首次后 24 小时尝试，共三次。三次后仍缺少图片时才生成截图，并且只为缺失的类型生成；已有
+      `POSTER` 和 `THUMB` 时不再截图。重试时刻持久化，进程重启和媒体库重扫不重置首次尝试时间。
+- [ ] `SCRAPER_FIRST` 没有配置在线刮削器时，资源入库后仍可立即生成截图；三次在线尝试后截图作为回退图，
+      后续在线刮削成功时仍可替换该回退图。
 - [ ] STRM 信息提取插件的 `thumbnailEnabled` 仍受插件配置控制，但媒体库为 `NONE` 时宿主不得为该库
       请求或登记缩略图；媒体信息提取不受该缩略图策略影响。
 - [ ] API 对未知模式返回校验错误；旧策略 JSON 缺少该字段时按 `SCRAPER_FIRST` 兼容解析。
@@ -6372,6 +6376,7 @@ AccessToken 的生成、哈希存储、撤销和用户解析。
 验证：
 
 - `cargo test --locked --test thumbnails --test strm_probe --test libraries_api`
+- `cargo test --locked --lib storage::repository::repository_tests::thumbnail_scraper_retries_are_persisted_and_claimed_at_due_times`
 - `cargo fmt --all -- --check`
 - `cargo clippy --locked --all-targets --all-features -- -D warnings`
 - `pnpm --dir web test`
