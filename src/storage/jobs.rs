@@ -1832,12 +1832,17 @@ impl Database {
             child_directories.len(),
         );
         let manifest_state_started = Instant::now();
-        let (workflow_version, discovery_format_version): (i64, i64) = self
+        let (workflow_version, discovery_format_version, generation): (i64, i64, String) = self
             .query_as(
-                "SELECT workflow_version, discovery_format_version FROM scan_manifests
-                 WHERE id = ? AND state = 'DISCOVERING'",
+                "SELECT manifest.workflow_version, manifest.discovery_format_version,
+                        job.generation
+                 FROM scan_manifests manifest
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 WHERE manifest.id = ? AND manifest.state = 'DISCOVERING'
+                   AND job.id = ?",
             )
             .bind(chunk.manifest_id)
+            .bind(chunk.job_id)
             .fetch_one(&mut *transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -1911,9 +1916,7 @@ impl Database {
                          SELECT 1 FROM filesystem_entries entry
                            WHERE entry.library_root_id = ?
                            AND entry.relative_path = incoming.relative_path
-                           AND entry.last_seen_generation = (
-                               SELECT generation FROM scan_jobs WHERE id = ?
-                           )
+                           AND entry.last_seen_generation = ?
                      )"
                 )
             } else {
@@ -1931,7 +1934,7 @@ impl Database {
                 for path in paths {
                     statement = statement.bind(path);
                 }
-                statement = statement.bind(chunk.library_root_id).bind(chunk.job_id);
+                statement = statement.bind(chunk.library_root_id).bind(&generation);
             } else {
                 statement = statement
                     .bind(chunk.manifest_id)
@@ -2293,11 +2296,12 @@ impl Database {
                                 AND current.is_missing = 0
                           )
                      UPDATE filesystem_entries
-                     SET last_seen_generation = (
-                             SELECT generation FROM scan_jobs WHERE id = ?
-                         ),
+                     SET last_seen_generation = ?,
                          last_seen_change_kind = NULL
-                     WHERE id IN (SELECT filesystem_entry_id FROM matching)"
+                     WHERE id IN (SELECT filesystem_entry_id FROM matching)
+                       AND (last_seen_generation IS NULL
+                            OR last_seen_generation <> ?
+                            OR last_seen_change_kind IS NOT NULL)"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
                 for entry in entries {
@@ -2306,7 +2310,10 @@ impl Database {
                         .bind(&entry.relative_path)
                         .bind(&entry.fingerprint);
                 }
-                statement = statement.bind(chunk.library_root_id).bind(chunk.job_id);
+                statement = statement
+                    .bind(chunk.library_root_id)
+                    .bind(&generation)
+                    .bind(&generation);
                 let updated = statement
                     .execute(&mut *transaction)
                     .await
@@ -2334,9 +2341,7 @@ impl Database {
                      WHERE entry.library_root_id = ?
                        AND entry.entry_kind = 'FILE'
                        AND entry.is_missing = 0
-                       AND entry.last_seen_generation = (
-                           SELECT generation FROM scan_jobs WHERE id = ?
-                       )
+                       AND entry.last_seen_generation = ?
                        AND entry.fingerprint = incoming.fingerprint"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2348,7 +2353,7 @@ impl Database {
                 }
                 let successful_rows = statement
                     .bind(chunk.library_root_id)
-                    .bind(chunk.job_id)
+                    .bind(&generation)
                     .fetch_all(&mut *transaction)
                     .await
                     .map_err(|source| StorageError::Sqlx {
