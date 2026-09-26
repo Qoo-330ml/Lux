@@ -159,6 +159,127 @@ async fn recommendation_stats_are_refreshed_once_per_batch_and_deduplicate_users
 }
 
 #[tokio::test]
+async fn thumbnail_scraper_retries_are_persisted_and_claimed_at_due_times() {
+    const SIX_HOURS: i64 = 6 * 60 * 60;
+    const ONE_DAY: i64 = 24 * 60 * 60;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Retry Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Retry.Movie.2024.mkv"), b"video")
+        .await
+        .expect("movie file");
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movie");
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await
+            .expect("indexed item");
+
+    let first_attempt_at = 1_000;
+    assert!(
+        database
+            .ensure_thumbnail_scraper_retry(
+                &item_id,
+                first_attempt_at,
+                first_attempt_at + SIX_HOURS,
+            )
+            .await
+            .expect("seed first retry")
+    );
+    assert!(
+        !database
+            .ensure_thumbnail_scraper_retry(
+                &item_id,
+                first_attempt_at + 1,
+                first_attempt_at + SIX_HOURS + 1,
+            )
+            .await
+            .expect("do not reset retry history")
+    );
+    assert!(
+        database
+            .claim_due_thumbnail_scraper_retries(
+                first_attempt_at + SIX_HOURS - 1,
+                first_attempt_at + SIX_HOURS + 300,
+                10,
+            )
+            .await
+            .expect("check before due")
+            .is_empty()
+    );
+
+    let second_attempt = database
+        .claim_due_thumbnail_scraper_retries(
+            first_attempt_at + SIX_HOURS,
+            first_attempt_at + SIX_HOURS + 300,
+            10,
+        )
+        .await
+        .expect("claim six-hour retry");
+    assert_eq!(second_attempt.len(), 1);
+    assert_eq!(second_attempt[0].attempt_count, 1);
+    assert!(
+        database
+            .finish_thumbnail_scraper_retry(
+                &item_id,
+                2,
+                Some(first_attempt_at + ONE_DAY),
+                first_attempt_at + SIX_HOURS,
+            )
+            .await
+            .expect("schedule twenty-four-hour retry")
+    );
+
+    let third_attempt = database
+        .claim_due_thumbnail_scraper_retries(
+            first_attempt_at + ONE_DAY,
+            first_attempt_at + ONE_DAY + 300,
+            10,
+        )
+        .await
+        .expect("claim twenty-four-hour retry");
+    assert_eq!(third_attempt.len(), 1);
+    assert_eq!(third_attempt[0].attempt_count, 2);
+    assert!(
+        database
+            .finish_thumbnail_scraper_retry(&item_id, 3, None, first_attempt_at + ONE_DAY,)
+            .await
+            .expect("complete retry sequence")
+    );
+
+    let completed = database
+        .find_thumbnail_scraper_retry(&item_id)
+        .await
+        .expect("read completed retry")
+        .expect("retry state exists");
+    assert_eq!(completed.status, "COMPLETE");
+    assert_eq!(completed.attempt_count, 3);
+    assert_eq!(completed.first_attempt_at, first_attempt_at);
+    assert_eq!(completed.next_retry_at, None);
+}
+
+#[tokio::test]
 async fn recommendation_daily_batch_is_stable_until_the_next_batch() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

@@ -2010,6 +2010,15 @@ pub(crate) struct StoredMetadataImageAttempt {
     pub(crate) status: String,
 }
 
+#[derive(Debug)]
+pub(crate) struct StoredThumbnailScraperRetry {
+    pub(crate) item_id: String,
+    pub(crate) status: String,
+    pub(crate) attempt_count: u32,
+    pub(crate) first_attempt_at: i64,
+    pub(crate) next_retry_at: Option<i64>,
+}
+
 pub(crate) struct NewMetadataCandidate<'a> {
     pub(crate) id: &'a str,
     pub(crate) item_id: &'a str,
@@ -2947,6 +2956,7 @@ pub(crate) struct StoredThumbnailSource {
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
     pub(crate) library_media_strategy_json: Option<String>,
+    pub(crate) scraper_id: Option<String>,
 }
 
 #[derive(Debug)]

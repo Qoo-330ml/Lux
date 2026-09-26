@@ -191,6 +191,218 @@ fn sqlite_recent_catalog_rows_by_library_query(library_count: usize) -> String {
 }
 
 impl Database {
+    pub(crate) async fn ensure_thumbnail_scraper_retry(
+        &self,
+        item_id: &str,
+        first_attempt_at: i64,
+        next_retry_at: i64,
+    ) -> Result<bool, StorageError> {
+        let result = self
+            .query(
+                "INSERT INTO thumbnail_scraper_retries (
+                    item_id, status, attempt_count, first_attempt_at, next_retry_at,
+                    claimed_until, created_at, updated_at
+                 ) VALUES (?, 'PENDING', 1, ?, ?, NULL, ?, ?)
+                 ON CONFLICT(item_id) DO NOTHING",
+            )
+            .bind(item_id)
+            .bind(first_attempt_at)
+            .bind(next_retry_at)
+            .bind(first_attempt_at)
+            .bind(first_attempt_at)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn find_thumbnail_scraper_retry(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredThumbnailScraperRetry>, StorageError> {
+        self.query(
+            "SELECT item_id, status, attempt_count, first_attempt_at, next_retry_at
+             FROM thumbnail_scraper_retries WHERE item_id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredThumbnailScraperRetry {
+                item_id: row.get("item_id"),
+                status: row.get("status"),
+                attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
+                    .unwrap_or(u32::MAX),
+                first_attempt_at: row.get("first_attempt_at"),
+                next_retry_at: row.get("next_retry_at"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn claim_due_thumbnail_scraper_retries(
+        &self,
+        now: i64,
+        claimed_until: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredThumbnailScraperRetry>, StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let rows = self
+            .query(
+                "SELECT item_id, status, attempt_count, first_attempt_at, next_retry_at
+                 FROM thumbnail_scraper_retries
+                 WHERE (status = 'PENDING' AND next_retry_at <= ?)
+                    OR (status = 'RUNNING' AND claimed_until <= ?)
+                 ORDER BY next_retry_at, item_id
+                 LIMIT ?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut claimed = Vec::with_capacity(rows.len());
+        for row in rows {
+            let item_id: String = row.get("item_id");
+            let updated = self
+                .query(
+                    "UPDATE thumbnail_scraper_retries
+                     SET status = 'RUNNING', claimed_until = ?, updated_at = ?
+                     WHERE item_id = ? AND (
+                         (status = 'PENDING' AND next_retry_at <= ?)
+                         OR (status = 'RUNNING' AND claimed_until <= ?)
+                     )",
+                )
+                .bind(claimed_until)
+                .bind(now)
+                .bind(&item_id)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if updated.rows_affected() == 1 {
+                claimed.push(StoredThumbnailScraperRetry {
+                    item_id,
+                    status: "RUNNING".to_owned(),
+                    attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
+                        .unwrap_or(u32::MAX),
+                    first_attempt_at: row.get("first_attempt_at"),
+                    next_retry_at: row.get("next_retry_at"),
+                });
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(claimed)
+    }
+
+    pub(crate) async fn finish_thumbnail_scraper_retry(
+        &self,
+        item_id: &str,
+        attempt_count: u32,
+        next_retry_at: Option<i64>,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let status = if next_retry_at.is_some() {
+            "PENDING"
+        } else {
+            "COMPLETE"
+        };
+        let result = self
+            .query(
+                "UPDATE thumbnail_scraper_retries
+                 SET status = ?, attempt_count = ?, next_retry_at = ?,
+                     claimed_until = NULL, updated_at = ?
+                 WHERE item_id = ? AND status = 'RUNNING'",
+            )
+            .bind(status)
+            .bind(i64::from(attempt_count.clamp(1, 3)))
+            .bind(next_retry_at)
+            .bind(now)
+            .bind(item_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn clear_metadata_image_attempt_history_for_thumbnail_retry(
+        &self,
+        item_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "DELETE FROM metadata_image_attempts
+             WHERE item_id = ? AND image_type IN ('POSTER', 'THUMB')
+               AND status <> 'RUNNING'",
+        )
+        .bind(item_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_local_thumbnail_source(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<StoredThumbnailSource>, StorageError> {
+        self.query(
+            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+                    l.media_strategy_json AS library_media_strategy_json, l.scraper_id
+             FROM media_sources ms
+             JOIN media_items mi ON mi.id = ms.item_id
+             JOIN libraries l ON l.id = mi.library_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             JOIN library_roots lr ON lr.id = fe.library_root_id
+             WHERE ms.item_id = ? AND ms.source_kind = 'LOCAL_FILE'
+               AND fe.is_missing = 0
+             ORDER BY ms.is_default DESC, ms.id
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredThumbnailSource {
+                item_id: row.get("item_id"),
+                root_path: row.get("root_path"),
+                relative_path: row.get("relative_path"),
+                library_media_strategy_json: row.get("library_media_strategy_json"),
+                scraper_id: row.get("scraper_id"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn refresh_recommendation_stats_if_needed(
         &self,
     ) -> Result<bool, StorageError> {
@@ -3112,7 +3324,7 @@ impl Database {
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
             "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
-                    l.media_strategy_json AS library_media_strategy_json
+                    l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id
@@ -3135,6 +3347,7 @@ impl Database {
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
+                    scraper_id: row.get("scraper_id"),
                 })
                 .collect()
         })
@@ -3152,7 +3365,7 @@ impl Database {
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
             "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
-                    l.media_strategy_json AS library_media_strategy_json
+                    l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id
@@ -3189,6 +3402,7 @@ impl Database {
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
+                    scraper_id: row.get("scraper_id"),
                 })
                 .collect()
         })
@@ -3206,7 +3420,7 @@ impl Database {
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
             "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path,
-                    l.media_strategy_json AS library_media_strategy_json
+                    l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM scan_job_targets t
              JOIN media_items mi ON mi.id = t.item_id
              JOIN libraries l ON l.id = mi.library_id
@@ -3240,6 +3454,7 @@ impl Database {
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
+                    scraper_id: row.get("scraper_id"),
                 })
                 .collect()
         })
