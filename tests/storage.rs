@@ -67,6 +67,33 @@ fn postgres_bootstrap_migration_keeps_its_original_checksum() {
     );
 }
 
+#[test]
+fn postgres_derived_index_refresh_uses_statement_level_triggers() {
+    let migration = include_str!("../migrations-postgres/0137_statement_derived_index_refresh.sql");
+
+    for trigger in [
+        "media_items_search_ai",
+        "media_items_search_au",
+        "media_items_search_ad",
+        "item_aliases_search_ai",
+        "item_aliases_search_au",
+        "item_aliases_search_ad",
+        "media_sources_availability_ai",
+        "media_sources_availability_au",
+        "media_sources_availability_ad",
+        "filesystem_entries_availability_au",
+    ] {
+        assert!(
+            migration.contains(&format!("DROP TRIGGER IF EXISTS {trigger}")),
+            "migration must replace the row trigger {trigger}"
+        );
+    }
+
+    assert!(migration.contains("FOR EACH STATEMENT"));
+    assert!(!migration.contains("FOR EACH ROW"));
+    assert!(migration.contains("REFERENCING NEW TABLE"));
+}
+
 #[tokio::test]
 async fn postgres_scan_job_migration_allows_one_active_job_per_type()
 -> Result<(), Box<dyn std::error::Error>> {
