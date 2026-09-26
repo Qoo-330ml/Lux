@@ -1680,6 +1680,24 @@ async fn streamed_manifest_change_cas_does_not_overwrite_a_newer_incremental_ent
         .execute(database.pool())
         .await?;
 
+    loop {
+        let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
+            .bind(&reconciliation.id)
+            .fetch_one(database.pool())
+            .await?;
+        if state == "READY_TO_DIFF" {
+            break;
+        }
+        assert!(!jobs.run_batch(&reconciliation.id, 100).await?.completed);
+    }
+    let seen_path_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_seen_paths
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&reconciliation.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(seen_path_count, 1);
     jobs.run_to_completion(&reconciliation.id, 100, None)
         .await?;
 

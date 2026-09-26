@@ -2055,6 +2055,22 @@ impl Database {
         );
 
         let presence_ledger_started = Instant::now();
+        let mut ledger_paths = Vec::new();
+        if discovery_format_version == 3 {
+            let seen_paths = seen_filesystem_entries
+                .iter()
+                .map(|entry| entry.relative_path.as_str())
+                .collect::<std::collections::HashSet<_>>();
+            positive_result.indexed_paths.sort_unstable();
+            ledger_paths = file_paths
+                .iter()
+                .copied()
+                .filter(|path| {
+                    positive_result.indexed_paths.binary_search(path).is_err()
+                        && !seen_paths.contains(path)
+                })
+                .collect::<Vec<_>>();
+        }
         if discovery_format_version == 3 && !seen_filesystem_entries.is_empty() {
             for entries in seen_filesystem_entries
                 .chunks(super::manifest_path_query_chunk_size(self.backend()))
@@ -2095,11 +2111,46 @@ impl Database {
                     })?;
             }
         }
+        for paths in ledger_paths.chunks(super::manifest_path_query_chunk_size(self.backend())) {
+            if paths.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?)", paths.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH incoming_seen_paths(relative_path) AS (VALUES {values})
+                 INSERT INTO scan_manifest_seen_paths (
+                     manifest_id, library_root_id, relative_path
+                 )
+                 SELECT ?, ?, incoming_seen_paths.relative_path
+                 FROM incoming_seen_paths WHERE TRUE
+                 ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for path in paths {
+                statement = statement.bind(path);
+            }
+            statement = statement
+                .bind(chunk.manifest_id)
+                .bind(chunk.library_root_id);
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
         record_manifest_storage_stage(
             "presence_ledger",
             presence_ledger_started,
-            seen_filesystem_entries.len(),
-            seen_filesystem_entries.len(),
+            seen_filesystem_entries
+                .len()
+                .saturating_add(ledger_paths.len()),
+            seen_filesystem_entries
+                .len()
+                .saturating_add(ledger_paths.len()),
             0,
         );
 
