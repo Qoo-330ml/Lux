@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fmt,
     io::Read,
     path::{Component, Path, PathBuf},
@@ -67,7 +67,8 @@ use crate::{
         NewScanManifestUnresolvedFile, ReconciliationBatchCommit, StorageError,
         StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath, StoredScanManifestDelta,
-        StoredScanManifestFilesystemBaseline, movie_parent_folder_identity,
+        StoredScanManifestFilesystemBaseline, is_lite_manifest_discovery,
+        movie_parent_folder_identity,
     },
 };
 
@@ -154,6 +155,12 @@ struct PendingManifestDirectoryChunk {
 struct ManifestDiscoveryDirectoryResult {
     observed_file_count: usize,
     created_items: usize,
+    child_directories: Vec<String>,
+}
+
+#[derive(Default)]
+struct LiteManifestDiscoverySession {
+    directories: VecDeque<(String, String)>,
 }
 
 enum PreparedManifestFile {
@@ -4437,6 +4444,7 @@ pub struct ScanJobService {
     scan_concurrency_override: Option<usize>,
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
 }
 
 struct LocalMetadataWorkerHandle {
@@ -4478,6 +4486,7 @@ impl ScanJobService {
                 .and_then(|value| usize::try_from(value).ok()),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
+            lite_manifest_discovery: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -4554,6 +4563,116 @@ impl ScanJobService {
         flags.remove(job_id);
     }
 
+    async fn ensure_lite_manifest_discovery_session(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), ScanJobError> {
+        {
+            let sessions = match self.lite_manifest_discovery.lock() {
+                Ok(sessions) => sessions,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if sessions.contains_key(manifest_id) {
+                return Ok(());
+            }
+        }
+
+        let root_ids = self
+            .database
+            .list_scan_manifest_root_ids(manifest_id)
+            .await?;
+        let mut session = LiteManifestDiscoverySession::default();
+        for root_id in root_ids {
+            let state = self
+                .database
+                .get_scan_manifest_root_identity(manifest_id, &root_id)
+                .await?
+                .map(|(state, _, _)| state);
+            if matches!(state.as_deref(), Some("COMPLETE" | "UNAVAILABLE")) {
+                continue;
+            }
+            session.directories.push_back((root_id, String::new()));
+        }
+        let mut sessions = match self.lite_manifest_discovery.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sessions.entry(manifest_id.to_owned()).or_insert(session);
+        Ok(())
+    }
+
+    fn pop_lite_manifest_directories(
+        &self,
+        manifest_id: &str,
+        limit: usize,
+    ) -> Vec<(String, String)> {
+        let mut sessions = match self.lite_manifest_discovery.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(session) = sessions.get_mut(manifest_id) else {
+            return Vec::new();
+        };
+        let mut directories = Vec::with_capacity(limit);
+        for _ in 0..limit {
+            let Some(directory) = session.directories.pop_front() else {
+                break;
+            };
+            directories.push(directory);
+        }
+        directories
+    }
+
+    fn push_lite_manifest_directories(
+        &self,
+        manifest_id: &str,
+        root_id: &str,
+        directories: impl IntoIterator<Item = String>,
+    ) {
+        let mut sessions = match self.lite_manifest_discovery.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let Some(session) = sessions.get_mut(manifest_id) else {
+            return;
+        };
+        session.directories.extend(
+            directories
+                .into_iter()
+                .map(|directory| (root_id.to_owned(), directory)),
+        );
+    }
+
+    fn remove_lite_manifest_root(&self, manifest_id: &str, root_id: &str) {
+        let mut sessions = match self.lite_manifest_discovery.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(session) = sessions.get_mut(manifest_id) {
+            session
+                .directories
+                .retain(|(queued_root_id, _)| queued_root_id != root_id);
+        }
+    }
+
+    fn clear_lite_manifest_discovery_session(&self, manifest_id: &str) {
+        let mut sessions = match self.lite_manifest_discovery.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sessions.remove(manifest_id);
+    }
+
+    fn lite_manifest_has_pending_directories(&self, manifest_id: &str) -> bool {
+        let sessions = match self.lite_manifest_discovery.lock() {
+            Ok(sessions) => sessions,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sessions
+            .get(manifest_id)
+            .is_some_and(|session| !session.directories.is_empty())
+    }
+
     async fn flush_home_after_scan_terminal(&self) {
         if let Some(home) = &self.home {
             if home.flush_scan_invalidation().await {
@@ -4605,6 +4724,9 @@ impl ScanJobService {
         self.database
             .finish_scan_manifest(job_id, "CANCELLED")
             .await?;
+        if let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? {
+            self.clear_lite_manifest_discovery_session(&manifest.id);
+        }
         self.database
             .clear_reconciliation_scan_entries(job_id)
             .await?;
@@ -5147,6 +5269,11 @@ impl ScanJobService {
         }
 
         if let Some(manifest) = self.database.get_scan_manifest_by_job(&job.id).await? {
+            let lite_mode = is_lite_manifest_discovery(
+                manifest.workflow_version,
+                manifest.discovery_format_version,
+                &manifest.discovery_mode,
+            );
             return match manifest.state.as_str() {
                 "DISCOVERING" => {
                     self.run_scan_manifest_discovery_batch(
@@ -5155,6 +5282,7 @@ impl ScanJobService {
                         batch_size,
                         &cancellation,
                         manifest.workflow_version == 2,
+                        lite_mode,
                     )
                     .await
                 }
@@ -5165,6 +5293,7 @@ impl ScanJobService {
                         &cancellation,
                         manifest.workflow_version == 2,
                         manifest.discovery_format_version,
+                        lite_mode,
                     )
                     .await
                 }
@@ -5280,6 +5409,9 @@ impl ScanJobService {
             let completed = batch.completed;
             let mut child_directories = batch.child_directories;
             let mut observations = batch.entries;
+            result
+                .child_directories
+                .extend(child_directories.iter().cloned());
             if !completed && child_directories.is_empty() && observations.is_empty() {
                 continue;
             }
@@ -5779,6 +5911,9 @@ impl ScanJobService {
 
                 let mut child_directories = batch.child_directories;
                 let mut entries = batch.entries;
+                result
+                    .child_directories
+                    .extend(child_directories.iter().cloned());
                 child_directories.sort_unstable();
                 entries
                     .sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
@@ -6080,6 +6215,165 @@ impl ScanJobService {
         }
     }
 
+    async fn run_lite_scan_manifest_discovery_batch(
+        &self,
+        job: &StoredScanJob,
+        manifest_id: &str,
+        batch_size: usize,
+        cancellation: &AtomicBool,
+    ) -> Result<ScanBatchReport, ScanJobError> {
+        self.ensure_lite_manifest_discovery_session(manifest_id)
+            .await?;
+        let directories = self.pop_lite_manifest_directories(
+            manifest_id,
+            batch_size.min(MANIFEST_DISCOVERY_BATCH_SIZE),
+        );
+        let library = self
+            .database
+            .find_library(&job.library_id)
+            .await?
+            .ok_or(ScanJobError::LibraryNotFound)?;
+        let preparation_concurrency = self
+            .effective_scan_concurrency(configured_scan_concurrency(
+                self.scan_concurrency_override,
+                Some(library.scan_concurrency),
+                self.default_scan_concurrency,
+            ))
+            .await
+            .max(1);
+        let roots_by_id = self
+            .database
+            .list_library_roots_by_ids(
+                &directories
+                    .iter()
+                    .map(|(root_id, _)| root_id.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+        let mut discovered_count = job.total_count;
+        let mut created_items = 0_usize;
+
+        for (root_id, relative_directory) in directories {
+            if cancellation.load(Ordering::Acquire) {
+                return self.cancel_running_job(&job.id).await;
+            }
+            let Some(root) = roots_by_id.get(&root_id).cloned() else {
+                self.database
+                    .mark_scan_manifest_root_unavailable(manifest_id, &root_id)
+                    .await?;
+                self.remove_lite_manifest_root(manifest_id, &root_id);
+                continue;
+            };
+            let expected_root_identity = self
+                .database
+                .get_scan_manifest_root_identity(manifest_id, &root.id)
+                .await?
+                .and_then(|(_, device, inode)| device.zip(inode));
+            let context = ManifestRootDiscoveryContext {
+                job_id: &job.id,
+                manifest_id,
+                root: &root,
+                cancellation,
+                stream_files_during_discovery: true,
+                library_kind: &library.kind,
+                preparation_concurrency,
+                expected_root_identity,
+            };
+            match self
+                .discover_scan_manifest_directory_batches(context, &relative_directory)
+                .await
+            {
+                Ok(Some(discovered)) => {
+                    discovered_count = discovered_count.saturating_add(
+                        i64::try_from(discovered.observed_file_count).unwrap_or(i64::MAX),
+                    );
+                    created_items = created_items.saturating_add(discovered.created_items);
+                    self.push_lite_manifest_directories(
+                        manifest_id,
+                        &root_id,
+                        discovered.child_directories,
+                    );
+                    if !root.is_available {
+                        self.database
+                            .update_library_root_availability(&root.id, true)
+                            .await?;
+                    }
+                }
+                Ok(None) => return self.cancel_running_job(&job.id).await,
+                Err(_error)
+                    if self
+                        .cancellation_requested(&job.id, false, cancellation)
+                        .await? =>
+                {
+                    return self.cancel_running_job(&job.id).await;
+                }
+                Err(ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_)) => {
+                    self.database
+                        .update_library_root_availability(&root.id, false)
+                        .await?;
+                    self.database
+                        .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
+                        .await?;
+                    self.remove_lite_manifest_root(manifest_id, &root.id);
+                    self.record_event(
+                        &job.id,
+                        "WARN",
+                        "ROOT_UNAVAILABLE",
+                        "媒体库根路径不可用，已跳过本轮缺失判定",
+                        "{}",
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    return self
+                        .fail_reconciliation_job(job, error, &[], job.processed_count)
+                        .await;
+                }
+            }
+        }
+
+        if self
+            .cancellation_requested(&job.id, false, cancellation)
+            .await?
+        {
+            return self.cancel_running_job(&job.id).await;
+        }
+        if !self.lite_manifest_has_pending_directories(manifest_id) {
+            self.database
+                .finish_lite_scan_manifest_roots(manifest_id)
+                .await?;
+            let total = self
+                .database
+                .finish_scan_manifest_discovery(manifest_id, &job.id)
+                .await?;
+            self.clear_lite_manifest_discovery_session(manifest_id);
+            self.record_event(
+                &job.id,
+                "INFO",
+                "DISCOVERY_COMPLETED",
+                "媒体库目录发现完成",
+                &format!(r#"{{"discovered":{total},"discoveryCompleted":true}}"#),
+            )
+            .await;
+        } else {
+            self.record_event(
+                &job.id,
+                "INFO",
+                "DISCOVERY_PROGRESS",
+                "媒体库目录发现进行中",
+                &format!(r#"{{"discovered":{discovered_count},"discoveryCompleted":false}}"#),
+            )
+            .await;
+        }
+        Ok(ScanBatchReport {
+            status: "RUNNING".to_owned(),
+            processed: usize::try_from(discovered_count.saturating_sub(job.total_count))
+                .unwrap_or(usize::MAX),
+            created_items,
+            completed: false,
+        })
+    }
+
     async fn run_scan_manifest_discovery_batch(
         &self,
         job: &StoredScanJob,
@@ -6087,7 +6381,13 @@ impl ScanJobService {
         batch_size: usize,
         cancellation: &AtomicBool,
         stream_files_during_discovery: bool,
+        lite_mode: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
+        if lite_mode {
+            return self
+                .run_lite_scan_manifest_discovery_batch(job, manifest_id, batch_size, cancellation)
+                .await;
+        }
         let limit =
             i64::try_from(batch_size.min(MANIFEST_DISCOVERY_BATCH_SIZE)).unwrap_or(i64::MAX);
         let directories = self
@@ -6296,6 +6596,7 @@ impl ScanJobService {
         cancellation: &AtomicBool,
         positives_already_indexed: bool,
         discovery_format_version: i64,
+        lite_mode: bool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         for root in self.database.list_library_roots(&job.library_id).await? {
             if self
@@ -6394,76 +6695,9 @@ impl ScanJobService {
         }
 
         if discovery_format_version == 3 {
-            let mut directory_after_library_root_id: Option<String> = None;
-            let mut directory_after_relative_path: Option<String> = None;
-            loop {
-                if self
-                    .cancellation_requested(&job.id, false, cancellation)
-                    .await?
-                {
-                    return self.cancel_running_job(&job.id).await;
-                }
-                let directories = self
-                    .database
-                    .list_scan_manifest_complete_directories(
-                        manifest_id,
-                        directory_after_library_root_id.as_deref(),
-                        directory_after_relative_path.as_deref(),
-                        MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE,
-                    )
-                    .await?;
-                let Some(last_directory) = directories.last() else {
-                    break;
-                };
-                loop {
-                    if self
-                        .cancellation_requested(&job.id, false, cancellation)
-                        .await?
-                    {
-                        return self.cancel_running_job(&job.id).await;
-                    }
-                    let candidates = self
-                        .database
-                        .list_scan_manifest_removal_candidates_for_directories(
-                            manifest_id,
-                            &directories,
-                            page_size,
-                        )
-                        .await?;
-                    if candidates.is_empty() {
-                        break;
-                    }
-                    let delta_ids = candidates
-                        .iter()
-                        .map(|_| Uuid::now_v7().to_string())
-                        .collect::<Vec<_>>();
-                    let deltas = candidates
-                        .iter()
-                        .zip(&delta_ids)
-                        .map(|(candidate, id)| NewScanManifestDelta {
-                            id,
-                            library_root_id: &candidate.library_root_id,
-                            relative_path: &candidate.relative_path,
-                            observation_sequence: None,
-                            delta_kind: "REMOVE",
-                            base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
-                            base_fingerprint: candidate.base_fingerprint.as_deref(),
-                        })
-                        .collect::<Vec<_>>();
-                    self.database
-                        .insert_scan_manifest_deltas(manifest_id, &deltas)
-                        .await?;
-                }
-                directory_after_library_root_id = Some(last_directory.library_root_id.clone());
-                directory_after_relative_path = Some(last_directory.relative_path.clone());
-            }
-            if self
-                .database
-                .scan_manifest_has_uncovered_files(manifest_id)
-                .await?
-            {
-                let mut uncovered_after_library_root_id: Option<String> = None;
-                let mut uncovered_after_relative_path: Option<String> = None;
+            let mut removal_after_library_root_id: Option<String> = None;
+            let mut removal_after_relative_path: Option<String> = None;
+            if lite_mode {
                 loop {
                     if self
                         .cancellation_requested(&job.id, false, cancellation)
@@ -6476,9 +6710,9 @@ impl ScanJobService {
                         .list_scan_manifest_removal_candidates(
                             manifest_id,
                             discovery_format_version,
-                            true,
-                            uncovered_after_library_root_id.as_deref(),
-                            uncovered_after_relative_path.as_deref(),
+                            false,
+                            removal_after_library_root_id.as_deref(),
+                            removal_after_relative_path.as_deref(),
                             page_size,
                         )
                         .await?;
@@ -6505,8 +6739,125 @@ impl ScanJobService {
                     self.database
                         .insert_scan_manifest_deltas(manifest_id, &deltas)
                         .await?;
-                    uncovered_after_library_root_id = Some(last_candidate.library_root_id.clone());
-                    uncovered_after_relative_path = Some(last_candidate.relative_path.clone());
+                    removal_after_library_root_id = Some(last_candidate.library_root_id.clone());
+                    removal_after_relative_path = Some(last_candidate.relative_path.clone());
+                }
+            } else {
+                let mut directory_after_library_root_id: Option<String> = None;
+                let mut directory_after_relative_path: Option<String> = None;
+                loop {
+                    if self
+                        .cancellation_requested(&job.id, false, cancellation)
+                        .await?
+                    {
+                        return self.cancel_running_job(&job.id).await;
+                    }
+                    let directories = self
+                        .database
+                        .list_scan_manifest_complete_directories(
+                            manifest_id,
+                            directory_after_library_root_id.as_deref(),
+                            directory_after_relative_path.as_deref(),
+                            MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE,
+                        )
+                        .await?;
+                    let Some(last_directory) = directories.last() else {
+                        break;
+                    };
+                    loop {
+                        if self
+                            .cancellation_requested(&job.id, false, cancellation)
+                            .await?
+                        {
+                            return self.cancel_running_job(&job.id).await;
+                        }
+                        let candidates = self
+                            .database
+                            .list_scan_manifest_removal_candidates_for_directories(
+                                manifest_id,
+                                &directories,
+                                page_size,
+                            )
+                            .await?;
+                        if candidates.is_empty() {
+                            break;
+                        }
+                        let delta_ids = candidates
+                            .iter()
+                            .map(|_| Uuid::now_v7().to_string())
+                            .collect::<Vec<_>>();
+                        let deltas = candidates
+                            .iter()
+                            .zip(&delta_ids)
+                            .map(|(candidate, id)| NewScanManifestDelta {
+                                id,
+                                library_root_id: &candidate.library_root_id,
+                                relative_path: &candidate.relative_path,
+                                observation_sequence: None,
+                                delta_kind: "REMOVE",
+                                base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                                base_fingerprint: candidate.base_fingerprint.as_deref(),
+                            })
+                            .collect::<Vec<_>>();
+                        self.database
+                            .insert_scan_manifest_deltas(manifest_id, &deltas)
+                            .await?;
+                    }
+                    directory_after_library_root_id = Some(last_directory.library_root_id.clone());
+                    directory_after_relative_path = Some(last_directory.relative_path.clone());
+                }
+                if self
+                    .database
+                    .scan_manifest_has_uncovered_files(manifest_id)
+                    .await?
+                {
+                    let mut uncovered_after_library_root_id: Option<String> = None;
+                    let mut uncovered_after_relative_path: Option<String> = None;
+                    loop {
+                        if self
+                            .cancellation_requested(&job.id, false, cancellation)
+                            .await?
+                        {
+                            return self.cancel_running_job(&job.id).await;
+                        }
+                        let candidates = self
+                            .database
+                            .list_scan_manifest_removal_candidates(
+                                manifest_id,
+                                discovery_format_version,
+                                true,
+                                uncovered_after_library_root_id.as_deref(),
+                                uncovered_after_relative_path.as_deref(),
+                                page_size,
+                            )
+                            .await?;
+                        let Some(last_candidate) = candidates.last() else {
+                            break;
+                        };
+                        let delta_ids = candidates
+                            .iter()
+                            .map(|_| Uuid::now_v7().to_string())
+                            .collect::<Vec<_>>();
+                        let deltas = candidates
+                            .iter()
+                            .zip(&delta_ids)
+                            .map(|(candidate, id)| NewScanManifestDelta {
+                                id,
+                                library_root_id: &candidate.library_root_id,
+                                relative_path: &candidate.relative_path,
+                                observation_sequence: None,
+                                delta_kind: "REMOVE",
+                                base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                                base_fingerprint: candidate.base_fingerprint.as_deref(),
+                            })
+                            .collect::<Vec<_>>();
+                        self.database
+                            .insert_scan_manifest_deltas(manifest_id, &deltas)
+                            .await?;
+                        uncovered_after_library_root_id =
+                            Some(last_candidate.library_root_id.clone());
+                        uncovered_after_relative_path = Some(last_candidate.relative_path.clone());
+                    }
                 }
             }
         } else {
@@ -8624,6 +8975,9 @@ impl ScanJobService {
         self.database
             .finish_scan_manifest(&job.id, "FAILED")
             .await?;
+        if let Some(manifest) = self.database.get_scan_manifest_by_job(&job.id).await? {
+            self.clear_lite_manifest_discovery_session(&manifest.id);
+        }
         self.database
             .finish_scan_job(&job.id, "FAILED", Some(&error.to_string()))
             .await?;
@@ -8661,6 +9015,9 @@ impl ScanJobService {
         }
         let error_code = error.code();
         self.database.finish_scan_manifest(job_id, "FAILED").await?;
+        if let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? {
+            self.clear_lite_manifest_discovery_session(&manifest.id);
+        }
         self.database
             .finish_scan_job(job_id, "FAILED", Some(&error.to_string()))
             .await?;
@@ -11486,8 +11843,8 @@ mod tests {
         MixedClassificationCache, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
         PendingManifestDirectoryChunk, ScanJobService, ScannerError,
         classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
-        manifest_root_identity_matches, media_source_folder, normalize_incremental_path,
-        read_manifest_strm_target, safe_scan_activity_label,
+        is_lite_manifest_discovery, manifest_root_identity_matches, media_source_folder,
+        normalize_incremental_path, read_manifest_strm_target, safe_scan_activity_label,
         stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
         stat_manifest_root_sync,
     };
@@ -11497,6 +11854,14 @@ mod tests {
         assert_eq!(configured_scan_concurrency(Some(8), Some(4), 16), 8);
         assert_eq!(configured_scan_concurrency(None, Some(4), 16), 4);
         assert_eq!(configured_scan_concurrency(None, None, 16), 16);
+    }
+
+    #[test]
+    fn lite_manifest_discovery_requires_the_streamed_v3_contract() {
+        assert!(is_lite_manifest_discovery(2, 3, "LITE"));
+        assert!(!is_lite_manifest_discovery(1, 3, "LITE"));
+        assert!(!is_lite_manifest_discovery(2, 2, "LITE"));
+        assert!(!is_lite_manifest_discovery(2, 3, "PERSISTED"));
     }
 
     #[test]

@@ -1837,10 +1837,15 @@ impl Database {
             child_directories.len(),
         );
         let manifest_state_started = Instant::now();
-        let (workflow_version, discovery_format_version, generation): (i64, i64, String) = self
+        let (workflow_version, discovery_format_version, discovery_mode, generation): (
+            i64,
+            i64,
+            String,
+            String,
+        ) = self
             .query_as(
                 "SELECT manifest.workflow_version, manifest.discovery_format_version,
-                        job.generation
+                        manifest.discovery_mode, job.generation
                  FROM scan_manifests manifest
                  JOIN scan_jobs job ON job.id = manifest.job_id
                  WHERE manifest.id = ? AND manifest.state = 'DISCOVERING'
@@ -1854,11 +1859,20 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let lite_mode =
+            is_lite_manifest_discovery(workflow_version, discovery_format_version, &discovery_mode);
 
         record_manifest_storage_stage("manifest_state_check", manifest_state_started, 1, 0, 0);
         let directory_frontier_started = Instant::now();
         let mut inserted_directory_count = 0_u64;
-        for paths in child_directories.chunks(SCAN_DML_CHUNK_SIZE) {
+        let directory_chunks = if lite_mode {
+            Vec::new()
+        } else {
+            child_directories
+                .chunks(SCAN_DML_CHUNK_SIZE)
+                .collect::<Vec<_>>()
+        };
+        for paths in directory_chunks {
             if paths.is_empty() {
                 continue;
             }
@@ -1982,7 +1996,14 @@ impl Database {
             .map_err(|_| StorageError::Conflict("manifest directory count overflow".to_owned()))?;
         let directory_frontier_completion_started = Instant::now();
         let mut completed_directory_count = 0_i64;
-        for directories in completed_directories.chunks(SCAN_DML_CHUNK_SIZE) {
+        let completed_directory_chunks = if lite_mode {
+            Vec::new()
+        } else {
+            completed_directories
+                .chunks(SCAN_DML_CHUNK_SIZE)
+                .collect::<Vec<_>>()
+        };
+        for directories in completed_directory_chunks {
             let placeholders = std::iter::repeat_n("?", directories.len())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -2027,7 +2048,10 @@ impl Database {
             entries
                 .iter()
                 .copied()
-                .filter(|entry| entry.entry_kind == "DIRECTORY")
+                .filter(|entry| {
+                    entry.entry_kind == "DIRECTORY"
+                        && (!lite_mode || entry.relative_path.is_empty())
+                })
                 .collect::<Vec<_>>()
         } else {
             entries.clone()
@@ -2039,15 +2063,31 @@ impl Database {
         } else {
             0
         };
+        let discovered_directory_count_i64 = if lite_mode {
+            i64::try_from(child_directories.len()).map_err(|_| {
+                StorageError::Conflict("manifest directory count overflow".to_owned())
+            })?
+        } else {
+            inserted_directory_count_i64
+        };
+        let completed_directory_count_for_root = if lite_mode {
+            i64::try_from(completed_directories.len()).map_err(|_| {
+                StorageError::Conflict("manifest directory count overflow".to_owned())
+            })?
+        } else {
+            completed_directory_count
+        };
         let last_sequence = self
             .query_scalar::<i64>(
                 "UPDATE scan_manifest_roots
-                 SET state = CASE WHEN NOT EXISTS (
+                 SET state = CASE WHEN ? = 'LITE' THEN 'SCANNING'
+                     WHEN NOT EXISTS (
                          SELECT 1 FROM scan_manifest_directories
                          WHERE manifest_id = ? AND library_root_id = ? AND state = 'PENDING'
                      ) THEN 'COMPLETE' ELSE 'SCANNING' END,
                      started_at = COALESCE(started_at, unixepoch()),
-                     finished_at = CASE WHEN NOT EXISTS (
+                     finished_at = CASE WHEN ? = 'LITE' THEN finished_at
+                         WHEN NOT EXISTS (
                          SELECT 1 FROM scan_manifest_directories
                          WHERE manifest_id = ? AND library_root_id = ? AND state = 'PENDING'
                      ) THEN COALESCE(finished_at, unixepoch()) ELSE finished_at END,
@@ -2064,12 +2104,14 @@ impl Database {
                    )
                  RETURNING next_observation_sequence",
             )
+            .bind(&discovery_mode)
             .bind(chunk.manifest_id)
             .bind(chunk.library_root_id)
+            .bind(&discovery_mode)
             .bind(chunk.manifest_id)
             .bind(chunk.library_root_id)
-            .bind(inserted_directory_count_i64)
-            .bind(completed_directory_count)
+            .bind(discovered_directory_count_i64)
+            .bind(completed_directory_count_for_root)
             .bind(inserted_file_count_i64)
             .bind(observation_count_i64)
             .bind(chunk.manifest_id)
@@ -2084,6 +2126,22 @@ impl Database {
             .ok_or_else(|| {
                 StorageError::Conflict("manifest root is not available for discovery".to_owned())
             })?;
+        if lite_mode && !completed_directories.is_empty() {
+            self.query(
+                "UPDATE scan_manifest_directories
+                 SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
+                 WHERE manifest_id = ? AND library_root_id = ? AND relative_path = ''
+                   AND state <> 'COMPLETE'",
+            )
+            .bind(chunk.manifest_id)
+            .bind(chunk.library_root_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         record_manifest_storage_stage(
             "root_checkpoint",
             root_checkpoint_started,
@@ -2929,6 +2987,69 @@ impl Database {
         })
     }
 
+    pub(crate) async fn list_scan_manifest_root_ids(
+        &self,
+        manifest_id: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query(
+            "SELECT library_root_id
+             FROM scan_manifest_roots
+             WHERE manifest_id = ?
+             ORDER BY library_root_id",
+        )
+        .bind(manifest_id)
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| row.get("library_root_id"))
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn finish_lite_scan_manifest_roots(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE scan_manifest_roots
+             SET state = 'COMPLETE', finished_at = COALESCE(finished_at, unixepoch()),
+                 updated_at = unixepoch()
+             WHERE manifest_id = ? AND state = 'SCANNING'",
+        )
+        .bind(manifest_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE scan_manifest_directories
+             SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
+             WHERE manifest_id = ? AND relative_path = '' AND state <> 'COMPLETE'",
+        )
+        .bind(manifest_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn finish_scan_manifest_discovery(
         &self,
         manifest_id: &str,
@@ -3364,9 +3485,9 @@ impl Database {
         job_id: &str,
     ) -> Result<bool, StorageError> {
         let mut transaction = self.begin_scan_write_transaction().await?;
-        let (workflow_version, discovery_format_version): (i64, i64) = self
+        let (workflow_version, discovery_format_version, discovery_mode): (i64, i64, String) = self
             .query_as(
-                "SELECT workflow_version, discovery_format_version
+                "SELECT workflow_version, discovery_format_version, discovery_mode
                  FROM scan_manifests WHERE id = ?",
             )
             .bind(manifest_id)
@@ -3376,7 +3497,43 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let remaining_changes: i64 = if workflow_version == 2 && discovery_format_version == 3 {
+        let remaining_changes: i64 = if is_lite_manifest_discovery(
+            workflow_version,
+            discovery_format_version,
+            &discovery_mode,
+        ) {
+            self.query_scalar(
+                "SELECT COUNT(*)
+                 FROM filesystem_entries fe
+                 JOIN scan_manifest_roots root
+                   ON root.manifest_id = ?
+                  AND root.library_root_id = fe.library_root_id
+                  AND root.state = 'COMPLETE'
+                 JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                   AND COALESCE(fe.last_seen_generation, '') <> job.generation
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_seen_paths seen
+                       WHERE seen.manifest_id = root.manifest_id
+                         AND seen.library_root_id = fe.library_root_id
+                         AND seen.relative_path = fe.relative_path
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_deltas delta
+                       WHERE delta.manifest_id = root.manifest_id
+                         AND delta.library_root_id = fe.library_root_id
+                         AND delta.relative_path = fe.relative_path
+                   )",
+            )
+            .bind(manifest_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+        } else if workflow_version == 2 && discovery_format_version == 3 {
             self.query_scalar(
                 "SELECT COUNT(*)
                  FROM filesystem_entries fe
@@ -5919,8 +6076,12 @@ impl Database {
         job_id: &str,
     ) -> Result<Option<String>, StorageError> {
         let mut transaction = self.begin_scan_write_transaction().await?;
-        let manifest: Option<(String, Option<String>)> = self
-            .query_as("SELECT state, resume_state FROM scan_manifests WHERE job_id = ?")
+        let manifest: Option<(String, Option<String>, i64, i64, String)> = self
+            .query_as(
+                "SELECT state, resume_state, workflow_version,
+                        discovery_format_version, discovery_mode
+                 FROM scan_manifests WHERE job_id = ?",
+            )
             .bind(job_id)
             .fetch_optional(&mut *transaction)
             .await
@@ -5928,7 +6089,9 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let Some((state, resume_state)) = manifest else {
+        let Some((state, resume_state, workflow_version, discovery_format_version, discovery_mode)) =
+            manifest
+        else {
             transaction
                 .commit()
                 .await
@@ -5983,21 +6146,54 @@ impl Database {
         };
 
         if stage == "DISCOVERING" {
-            self.query(
-                "UPDATE scan_manifest_directories
+            if is_lite_manifest_discovery(
+                workflow_version,
+                discovery_format_version,
+                &discovery_mode,
+            ) {
+                self.query(
+                    "UPDATE scan_manifest_directories
+                     SET state = 'PENDING', error = NULL, updated_at = unixepoch()
+                     WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                       AND relative_path = ''",
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                self.query(
+                    "UPDATE scan_manifest_roots
+                     SET state = 'PENDING', error = NULL, finished_at = NULL,
+                         updated_at = unixepoch()
+                     WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+                       AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            } else {
+                self.query(
+                    "UPDATE scan_manifest_directories
                  SET state = 'PENDING', error = NULL, updated_at = unixepoch()
                  WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
                    AND state IN ('SCANNING', 'FAILED')",
-            )
-            .bind(job_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            self.query(
-                "UPDATE scan_manifest_roots
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                self.query(
+                    "UPDATE scan_manifest_roots
                  SET state = CASE WHEN EXISTS (
                          SELECT 1 FROM scan_manifest_directories directory
                          WHERE directory.manifest_id = scan_manifest_roots.manifest_id
@@ -6007,14 +6203,15 @@ impl Database {
                      error = NULL, finished_at = NULL, updated_at = unixepoch()
                  WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
                    AND state IN ('PENDING', 'SCANNING', 'INCOMPLETE')",
-            )
-            .bind(job_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                )
+                .bind(job_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
         }
 
         transaction

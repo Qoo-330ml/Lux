@@ -310,7 +310,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -330,7 +330,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 136);
+    assert_eq!(second_database.schema_version().await?, 144);
     second_database.close().await;
     Ok(())
 }
@@ -406,6 +406,13 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(discovery_format_version_column, 1);
+    let discovery_mode_column: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('scan_manifests')
+         WHERE name = 'discovery_mode'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(discovery_mode_column, 1);
     let sequence_column: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('scan_manifest_roots')
          WHERE name = 'next_observation_sequence'",
@@ -451,6 +458,11 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(default_discovery_format_version, 2);
+    let default_discovery_mode: String =
+        sqlx::query_scalar("SELECT discovery_mode FROM scan_manifests WHERE id = 'manifest-job'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(default_discovery_mode, "PERSISTED");
     let default_targets_ready: i64 = sqlx::query_scalar(
         "SELECT postprocessing_targets_ready FROM scan_manifests WHERE id = 'manifest-job'",
     )
@@ -536,7 +548,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
 
     database.close().await;
     Ok(())
@@ -1230,7 +1242,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
     Ok(())
 }
 
@@ -1402,7 +1414,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
     Ok(())
 }
 
@@ -1489,7 +1501,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
     database.close().await;
     Ok(())
 }
@@ -1616,7 +1628,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -1798,7 +1810,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

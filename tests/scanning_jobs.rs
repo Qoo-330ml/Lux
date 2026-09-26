@@ -63,8 +63,25 @@ async fn set_manifest_discovery_format_version(
     job_id: &str,
     version: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE scan_manifests SET discovery_format_version = ? WHERE job_id = ?")
-        .bind(version)
+    sqlx::query(
+        "UPDATE scan_manifests
+         SET discovery_format_version = ?, discovery_mode = 'PERSISTED'
+         WHERE job_id = ?",
+    )
+    .bind(version)
+    .bind(job_id)
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+async fn set_manifest_discovery_mode(
+    database: &Database,
+    job_id: &str,
+    mode: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE scan_manifests SET discovery_mode = ? WHERE job_id = ?")
+        .bind(mode)
         .bind(job_id)
         .execute(database.pool())
         .await?;
@@ -814,6 +831,7 @@ async fn manifest_cancellation_preserves_committed_frontier_and_observations()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_mode(&database, &job.id, "PERSISTED").await?;
     jobs.run_batch(&job.id, 1).await?;
     jobs.cancel(&job.id).await?;
     let cancelled = jobs.run_batch(&job.id, 1).await?;
@@ -888,6 +906,7 @@ async fn failed_manifest_discovery_retries_its_pending_frontier_safely()
 
     let jobs = ScanJobService::new(database.clone());
     let failed = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_mode(&database, &failed.id, "PERSISTED").await?;
     sqlx::query(
         "UPDATE scan_manifest_directories SET relative_path = '../invalid'
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
@@ -977,6 +996,7 @@ async fn shutdown_cancelled_manifest_resumes_the_persisted_discovery_frontier()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_mode(&database, &job.id, "PERSISTED").await?;
     assert_eq!(jobs.run_batch(&job.id, 1).await?.status, "RUNNING");
     let before_restart: (String, i64, i64, i64, String) = sqlx::query_as(
         "SELECT manifest.state, manifest.observed_file_count,
@@ -1053,10 +1073,14 @@ async fn cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery()
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     set_manifest_discovery_format_version(&database, &job.id, 2).await?;
-    sqlx::query("UPDATE scan_manifests SET workflow_version = 1 WHERE job_id = ?")
-        .bind(&job.id)
-        .execute(database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE scan_manifests
+         SET workflow_version = 1, discovery_mode = 'PERSISTED'
+         WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
     assert_eq!(jobs.run_batch(&job.id, 100).await?.status, "RUNNING");
     assert_eq!(jobs.run_batch(&job.id, 100).await?.status, "RUNNING");
     let first_apply = jobs.run_batch(&job.id, 1).await?;
@@ -1282,6 +1306,18 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
         jobs.run_batch(&job.id, 1).await?;
     }
     assert_eq!(manifest_state, "READY_TO_DIFF");
+    let lite_child_frontier_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_directories
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+           AND relative_path <> ''",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        lite_child_frontier_count, 0,
+        "Lite discovery keeps directory work in memory"
+    );
     let file_observation_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scan_manifest_entries
          WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
@@ -1326,6 +1362,44 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(visible_items, 64);
+    Ok(())
+}
+
+#[tokio::test]
+async fn lite_scan_uses_the_manifest_root_snapshot() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let first_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&first_root).await?;
+    tokio::fs::write(first_root.join("Before.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, first_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let late_root = temp_dir.path().join("Movies-late");
+    tokio::fs::create_dir_all(&late_root).await?;
+    tokio::fs::write(late_root.join("After.Movie.2025.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, late_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let indexed_paths: Vec<String> =
+        sqlx::query_scalar("SELECT relative_path FROM filesystem_entries ORDER BY relative_path")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(indexed_paths, vec!["Before.Movie.2024.mkv".to_owned()]);
     Ok(())
 }
 
@@ -1550,7 +1624,7 @@ async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_upd
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 136);
+    assert_eq!(database.schema_version().await?, 144);
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)
@@ -4191,6 +4265,7 @@ async fn manifest_frontier_batches_handle_long_and_small_directories()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_mode(&database, &job.id, "PERSISTED").await?;
     let root_discovery = jobs.run_batch(&job.id, 1).await?;
     assert!(!root_discovery.completed);
     let pending_frontier_count: i64 = sqlx::query_scalar(
@@ -4334,6 +4409,7 @@ async fn reconciliation_discovery_uses_persisted_snapshot_for_manual_retry()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    set_manifest_discovery_mode(&database, &job.id, "PERSISTED").await?;
     let root_discovery = jobs.run_batch(&job.id, 1).await?;
     assert_eq!(root_discovery.processed, 0);
     let queued_directories: i64 = sqlx::query_scalar(
@@ -5760,10 +5836,14 @@ async fn advance_manifest_to_applying(
     jobs: &ScanJobService,
     job_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    sqlx::query("UPDATE scan_manifests SET workflow_version = 1 WHERE job_id = ?")
-        .bind(job_id)
-        .execute(database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE scan_manifests
+         SET workflow_version = 1, discovery_mode = 'PERSISTED'
+         WHERE job_id = ?",
+    )
+    .bind(job_id)
+    .execute(database.pool())
+    .await?;
     for _ in 0..16 {
         let state: String = sqlx::query_scalar("SELECT state FROM scan_manifests WHERE job_id = ?")
             .bind(job_id)

@@ -1351,6 +1351,14 @@ pub(crate) struct StoredScanManifest {
     pub(crate) postprocessing_targets_ready: bool,
 }
 
+pub(crate) fn is_lite_manifest_discovery(
+    workflow_version: i64,
+    discovery_format_version: i64,
+    discovery_mode: &str,
+) -> bool {
+    workflow_version == 2 && discovery_format_version == 3 && discovery_mode == "LITE"
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredScanManifestPostprocessingRoot {
     pub(crate) library_root_id: String,
