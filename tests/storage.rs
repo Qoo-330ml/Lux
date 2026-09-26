@@ -95,6 +95,23 @@ fn postgres_derived_index_refresh_uses_statement_level_triggers() {
 }
 
 #[test]
+fn postgres_provider_index_refresh_uses_statement_level_triggers() {
+    let migration =
+        include_str!("../migrations-postgres/0141_statement_provider_index_refresh.sql");
+
+    for trigger in ["media_item_provider_ids_ai", "media_item_provider_ids_au"] {
+        assert!(
+            migration.contains(&format!("DROP TRIGGER IF EXISTS {trigger}")),
+            "migration must replace the row trigger {trigger}"
+        );
+    }
+
+    assert!(migration.contains("FOR EACH STATEMENT"));
+    assert!(!migration.contains("FOR EACH ROW"));
+    assert!(migration.contains("REFERENCING NEW TABLE"));
+}
+
+#[test]
 fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
     let migration =
         include_str!("../migrations-postgres/0138_avoid_alias_rescan_on_media_item_refresh.sql");
