@@ -11925,7 +11925,8 @@ mod tests {
     #[test]
     fn manifest_discovery_budget_stays_within_streamed_file_budget() {
         assert_eq!(MANIFEST_DISCOVERY_BATCH_SIZE, 80);
-        assert!(MANIFEST_DISCOVERY_BATCH_SIZE * 100 <= MANIFEST_STREAMED_INDEX_BATCH_SIZE);
+        const _: () =
+            assert!(MANIFEST_DISCOVERY_BATCH_SIZE * 100 <= MANIFEST_STREAMED_INDEX_BATCH_SIZE);
     }
 
     #[tokio::test]
