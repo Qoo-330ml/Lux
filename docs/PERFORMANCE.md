@@ -416,3 +416,5 @@ PostgreSQL 候选将总 DML 减少约 27%、SQL 减少约 11%，三类主要批�
 | WAL | 约 219 MB |
 
 同一扫描代码的 SQLite 对照（三轮，关闭 lock monitor）为首扫 2.683 / 2.964 / 2.893 s（中位数 2.893 s）、target 715 ms、无变化重扫 1.032 s、前台 p95 237 ms；provider 迁移未改变 SQLite 结果。以上数据只代表本机 ARM64，不外推 NAS/x86_64，且不关闭 LUX-275 阶段门。
+
+迁移 `0142_filter_available_source_promotions.sql` 继续压缩 source INSERT 的 availability 路径：先筛选仍为 `has_available_source = 0` 的 item，再连接 `filesystem_entries`。同一 Apple M4 / PostgreSQL 16 / 60,000 文件 fixture 的三轮为首扫 6.596 / 6.384 / 6.578 s（中位数 6.578 s）、`movie_source_insert` 1.236 / 1.170 / 1.154 s（中位数 1.170 s）、`positive_index_apply` 5.131 / 4.741 / 4.965 s（中位数 4.965 s）、target 2.378 / 2.412 / 2.373 s（中位数 2.378 s）、无变化重扫 2.214 / 2.292 / 2.295 s（中位数 2.292 s）。与上一组三轮相比没有形成稳定的总耗时加速，因此保留它作为无语义变化的冗余探测削减，不把它计入 LUX-275 性能门收益。
