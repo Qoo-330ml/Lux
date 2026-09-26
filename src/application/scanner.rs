@@ -75,7 +75,10 @@ pub const BACKGROUND_SCAN_BATCH_SIZE: usize = 100;
 const MANIFEST_APPLY_BATCH_SIZE: usize = 500;
 const MAX_SCAN_JOB_BATCH_SIZE: usize = 500;
 const DISCOVERY_BATCH_SIZE: usize = 16;
-const MANIFEST_DISCOVERY_BATCH_SIZE: usize = 64;
+// A typical fixture directory contains about 100 files. Keep one discovery
+// work unit close to the 8,000-file streamed index budget without changing
+// the inner file and in-flight entry caps.
+const MANIFEST_DISCOVERY_BATCH_SIZE: usize = 80;
 const MANIFEST_DIFF_BATCH_SIZE: usize = 500;
 const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
 const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
@@ -11331,9 +11334,10 @@ fn configured_scan_concurrency(
 #[cfg(test)]
 mod tests {
     use super::{
-        ManifestDirectoryReader, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
-        MixedClassification, MixedClassificationCache, NewScanManifestDiscoveryChunk,
-        NewScanManifestEntry, PendingManifestDirectoryChunk, ScanJobService, ScannerError,
+        MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_INDEX_BATCH_SIZE, ManifestDirectoryReader,
+        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
+        MixedClassificationCache, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
+        PendingManifestDirectoryChunk, ScanJobService, ScannerError,
         classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
         manifest_root_identity_matches, media_source_folder, normalize_incremental_path,
         read_manifest_strm_target, safe_scan_activity_label,
@@ -11346,6 +11350,12 @@ mod tests {
         assert_eq!(configured_scan_concurrency(Some(8), Some(4), 16), 8);
         assert_eq!(configured_scan_concurrency(None, Some(4), 16), 4);
         assert_eq!(configured_scan_concurrency(None, None, 16), 16);
+    }
+
+    #[test]
+    fn manifest_discovery_budget_stays_within_streamed_file_budget() {
+        assert_eq!(MANIFEST_DISCOVERY_BATCH_SIZE, 80);
+        assert!(MANIFEST_DISCOVERY_BATCH_SIZE * 100 <= MANIFEST_STREAMED_INDEX_BATCH_SIZE);
     }
 
     #[tokio::test]

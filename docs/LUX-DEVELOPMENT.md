@@ -6782,7 +6782,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-275：全链路扫描性能与阶段门
 
-范围：以最终 discovery、准备与 storage 路径运行 60,000 files / 600 directories 的 SQLite/PostgreSQL 各三轮 release 基准，作为阶段 22 完成判定。除索引完成外，必须评估 120,000 targets、无变化重扫、批次尾延迟、扫描期间 50 并发前台请求、SQL/DML、WAL 和锁等待。若首轮阶段门未通过，可依据已测子阶段做一个受数据库 bind 上限约束的 storage 批次调整，然后完整重跑阶段门。`LUX_SCAN_CONCURRENCY` 与媒体库设置值均须证明有效多任务运行、有界、可受资源反馈降档；不得在 Tokio core 线程执行阻塞 I/O，不声称 NAS/x86 性能。
+范围：以最终 discovery、准备与 storage 路径运行 60,000 files / 600 directories 的 SQLite/PostgreSQL 各三轮 release 基准，作为阶段 22 完成判定。除索引完成外，必须评估 120,000 targets、无变化重扫、批次尾延迟、扫描期间 50 并发前台请求、SQL/DML、WAL 和锁等待。若首轮阶段门未通过，可依据已测子阶段做一轮有界 discovery work-unit 与受数据库 bind 上限约束的 storage 批次调整，然后完整重跑阶段门。`LUX_SCAN_CONCURRENCY` 与媒体库设置值均须证明有效多任务运行、有界、可受资源反馈降档；不得在 Tokio core 线程执行阻塞 I/O，不声称 NAS/x86 性能。
 
 验收：
 
@@ -6793,7 +6793,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-273、LUX-274。
 
-实现文件（含首轮未过门后的有界批次跟进）：`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+实现文件（含首轮未过门后的有界 discovery/storage 批次跟进）：`src/application/scanner.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 26. 风险与缓解
 
