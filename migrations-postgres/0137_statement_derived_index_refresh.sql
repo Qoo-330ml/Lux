@@ -58,11 +58,15 @@ BEGIN
            COALESCE(n.original_title, ''),
            COALESCE(a.aliases, '')
     FROM new_rows n
+    JOIN old_rows o ON o.id = n.id
     LEFT JOIN LATERAL (
         SELECT string_agg(ia.alias, ' ') AS aliases
         FROM item_aliases ia
         WHERE ia.item_id = n.id
     ) a ON TRUE
+    WHERE n.title IS DISTINCT FROM o.title
+       OR n.sort_title IS DISTINCT FROM o.sort_title
+       OR n.original_title IS DISTINCT FROM o.original_title
     ON CONFLICT (item_id) DO UPDATE SET
         title = EXCLUDED.title,
         sort_title = EXCLUDED.sort_title,
@@ -73,8 +77,9 @@ END;
 $$;
 
 CREATE TRIGGER media_items_search_au
-AFTER UPDATE OF title, sort_title, original_title ON media_items
+AFTER UPDATE ON media_items
 REFERENCING NEW TABLE AS new_rows
+             OLD TABLE AS old_rows
 FOR EACH STATEMENT
 EXECUTE FUNCTION lux_refresh_media_search_items_update_stmt();
 
@@ -131,9 +136,19 @@ BEGIN
     UPDATE media_search s
     SET aliases = COALESCE(a.aliases, '')
     FROM (
-        SELECT item_id FROM old_rows
+        SELECT o.item_id
+        FROM old_rows o
+        JOIN new_rows n ON n.id = o.id
+        WHERE o.alias IS DISTINCT FROM n.alias
+           OR o.alias_normalized IS DISTINCT FROM n.alias_normalized
+           OR o.item_id IS DISTINCT FROM n.item_id
         UNION
-        SELECT item_id FROM new_rows
+        SELECT n.item_id
+        FROM old_rows o
+        JOIN new_rows n ON n.id = o.id
+        WHERE o.alias IS DISTINCT FROM n.alias
+           OR o.alias_normalized IS DISTINCT FROM n.alias_normalized
+           OR o.item_id IS DISTINCT FROM n.item_id
     ) affected
     LEFT JOIN LATERAL (
         SELECT string_agg(ia.alias, ' ') AS aliases
@@ -146,7 +161,7 @@ END;
 $$;
 
 CREATE TRIGGER item_aliases_search_au
-AFTER UPDATE OF alias, alias_normalized, item_id ON item_aliases
+AFTER UPDATE ON item_aliases
 REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
 FOR EACH STATEMENT
 EXECUTE FUNCTION lux_refresh_media_search_aliases_update_stmt();
@@ -217,10 +232,16 @@ RETURNS TRIGGER
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    WITH affected AS (
-        SELECT item_id FROM old_rows
+    WITH changed AS (
+        SELECT o.item_id AS old_item_id, n.item_id AS new_item_id
+        FROM old_rows o
+        JOIN new_rows n ON n.id = o.id
+        WHERE o.item_id IS DISTINCT FROM n.item_id
+           OR o.filesystem_entry_id IS DISTINCT FROM n.filesystem_entry_id
+    ), affected AS (
+        SELECT old_item_id AS item_id FROM changed
         UNION
-        SELECT item_id FROM new_rows
+        SELECT new_item_id AS item_id FROM changed
     ), computed AS (
         SELECT a.item_id,
                CASE WHEN EXISTS (
@@ -242,7 +263,7 @@ END;
 $$;
 
 CREATE TRIGGER media_sources_availability_au
-AFTER UPDATE OF item_id, filesystem_entry_id ON media_sources
+AFTER UPDATE ON media_sources
 REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
 FOR EACH STATEMENT
 EXECUTE FUNCTION lux_refresh_media_sources_availability_update_stmt();
@@ -316,7 +337,7 @@ END;
 $$;
 
 CREATE TRIGGER filesystem_entries_availability_au
-AFTER UPDATE OF is_missing ON filesystem_entries
+AFTER UPDATE ON filesystem_entries
 REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows
 FOR EACH STATEMENT
 EXECUTE FUNCTION lux_refresh_filesystem_entries_availability_update_stmt();
