@@ -3480,6 +3480,105 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
 }
 
 #[tokio::test]
+async fn movie_batch_insert_refreshes_existing_parent_folders_as_a_set() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+
+    let make_file = |index: usize, folder: &str, name: &str| NewMovieFile {
+        filesystem_entry_id: format!("folder-entry-{index}"),
+        source_id: format!("folder-source-{index}"),
+        relative_path: format!("{folder}/{name}.202{index}.mkv"),
+        size: 1,
+        modified_at: index as i64,
+        fingerprint: vec![index as u8],
+        title: format!("{name} {index}"),
+        sort_title: format!("{name} {index}"),
+        original_title: format!("{name} {index}"),
+        production_year: Some(2020 + index as i64),
+        provider_ids_json: None,
+        source_kind: "LOCAL_FILE".to_owned(),
+        strm_target_kind: None,
+        edition_name: None,
+        quality_label: None,
+        container: "mkv".to_owned(),
+        external_url: None,
+    };
+
+    let first_files = vec![
+        make_file(1, "Alpha", "First"),
+        make_file(2, "Beta", "First"),
+        make_file(3, "Gamma", "First"),
+    ];
+    database
+        .insert_movie_files_batch(
+            &library.id.to_string(),
+            &root.id.to_string(),
+            "generation-1",
+            &first_files,
+        )
+        .await
+        .expect("first batch");
+
+    sqlx::query(
+        "UPDATE media_items
+         SET title = 'stale', sort_title = 'stale', removed_at = unixepoch()
+         WHERE identity_key = ?",
+    )
+    .bind(format!("folder:{}:Alpha", root.id))
+    .execute(database.pool())
+    .await
+    .expect("stale folder");
+
+    let second_files = vec![
+        make_file(4, "Alpha", "Second"),
+        make_file(5, "Beta", "Second"),
+        make_file(6, "Gamma", "Second"),
+    ];
+    database.reset_query_count();
+    database
+        .insert_movie_files_batch(
+            &library.id.to_string(),
+            &root.id.to_string(),
+            "generation-2",
+            &second_files,
+        )
+        .await
+        .expect("second batch");
+
+    assert_eq!(
+        database.query_count(),
+        6,
+        "existing parent folders should refresh in one set-based statement"
+    );
+    let (title, removed_at): (String, Option<i64>) =
+        sqlx::query_as("SELECT title, removed_at FROM media_items WHERE identity_key = ?")
+            .bind(format!("folder:{}:Alpha", root.id))
+            .fetch_one(database.pool())
+            .await
+            .expect("refreshed folder");
+    assert_eq!(title, "Alpha");
+    assert!(removed_at.is_none());
+}
+
+#[tokio::test]
 async fn write_probe_reports_a_query_only_sqlite_connection() {
     let pool = AnyPoolOptions::new()
         .max_connections(1)

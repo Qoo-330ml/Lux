@@ -25,6 +25,14 @@ struct MovieParentFolderToInsert {
     depth: usize,
 }
 
+struct MovieParentFolderUpdate {
+    id: String,
+    identity_key: String,
+    parent_id: String,
+    title: String,
+    sort_title: String,
+}
+
 #[derive(Clone, Copy)]
 struct FileIndexScope<'a> {
     library_id: &'a str,
@@ -62,6 +70,41 @@ fn parse_folder_identity_key(value: &str) -> Option<(String, String)> {
         return None;
     }
     Some((library_root_id.to_owned(), relative_path.to_owned()))
+}
+
+fn movie_parent_folder_id_from_cache(
+    library_root_id: &str,
+    relative_path: &str,
+    folder_cache: &HashMap<String, String>,
+) -> Result<Option<String>, StorageError> {
+    let directory = relative_path
+        .rsplit_once('/')
+        .map(|(directory, _)| directory)
+        .or_else(|| {
+            relative_path
+                .rsplit_once('\\')
+                .map(|(directory, _)| directory)
+        })
+        .unwrap_or_default();
+    let mut parent_folder_id = None;
+    let mut directory_key = String::new();
+    for component in directory.split(['/', '\\']) {
+        if component.is_empty() || component == "." {
+            continue;
+        }
+        if !directory_key.is_empty() {
+            directory_key.push('/');
+        }
+        directory_key.push_str(component);
+        let identity_key = format!("folder:{library_root_id}:{directory_key}");
+        let folder_id = folder_cache.get(&identity_key).ok_or_else(|| {
+            StorageError::Conflict(
+                "movie parent folder cache is missing a discovered directory".to_owned(),
+            )
+        })?;
+        parent_folder_id = Some(folder_id.clone());
+    }
+    Ok(parent_folder_id)
 }
 
 fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
@@ -1385,6 +1428,122 @@ impl Database {
         Ok(())
     }
 
+    async fn refresh_existing_movie_parent_folders_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        batch: MovieParentFolderBatch<'_>,
+    ) -> Result<(), StorageError> {
+        let MovieParentFolderBatch {
+            library_id,
+            library_root_id,
+            files,
+            folder_cache,
+            touched_folders,
+            batch_size,
+        } = batch;
+        let mut updates = HashMap::<String, MovieParentFolderUpdate>::new();
+        for file in files {
+            let directory = file
+                .relative_path
+                .rsplit_once('/')
+                .map(|(directory, _)| directory)
+                .or_else(|| {
+                    file.relative_path
+                        .rsplit_once('\\')
+                        .map(|(directory, _)| directory)
+                })
+                .unwrap_or_default();
+            let mut parent_id = library_id.to_owned();
+            let mut directory_key = String::new();
+            for component in directory.split(['/', '\\']) {
+                if component.is_empty() || component == "." {
+                    continue;
+                }
+                if !directory_key.is_empty() {
+                    directory_key.push('/');
+                }
+                directory_key.push_str(component);
+                let identity_key = format!("folder:{library_root_id}:{directory_key}");
+                let folder_id = folder_cache.get(&identity_key).ok_or_else(|| {
+                    StorageError::Conflict(
+                        "movie parent folder cache is missing a discovered directory".to_owned(),
+                    )
+                })?;
+                if !touched_folders.contains(&identity_key) {
+                    updates.entry(identity_key.clone()).or_insert_with(|| {
+                        MovieParentFolderUpdate {
+                            id: folder_id.clone(),
+                            identity_key: identity_key.clone(),
+                            parent_id: parent_id.clone(),
+                            title: component.to_owned(),
+                            sort_title: component.to_ascii_lowercase(),
+                        }
+                    });
+                }
+                parent_id = folder_id.clone();
+            }
+        }
+
+        let mut updates = updates.into_values().collect::<Vec<_>>();
+        updates.sort_unstable_by(|left, right| left.identity_key.cmp(&right.identity_key));
+        for chunk in updates.chunks(batch_size) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH incoming(
+                     id, identity_key, library_id, parent_id, title, sort_title,
+                     identification_status
+                 ) AS (VALUES {values})
+                 UPDATE media_items AS folder
+                 SET library_id = incoming.library_id,
+                     parent_id = incoming.parent_id,
+                     title = incoming.title,
+                     sort_title = incoming.sort_title,
+                     original_title = incoming.title,
+                     identification_status = incoming.identification_status,
+                     removed_at = NULL,
+                     updated_at = unixepoch()
+                 FROM incoming
+                 WHERE folder.id = incoming.id
+                   AND folder.identity_key = incoming.identity_key
+                   AND folder.item_type = 'FOLDER'
+                   AND (
+                       folder.library_id <> incoming.library_id
+                       OR folder.parent_id IS NULL
+                       OR folder.parent_id <> incoming.parent_id
+                       OR folder.title <> incoming.title
+                       OR folder.sort_title <> incoming.sort_title
+                       OR folder.original_title IS NULL
+                       OR folder.original_title <> incoming.title
+                       OR folder.identification_status <> incoming.identification_status
+                       OR folder.removed_at IS NOT NULL
+                   )"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for update in chunk {
+                statement = statement
+                    .bind(&update.id)
+                    .bind(&update.identity_key)
+                    .bind(library_id)
+                    .bind(&update.parent_id)
+                    .bind(&update.title)
+                    .bind(&update.sort_title);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
     async fn update_movie_parents_in_batches(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -1465,92 +1624,6 @@ impl Database {
                 })?;
         }
         Ok(())
-    }
-
-    async fn ensure_movie_parent_folder_cached(
-        &self,
-        transaction: &mut sqlx::Transaction<'_, Any>,
-        library_id: &str,
-        library_root_id: &str,
-        relative_path: &str,
-        folder_cache: &mut HashMap<String, String>,
-        touched_folders: &mut HashSet<String>,
-    ) -> Result<Option<String>, StorageError> {
-        let directory = relative_path
-            .rsplit_once('/')
-            .map(|(directory, _)| directory)
-            .or_else(|| {
-                relative_path
-                    .rsplit_once('\\')
-                    .map(|(directory, _)| directory)
-            })
-            .unwrap_or_default();
-        let mut parent_folder_id = None;
-        let mut parent_id = library_id.to_owned();
-        let mut directory_key = String::new();
-        for component in directory.split(['/', '\\']) {
-            if component.is_empty() || component == "." {
-                continue;
-            }
-            if !directory_key.is_empty() {
-                directory_key.push('/');
-            }
-            directory_key.push_str(component);
-            let identity_key = format!("folder:{library_root_id}:{directory_key}");
-            let folder_id = if let Some(folder_id) = folder_cache.get(&identity_key) {
-                let folder_id = folder_id.clone();
-                if touched_folders.insert(identity_key.clone()) {
-                    self.query(
-                        "UPDATE media_items
-                         SET library_id = ?, item_type = 'FOLDER', parent_id = ?,
-                             title = ?, sort_title = ?, original_title = ?,
-                             identification_status = 'LOCAL_CONFIRMED', removed_at = NULL,
-                             updated_at = unixepoch()
-                         WHERE id = ?",
-                    )
-                    .bind(library_id)
-                    .bind(&parent_id)
-                    .bind(component)
-                    .bind(component.to_ascii_lowercase())
-                    .bind(component)
-                    .bind(&folder_id)
-                    .execute(&mut **transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                }
-                folder_id
-            } else {
-                let folder_id = Uuid::now_v7().to_string();
-                self.query(
-                    "INSERT INTO media_items (
-                        id, library_id, item_type, parent_id, title, sort_title,
-                        original_title, identification_status, identity_key
-                    ) VALUES (?, ?, 'FOLDER', ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
-                )
-                .bind(&folder_id)
-                .bind(library_id)
-                .bind(&parent_id)
-                .bind(component)
-                .bind(component.to_ascii_lowercase())
-                .bind(component)
-                .bind(&identity_key)
-                .execute(&mut **transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-                folder_cache.insert(identity_key.clone(), folder_id.clone());
-                touched_folders.insert(identity_key);
-                folder_id
-            };
-            parent_id = folder_id.clone();
-            parent_folder_id = Some(folder_id);
-        }
-        Ok(parent_folder_id)
     }
 
     pub(crate) async fn repair_movie_parent_folder(
@@ -1744,6 +1817,18 @@ impl Database {
             },
         )
         .await?;
+        self.refresh_existing_movie_parent_folders_in_transaction(
+            &mut *transaction,
+            MovieParentFolderBatch {
+                library_id,
+                library_root_id,
+                files,
+                folder_cache: &mut folder_cache,
+                touched_folders: &mut touched_folders,
+                batch_size,
+            },
+        )
+        .await?;
         let mut movie_cache = self
             .prefetch_movie_items_in_transaction(&mut *transaction, library_id, files, batch_size)
             .await?;
@@ -1797,16 +1882,11 @@ impl Database {
         let mut provider_updates = HashMap::new();
         let mut source_rows = Vec::with_capacity(files.len());
         for (index, file) in files.iter().enumerate() {
-            let parent_folder_id = self
-                .ensure_movie_parent_folder_cached(
-                    &mut *transaction,
-                    library_id,
-                    library_root_id,
-                    &file.relative_path,
-                    &mut folder_cache,
-                    &mut touched_folders,
-                )
-                .await?;
+            let parent_folder_id = movie_parent_folder_id_from_cache(
+                library_root_id,
+                &file.relative_path,
+                &folder_cache,
+            )?;
             let identity = (file.sort_title.clone(), file.production_year);
             let (item_id, is_new_item) = if let Some(item) = movie_cache.get(&identity) {
                 (item.id.clone(), false)
