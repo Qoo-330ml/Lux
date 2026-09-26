@@ -134,7 +134,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 142);
+    assert_eq!(database.schema_version().await?, 143);
     let manifest_tables: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM information_schema.tables
@@ -147,6 +147,37 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_tables, 6);
+    let removed_media_search_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname IN ('idx_media_search_title', 'idx_media_search_sort_title')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(removed_media_search_indexes, 0);
+    let provider_row_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_trigger trigger_row
+         JOIN pg_class trigger_table ON trigger_table.oid = trigger_row.tgrelid
+         WHERE trigger_table.relname = 'media_items'
+           AND NOT trigger_row.tgisinternal
+           AND trigger_row.tgname IN ('media_item_provider_ids_ai', 'media_item_provider_ids_au')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(provider_row_triggers, 0);
+    let merged_media_search_triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*)
+         FROM pg_trigger trigger_row
+         JOIN pg_class trigger_table ON trigger_table.oid = trigger_row.tgrelid
+         WHERE trigger_table.relname = 'media_items'
+           AND NOT trigger_row.tgisinternal
+           AND trigger_row.tgname IN ('media_items_search_ai', 'media_items_search_au')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(merged_media_search_triggers, 2);
     let postprocessing_targets_ready_column: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
          WHERE table_schema = current_schema()
@@ -454,6 +485,19 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(updated_provider_id, "456");
+    sqlx::query("UPDATE media_items SET title = 'Postgres Search Movie Renamed' WHERE id = $1")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let provider_after_title_update: String = sqlx::query_scalar(
+        "SELECT provider_id
+         FROM media_item_provider_ids
+         WHERE media_item_id = $1",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(provider_after_title_update, "456");
     sqlx::query(
         "INSERT INTO item_aliases (id, item_id, alias, language, alias_normalized)
          VALUES ($1, $2, '银河搜索电影', 'zh-CN', '银河搜索电影')",
@@ -584,7 +628,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 142);
+    assert_eq!(database.schema_version().await?, 143);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",

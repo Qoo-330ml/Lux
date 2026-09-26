@@ -112,6 +112,29 @@ fn postgres_provider_index_refresh_uses_statement_level_triggers() {
 }
 
 #[test]
+fn postgres_media_search_refresh_owns_provider_index_refresh() {
+    let migration =
+        include_str!("../migrations-postgres/0143_merge_provider_refresh_into_media_search.sql");
+
+    assert!(migration.contains("lux_refresh_media_search_items_insert_stmt"));
+    assert!(migration.contains("lux_refresh_media_search_items_update_stmt"));
+    assert!(migration.contains("INSERT INTO media_item_provider_ids"));
+    assert!(migration.contains("DELETE FROM media_item_provider_ids"));
+    assert!(migration.contains("DROP TRIGGER IF EXISTS media_item_provider_ids_ai"));
+    assert!(migration.contains("DROP TRIGGER IF EXISTS media_item_provider_ids_au"));
+    assert!(migration.contains("DROP INDEX IF EXISTS idx_media_search_title"));
+    assert!(migration.contains("DROP INDEX IF EXISTS idx_media_search_sort_title"));
+    assert!(!migration.contains("CREATE TRIGGER media_item_provider_ids_ai"));
+    assert!(!migration.contains("CREATE TRIGGER media_item_provider_ids_au"));
+    assert!(!migration.contains("FOR EACH ROW"));
+    assert!(migration.contains("FROM new_rows"));
+    assert!(migration.contains("USING old_rows"));
+    assert!(migration.contains("JOIN old_rows o"));
+    assert!(migration.contains("n.title IS DISTINCT FROM o.title"));
+    assert!(migration.contains("existing.item_id IS NULL"));
+}
+
+#[test]
 fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
     let migration =
         include_str!("../migrations-postgres/0138_avoid_alias_rescan_on_media_item_refresh.sql");

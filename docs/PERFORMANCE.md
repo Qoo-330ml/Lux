@@ -418,3 +418,16 @@ PostgreSQL 候选将总 DML 减少约 27%、SQL 减少约 11%，三类主要批�
 同一扫描代码的 SQLite 对照（三轮，关闭 lock monitor）为首扫 2.683 / 2.964 / 2.893 s（中位数 2.893 s）、target 715 ms、无变化重扫 1.032 s、前台 p95 237 ms；provider 迁移未改变 SQLite 结果。以上数据只代表本机 ARM64，不外推 NAS/x86_64，且不关闭 LUX-275 阶段门。
 
 迁移 `0142_filter_available_source_promotions.sql` 继续压缩 source INSERT 的 availability 路径：先筛选仍为 `has_available_source = 0` 的 item，再连接 `filesystem_entries`。同一 Apple M4 / PostgreSQL 16 / 60,000 文件 fixture 的三轮为首扫 6.596 / 6.384 / 6.578 s（中位数 6.578 s）、`movie_source_insert` 1.236 / 1.170 / 1.154 s（中位数 1.170 s）、`positive_index_apply` 5.131 / 4.741 / 4.965 s（中位数 4.965 s）、target 2.378 / 2.412 / 2.373 s（中位数 2.378 s）、无变化重扫 2.214 / 2.292 / 2.295 s（中位数 2.292 s）。与上一组三轮相比没有形成稳定的总耗时加速，因此保留它作为无语义变化的冗余探测削减，不把它计入 LUX-275 性能门收益。
+
+### PostgreSQL media_search/provider 刷新合并与未使用索引清理（0143）
+
+迁移 `0143_merge_provider_refresh_into_media_search.sql` 将 provider lookup 刷新合并到已有的 `media_items` statement-level search trigger，并删除实际 `ILIKE '%term%'` 查询不使用的 `media_search(title)` 与 `media_search(sort_title)` B-tree。标题未变化时只在搜索行缺失的情况下补建；provider 字段未变化时不删除/重建 provider 行。SQLite 路径不变。
+
+2026-09-26 在同一 Apple M4 ARM64、PostgreSQL 16 本机容器、60,000 文件 / 600 目录 fixture 上关闭锁采样，分别对干净 0142 worktree 和 0143 工作树各运行三轮。fixture SHA-256 为 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。
+
+| 版本 | 首扫索引完成：三轮 / 中位数 | `positive_index_apply` 中位数 | target 物化 | 无变化重扫 | 前台 p95 | SQL / DML | WAL 中位数 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 0142 基线 | 15.242 / 15.266 / 15.015 s；**15.242 s** | 4.441 s | 2.394 s | 12.103 s | 267 ms | 421 / 122 | 219,210,636 bytes |
+| 0143 工作树 | 14.771 / 13.171 / 14.642 s；**14.642 s** | 4.250 s | 2.378 s | 12.116 s | 272 ms | 419 / 122 | 209,838,782 bytes |
+
+相对同机 0142 A/B，首扫中位数下降约 3.9%，`positive_index_apply` 下降约 4.3%，WAL 下降约 4.3%；无变化重扫增加约 0.1%，前台 p95 增加约 1.9%，均在 5% 回退门槛内。这个改动确认减少了 PostgreSQL 派生写入成本，但绝对首扫仍高于 LUX-270 的 9.657 秒参考，因此不关闭 LUX-275，也不能外推 NAS/x86_64。
