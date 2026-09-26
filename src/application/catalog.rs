@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt,
+    path::Path,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -1556,6 +1557,7 @@ pub struct CatalogItem {
 pub struct CatalogSource {
     pub id: String,
     pub source_kind: String,
+    pub file_name: Option<String>,
     pub container: Option<String>,
     pub size: Option<i64>,
     pub external_url: Option<String>,
@@ -1668,6 +1670,7 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
                 item.media_sources.push(CatalogSource {
                     id: source_id,
                     source_kind: row.source_kind.unwrap_or_else(|| "LOCAL_FILE".to_owned()),
+                    file_name: catalog_source_file_name(row.source_relative_path.as_deref()),
                     container: row.container.clone(),
                     size: row.size,
                     external_url: row.external_url.clone(),
@@ -1712,6 +1715,13 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
         let _ = stream_id;
     }
     items
+}
+
+fn catalog_source_file_name(relative_path: Option<&str>) -> Option<String> {
+    Path::new(relative_path?)
+        .file_name()?
+        .to_str()
+        .map(str::to_owned)
 }
 
 fn reorder_catalog_items(items: Vec<CatalogItem>, item_ids: &[String]) -> Vec<CatalogItem> {
@@ -1808,7 +1818,7 @@ mod tests {
 
     use super::{
         CatalogItem, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle, SearchFlightKey,
-        SearchFlightRegistry, reorder_catalog_items, take_recent_entries,
+        SearchFlightRegistry, catalog_source_file_name, reorder_catalog_items, take_recent_entries,
     };
 
     fn catalog_item(id: &str) -> CatalogItem {
@@ -1853,6 +1863,15 @@ mod tests {
             wallpaper_image_tag: None,
             media_sources: Vec::new(),
         }
+    }
+
+    #[test]
+    fn catalog_source_file_name_uses_only_the_last_path_component() {
+        assert_eq!(
+            catalog_source_file_name(Some("Series/Season 01/Show.S01E01.2160p.WEB-DL.mkv",)),
+            Some("Show.S01E01.2160p.WEB-DL.mkv".to_owned())
+        );
+        assert_eq!(catalog_source_file_name(None), None);
     }
 
     #[test]

@@ -1909,6 +1909,7 @@ mod tests {
             bitrate: Some(800_000),
             duration_ticks: Some(90_000_000),
             is_default: true,
+            file_name: None,
             probe_status: "READY".to_owned(),
             streams: vec![CatalogStream {
                 index: 0,
@@ -2043,6 +2044,7 @@ mod tests {
             bitrate: None,
             duration_ticks: Some(100_000_000),
             is_default: true,
+            file_name: None,
             probe_status: "READY".to_owned(),
             streams: Vec::new(),
             chapters: vec![CatalogChapter {
@@ -2087,6 +2089,7 @@ mod tests {
             bitrate: None,
             duration_ticks: None,
             is_default: true,
+            file_name: None,
             probe_status: "READY".to_owned(),
             streams: Vec::new(),
             chapters,
@@ -2117,6 +2120,7 @@ mod tests {
             bitrate: None,
             duration_ticks: None,
             is_default: true,
+            file_name: None,
             probe_status: "PENDING".to_owned(),
             streams: Vec::new(),
             chapters: Vec::new(),
@@ -2160,6 +2164,7 @@ mod tests {
             bitrate: None,
             duration_ticks: None,
             is_default: true,
+            file_name: None,
             probe_status: "PENDING".to_owned(),
             streams: Vec::new(),
             chapters: Vec::new(),
@@ -2227,6 +2232,7 @@ mod tests {
             bitrate: Some(800_000),
             duration_ticks: Some(90_000_000),
             is_default: true,
+            file_name: None,
             probe_status: "READY".to_owned(),
             streams: vec![CatalogStream {
                 index: 0,

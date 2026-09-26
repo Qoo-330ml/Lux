@@ -947,6 +947,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1051,6 +1053,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1240,6 +1244,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1461,6 +1467,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1593,6 +1601,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1690,6 +1700,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1756,6 +1768,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                          ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        (SELECT fe.relative_path FROM filesystem_entries fe
+                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1809,6 +1823,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                          ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        (SELECT fe.relative_path FROM filesystem_entries fe
+                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1865,6 +1881,8 @@ impl Database {
                      ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                     (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                      ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                     ms.edition_name, ms.quality_label,
                     ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -1916,6 +1934,8 @@ impl Database {
                          ORDER BY image_index LIMIT 1) AS thumb_image_tag,
                         (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
                          ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                        (SELECT fe.relative_path FROM filesystem_entries fe
+                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
                         ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                         ms.edition_name, ms.quality_label,
                         ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
@@ -2130,6 +2150,7 @@ impl Database {
                         thumb_image_tag: row.get("thumb_image_tag"),
                         logo_image_tag: row.get("logo_image_tag"),
                         source_id: row.get("source_id"),
+                        source_relative_path: row.try_get("source_relative_path").ok().flatten(),
                         source_kind: row.get("source_kind"),
                         container: row.get("container"),
                         size: row.get("size"),

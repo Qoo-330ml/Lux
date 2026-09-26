@@ -648,6 +648,7 @@ Lux 当前提供一个版本化的原生 Webhook 合同（`schemaVersion: 1`）�
 - 2026-08-14 Filmly Android 详情页根因定位：部分媒体源的 `MediaStreams[].Language` 为 JSON `null` 时，爆米花详情页显示“尝试连接时发生错误”；该日期的临时方案曾仅将剧集分集接口对 Filmly User-Agent 的空语言规范化为 `"und"`。该方案已由 2026-08-28 的统一媒体流序列化修复取代。
 - 2026-08-28 Filmly Android 详情页兼容修复：媒体探测结果中的空白/缺失流语言统一输出为 `"und"`，缺失/空白 `DisplayTitle` 按流类型输出 `Video`、`Audio`、`Subtitle` 或 `Unknown`；规则位于统一 Emby `MediaStream` 序列化入口，覆盖分集列表、详情和媒体源响应，不再依赖客户端 User-Agent 后处理。`tests/series_api.rs` 已覆盖空标题的 Filmly 与 VidHub 分集响应。
 - 2026-09-23 Hills Android 媒体轨道细节补齐：Emby `MediaStreams[].DisplayTitle` 在可用时组合语言、编码、声道布局及字幕 SDH 等原始标题；ffprobe 的 `hearing_impaired` disposition 写入 `IsHearingImpaired`，其他已解析音频字段继续作为结构化字段返回。DTO 与 probe 回归已覆盖；部署后的 Hills 真机复测待完成。
+- 2026-09-24 Hills Android 视频源名称对齐：Emby `MediaSources[].Name` 现在优先使用该源文件的 basename，完整媒体库路径不进入 DTO；`MediaStreams[].DisplayTitle` 在视频标题为空或仅为 `Video` 时显示媒体源质量标签（如 `2160p`），已有标题未包含该标签时也会前置补上。DTO 回归已覆盖；部署后的 Hills 真机复测待完成。
 - 2026-08-11 Filmly 2.12.3 首页请求修复：`/Users/{userId}/Items` 现在支持 `ExcludeItemTypes`，未指定递归和类型时按 Emby 根层级返回电影/剧集，列表 DTO 补充用户 `CanDownload` 和请求的 `Chapters` 字段；已用真实请求参数加入剧集层级协议回归，真实设备刷新复测仍待完成。
 - 播放兼容修复：本地源的 Emby `Container` 使用真实文件扩展名，播放 URL 由 `MediaSourceId` 定位文件并兼容复合容器旧后缀；`attached_pic` 不再暴露为视频轨。自动化播放/探测回归已覆盖 MKV 和 MP4 路径，VidHub 已实测本地 MKV 直放。
 - 播放会话失活保护：若第三方客户端异常退出、网络中断或未发送 `Stopped`，`PLAYING`/`PAUSED` 会话在连续 90 秒没有事件后从 Emby `GET /Sessions`、管理员控制台和 Web 播放状态中隐藏；显式 `Stopped` 仍立即清理活动会话。

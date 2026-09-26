@@ -4216,6 +4216,7 @@ mod emby_playback_tests {
             bitrate: None,
             duration_ticks: None,
             is_default: true,
+            file_name: None,
             probe_status: "READY".to_owned(),
             streams: vec![
                 CatalogStream {
