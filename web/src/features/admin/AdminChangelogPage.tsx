@@ -21,6 +21,7 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "changed", items: [
         "全量扫描新增轻量 Manifest 发现模式，减少目录 frontier 和逐文件状态写入；批量更新未变化文件，并通过 generation/fingerprint CAS 与删除前复核维持扫描安全。",
         "批量优化 PostgreSQL 媒体搜索、可用性与 Provider 索引刷新，减少扫描和入库时重复触发的数据库工作；补充扫描阶段耗时诊断信息。",
+        "已配置在线刮削器的媒体库在 SCRAPER_FIRST 模式下，会为缺失海报/缩略图安排首次尝试及 6 小时、24 小时后的重试；三次后仍缺少时才生成截图回退，重试状态在进程重启和媒体库重扫后保留。",
       ] },
     ],
   },
