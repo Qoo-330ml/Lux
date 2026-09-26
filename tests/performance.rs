@@ -941,16 +941,35 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         )
         .await?;
     let derived_index_triggers_disabled =
-        backend == "sqlite" && env::var_os("LUX_PERF_DISABLE_DERIVED_INDEX_TRIGGERS").is_some();
+        env::var_os("LUX_PERF_DISABLE_DERIVED_INDEX_TRIGGERS").is_some();
     if derived_index_triggers_disabled {
-        for trigger in [
-            "media_items_search_ai",
-            "media_items_search_au",
-            "media_items_search_ad",
-            "media_item_provider_ids_ai",
-            "media_item_provider_ids_au",
-        ] {
-            let query = format!("DROP TRIGGER IF EXISTS {trigger}");
+        let triggers: &[(&str, &str)] = if backend == "postgres" {
+            &[
+                ("media_items_search_ai", "media_items"),
+                ("media_items_search_au", "media_items"),
+                ("media_items_search_ad", "media_items"),
+                ("media_item_provider_ids_ai", "media_items"),
+                ("media_item_provider_ids_au", "media_items"),
+                ("media_sources_availability_ai", "media_sources"),
+                ("media_sources_availability_au", "media_sources"),
+                ("media_sources_availability_ad", "media_sources"),
+                ("filesystem_entries_availability_au", "filesystem_entries"),
+            ]
+        } else {
+            &[
+                ("media_items_search_ai", "media_items"),
+                ("media_items_search_au", "media_items"),
+                ("media_items_search_ad", "media_items"),
+                ("media_item_provider_ids_ai", "media_items"),
+                ("media_item_provider_ids_au", "media_items"),
+            ]
+        };
+        for (trigger, table) in triggers {
+            let query = if backend == "postgres" {
+                format!("DROP TRIGGER IF EXISTS {trigger} ON {table}")
+            } else {
+                format!("DROP TRIGGER IF EXISTS {trigger}")
+            };
             sqlx::query(sqlx::AssertSqlSafe(query))
                 .execute(database.pool())
                 .await?;
