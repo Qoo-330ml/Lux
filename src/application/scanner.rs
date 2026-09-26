@@ -5398,11 +5398,9 @@ impl ScanJobService {
         }
 
         let root_path = PathBuf::from(&root.canonical_path);
-        let current_root = stat_manifest_root(root_path.clone()).await?;
-        if !manifest_root_identity_matches(expected_root_device, expected_root_inode, &current_root)
-        {
-            return Err(ScannerError::RootIdentityChanged(root_path));
-        }
+        // The directory reader already captured and checked the root identity. Positive files
+        // are re-statted through the secured directory handle below before they are committed,
+        // so a second standalone stat(root) here only duplicates filesystem I/O.
         let mut classification_cache = MixedClassificationCache::default();
         let mut unchanged_paths = Vec::new();
         let mut preparation_tasks = tokio::task::JoinSet::new();
