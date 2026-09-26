@@ -1473,6 +1473,69 @@ async fn compact_manifest_removes_a_path_only_after_complete_root_and_absence_ch
 }
 
 #[tokio::test]
+async fn compact_manifest_removal_checks_each_completed_directory_without_prefix_overlap()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Nested movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let alpha = root.join("A");
+    let nested = alpha.join("Nested");
+    let alpha_sibling = root.join("AB");
+    tokio::fs::create_dir_all(&nested).await?;
+    tokio::fs::create_dir_all(&alpha_sibling).await?;
+    let removed = alpha.join("Removed.Movie.2024.mkv");
+    let retained = alpha.join("Retained.Movie.2024.mkv");
+    let nested_retained = nested.join("Nested.Movie.2024.mkv");
+    let sibling_retained = alpha_sibling.join("Sibling.Movie.2024.mkv");
+    for path in [&removed, &retained, &nested_retained, &sibling_retained] {
+        tokio::fs::write(path, b"fixture").await?;
+    }
+    let root_id = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?
+        .root
+        .id
+        .to_string();
+
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 100, None).await?;
+    tokio::fs::remove_file(&removed).await?;
+
+    let reconciliation = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&reconciliation.id, 100, None)
+        .await?;
+
+    let states: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT relative_path, is_missing
+         FROM filesystem_entries
+         WHERE library_root_id = ?
+         ORDER BY relative_path",
+    )
+    .bind(root_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        states,
+        vec![
+            ("A/Nested/Nested.Movie.2024.mkv".to_owned(), 0),
+            ("A/Removed.Movie.2024.mkv".to_owned(), 1),
+            ("A/Retained.Movie.2024.mkv".to_owned(), 0),
+            ("AB/Sibling.Movie.2024.mkv".to_owned(), 0),
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_update()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

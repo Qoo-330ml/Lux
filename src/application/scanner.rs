@@ -81,6 +81,7 @@ const DISCOVERY_BATCH_SIZE: usize = 16;
 // the inner file and in-flight entry caps.
 const MANIFEST_DISCOVERY_BATCH_SIZE: usize = 80;
 const MANIFEST_DIFF_BATCH_SIZE: usize = 500;
+const MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE: i64 = 128;
 const FINGERPRINT_CHECK_CONCURRENCY: usize = 64;
 const DISCOVERY_ENTRY_BATCH_SIZE: usize = 1024;
 const MANIFEST_STREAMED_INDEX_BATCH_SIZE: usize = 8_000;
@@ -6392,50 +6393,169 @@ impl ScanJobService {
             }
         }
 
-        after_library_root_id = None;
-        after_relative_path = None;
-        loop {
+        if discovery_format_version == 3 {
+            let mut directory_after_library_root_id: Option<String> = None;
+            let mut directory_after_relative_path: Option<String> = None;
+            loop {
+                if self
+                    .cancellation_requested(&job.id, false, cancellation)
+                    .await?
+                {
+                    return self.cancel_running_job(&job.id).await;
+                }
+                let directories = self
+                    .database
+                    .list_scan_manifest_complete_directories(
+                        manifest_id,
+                        directory_after_library_root_id.as_deref(),
+                        directory_after_relative_path.as_deref(),
+                        MANIFEST_REMOVAL_DIRECTORY_BATCH_SIZE,
+                    )
+                    .await?;
+                let Some(last_directory) = directories.last() else {
+                    break;
+                };
+                loop {
+                    if self
+                        .cancellation_requested(&job.id, false, cancellation)
+                        .await?
+                    {
+                        return self.cancel_running_job(&job.id).await;
+                    }
+                    let candidates = self
+                        .database
+                        .list_scan_manifest_removal_candidates_for_directories(
+                            manifest_id,
+                            &directories,
+                            page_size,
+                        )
+                        .await?;
+                    if candidates.is_empty() {
+                        break;
+                    }
+                    let delta_ids = candidates
+                        .iter()
+                        .map(|_| Uuid::now_v7().to_string())
+                        .collect::<Vec<_>>();
+                    let deltas = candidates
+                        .iter()
+                        .zip(&delta_ids)
+                        .map(|(candidate, id)| NewScanManifestDelta {
+                            id,
+                            library_root_id: &candidate.library_root_id,
+                            relative_path: &candidate.relative_path,
+                            observation_sequence: None,
+                            delta_kind: "REMOVE",
+                            base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                            base_fingerprint: candidate.base_fingerprint.as_deref(),
+                        })
+                        .collect::<Vec<_>>();
+                    self.database
+                        .insert_scan_manifest_deltas(manifest_id, &deltas)
+                        .await?;
+                }
+                directory_after_library_root_id = Some(last_directory.library_root_id.clone());
+                directory_after_relative_path = Some(last_directory.relative_path.clone());
+            }
             if self
-                .cancellation_requested(&job.id, false, cancellation)
+                .database
+                .scan_manifest_has_uncovered_files(manifest_id)
                 .await?
             {
-                return self.cancel_running_job(&job.id).await;
+                let mut uncovered_after_library_root_id: Option<String> = None;
+                let mut uncovered_after_relative_path: Option<String> = None;
+                loop {
+                    if self
+                        .cancellation_requested(&job.id, false, cancellation)
+                        .await?
+                    {
+                        return self.cancel_running_job(&job.id).await;
+                    }
+                    let candidates = self
+                        .database
+                        .list_scan_manifest_removal_candidates(
+                            manifest_id,
+                            discovery_format_version,
+                            true,
+                            uncovered_after_library_root_id.as_deref(),
+                            uncovered_after_relative_path.as_deref(),
+                            page_size,
+                        )
+                        .await?;
+                    let Some(last_candidate) = candidates.last() else {
+                        break;
+                    };
+                    let delta_ids = candidates
+                        .iter()
+                        .map(|_| Uuid::now_v7().to_string())
+                        .collect::<Vec<_>>();
+                    let deltas = candidates
+                        .iter()
+                        .zip(&delta_ids)
+                        .map(|(candidate, id)| NewScanManifestDelta {
+                            id,
+                            library_root_id: &candidate.library_root_id,
+                            relative_path: &candidate.relative_path,
+                            observation_sequence: None,
+                            delta_kind: "REMOVE",
+                            base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                            base_fingerprint: candidate.base_fingerprint.as_deref(),
+                        })
+                        .collect::<Vec<_>>();
+                    self.database
+                        .insert_scan_manifest_deltas(manifest_id, &deltas)
+                        .await?;
+                    uncovered_after_library_root_id = Some(last_candidate.library_root_id.clone());
+                    uncovered_after_relative_path = Some(last_candidate.relative_path.clone());
+                }
             }
-            let candidates = self
-                .database
-                .list_scan_manifest_removal_candidates(
-                    manifest_id,
-                    discovery_format_version,
-                    after_library_root_id.as_deref(),
-                    after_relative_path.as_deref(),
-                    page_size,
-                )
-                .await?;
-            let Some(last_candidate) = candidates.last() else {
-                break;
-            };
-            let delta_ids = candidates
-                .iter()
-                .map(|_| Uuid::now_v7().to_string())
-                .collect::<Vec<_>>();
-            let deltas = candidates
-                .iter()
-                .zip(&delta_ids)
-                .map(|(candidate, id)| NewScanManifestDelta {
-                    id,
-                    library_root_id: &candidate.library_root_id,
-                    relative_path: &candidate.relative_path,
-                    observation_sequence: None,
-                    delta_kind: "REMOVE",
-                    base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
-                    base_fingerprint: candidate.base_fingerprint.as_deref(),
-                })
-                .collect::<Vec<_>>();
-            self.database
-                .insert_scan_manifest_deltas(manifest_id, &deltas)
-                .await?;
-            after_library_root_id = Some(last_candidate.library_root_id.clone());
-            after_relative_path = Some(last_candidate.relative_path.clone());
+        } else {
+            after_library_root_id = None;
+            after_relative_path = None;
+            loop {
+                if self
+                    .cancellation_requested(&job.id, false, cancellation)
+                    .await?
+                {
+                    return self.cancel_running_job(&job.id).await;
+                }
+                let candidates = self
+                    .database
+                    .list_scan_manifest_removal_candidates(
+                        manifest_id,
+                        discovery_format_version,
+                        false,
+                        after_library_root_id.as_deref(),
+                        after_relative_path.as_deref(),
+                        page_size,
+                    )
+                    .await?;
+                let Some(last_candidate) = candidates.last() else {
+                    break;
+                };
+                let delta_ids = candidates
+                    .iter()
+                    .map(|_| Uuid::now_v7().to_string())
+                    .collect::<Vec<_>>();
+                let deltas = candidates
+                    .iter()
+                    .zip(&delta_ids)
+                    .map(|(candidate, id)| NewScanManifestDelta {
+                        id,
+                        library_root_id: &candidate.library_root_id,
+                        relative_path: &candidate.relative_path,
+                        observation_sequence: None,
+                        delta_kind: "REMOVE",
+                        base_filesystem_entry_id: Some(&candidate.base_filesystem_entry_id),
+                        base_fingerprint: candidate.base_fingerprint.as_deref(),
+                    })
+                    .collect::<Vec<_>>();
+                self.database
+                    .insert_scan_manifest_deltas(manifest_id, &deltas)
+                    .await?;
+                after_library_root_id = Some(last_candidate.library_root_id.clone());
+                after_relative_path = Some(last_candidate.relative_path.clone());
+            }
         }
 
         if !self

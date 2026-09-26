@@ -5,6 +5,13 @@ const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
 const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
 
+fn escape_sql_like_pattern(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
+}
+
 struct ManifestPostprocessingTargetRange<'a> {
     job_id: &'a str,
     library_root_id: &'a str,
@@ -1443,6 +1450,206 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    pub(crate) async fn list_scan_manifest_complete_directories(
+        &self,
+        manifest_id: &str,
+        after_library_root_id: Option<&str>,
+        after_relative_path: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<StoredScanManifestDirectory>, StorageError> {
+        self.query(
+            "SELECT directory.library_root_id, directory.relative_path
+             FROM scan_manifest_directories directory
+             JOIN scan_manifest_roots root
+               ON root.manifest_id = directory.manifest_id
+              AND root.library_root_id = directory.library_root_id
+              AND root.state = 'COMPLETE'
+             WHERE directory.manifest_id = ?
+               AND directory.state = 'COMPLETE'
+               AND (directory.library_root_id, directory.relative_path) > (?, ?)
+             ORDER BY directory.library_root_id, directory.relative_path
+             LIMIT ?",
+        )
+        .bind(manifest_id)
+        .bind(after_library_root_id.unwrap_or_default())
+        .bind(after_relative_path.unwrap_or_default())
+        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredScanManifestDirectory {
+                    library_root_id: row.get("library_root_id"),
+                    relative_path: row.get("relative_path"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn scan_manifest_has_uncovered_files(
+        &self,
+        manifest_id: &str,
+    ) -> Result<bool, StorageError> {
+        self.query_scalar(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1
+                 FROM filesystem_entries fe
+                 JOIN scan_manifest_roots root
+                   ON root.manifest_id = ?
+                  AND root.library_root_id = fe.library_root_id
+                  AND root.state = 'COMPLETE'
+                 JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                   AND COALESCE(fe.last_seen_generation, '') <> job.generation
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_seen_paths seen
+                       WHERE seen.manifest_id = root.manifest_id
+                         AND seen.library_root_id = fe.library_root_id
+                         AND seen.relative_path = fe.relative_path
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM scan_manifest_deltas delta
+                       WHERE delta.manifest_id = root.manifest_id
+                         AND delta.library_root_id = fe.library_root_id
+                         AND delta.relative_path = fe.relative_path
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM scan_manifest_directories directory
+                       WHERE directory.manifest_id = root.manifest_id
+                         AND directory.library_root_id = fe.library_root_id
+                         AND directory.state = 'COMPLETE'
+                         AND (
+                             (directory.relative_path = ''
+                              AND fe.relative_path NOT LIKE '%/%' ESCAPE '\\')
+                             OR (directory.relative_path <> ''
+                                 AND fe.relative_path LIKE (
+                                     REPLACE(
+                                         REPLACE(
+                                             REPLACE(directory.relative_path, '\\', '\\\\'),
+                                             '%',
+                                             '\\%'
+                                         ),
+                                         '_',
+                                         '\\_'
+                                     ) || '/%'
+                                 ) ESCAPE '\\'
+                                 AND fe.relative_path NOT LIKE (
+                                     REPLACE(
+                                         REPLACE(
+                                             REPLACE(directory.relative_path, '\\', '\\\\'),
+                                             '%',
+                                             '\\%'
+                                         ),
+                                         '_',
+                                         '\\_'
+                                     ) || '/%/%'
+                                 ) ESCAPE '\\')
+                         )
+                   )
+             ) THEN 1 ELSE 0 END",
+        )
+        .bind(manifest_id)
+        .fetch_one(&self.pool)
+        .await
+        .map(|value: i64| value != 0)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_scan_manifest_removal_candidates_for_directories(
+        &self,
+        manifest_id: &str,
+        directories: &[StoredScanManifestDirectory],
+        limit: i64,
+    ) -> Result<Vec<StoredScanManifestRemovalCandidate>, StorageError> {
+        if directories.is_empty() {
+            return Ok(Vec::new());
+        }
+        let predicates = directories
+            .iter()
+            .map(|directory| {
+                if directory.relative_path.is_empty() {
+                    "(fe.library_root_id = ? AND fe.relative_path NOT LIKE '%/%' ESCAPE '\\')"
+                        .to_owned()
+                } else {
+                    "(fe.library_root_id = ?
+                      AND fe.relative_path LIKE ? ESCAPE '\\'
+                      AND fe.relative_path NOT LIKE ? ESCAPE '\\')"
+                        .to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        let query = format!(
+            "SELECT fe.library_root_id, fe.relative_path,
+                    fe.id AS base_filesystem_entry_id,
+                    fe.fingerprint AS base_fingerprint
+             FROM filesystem_entries fe
+             JOIN scan_manifest_roots root
+              ON root.manifest_id = ?
+              AND root.library_root_id = fe.library_root_id
+              AND root.state = 'COMPLETE'
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             JOIN scan_jobs job ON job.id = manifest.job_id
+             WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+               AND ({predicates})
+               AND COALESCE(fe.last_seen_generation, '') <> job.generation
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_manifest_seen_paths seen
+                   WHERE seen.manifest_id = ?
+                     AND seen.library_root_id = fe.library_root_id
+                     AND seen.relative_path = fe.relative_path
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_manifest_deltas delta
+                   WHERE delta.manifest_id = ?
+                     AND delta.library_root_id = fe.library_root_id
+                     AND delta.relative_path = fe.relative_path
+               )
+             ORDER BY fe.library_root_id, fe.relative_path
+             LIMIT ?"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(manifest_id);
+        for directory in directories {
+            statement = statement.bind(&directory.library_root_id);
+            if !directory.relative_path.is_empty() {
+                let escaped = escape_sql_like_pattern(&directory.relative_path);
+                statement = statement
+                    .bind(format!("{escaped}/%"))
+                    .bind(format!("{escaped}/%/%"));
+            }
+        }
+        statement = statement
+            .bind(manifest_id)
+            .bind(manifest_id)
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE));
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredScanManifestRemovalCandidate {
+                        library_root_id: row.get("library_root_id"),
+                        relative_path: row.get("relative_path"),
+                        base_filesystem_entry_id: row.get("base_filesystem_entry_id"),
+                        base_fingerprint: row.get("base_fingerprint"),
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     #[allow(dead_code)] // Kept for focused storage contract tests.
@@ -3025,6 +3232,7 @@ impl Database {
         &self,
         manifest_id: &str,
         discovery_format_version: i64,
+        uncovered_only: bool,
         after_library_root_id: Option<&str>,
         after_relative_path: Option<&str>,
         limit: i64,
@@ -3048,6 +3256,44 @@ impl Database {
                    LIMIT 1
                ), '') <> 'FILE'"
         };
+        let uncovered_predicate = if discovery_format_version == 3 && uncovered_only {
+            "AND NOT EXISTS (
+                    SELECT 1
+                    FROM scan_manifest_directories directory
+                    WHERE directory.manifest_id = root.manifest_id
+                      AND directory.library_root_id = fe.library_root_id
+                      AND directory.state = 'COMPLETE'
+                      AND (
+                          (directory.relative_path = ''
+                           AND fe.relative_path NOT LIKE '%/%' ESCAPE '\\')
+                          OR (directory.relative_path <> ''
+                              AND fe.relative_path LIKE (
+                                  REPLACE(
+                                      REPLACE(
+                                          REPLACE(directory.relative_path, '\\', '\\\\'),
+                                          '%',
+                                          '\\%'
+                                      ),
+                                      '_',
+                                      '\\_'
+                                  ) || '/%'
+                              ) ESCAPE '\\'
+                              AND fe.relative_path NOT LIKE (
+                                  REPLACE(
+                                      REPLACE(
+                                          REPLACE(directory.relative_path, '\\', '\\\\'),
+                                          '%',
+                                          '\\%'
+                                      ),
+                                      '_',
+                                      '\\_'
+                                  ) || '/%/%'
+                              ) ESCAPE '\\')
+                      )
+                )"
+        } else {
+            ""
+        };
         let query = format!(
             "SELECT fe.library_root_id, fe.relative_path, fe.id AS base_filesystem_entry_id,
                     fe.fingerprint AS base_fingerprint
@@ -3061,25 +3307,22 @@ impl Database {
              WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
                AND (fe.library_root_id, fe.relative_path) > (?, ?)
                AND {unseen_path_predicate}
+               {uncovered_predicate}
                AND NOT EXISTS (
                    SELECT 1 FROM scan_manifest_deltas delta
                    WHERE delta.manifest_id = ?
                      AND delta.library_root_id = fe.library_root_id
                      AND delta.relative_path = fe.relative_path
                )
-             ORDER BY fe.library_root_id, fe.relative_path
-             LIMIT ?"
+            ORDER BY fe.library_root_id, fe.relative_path
+            LIMIT ?"
         );
         let mut statement = self
             .query(sqlx::AssertSqlSafe(query))
             .bind(manifest_id)
             .bind(after_library_root_id.unwrap_or_default())
             .bind(after_relative_path.unwrap_or_default());
-        if discovery_format_version == 3 {
-            statement = statement.bind(manifest_id).bind(manifest_id);
-        } else {
-            statement = statement.bind(manifest_id).bind(manifest_id);
-        }
+        statement = statement.bind(manifest_id).bind(manifest_id);
         statement
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .fetch_all(&self.pool)
@@ -3129,6 +3372,40 @@ impl Database {
                  JOIN scan_manifests manifest ON manifest.id = root.manifest_id
                  JOIN scan_jobs job ON job.id = manifest.job_id
                  WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
+                   AND EXISTS (
+                       SELECT 1
+                       FROM scan_manifest_directories directory
+                       WHERE directory.manifest_id = root.manifest_id
+                         AND directory.library_root_id = fe.library_root_id
+                         AND directory.state = 'COMPLETE'
+                         AND (
+                             (directory.relative_path = ''
+                              AND fe.relative_path NOT LIKE '%/%' ESCAPE '\\')
+                             OR (directory.relative_path <> ''
+                                 AND fe.relative_path LIKE (
+                                     REPLACE(
+                                         REPLACE(
+                                             REPLACE(directory.relative_path, '\\', '\\\\'),
+                                             '%',
+                                             '\\%'
+                                         ),
+                                         '_',
+                                         '\\_'
+                                     ) || '/%'
+                                 ) ESCAPE '\\'
+                                 AND fe.relative_path NOT LIKE (
+                                     REPLACE(
+                                         REPLACE(
+                                             REPLACE(directory.relative_path, '\\', '\\\\'),
+                                             '%',
+                                             '\\%'
+                                         ),
+                                         '_',
+                                         '\\_'
+                                     ) || '/%/%'
+                                 ) ESCAPE '\\')
+                         )
+                   )
                    AND COALESCE(fe.last_seen_generation, '') <> job.generation
                    AND NOT EXISTS (
                        SELECT 1 FROM scan_manifest_seen_paths seen

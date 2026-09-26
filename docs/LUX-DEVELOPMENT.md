@@ -6633,7 +6633,7 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 
 #### LUX-267：Manifest 差异计算与安全应用
 
-范围：新建 discovery format 3。成功新增/变化/重新出现的正向索引以 `filesystem_entries.last_seen_generation` 与 `last_seen_change_kind` 标记本次扫描；稳定 unchanged 文件直接以同一 generation 标记并清空本轮 change kind，不再写 `scan_manifest_seen_paths`。该 ledger 只保留已观察但未能安全推进 generation 的路径，例如准备不稳定或 CAS 冲突路径。root 与目录身份仍保留完整 observation。发现批次中的文件 stat/fingerprint 保留在内存供二次校验和 CAS 使用，并与 `filesystem_entries`/媒体索引、必要的 presence ledger、目录 frontier 和进度原子提交。`scan_job_targets` 不在正向索引事务写入；索引完成后按持久化的每根路径游标分批物化，所有根路径的 target checkpoint 原子就绪前不得启动 probe/NFO/缩略图 worker。该阶段重试必须保持已完成 target 状态，并以数据库屏障阻止增量扫描改写尚未物化的全量 generation。完整 root 的 REMOVE 候选要求 generation 不匹配且不存在 seen-path 记录；删除前仍须确认路径缺失并按基线 ID/fingerprint CAS。既有 workflow 1/2 与 discovery format 2 继续使用原观察行和原执行器。
+范围：新建 discovery format 3。成功新增/变化/重新出现的正向索引以 `filesystem_entries.last_seen_generation` 与 `last_seen_change_kind` 标记本次扫描；稳定 unchanged 文件以 observed fingerprint CAS 成功后标记同一 generation 并清空本轮 change kind，不再写 `scan_manifest_seen_paths`。该 ledger 只保留已观察但未能安全推进 generation 的路径，例如准备不稳定或 CAS 冲突路径。root 与目录身份仍保留完整 observation。发现批次中的文件 stat/fingerprint 保留在内存供二次校验和 CAS 使用，并与 `filesystem_entries`/媒体索引、必要的 presence ledger、目录 frontier 和进度原子提交。`scan_job_targets` 不在正向索引事务写入；索引完成后按持久化的每根路径游标分批物化，所有根路径的 target checkpoint 原子就绪前不得启动 probe/NFO/缩略图 worker。该阶段重试必须保持已完成 target 状态，并以数据库屏障阻止增量扫描改写尚未物化的全量 generation。REMOVE 候选按完整根路径下的已完成目录分批枚举，只比较直接 FILE 子项，且要求 generation 不匹配、不存在 seen-path 记录；删除前仍须确认路径缺失并按基线 ID/fingerprint CAS。既有 workflow 1/2 与 discovery format 2 继续使用原观察行和原执行器。
 
 验收：
 
@@ -6643,6 +6643,7 @@ Manifest observation 一经写入不可原地修改；应用新增或变化条�
 - [x] 所有根路径的 target 游标完成与 Manifest `targets_ready` 屏障在同一终结事务提交；probe/NFO/缩略图 worker 和并发增量扫描均等待此屏障，重试不重置已完成 target 状态。
 - [x] target 物化覆盖不完整/不可用根路径上已安全提交的正向索引，但每个消费页都核对扫描根路径身份；根替换时不推进该根游标，等待恢复后继续。
 - [x] 只有完整、仍匹配 device/inode 的根路径可生成 REMOVE 候选；删除前确认路径缺失，并以基线 ID/fingerprint CAS；根路径 unavailable/incomplete、取消或 I/O 错误不删除。
+- [x] discovery format 3 的 REMOVE 候选按有界目录页枚举直接文件子项；相邻目录前缀不会互相匹配，历史异常路径不会阻塞终结检查。
 - [x] 扫描中的安全正向提交可见于普通列表，但首页快照仍只在索引/缺失确认结束后切换；正向提交不得覆盖并发增量结果。
 - [x] v3 REMOVE delta 与索引、targets 和进度原子提交；旧版未完成 Manifest 任务仍按旧 discovery format 与 delta PENDING/APPLIED 合同恢复。
 

@@ -20,6 +20,7 @@ LUX-267 v2 已将新增/变化/重新出现文件的正向索引合并进 discov
 - v3 新增 `scan_manifest_seen_paths(manifest_id, library_root_id, relative_path)`，复合主键保证每个 manifest/root/path 最多一行。成功正向索引和 fingerprint CAS 成功的稳定 unchanged 文件都通过 `filesystem_entries.last_seen_generation` 标记本次扫描，并以 `last_seen_change_kind` 保留 `NEW`/`CHANGED` 的 postprocessing 语义；ledger 只记录无法安全推进 generation 的已观察文件，例如准备不稳定或 CAS 冲突。它不重复保存 size、mtime、device、inode 或 fingerprint。
 - root 与目录身份 observation 继续追加到 `scan_manifest_entries`。文件 stat/fingerprint 在 discovery 内存中用于二次安全校验、分类和基线 ID/fingerprint CAS；成功的正向文件事实写入当前 `filesystem_entries`/媒体索引。
 - presence ledger、文件/媒体索引、目录 frontier 和进度必须在同一个有界事务提交或回滚。重复恢复同一目录通过 `ON CONFLICT DO NOTHING` 幂等。
+- v3 的 REMOVE 候选按已完成目录分批枚举，只比较每个目录的直接 FILE 子项，避免每次从全库 generation sweep 开始；旧 workflow/format 继续使用全库兼容查询。终结检查保留完整目录成员资格过滤，忽略历史上不属于当前目录快照的异常路径。
 - `scan_job_targets` 在所有索引与 REMOVE 确认完成、首页快照切换并发布索引完成事件后生成。Manifest 和每个 root 都保存 target-ready 标记；root 保存 keyset cursor。每页 target 写入与 cursor 前进同事务，最后 root 完成和全局 ready barrier 原子提交。worker 仅在全局 ready 后启动。迁移为既有 workflow/discovery format 设 ready 默认值；新 v3 Manifest 明确设为未就绪。
 - 只有完整且身份仍匹配的 root，才对 `filesystem_entries` 中 generation 与本次扫描不同、且不存在 seen-path 记录的 FILE 产生 REMOVE 候选。每个删除仍需安全复核路径并按基线 entry ID/fingerprint CAS；不可用 root、取消或 I/O 错误不能删除。
 - format 3 的 completed payload cleanup 按有界批次删除 seen-path 行并清空 target cursor；FAILED/CANCELLED 的 checkpoint 与 ledger 保留以供重试。没有公开 API、Webhook 或 Emby 合同变化。
@@ -43,5 +44,6 @@ LUX-267 v2 已将新增/变化/重新出现文件的正向索引合并进 discov
 
 - 新 schema 只追加 discovery format 字段和 seen-path 表；不重建 `scan_manifests`，不访问文件系统、不回填全库、不转换活动旧任务。
 - ledger、目录 frontier 和正向索引共享批次事务，故 rollback 时不得留下 seen path；重启时已提交的 path/目录可幂等复用，未完成 root 仍不具备删除权。稳定 unchanged 的 generation 更新带 observed fingerprint CAS，冲突时转入 ledger；删除候选排除 ledger 中的路径。target materialization 只处理带本次 generation 和有效 change kind 的已索引文件，并通过 root identity check 避免路径被替换后推进游标。
+- 目录级 REMOVE 查询使用有界目录页、直接子项匹配和转义后的 LIKE 前缀，避免相邻目录前缀相互覆盖；完成检查仍以事务内目录成员资格为准。
 - 验收覆盖 SQLite 空库与当前 schema 升级、format 2 活动 Manifest 保持、format 3 首扫/无变化重扫/删除/取消恢复/CAS 竞争/事务回滚/target readiness barrier/清理，以及三轮 60,000 文件 release benchmark。
 - PostgreSQL migration 文本与核心 SQL 有自动化检查；只有运行 PostgreSQL integration tests 和实际 6 万文件 PostgreSQL 基准后，才能声称该后端 runtime 通过。ARM64/SQLite 数字不外推 NAS/x86_64。
