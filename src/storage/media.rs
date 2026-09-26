@@ -2030,25 +2030,35 @@ impl Database {
             .filter(|(index, _, _)| files[*index].source_kind == "STRM_URL")
             .map(|(_, item_id, _)| item_id)
             .collect::<HashSet<_>>();
-        for item_id in strm_item_ids {
-            self.query(
+        let strm_item_ids = strm_item_ids.into_iter().collect::<Vec<_>>();
+        for chunk in strm_item_ids.chunks(super::manifest_path_query_chunk_size(self.backend())) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut statement = self.query(sqlx::AssertSqlSafe(format!(
                 "UPDATE media_items
                  SET poster_fallback_required = 1
-                 WHERE id = ?
+                 WHERE id IN ({placeholders})
                    AND NOT EXISTS (
                        SELECT 1 FROM item_images
                        WHERE item_id = media_items.id
                          AND image_type IN ('POSTER', 'THUMB')
                          AND image_index = 0
-                   )",
-            )
-            .bind(item_id)
-            .execute(&mut **transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+                   )"
+            )));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
         Ok(new_items.len())
     }

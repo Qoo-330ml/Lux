@@ -3480,6 +3480,94 @@ async fn movie_batch_insert_uses_one_item_for_multiple_sources() {
 }
 
 #[tokio::test]
+async fn movie_batch_insert_updates_strm_poster_fallbacks_as_a_set() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    let files = [
+        NewMovieFile {
+            filesystem_entry_id: "strm-entry-1".to_owned(),
+            source_id: "strm-source-1".to_owned(),
+            relative_path: "First.Remote.2024.strm".to_owned(),
+            size: 1,
+            modified_at: 1,
+            fingerprint: vec![1],
+            title: "First Remote".to_owned(),
+            sort_title: "first remote".to_owned(),
+            original_title: "First Remote".to_owned(),
+            production_year: Some(2024),
+            provider_ids_json: None,
+            source_kind: "STRM_URL".to_owned(),
+            strm_target_kind: Some("URL".to_owned()),
+            edition_name: None,
+            quality_label: None,
+            container: "strm".to_owned(),
+            external_url: Some("https://example.invalid/first".to_owned()),
+        },
+        NewMovieFile {
+            filesystem_entry_id: "strm-entry-2".to_owned(),
+            source_id: "strm-source-2".to_owned(),
+            relative_path: "Second.Remote.2025.strm".to_owned(),
+            size: 1,
+            modified_at: 2,
+            fingerprint: vec![2],
+            title: "Second Remote".to_owned(),
+            sort_title: "second remote".to_owned(),
+            original_title: "Second Remote".to_owned(),
+            production_year: Some(2025),
+            provider_ids_json: None,
+            source_kind: "STRM_URL".to_owned(),
+            strm_target_kind: Some("URL".to_owned()),
+            edition_name: None,
+            quality_label: None,
+            container: "strm".to_owned(),
+            external_url: Some("https://example.invalid/second".to_owned()),
+        },
+    ];
+
+    database.reset_query_count();
+    database
+        .insert_movie_files_batch(
+            &library.id.to_string(),
+            &root.id.to_string(),
+            "generation",
+            &files,
+        )
+        .await
+        .expect("batch insert");
+
+    assert_eq!(
+        database.query_count(),
+        5,
+        "STRM poster fallback promotion should use one set-based update"
+    );
+    let fallback_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_items WHERE item_type = 'MOVIE' AND poster_fallback_required = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("poster fallback count");
+    assert_eq!(fallback_count, 2);
+}
+
+#[tokio::test]
 async fn movie_batch_insert_refreshes_existing_parent_folders_as_a_set() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
