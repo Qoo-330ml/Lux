@@ -2185,7 +2185,7 @@ impl Database {
     ) -> Result<(HashMap<String, String>, HashSet<String>), StorageError> {
         let mut ids = HashMap::new();
         let mut removed_ids = HashSet::new();
-        for chunk in identity_keys.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        for chunk in identity_keys.chunks(super::manifest_path_query_chunk_size(self.backend())) {
             if chunk.is_empty() {
                 continue;
             }
@@ -2245,7 +2245,9 @@ impl Database {
         I: IntoIterator<Item = &'a BatchHierarchyRow>,
     {
         let rows = rows.into_iter().collect::<Vec<_>>();
-        for chunk in rows.chunks(BATCH_INSERT_CHUNK_SIZE) {
+        for chunk in rows.chunks(super::media_item_hierarchy_insert_chunk_size(
+            self.backend(),
+        )) {
             if chunk.is_empty() {
                 continue;
             }

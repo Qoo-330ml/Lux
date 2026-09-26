@@ -49,11 +49,19 @@ mod users;
 
 // A media_sources row uses 11 bind values. Keep each backend's positive-index batches
 // below its parameter limit while allowing PostgreSQL fewer round trips per transaction.
-const MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 2_000;
+const MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 2_900;
 const POSTGRES_MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE: usize = 5_000;
 const MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW: usize = 11;
 const SQLITE_MAX_BIND_PARAMETERS: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS: usize = 65_535;
+// Manifest path queries have at most a handful of fixed binds in addition to each path.
+// Keep a generous safety margin below both backend parameter limits.
+const MANIFEST_PATH_QUERY_SQLITE_CHUNK_SIZE: usize = 2_900;
+const MANIFEST_PATH_QUERY_POSTGRES_CHUNK_SIZE: usize = 5_000;
+// A media_items hierarchy row has 15 bound columns; these sizes stay below each backend limit.
+const MEDIA_ITEM_HIERARCHY_SQLITE_CHUNK_SIZE: usize = 2_000;
+const MEDIA_ITEM_HIERARCHY_POSTGRES_CHUNK_SIZE: usize = 4_000;
+const MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW: usize = 15;
 const MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE: usize = 8_000;
 
 pub(crate) fn manifest_positive_index_insert_chunk_size(backend: DatabaseBackend) -> usize {
@@ -73,12 +81,35 @@ pub(crate) fn manifest_positive_index_insert_chunk_size(backend: DatabaseBackend
     chunk_size
 }
 
+pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => MANIFEST_PATH_QUERY_SQLITE_CHUNK_SIZE,
+        DatabaseBackend::Postgres => MANIFEST_PATH_QUERY_POSTGRES_CHUNK_SIZE,
+    }
+}
+
+pub(crate) fn media_item_hierarchy_insert_chunk_size(backend: DatabaseBackend) -> usize {
+    let (chunk_size, max_bind_parameters) = match backend {
+        DatabaseBackend::Sqlite => (
+            MEDIA_ITEM_HIERARCHY_SQLITE_CHUNK_SIZE,
+            SQLITE_MAX_BIND_PARAMETERS,
+        ),
+        DatabaseBackend::Postgres => (
+            MEDIA_ITEM_HIERARCHY_POSTGRES_CHUNK_SIZE,
+            POSTGRES_MAX_BIND_PARAMETERS,
+        ),
+    };
+    debug_assert!(chunk_size * MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW <= max_bind_parameters);
+    chunk_size
+}
+
 #[cfg(test)]
 mod manifest_positive_index_batch_tests {
     use super::{
         DatabaseBackend, MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW,
-        POSTGRES_MAX_BIND_PARAMETERS, SQLITE_MAX_BIND_PARAMETERS,
-        manifest_positive_index_insert_chunk_size,
+        MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW, POSTGRES_MAX_BIND_PARAMETERS,
+        SQLITE_MAX_BIND_PARAMETERS, manifest_path_query_chunk_size,
+        manifest_positive_index_insert_chunk_size, media_item_hierarchy_insert_chunk_size,
     };
 
     #[test]
@@ -86,7 +117,7 @@ mod manifest_positive_index_batch_tests {
         let sqlite_size = manifest_positive_index_insert_chunk_size(DatabaseBackend::Sqlite);
         let postgres_size = manifest_positive_index_insert_chunk_size(DatabaseBackend::Postgres);
 
-        assert_eq!(sqlite_size, 2_000);
+        assert_eq!(sqlite_size, 2_900);
         assert_eq!(postgres_size, 5_000);
         assert!(
             sqlite_size * MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW
@@ -94,6 +125,36 @@ mod manifest_positive_index_batch_tests {
         );
         assert!(
             postgres_size * MANIFEST_POSITIVE_INDEX_MAX_BIND_VALUES_PER_ROW
+                <= POSTGRES_MAX_BIND_PARAMETERS
+        );
+        assert!(postgres_size > sqlite_size);
+    }
+
+    #[test]
+    fn manifest_path_batches_are_backend_aware() {
+        assert_eq!(
+            manifest_path_query_chunk_size(DatabaseBackend::Sqlite),
+            2_900
+        );
+        assert_eq!(
+            manifest_path_query_chunk_size(DatabaseBackend::Postgres),
+            5_000
+        );
+    }
+
+    #[test]
+    fn hierarchy_batches_respect_media_item_bind_limits() {
+        let sqlite_size = media_item_hierarchy_insert_chunk_size(DatabaseBackend::Sqlite);
+        let postgres_size = media_item_hierarchy_insert_chunk_size(DatabaseBackend::Postgres);
+
+        assert_eq!(sqlite_size, 2_000);
+        assert_eq!(postgres_size, 4_000);
+        assert!(
+            sqlite_size * MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW
+                <= SQLITE_MAX_BIND_PARAMETERS
+        );
+        assert!(
+            postgres_size * MEDIA_ITEM_HIERARCHY_MAX_BIND_VALUES_PER_ROW
                 <= POSTGRES_MAX_BIND_PARAMETERS
         );
         assert!(postgres_size > sqlite_size);

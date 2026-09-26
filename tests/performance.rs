@@ -1196,10 +1196,10 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         dml_statement_count <= max_scan_dml_count,
         "Manifest scan issued {dml_statement_count} DML statements for {file_count} files; limit is {max_scan_dml_count}"
     );
-    if backend == "postgres" {
+    if matches!(backend.as_str(), "sqlite" | "postgres") {
         assert!(
             dml_statement_count < 209,
-            "LUX-274 PostgreSQL batching should reduce scan DML from the 209-statement baseline; observed {dml_statement_count}"
+            "LUX-275 backend batching should reduce scan DML from the 209-statement baseline; backend={backend}, observed {dml_statement_count}"
         );
     }
     let postgres_wal_after = if backend == "postgres" {

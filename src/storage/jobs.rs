@@ -2,17 +2,8 @@ use super::*;
 use std::time::Instant;
 
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
-// Each path uses one bind plus three fixed parameters; 996 paths fit SQLite's historical
-// 999-variable limit exactly.
-const SCAN_JOB_TARGET_PATH_CHUNK_SIZE: usize = 996;
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
 const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
-// Eight binds per observation plus two fixed binds keep 124 rows below SQLite's historical 999 limit.
-const SCAN_MANIFEST_OBSERVATION_BATCH_SIZE: usize = 124;
-// One bind per seen path plus two fixed binds keep inserts at SQLite's historical 999 limit.
-const SCAN_MANIFEST_SEEN_PATH_BATCH_SIZE: usize = 997;
-// One bind per candidate path plus four fixed binds keeps the known-path lookup below SQLite's limit.
-const SCAN_MANIFEST_KNOWN_PATH_CHUNK_SIZE: usize = 500;
 
 fn record_manifest_storage_stage(
     phase: &'static str,
@@ -1681,7 +1672,7 @@ impl Database {
             .collect::<Vec<_>>();
         let known_path_started = Instant::now();
         let mut known_file_paths = std::collections::HashSet::new();
-        for paths in file_paths.chunks(SCAN_MANIFEST_KNOWN_PATH_CHUNK_SIZE) {
+        for paths in file_paths.chunks(super::manifest_path_query_chunk_size(self.backend())) {
             if paths.is_empty() {
                 continue;
             }
@@ -1894,7 +1885,7 @@ impl Database {
         };
 
         let observation_batch_size = if workflow_version == 2 {
-            SCAN_MANIFEST_OBSERVATION_BATCH_SIZE
+            super::manifest_path_query_chunk_size(self.backend())
         } else {
             80
         };
@@ -2068,7 +2059,8 @@ impl Database {
                     ledger_paths.push(*path);
                 }
             }
-            for paths in ledger_paths.chunks(SCAN_MANIFEST_SEEN_PATH_BATCH_SIZE) {
+            for paths in ledger_paths.chunks(super::manifest_path_query_chunk_size(self.backend()))
+            {
                 if paths.is_empty() {
                     continue;
                 }
@@ -2897,7 +2889,7 @@ impl Database {
         relative_paths: &[String],
     ) -> Result<HashMap<String, StoredScanManifestFilesystemBaseline>, StorageError> {
         let mut baselines = HashMap::with_capacity(relative_paths.len());
-        for paths in relative_paths.chunks(SCAN_JOB_TARGET_PATH_CHUNK_SIZE) {
+        for paths in relative_paths.chunks(super::manifest_path_query_chunk_size(self.backend())) {
             if paths.is_empty() {
                 continue;
             }
@@ -3884,7 +3876,8 @@ impl Database {
             }
         }
 
-        for paths in new_paths.chunks(SCAN_JOB_TARGET_PATH_CHUNK_SIZE) {
+        let manifest_path_chunk_size = super::manifest_path_query_chunk_size(self.backend());
+        for paths in new_paths.chunks(manifest_path_chunk_size) {
             result.metadata_targets_changed |= self
                 .record_scan_job_targets_in_transaction(
                     &mut transaction,
@@ -3895,7 +3888,7 @@ impl Database {
                 )
                 .await?;
         }
-        for paths in changed_paths.chunks(SCAN_JOB_TARGET_PATH_CHUNK_SIZE) {
+        for paths in changed_paths.chunks(manifest_path_chunk_size) {
             result.metadata_targets_changed |= self
                 .record_scan_job_targets_in_transaction(
                     &mut transaction,
@@ -4925,7 +4918,7 @@ impl Database {
             return Ok(false);
         }
         let mut changed = false;
-        for paths in relative_paths.chunks(SCAN_JOB_TARGET_PATH_CHUNK_SIZE) {
+        for paths in relative_paths.chunks(super::manifest_path_query_chunk_size(self.backend())) {
             let placeholders = std::iter::repeat_n("?", paths.len())
                 .collect::<Vec<_>>()
                 .join(", ");
