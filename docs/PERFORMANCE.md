@@ -396,3 +396,23 @@ scripts/run-performance.sh
 | PostgreSQL 16 LUX-274 候选 | 9.692 / 9.354 / 8.758 s；**9.354 s** | 6.441 s | 616 / 152 | 2.617 / 3.847 s | 271 ms | 222,461,224 bytes |
 
 PostgreSQL 候选将总 DML 减少约 27%、SQL 减少约 11%，三类主要批量写入分别从 48/38/38 次降为 29/19/19 次；索引完成中位数快约 10.7%，无变化重扫快约 25%。WAL 增加约 2.7%，锁等待采样最大 waiter 数仍为 0；正向索引阶段耗时基本持平，说明数据库行/索引写入仍是剩余成本。SQLite 仍走原 2,000 行批次，DML 不变；其首扫中位数比 LUX-272 参考高约 4.3%，target 和无变化重扫分别高约 4.4% 和 2.6%，前台 p95 改善约 1.5%。这组 ARM64 结果不证明 NAS 性能，也没有关闭 LUX-275 的严格双后端性能门。
+
+### PostgreSQL provider 派生索引 statement trigger 复测
+
+提交 `328d034b` 的迁移 `0141_statement_provider_index_refresh.sql` 将 `media_item_provider_ids` 的 INSERT/UPDATE 触发器改为 statement-level transition table。它避免大批量 `media_items` 写入时为每一行单独执行 provider 索引刷新；SQLite 没有对应迁移。迁移契约、空库启动、旧库升级和 provider 插入/更新语义测试均通过。
+
+2026-09-26 在同一 Apple M4 ARM64、60,000 文件 / 600 目录 fixture、本机 PostgreSQL 16 容器上运行三轮。下面的数值用于定位剩余写入热点；由于尚未在同一环境对旧 row-trigger 版本完成三轮 A/B，不把它们表述为已证实的加速百分比。
+
+| 指标 | 三轮 / 中位数 |
+|---|---:|
+| 首扫索引完成 | 6.266 / 6.172 / 5.957 s；**6.172 s** |
+| `positive_index_apply` | 4.807 / 4.744 / 4.527 s；**4.744 s** |
+| `movie_item_insert` | 2.186 / 2.213 / 2.098 s；**2.186 s** |
+| `movie_source_insert` | 1.333 / 1.223 / 1.171 s；**1.223 s** |
+| filesystem claim | 0.918 / 0.939 / 0.888 s；**0.918 s** |
+| target 物化 | 2.412 / 2.380 / 2.502 s；**2.412 s** |
+| 无变化重扫 | 2.285 / 2.037 / 2.102 s；**2.102 s** |
+| 前台 p95 | 319 / 271 / 268 ms；**271 ms** |
+| WAL | 约 219 MB |
+
+同一扫描代码的 SQLite 对照（三轮，关闭 lock monitor）为首扫 2.683 / 2.964 / 2.893 s（中位数 2.893 s）、target 715 ms、无变化重扫 1.032 s、前台 p95 237 ms；provider 迁移未改变 SQLite 结果。以上数据只代表本机 ARM64，不外推 NAS/x86_64，且不关闭 LUX-275 阶段门。

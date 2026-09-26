@@ -6774,11 +6774,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果：LUX-274 关闭为共用写入路径的有界批次优化。PostgreSQL 事务里的 `positive_index_apply` 本身仍约 6.44 秒，SQLite 本地首扫尚未稳定快于 LUX-270 参考；因此阶段 22 的严格性能门仍由 LUX-275 验收，本结果不能外推 NAS。
 
+补充子阶段（2026-09-26，提交 `328d034b`）：PostgreSQL 的 `media_item_provider_ids` 派生索引原先按行触发器逐条重建；迁移 `0141_statement_provider_index_refresh.sql` 改为使用 transition table 的 statement-level trigger，在一次 `media_items` 语句内批量刷新 provider 行。该优化只改变 PostgreSQL 派生索引的刷新方式，不改变 SQLite 路径或公共数据语义；空库启动、旧库升级以及 provider 插入/更新语义回归均通过。独立三轮 PostgreSQL 结果仍需与同构旧版本三轮 A/B 后才能宣称稳定加速，不能据当前数据关闭 LUX-275。
+
 验证：相关 `storage`/`scanning_jobs` 测试、`postgres_database` ignored 集成目标、SQLite/PostgreSQL 60k 基准、fmt、build、Clippy。
 
 依赖：LUX-272；如依赖 LUX-273 的数据形态，则在 LUX-273 完成后执行。
 
-实现文件（按 LUX-274 子阶段剖析结果调整）：`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。现有 `storage` 与 `postgres_database` 测试目标作为验证运行，不需要改动测试源码。
+实现文件（按 LUX-274 子阶段剖析结果调整）：`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`migrations-postgres/0141_statement_provider_index_refresh.sql`、`tests/storage.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。
 
 #### LUX-275：全链路扫描性能与阶段门
 
