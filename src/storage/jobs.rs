@@ -2255,6 +2255,7 @@ impl Database {
                 ),
             });
         }
+        let add_filesystem_claim_started = Instant::now();
         let claimed_add_paths = self
             .claim_manifest_add_filesystem_entries_in_transaction(
                 transaction,
@@ -2263,6 +2264,13 @@ impl Database {
                 &add_filesystem_entries,
             )
             .await?;
+        record_manifest_storage_stage(
+            "positive_add_filesystem_claim",
+            add_filesystem_claim_started,
+            add_filesystem_entries.len(),
+            add_filesystem_entries.len(),
+            0,
+        );
 
         let claimed_movie_files = positives
             .iter()
@@ -2286,6 +2294,7 @@ impl Database {
             .collect::<Vec<_>>();
 
         let mut result = ManifestDiscoveryPositiveIndexResult::default();
+        let movie_materialization_started = Instant::now();
         result.created_items = self
             .insert_movie_files_without_filesystem_entries_in_transaction(
                 transaction,
@@ -2295,6 +2304,14 @@ impl Database {
                 &claimed_movie_files,
             )
             .await?;
+        record_manifest_storage_stage(
+            "positive_add_movie_materialization",
+            movie_materialization_started,
+            claimed_movie_files.len(),
+            claimed_movie_files.len(),
+            0,
+        );
+        let episode_materialization_started = Instant::now();
         result.created_items = result.created_items.saturating_add(
             self.insert_episode_files_without_filesystem_entries_in_transaction(
                 transaction,
@@ -2305,8 +2322,16 @@ impl Database {
             )
             .await?,
         );
+        record_manifest_storage_stage(
+            "positive_add_episode_materialization",
+            episode_materialization_started,
+            claimed_episode_files.len(),
+            claimed_episode_files.len(),
+            0,
+        );
 
         let mut changed_sidecar_paths = Vec::new();
+        let positive_change_application_started = Instant::now();
         for positive in positives {
             let applied = match positive.delta_kind.as_str() {
                 "ADD" => {
@@ -2463,6 +2488,13 @@ impl Database {
                 }
             }
         }
+        record_manifest_storage_stage(
+            "positive_change_application",
+            positive_change_application_started,
+            positives.len(),
+            positives.len(),
+            0,
+        );
 
         let sidecar_directories = prune_sidecar_directories(
             changed_sidecar_paths
@@ -2481,6 +2513,7 @@ impl Database {
                 })
                 .collect(),
         );
+        let sidecar_target_registration_started = Instant::now();
         result.metadata_targets_changed |= self
             .record_scan_job_sidecar_targets_in_transaction(
                 transaction,
@@ -2489,6 +2522,13 @@ impl Database {
                 &sidecar_directories,
             )
             .await?;
+        record_manifest_storage_stage(
+            "positive_sidecar_target_registration",
+            sidecar_target_registration_started,
+            sidecar_directories.len(),
+            0,
+            sidecar_directories.len(),
+        );
         Ok(result)
     }
 

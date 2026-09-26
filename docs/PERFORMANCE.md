@@ -372,3 +372,14 @@ scripts/run-performance.sh
 | PostgreSQL 流水线 | 10.987 / 17.588 / 14.756 s；**14.756 s** | 871 / 359 | 28 | 2,593 / 3,735 ms | 269 / 620 ms | 228,425,152 bytes |
 
 六轮流水线基准均观察到两个活动 reader、两个并发目录读操作以及读/准备、读/提交重叠，在途峰值 7,454 / 8,192。它把 SQLite 首扫中位数缩短约 5.2%，但 SQL 增约 23%、DML 增约 72%；PostgreSQL 首扫中位数慢约 40.9%，SQL 增约 25%、DML 增约 72%，WAL 增约 5.5%。候选代码已按 LUX-273 条件移除：PostgreSQL 没有稳定收益，单后端加速不足以抵消另一后端回退。SQLite 与 PostgreSQL 数据仍只代表这台 ARM64 开发机和本机测试容器。
+
+### LUX-274 正向索引写入子阶段诊断
+
+2026-09-26 在同一 60,000 文件 / 600 目录 fixture 上各运行一轮，基于 `93a9fa3a` 的顺序 reader 路径，只增加固定名称的子阶段计时。单轮数据用于定位热点，不替代 LUX-272/LUX-273 的三轮中位数；PostgreSQL 此轮总耗时波动尤其明显。
+
+| 后端 | 首扫索引 | `positive_index_apply` | add filesystem claim | add movie materialization | SQL / DML | target 物化 / 无变化重扫 | 前台 p95 | WAL |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| SQLite | 2.537 s | 0.978 s | 0.196 s | 0.755 s | 675 / 209 | 0.569 / 0.970 s | 234 ms | — |
+| PostgreSQL 16 | 15.808 s | 6.212 s | 0.881 s | 5.260 s | 698 / 209 | 2.673 / 3.815 s | 278 ms | 216,191,375 bytes |
+
+首扫 DML 摘要中，批量 `media_items` 插入 48 次、`media_sources` 插入 38 次、`filesystem_entries` 插入 38 次。PG 锁采样观察到 0 个最大等待者。电影项/来源物化占正向索引阶段的大部分耗时；LUX-274 接下来试验受参数上限约束的后端批次，而不改变 SQL 数据合同。单轮 PostgreSQL 数值不能与三轮中位数直接比较。
