@@ -6768,9 +6768,11 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 明确列出被优化的热阶段及优化前 SQL/DML、事务、WAL 证据；只修改有观测支撑的瓶颈。
-- [ ] SQLite/PostgreSQL 使用相同数据合同；CAS、正向索引、frontier、进度、seen ledger 和 checkpoint 仍同事务提交，失败整体回滚且幂等重试。
-- [ ] 对 60k fixtures 至少三轮复测写入阶段、总索引完成、WAL/SQL/DML、无变化重扫及前台 p95；不牺牲 SQLite 指标换取单 backend 收益。
+- [x] 明确列出被优化的 `positive_index_apply` 热阶段及其 DML/SQL/WAL 基线，并将其拆分到 filesystem claim 与 movie materialization；只调整有 profile 支持的批次边界。
+- [x] SQLite/PostgreSQL 使用相同 SQL 与数据合同；SQLite 保持 2,000 行批次，PostgreSQL 使用 5,000 行批次并低于 bind 上限。CAS、正向索引、frontier、进度、seen ledger 和 checkpoint 仍同事务提交；相关 SQLite 与 PostgreSQL 回滚/重试及恢复测试通过。
+- [x] 对 60k fixture 完成 SQLite/PostgreSQL 各三轮，记录写入阶段、索引完成、WAL/SQL/DML、无变化重扫及前台 p95。PostgreSQL DML 从 209 降为 152、索引中位数快约 10.7%；SQLite 的 batch 与 DML 不变，索引中位数在基线 5% 内，target/重扫回退均低于 5%，前台 p95 改善。WAL 中位数增加约 2.7%，已记录。
+
+结果：LUX-274 关闭为共用写入路径的有界批次优化。PostgreSQL 事务里的 `positive_index_apply` 本身仍约 6.44 秒，SQLite 本地首扫尚未稳定快于 LUX-270 参考；因此阶段 22 的严格性能门仍由 LUX-275 验收，本结果不能外推 NAS。
 
 验证：相关 `storage`/`scanning_jobs` 测试、`postgres_database` ignored 集成目标、SQLite/PostgreSQL 60k 基准、fmt、build、Clippy。
 

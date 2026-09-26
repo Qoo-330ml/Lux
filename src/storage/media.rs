@@ -603,7 +603,8 @@ impl Database {
         entries: &[NewScanManifestFilesystemEntry<'_>],
     ) -> Result<HashSet<String>, StorageError> {
         let mut inserted_paths = HashSet::with_capacity(entries.len());
-        for chunk in entries.chunks(MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE) {
+        let batch_size = super::manifest_positive_index_insert_chunk_size(self.backend());
+        for chunk in entries.chunks(batch_size) {
             let values = std::iter::repeat_n("(?, ?, ?, 'FILE', ?, ?, ?, ?, ?, ?, 0)", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -1529,7 +1530,7 @@ impl Database {
             files,
             FileIndexWriteOptions {
                 insert_filesystem_entries: false,
-                batch_size: MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE,
+                batch_size: super::manifest_positive_index_insert_chunk_size(self.backend()),
             },
         )
         .await
@@ -1876,7 +1877,7 @@ impl Database {
             files,
             FileIndexWriteOptions {
                 insert_filesystem_entries: false,
-                batch_size: MANIFEST_POSITIVE_INDEX_INSERT_CHUNK_SIZE,
+                batch_size: super::manifest_positive_index_insert_chunk_size(self.backend()),
             },
         )
         .await
