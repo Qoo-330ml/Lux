@@ -1393,7 +1393,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             .bind(&rescan_job.id)
             .fetch_one(database.pool())
             .await?;
-    assert_eq!(rescan_presence, (3, file_count as i64, 0));
+    assert_eq!(rescan_presence, (3, 0, file_count as i64));
     jobs.materialize_manifest_postprocessing_targets(&rescan_job.id)
         .await?;
     assert!(
