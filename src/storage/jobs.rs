@@ -54,6 +54,20 @@ struct ManifestDiscoveryPositiveIndexCommit<'a, 'b> {
     observations: &'a [&'a NewScanManifestEntry],
 }
 
+fn record_manifest_positive_applied<'a>(
+    result: &mut ManifestDiscoveryPositiveIndexResult<'a>,
+    positive: &'a NewScanManifestPositiveIndex,
+) {
+    result.indexed_paths.push(positive.relative_path.as_str());
+    result.applied_count = result.applied_count.saturating_add(1);
+    match positive.delta_kind.as_str() {
+        "ADD" => result.add_count = result.add_count.saturating_add(1),
+        "CHANGE" => result.change_count = result.change_count.saturating_add(1),
+        "REAPPEARED" => result.reappeared_count = result.reappeared_count.saturating_add(1),
+        _ => {}
+    }
+}
+
 fn manifest_positive_file_path(file: &NewScanManifestIndexedFile) -> &str {
     match file {
         NewScanManifestIndexedFile::Movie(file) => &file.relative_path,
@@ -2323,32 +2337,33 @@ impl Database {
         );
 
         let mut changed_sidecar_paths = Vec::new();
+        let mut existing_updates = Vec::new();
         let positive_change_application_started = Instant::now();
+
         for positive in positives {
-            let applied = match positive.delta_kind.as_str() {
+            match positive.delta_kind.as_str() {
                 "ADD" => {
                     if !claimed_add_paths.contains(&positive.relative_path) {
-                        false
-                    } else {
-                        match &positive.file {
-                            NewScanManifestIndexedFile::Movie(_)
-                            | NewScanManifestIndexedFile::Episode(_) => {}
-                            NewScanManifestIndexedFile::Unresolved(file) => {
-                                self.materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
-                                    transaction,
-                                    library_id,
-                                    library_root_id,
-                                    file,
-                                )
-                                .await?;
-                                result.created_items = result.created_items.saturating_add(1);
-                            }
-                            NewScanManifestIndexedFile::Sidecar(_) => {
-                                changed_sidecar_paths.push(positive.relative_path.clone());
-                            }
-                        }
-                        true
+                        continue;
                     }
+                    match &positive.file {
+                        NewScanManifestIndexedFile::Movie(_)
+                        | NewScanManifestIndexedFile::Episode(_) => {}
+                        NewScanManifestIndexedFile::Unresolved(file) => {
+                            self.materialize_manifest_unresolved_file_after_filesystem_insert_in_transaction(
+                                transaction,
+                                library_id,
+                                library_root_id,
+                                file,
+                            )
+                            .await?;
+                            result.created_items = result.created_items.saturating_add(1);
+                        }
+                        NewScanManifestIndexedFile::Sidecar(_) => {
+                            changed_sidecar_paths.push(positive.relative_path.clone());
+                        }
+                    }
+                    record_manifest_positive_applied(&mut result, positive);
                 }
                 "CHANGE" | "REAPPEARED" => {
                     let Some(filesystem_entry_id) = positive.base_filesystem_entry_id.as_deref()
@@ -2364,120 +2379,110 @@ impl Database {
                                 "manifest changed file is missing its observation".to_owned(),
                             )
                         })?;
-                    let fingerprint = observation.fingerprint.as_slice();
                     let expected_missing = positive.delta_kind == "REAPPEARED";
-                    let applied = match &positive.file {
+                    match &positive.file {
                         NewScanManifestIndexedFile::Movie(file) => {
-                            self.apply_manifest_existing_file_in_transaction(
-                                transaction,
-                                ManifestExistingFileUpdate {
-                                    filesystem_entry_id,
-                                    library_root_id,
-                                    relative_path: &positive.relative_path,
-                                    base_fingerprint: positive.base_fingerprint.as_deref(),
-                                    expected_missing,
-                                    size: observation.size,
-                                    modified_at: observation.modified_at,
-                                    inode: observation.inode,
-                                    fingerprint,
-                                    generation,
-                                    last_seen_change_kind: Some("CHANGED"),
-                                    source_kind: &file.source_kind,
-                                    edition_name: file.edition_name.as_deref(),
-                                    quality_label: file.quality_label.as_deref(),
-                                    container: &file.container,
-                                    external_url: file.external_url.as_deref(),
-                                    strm_target_kind: file.strm_target_kind.as_deref(),
-                                },
-                            )
-                            .await?
+                            existing_updates.push(ManifestExistingFileUpdate {
+                                filesystem_entry_id,
+                                library_root_id,
+                                relative_path: &positive.relative_path,
+                                base_fingerprint: positive.base_fingerprint.as_deref(),
+                                expected_missing,
+                                size: observation.size,
+                                modified_at: observation.modified_at,
+                                inode: observation.inode,
+                                fingerprint: observation.fingerprint.as_slice(),
+                                generation,
+                                last_seen_change_kind: Some("CHANGED"),
+                                source_kind: &file.source_kind,
+                                edition_name: file.edition_name.as_deref(),
+                                quality_label: file.quality_label.as_deref(),
+                                container: &file.container,
+                                external_url: file.external_url.as_deref(),
+                                strm_target_kind: file.strm_target_kind.as_deref(),
+                            });
                         }
                         NewScanManifestIndexedFile::Episode(file) => {
-                            self.apply_manifest_existing_file_in_transaction(
-                                transaction,
-                                ManifestExistingFileUpdate {
-                                    filesystem_entry_id,
-                                    library_root_id,
-                                    relative_path: &positive.relative_path,
-                                    base_fingerprint: positive.base_fingerprint.as_deref(),
-                                    expected_missing,
-                                    size: observation.size,
-                                    modified_at: observation.modified_at,
-                                    inode: observation.inode,
-                                    fingerprint,
-                                    generation,
-                                    last_seen_change_kind: Some("CHANGED"),
-                                    source_kind: &file.source_kind,
-                                    edition_name: file.edition_name.as_deref(),
-                                    quality_label: file.quality_label.as_deref(),
-                                    container: &file.container,
-                                    external_url: file.external_url.as_deref(),
-                                    strm_target_kind: file.strm_target_kind.as_deref(),
-                                },
-                            )
-                            .await?
+                            existing_updates.push(ManifestExistingFileUpdate {
+                                filesystem_entry_id,
+                                library_root_id,
+                                relative_path: &positive.relative_path,
+                                base_fingerprint: positive.base_fingerprint.as_deref(),
+                                expected_missing,
+                                size: observation.size,
+                                modified_at: observation.modified_at,
+                                inode: observation.inode,
+                                fingerprint: observation.fingerprint.as_slice(),
+                                generation,
+                                last_seen_change_kind: Some("CHANGED"),
+                                source_kind: &file.source_kind,
+                                edition_name: file.edition_name.as_deref(),
+                                quality_label: file.quality_label.as_deref(),
+                                container: &file.container,
+                                external_url: file.external_url.as_deref(),
+                                strm_target_kind: file.strm_target_kind.as_deref(),
+                            });
                         }
                         NewScanManifestIndexedFile::Unresolved(file) => {
-                            self.apply_manifest_existing_file_in_transaction(
-                                transaction,
-                                ManifestExistingFileUpdate {
-                                    filesystem_entry_id,
-                                    library_root_id,
-                                    relative_path: &positive.relative_path,
-                                    base_fingerprint: positive.base_fingerprint.as_deref(),
-                                    expected_missing,
-                                    size: observation.size,
-                                    modified_at: observation.modified_at,
-                                    inode: observation.inode,
-                                    fingerprint,
-                                    generation,
-                                    last_seen_change_kind: Some("CHANGED"),
-                                    source_kind: &file.source_kind,
-                                    edition_name: None,
-                                    quality_label: None,
-                                    container: &file.container,
-                                    external_url: file.external_url.as_deref(),
-                                    strm_target_kind: file.strm_target_kind.as_deref(),
-                                },
-                            )
-                            .await?
+                            existing_updates.push(ManifestExistingFileUpdate {
+                                filesystem_entry_id,
+                                library_root_id,
+                                relative_path: &positive.relative_path,
+                                base_fingerprint: positive.base_fingerprint.as_deref(),
+                                expected_missing,
+                                size: observation.size,
+                                modified_at: observation.modified_at,
+                                inode: observation.inode,
+                                fingerprint: observation.fingerprint.as_slice(),
+                                generation,
+                                last_seen_change_kind: Some("CHANGED"),
+                                source_kind: &file.source_kind,
+                                edition_name: None,
+                                quality_label: None,
+                                container: &file.container,
+                                external_url: file.external_url.as_deref(),
+                                strm_target_kind: file.strm_target_kind.as_deref(),
+                            });
                         }
                         NewScanManifestIndexedFile::Sidecar(_) => {
-                            self.apply_manifest_existing_sidecar_in_transaction(
-                                transaction,
-                                library_root_id,
-                                generation,
-                                positive,
-                                observation,
-                                expected_missing,
-                            )
-                            .await?
-                        }
-                    };
-                    if applied {
-                        if matches!(positive.file, NewScanManifestIndexedFile::Sidecar(_)) {
-                            changed_sidecar_paths.push(positive.relative_path.clone());
+                            let applied = self
+                                .apply_manifest_existing_sidecar_in_transaction(
+                                    transaction,
+                                    library_root_id,
+                                    generation,
+                                    positive,
+                                    observation,
+                                    expected_missing,
+                                )
+                                .await?;
+                            if applied {
+                                changed_sidecar_paths.push(positive.relative_path.clone());
+                                record_manifest_positive_applied(&mut result, positive);
+                            }
                         }
                     }
-                    applied
                 }
                 _ => {
                     return Err(StorageError::Conflict(
                         "manifest positive index has an unknown delta kind".to_owned(),
                     ));
                 }
-            };
-            if applied {
-                result.indexed_paths.push(positive.relative_path.as_str());
-                result.applied_count = result.applied_count.saturating_add(1);
-                match positive.delta_kind.as_str() {
-                    "ADD" => result.add_count = result.add_count.saturating_add(1),
-                    "CHANGE" => result.change_count = result.change_count.saturating_add(1),
-                    "REAPPEARED" => {
-                        result.reappeared_count = result.reappeared_count.saturating_add(1)
-                    }
-                    _ => {}
-                }
+            }
+        }
+
+        let applied_existing_ids = self
+            .apply_manifest_existing_files_batch_in_transaction(transaction, &existing_updates)
+            .await?;
+        for positive in positives.iter().filter(|positive| {
+            matches!(positive.delta_kind.as_str(), "CHANGE" | "REAPPEARED")
+                && !matches!(&positive.file, NewScanManifestIndexedFile::Sidecar(_))
+        }) {
+            if positive
+                .base_filesystem_entry_id
+                .as_deref()
+                .is_some_and(|id| applied_existing_ids.contains(id))
+            {
+                record_manifest_positive_applied(&mut result, positive);
             }
         }
         record_manifest_storage_stage(

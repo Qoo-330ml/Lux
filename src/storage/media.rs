@@ -595,6 +595,174 @@ impl Database {
         Ok(true)
     }
 
+    pub(crate) async fn apply_manifest_existing_files_batch_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        updates: &[ManifestExistingFileUpdate<'_>],
+    ) -> Result<HashSet<String>, StorageError> {
+        if updates.is_empty() {
+            return Ok(HashSet::new());
+        }
+
+        let mut applied_ids = HashSet::with_capacity(updates.len());
+        let batch_size = super::manifest_existing_file_update_chunk_size(self.backend());
+        for chunk in updates.chunks(batch_size) {
+            let values = std::iter::repeat_n(
+                "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(", ");
+            let query = format!(
+                "WITH incoming(
+                     filesystem_entry_id, library_root_id, relative_path, base_fingerprint,
+                     expected_missing, size, modified_at, inode, fingerprint, generation,
+                     last_seen_change_kind, source_kind, edition_name, quality_label, container,
+                     external_url, strm_target_kind
+                 ) AS (VALUES {values})
+                 UPDATE filesystem_entries AS entry
+                 SET size = incoming.size,
+                     modified_at = incoming.modified_at,
+                     inode = incoming.inode,
+                     fingerprint = incoming.fingerprint,
+                     last_seen_generation = incoming.generation,
+                     last_seen_change_kind = incoming.last_seen_change_kind,
+                     is_missing = 0,
+                     updated_at = unixepoch()
+                 FROM incoming
+                 WHERE entry.id = incoming.filesystem_entry_id
+                   AND entry.library_root_id = incoming.library_root_id
+                   AND entry.relative_path = incoming.relative_path
+                   AND entry.entry_kind = 'FILE'
+                   AND entry.is_missing = incoming.expected_missing
+                   AND (entry.fingerprint = incoming.base_fingerprint
+                        OR (entry.fingerprint IS NULL AND incoming.base_fingerprint IS NULL))
+                 RETURNING id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for update in chunk {
+                statement = statement
+                    .bind(update.filesystem_entry_id)
+                    .bind(update.library_root_id)
+                    .bind(update.relative_path)
+                    .bind(update.base_fingerprint)
+                    .bind(database_flag(update.expected_missing))
+                    .bind(update.size)
+                    .bind(update.modified_at)
+                    .bind(update.inode)
+                    .bind(update.fingerprint)
+                    .bind(update.generation)
+                    .bind(update.last_seen_change_kind)
+                    .bind(update.source_kind)
+                    .bind(update.edition_name)
+                    .bind(update.quality_label)
+                    .bind(update.container)
+                    .bind(update.external_url)
+                    .bind(update.strm_target_kind);
+            }
+            let rows = statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            applied_ids.extend(rows.into_iter().map(|row| row.get::<String, _>("id")));
+        }
+
+        let applied_updates = updates
+            .iter()
+            .filter(|update| applied_ids.contains(update.filesystem_entry_id))
+            .collect::<Vec<_>>();
+        for chunk in applied_updates.chunks(batch_size) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH incoming(
+                     filesystem_entry_id, source_kind, size, container, edition_name,
+                     quality_label, external_url, strm_target_kind
+                 ) AS (VALUES {values})
+                 UPDATE media_sources AS source
+                 SET source_kind = incoming.source_kind,
+                     size = incoming.size,
+                     container = incoming.container,
+                     edition_name = incoming.edition_name,
+                     quality_label = incoming.quality_label,
+                     external_url = incoming.external_url,
+                     strm_target_kind = incoming.strm_target_kind,
+                     probe_status = 'PENDING',
+                     probe_error = NULL,
+                     updated_at = unixepoch()
+                 FROM incoming
+                 WHERE source.filesystem_entry_id = incoming.filesystem_entry_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for update in chunk {
+                statement = statement
+                    .bind(update.filesystem_entry_id)
+                    .bind(update.source_kind)
+                    .bind(update.size)
+                    .bind(update.container)
+                    .bind(update.edition_name)
+                    .bind(update.quality_label)
+                    .bind(update.external_url)
+                    .bind(update.strm_target_kind);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let applied_ids = applied_ids.into_iter().collect::<Vec<_>>();
+        for chunk in applied_ids.chunks(batch_size) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "DELETE FROM media_chapters
+                 WHERE media_source_id IN (
+                     SELECT id FROM media_sources
+                     WHERE filesystem_entry_id IN ({placeholders})
+                 )"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for filesystem_entry_id in chunk {
+                statement = statement.bind(filesystem_entry_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let restored_ids = updates
+            .iter()
+            .filter(|update| {
+                update.expected_missing
+                    && applied_ids.iter().any(|filesystem_entry_id| {
+                        filesystem_entry_id == update.filesystem_entry_id
+                    })
+            })
+            .map(|update| update.filesystem_entry_id.to_owned())
+            .collect::<Vec<_>>();
+        if !restored_ids.is_empty() {
+            self.restore_media_items_for_filesystem_entries(transaction, &restored_ids)
+                .await?;
+        }
+        Ok(applied_ids.into_iter().collect())
+    }
+
     pub(crate) async fn claim_manifest_add_filesystem_entries_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
