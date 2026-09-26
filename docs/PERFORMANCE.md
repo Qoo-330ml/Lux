@@ -359,3 +359,16 @@ scripts/run-performance.sh
 | transaction total | 1,206,315 | 7,384,819 |
 
 六轮的活动峰值均为 9 个文件准备任务、1 个目录 reader；这测量的是当前实际代码，暂未启用双目录读前。PostgreSQL `baseline_query` 三轮为 10.360 / 1.103 / 2.129 s，缓存和运行抖动明显；正向索引事务 `positive_index_apply` 中位数为 6.459 s，是当前 PG 主要成本之一。相较 LUX-270 的 SQLite 2.018 s / PostgreSQL 9.657 s 参考中位数，本次诊断版本为 2.058 s / 10.472 s，尚未通过阶段性能目标。
+
+### LUX-273 双 reader 流水线 A/B 与回退决定
+
+2026-09-26 在同一 Apple M4 / 16 GiB ARM64、Rust 1.97.1 和 60,000 文件 / 600 目录 fixture 上，对比 LUX-272 顺序 reader 和双 reader、有界 read/prepare/单 writer 流水线各三轮。两组使用相同 fixture SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`；PostgreSQL 使用本机一次性 PostgreSQL 16 容器。
+
+| 后端/实现 | 首扫索引完成：三轮 / 中位数 | SQL / DML 中位数 | 正向提交批次 | target 物化 / 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | WAL 中位数 |
+|---|---:|---:|---:|---:|---:|---:|
+| SQLite 顺序 reader（LUX-272） | 2.058 / 2.009 / 2.178 s；**2.058 s** | 675 / 209 | 10 | 546 / 961 ms | 259 / 383 ms | — |
+| SQLite 流水线 | 1.951 / 2.136 / 1.935 s；**1.951 s** | 832 / 359 | 28 | 598 / 842 ms | 237 / 365 ms | — |
+| PostgreSQL 顺序 reader（LUX-272） | 19.059 / 10.472 / 10.368 s；**10.472 s** | 694 / 209 | 10 | 2,523 / 5,145 ms | 281 / 685 ms | 216,506,975 bytes |
+| PostgreSQL 流水线 | 10.987 / 17.588 / 14.756 s；**14.756 s** | 871 / 359 | 28 | 2,593 / 3,735 ms | 269 / 620 ms | 228,425,152 bytes |
+
+六轮流水线基准均观察到两个活动 reader、两个并发目录读操作以及读/准备、读/提交重叠，在途峰值 7,454 / 8,192。它把 SQLite 首扫中位数缩短约 5.2%，但 SQL 增约 23%、DML 增约 72%；PostgreSQL 首扫中位数慢约 40.9%，SQL 增约 25%、DML 增约 72%，WAL 增约 5.5%。候选代码已按 LUX-273 条件移除：PostgreSQL 没有稳定收益，单后端加速不足以抵消另一后端回退。SQLite 与 PostgreSQL 数据仍只代表这台 ARM64 开发机和本机测试容器。

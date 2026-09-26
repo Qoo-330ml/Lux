@@ -6743,16 +6743,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 实现文件：`src/application/scanner.rs`、`src/storage/jobs.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。
 
-#### LUX-273：滚动式双 reader 有界预读
+#### LUX-273：滚动式双 reader 有界预读评估
 
-范围：基于 LUX-272 的分项证据，在 format 3 discovery 内用滚动窗口同时枚举最多两个不同目录，并在 reader/目录批完成时立刻从持久化 frontier 补入后续目录。读取、prepare 与 commit 通过有界队列形成多线程流水线；累计未提交 observation 和准备结果不超过 8,192，不先打开整个 64-directory page，也不因同一慢目录阻塞另一 reader。结果按 root/relative-path 稳定顺序交给单 writer 批次事务；取消、根/目录替换、I/O 错误、增量优先级与 readiness barrier 语义不变。
+范围：基于 LUX-272 的分项证据，试验 format 3 discovery 的滚动双 reader 与有界 read/prepare/单 writer 流水线。只在相同 60k fixture 的 SQLite 和 PostgreSQL 三轮中位数都改善且满足前台/重扫门槛时保留；否则撤掉候选实现，保留已验证的顺序 reader，并把性能优化转向测得的写入热点。
 
 验收：
 
-- [ ] 最多两个 enumerator handle、最多两个并发 directory read；正向准备并发受全局/库级/资源反馈约束。测试峰值和读/准备重叠，而不只测试配置上限。
-- [ ] 在途 observation、prepared index、channel payload 和未提交 child frontier 总量有统一硬上限；consumer 能在读取继续时准备上一批，writer 能在后续 I/O 继续时提交已就绪批次，storage 仍是单 writer。
-- [ ] 测试覆盖长目录与小目录混合、慢目录、取消、替换目录、无 positive/unchanged 页、重试恢复和小于/大于单批预算；frontier、CAS、缺失保护、target gate 与旧 workflow 不变。
-- [ ] 与顺序 reader 用相同 60k fixture 做 SQLite/PostgreSQL 各三轮 A/B；只有两个后端首扫中位数都改善且满足 LUX-275 前台/重扫回归阈值才保留流水线，否则移除预读代码。
+- [x] 双 reader 候选的六轮基准实测到最多两个目录 reader，并记录了与文件准备/提交的重叠及全局/库级资源并发策略。
+- [x] 候选流水线以统一的 8,192 在途预算运行；六轮观测峰值不超过预算，storage 仍使用单 writer 和稳定路径顺序。
+- [x] 长/小目录混合、取消、目录替换、失败后重试、缺失保护与 readiness 等回归覆盖保留路径；LUX-273 专项目标通过。
+- [x] 完成相同 fixture 的 SQLite/PostgreSQL 各三轮 A/B。SQLite 首扫中位数约快 5.2%，PostgreSQL 慢约 40.9%，因此撤回双 reader 生产实现，当前路径恢复为顺序 reader。
+
+结果：LUX-273 作为性能候选评估关闭；没有把只对 SQLite 有利、却显著拖慢 PostgreSQL 的流水线留在正式扫描路径。阶段优化继续由 LUX-274 根据 `positive_index_apply` 等实测写入阶段推进。
 
 验证：`cargo test --locked --lib application::scanner::tests`、`cargo test --locked --test scanning_jobs --test scanner --test storage`、SQLite 60k 三轮及 PostgreSQL 60k 烟测、fmt、Clippy。
 

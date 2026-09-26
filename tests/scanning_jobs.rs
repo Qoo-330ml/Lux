@@ -3858,6 +3858,81 @@ async fn manifest_streams_large_directory_discovery_in_bounded_chunks()
 }
 
 #[tokio::test]
+async fn manifest_frontier_batches_handle_long_and_small_directories()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let long_directory = root.join("000 Long Directory");
+    tokio::fs::create_dir_all(&long_directory).await?;
+    for index in 0..2_100 {
+        tokio::fs::write(
+            long_directory.join(format!("Long Film {index:04}.Movie.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    for index in 0..70 {
+        let directory = root.join(format!("Small Directory {index:03}"));
+        tokio::fs::create_dir_all(&directory).await?;
+        tokio::fs::write(
+            directory.join(format!("Small Film {index:03}.Movie.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let root_discovery = jobs.run_batch(&job.id, 1).await?;
+    assert!(!root_discovery.completed);
+    let pending_frontier_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM scan_manifest_directories
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)
+           AND state = 'PENDING'",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(pending_frontier_count, 71);
+    jobs.run_batch(&job.id, 100).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let file_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = (SELECT id FROM library_roots WHERE library_id = ? LIMIT 1)
+           AND entry_kind = 'FILE'
+           AND last_seen_generation = (SELECT generation FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(library.id.to_string())
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(file_count, 2_170);
+
+    let root_state: (String, i64) = sqlx::query_as(
+        "SELECT state, completed_directory_count FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(root_state, ("COMPLETE".to_owned(), 72));
+    Ok(())
+}
+
+#[tokio::test]
 async fn reconciliation_hides_items_after_their_last_file_is_deleted()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
