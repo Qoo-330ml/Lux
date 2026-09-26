@@ -796,11 +796,11 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
         .await?;
     let jobs = ScanJobService::new(database.clone()).with_webhooks(webhooks);
     let manifest_job = jobs.create_movie_scan_job(library.id).await?;
-    sqlx::query("UPDATE scan_manifests SET discovery_format_version = 2 WHERE job_id = $1")
-        .bind(&manifest_job.id)
-        .execute(database.pool())
-        .await?;
-    sqlx::query("UPDATE scan_manifests SET workflow_version = 1 WHERE job_id = $1")
+    sqlx::query(
+        "UPDATE scan_manifests
+         SET workflow_version = 1, discovery_format_version = 2, discovery_mode = 'PERSISTED'
+         WHERE job_id = $1",
+    )
         .bind(&manifest_job.id)
         .execute(database.pool())
         .await?;
@@ -920,7 +920,11 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
 
     fs::remove_file(media_root.join("A.Movie.2024.mkv"))?;
     let replacement_job = jobs.create_movie_scan_job(library.id).await?;
-    sqlx::query("UPDATE scan_manifests SET discovery_format_version = 2 WHERE job_id = $1")
+    sqlx::query(
+        "UPDATE scan_manifests
+         SET discovery_format_version = 2, discovery_mode = 'PERSISTED'
+         WHERE job_id = $1",
+    )
         .bind(&replacement_job.id)
         .execute(database.pool())
         .await?;
