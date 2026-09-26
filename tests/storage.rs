@@ -116,6 +116,16 @@ fn postgres_media_source_insert_refresh_only_promotes_unavailable_items() {
     assert!(!migration.contains("CASE WHEN EXISTS"));
 }
 
+#[test]
+fn postgres_media_search_insert_refresh_avoids_redundant_upsert() {
+    let migration =
+        include_str!("../migrations-postgres/0140_media_search_insert_without_conflict_probe.sql");
+
+    assert!(migration.contains("INSERT INTO media_search"));
+    assert!(migration.contains("lux_refresh_media_search_items_insert_stmt"));
+    assert!(!migration.contains("ON CONFLICT"));
+}
+
 #[tokio::test]
 async fn postgres_scan_job_migration_allows_one_active_job_per_type()
 -> Result<(), Box<dyn std::error::Error>> {
