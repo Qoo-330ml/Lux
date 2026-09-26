@@ -801,9 +801,9 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
          SET workflow_version = 1, discovery_format_version = 2, discovery_mode = 'PERSISTED'
          WHERE job_id = $1",
     )
-        .bind(&manifest_job.id)
-        .execute(database.pool())
-        .await?;
+    .bind(&manifest_job.id)
+    .execute(database.pool())
+    .await?;
     advance_postgres_manifest_to_applying(&database, &jobs, &manifest_job.id).await?;
 
     let incremental = jobs
@@ -925,9 +925,9 @@ async fn postgres_manifest_cas_resume_and_root_replacement_safety()
          SET discovery_format_version = 2, discovery_mode = 'PERSISTED'
          WHERE job_id = $1",
     )
-        .bind(&replacement_job.id)
-        .execute(database.pool())
-        .await?;
+    .bind(&replacement_job.id)
+    .execute(database.pool())
+    .await?;
     advance_postgres_manifest_to_applying(&database, &jobs, &replacement_job.id).await?;
     let moved_root = temp_dir.path().join("original-media");
     fs::rename(&media_root, &moved_root)?;
