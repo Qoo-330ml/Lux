@@ -94,6 +94,17 @@ fn postgres_derived_index_refresh_uses_statement_level_triggers() {
     assert!(migration.contains("REFERENCING NEW TABLE"));
 }
 
+#[test]
+fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
+    let migration =
+        include_str!("../migrations-postgres/0138_avoid_alias_rescan_on_media_item_refresh.sql");
+
+    assert!(migration.contains("lux_refresh_media_search_items_insert_stmt"));
+    assert!(migration.contains("           ''"));
+    assert!(migration.contains("LEFT JOIN media_search existing"));
+    assert!(!migration.contains("FROM item_aliases"));
+}
+
 #[tokio::test]
 async fn postgres_scan_job_migration_allows_one_active_job_per_type()
 -> Result<(), Box<dyn std::error::Error>> {
