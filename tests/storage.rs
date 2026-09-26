@@ -105,6 +105,17 @@ fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
     assert!(!migration.contains("FROM item_aliases"));
 }
 
+#[test]
+fn postgres_media_source_insert_refresh_only_promotes_unavailable_items() {
+    let migration =
+        include_str!("../migrations-postgres/0139_promote_media_availability_on_source_insert.sql");
+
+    assert!(migration.contains("SET has_available_source = 1"));
+    assert!(migration.contains("has_available_source = 0"));
+    assert!(migration.contains("JOIN filesystem_entries"));
+    assert!(!migration.contains("CASE WHEN EXISTS"));
+}
+
 #[tokio::test]
 async fn postgres_scan_job_migration_allows_one_active_job_per_type()
 -> Result<(), Box<dyn std::error::Error>> {
