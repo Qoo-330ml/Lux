@@ -5376,6 +5376,7 @@ impl ScanJobService {
         let root_path = PathBuf::from(&root.canonical_path);
         let open_root_path = root_path.clone();
         let open_relative_directory = relative_directory.to_owned();
+        let open_started = Instant::now();
         let mut reader = tokio::task::spawn_blocking(move || {
             ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
         })
@@ -5384,6 +5385,7 @@ impl ScanJobService {
             path: root_path.clone(),
             source: std::io::Error::other(source.to_string()),
         })??;
+        record_manifest_scan_stage("directory_open", open_started, 1, 0, 1);
         record_manifest_scan_activity(0, 1);
         let root_observation = reader.root_observation.clone();
         let directory_observation = reader.directory_observation.clone();
@@ -5393,7 +5395,19 @@ impl ScanJobService {
         } else {
             DISCOVERY_ENTRY_BATCH_SIZE
         };
+        if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
+            tracing::debug!(
+                target: "lux::scan_performance",
+                phase = "directory_read_budget",
+                preparation_concurrency = preparation_concurrency as u64,
+                directory_read_concurrency = 1_u64,
+                directory_count = 1_u64,
+                reader_batch_size = reader_batch_size as u64,
+                "manifest directory reader concurrency budget"
+            );
+        }
         loop {
+            let read_started = Instant::now();
             let reader_to_move = reader;
             let (next_reader, batch) =
                 tokio::task::spawn_blocking(move || reader_to_move.next_batch(reader_batch_size))
@@ -5403,6 +5417,32 @@ impl ScanJobService {
                         source: std::io::Error::other(source.to_string()),
                     })??;
             reader = next_reader;
+            let batch_file_count = batch
+                .entries
+                .iter()
+                .filter(|entry| entry.entry_kind == "FILE")
+                .count();
+            record_manifest_scan_stage(
+                "directory_batch_total",
+                read_started,
+                u64::try_from(batch.entries.len()).unwrap_or(u64::MAX),
+                u64::try_from(batch_file_count).unwrap_or(u64::MAX),
+                u64::try_from(batch.child_directories.len()).unwrap_or(u64::MAX),
+            );
+            record_manifest_scan_stage_duration(
+                "directory_readdir",
+                batch.readdir_duration,
+                u64::try_from(batch.readdir_entry_count).unwrap_or(u64::MAX),
+                0,
+                0,
+            );
+            record_manifest_scan_stage_duration(
+                "directory_stat",
+                batch.stat_duration,
+                u64::try_from(batch.stat_entry_count).unwrap_or(u64::MAX),
+                u64::try_from(batch_file_count).unwrap_or(u64::MAX),
+                u64::try_from(batch.child_directories.len()).unwrap_or(u64::MAX),
+            );
             if cancellation.load(Ordering::Acquire) {
                 return Ok(None);
             }
@@ -5423,6 +5463,7 @@ impl ScanJobService {
                 .filter(|entry| entry.entry_kind == "FILE")
                 .map(|entry| entry.relative_path.clone())
                 .collect::<Vec<_>>();
+            let baseline_started = Instant::now();
             let baselines = if stream_files_during_discovery {
                 self.database
                     .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
@@ -5430,6 +5471,13 @@ impl ScanJobService {
             } else {
                 HashMap::new()
             };
+            record_manifest_scan_stage(
+                "baseline_query",
+                baseline_started,
+                u64::try_from(file_paths.len()).unwrap_or(u64::MAX),
+                u64::try_from(file_paths.len()).unwrap_or(u64::MAX),
+                0,
+            );
             let (positive_indexes, unchanged_paths, seen_filesystem_entries) =
                 if stream_files_during_discovery {
                     let Some((positive_indexes, unchanged_paths, seen_filesystem_entries)) = self
@@ -6241,19 +6289,21 @@ impl ScanJobService {
             ))
             .await
             .max(1);
+        let mut directories_by_root = BTreeMap::<String, Vec<String>>::new();
+        for (root_id, relative_directory) in directories {
+            directories_by_root
+                .entry(root_id)
+                .or_default()
+                .push(relative_directory);
+        }
         let roots_by_id = self
             .database
-            .list_library_roots_by_ids(
-                &directories
-                    .iter()
-                    .map(|(root_id, _)| root_id.clone())
-                    .collect::<Vec<_>>(),
-            )
+            .list_library_roots_by_ids(&directories_by_root.keys().cloned().collect::<Vec<_>>())
             .await?;
         let mut discovered_count = job.total_count;
         let mut created_items = 0_usize;
 
-        for (root_id, relative_directory) in directories {
+        for (root_id, relative_directories) in directories_by_root {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(&job.id).await;
             }
@@ -6280,7 +6330,7 @@ impl ScanJobService {
                 expected_root_identity,
             };
             match self
-                .discover_scan_manifest_directory_batches(context, &relative_directory)
+                .discover_scan_manifest_directory_group_batches(context, &relative_directories)
                 .await
             {
                 Ok(Some(discovered)) => {
@@ -6342,10 +6392,18 @@ impl ScanJobService {
             self.database
                 .finish_lite_scan_manifest_roots(manifest_id)
                 .await?;
+            let index_completion_started = Instant::now();
             let total = self
                 .database
                 .finish_scan_manifest_discovery(manifest_id, &job.id)
                 .await?;
+            record_manifest_scan_stage(
+                "index_completion",
+                index_completion_started,
+                u64::try_from(total).unwrap_or(u64::MAX),
+                u64::try_from(total).unwrap_or(u64::MAX),
+                0,
+            );
             self.clear_lite_manifest_discovery_session(manifest_id);
             self.record_event(
                 &job.id,
