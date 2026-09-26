@@ -2280,19 +2280,24 @@ impl Database {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let query = format!(
-                    "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES {values})
+                    "WITH incoming(filesystem_entry_id, relative_path, fingerprint) AS (VALUES {values}),
+                          matching(filesystem_entry_id) AS (
+                              SELECT incoming.filesystem_entry_id
+                              FROM incoming
+                              JOIN filesystem_entries current
+                                ON current.id = incoming.filesystem_entry_id
+                               AND current.relative_path = incoming.relative_path
+                               AND current.fingerprint = incoming.fingerprint
+                              WHERE current.library_root_id = ?
+                                AND current.entry_kind = 'FILE'
+                                AND current.is_missing = 0
+                          )
                      UPDATE filesystem_entries
                      SET last_seen_generation = (
                              SELECT generation FROM scan_jobs WHERE id = ?
                          ),
                          last_seen_change_kind = NULL
-                     WHERE library_root_id = ? AND entry_kind = 'FILE' AND is_missing = 0
-                       AND EXISTS (
-                           SELECT 1 FROM incoming
-                           WHERE incoming.filesystem_entry_id = filesystem_entries.id
-                             AND incoming.relative_path = filesystem_entries.relative_path
-                             AND incoming.fingerprint = filesystem_entries.fingerprint
-                       )"
+                     WHERE id IN (SELECT filesystem_entry_id FROM matching)"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
                 for entry in entries {
@@ -2301,7 +2306,7 @@ impl Database {
                         .bind(&entry.relative_path)
                         .bind(&entry.fingerprint);
                 }
-                statement = statement.bind(chunk.job_id).bind(chunk.library_root_id);
+                statement = statement.bind(chunk.library_root_id).bind(chunk.job_id);
                 let updated = statement
                     .execute(&mut *transaction)
                     .await
