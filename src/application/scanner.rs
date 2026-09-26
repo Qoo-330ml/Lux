@@ -63,8 +63,9 @@ use crate::{
         NewMediaItem, NewMediaSource, NewMovieFile, NewScanJobEvent, NewScanManifest,
         NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
         NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
-        NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile, ReconciliationBatchCommit,
-        StorageError, StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
+        NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry,
+        NewScanManifestUnresolvedFile, ReconciliationBatchCommit, StorageError,
+        StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath, StoredScanManifestDelta,
         StoredScanManifestFilesystemBaseline, movie_parent_folder_identity,
     },
@@ -5296,30 +5297,31 @@ impl ScanJobService {
             } else {
                 HashMap::new()
             };
-            let (positive_indexes, unchanged_paths) = if stream_files_during_discovery {
-                let Some((positive_indexes, unchanged_paths)) = self
-                    .prepare_manifest_discovery_positive_indexes(
-                        ManifestPositiveIndexPreparationContext {
-                            root,
-                            relative_directory,
-                            library_kind,
-                            preparation_concurrency,
-                            baselines: &baselines,
-                            expected_root_identity,
-                            expected_root_observation: &root_observation,
-                            expected_directory_observation: &directory_observation,
-                            entries: &observations,
-                            cancellation,
-                        },
-                    )
-                    .await?
-                else {
-                    return Ok(None);
+            let (positive_indexes, unchanged_paths, seen_filesystem_entries) =
+                if stream_files_during_discovery {
+                    let Some((positive_indexes, unchanged_paths, seen_filesystem_entries)) = self
+                        .prepare_manifest_discovery_positive_indexes(
+                            ManifestPositiveIndexPreparationContext {
+                                root,
+                                relative_directory,
+                                library_kind,
+                                preparation_concurrency,
+                                baselines: &baselines,
+                                expected_root_identity,
+                                expected_root_observation: &root_observation,
+                                expected_directory_observation: &directory_observation,
+                                entries: &observations,
+                                cancellation,
+                            },
+                        )
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    (positive_indexes, unchanged_paths, seen_filesystem_entries)
+                } else {
+                    (Vec::new(), Vec::new(), Vec::new())
                 };
-                (positive_indexes, unchanged_paths)
-            } else {
-                (Vec::new(), Vec::new())
-            };
             let completed_directory = completed.then_some(relative_directory);
             let Some(commit_result) = self
                 .commit_scan_manifest_discovery_chunk(
@@ -5331,6 +5333,7 @@ impl ScanJobService {
                         entries: &observations,
                         positive_indexes: &positive_indexes,
                         unchanged_paths: &unchanged_paths,
+                        seen_filesystem_entries: &seen_filesystem_entries,
                         completed_directory,
                     },
                     cancellation,
@@ -5358,7 +5361,14 @@ impl ScanJobService {
     async fn prepare_manifest_discovery_positive_indexes(
         &self,
         context: ManifestPositiveIndexPreparationContext<'_>,
-    ) -> Result<Option<(Vec<NewScanManifestPositiveIndex>, Vec<String>)>, ScannerError> {
+    ) -> Result<
+        Option<(
+            Vec<NewScanManifestPositiveIndex>,
+            Vec<String>,
+            Vec<NewScanManifestSeenFilesystemEntry>,
+        )>,
+        ScannerError,
+    > {
         let ManifestPositiveIndexPreparationContext {
             root,
             relative_directory,
@@ -5403,6 +5413,7 @@ impl ScanJobService {
         // so a second standalone stat(root) here only duplicates filesystem I/O.
         let mut classification_cache = MixedClassificationCache::default();
         let mut unchanged_paths = Vec::new();
+        let mut seen_filesystem_entries = Vec::new();
         let mut preparation_tasks = tokio::task::JoinSet::new();
         let preparation_concurrency = preparation_concurrency.max(1);
         let mut positive_indexes = Vec::new();
@@ -5422,9 +5433,6 @@ impl ScanJobService {
             let path = root_path.join(&observation.relative_path);
             let is_media = is_supported_movie_file(&path);
             let is_sidecar = is_supported_sidecar_file(&path);
-            if !is_media && !is_sidecar {
-                continue;
-            }
             let baseline = baselines.get(&observation.relative_path);
             if let Some(baseline) = baseline {
                 if baseline.entry_kind != "FILE" {
@@ -5433,9 +5441,18 @@ impl ScanJobService {
                 if !baseline.is_missing
                     && baseline.fingerprint.as_deref() == Some(observation.fingerprint.as_slice())
                 {
-                    unchanged_paths.push(observation.relative_path.clone());
+                    seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
+                        filesystem_entry_id: baseline.id.clone(),
+                        relative_path: observation.relative_path.clone(),
+                    });
+                    if is_media || is_sidecar {
+                        unchanged_paths.push(observation.relative_path.clone());
+                    }
                     continue;
                 }
+            }
+            if !is_media && !is_sidecar {
+                continue;
             }
 
             let delta_kind = match baseline {
@@ -5630,7 +5647,11 @@ impl ScanJobService {
                 "manifest positive discovery preparation timing"
             );
         }
-        Ok(Some((positive_indexes, unchanged_paths)))
+        Ok(Some((
+            positive_indexes,
+            unchanged_paths,
+            seen_filesystem_entries,
+        )))
     }
 
     async fn discover_scan_manifest_directory_group_batches(
@@ -5879,12 +5900,13 @@ impl ScanJobService {
         );
         let mut positive_indexes_by_chunk = Vec::with_capacity(chunks.len());
         let mut unchanged_paths_by_chunk = Vec::with_capacity(chunks.len());
+        let mut seen_filesystem_entries_by_chunk = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             if cancellation.load(Ordering::Acquire) {
                 return Ok(None);
             }
             if stream_files_during_discovery {
-                let Some((positive_indexes, unchanged_paths)) = self
+                let Some((positive_indexes, unchanged_paths, seen_filesystem_entries)) = self
                     .prepare_manifest_discovery_positive_indexes(
                         ManifestPositiveIndexPreparationContext {
                             root,
@@ -5905,9 +5927,11 @@ impl ScanJobService {
                 };
                 positive_indexes_by_chunk.push(positive_indexes);
                 unchanged_paths_by_chunk.push(unchanged_paths);
+                seen_filesystem_entries_by_chunk.push(seen_filesystem_entries);
             } else {
                 positive_indexes_by_chunk.push(Vec::new());
                 unchanged_paths_by_chunk.push(Vec::new());
+                seen_filesystem_entries_by_chunk.push(Vec::new());
             }
         }
         if stream_files_during_discovery {
@@ -5937,16 +5961,20 @@ impl ScanJobService {
             .iter()
             .zip(&positive_indexes_by_chunk)
             .zip(&unchanged_paths_by_chunk)
+            .zip(&seen_filesystem_entries_by_chunk)
             .map(
-                |((chunk, positive_indexes), unchanged_paths)| NewScanManifestDiscoveryChunk {
-                    manifest_id,
-                    job_id,
-                    library_root_id: &root.id,
-                    child_directories: &chunk.child_directories,
-                    entries: &chunk.entries,
-                    positive_indexes,
-                    unchanged_paths,
-                    completed_directory: chunk.completed_directory.as_deref(),
+                |(((chunk, positive_indexes), unchanged_paths), seen_filesystem_entries)| {
+                    NewScanManifestDiscoveryChunk {
+                        manifest_id,
+                        job_id,
+                        library_root_id: &root.id,
+                        child_directories: &chunk.child_directories,
+                        entries: &chunk.entries,
+                        positive_indexes,
+                        unchanged_paths,
+                        seen_filesystem_entries,
+                        completed_directory: chunk.completed_directory.as_deref(),
+                    }
                 },
             )
             .collect::<Vec<_>>();
@@ -11464,6 +11492,7 @@ mod tests {
             entries: &entries,
             positive_indexes: &[],
             unchanged_paths: &[],
+            seen_filesystem_entries: &[],
             completed_directory: Some("Bucket"),
         };
         let result = service

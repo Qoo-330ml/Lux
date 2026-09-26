@@ -1240,6 +1240,17 @@ pub(crate) struct NewScanManifestPositiveIndex {
     pub(crate) file: NewScanManifestIndexedFile,
 }
 
+/// An existing filesystem entry observed unchanged during a format-3 directory read.
+///
+/// The scan generation is advanced directly on the canonical filesystem row instead of
+/// inserting a duplicate row into the manifest presence ledger. The entry id is the CAS
+/// anchor: a missing or replaced row is never marked as seen by this optimization.
+#[derive(Clone, Debug)]
+pub(crate) struct NewScanManifestSeenFilesystemEntry {
+    pub(crate) filesystem_entry_id: String,
+    pub(crate) relative_path: String,
+}
+
 pub(crate) struct NewScanManifestFilesystemEntry<'a> {
     pub(crate) id: &'a str,
     pub(crate) relative_path: &'a str,
@@ -1429,6 +1440,7 @@ pub(crate) struct NewScanManifestDiscoveryChunk<'a> {
     pub(crate) entries: &'a [NewScanManifestEntry],
     pub(crate) positive_indexes: &'a [NewScanManifestPositiveIndex],
     pub(crate) unchanged_paths: &'a [String],
+    pub(crate) seen_filesystem_entries: &'a [NewScanManifestSeenFilesystemEntry],
     pub(crate) completed_directory: Option<&'a str>,
 }
 

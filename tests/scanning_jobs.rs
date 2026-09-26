@@ -3852,7 +3852,20 @@ async fn manifest_streams_large_directory_discovery_in_bounded_chunks()
     .bind(&unchanged_job.id)
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(unchanged_paths, 1_025);
+    assert_eq!(unchanged_paths, 0);
+    let unchanged_generation_paths: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM filesystem_entries
+         WHERE library_root_id = (
+             SELECT root.library_root_id FROM scan_manifest_roots root
+             JOIN scan_manifests manifest ON manifest.id = root.manifest_id
+             WHERE manifest.job_id = ?
+         ) AND last_seen_generation = (SELECT generation FROM scan_jobs WHERE id = ?)",
+    )
+    .bind(&unchanged_job.id)
+    .bind(&unchanged_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged_generation_paths, 1_025);
     jobs.run_to_completion(&unchanged_job.id, 100, None).await?;
     Ok(())
 }

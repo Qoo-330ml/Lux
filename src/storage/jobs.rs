@@ -1468,6 +1468,7 @@ impl Database {
         let mut completed_directories = Vec::new();
         let mut positive_indexes = Vec::new();
         let mut unchanged_paths = Vec::new();
+        let mut seen_filesystem_entries = Vec::new();
         for candidate in chunks {
             if candidate.manifest_id != chunk.manifest_id
                 || candidate.job_id != chunk.job_id
@@ -1481,6 +1482,7 @@ impl Database {
             entries.extend(candidate.entries.iter());
             positive_indexes.extend(candidate.positive_indexes.iter());
             unchanged_paths.extend(candidate.unchanged_paths.iter().map(String::as_str));
+            seen_filesystem_entries.extend(candidate.seen_filesystem_entries.iter());
             if let Some(directory) = candidate.completed_directory {
                 completed_directories.push(directory);
             }
@@ -1570,6 +1572,22 @@ impl Database {
             {
                 return Err(StorageError::Conflict(
                     "manifest unchanged path does not match a unique unindexed file observation"
+                        .to_owned(),
+                ));
+            }
+        }
+        let mut seen_filesystem_entry_paths =
+            std::collections::HashSet::with_capacity(seen_filesystem_entries.len());
+        for seen in &seen_filesystem_entries {
+            if observations_by_path
+                .get(seen.relative_path.as_str())
+                .is_none_or(|observation| observation.entry_kind != "FILE")
+                || indexed_paths.contains(seen.relative_path.as_str())
+                || !seen_filesystem_entry_paths.insert(seen.relative_path.as_str())
+                || seen.filesystem_entry_id.is_empty()
+            {
+                return Err(StorageError::Conflict(
+                    "manifest seen filesystem entry does not match a unique unindexed file observation"
                         .to_owned(),
                 ));
             }
@@ -1678,12 +1696,8 @@ impl Database {
                     "WITH incoming(relative_path) AS (VALUES {values})
                      SELECT incoming.relative_path FROM incoming
                      WHERE EXISTS (
-                         SELECT 1 FROM scan_manifest_seen_paths seen
-                         WHERE seen.manifest_id = ? AND seen.library_root_id = ?
-                           AND seen.relative_path = incoming.relative_path
-                     ) OR EXISTS (
                          SELECT 1 FROM filesystem_entries entry
-                         WHERE entry.library_root_id = ?
+                           WHERE entry.library_root_id = ?
                            AND entry.relative_path = incoming.relative_path
                            AND entry.last_seen_generation = (
                                SELECT generation FROM scan_jobs WHERE id = ?
@@ -1705,11 +1719,7 @@ impl Database {
                 for path in paths {
                     statement = statement.bind(path);
                 }
-                statement = statement
-                    .bind(chunk.manifest_id)
-                    .bind(chunk.library_root_id)
-                    .bind(chunk.library_root_id)
-                    .bind(chunk.job_id);
+                statement = statement.bind(chunk.library_root_id).bind(chunk.job_id);
             } else {
                 statement = statement
                     .bind(chunk.manifest_id)
@@ -2045,38 +2055,37 @@ impl Database {
         );
 
         let presence_ledger_started = Instant::now();
-        if discovery_format_version == 3 {
-            let mut ledger_paths = Vec::new();
-            positive_result.indexed_paths.sort_unstable();
-            for path in &file_paths {
-                if positive_result.indexed_paths.binary_search(path).is_err() {
-                    ledger_paths.push(*path);
-                }
-            }
-            for paths in ledger_paths.chunks(super::manifest_path_query_chunk_size(self.backend()))
+        if discovery_format_version == 3 && !seen_filesystem_entries.is_empty() {
+            for entries in seen_filesystem_entries
+                .chunks(super::manifest_path_query_chunk_size(self.backend()))
             {
-                if paths.is_empty() {
+                if entries.is_empty() {
                     continue;
                 }
-                let values = std::iter::repeat_n("(?)", paths.len())
+                let values = std::iter::repeat_n("(?, ?)", entries.len())
                     .collect::<Vec<_>>()
                     .join(", ");
                 let query = format!(
-                    "WITH incoming_seen_paths(relative_path) AS (VALUES {values})
-                     INSERT INTO scan_manifest_seen_paths (
-                         manifest_id, library_root_id, relative_path
-                     )
-                     SELECT ?, ?, incoming_seen_paths.relative_path
-                     FROM incoming_seen_paths WHERE TRUE
-                     ON CONFLICT(manifest_id, library_root_id, relative_path) DO NOTHING"
+                    "WITH incoming(filesystem_entry_id, relative_path) AS (VALUES {values})
+                     UPDATE filesystem_entries
+                     SET last_seen_generation = (
+                             SELECT generation FROM scan_jobs WHERE id = ?
+                         ),
+                         last_seen_change_kind = NULL
+                     WHERE library_root_id = ? AND entry_kind = 'FILE' AND is_missing = 0
+                       AND EXISTS (
+                           SELECT 1 FROM incoming
+                           WHERE incoming.filesystem_entry_id = filesystem_entries.id
+                             AND incoming.relative_path = filesystem_entries.relative_path
+                       )"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
-                for path in paths {
-                    statement = statement.bind(path);
+                for entry in entries {
+                    statement = statement
+                        .bind(&entry.filesystem_entry_id)
+                        .bind(&entry.relative_path);
                 }
-                statement = statement
-                    .bind(chunk.manifest_id)
-                    .bind(chunk.library_root_id);
+                statement = statement.bind(chunk.job_id).bind(chunk.library_root_id);
                 statement
                     .execute(&mut *transaction)
                     .await
@@ -2089,8 +2098,8 @@ impl Database {
         record_manifest_storage_stage(
             "presence_ledger",
             presence_ledger_started,
-            file_paths.len(),
-            file_paths.len(),
+            seen_filesystem_entries.len(),
+            seen_filesystem_entries.len(),
             0,
         );
 
@@ -2920,13 +2929,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredScanManifestRemovalCandidate>, StorageError> {
         let unseen_path_predicate = if discovery_format_version == 3 {
-            "COALESCE(fe.last_seen_generation, '') <> job.generation
-               AND NOT EXISTS (
-                   SELECT 1 FROM scan_manifest_seen_paths seen
-                   WHERE seen.manifest_id = ?
-                     AND seen.library_root_id = fe.library_root_id
-                     AND seen.relative_path = fe.relative_path
-               )"
+            "COALESCE(fe.last_seen_generation, '') <> job.generation"
         } else {
             "COALESCE((
                    SELECT observed.entry_kind
@@ -2960,12 +2963,17 @@ impl Database {
              ORDER BY fe.library_root_id, fe.relative_path
              LIMIT ?"
         );
-        self.query(sqlx::AssertSqlSafe(query))
+        let mut statement = self
+            .query(sqlx::AssertSqlSafe(query))
             .bind(manifest_id)
             .bind(after_library_root_id.unwrap_or_default())
-            .bind(after_relative_path.unwrap_or_default())
-            .bind(manifest_id)
-            .bind(manifest_id)
+            .bind(after_relative_path.unwrap_or_default());
+        if discovery_format_version == 3 {
+            statement = statement.bind(manifest_id);
+        } else {
+            statement = statement.bind(manifest_id).bind(manifest_id);
+        }
+        statement
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .fetch_all(&self.pool)
             .await
@@ -3016,19 +3024,12 @@ impl Database {
                  WHERE fe.entry_kind = 'FILE' AND fe.is_missing = 0
                    AND COALESCE(fe.last_seen_generation, '') <> job.generation
                    AND NOT EXISTS (
-                       SELECT 1 FROM scan_manifest_seen_paths seen
-                       WHERE seen.manifest_id = ?
-                         AND seen.library_root_id = fe.library_root_id
-                         AND seen.relative_path = fe.relative_path
-                   )
-                   AND NOT EXISTS (
                        SELECT 1 FROM scan_manifest_deltas delta
                        WHERE delta.manifest_id = ?
                          AND delta.library_root_id = fe.library_root_id
                          AND delta.relative_path = fe.relative_path
                    )",
             )
-            .bind(manifest_id)
             .bind(manifest_id)
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
@@ -9452,6 +9453,7 @@ mod tests {
             entries: &entries,
             positive_indexes: &[],
             unchanged_paths: &[],
+            seen_filesystem_entries: &[],
             completed_directory: Some(""),
         };
 
@@ -9537,6 +9539,7 @@ mod tests {
             entries: &entries,
             positive_indexes: &[],
             unchanged_paths: &[],
+            seen_filesystem_entries: &[],
             completed_directory: Some(""),
         };
         database
