@@ -6776,7 +6776,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 依赖：LUX-272；如依赖 LUX-273 的数据形态，则在 LUX-273 完成后执行。
 
-实现文件：`src/storage/jobs.rs`、`tests/storage.rs`、`tests/postgres_database.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。
+实现文件（按 LUX-274 子阶段剖析结果调整）：`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`。现有 `storage` 与 `postgres_database` 测试目标作为验证运行，不需要改动测试源码。
 
 #### LUX-275：全链路扫描性能与阶段门
 
