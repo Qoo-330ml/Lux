@@ -33,7 +33,10 @@ use crate::{
         thumbnails::ThumbnailService,
     },
     domain::ids::LibraryId,
-    storage::{Database, StorageError, StoredScheduledTaskConfig, StoredScheduledTaskPlan},
+    storage::{
+        Database, StorageError, StoredScheduledTaskConfig, StoredScheduledTaskPlan,
+        StoredThumbnailScraperRetry,
+    },
 };
 
 pub const RECONCILIATION_TASK_TYPE: &str = "RECONCILIATION_SCAN";
@@ -41,6 +44,9 @@ pub const METADATA_TASK_TYPE: &str = "METADATA_PARSE";
 
 const POLL_INTERVAL: Duration = Duration::from_secs(15);
 const SCHEDULER_PAGE_SIZE: i64 = 100;
+const THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE: i64 = 4;
+const THUMBNAIL_SCRAPER_RETRY_LEASE_SECONDS: i64 = 15 * 60;
+const THUMBNAIL_SCRAPER_RETRY_INTERNAL_FAILURE_DELAY_SECONDS: i64 = 5 * 60;
 
 #[derive(Clone)]
 pub struct ScheduledTaskService {
@@ -293,6 +299,7 @@ impl ScheduledTaskService {
                 break;
             }
         }
+        self.run_due_thumbnail_scraper_retries().await;
         self.cursors
             .lock()
             .await
@@ -336,6 +343,38 @@ impl ScheduledTaskService {
             );
         }
         due
+    }
+
+    async fn run_due_thumbnail_scraper_retries(&self) {
+        let (Some(metadata), Some(thumbnails)) =
+            (self.metadata_reidentify.clone(), self.thumbnails.clone())
+        else {
+            return;
+        };
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let retries = match self
+            .database
+            .claim_due_thumbnail_scraper_retries(
+                now,
+                now.saturating_add(THUMBNAIL_SCRAPER_RETRY_LEASE_SECONDS),
+                THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE,
+            )
+            .await
+        {
+            Ok(retries) => retries,
+            Err(error) => {
+                tracing::error!(%error, "failed to claim due thumbnail scraper retries");
+                return;
+            }
+        };
+        for retry in retries {
+            let database = self.database.clone();
+            let metadata = metadata.clone();
+            let thumbnails = thumbnails.clone();
+            tokio::spawn(async move {
+                run_thumbnail_scraper_retry(database, metadata, thumbnails, retry).await;
+            });
+        }
     }
 
     pub async fn run_task(
@@ -572,6 +611,136 @@ impl ScheduledTaskService {
         });
         Ok(ScheduledTaskRun::AutoLibraryCover { job })
     }
+}
+
+async fn run_thumbnail_scraper_retry(
+    database: Database,
+    metadata: MetadataReidentifyService,
+    thumbnails: ThumbnailService,
+    retry: StoredThumbnailScraperRetry,
+) {
+    let item_id = retry.item_id.clone();
+    let now = OffsetDateTime::now_utc().unix_timestamp();
+    if retry.next_retry_at.is_none() {
+        finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
+        return;
+    }
+    let applicable = match thumbnails.scraper_first_retry_is_applicable(&item_id).await {
+        Ok(applicable) => applicable,
+        Err(error) => {
+            release_thumbnail_scraper_retry(&database, &retry, now).await;
+            tracing::warn!(item_id, %error, "thumbnail scraper retry policy could not be checked");
+            return;
+        }
+    };
+    if !applicable {
+        finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
+        return;
+    }
+
+    let images_missing = match thumbnails.scraper_first_images_missing(&item_id).await {
+        Ok(images_missing) => images_missing,
+        Err(error) => {
+            release_thumbnail_scraper_retry(&database, &retry, now).await;
+            tracing::warn!(item_id, %error, "thumbnail scraper retry images could not be checked");
+            return;
+        }
+    };
+    if !images_missing {
+        finish_thumbnail_scraper_retry(&database, &retry, retry.attempt_count, None, now).await;
+        return;
+    }
+
+    if retry.attempt_count >= 3 {
+        if let Err(error) = thumbnails.generate_item(&item_id).await {
+            tracing::warn!(item_id, %error, "thumbnail screenshot generation failed after scraper retries");
+        }
+        finish_thumbnail_scraper_retry(&database, &retry, 3, None, now).await;
+        return;
+    }
+
+    if let Err(error) = database
+        .clear_metadata_image_attempt_history_for_thumbnail_retry(&item_id)
+        .await
+    {
+        release_thumbnail_scraper_retry(&database, &retry, now).await;
+        tracing::warn!(item_id, %error, "thumbnail scraper retry history could not be cleared");
+        return;
+    }
+    let job = match metadata
+        .create_fill_missing_job(vec![item_id.clone()])
+        .await
+    {
+        Ok(job) => job,
+        Err(error) => {
+            release_thumbnail_scraper_retry(&database, &retry, now).await;
+            tracing::warn!(item_id, %error, "thumbnail scraper retry refresh could not be queued");
+            return;
+        }
+    };
+    metadata.run(&job.id).await;
+
+    let attempted_at = OffsetDateTime::now_utc().unix_timestamp();
+    let attempt_count = retry.attempt_count.saturating_add(1).min(3);
+    let still_missing = match thumbnails.scraper_first_images_missing(&item_id).await {
+        Ok(still_missing) => still_missing,
+        Err(error) => {
+            tracing::warn!(item_id, %error, "thumbnail scraper retry result could not be checked");
+            true
+        }
+    };
+    if !still_missing {
+        finish_thumbnail_scraper_retry(&database, &retry, attempt_count, None, attempted_at).await;
+    } else if attempt_count >= 3 {
+        if let Err(error) = thumbnails.generate_item(&item_id).await {
+            tracing::warn!(item_id, %error, "thumbnail screenshot generation failed after scraper retries");
+        }
+        finish_thumbnail_scraper_retry(&database, &retry, attempt_count, None, attempted_at).await;
+    } else {
+        let next_retry_at = crate::application::thumbnail_policy::thumbnail_scraper_retry_at(
+            retry.first_attempt_at,
+            attempt_count,
+        );
+        finish_thumbnail_scraper_retry(
+            &database,
+            &retry,
+            attempt_count,
+            next_retry_at,
+            attempted_at,
+        )
+        .await;
+    }
+}
+
+async fn finish_thumbnail_scraper_retry(
+    database: &Database,
+    retry: &StoredThumbnailScraperRetry,
+    attempt_count: u32,
+    next_retry_at: Option<i64>,
+    now: i64,
+) {
+    if let Err(error) = database
+        .finish_thumbnail_scraper_retry(&retry.item_id, attempt_count, next_retry_at, now)
+        .await
+    {
+        tracing::error!(item_id = %retry.item_id, %error, "thumbnail scraper retry state could not be updated");
+    }
+}
+
+async fn release_thumbnail_scraper_retry(
+    database: &Database,
+    retry: &StoredThumbnailScraperRetry,
+    now: i64,
+) {
+    let next_retry_at = now.saturating_add(THUMBNAIL_SCRAPER_RETRY_INTERNAL_FAILURE_DELAY_SECONDS);
+    finish_thumbnail_scraper_retry(
+        database,
+        retry,
+        retry.attempt_count,
+        Some(next_retry_at),
+        now,
+    )
+    .await;
 }
 
 fn scheduler_schedule(task: &StoredScheduledTaskConfig) -> Option<CronSchedule> {

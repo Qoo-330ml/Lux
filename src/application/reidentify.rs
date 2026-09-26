@@ -24,6 +24,7 @@ use crate::{
         },
         notification_template::bounded_display_text,
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
+        thumbnail_policy::thumbnail_scraper_retry_at,
         webhooks::{WebhookEventType, WebhookService},
     },
     config::DatabaseBackend,
@@ -760,6 +761,10 @@ impl MetadataReidentifyService {
                                 .await
                             {
                                 Ok(Some(providers)) => {
+                                    if matches!(mode, MetadataRefreshMode::FillMissing) {
+                                        self.schedule_thumbnail_scraper_retry_if_needed(item_id)
+                                            .await;
+                                    }
                                     self.refresh_with_scraper_roles(
                                         item_id,
                                         &item,
@@ -853,6 +858,34 @@ impl MetadataReidentifyService {
                     );
                 }
                 self.publish_job_progress(job_id);
+            }
+        }
+    }
+
+    async fn schedule_thumbnail_scraper_retry_if_needed(&self, item_id: &str) {
+        let Some(selection) = self.selection.as_ref() else {
+            return;
+        };
+        match selection
+            .should_schedule_thumbnail_scraper_retry(item_id)
+            .await
+        {
+            Ok(true) => {
+                let first_attempt_at = unix_now();
+                let Some(next_retry_at) = thumbnail_scraper_retry_at(first_attempt_at, 1) else {
+                    return;
+                };
+                if let Err(error) = self
+                    .database
+                    .ensure_thumbnail_scraper_retry(item_id, first_attempt_at, next_retry_at)
+                    .await
+                {
+                    tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be saved");
+                }
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(item_id, %error, "thumbnail scraper retry state could not be checked");
             }
         }
     }

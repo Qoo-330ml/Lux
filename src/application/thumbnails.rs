@@ -104,8 +104,9 @@ impl ThumbnailService {
                 global_strategy.as_deref(),
                 &mut seen_items,
                 &mut report,
+                false,
             )
-            .await;
+            .await?;
             if last_page {
                 break;
             }
@@ -137,8 +138,9 @@ impl ThumbnailService {
                 global_strategy.as_deref(),
                 &mut seen_items,
                 &mut report,
+                false,
             )
-            .await;
+            .await?;
             if last_page {
                 break;
             }
@@ -175,8 +177,9 @@ impl ThumbnailService {
                 global_strategy.as_deref(),
                 &mut seen_items,
                 &mut report,
+                false,
             )
-            .await;
+            .await?;
             let failed_item_ids = report.failed_item_ids.clone();
             self.database
                 .mark_scan_job_target_stage(
@@ -204,13 +207,72 @@ impl ThumbnailService {
         Ok(report)
     }
 
+    pub(crate) async fn generate_item(
+        &self,
+        item_id: &str,
+    ) -> Result<ThumbnailReport, ThumbnailError> {
+        let Some(source) = self.database.find_local_thumbnail_source(item_id).await? else {
+            return Ok(ThumbnailReport::default());
+        };
+        let global_strategy = self.database.media_strategy_settings().await?;
+        let mut report = ThumbnailReport::default();
+        let mut seen_items = HashSet::new();
+        self.generate_sources(
+            vec![source],
+            global_strategy.as_deref(),
+            &mut seen_items,
+            &mut report,
+            true,
+        )
+        .await?;
+        Ok(report)
+    }
+
+    pub(crate) async fn scraper_first_retry_is_applicable(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, ThumbnailError> {
+        let Some(source) = self.database.find_local_thumbnail_source(item_id).await? else {
+            return Ok(false);
+        };
+        if source.scraper_id.is_none() || is_strm_path(&source.relative_path) {
+            return Ok(false);
+        }
+        let global_strategy = self.database.media_strategy_settings().await?;
+        Ok(ThumbnailScrapingMode::from_strategy_json(
+            source.library_media_strategy_json.as_deref(),
+            global_strategy.as_deref(),
+        ) == ThumbnailScrapingMode::ScraperFirst)
+    }
+
+    pub(crate) async fn scraper_first_images_missing(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, ThumbnailError> {
+        let Some(source) = self.database.find_local_thumbnail_source(item_id).await? else {
+            return Ok(false);
+        };
+        let (_source_path, _target_path, root_path) = resolve_media_paths(&source).await?;
+        let indexed_images = self.database.list_item_images(item_id).await?;
+        for image_type in ["POSTER", "THUMB"] {
+            if matches!(
+                indexed_image_availability(&indexed_images, image_type, &root_path).await?,
+                ImageAvailability::Missing | ImageAvailability::Fallback
+            ) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn generate_sources(
         &self,
         candidates: Vec<StoredThumbnailSource>,
         global_strategy: Option<&str>,
         seen_items: &mut HashSet<String>,
         report: &mut ThumbnailReport,
-    ) {
+        allow_scraper_first_screenshots: bool,
+    ) -> Result<(), ThumbnailError> {
         let mut pending = JoinSet::new();
         for candidate in candidates {
             if !seen_items.insert(candidate.item_id.clone()) {
@@ -228,6 +290,16 @@ impl ThumbnailService {
                 report.skipped_strm += 1;
                 continue;
             }
+            if !allow_scraper_first_screenshots
+                && mode == ThumbnailScrapingMode::ScraperFirst
+                && candidate.scraper_id.is_some()
+                && self
+                    .should_defer_scraper_first_screenshot(&candidate)
+                    .await?
+            {
+                report.skipped_policy += 1;
+                continue;
+            }
             report.considered += 1;
             while pending.len() >= THUMBNAIL_WORKER_CONCURRENCY {
                 self.collect_thumbnail_task(&mut pending, report).await;
@@ -242,6 +314,21 @@ impl ThumbnailService {
         while !pending.is_empty() {
             self.collect_thumbnail_task(&mut pending, report).await;
         }
+        Ok(())
+    }
+
+    async fn should_defer_scraper_first_screenshot(
+        &self,
+        source: &StoredThumbnailSource,
+    ) -> Result<bool, ThumbnailError> {
+        let Some(retry) = self
+            .database
+            .find_thumbnail_scraper_retry(&source.item_id)
+            .await?
+        else {
+            return Ok(true);
+        };
+        Ok(retry.status != "COMPLETE" && retry.attempt_count < 3)
     }
 
     async fn collect_thumbnail_task(
@@ -935,12 +1022,16 @@ impl fmt::Display for ThumbnailFileError {
 #[derive(Debug)]
 pub enum ThumbnailError {
     Storage(StorageError),
+    ImageAvailabilityUnavailable,
 }
 
 impl fmt::Display for ThumbnailError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Storage(error) => error.fmt(formatter),
+            Self::ImageAvailabilityUnavailable => {
+                formatter.write_str("thumbnail image availability could not be checked")
+            }
         }
     }
 }
@@ -950,5 +1041,11 @@ impl std::error::Error for ThumbnailError {}
 impl From<StorageError> for ThumbnailError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+impl From<ThumbnailFileError> for ThumbnailError {
+    fn from(_: ThumbnailFileError) -> Self {
+        Self::ImageAvailabilityUnavailable
     }
 }

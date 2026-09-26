@@ -1,6 +1,21 @@
 use serde::Deserialize;
 
 pub(crate) const DEFAULT_THUMBNAIL_SCRAPING_MODE: &str = "SCRAPER_FIRST";
+pub(crate) const THUMBNAIL_SCRAPER_FIRST_RETRY_DELAYS_SECONDS: [i64; 2] =
+    [6 * 60 * 60, 24 * 60 * 60];
+
+pub(crate) fn thumbnail_scraper_retry_at(
+    first_attempt_at: i64,
+    completed_attempt_count: u32,
+) -> Option<i64> {
+    if completed_attempt_count == 0 {
+        return None;
+    }
+    let delay_index = usize::try_from(completed_attempt_count.saturating_sub(1)).ok()?;
+    THUMBNAIL_SCRAPER_FIRST_RETRY_DELAYS_SECONDS
+        .get(delay_index)
+        .map(|delay| first_attempt_at.saturating_add(*delay))
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ThumbnailScrapingMode {
@@ -59,7 +74,9 @@ fn parse_strategy_json(value: &str) -> Option<ThumbnailScrapingMode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEFAULT_THUMBNAIL_SCRAPING_MODE, ThumbnailScrapingMode};
+    use super::{
+        DEFAULT_THUMBNAIL_SCRAPING_MODE, ThumbnailScrapingMode, thumbnail_scraper_retry_at,
+    };
 
     #[test]
     fn missing_or_unknown_modes_preserve_scraper_first_compatibility() {
@@ -92,5 +109,21 @@ mod tests {
             ThumbnailScrapingMode::from_strategy_json(Some(library), Some(global)),
             ThumbnailScrapingMode::ScraperFirst
         );
+    }
+
+    #[test]
+    fn scraper_first_retry_deadlines_are_six_and_twenty_four_hours_from_first_attempt() {
+        let first_attempt_at = 1_000;
+
+        assert_eq!(
+            thumbnail_scraper_retry_at(first_attempt_at, 1),
+            Some(first_attempt_at + 6 * 60 * 60)
+        );
+        assert_eq!(
+            thumbnail_scraper_retry_at(first_attempt_at, 2),
+            Some(first_attempt_at + 24 * 60 * 60)
+        );
+        assert_eq!(thumbnail_scraper_retry_at(first_attempt_at, 0), None);
+        assert_eq!(thumbnail_scraper_retry_at(first_attempt_at, 3), None);
     }
 }

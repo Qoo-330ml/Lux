@@ -1910,6 +1910,27 @@ impl MetadataSelectionService {
         })
     }
 
+    pub(crate) async fn should_schedule_thumbnail_scraper_retry(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, MetadataSelectionError> {
+        let image_policy = self.image_selection_policy(item_id).await?;
+        if image_policy.thumbnail_scraping_mode != ThumbnailScrapingMode::ScraperFirst {
+            return Ok(false);
+        }
+        let image_types = image_policy
+            .enabled_types()
+            .filter(|image_type| matches!(*image_type, "POSTER" | "THUMB"))
+            .collect::<Vec<_>>();
+        if image_types.is_empty() {
+            return Ok(false);
+        }
+        let local_image_types = self.images.local_image_types(item_id, &image_types).await?;
+        Ok(image_types
+            .iter()
+            .any(|image_type| !local_image_types.contains(*image_type)))
+    }
+
     async fn fill_missing_request_plan_for_current_with_options(
         &self,
         item_id: &str,
