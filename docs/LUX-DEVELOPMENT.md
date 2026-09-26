@@ -6782,18 +6782,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-275：全链路扫描性能与阶段门
 
-范围：以最终 discovery、准备与 storage 路径运行 60,000 files / 600 directories 的 SQLite/PostgreSQL 各三轮 release 基准，作为阶段 22 完成判定。除索引完成外，必须评估 120,000 targets、无变化重扫、批次尾延迟、扫描期间 50 并发前台请求、SQL/DML、WAL 和锁等待。`LUX_SCAN_CONCURRENCY` 与媒体库设置值均须证明有效多任务运行、有界、可受资源反馈降档；不得在 Tokio core 线程执行阻塞 I/O，不声称 NAS/x86 性能。
+范围：以最终 discovery、准备与 storage 路径运行 60,000 files / 600 directories 的 SQLite/PostgreSQL 各三轮 release 基准，作为阶段 22 完成判定。除索引完成外，必须评估 120,000 targets、无变化重扫、批次尾延迟、扫描期间 50 并发前台请求、SQL/DML、WAL 和锁等待。若首轮阶段门未通过，可依据已测子阶段做一个受数据库 bind 上限约束的 storage 批次调整，然后完整重跑阶段门。`LUX_SCAN_CONCURRENCY` 与媒体库设置值均须证明有效多任务运行、有界、可受资源反馈降档；不得在 Tokio core 线程执行阻塞 I/O，不声称 NAS/x86 性能。
 
 验收：
 
 - [ ] SQLite 和 PostgreSQL 的全扫描索引中位数都相对同机 LUX-270 基线有稳定改善；无变化重扫和前台 p95 均不回退超过 5%，且 batch p95 无明显长尾恶化。
 - [ ] 取消、root 替换、错误回滚/重试、CAS、target readiness、首页快照与事件时序的安全测试全部通过。
 - [ ] 记录各阶段三轮中位数、分布、总墙钟、fixture、硬件、数据库配置和命令；运行 build、all-targets、fmt、Clippy 与 PostgreSQL integration gate。
-- [ ] 通过性能门后更新 COMPATIBILITY/PERFORMANCE，等待项目所有者确认阶段 22；未通过则保留阶段为开放，不进入下一阶段。
+- [ ] 通过性能门后更新 PERFORMANCE 与本规格，并等待项目所有者确认阶段 22；若外部兼容性行为发生变化，同时更新 COMPATIBILITY。未通过则保留阶段为开放，不进入下一阶段。
 
 依赖：LUX-273、LUX-274。
 
-实现文件：`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。
+实现文件（含首轮未过门后的有界批次跟进）：`src/storage/repository.rs`、`src/storage/media.rs`、`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
 
 ## 26. 风险与缓解
 
