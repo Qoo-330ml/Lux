@@ -65,6 +65,7 @@ const METADATA_BENCHMARK_PNG: &[u8] = &[
     0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
     0x42, 0x60, 0x82,
 ];
+type ScanStageSample = (u64, u64, u64, u64);
 
 #[derive(Default)]
 struct QueryStatementCounts {
@@ -78,6 +79,9 @@ struct QueryStatementCounts {
     manifest_positive_commit_batches: AtomicUsize,
     manifest_preparation_concurrency: AtomicUsize,
     manifest_directory_read_concurrency: AtomicUsize,
+    active_preparation_tasks_peak: AtomicUsize,
+    active_directory_readers_peak: AtomicUsize,
+    scan_stage_samples: Mutex<std::collections::HashMap<String, Vec<ScanStageSample>>>,
 }
 
 impl QueryStatementCounts {
@@ -94,11 +98,19 @@ impl QueryStatementCounts {
             .store(0, Ordering::Relaxed);
         self.manifest_directory_read_concurrency
             .store(0, Ordering::Relaxed);
+        self.active_preparation_tasks_peak
+            .store(0, Ordering::Relaxed);
+        self.active_directory_readers_peak
+            .store(0, Ordering::Relaxed);
         self.dml_summaries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
         self.unclassified_cte_summaries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.scan_stage_samples
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clear();
@@ -133,6 +145,45 @@ impl QueryStatementCounts {
         )
     }
 
+    fn scan_stage_snapshot(&self) -> Vec<ScanStageSummary> {
+        let samples = self
+            .scan_stage_samples
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut summaries = samples
+            .iter()
+            .filter_map(|(phase, samples)| scan_stage_summary(phase, samples))
+            .collect::<Vec<_>>();
+        summaries.sort_unstable_by(|left, right| left.phase.cmp(&right.phase));
+        summaries
+    }
+
+    fn scan_stage_peaks(&self) -> (usize, usize) {
+        (
+            self.active_preparation_tasks_peak.load(Ordering::Relaxed),
+            self.active_directory_readers_peak.load(Ordering::Relaxed),
+        )
+    }
+
+    fn scan_stage_values(&self) -> serde_json::Value {
+        let (preparation_peak, reader_peak) = self.scan_stage_peaks();
+        serde_json::json!({
+            "stages": self.scan_stage_snapshot().into_iter().map(|summary| serde_json::json!({
+                "phase": summary.phase,
+                "calls": summary.call_count,
+                "cumulativeDurationUs": summary.total_duration_us,
+                "p50DurationUs": summary.p50_duration_us,
+                "p95DurationUs": summary.p95_duration_us,
+                "units": summary.total_units,
+                "files": summary.total_files,
+                "directories": summary.total_directories,
+            })).collect::<Vec<_>>(),
+            "activePreparationTasksPeak": preparation_peak,
+            "activeDirectoryReadersPeak": reader_peak,
+            "durationNote": "Cumulative stage durations are work totals, not wall time; nested and concurrent stages may overlap."
+        })
+    }
+
     fn dml_summary_snapshot(&self) -> Vec<(usize, String)> {
         let summaries = self
             .dml_summaries
@@ -162,14 +213,55 @@ impl QueryStatementCounts {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScanStageSummary {
+    phase: String,
+    call_count: usize,
+    total_duration_us: u128,
+    p50_duration_us: u64,
+    p95_duration_us: u64,
+    total_units: u128,
+    total_files: u128,
+    total_directories: u128,
+}
+
+fn scan_stage_summary(phase: &str, samples: &[ScanStageSample]) -> Option<ScanStageSummary> {
+    if samples.is_empty() {
+        return None;
+    }
+    let mut durations = samples.iter().map(|sample| sample.0).collect::<Vec<_>>();
+    durations.sort_unstable();
+    let percentile_index = |percentile: usize| {
+        ((durations.len() * percentile).saturating_add(99) / 100)
+            .saturating_sub(1)
+            .min(durations.len().saturating_sub(1))
+    };
+    Some(ScanStageSummary {
+        phase: phase.to_owned(),
+        call_count: samples.len(),
+        total_duration_us: durations.iter().map(|duration| u128::from(*duration)).sum(),
+        p50_duration_us: durations[percentile_index(50)],
+        p95_duration_us: durations[percentile_index(95)],
+        total_units: samples.iter().map(|sample| u128::from(sample.1)).sum(),
+        total_files: samples.iter().map(|sample| u128::from(sample.2)).sum(),
+        total_directories: samples.iter().map(|sample| u128::from(sample.3)).sum(),
+    })
+}
+
 #[derive(Default)]
 struct QuerySummaryVisitor {
     summary: Option<String>,
     application_ms: Option<u64>,
     transaction_ms: Option<u64>,
     phase: Option<String>,
+    duration_us: Option<u64>,
+    units: Option<u64>,
+    files: Option<u64>,
+    directories: Option<u64>,
     preparation_concurrency: Option<u64>,
     directory_read_concurrency: Option<u64>,
+    active_preparation_tasks: Option<u64>,
+    active_directory_readers: Option<u64>,
 }
 
 impl Visit for QuerySummaryVisitor {
@@ -179,6 +271,12 @@ impl Visit for QuerySummaryVisitor {
             "transaction_ms" => self.transaction_ms = Some(value),
             "preparation_concurrency" => self.preparation_concurrency = Some(value),
             "directory_read_concurrency" => self.directory_read_concurrency = Some(value),
+            "duration_us" => self.duration_us = Some(value),
+            "units" => self.units = Some(value),
+            "files" => self.files = Some(value),
+            "directories" => self.directories = Some(value),
+            "active_preparation_tasks" => self.active_preparation_tasks = Some(value),
+            "active_directory_readers" => self.active_directory_readers = Some(value),
             _ => {}
         }
     }
@@ -259,6 +357,38 @@ fn query_counter_classifies_dml_statements_inside_common_table_expressions() {
     ));
 }
 
+#[test]
+fn scan_stage_summary_reports_overlapping_microsecond_work_without_calling_it_wall_time() {
+    let summary = scan_stage_summary("directory_read", &[(1_000, 8, 8, 2), (2_000, 4, 4, 1)]);
+    assert_eq!(
+        summary,
+        Some(ScanStageSummary {
+            phase: "directory_read".to_owned(),
+            call_count: 2,
+            total_duration_us: 3_000,
+            p50_duration_us: 1_000,
+            p95_duration_us: 2_000,
+            total_units: 12,
+            total_files: 12,
+            total_directories: 3,
+        })
+    );
+}
+
+#[test]
+fn scan_stage_summary_omits_empty_stages() {
+    assert_eq!(scan_stage_summary("known_paths", &[]), None);
+}
+
+fn stage_names(value: &serde_json::Value) -> std::collections::HashSet<&str> {
+    value["stages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|stage| stage["phase"].as_str())
+        .collect()
+}
+
 impl<S> Layer<S> for QueryStatementLayer
 where
     S: Subscriber,
@@ -282,22 +412,54 @@ where
                 }
                 return;
             }
+            if let Some(phase) = visitor.phase.as_deref()
+                && let Some(duration_us) = visitor.duration_us
+            {
+                self.0
+                    .scan_stage_samples
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entry(phase.to_owned())
+                    .or_default()
+                    .push((
+                        duration_us,
+                        visitor.units.unwrap_or_default(),
+                        visitor.files.unwrap_or_default(),
+                        visitor.directories.unwrap_or_default(),
+                    ));
+            }
+            if let Some(active_tasks) = visitor.active_preparation_tasks {
+                self.0.active_preparation_tasks_peak.fetch_max(
+                    usize::try_from(active_tasks).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+            }
+            if let Some(active_readers) = visitor.active_directory_readers {
+                self.0.active_directory_readers_peak.fetch_max(
+                    usize::try_from(active_readers).unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+            }
             if visitor.phase.as_deref() == Some("positive_commit") {
                 self.0
                     .manifest_positive_commit_batches
                     .fetch_add(1, Ordering::Relaxed);
             }
-            self.0.manifest_application_ms.fetch_add(
-                usize::try_from(visitor.application_ms.unwrap_or_default()).unwrap_or(usize::MAX),
-                Ordering::Relaxed,
-            );
-            self.0.manifest_transaction_ms.fetch_add(
-                usize::try_from(visitor.transaction_ms.unwrap_or_default()).unwrap_or(usize::MAX),
-                Ordering::Relaxed,
-            );
-            self.0
-                .manifest_apply_timing_batches
-                .fetch_add(1, Ordering::Relaxed);
+            if visitor.application_ms.is_some() || visitor.transaction_ms.is_some() {
+                self.0.manifest_application_ms.fetch_add(
+                    usize::try_from(visitor.application_ms.unwrap_or_default())
+                        .unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+                self.0.manifest_transaction_ms.fetch_add(
+                    usize::try_from(visitor.transaction_ms.unwrap_or_default())
+                        .unwrap_or(usize::MAX),
+                    Ordering::Relaxed,
+                );
+                self.0
+                    .manifest_apply_timing_batches
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             return;
         }
         if event.metadata().target() != "sqlx::query" {
@@ -876,6 +1038,53 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         }
     }
     let manifest_index_ms = first_scan_started.elapsed().as_millis();
+    let manifest_stage_timings = statement_counts.scan_stage_values();
+    let recorded_stages = stage_names(&manifest_stage_timings);
+    for phase in [
+        "directory_open",
+        "directory_readdir",
+        "directory_stat",
+        "directory_batch_total",
+        "baseline_query",
+        "positive_classification",
+        "positive_file_prepare",
+        "positive_prepare_wall",
+        "positive_file_recheck",
+        "transaction_input_validation",
+        "transaction_begin",
+        "manifest_state_check",
+        "directory_frontier_insert",
+        "known_path_query",
+        "directory_frontier_completion",
+        "root_checkpoint",
+        "manifest_observation_insert",
+        "positive_index_apply",
+        "presence_ledger",
+        "manifest_counter_checkpoint",
+        "transaction_commit",
+        "transaction_total",
+        "index_completion",
+    ] {
+        assert!(
+            recorded_stages.contains(phase),
+            "60k scan report is missing the {phase} stage; phase={phase}, processed={first_scan_processed}, writerCommits={}, writerAbort={}, writerCancelled={}, timing report: {manifest_stage_timings}",
+            statement_counts.manifest_positive_commit_batch_count(),
+            manifest_stage_timings["writerAbortFlagObserved"],
+            manifest_stage_timings["writerCancelledObserved"]
+        );
+    }
+    assert!(
+        manifest_stage_timings["activePreparationTasksPeak"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0,
+        "scan should report an observed preparation task peak"
+    );
+    assert_eq!(
+        manifest_stage_timings["activeDirectoryReadersPeak"].as_u64(),
+        Some(1),
+        "sequential reader path should report one active directory reader"
+    );
     assert_eq!(
         phase_batch_counts.get("APPLYING"),
         Some(&1),
@@ -885,6 +1094,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         statement_counts.manifest_apply_timing_snapshot();
     let (manifest_preparation_concurrency, manifest_directory_read_concurrency) =
         statement_counts.manifest_directory_concurrency_snapshot();
+    assert_eq!(manifest_directory_read_concurrency, 1);
     let (postgres_lock_wait_samples, postgres_max_lock_waiters) =
         if let Some(monitor) = postgres_lock_monitor {
             monitor.stop().await
@@ -1023,8 +1233,18 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let target_materialization_started = Instant::now();
     jobs.materialize_manifest_postprocessing_targets(&job.id)
         .await?;
-    let postprocessing_target_materialization_ms =
-        target_materialization_started.elapsed().as_millis();
+    let target_materialization_duration = target_materialization_started.elapsed();
+    let postprocessing_target_materialization_ms = target_materialization_duration.as_millis();
+    tracing::debug!(
+        target: "lux::scan_performance",
+        phase = "target_materialization",
+        duration_us = u64::try_from(target_materialization_duration.as_micros()).unwrap_or(u64::MAX),
+        units = u64::try_from(file_count.saturating_mul(2)).unwrap_or(u64::MAX),
+        files = u64::try_from(file_count).unwrap_or(u64::MAX),
+        directories = u64::try_from(directory_count).unwrap_or(u64::MAX),
+        "manifest target materialization timing"
+    );
+    let target_stage_timings = statement_counts.scan_stage_values();
     let (postprocessing_target_sql_count, postprocessing_target_dml_count) =
         statement_counts.snapshot();
     let postprocessing_target_count_query =
@@ -1094,6 +1314,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         .map_err(|error| std::io::Error::other(error.to_string()))?
         .map_err(std::io::Error::other)?;
     let rescan_ms = rescan_started.elapsed().as_millis();
+    let unchanged_rescan_stage_timings = statement_counts.scan_stage_values();
     let batch_p50_ms = percentile(&first_batch_durations, 50);
     let batch_p95_ms = percentile(&first_batch_durations, 95);
     let foreground_p95_ms = percentile(&foreground_ms, 95);
@@ -1109,7 +1330,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             .fetch_one(database.pool())
             .await?;
     assert_eq!(rescan_manifest.0, "POSTPROCESSING");
-    assert_eq!(rescan_manifest.1, file_count as i64);
+    assert_eq!(
+        rescan_manifest.1,
+        file_count as i64,
+        "rescan={rescan_manifest:?}, processed={rescan_processed}, batches={}, stages={}",
+        rescan_batch_durations.len(),
+        serde_json::to_string(&unchanged_rescan_stage_timings)?
+    );
     assert_eq!(rescan_manifest.2, file_count as i64);
     assert_eq!(rescan_manifest.3, 0);
     let rescan_presence_query = format!(
@@ -1159,6 +1386,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "manifestBatchCount": first_batch_durations.len(),
             "manifestPhaseMs": phase_durations,
             "manifestPhaseBatchCounts": phase_batch_counts,
+            "manifestStageTimings": manifest_stage_timings,
             "manifestPositivePreparationMs": manifest_application_ms,
             "manifestPositiveCommitMs": manifest_transaction_ms,
             "manifestPositiveTimingEventCount": manifest_apply_timing_batches,
@@ -1166,6 +1394,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "manifestPreparationConcurrency": manifest_preparation_concurrency,
             "manifestDirectoryReadConcurrency": manifest_directory_read_concurrency,
             "postprocessingTargetMaterializationMs": postprocessing_target_materialization_ms,
+            "targetStageTimings": target_stage_timings,
             "postprocessingTargetSqlStatementCount": postprocessing_target_sql_count,
             "postprocessingTargetDmlStatementCount": postprocessing_target_dml_count,
             "postprocessingTargetCount": postprocessing_target_count,
@@ -1204,6 +1433,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             "foregroundP95Ms": foreground_p95_ms,
             "catalogListP95Ms": catalog_list_p95_ms,
             "unchangedRescanMs": rescan_ms,
+            "unchangedRescanStageTimings": unchanged_rescan_stage_timings,
             "unchangedRescanBatchCount": rescan_batch_durations.len(),
             "unchangedRescanProcessed": rescan_processed,
             "manifestState": initial_manifest.0,

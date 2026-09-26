@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 // Each path uses one bind plus three fixed parameters; 996 paths fit SQLite's historical
@@ -12,6 +13,26 @@ const SCAN_MANIFEST_OBSERVATION_BATCH_SIZE: usize = 124;
 const SCAN_MANIFEST_SEEN_PATH_BATCH_SIZE: usize = 997;
 // One bind per candidate path plus four fixed binds keeps the known-path lookup below SQLite's limit.
 const SCAN_MANIFEST_KNOWN_PATH_CHUNK_SIZE: usize = 500;
+
+fn record_manifest_storage_stage(
+    phase: &'static str,
+    started: Instant,
+    units: usize,
+    files: usize,
+    directories: usize,
+) {
+    if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase,
+            duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            units = u64::try_from(units).unwrap_or(u64::MAX),
+            files = u64::try_from(files).unwrap_or(u64::MAX),
+            directories = u64::try_from(directories).unwrap_or(u64::MAX),
+            "manifest storage stage timing"
+        );
+    }
+}
 
 struct ManifestPostprocessingTargetRange<'a> {
     job_id: &'a str,
@@ -1456,6 +1477,7 @@ impl Database {
         let Some(chunk) = chunks.first() else {
             return Ok(ManifestDiscoveryCommitResult::default());
         };
+        let input_validation_started = Instant::now();
         let mut child_directories = Vec::new();
         let mut entries = Vec::new();
         let mut completed_directories = Vec::new();
@@ -1571,7 +1593,30 @@ impl Database {
             return Ok(ManifestDiscoveryCommitResult::default());
         }
 
+        record_manifest_storage_stage(
+            "transaction_input_validation",
+            input_validation_started,
+            entries.len().saturating_add(child_directories.len()),
+            entries
+                .iter()
+                .filter(|entry| entry.entry_kind == "FILE")
+                .count(),
+            child_directories.len(),
+        );
+        let transaction_total_started = Instant::now();
+        let transaction_begin_started = Instant::now();
         let mut transaction = self.begin_scan_write_transaction().await?;
+        record_manifest_storage_stage(
+            "transaction_begin",
+            transaction_begin_started,
+            entries.len().saturating_add(child_directories.len()),
+            entries
+                .iter()
+                .filter(|entry| entry.entry_kind == "FILE")
+                .count(),
+            child_directories.len(),
+        );
+        let manifest_state_started = Instant::now();
         let (workflow_version, discovery_format_version): (i64, i64) = self
             .query_as(
                 "SELECT workflow_version, discovery_format_version FROM scan_manifests
@@ -1585,6 +1630,8 @@ impl Database {
                 source,
             })?;
 
+        record_manifest_storage_stage("manifest_state_check", manifest_state_started, 1, 0, 0);
+        let directory_frontier_started = Instant::now();
         let mut inserted_directory_count = 0_u64;
         for paths in child_directories.chunks(SCAN_DML_CHUNK_SIZE) {
             if paths.is_empty() {
@@ -1619,12 +1666,20 @@ impl Database {
                     StorageError::Conflict("manifest directory count overflow".to_owned())
                 })?;
         }
+        record_manifest_storage_stage(
+            "directory_frontier_insert",
+            directory_frontier_started,
+            child_directories.len(),
+            0,
+            child_directories.len(),
+        );
 
         let file_paths = entries
             .iter()
             .filter(|entry| entry.entry_kind == "FILE")
             .map(|entry| entry.relative_path.as_str())
             .collect::<Vec<_>>();
+        let known_path_started = Instant::now();
         let mut known_file_paths = std::collections::HashSet::new();
         for paths in file_paths.chunks(SCAN_MANIFEST_KNOWN_PATH_CHUNK_SIZE) {
             if paths.is_empty() {
@@ -1698,11 +1753,19 @@ impl Database {
             .iter()
             .filter(|path| !known_file_paths.contains(**path))
             .count();
+        record_manifest_storage_stage(
+            "known_path_query",
+            known_path_started,
+            file_paths.len().saturating_add(unchanged_paths.len()),
+            file_paths.len(),
+            0,
+        );
 
         let inserted_file_count_i64 = i64::try_from(inserted_file_count)
             .map_err(|_| StorageError::Conflict("manifest file count overflow".to_owned()))?;
         let inserted_directory_count_i64 = i64::try_from(inserted_directory_count)
             .map_err(|_| StorageError::Conflict("manifest directory count overflow".to_owned()))?;
+        let directory_frontier_completion_started = Instant::now();
         let mut completed_directory_count = 0_i64;
         for directories in completed_directories.chunks(SCAN_DML_CHUNK_SIZE) {
             let placeholders = std::iter::repeat_n("?", directories.len())
@@ -1736,7 +1799,15 @@ impl Database {
                     StorageError::Conflict("manifest directory count overflow".to_owned())
                 })?;
         }
+        record_manifest_storage_stage(
+            "directory_frontier_completion",
+            directory_frontier_completion_started,
+            completed_directories.len(),
+            0,
+            completed_directories.len(),
+        );
 
+        let root_checkpoint_started = Instant::now();
         let observation_entries = if discovery_format_version == 3 {
             entries
                 .iter()
@@ -1798,6 +1869,17 @@ impl Database {
             .ok_or_else(|| {
                 StorageError::Conflict("manifest root is not available for discovery".to_owned())
             })?;
+        record_manifest_storage_stage(
+            "root_checkpoint",
+            root_checkpoint_started,
+            inserted_directory_count
+                .try_into()
+                .unwrap_or(usize::MAX)
+                .saturating_add(completed_directories.len())
+                .saturating_add(inserted_file_count),
+            inserted_file_count,
+            completed_directories.len(),
+        );
         let observation_sequence_start = if workflow_version == 2 && observation_count_i64 > 0 {
             Some(
                 last_sequence
@@ -1816,6 +1898,7 @@ impl Database {
         } else {
             80
         };
+        let observation_started = Instant::now();
         let mut observation_offset = 0_i64;
         for entry_chunk in observation_entries.chunks(observation_batch_size) {
             if entry_chunk.is_empty() {
@@ -1911,6 +1994,19 @@ impl Database {
                     })?;
             }
         }
+        record_manifest_storage_stage(
+            "manifest_observation_insert",
+            observation_started,
+            observation_entries.len(),
+            observation_entries
+                .iter()
+                .filter(|entry| entry.entry_kind == "FILE")
+                .count(),
+            observation_entries
+                .iter()
+                .filter(|entry| entry.entry_kind == "DIRECTORY")
+                .count(),
+        );
 
         if workflow_version != 2 && !positive_indexes.is_empty() {
             return Err(StorageError::Conflict(
@@ -1918,6 +2014,7 @@ impl Database {
             ));
         }
         let mut positive_result = ManifestDiscoveryPositiveIndexResult::default();
+        let positive_index_started = Instant::now();
         if workflow_version == 2 && !positive_indexes.is_empty() {
             let (library_id, generation): (String, String) = self
                 .query_as(
@@ -1954,7 +2051,15 @@ impl Database {
                 )
                 .await?;
         }
+        record_manifest_storage_stage(
+            "positive_index_apply",
+            positive_index_started,
+            positive_indexes.len(),
+            positive_indexes.len(),
+            0,
+        );
 
+        let presence_ledger_started = Instant::now();
         if discovery_format_version == 3 {
             let mut ledger_paths = Vec::new();
             positive_result.indexed_paths.sort_unstable();
@@ -1995,7 +2100,15 @@ impl Database {
                     })?;
             }
         }
+        record_manifest_storage_stage(
+            "presence_ledger",
+            presence_ledger_started,
+            file_paths.len(),
+            file_paths.len(),
+            0,
+        );
 
+        let manifest_counters_started = Instant::now();
         self.query(
             "UPDATE scan_manifests
              SET discovered_directory_count = discovered_directory_count + ?,
@@ -2053,6 +2166,16 @@ impl Database {
             ));
         }
 
+        record_manifest_storage_stage(
+            "manifest_counter_checkpoint",
+            manifest_counters_started,
+            inserted_file_count
+                .saturating_add(completed_directories.len())
+                .saturating_add(positive_indexes.len()),
+            inserted_file_count,
+            completed_directories.len(),
+        );
+        let transaction_commit_started = Instant::now();
         transaction
             .commit()
             .await
@@ -2060,6 +2183,20 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        record_manifest_storage_stage(
+            "transaction_commit",
+            transaction_commit_started,
+            entries.len().saturating_add(child_directories.len()),
+            file_paths.len(),
+            child_directories.len(),
+        );
+        record_manifest_storage_stage(
+            "transaction_total",
+            transaction_total_started,
+            entries.len().saturating_add(child_directories.len()),
+            file_paths.len(),
+            child_directories.len(),
+        );
         Ok(ManifestDiscoveryCommitResult {
             observed_file_count: i64::try_from(inserted_file_count)
                 .map_err(|_| StorageError::Conflict("manifest file count overflow".to_owned()))?,

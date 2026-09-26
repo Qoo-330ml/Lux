@@ -88,6 +88,52 @@ struct ManifestDirectoryBatch {
     child_directories: Vec<String>,
     entries: Vec<NewScanManifestEntry>,
     completed: bool,
+    readdir_duration: Duration,
+    stat_duration: Duration,
+    readdir_entry_count: usize,
+    stat_entry_count: usize,
+}
+
+fn record_manifest_scan_stage(
+    phase: &'static str,
+    started: Instant,
+    units: u64,
+    files: u64,
+    directories: u64,
+) {
+    record_manifest_scan_stage_duration(phase, started.elapsed(), units, files, directories);
+}
+
+fn record_manifest_scan_stage_duration(
+    phase: &'static str,
+    duration: Duration,
+    units: u64,
+    files: u64,
+    directories: u64,
+) {
+    if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase,
+            duration_us = u64::try_from(duration.as_micros()).unwrap_or(u64::MAX),
+            units,
+            files,
+            directories,
+            "manifest scan stage timing"
+        );
+    }
+}
+
+fn record_manifest_scan_activity(active_preparation_tasks: usize, active_directory_readers: usize) {
+    if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
+        tracing::debug!(
+            target: "lux::scan_performance",
+            phase = "active_work",
+            active_preparation_tasks = u64::try_from(active_preparation_tasks).unwrap_or(u64::MAX),
+            active_directory_readers = u64::try_from(active_directory_readers).unwrap_or(u64::MAX),
+            "manifest scan active work"
+        );
+    }
 }
 
 struct PendingManifestDirectoryChunk {
@@ -448,6 +494,12 @@ impl ManifestDirectoryReader {
         let mut child_directories = Vec::with_capacity(batch_size);
         let mut observations = Vec::with_capacity(batch_size);
         let mut completed = false;
+        let measure_stages =
+            tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG);
+        let mut readdir_duration = Duration::ZERO;
+        let mut stat_duration = Duration::ZERO;
+        let mut readdir_entry_count = 0_usize;
+        let mut stat_entry_count = 0_usize;
 
         if self.relative_directory.is_empty() && !self.root_observation_emitted {
             observations.push(self.root_observation.clone());
@@ -456,8 +508,13 @@ impl ManifestDirectoryReader {
 
         for _ in 0..batch_size {
             clear_manifest_errno();
+            let readdir_started = measure_stages.then(Instant::now);
             // SAFETY: `entries` remains a live, exclusively owned DIR stream until Drop.
             let entry = unsafe { libc::readdir(self.entries) };
+            if let Some(started) = readdir_started {
+                readdir_duration = readdir_duration.saturating_add(started.elapsed());
+            }
+            readdir_entry_count = readdir_entry_count.saturating_add(1);
             if entry.is_null() {
                 let source = std::io::Error::last_os_error();
                 if source.raw_os_error().is_some_and(|code| code != 0) {
@@ -486,6 +543,7 @@ impl ManifestDirectoryReader {
             let name_c = std::ffi::CString::new(name)
                 .map_err(|_| ScannerError::InvalidRelativePath(relative_path.clone()))?;
             let mut stat = std::mem::MaybeUninit::<libc::stat>::zeroed();
+            let stat_started = measure_stages.then(Instant::now);
             // SAFETY: the directory descriptor is open, name_c is NUL-terminated, and stat
             // points to writable storage for the duration of the call.
             let stat_result = unsafe {
@@ -496,6 +554,10 @@ impl ManifestDirectoryReader {
                     libc::AT_SYMLINK_NOFOLLOW,
                 )
             };
+            if let Some(started) = stat_started {
+                stat_duration = stat_duration.saturating_add(started.elapsed());
+            }
+            stat_entry_count = stat_entry_count.saturating_add(1);
             if stat_result < 0 {
                 let source = std::io::Error::last_os_error();
                 if source.raw_os_error().is_some_and(|code| {
@@ -547,6 +609,10 @@ impl ManifestDirectoryReader {
                 child_directories,
                 entries: observations,
                 completed,
+                readdir_duration,
+                stat_duration,
+                readdir_entry_count,
+                stat_entry_count,
             },
         ))
     }
@@ -816,6 +882,12 @@ fn manifest_directory_observation_matches(
         && expected.inode.is_some()
 }
 
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 fn open_manifest_directory_for_final_check(
     root_path: &Path,
     expected_root_observation: &NewScanManifestEntry,
@@ -884,7 +956,9 @@ async fn verify_manifest_directory_observations(
     observations: Vec<(NewScanManifestEntry, NewScanManifestEntry)>,
 ) -> Result<(), ScannerError> {
     let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || {
+    let directory_count = observations.len();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
         for (expected_root_observation, expected_directory_observation) in observations {
             verify_manifest_directory_observation_sync(
                 &root_path,
@@ -898,7 +972,15 @@ async fn verify_manifest_directory_observations(
     .map_err(|source| ScannerError::Io {
         path: display_path,
         source: std::io::Error::other(source.to_string()),
-    })?
+    })?;
+    record_manifest_scan_stage(
+        "directory_identity_recheck",
+        started,
+        u64::try_from(directory_count).unwrap_or(u64::MAX),
+        0,
+        u64::try_from(directory_count).unwrap_or(u64::MAX),
+    );
+    result
 }
 
 fn verify_manifest_directory_observation_sync(
@@ -961,7 +1043,9 @@ async fn stat_manifest_directory_file_batch(
     expected_files: Vec<NewScanManifestEntry>,
 ) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
     let display_path = root_path.clone();
-    tokio::task::spawn_blocking(move || {
+    let file_count = expected_files.len();
+    let started = Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
         stat_manifest_directory_file_batch_sync(
             &root_path,
             &expected_root_observation,
@@ -973,9 +1057,70 @@ async fn stat_manifest_directory_file_batch(
     .map_err(|source| ScannerError::Io {
         path: display_path,
         source: std::io::Error::other(source.to_string()),
-    })?
+    })?;
+    record_manifest_scan_stage(
+        "positive_file_recheck",
+        started,
+        u64::try_from(file_count).unwrap_or(u64::MAX),
+        u64::try_from(file_count).unwrap_or(u64::MAX),
+        0,
+    );
+    result
 }
 
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+))]
+fn stat_manifest_directory_file_batch_sync(
+    root_path: &Path,
+    expected_root_observation: &NewScanManifestEntry,
+    expected_directory_observation: &NewScanManifestEntry,
+    expected_files: &[NewScanManifestEntry],
+) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
+    let (directory, current_root, current_directory) = match open_manifest_directory_identity(
+        root_path,
+        &expected_directory_observation.relative_path,
+    ) {
+        Ok(observations) => observations,
+        Err(ScannerError::InvalidRelativePath(_)) => {
+            return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+        }
+        Err(error) => return Err(error),
+    };
+    if !manifest_root_identity_matches(
+        expected_root_observation.device,
+        expected_root_observation.inode,
+        &current_root,
+    ) || !manifest_directory_observation_matches(
+        expected_directory_observation,
+        &current_directory,
+    ) {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    }
+    let current_files = stat_manifest_directory_files_from_handle(
+        root_path,
+        &directory,
+        &expected_directory_observation.relative_path,
+        expected_files,
+    )?;
+    drop(directory);
+    verify_manifest_directory_observation_sync(
+        root_path,
+        expected_root_observation,
+        expected_directory_observation,
+    )?;
+    Ok(current_files)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "android",
+    target_os = "macos",
+    target_os = "ios"
+)))]
 fn stat_manifest_directory_file_batch_sync(
     root_path: &Path,
     expected_root_observation: &NewScanManifestEntry,
@@ -1011,16 +1156,16 @@ fn stat_manifest_directory_file_batch_sync(
     target_os = "macos",
     target_os = "ios"
 ))]
-fn stat_manifest_directory_files_from_reader(
+fn stat_manifest_directory_files_from_handle(
     root_path: &Path,
-    reader: &ManifestDirectoryReader,
+    directory: &std::fs::File,
+    relative_directory: &str,
     expected_files: &[NewScanManifestEntry],
 ) -> Result<Vec<Option<NewScanManifestEntry>>, ScannerError> {
     let mut observations = Vec::with_capacity(expected_files.len());
     for expected in expected_files {
         let relative = Path::new(&expected.relative_path);
-        if relative.parent().and_then(Path::to_str).unwrap_or_default() != reader.relative_directory
-        {
+        if relative.parent().and_then(Path::to_str).unwrap_or_default() != relative_directory {
             return Err(ScannerError::InvalidRelativePath(
                 expected.relative_path.clone(),
             ));
@@ -1036,7 +1181,7 @@ fn stat_manifest_directory_files_from_reader(
         // SAFETY: The secured parent directory descriptor and both C pointers stay live here.
         let result = unsafe {
             libc::fstatat(
-                reader._directory.as_raw_fd(),
+                directory.as_raw_fd(),
                 file_name.as_ptr(),
                 stat.as_mut_ptr(),
                 libc::AT_SYMLINK_NOFOLLOW,
@@ -1555,15 +1700,30 @@ impl ManifestDirectoryReader {
         let mut child_directories = Vec::with_capacity(batch_size);
         let mut observations = Vec::with_capacity(batch_size);
         let mut completed = false;
+        let measure_stages =
+            tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG);
+        let mut readdir_duration = Duration::ZERO;
+        let mut stat_duration = Duration::ZERO;
+        let mut readdir_entry_count = 0_usize;
+        let mut stat_entry_count = 0_usize;
         if self.relative_directory.is_empty() && !self.root_observation_emitted {
             observations.push(self.root_observation.clone());
             self.root_observation_emitted = true;
         }
         for _ in 0..batch_size {
+            let readdir_started = measure_stages.then(Instant::now);
             let Some(entry) = self.entries.next() else {
+                if let Some(started) = readdir_started {
+                    readdir_duration = readdir_duration.saturating_add(started.elapsed());
+                }
+                readdir_entry_count = readdir_entry_count.saturating_add(1);
                 completed = true;
                 break;
             };
+            if let Some(started) = readdir_started {
+                readdir_duration = readdir_duration.saturating_add(started.elapsed());
+            }
+            readdir_entry_count = readdir_entry_count.saturating_add(1);
             let entry = entry.map_err(|source| ScannerError::Io {
                 path: self.directory_path.clone(),
                 source,
@@ -1585,10 +1745,15 @@ impl ManifestDirectoryReader {
                 .to_str()
                 .ok_or(ScannerError::NonUtf8Path)?
                 .to_owned();
+            let stat_started = measure_stages.then(Instant::now);
             let metadata = entry.metadata().map_err(|source| ScannerError::Io {
                 path: path.clone(),
                 source,
             })?;
+            if let Some(started) = stat_started {
+                stat_duration = stat_duration.saturating_add(started.elapsed());
+            }
+            stat_entry_count = stat_entry_count.saturating_add(1);
             let entry_kind = if file_type.is_dir() {
                 child_directories.push(relative_path.clone());
                 "DIRECTORY"
@@ -1611,6 +1776,10 @@ impl ManifestDirectoryReader {
                 child_directories,
                 entries: observations,
                 completed,
+                readdir_duration,
+                stat_duration,
+                readdir_entry_count,
+                stat_entry_count,
             },
         ))
     }
@@ -5081,6 +5250,7 @@ impl ScanJobService {
             path: root_path.clone(),
             source: std::io::Error::other(source.to_string()),
         })??;
+        record_manifest_scan_activity(0, 1);
         let root_observation = reader.root_observation.clone();
         let directory_observation = reader.directory_observation.clone();
         let mut result = ManifestDiscoveryDirectoryResult::default();
@@ -5236,6 +5406,13 @@ impl ScanJobService {
         let preparation_concurrency = preparation_concurrency.max(1);
         let mut positive_indexes = Vec::new();
         let mut root_identity_lost = false;
+        let mut classification_duration = Duration::ZERO;
+        let mut file_preparation_duration = Duration::ZERO;
+        let mut classification_count = 0_u64;
+        let mut preparation_count = 0_u64;
+        let mut active_preparation_tasks_peak = 0_usize;
+        let measure_preparation =
+            tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG);
 
         for observation in entries.iter().filter(|entry| entry.entry_kind == "FILE") {
             if cancellation.load(Ordering::Acquire) {
@@ -5265,6 +5442,7 @@ impl ScanJobService {
                 Some(baseline) if baseline.is_missing => "REAPPEARED",
                 Some(_) => "CHANGE",
             };
+            let classification_started = measure_preparation.then(Instant::now);
             let classification = if is_media {
                 Some(match library_kind {
                     "MOVIE" => {
@@ -5298,6 +5476,10 @@ impl ScanJobService {
             } else {
                 None
             };
+            if let Some(started) = classification_started {
+                classification_duration = classification_duration.saturating_add(started.elapsed());
+            }
+            classification_count = classification_count.saturating_add(1);
             let seed = ManifestPositiveIndexSeed {
                 relative_path: observation.relative_path.clone(),
                 delta_kind: delta_kind.to_owned(),
@@ -5310,6 +5492,7 @@ impl ScanJobService {
             let observed = observation.clone();
             let is_add = delta_kind == "ADD";
             preparation_tasks.spawn(async move {
+                let preparation_started = measure_preparation.then(Instant::now);
                 let preparation = prepare_manifest_observation(
                     ManifestFilePreparationContext {
                         scanner,
@@ -5325,8 +5508,16 @@ impl ScanJobService {
                     classification,
                 )
                 .await;
-                (seed, preparation)
+                let duration = preparation_started
+                    .map(|started| started.elapsed())
+                    .unwrap_or_default();
+                (seed, preparation, duration)
             });
+            preparation_count = preparation_count.saturating_add(1);
+            if preparation_tasks.len() > active_preparation_tasks_peak {
+                active_preparation_tasks_peak = preparation_tasks.len();
+                record_manifest_scan_activity(active_preparation_tasks_peak, 0);
+            }
 
             if preparation_tasks.len() >= preparation_concurrency {
                 let prepared = preparation_tasks
@@ -5340,6 +5531,7 @@ impl ScanJobService {
                         path: root_path.clone(),
                         source: std::io::Error::other(error.to_string()),
                     })?;
+                file_preparation_duration = file_preparation_duration.saturating_add(prepared.2);
                 match manifest_discovery_index_from_preparation(prepared.0, prepared.1) {
                     ManifestDiscoveryIndexPreparation::Indexed(index) => {
                         positive_indexes.push(index)
@@ -5360,6 +5552,7 @@ impl ScanJobService {
                 path: root_path.clone(),
                 source: std::io::Error::other(error.to_string()),
             })?;
+            file_preparation_duration = file_preparation_duration.saturating_add(prepared.2);
             match manifest_discovery_index_from_preparation(prepared.0, prepared.1) {
                 ManifestDiscoveryIndexPreparation::Indexed(index) => positive_indexes.push(index),
                 ManifestDiscoveryIndexPreparation::Unstable => {}
@@ -5369,6 +5562,20 @@ impl ScanJobService {
         if root_identity_lost {
             return Err(ScannerError::RootIdentityChanged(root_path));
         }
+        record_manifest_scan_stage_duration(
+            "positive_classification",
+            classification_duration,
+            classification_count,
+            classification_count,
+            0,
+        );
+        record_manifest_scan_stage_duration(
+            "positive_file_prepare",
+            file_preparation_duration,
+            preparation_count,
+            preparation_count,
+            0,
+        );
         if !positive_indexes.is_empty() {
             let observations_by_path = entries
                 .iter()
@@ -5404,6 +5611,13 @@ impl ScanJobService {
                 })
                 .collect();
         }
+        record_manifest_scan_stage(
+            "positive_prepare_wall",
+            preparation_started,
+            preparation_count,
+            preparation_count,
+            0,
+        );
         if tracing::enabled!(target: "lux::scan_performance", tracing::Level::DEBUG) {
             tracing::debug!(
                 target: "lux::scan_performance",
@@ -5476,6 +5690,7 @@ impl ScanJobService {
             }
             let open_root_path = root_path.clone();
             let open_relative_directory = relative_directory.clone();
+            let open_started = Instant::now();
             let mut reader = tokio::task::spawn_blocking(move || {
                 ManifestDirectoryReader::open(&open_root_path, &open_relative_directory)
             })
@@ -5484,6 +5699,8 @@ impl ScanJobService {
                 path: root_path.clone(),
                 source: std::io::Error::other(source.to_string()),
             })??;
+            record_manifest_scan_stage("directory_open", open_started, 1, 0, 1);
+            record_manifest_scan_activity(0, 1);
             let root_observation = reader.root_observation.clone();
             let directory_observation = reader.directory_observation.clone();
 
@@ -5491,6 +5708,7 @@ impl ScanJobService {
                 if cancellation.load(Ordering::Acquire) {
                     return Ok(None);
                 }
+                let read_started = Instant::now();
                 let (next_reader, batch) =
                     tokio::task::spawn_blocking(move || reader.next_batch(reader_batch_size))
                         .await
@@ -5499,6 +5717,32 @@ impl ScanJobService {
                             source: std::io::Error::other(source.to_string()),
                         })??;
                 reader = next_reader;
+                let batch_file_count = batch
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.entry_kind == "FILE")
+                    .count();
+                record_manifest_scan_stage(
+                    "directory_batch_total",
+                    read_started,
+                    u64::try_from(batch.entries.len()).unwrap_or(u64::MAX),
+                    u64::try_from(batch_file_count).unwrap_or(u64::MAX),
+                    u64::try_from(batch.child_directories.len()).unwrap_or(u64::MAX),
+                );
+                record_manifest_scan_stage_duration(
+                    "directory_readdir",
+                    batch.readdir_duration,
+                    u64::try_from(batch.readdir_entry_count).unwrap_or(u64::MAX),
+                    0,
+                    0,
+                );
+                record_manifest_scan_stage_duration(
+                    "directory_stat",
+                    batch.stat_duration,
+                    u64::try_from(batch.stat_entry_count).unwrap_or(u64::MAX),
+                    u64::try_from(batch_file_count).unwrap_or(u64::MAX),
+                    u64::try_from(batch.child_directories.len()).unwrap_or(u64::MAX),
+                );
                 if cancellation.load(Ordering::Acquire) {
                     return Ok(None);
                 }
@@ -5514,10 +5758,6 @@ impl ScanJobService {
                 child_directories.sort_unstable();
                 entries
                     .sort_unstable_by(|left, right| left.relative_path.cmp(&right.relative_path));
-                let batch_file_count = entries
-                    .iter()
-                    .filter(|entry| entry.entry_kind == "FILE")
-                    .count();
                 let next_entry_count = pending_entry_count.saturating_add(entries.len());
                 let next_file_count = pending_file_count.saturating_add(batch_file_count);
                 let next_child_count = pending_child_count.saturating_add(child_directories.len());
@@ -5621,6 +5861,7 @@ impl ScanJobService {
             .filter(|entry| entry.entry_kind == "FILE")
             .map(|entry| entry.relative_path.clone())
             .collect::<Vec<_>>();
+        let baseline_started = Instant::now();
         let baselines = if stream_files_during_discovery && !file_paths.is_empty() {
             self.database
                 .list_scan_manifest_filesystem_baselines(&root.id, &file_paths)
@@ -5628,6 +5869,13 @@ impl ScanJobService {
         } else {
             HashMap::new()
         };
+        record_manifest_scan_stage(
+            "baseline_query",
+            baseline_started,
+            u64::try_from(file_paths.len()).unwrap_or(u64::MAX),
+            u64::try_from(file_paths.len()).unwrap_or(u64::MAX),
+            0,
+        );
         let mut positive_indexes_by_chunk = Vec::with_capacity(chunks.len());
         let mut unchanged_paths_by_chunk = Vec::with_capacity(chunks.len());
         for chunk in chunks {
@@ -5947,12 +6195,22 @@ impl ScanJobService {
             .list_scan_manifest_directories(manifest_id, 1)
             .await?;
         if remaining.is_empty() {
+            let index_completion_started = Instant::now();
             let total = match self
                 .database
                 .finish_scan_manifest_discovery(manifest_id, &job.id)
                 .await
             {
-                Ok(total) => total,
+                Ok(total) => {
+                    record_manifest_scan_stage(
+                        "index_completion",
+                        index_completion_started,
+                        u64::try_from(total).unwrap_or(u64::MAX),
+                        u64::try_from(total).unwrap_or(u64::MAX),
+                        0,
+                    );
+                    total
+                }
                 Err(_error)
                     if self
                         .cancellation_requested(&job.id, false, cancellation)

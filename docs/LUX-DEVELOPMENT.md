@@ -6733,9 +6733,9 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 每一轮 60k SQLite/PostgreSQL 基准可以区分目录打开与枚举、基线读、文件准备、事务各写入段/commit 的累计时间与次数，并同时保留关键路径的墙钟时间。
-- [ ] 计时使用微秒、固定阶段名、测试/诊断低基数事件；阶段时长总和不得冒充墙钟时间，并明确表示并发阶段的累计耗时可能重叠。
-- [ ] 三轮结果记录硬件、fixture checksum、并发峰值、批次、SQL/DML、WAL、target、无变化重扫和前台 p95；不据单次异常值下结论。
+- [x] 每一轮 60k SQLite/PostgreSQL 基准可以区分目录打开与枚举、基线读、文件准备、事务各写入段/commit 的累计时间与次数，并同时保留关键路径的墙钟时间。
+- [x] 计时使用微秒、固定阶段名、测试/诊断低基数事件；阶段时长总和不得冒充墙钟时间，并明确表示并发阶段的累计耗时可能重叠。
+- [x] 三轮结果记录硬件、fixture checksum、并发峰值、批次、SQL/DML、WAL、target、无变化重扫和前台 p95；不据单次异常值下结论。
 
 验证：scoped `cargo test --locked --test performance query_counter_classifies_dml_statements_inside_common_table_expressions`、SQLite/PostgreSQL 各一次 60k 烟测、`cargo fmt --all -- --check`、Clippy。
 

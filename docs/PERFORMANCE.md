@@ -307,3 +307,55 @@ LUX-271 的扫描配置优先级和目录替换安全检查已保留；并行目
 - 每次性能优化记录硬件、数据集、命令、提交以及前后结果。
 - 记录中的路径、token、真实外部 URL 和用户数据必须脱敏。
 - SQL 热查询计划记录见 [`docs/SQL-AUDIT.md`](SQL-AUDIT.md)。
+### LUX-272 v3 全量扫描分阶段计时
+
+LUX-272 在 `lux_270_manifest_job_scan_benchmark` 的完整 `ScanJobService` 路径中采集固定阶段名、微秒累计耗时、调用数、p50/p95 和处理单元数。报告的 `manifestIndexMs`、`postprocessingTargetMaterializationMs`、`unchangedRescanMs` 与前台请求 p95 是墙钟指标；`manifestStageTimings`、`targetStageTimings` 和 `unchangedRescanStageTimings` 是分项累计时间。分项可能嵌套或并发重叠，不能相加当作墙钟时间。
+
+发现阶段分为 `directory_open`、`directory_readdir`、`directory_stat`、`directory_batch_total`、`baseline_query`、`positive_classification`、`positive_file_prepare` 和 `positive_file_recheck`。事务阶段分为输入校验、writer admission、Manifest 状态读取、目录 frontier 插入/完成、known-path 查询、root checkpoint、observation 插入、正向索引、presence ledger、Manifest/job 计数 checkpoint、commit 和事务总时间。`activePreparationTasksPeak` 与 `activeDirectoryReadersPeak` 取实测活动任务峰值；预算配置只作为背景值，不代替观测值。
+
+事件只包含固定阶段名、微秒、计数和批次规模，不包含媒体名、路径、用户数据或数据库连接信息。每次 60k 报告必须包含首扫阶段 JSON、target 物化阶段、无变化重扫阶段、扫描墙钟时间、前台 p95、SQL/DML、SQLite 锁等待或 PostgreSQL WAL/锁等待。此阶段只增加诊断，不改变扫描调度或数据库语义。
+
+验证命令（SQLite 与 PostgreSQL 各三轮 60k；每轮 PostgreSQL 使用新建空库）：
+
+```bash
+LUX_PERF_DISABLE_LOCK_MONITOR=1 \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+scripts/run-performance.sh
+
+LUX_PERF_BACKEND=postgres \
+LUX_PERF_FILE_COUNT=60000 \
+LUX_PERF_TEST_FILTER=lux_270_manifest_job_scan_benchmark \
+POSTGRES_TEST_HOST=127.0.0.1 \
+POSTGRES_TEST_PORT=55432 \
+POSTGRES_TEST_DATABASE=your_disposable_empty_database \
+POSTGRES_TEST_USER=your_test_user \
+scripts/run-performance.sh
+```
+
+2026-09-26 使用 Apple M4 / 16 GiB（`uname -m=arm64`，Rust 1.97.1），release 构建提交 `32b28d6a`。固定 fixture 为 60,000 个文件 / 600 个目录，SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`。SQLite 关闭 lock canary；PostgreSQL 16 使用本机一次性容器并启用 `pg_stat_activity` lock sampler。数据只代表本机 ARM64，不外推 NAS/x86_64。
+
+| 后端 | 首扫索引完成：三轮 / 中位数 | 扫描批次；batch p50 / p95 中位数 | 正向准备 / 正向提交墙钟累计中位数 | target 物化 / 无变化重扫中位数 | 前台 p95 / 目录列表 p95 中位数 | SQL / DML 中位数 | WAL / 锁采样 |
+|---|---:|---:|---:|---:|---:|---:|---|
+| SQLite | 2.058 / 2.009 / 2.178 s；**2.058 s** | 13；208 / 264 ms | 523 / 1,208 ms | 546 / 961 ms | 259 / 383 ms | 675 / 209 | canary 关闭 |
+| PostgreSQL 16 | 19.059 / 10.472 / 10.368 s；**10.472 s** | 13；835 / 2,036 ms | 411 / 7,365 ms | 2,523 / 5,145 ms | 281 / 685 ms | 694 / 209 | WAL 216,506,975 bytes；385 个锁等待采样，中位轮观察最大 waiter 数为 0 |
+
+下表是三轮每轮阶段累计微秒的中位数。`directory_batch_total` 包括 reader 批次开销，readdir/stat 是其内部拆分；同理事务总时间包含内部 SQL 阶段，不能把这些行相加成墙钟时间。
+
+| 阶段（累计微秒） | SQLite | PostgreSQL 16 |
+|---|---:|---:|
+| directory open | 39,790 | 66,485 |
+| readdir | 11,919 | 19,425 |
+| stat | 61,034 | 92,844 |
+| directory batch total | 108,250 | 169,312 |
+| baseline query | 17,397 | 2,128,641 |
+| positive classification | 318,442 | 317,933 |
+| positive file preparation | 770,302 | 788,440 |
+| positive file recheck | 120,280 | 153,753 |
+| positive index apply | 950,342 | 6,458,998 |
+| presence ledger | 5,895 | 21,658 |
+| transaction begin | 445 | 4,090 |
+| transaction commit call | 218,952 | 75,649 |
+| transaction total | 1,206,315 | 7,384,819 |
+
+六轮的活动峰值均为 9 个文件准备任务、1 个目录 reader；这测量的是当前实际代码，暂未启用双目录读前。PostgreSQL `baseline_query` 三轮为 10.360 / 1.103 / 2.129 s，缓存和运行抖动明显；正向索引事务 `positive_index_apply` 中位数为 6.459 s，是当前 PG 主要成本之一。相较 LUX-270 的 SQLite 2.018 s / PostgreSQL 9.657 s 参考中位数，本次诊断版本为 2.058 s / 10.472 s，尚未通过阶段性能目标。
