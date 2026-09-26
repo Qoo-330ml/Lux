@@ -753,9 +753,10 @@ impl Database {
             .query(
                 "INSERT INTO scan_manifests (
                      id, job_id, library_id, state, workflow_version,
-                     discovery_format_version, root_count, postprocessing_targets_ready
+                     discovery_format_version, discovery_mode, root_count,
+                     postprocessing_targets_ready
                  )
-                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', 2, 3, ?, 0
+                 SELECT ?, sj.id, sj.library_id, 'DISCOVERING', 2, 3, 'LITE', ?, 0
                  FROM scan_jobs sj
                  WHERE sj.id = ? AND sj.library_id = ?
                    AND sj.job_type = 'RECONCILE_LIBRARY' AND sj.status = 'PENDING'",
@@ -938,6 +939,7 @@ impl Database {
     ) -> Result<Option<StoredScanManifest>, StorageError> {
         self.query(
             "SELECT id, job_id, library_id, state, workflow_version, discovery_format_version,
+                    discovery_mode,
                     root_count,
                     discovered_directory_count, completed_directory_count,
                     observed_file_count, unchanged_count, add_count, change_count, remove_count,
@@ -955,6 +957,7 @@ impl Database {
                 state: row.get("state"),
                 workflow_version: row.get("workflow_version"),
                 discovery_format_version: row.get("discovery_format_version"),
+                discovery_mode: row.get("discovery_mode"),
                 root_count: row.get("root_count"),
                 discovered_directory_count: row.get("discovered_directory_count"),
                 completed_directory_count: row.get("completed_directory_count"),
@@ -981,6 +984,7 @@ impl Database {
     ) -> Result<Option<StoredScanManifest>, StorageError> {
         self.query(
             "SELECT id, job_id, library_id, state, workflow_version, discovery_format_version,
+                    discovery_mode,
                     root_count,
                     discovered_directory_count, completed_directory_count,
                     observed_file_count, unchanged_count, add_count, change_count, remove_count,
@@ -998,6 +1002,7 @@ impl Database {
                 state: row.get("state"),
                 workflow_version: row.get("workflow_version"),
                 discovery_format_version: row.get("discovery_format_version"),
+                discovery_mode: row.get("discovery_mode"),
                 root_count: row.get("root_count"),
                 discovered_directory_count: row.get("discovered_directory_count"),
                 completed_directory_count: row.get("completed_directory_count"),

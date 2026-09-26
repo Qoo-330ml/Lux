@@ -1337,6 +1337,7 @@ pub(crate) struct StoredScanManifest {
     pub(crate) state: String,
     pub(crate) workflow_version: i64,
     pub(crate) discovery_format_version: i64,
+    pub(crate) discovery_mode: String,
     pub(crate) root_count: i64,
     pub(crate) discovered_directory_count: i64,
     pub(crate) completed_directory_count: i64,

@@ -1198,6 +1198,12 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
 
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
+    let discovery_mode: String =
+        sqlx::query_scalar("SELECT discovery_mode FROM scan_manifests WHERE job_id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(discovery_mode, "LITE");
     let workflow_version: i64 =
         sqlx::query_scalar("SELECT workflow_version FROM scan_manifests WHERE job_id = ?")
             .bind(&job.id)
