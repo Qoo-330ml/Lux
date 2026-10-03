@@ -212,6 +212,12 @@ pub struct AppState {
 }
 
 impl AppState {
+    pub async fn shutdown_background_workers(&self) {
+        if let Some(metadata_reidentify) = &self.metadata_reidentify {
+            metadata_reidentify.shutdown().await;
+        }
+    }
+
     pub fn ready(
         config: Config,
         database: Database,

@@ -177,6 +177,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let listener = TcpListener::bind(config.http_addr).await?;
     info!(address = %config.http_addr, version = luxd::VERSION, "luxd listening");
     app_state.start_database_diagnostics().await;
+    let shutdown_state = app_state.clone();
     let app = app_with_state(app_state);
 
     let serve_result = axum::serve(
@@ -187,12 +188,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         control_rx,
         control_tx.clone(),
         shutdown_tx.clone(),
+        shutdown_state.clone(),
     ))
     .await;
     let _ = shutdown_tx.send(true);
     let _ = discovery_task.await;
     serve_result?;
     let shutdown_reason = *control_tx.borrow();
+    shutdown_state.shutdown_background_workers().await;
 
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
@@ -216,6 +219,7 @@ async fn shutdown_signal(
     mut control_rx: watch::Receiver<ShutdownReason>,
     control_tx: watch::Sender<ShutdownReason>,
     shutdown: watch::Sender<bool>,
+    app_state: AppState,
 ) {
     let ctrl_c = async {
         if let Err(error) = tokio::signal::ctrl_c().await {
@@ -263,6 +267,7 @@ async fn shutdown_signal(
         }
     }
 
+    app_state.shutdown_background_workers().await;
     let _ = shutdown.send(true);
 }
 

@@ -157,6 +157,10 @@ impl Drop for MetadataJobOwnerGuard {
 }
 
 impl MetadataReidentifyService {
+    pub(crate) async fn shutdown(&self) {
+        self.actor_enrichment.shutdown().await;
+    }
+
     pub fn new<T>(database: Database, scraper: T) -> Self
     where
         T: Into<ScraperProvider>,
@@ -422,11 +426,7 @@ impl MetadataReidentifyService {
             .enqueue(item_id, candidate_id, selection.clone(), scraper)
             .await
         {
-            tracing::warn!(
-                item_id,
-                candidate_id,
-                "actor metadata enrichment queue is full"
-            );
+            return Err(MetadataReidentifyError::SelectionUnavailable);
         }
         Ok(())
     }
@@ -1349,11 +1349,7 @@ impl MetadataReidentifyService {
             .enqueue(item_id, &candidate.id, selection.clone(), provider.clone())
             .await
         {
-            tracing::warn!(
-                item_id,
-                candidate_id = %candidate.id,
-                "actor metadata enrichment queue is full"
-            );
+            return Err(MetadataReidentifyError::SelectionUnavailable);
         }
         let candidate_count = candidate_count_for_page(&page);
         Ok(if needs_review {
