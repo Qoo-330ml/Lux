@@ -8560,6 +8560,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-06）：两处去重查询都将近 1 小时内 DEFERRED job 中 `FAILED/SCRAPER_UNAVAILABLE` item 作为已有工作；普通失败仍能立即重新排队，provider-unavailable 超过一小时后也可重新排队。SQLite storage 回归分别覆盖扫描 completeness 调度和通用 FILL_MISSING 创建入口，原子事务、queued job 合并与既有 active dedup 保持不变。两条定向测试、build、fmt、全目标全 feature Clippy 和差异检查通过。全目标测试的 lib 部分为 732 passed、11 ignored，随后在既有无关 `tests/emby_counts.rs:159` 失败（viewer 无剧集库访问权限时实际计数 1，预期 0）；本任务未改该行为。未部署 FNOS，也未测生产 CPU/队列创建率。
 
+#### LUX-398：校准 Compose 扫描并发注释
+
+范围：README 的 Compose 环境变量注释把索引默认值写成 8，但 Docker 镜像、Compose 与配置代码的默认值均为 2。将注释改为实际的 2/8/2；不改变运行配置、并发算法或环境变量。
+
+验收：
+
+- [x] README 中索引、ffprobe、ffmpeg 的注释值与 Dockerfile、Compose 和配置代码默认值一致。
+- [x] 文档差异检查通过；本任务不涉及运行时行为，不运行 Cargo 测试。
+
+文件：`README.md`、`docs/LUX-DEVELOPMENT.md`。
+
+结果（2026-10-06）：Compose 注释已改为索引、ffprobe、ffmpeg 默认并发 `2/8/2`，与 Dockerfile、Compose、Rust 配置常量及相邻说明一致。`git diff --check` 通过；仅改文档，未运行 Cargo 测试。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

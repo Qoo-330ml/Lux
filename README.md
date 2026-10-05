@@ -72,7 +72,7 @@ services:
     image: pdzhou/lux:latest
     container_name: lux
     environment:
-      # Indexing, ffprobe, and ffmpeg defaults are 8, 8, and 2.
+      # Indexing, ffprobe, and ffmpeg defaults are 2, 8, and 2.
       LUX_SCAN_CONCURRENCY: ${LUX_SCAN_CONCURRENCY:-2}
       LUX_PROBE_CONCURRENCY: ${LUX_PROBE_CONCURRENCY:-8}
       LUX_FFMPEG_CONCURRENCY: ${LUX_FFMPEG_CONCURRENCY:-2}
