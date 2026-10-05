@@ -5337,24 +5337,41 @@ pub(crate) async fn admin_health_payload(state: &AppState) -> Result<Value, Stat
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
     let resources = state.resources.snapshot().await;
-    let database_writable = database.probe_write().await.is_ok();
     let database_pool = database.pool_snapshot();
-    let config_available = match state.config_dir.as_deref() {
-        Some(path) => fs::metadata(path)
-            .await
-            .map(|metadata| metadata.is_dir())
-            .unwrap_or(false),
-        None => false,
-    };
-    let config_writable = match state.config_dir.as_deref() {
-        Some(path) if config_available => probe_directory_writable(path).await,
-        _ => false,
-    };
-    let ffprobe_available = Command::new("ffprobe")
-        .arg("-version")
-        .output()
-        .await
-        .is_ok_and(|output| output.status.success());
+    let probes = state
+        .admin_health_probe_cache
+        .get_or_probe(|| async {
+            let database_writable = database.probe_write().await.is_ok();
+            let config_available = match state.config_dir.as_deref() {
+                Some(path) => fs::metadata(path)
+                    .await
+                    .map(|metadata| metadata.is_dir())
+                    .unwrap_or(false),
+                None => false,
+            };
+            let config_writable = match state.config_dir.as_deref() {
+                Some(path) if config_available => probe_directory_writable(path).await,
+                _ => false,
+            };
+            let ffprobe_available = Command::new("ffprobe")
+                .arg("-version")
+                .output()
+                .await
+                .is_ok_and(|output| output.status.success());
+            AdminHealthProbeSnapshot {
+                database_writable,
+                config_available,
+                config_writable,
+                ffprobe_available,
+            }
+        })
+        .await;
+    let AdminHealthProbeSnapshot {
+        database_writable,
+        config_available,
+        config_writable,
+        ffprobe_available,
+    } = probes;
     let libraries = match state.libraries.as_ref() {
         Some(libraries) => match libraries.list_libraries().await {
             Ok(views) => views

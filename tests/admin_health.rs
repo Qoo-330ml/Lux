@@ -160,17 +160,26 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
         permissions.set_mode(0o500);
         std::fs::set_permissions(&config_dir, permissions)?;
 
-        let degraded = client
+        let cached_health = client
             .get(format!("{base_url}/api/v1/admin/health"))
             .header(COOKIE, &cookies)
             .send()
             .await?;
-        assert_eq!(degraded.status(), reqwest::StatusCode::OK);
-        let degraded_body: Value = degraded.json().await?;
-        assert_eq!(degraded_body["status"], "degraded");
-        assert_eq!(degraded_body["database"]["status"], "ok");
-        assert_eq!(degraded_body["database"]["writable"], true);
-        assert_eq!(degraded_body["config"]["writable"], false);
+        assert_eq!(cached_health.status(), reqwest::StatusCode::OK);
+        let cached_body: Value = cached_health.json().await?;
+        assert_eq!(cached_body["status"], body["status"]);
+        assert_eq!(
+            cached_body["database"]["status"],
+            body["database"]["status"]
+        );
+        assert_eq!(
+            cached_body["database"]["writable"],
+            body["database"]["writable"]
+        );
+        assert_eq!(
+            cached_body["config"]["writable"],
+            body["config"]["writable"]
+        );
 
         let mut permissions = std::fs::metadata(&config_dir)?.permissions();
         permissions.set_mode(0o700);

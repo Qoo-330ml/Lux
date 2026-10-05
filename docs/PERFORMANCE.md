@@ -1452,3 +1452,9 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 FNOS 上运行的 `pdzhou/lux:test` revision `bd32e0d`，PostgreSQL `scan_jobs` 约有 25.7 万行。旧的 `SUM(CASE...)` 单条查询使用并行顺序扫描，单次测量约 155 ms、读取 8,722 个 shared buffers；把活动状态单独统计时，现有活动部分索引的测量约 0.11 ms，而失败状态仍需要全表扫描。该基线来自线上旧版本，只描述当时查询成本。
 
 当前变更将活动计数与失败计数拆开，并新增 `status = 'FAILED'` 的部分索引。SQLite 定向回归使用空库迁移和 4 条固定状态记录验证计数，并由 `EXPLAIN QUERY PLAN` 确认活动/失败查询使用各自的部分索引。验证命令为 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib scan_job_status_counts_use_covering_status_indexes`；开发机架构为 `arm64`。测试没有记录 SQLite 查询耗时；PostgreSQL 新迁移也未在 FNOS 部署或做线上复测，因此目前没有可报告的生产优化后收益。
+
+### LUX-396 管理健康探测调用频率估算
+
+管理员 dashboard 每 15 秒刷新一次；每个健康 payload 的低频探测包含一次数据库写探针、配置目录可用性/可写性检查（包括写入并 `fsync` 4 KiB 临时文件）和一次 `ffprobe -version` 子进程。若每次刷新都重新探测，单个持续打开的 dashboard 每分钟会触发约 4 组此类探测；按 AppState 合并并发请求并缓存 30 秒后，持续请求时约为每分钟 2 组，静态调用频率估算下降 50%。缓存仅在请求到达时刷新；CPU、连接池、任务计数、媒体库信息等动态字段仍逐请求读取。
+
+该估算来自前端刷新间隔和服务端调用结构，不是运行时计数或 CPU 基准；没有据此推断 FNOS CPU、API 时延、PostgreSQL 或 NAS 性能收益。`/health/ready` 保留实时数据库写探针。

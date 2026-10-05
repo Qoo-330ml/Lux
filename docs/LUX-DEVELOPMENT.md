@@ -8529,6 +8529,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-06）：管理健康计数从一次历史表条件聚合改为两个可由状态部分索引覆盖的 `COUNT(*)` 子查询；新增 SQLite/PostgreSQL `FAILED` 部分索引，schema 版本为 162。SQLite 空库迁移、计数与 `EXPLAIN QUERY PLAN` 单测通过；`admin_health`、dashboard、ready/version、storage 目标通过，storage 47 项全过；scanner 17 项、danmaku 7 项、scanning_jobs 80 项通过。全量 `cargo test --locked --all-targets` 的库测试为 729 passed、11 ignored；随后在既有无关 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）。`scanning_jobs` 全目标中另有一个用例并行运行时超时，单独串行复跑通过。Build、fmt、all-target Clippy 和 `git diff --check` 通过。本机没有 PostgreSQL 服务，Docker daemon 未启动，PostgreSQL 迁移未做运行时验证；FNOS 上仍是旧 revision，未部署、未测生产收益。
 
+#### LUX-396：合并短周期管理健康探测
+
+范围：管理员 dashboard 每 15 秒刷新；每次健康 payload 都会提交一次数据库探针写入、创建并 fsync 4 KB 临时文件，再启动 `ffprobe -version`。将这三项低频诊断结果按 AppState 缓存 30 秒，并合并并发刷新；`/health/ready` 继续执行实时数据库写探测，CPU、连接池、任务计数、媒体库等动态字段继续逐请求读取。
+
+验收：
+
+- [x] 同一状态缓存有效期内，多个健康/dashboard 请求只执行一次数据库、配置目录与 ffprobe 探测；缓存过期后重新探测。
+- [x] admin health/dashboard JSON 字段与降级映射保持不变；`/health/ready` 不使用缓存。
+- [x] 回归覆盖 TTL 命中、过期刷新和并发请求合并；管理健康、dashboard、ready/version 定向测试通过。
+- [x] build、fmt、all-target Clippy 和差异检查通过；全量测试独立失败已如实记录。
+- [x] 性能记录注明 dashboard 的 15 秒轮询与 30 秒探测缓存；不将调用次数变化推断成 FNOS CPU 或时延收益。
+
+预计文件：`src/api/legacy.rs`、`src/api/admin_handlers.rs`、`tests/admin_health.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。缓存测试与 AppState 状态定义同文件。先写 TTL 命中/过期/并发合并测试，再接入健康数据构建。
+
+结果（2026-10-06）：AppState 共享同一个 30 秒探测快照；对并发请求合并数据库写探针、配置目录读写检查与 `ffprobe -version`，TTL 从探测完成时起算；CPU、连接池、任务计数和库状态仍实时生成，`/health/ready` 继续实时检查写能力。缓存 TTL/过期合并/锁等待过期/探测耗时单测 3 项通过；`admin_health`、`admin_dashboard`、`ready_version` 共 4 项通过。`cargo build --locked`、`cargo fmt --all -- --check`、all-target/all-features Clippy 与 `git diff --check` 通过。`cargo test --locked --all-targets` 库测试 732 passed、11 ignored，随后在既有独立 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）；此前 LUX-395 也观察到此失败，本任务未改动计数访问范围。性能记录仅按 dashboard 15 秒轮询/探测 30 秒 TTL 估算调用频率，未部署 FNOS，也未测 CPU、NAS 或 API 时延收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
