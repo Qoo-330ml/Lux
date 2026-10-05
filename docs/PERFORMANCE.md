@@ -1440,3 +1440,9 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 ### LUX-393 插件卸载刮削器计数回归校准
 
 后续合并后的卸载路径在同一双媒体库 fixture 中固定执行 6 次 storage query-wrapper 调用：配置读取、批量删除、批量重插、批量主刮削器更新、插件引用清理和插件记录删除。旧回归中的 8 次期望与当前实现不符，已按当前 fixture 更新为 6 次；无运行时代码变化。
+
+### LUX-394 自动 FILL_MISSING 可选详情门槛
+
+本地扫描完整度计划仍记录缺失的 `EXTERNAL_IDS` 和 `TRAILERS`，但二者单独缺失不再被当作自动 FILL_MISSING 的排队理由；核心 metadata、启用图片或 credits 仍会触发任务，任务触发后仍可顺带获取这两类详情。显式 metadata 任务继续使用通用 request plan。
+
+回归使用固定的单电影 `StoredMediaMetadata` 测试对象验证仅缺 external IDs 与 trailer 时自动计划不可排队、缺少 credits 时仍可排队，且通用计划仍识别 optional 能力。该测试只证明本地计划决策，不测 SQL 调用、任务墙钟或生产 CPU；未据此推断 FNOS、PostgreSQL 或 NAS 收益。

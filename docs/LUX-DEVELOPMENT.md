@@ -8496,6 +8496,23 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-05）：插件卸载 storage 回归通过；双媒体库 fixture 固定为 6 次 query-wrapper 调用，插件卸载实现和 schema 均未变。
 
+#### LUX-394：避免自动补缺仅因可选 provider 详情重复排队
+
+范围：本地扫描完整度计划继续记录缺失的 `EXTERNAL_IDS` 和 `TRAILERS`，但二者单独缺失不启动自动 `FILL_MISSING`。核心 metadata、已启用图片或 credits 缺失仍可排队；这些必要能力触发任务时允许顺带补充外部 ID 和预告片。显式 metadata 任务保持通用 request plan，并且 optional-only 项不额外读取 capability attempt 状态来决定自动排队。
+
+验收：
+
+- [x] 仅缺 `EXTERNAL_IDS` / `TRAILERS` 时自动完整度计划不可排队；核心 metadata、图片或 credits 缺失仍可排队。
+- [x] 显式 `FILL_MISSING` / `FULL_REFRESH` 计划仍包含其原有能力，不改变人工请求行为。
+- [x] 定向 metadata selection、NFO writer 和 `cargo build --locked` 通过。
+- [ ] 全目标 Rust 测试全绿：并行运行中的字幕/HLS 超时在逐项串行复跑时通过；串行全量运行复现无关的 `tests/emby_counts.rs:159` 失败，viewer 无剧集库权限时仍得到 `SeriesCount = 1`。
+- [x] fmt、全目标全 feature Clippy 与差异检查通过。
+- [x] 性能记录只描述计划资格与 attempt 状态读取边界，不推断 FNOS CPU 收益。
+
+文件：`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-06）：固定电影 metadata 测试对象先复现旧逻辑会把 optional-only 计划标记为可排队，再验证仅缺外部 ID/预告片不会启动自动补缺、credits 缺失仍会触发，且通用 metadata request plan 未改变。定向计划单测、`metadata_selection`（31 项）、`nfo_writer`（26 项）和 `cargo build --locked` 通过。并行全目标运行出现的 5 个字幕/HLS 超时逐项串行复跑通过；串行全目标运行则发现无关的 Emby 计数访问范围失败（`tests/emby_counts.rs:159`，实际 1、期望 0），因此全量 Rust 测试门未通过，本任务没有修改该独立行为。未据本地测试推断服务器性能收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

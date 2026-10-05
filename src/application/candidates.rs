@@ -226,6 +226,12 @@ fn metadata_request_plan_has_work(plan: MetadataRequestPlan) -> bool {
         || plan.needs_trailers
 }
 
+fn automatic_fill_missing_plan_has_work(plan: MetadataRequestPlan) -> bool {
+    // Optional provider extras are collected when real fill work runs, but do not
+    // start an automatic scan job by themselves.
+    plan.needs_metadata || plan.needs_images || plan.needs_credits
+}
+
 fn missing_image_mask(image_types: &[&str], local_image_types: &BTreeSet<String>) -> u16 {
     image_types.iter().fold(0_u16, |mask, image_type| {
         if local_image_types.contains(*image_type) {
@@ -317,7 +323,7 @@ fn local_metadata_completeness_plan(
             requestable_plan,
         ),
         capabilities: completeness_capabilities(current, actual_plan),
-        has_requestable_capability: metadata_request_plan_has_work(requestable_plan),
+        has_requestable_capability: automatic_fill_missing_plan_has_work(requestable_plan),
     })
 }
 
@@ -2383,7 +2389,7 @@ impl MetadataSelectionService {
                 )
                 .await?;
             let should_read_attempt_state =
-                capability_identity.is_some() && metadata_request_plan_has_work(actual_plan);
+                capability_identity.is_some() && automatic_fill_missing_plan_has_work(actual_plan);
             if should_read_attempt_state {
                 attempt_item_ids.push((*item_id).to_owned());
             }
@@ -4167,8 +4173,8 @@ mod tests {
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_actors,
         generic_candidate_images, image_attempt_identities, local_metadata_completeness_plan,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
-        metadata_match_score, metadata_request_plan, parse_image_selection_policy,
-        selected_scraper_provider_id,
+        metadata_match_score, metadata_request_plan, metadata_request_plan_has_work,
+        parse_image_selection_policy, selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
@@ -4511,7 +4517,75 @@ mod tests {
         assert!(!plan.needs_trailers);
         // Existing items are not re-scraped solely because their local NFO lacks
         // optional rich fields. A user-triggered full refresh still uses the full plan.
-        assert!(MetadataRequestPlan::full().needs_metadata);
+        let explicit_full_plan = MetadataRequestPlan::full();
+        assert!(explicit_full_plan.needs_metadata);
+        assert!(explicit_full_plan.needs_external_ids);
+        assert!(explicit_full_plan.needs_trailers);
+
+        let complete_provider_ids = current.provider_ids_json.clone();
+        current.provider_ids_json = Some(json!({"tmdb": "1"}).to_string());
+        let optional_details = crate::application::nfo::LocalNfoDetails {
+            directors: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "Director".to_owned(),
+            }],
+            writers: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "writer-1".to_owned(),
+                name: "Writer".to_owned(),
+            }],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
+        assert!(optional_details.tagline.is_none());
+        assert!(optional_details.website.is_none());
+        assert!(optional_details.certification.is_none());
+        assert!(optional_details.countries.is_empty());
+        assert!(optional_details.genres.is_empty());
+        assert!(optional_details.studios.is_empty());
+        let optional_details_plan =
+            metadata_request_plan(&current, false, false, Some(&optional_details));
+        assert!(!optional_details_plan.needs_metadata);
+        assert!(optional_details_plan.needs_external_ids);
+        assert!(optional_details_plan.needs_trailers);
+        assert!(metadata_request_plan_has_work(optional_details_plan));
+        let optional_details_completeness = local_metadata_completeness_plan(
+            "movie-1",
+            &current,
+            optional_details_plan,
+            optional_details_plan,
+        )
+        .expect("movie completeness plan is supported");
+        assert!(
+            !optional_details_completeness.has_requestable_capability,
+            "optional trailers and external IDs must not alone enqueue automatic FILL_MISSING"
+        );
+        assert!(
+            optional_details_completeness
+                .capabilities
+                .contains(&("EXTERNAL_IDS".to_owned(), true))
+        );
+        assert!(
+            optional_details_completeness
+                .capabilities
+                .contains(&("TRAILERS".to_owned(), true))
+        );
+        let required_work_completeness = local_metadata_completeness_plan(
+            "movie-1",
+            &current,
+            MetadataRequestPlan {
+                needs_credits: true,
+                ..optional_details_plan
+            },
+            MetadataRequestPlan {
+                needs_credits: true,
+                ..optional_details_plan
+            },
+        )
+        .expect("movie completeness plan is supported");
+        assert!(
+            required_work_completeness.has_requestable_capability,
+            "optional provider extras may accompany required automatic fill work"
+        );
+        current.provider_ids_json = complete_provider_ids;
 
         let poster_index = SCRAPER_IMAGE_TYPES
             .iter()
