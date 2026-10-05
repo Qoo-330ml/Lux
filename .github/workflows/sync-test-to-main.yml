@@ -18,6 +18,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       updated: ${{ steps.sync.outputs.updated }}
+      revision: ${{ steps.sync.outputs.revision }}
 
     steps:
       - name: Check out main
@@ -45,10 +46,13 @@ jobs:
           git merge --no-ff --no-edit origin/test
           git push origin HEAD:main
           echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   publish:
     name: Publish latest from main
     needs: sync
     if: needs.sync.outputs.updated == 'true'
     uses: ./.github/workflows/dockerhub.yml
+    with:
+      source_sha: ${{ needs.sync.outputs.revision }}
     secrets: inherit

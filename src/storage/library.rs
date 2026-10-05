@@ -993,7 +993,8 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE library_cover_jobs
-             SET status = ?, error = ?, processed_count = CASE
+             SET status = ?, error = ?,
+                 processed_count = CASE
                     WHEN ? = 'COMPLETED' THEN total_count ELSE processed_count END,
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",

@@ -243,7 +243,7 @@ export function PlayerPage() {
   const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
   const bootstrapCapabilities = webPlaybackCapabilities(undefined, playbackAttempt);
   const playbackBootstrap = useQuery({
-    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt, requestedAudioStreamIndex),
+    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
     queryFn: ({ signal }) => api.createWebPlaybackBootstrap(
       itemId,
       requestedSourceId ?? undefined,
@@ -323,7 +323,7 @@ export function PlayerPage() {
   const playbackSessionIdRef = useRef<string | null>(null);
   const capabilities = webPlaybackCapabilities(source, playbackAttempt);
   const webPlaybackSession = useQuery({
-    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt, requestedAudioStreamIndex),
+    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
     queryFn: ({ signal }) => api.createWebPlaybackSession(
       itemId,
       source?.id ?? "",
@@ -456,6 +456,10 @@ export function PlayerPage() {
       if (state === "STOPPED") {
         return request
           .then(() => {
+            queryClient.removeQueries({
+              predicate: (query) => query.queryKey[0] === "web-playback-session"
+                && (query.state.data as { sessionId?: string } | undefined)?.sessionId === sessionId,
+            });
             void queryClient.invalidateQueries({ queryKey: queryKeys.home });
           })
           .catch(() => undefined);
@@ -469,8 +473,15 @@ export function PlayerPage() {
 
   const stopActiveSession = useCallback((sessionId: string | null, keepalive = false) => {
     if (!sessionId) return Promise.resolve();
-    return api.stopWebPlaybackSession(sessionId, keepalive).catch(() => undefined);
-  }, []);
+    return api.stopWebPlaybackSession(sessionId, keepalive)
+      .then(() => {
+        queryClient.removeQueries({
+          predicate: (query) => query.queryKey[0] === "web-playback-session"
+            && (query.state.data as { sessionId?: string } | undefined)?.sessionId === sessionId,
+        });
+      })
+      .catch(() => undefined);
+  }, [queryClient]);
 
   const requestServerFallback = useCallback(async (reason?: unknown) => {
     if (remoteHttpSource) {

@@ -3618,7 +3618,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE danmaku_match_jobs
-             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
         .bind(status)

@@ -41,7 +41,7 @@ export function MediaDetailPage() {
     enabled: Boolean(itemId),
     refetchInterval: queryRefreshIntervals.mediaSurface,
   });
-  const pendingItemsQueryKey = queryKeys.library(item.data?.libraryId ?? "", 1, undefined, "Name", "Ascending", "PENDING");
+  const pendingItemsQueryKey = queryKeys.library(item.data?.libraryId ?? "", 1, undefined, "Name", "Ascending", "PENDING", 100);
   const pendingItems = useQuery({
     queryKey: pendingItemsQueryKey,
     queryFn: () => api.libraryItems(item.data?.libraryId ?? "", 1, undefined, { metadataStatus: "PENDING", pageSize: 100 }),

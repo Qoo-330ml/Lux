@@ -28,7 +28,6 @@ function writeClientCookie(value, maxAge) {
 }
 
 export function readCsrfToken() {
-  if (inMemoryCsrfToken) return inMemoryCsrfToken;
   try {
     if (typeof localStorage !== "undefined") {
       const stored = localStorage.getItem(csrfTokenStorageKey);
@@ -37,6 +36,7 @@ export function readCsrfToken() {
   } catch {
     // Private browsing and restrictive storage policies must not break requests.
   }
+  if (inMemoryCsrfToken) return inMemoryCsrfToken;
   return readCookie(csrfCookie);
 }
 
