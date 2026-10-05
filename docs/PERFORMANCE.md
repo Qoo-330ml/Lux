@@ -1458,3 +1458,9 @@ FNOS 上运行的 `pdzhou/lux:test` revision `bd32e0d`，PostgreSQL `scan_jobs` 
 管理员 dashboard 每 15 秒刷新一次；每个健康 payload 的低频探测包含一次数据库写探针、配置目录可用性/可写性检查（包括写入并 `fsync` 4 KiB 临时文件）和一次 `ffprobe -version` 子进程。若每次刷新都重新探测，单个持续打开的 dashboard 每分钟会触发约 4 组此类探测；按 AppState 合并并发请求并缓存 30 秒后，持续请求时约为每分钟 2 组，静态调用频率估算下降 50%。缓存仅在请求到达时刷新；CPU、连接池、任务计数、媒体库信息等动态字段仍逐请求读取。
 
 该估算来自前端刷新间隔和服务端调用结构，不是运行时计数或 CPU 基准；没有据此推断 FNOS CPU、API 时延、PostgreSQL 或 NAS 性能收益。`/health/ready` 保留实时数据库写探针。
+
+### LUX-397 DEFERRED FILL_MISSING 去重边界
+
+provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 `FAILED/SCRAPER_UNAVAILABLE`。此前扫描 completeness 调度和通用 FILL_MISSING 创建入口虽限制 1 小时内的 DEFERRED job，但又只选取 `PENDING/RUNNING` item，导致 provider-unavailable item 实际不受该窗口去重。现在两处都将 1 小时内此错误分类的失败 item 纳入既有去重判断；其他失败可以立即重试，provider-unavailable item 超过窗口后也可重新排队。
+
+验证只覆盖固定 SQLite storage 状态机回归，确认两个入口的 enqueue/job 去重边界；没有比较运行时创建速率、provider 请求量、墙钟、FNOS CPU、PostgreSQL 或 NAS 性能，不据此推断生产收益。

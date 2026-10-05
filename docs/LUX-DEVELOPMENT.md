@@ -8545,6 +8545,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-06）：AppState 共享同一个 30 秒探测快照；对并发请求合并数据库写探针、配置目录读写检查与 `ffprobe -version`，TTL 从探测完成时起算；CPU、连接池、任务计数和库状态仍实时生成，`/health/ready` 继续实时检查写能力。缓存 TTL/过期合并/锁等待过期/探测耗时单测 3 项通过；`admin_health`、`admin_dashboard`、`ready_version` 共 4 项通过。`cargo build --locked`、`cargo fmt --all -- --check`、all-target/all-features Clippy 与 `git diff --check` 通过。`cargo test --locked --all-targets` 库测试 732 passed、11 ignored，随后在既有独立 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）；此前 LUX-395 也观察到此失败，本任务未改动计数访问范围。性能记录仅按 dashboard 15 秒轮询/探测 30 秒 TTL 估算调用频率，未部署 FNOS，也未测 CPU、NAS 或 API 时延收益。
 
+#### LUX-397：去重近期 provider-unavailable 的 FILL_MISSING 条目
+
+范围：扫描完整度调度和通用 `create_or_merge_fill_missing_job` 都只将 QUEUED/RUNNING job 中 PENDING/RUNNING 的 item 当作活动去重项。provider 暂时不可用时，job 会进入 DEFERRED，失败 item 会落为 `FAILED/SCRAPER_UNAVAILABLE`，因此现有 1 小时 DEFERRED 窗口没有实际抑制重复调度。两处查询都应将 1 小时内 DEFERRED job 中明确标记 `SCRAPER_UNAVAILABLE` 的 item 纳入去重；其他错误仍可重试，超过窗口仍可重新排队。保留 QUEUED/RUNNING 行为、跨库语义和任务 API。
+
+验收：
+
+- [x] completeness 扫描调度和通用 FILL_MISSING 创建入口都抑制 1 小时内 DEFERRED 且 `FAILED/SCRAPER_UNAVAILABLE` 的同一 item。
+- [x] 其他失败分类和超过 1 小时的 DEFERRED provider-unavailable item 仍可创建新任务。
+- [x] QUEUED/RUNNING 的活动去重、queued job 合并及原子保存 completeness 和调度意向行为保持不变。
+- [x] 相关 storage 回归、build、fmt、全目标全 feature Clippy 与差异检查通过；性能记录只说明去重状态覆盖，不外推 FNOS CPU 收益。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先扩展现有 SQLite storage 回归证明 FAILED provider item 当前会漏过去重，再更新两个查询条件。
+
+结果（2026-10-06）：两处去重查询都将近 1 小时内 DEFERRED job 中 `FAILED/SCRAPER_UNAVAILABLE` item 作为已有工作；普通失败仍能立即重新排队，provider-unavailable 超过一小时后也可重新排队。SQLite storage 回归分别覆盖扫描 completeness 调度和通用 FILL_MISSING 创建入口，原子事务、queued job 合并与既有 active dedup 保持不变。两条定向测试、build、fmt、全目标全 feature Clippy 和差异检查通过。全目标测试的 lib 部分为 732 passed、11 ignored，随后在既有无关 `tests/emby_counts.rs:159` 失败（viewer 无剧集库访问权限时实际计数 1，预期 0）；本任务未改该行为。未部署 FNOS，也未测生产 CPU/队列创建率。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

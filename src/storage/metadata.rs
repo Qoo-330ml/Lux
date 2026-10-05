@@ -418,7 +418,12 @@ impl Database {
                        AND (jobs.status <> 'DEFERRED'
                             OR jobs.updated_at >= unixepoch() - 3600)
                        AND jobs.cancel_requested = 0
-                       AND job_items.status IN ('PENDING', 'RUNNING')
+                       AND (
+                           job_items.status IN ('PENDING', 'RUNNING')
+                           OR (jobs.status = 'DEFERRED'
+                               AND job_items.status = 'FAILED'
+                               AND job_items.error = 'SCRAPER_UNAVAILABLE')
+                       )
                        AND job_items.item_id IN ({placeholders})"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));

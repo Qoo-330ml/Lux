@@ -3819,6 +3819,17 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     .execute(database.pool())
     .await
     .expect("defer the existing fill-missing job");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE item_id = ? AND job_id IN (
+             SELECT id FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'
+         )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("record provider-unavailable item result");
     let replayed_deferred_job = database
         .complete_local_metadata_and_enqueue_fill_missing_with_policy(
             &library_id,
@@ -4182,6 +4193,62 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .expect("read removed item completeness")
         .expect("removed item completeness row");
     assert_eq!(removed_completeness.local_state, "RUNNING");
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET error = 'METADATA_WRITE_FAILED'
+         WHERE item_id = ? AND status = 'FAILED'
+           AND job_id IN (
+               SELECT id FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'
+           )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("set a non-provider deferred error");
+    let retried_non_provider_failure = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            Some(true),
+        )
+        .await
+        .expect("allow retry after a non-provider failure");
+    assert_eq!(retried_non_provider_failure.scheduled_job_ids.len(), 1);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'DEFERRED', updated_at = unixepoch() - 3601
+         WHERE id IN (
+             SELECT job_id FROM metadata_reidentify_job_items WHERE item_id = ?
+         ) AND mode = 'FILL_MISSING'",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("age prior deferred fill-missing jobs");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE item_id = ? AND job_id IN (
+             SELECT id FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'
+         )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("restore provider failure after deferral window");
+    let retried_expired_provider_failure = database
+        .complete_local_metadata_and_enqueue_fill_missing_with_policy(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_ids[3]),
+            Some(true),
+        )
+        .await
+        .expect("allow retry after deferred deduplication expires");
+    assert_eq!(retried_expired_provider_failure.scheduled_job_ids.len(), 1);
 
     database.close().await;
 }
@@ -12839,6 +12906,67 @@ async fn fill_missing_job_creation_coalesces_active_items() -> Result<(), Box<dy
         .fetch_one(database.pool())
         .await?;
     assert_eq!(pending_items, 2);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs SET status = 'DEFERRED', updated_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&first_job)
+    .execute(database.pool())
+    .await
+    .expect("defer fill-missing job after provider failure");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("record deferred provider failure");
+    let repeated_deferred_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    assert_eq!(repeated_deferred_job, first_job);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET error = 'METADATA_WRITE_FAILED'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("change deferred error to a non-provider failure");
+    let retried_non_provider_failure = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    assert_ne!(retried_non_provider_failure, first_job);
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs SET status = 'DEFERRED', updated_at = unixepoch() - 3601
+         WHERE id = ?",
+    )
+    .bind(&retried_non_provider_failure)
+    .execute(database.pool())
+    .await
+    .expect("age deferred fill-missing job");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&retried_non_provider_failure)
+    .bind(&item_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("record old provider failure");
+    let retried_expired_deferred_job = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
+        .await?;
+    assert_ne!(retried_expired_deferred_job, retried_non_provider_failure);
     Ok(())
 }
 
