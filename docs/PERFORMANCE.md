@@ -1446,3 +1446,9 @@ STRM 截图成功后原实现对同一文件分别 upsert `POSTER`、`THUMB`，�
 本地扫描完整度计划仍记录缺失的 `EXTERNAL_IDS` 和 `TRAILERS`，但二者单独缺失不再被当作自动 FILL_MISSING 的排队理由；核心 metadata、启用图片或 credits 仍会触发任务，任务触发后仍可顺带获取这两类详情。显式 metadata 任务继续使用通用 request plan。
 
 回归使用固定的单电影 `StoredMediaMetadata` 测试对象验证仅缺 external IDs 与 trailer 时自动计划不可排队、缺少 credits 时仍可排队，且通用计划仍识别 optional 能力。该测试只证明本地计划决策，不测 SQL 调用、任务墙钟或生产 CPU；未据此推断 FNOS、PostgreSQL 或 NAS 收益。
+
+### LUX-395 管理健康扫描任务计数
+
+FNOS 上运行的 `pdzhou/lux:test` revision `bd32e0d`，PostgreSQL `scan_jobs` 约有 25.7 万行。旧的 `SUM(CASE...)` 单条查询使用并行顺序扫描，单次测量约 155 ms、读取 8,722 个 shared buffers；把活动状态单独统计时，现有活动部分索引的测量约 0.11 ms，而失败状态仍需要全表扫描。该基线来自线上旧版本，只描述当时查询成本。
+
+当前变更将活动计数与失败计数拆开，并新增 `status = 'FAILED'` 的部分索引。SQLite 定向回归使用空库迁移和 4 条固定状态记录验证计数，并由 `EXPLAIN QUERY PLAN` 确认活动/失败查询使用各自的部分索引。验证命令为 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib scan_job_status_counts_use_covering_status_indexes`；开发机架构为 `arm64`。测试没有记录 SQLite 查询耗时；PostgreSQL 新迁移也未在 FNOS 部署或做线上复测，因此目前没有可报告的生产优化后收益。

@@ -48,6 +48,26 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
     libraries
         .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
         .await?;
+    for (id, status) in [
+        ("health-pending", "PENDING"),
+        ("health-running", "RUNNING"),
+        ("health-failed", "FAILED"),
+        ("health-completed", "COMPLETED"),
+    ] {
+        let scan_library_name = format!("Health {id}");
+        let scan_library = libraries
+            .create_library(&scan_library_name, LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', ?, 'health-generation')",
+        )
+        .bind(id)
+        .bind(scan_library.id.to_string())
+        .bind(status)
+        .execute(database.pool())
+        .await?;
+    }
 
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -91,7 +111,9 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
             "degraded"
         }
     );
-    assert_eq!(body["schemaVersion"], 161);
+    assert_eq!(body["schemaVersion"], 162);
+    assert_eq!(body["jobs"]["scanRunning"], 2);
+    assert_eq!(body["jobs"]["scanFailed"], 1);
     assert_eq!(body["database"]["status"], "ok");
     assert_eq!(body["database"]["backend"], "SQLITE");
     assert_eq!(body["database"]["writable"], true);
@@ -119,7 +141,11 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
         body["resources"]["mediaStorage"]["source"],
         "container-filesystem"
     );
-    assert_eq!(body["libraries"][0]["rootCount"], 1);
+    let movies_library = body["libraries"]
+        .as_array()
+        .and_then(|libraries| libraries.iter().find(|library| library["name"] == "Movies"))
+        .ok_or("health response omitted the Movies library")?;
+    assert_eq!(movies_library["rootCount"], 1);
     assert!(body.get("configDir").is_none());
     let body_text = body.to_string();
     let config_path = temp_dir.path().to_string_lossy().into_owned();

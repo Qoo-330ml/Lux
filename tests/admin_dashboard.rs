@@ -214,6 +214,8 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["stats"]["seriesCount"], 1);
     assert_eq!(body["stats"]["userCount"], 1);
     assert!(body["health"]["runtime"]["seconds"].is_number());
+    assert_eq!(body["health"]["jobs"]["scanRunning"], 0);
+    assert_eq!(body["health"]["jobs"]["scanFailed"], 0);
     assert_eq!(body["health"]["resources"]["cpu"]["source"], "cgroup");
     assert!(
         body["health"]["resources"]["cpu"]

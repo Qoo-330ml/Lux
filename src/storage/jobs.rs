@@ -9552,15 +9552,15 @@ impl Database {
     ) -> Result<StoredScanJobCounts, StorageError> {
         self.query(
             "SELECT
-                SUM(CASE WHEN status IN ('PENDING', 'RUNNING') THEN 1 ELSE 0 END) AS running,
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) AS failed
-             FROM scan_jobs",
+                (SELECT COUNT(*) FROM scan_jobs
+                 WHERE status IN ('PENDING', 'RUNNING')) AS running,
+                (SELECT COUNT(*) FROM scan_jobs WHERE status = 'FAILED') AS failed",
         )
         .fetch_one(&self.pool)
         .await
         .map(|row| StoredScanJobCounts {
-            running: row.get::<Option<i64>, _>("running").unwrap_or(0),
-            failed: row.get::<Option<i64>, _>("failed").unwrap_or(0),
+            running: row.get("running"),
+            failed: row.get("failed"),
         })
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
@@ -11414,6 +11414,7 @@ mod tests {
         prune_sidecar_directories, sidecar_target_query,
     };
     use crate::config::Config;
+    use sqlx::Row;
 
     #[tokio::test]
     async fn local_metadata_completeness_reuses_current_source_identities()
@@ -11572,6 +11573,76 @@ mod tests {
                 .is_empty(),
             "a source deleted after NFO processing cannot pass freshness validation"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_job_status_counts_use_covering_status_indexes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        for (id, job_type, status) in [
+            ("pending", "RECONCILE_LIBRARY", "PENDING"),
+            ("running", "INCREMENTAL_SCAN", "RUNNING"),
+            ("failed", "RECONCILE_LIBRARY", "FAILED"),
+            ("completed", "INCREMENTAL_SCAN", "COMPLETED"),
+        ] {
+            database
+                .query(
+                    "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+                     VALUES (?, 'lib', ?, ?, 'generation')",
+                )
+                .bind(id)
+                .bind(job_type)
+                .bind(status)
+                .execute(database.pool())
+                .await?;
+        }
+
+        let counts = database.count_scan_jobs_by_status().await?;
+        assert_eq!(counts.running, 2);
+        assert_eq!(counts.failed, 1);
+
+        let plan = database
+            .query(
+                "EXPLAIN QUERY PLAN
+                 SELECT (SELECT COUNT(*) FROM scan_jobs
+                         WHERE status IN ('PENDING', 'RUNNING')) AS running,
+                        (SELECT COUNT(*) FROM scan_jobs WHERE status = 'FAILED') AS failed",
+            )
+            .fetch_all(database.pool())
+            .await?;
+        let plan_details = plan
+            .iter()
+            .map(|row| row.get::<String, _>("detail"))
+            .collect::<Vec<_>>();
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_scan_jobs_activity")),
+            "active scan count should use its partial index: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .any(|detail| detail.contains("idx_scan_jobs_failed_count")),
+            "failed scan count should use its partial index: {plan_details:?}"
+        );
+        assert!(
+            plan_details
+                .iter()
+                .all(|detail| !detail.contains("idx_scan_jobs_library_status")),
+            "status counts must not scan the broad scan_jobs index: {plan_details:?}"
+        );
+        database.close().await;
         Ok(())
     }
 

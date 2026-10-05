@@ -8513,6 +8513,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-06）：固定电影 metadata 测试对象先复现旧逻辑会把 optional-only 计划标记为可排队，再验证仅缺外部 ID/预告片不会启动自动补缺、credits 缺失仍会触发，且通用 metadata request plan 未改变。定向计划单测、`metadata_selection`（31 项）、`nfo_writer`（26 项）和 `cargo build --locked` 通过。并行全目标运行出现的 5 个字幕/HLS 超时逐项串行复跑通过；串行全目标运行则发现无关的 Emby 计数访问范围失败（`tests/emby_counts.rs:159`，实际 1、期望 0），因此全量 Rust 测试门未通过，本任务没有修改该独立行为。未据本地测试推断服务器性能收益。
 
+#### LUX-395：按状态索引统计扫描任务
+
+范围：管理健康数据每次请求都用 `SUM(CASE...)` 聚合整个 `scan_jobs` 历史表。FNOS 只读执行计划显示该表约 25.7 万行；单次并行顺序扫描约 155 ms、读取 8,722 个 shared buffers。改为分别统计活动扫描和失败扫描，让二者都能通过部分索引计数；保持健康 API 字段和统计含义不变。
+
+验收：
+
+- [x] SQLite 与 PostgreSQL 都有仅覆盖 `FAILED` 任务的计数索引；SQLite 从空库迁移成功。
+- [x] 活动任务计数和失败任务计数使用各自匹配的部分索引；SQLite 回归检查查询计划且验证返回计数。
+- [x] `admin_health` / dashboard 的 `scanRunning`、`scanFailed` 字段合同不变。
+- [x] 定向 Rust 测试、build、fmt、Clippy 和差异检查通过；全目标 Rust 测试结果及已有独立失败如实记录。
+- [x] 性能记录区分 FNOS 基线执行计划与本地 SQLite 查询计划，不把未部署变更表述为生产收益。
+
+预计文件：`src/storage/jobs.rs`、`migrations/0162_scan_job_failed_count_index.sql`、`migrations-postgres/0162_scan_job_failed_count_index.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+结果（2026-10-06）：管理健康计数从一次历史表条件聚合改为两个可由状态部分索引覆盖的 `COUNT(*)` 子查询；新增 SQLite/PostgreSQL `FAILED` 部分索引，schema 版本为 162。SQLite 空库迁移、计数与 `EXPLAIN QUERY PLAN` 单测通过；`admin_health`、dashboard、ready/version、storage 目标通过，storage 47 项全过；scanner 17 项、danmaku 7 项、scanning_jobs 80 项通过。全量 `cargo test --locked --all-targets` 的库测试为 729 passed、11 ignored；随后在既有无关 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）。`scanning_jobs` 全目标中另有一个用例并行运行时超时，单独串行复跑通过。Build、fmt、all-target Clippy 和 `git diff --check` 通过。本机没有 PostgreSQL 服务，Docker daemon 未启动，PostgreSQL 迁移未做运行时验证；FNOS 上仍是旧 revision，未部署、未测生产收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
