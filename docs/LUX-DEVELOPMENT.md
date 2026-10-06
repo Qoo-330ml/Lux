@@ -8608,6 +8608,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 发布集成说明（2026-10-06，0.5.19）：保留 GitHub `test` 已发布的 `0162_filesystem_entry_directory_prefix_index.sql` 及全部历史迁移内容。LUX-395/LUX-401 尚未部署的迁移分别顺延为 0163/0164，同步双后端迁移列表、schema-version 断言和请求快照升级 fixture 的起始版本。上方测试结果对应功能分支原编号（162/163），不代表重新编号后的集成验证；本次按项目所有者要求不运行测试、构建或 lint，仅做 Git 差异、迁移编号/引用和合并保留检查。
 
+#### LUX-402：provider 不可用时对自动 FILL_MISSING 进行逐 item 退避
+
+范围：当前自动 `FILL_MISSING` 在 scraper/provider 不可用后将 job 置为 `DEFERRED`，并只依赖固定一小时去重窗口。对于持续不可用的 provider，周期扫描可能每小时再次创建相同 item 请求。为带自动请求快照的 job item 持久化退避次数和下次自动重试时间；同一 fingerprint/capability 快照在到期前去重，到期后由后续自动扫描重试。退避依次为 5 分钟、30 分钟、最多 6 小时。新请求快照不继承旧快照的退避；无快照的人工 job 不改变现有语义。管理员显式重试立即解除等待，但保留自动失败次数；取消任务不增加次数。
+
+验收：
+
+- [ ] SQLite/PostgreSQL migration 增加自动退避次数和到期时间；旧的自动 `DEFERRED/SCRAPER_UNAVAILABLE` item 升级后有安全的首次到期时间，历史任务状态和计数不变。
+- [ ] 同一请求快照在到期前不创建新 job；到期后可创建新 job，并继承该快照此前的失败次数。
+- [ ] 连续 provider 失败按 5 分钟、30 分钟、最多 6 小时退避；新 fingerprint/capability 不等待旧快照；人工 retry 可立即领取。
+- [ ] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
+- [ ] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在可用集成环境通过。
+
+短计划与文件：实现限定于 `migrations/0165_metadata_fill_missing_retry_backoff.sql`、`migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`。先添加红色状态机回归，再实现逐 item 退避、相同快照的跨 job 次数继承和到期去重，最后分别验证 SQLite 与 PostgreSQL 合同。本任务不改元数据 API DTO 或扫描并发策略。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
