@@ -19,9 +19,15 @@ struct ActiveFillMissingItem {
     job_id: String,
     job_status: String,
     item_status: String,
-    error: Option<String>,
     request_fingerprint: Option<Vec<u8>>,
     request_capabilities_json: String,
+}
+
+struct DeferredFillMissingRetryState {
+    automatic_retry_count: i64,
+    has_retry_deadline: bool,
+    retry_pending: bool,
+    recently_deferred: bool,
 }
 
 fn parse_scan_local_metadata_non_retryable_item_ids(
@@ -8505,6 +8511,7 @@ impl Database {
             return Ok(Vec::new());
         }
         let mut active_by_item = HashMap::with_capacity(requests.len());
+        let mut deferred_by_snapshot = HashMap::with_capacity(requests.len());
         let lock_clause = if self.backend == DatabaseBackend::Postgres {
             " FOR UPDATE OF jobs, job_items"
         } else {
@@ -8517,27 +8524,50 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", batch.len())
                 .collect::<Vec<_>>()
                 .join(", ");
+            let deferred_snapshot_predicates = batch
+                .iter()
+                .map(|request| {
+                    if request.input_fingerprint.is_some() {
+                        "(job_items.item_id = ? AND job_items.request_fingerprint = ? AND job_items.request_capabilities_json = ?)"
+                    } else {
+                        "(jobs.updated_at >= unixepoch() - 3600 AND job_items.item_id = ? AND job_items.request_fingerprint IS NULL AND job_items.request_capabilities_json = ?)"
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" OR ");
             let query = format!(
                 "SELECT jobs.id AS job_id, jobs.status AS job_status,
                         job_items.item_id, job_items.status AS item_status,
-                        job_items.error, job_items.request_fingerprint,
-                        job_items.request_capabilities_json
+                        job_items.request_fingerprint,
+                        job_items.request_capabilities_json,
+                        job_items.automatic_retry_count,
+                        CASE WHEN job_items.automatic_retry_after IS NULL
+                            THEN 0 ELSE 1 END AS has_retry_deadline,
+                        CASE WHEN job_items.automatic_retry_after > unixepoch()
+                            THEN 1 ELSE 0 END AS retry_pending,
+                        CASE WHEN jobs.updated_at >= unixepoch() - 3600
+                            THEN 1 ELSE 0 END AS recently_deferred
                  FROM metadata_reidentify_job_items job_items
                  JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
-                 WHERE jobs.mode = 'FILL_MISSING'
-                   AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
-                   AND jobs.cancel_requested = 0
-                   AND (
-                       (jobs.status = 'QUEUED'
-                        AND job_items.status IN ('PENDING', 'RUNNING', 'COMPLETED'))
-                       OR (jobs.status = 'RUNNING'
-                           AND job_items.status IN ('PENDING', 'RUNNING'))
-                       OR (jobs.status = 'DEFERRED'
-                           AND jobs.updated_at >= unixepoch() - 3600
-                           AND job_items.status = 'FAILED'
-                           AND job_items.error = 'SCRAPER_UNAVAILABLE')
-                   )
-                   AND job_items.item_id IN ({placeholders})
+                 WHERE (
+                     jobs.mode = 'FILL_MISSING'
+                     AND jobs.status IN ('QUEUED', 'RUNNING')
+                     AND jobs.cancel_requested = 0
+                     AND (
+                         (jobs.status = 'QUEUED'
+                          AND job_items.status IN ('PENDING', 'RUNNING', 'COMPLETED'))
+                         OR (jobs.status = 'RUNNING'
+                             AND job_items.status IN ('PENDING', 'RUNNING'))
+                     )
+                     AND job_items.item_id IN ({placeholders})
+                 ) OR (
+                     jobs.mode = 'FILL_MISSING'
+                     AND jobs.status = 'DEFERRED'
+                     AND jobs.cancel_requested = 0
+                     AND job_items.status = 'FAILED'
+                     AND job_items.error = 'SCRAPER_UNAVAILABLE'
+                     AND ({deferred_snapshot_predicates})
+                 )
                  ORDER BY CASE WHEN jobs.status IN ('QUEUED', 'RUNNING') THEN 0 ELSE 1 END,
                           CASE WHEN job_items.status = 'RUNNING' THEN 0 ELSE 1 END,
                           jobs.created_at, jobs.id{lock_clause}"
@@ -8545,6 +8575,14 @@ impl Database {
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for request in batch {
                 statement = statement.bind(&request.item_id);
+            }
+            for request in batch {
+                statement = statement.bind(&request.item_id);
+                if let Some(fingerprint) = &request.input_fingerprint {
+                    statement = statement.bind(fingerprint).bind(&request.capabilities_json);
+                } else {
+                    statement = statement.bind(&request.capabilities_json);
+                }
             }
             for row in statement
                 .fetch_all(&mut **transaction)
@@ -8555,13 +8593,32 @@ impl Database {
                 })?
             {
                 let item_id: String = row.get("item_id");
+                let job_status: String = row.get("job_status");
+                if job_status == "DEFERRED" {
+                    let fingerprint: Option<Vec<u8>> = row.get("request_fingerprint");
+                    let capabilities: String = row.get("request_capabilities_json");
+                    let retry = deferred_by_snapshot
+                        .entry((item_id, fingerprint, capabilities))
+                        .or_insert(DeferredFillMissingRetryState {
+                            automatic_retry_count: 0,
+                            has_retry_deadline: false,
+                            retry_pending: false,
+                            recently_deferred: false,
+                        });
+                    retry.automatic_retry_count = retry
+                        .automatic_retry_count
+                        .max(row.get("automatic_retry_count"));
+                    retry.has_retry_deadline |= row.get::<i64, _>("has_retry_deadline") != 0;
+                    retry.retry_pending |= row.get::<i64, _>("retry_pending") != 0;
+                    retry.recently_deferred |= row.get::<i64, _>("recently_deferred") != 0;
+                    continue;
+                }
                 active_by_item
                     .entry(item_id)
                     .or_insert_with(|| ActiveFillMissingItem {
                         job_id: row.get("job_id"),
-                        job_status: row.get("job_status"),
+                        job_status,
                         item_status: row.get("item_status"),
-                        error: row.get("error"),
                         request_fingerprint: row.get("request_fingerprint"),
                         request_capabilities_json: row.get("request_capabilities_json"),
                     });
@@ -8572,21 +8629,13 @@ impl Database {
         let mut completed_queued_updates = HashMap::<String, i64>::new();
         let mut remaining = Vec::new();
         for request in requests {
-            let Some(active_item) = active_by_item.get(&request.item_id) else {
-                remaining.push(request.clone());
-                continue;
-            };
-            let matches_snapshot = active_item.request_fingerprint.as_deref()
-                == request.input_fingerprint.as_deref()
-                && active_item.request_capabilities_json == request.capabilities_json;
-            if active_item.job_status == "DEFERRED" {
-                if !matches_snapshot
-                    || active_item.item_status != "FAILED"
-                    || active_item.error.as_deref() != Some("SCRAPER_UNAVAILABLE")
-                {
-                    remaining.push(request.clone());
+            if let Some(active_item) = active_by_item.get(&request.item_id) {
+                let matches_snapshot = active_item.request_fingerprint.as_deref()
+                    == request.input_fingerprint.as_deref()
+                    && active_item.request_capabilities_json == request.capabilities_json;
+                if matches_snapshot {
+                    continue;
                 }
-            } else if !matches_snapshot {
                 if active_item.job_status == "QUEUED" && active_item.item_status == "COMPLETED" {
                     *completed_queued_updates
                         .entry(active_item.job_id.clone())
@@ -8596,6 +8645,29 @@ impl Database {
                     .entry(active_item.job_id.clone())
                     .or_default()
                     .push(request.clone());
+                continue;
+            }
+
+            let snapshot_key = (
+                request.item_id.clone(),
+                request.input_fingerprint.clone(),
+                request.capabilities_json.clone(),
+            );
+            if let Some(deferred) = deferred_by_snapshot.get(&snapshot_key) {
+                if request.input_fingerprint.is_some() {
+                    if (deferred.has_retry_deadline && deferred.retry_pending)
+                        || (!deferred.has_retry_deadline && deferred.recently_deferred)
+                    {
+                        continue;
+                    }
+                    let mut retry = request.clone();
+                    retry.automatic_retry_count = deferred.automatic_retry_count;
+                    remaining.push(retry);
+                } else if !deferred.recently_deferred {
+                    remaining.push(request.clone());
+                }
+            } else {
+                remaining.push(request.clone());
             }
         }
 
@@ -8619,6 +8691,8 @@ impl Database {
                          status = CASE WHEN status = 'COMPLETED' THEN 'PENDING' ELSE status END,
                          candidate_count = CASE WHEN status = 'COMPLETED' THEN 0 ELSE candidate_count END,
                          error = CASE WHEN status = 'COMPLETED' THEN NULL ELSE error END,
+                         automatic_retry_count = 0,
+                         automatic_retry_after = NULL,
                          updated_at = unixepoch()
                      WHERE job_id = ? AND status IN ('PENDING', 'RUNNING', 'COMPLETED')
                        AND item_id IN ({placeholders})"
@@ -8737,6 +8811,7 @@ impl Database {
                     item_id: item_id.clone(),
                     input_fingerprint: None,
                     capabilities_json: "[]".to_owned(),
+                    automatic_retry_count: 0,
                 })
                 .collect::<Vec<_>>();
             self.enqueue_fill_missing_jobs_in_transaction(&mut transaction, library_id, &requests)
@@ -8766,7 +8841,7 @@ impl Database {
         let values = std::iter::repeat_n(
             format!(
                 "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
-                 FROM media_items WHERE id = ?), ?, ?)"
+                 FROM media_items WHERE id = ?), ?, ?, ?)"
             ),
             requests.len(),
         )
@@ -8775,7 +8850,7 @@ impl Database {
         let query = format!(
             "INSERT INTO metadata_reidentify_job_items
                  (job_id, item_id, status, priority, request_fingerprint,
-                  request_capabilities_json)
+                  request_capabilities_json, automatic_retry_count)
              VALUES {values}"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -8785,7 +8860,8 @@ impl Database {
                 .bind(&request.item_id)
                 .bind(&request.item_id)
                 .bind(request.input_fingerprint.as_deref())
-                .bind(&request.capabilities_json);
+                .bind(&request.capabilities_json)
+                .bind(request.automatic_retry_count);
         }
         statement
             .execute(&mut **transaction)
@@ -9388,6 +9464,20 @@ impl Database {
                                OR item.request_capabilities_json <>
                                   item.claimed_request_capabilities_json
                            )
+                     ), provider_unavailable_metadata_fill AS (
+                         SELECT item.job_id, item.item_id
+                         FROM metadata_reidentify_job_items item
+                         JOIN metadata_reidentify_jobs job ON job.id = item.job_id
+                         WHERE item.job_id = ? AND item.item_id = ?
+                           AND item.status = 'RUNNING'
+                           AND job.mode = 'FILL_MISSING'
+                           AND job.cancel_requested = 0
+                           AND item.request_fingerprint IS NOT NULL
+                           AND ? = 'FAILED'
+                           AND ? = 'SCRAPER_UNAVAILABLE'
+                           AND NOT EXISTS (
+                               SELECT 1 FROM changed_metadata_fill_request
+                           )
                      )
                      UPDATE metadata_reidentify_job_items
                      SET status = CASE WHEN EXISTS (
@@ -9399,6 +9489,26 @@ impl Database {
                          error = CASE WHEN EXISTS (
                              SELECT 1 FROM changed_metadata_fill_request
                          ) THEN NULL ELSE ? END,
+                         automatic_retry_count = CASE
+                             WHEN EXISTS (SELECT 1 FROM provider_unavailable_metadata_fill)
+                                 THEN CASE WHEN automatic_retry_count < 3
+                                     THEN automatic_retry_count + 1
+                                     ELSE automatic_retry_count END
+                             WHEN EXISTS (SELECT 1 FROM changed_metadata_fill_request)
+                                 THEN 0
+                             ELSE automatic_retry_count
+                         END,
+                         automatic_retry_after = CASE
+                             WHEN EXISTS (SELECT 1 FROM provider_unavailable_metadata_fill)
+                                 THEN unixepoch() + CASE automatic_retry_count
+                                     WHEN 0 THEN 300
+                                     WHEN 1 THEN 1800
+                                     ELSE 21600
+                                 END
+                             WHEN EXISTS (SELECT 1 FROM changed_metadata_fill_request)
+                                 THEN NULL
+                             ELSE automatic_retry_after
+                         END,
                          claimed_request_fingerprint = NULL,
                          claimed_request_capabilities_json = '[]',
                          updated_at = unixepoch()
@@ -9408,6 +9518,10 @@ impl Database {
             .query_scalar::<String>(query)
             .bind(job_id)
             .bind(item_id)
+            .bind(job_id)
+            .bind(item_id)
+            .bind(status)
+            .bind(error)
             .bind(status)
             .bind(candidate_count)
             .bind(error)
@@ -9662,6 +9776,7 @@ impl Database {
             self.query(
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
+                     automatic_retry_after = NULL,
                      claimed_request_fingerprint = NULL,
                      claimed_request_capabilities_json = '[]',
                      updated_at = unixepoch()

@@ -8620,7 +8620,9 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [ ] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
 - [ ] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在可用集成环境通过。
 
-短计划与文件：实现限定于 `migrations/0165_metadata_fill_missing_retry_backoff.sql`、`migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`。先添加红色状态机回归，再实现逐 item 退避、相同快照的跨 job 次数继承和到期去重，最后分别验证 SQLite 与 PostgreSQL 合同。本任务不改元数据 API DTO 或扫描并发策略。
+短计划与文件：实现涉及 `migrations/0165_metadata_fill_missing_retry_backoff.sql`、`migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql`、`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`，以及公开 schema version 断言所在的集成测试文件。先添加红色状态机回归，再实现逐 item 退避、相同快照的跨 job 次数继承和到期去重，最后分别验证 SQLite 与 PostgreSQL 合同。本任务不改元数据 API DTO 或扫描并发策略。
+
+结果（2026-10-07）：新增双后端 migration 0165，为 provider 失败后的自动快照 item 保存失败次数和截止时间；退避为 5 分钟、30 分钟、最高 6 小时，并在新 job 中继承相同 fingerprint/capability 的次数。migration 会给已有自动 deferred provider 失败安排首次 5 分钟冷却，保持任务状态和计数；旧的无快照 deferred 仍沿用一小时去重。相同快照冷却去重、新 fingerprint/capability、显式 retry、取消、其他错误及非 `FILL_MISSING` 模式均有回归测试。去重检查保留单条有界 SQL 查询，不额外增加扫描调度往返。SQLite 定向状态机、迁移升级、storage 全目标、build、fmt、全目标全 feature Clippy 通过；全目标测试有 743 个 library tests 通过、11 个忽略；集成目标 `emby_counts`（实际 1、预期 0）和 `strm`（401、预期 200），这两个持续失败均在未改动的基线提交 `1ffaf3b0` 上独立复现；`libraries_api` 曾出现一次瞬时 `DATABASE_UNAVAILABLE`，独立重跑 13 项全部通过。首次运行中的旧式 provider-deferral fixtures 已通过兼容兜底修复并单独复测通过。PostgreSQL 测试服务/容器 daemon 不可用，双后端 SQL 合同已静态验证但 PostgreSQL migration 未运行；本机 `arm64`，未部署或验证 FNOS CPU/真实重试节奏。
 
 #### 本轮代码质量与性能优化收口
 

@@ -82,6 +82,7 @@ fn metadata_migrations_preserve_historical_version_sequence()
             "0162_filesystem_entry_directory_prefix_index.sql",
             "0163_scan_job_failed_count_index.sql",
             "0164_metadata_fill_request_snapshots.sql",
+            "0165_metadata_fill_missing_retry_backoff.sql",
         ] {
             assert!(
                 migrations.join(name).is_file(),
@@ -96,6 +97,21 @@ fn metadata_migrations_preserve_historical_version_sequence()
         assert!(chapters.contains("CREATE TABLE media_info_chapters"));
         assert!(backfill.contains("non_retryable_item_ids_json"));
     }
+
+    let sqlite_retry = fs::read_to_string(
+        repository.join("migrations/0165_metadata_fill_missing_retry_backoff.sql"),
+    )?;
+    let postgres_retry = fs::read_to_string(
+        repository.join("migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql"),
+    )?;
+    for migration in [&sqlite_retry, &postgres_retry] {
+        assert!(migration.contains("automatic_retry_count"));
+        assert!(migration.contains("automatic_retry_after"));
+        assert!(migration.contains("SCRAPER_UNAVAILABLE"));
+        assert!(migration.contains("+ 300"));
+    }
+    assert!(!postgres_retry.contains("unixepoch()"));
+    assert!(postgres_retry.contains("EXTRACT(EPOCH FROM CURRENT_TIMESTAMP"));
 
     Ok(())
 }
@@ -536,7 +552,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -556,7 +572,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 164);
+    assert_eq!(second_database.schema_version().await?, 165);
     second_database.close().await;
     Ok(())
 }
@@ -641,7 +657,7 @@ async fn sqlite_fill_request_snapshot_migration_preserves_queued_jobs()
     old_pool.close().await;
 
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
     let job_state: (String, i64, i64) = sqlx::query_as(
         "SELECT status, processed_count, total_count
          FROM metadata_reidentify_jobs WHERE id = 'snapshot-job'",
@@ -678,6 +694,145 @@ async fn sqlite_fill_request_snapshot_migration_preserves_queued_jobs()
             },
         ]
     );
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sqlite_fill_missing_retry_migration_backfills_only_automatic_provider_deferrals()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    fs::create_dir(&config_dir)?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let migration_dir = temp_dir.path().join("migrations-v164");
+    fs::create_dir(&migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?
+            .ok_or("migration file has no version")?;
+        if version <= 164 {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing name")?),
+            )?;
+        }
+    }
+
+    let database_path = config_dir.join("lux.db");
+    let old_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    sqlx::migrate::Migrator::new(migration_dir)
+        .await?
+        .run(&old_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('retry-library', 'Retry', 'MOVIE')",
+    )
+    .execute(&old_pool)
+    .await?;
+    for item_id in ["retry-automatic", "retry-other-error", "retry-no-snapshot"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, 'retry-library', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(&old_pool)
+        .await?;
+    }
+    for (job_id, item_id) in [
+        ("retry-automatic-job", "retry-automatic"),
+        ("retry-other-error-job", "retry-other-error"),
+        ("retry-no-snapshot-job", "retry-no-snapshot"),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_jobs (
+                 id, status, processed_count, total_count, mode, library_id, job_scope
+             ) VALUES (?, 'DEFERRED', 1, 1, 'FILL_MISSING', 'retry-library', 'ITEMS')",
+        )
+        .bind(job_id)
+        .execute(&old_pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO metadata_reidentify_job_items (
+                 job_id, item_id, status, error, request_fingerprint,
+                 request_capabilities_json
+             ) VALUES (?, ?, 'FAILED', ?, ?, '[]')",
+        )
+        .bind(job_id)
+        .bind(item_id)
+        .bind(if item_id == "retry-other-error" {
+            "ITEM_NOT_FOUND"
+        } else {
+            "SCRAPER_UNAVAILABLE"
+        })
+        .bind((item_id != "retry-no-snapshot").then_some(b"retry-fingerprint".as_slice()))
+        .execute(&old_pool)
+        .await?;
+    }
+    old_pool.close().await;
+
+    let database = Database::connect(&config).await?;
+    assert_eq!(database.schema_version().await?, 165);
+    let jobs: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT jobs.id, jobs.status, jobs.processed_count, jobs.total_count,
+                items.automatic_retry_count
+         FROM metadata_reidentify_jobs jobs
+         JOIN metadata_reidentify_job_items items ON items.job_id = jobs.id
+         ORDER BY jobs.id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        jobs.iter()
+            .map(|(id, status, processed, total, retry_count)| {
+                (
+                    id.as_str(),
+                    status.as_str(),
+                    *processed,
+                    *total,
+                    *retry_count,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![
+            ("retry-automatic-job", "DEFERRED", 1, 1, 1),
+            ("retry-no-snapshot-job", "DEFERRED", 1, 1, 0),
+            ("retry-other-error-job", "DEFERRED", 1, 1, 0),
+        ]
+    );
+    let retry_deadlines: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT item_id, automatic_retry_after - unixepoch()
+         FROM metadata_reidentify_job_items ORDER BY item_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(retry_deadlines.len(), 3);
+    for (item_id, seconds_until_retry) in retry_deadlines {
+        if item_id == "retry-automatic" {
+            assert!(seconds_until_retry.is_some_and(|seconds| (299..=300).contains(&seconds)));
+        } else {
+            assert_eq!(seconds_until_retry, None);
+        }
+    }
     database.close().await;
     Ok(())
 }
@@ -753,7 +908,7 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 164);
+    assert_eq!(schema_version, 165);
     for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
         let table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -1114,7 +1269,7 @@ async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
         vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
     );
     let schema_version = database.schema_version().await?;
-    assert_eq!(schema_version, 164);
+    assert_eq!(schema_version, 165);
     database.close().await;
     Ok(())
 }
@@ -1462,7 +1617,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
 
     database.close().await;
     Ok(())
@@ -2156,7 +2311,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
     Ok(())
 }
 
@@ -2328,7 +2483,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
     Ok(())
 }
 
@@ -2415,7 +2570,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
     database.close().await;
     Ok(())
 }
@@ -2546,7 +2701,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -2728,7 +2883,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 164);
+    assert_eq!(database.schema_version().await?, 165);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())

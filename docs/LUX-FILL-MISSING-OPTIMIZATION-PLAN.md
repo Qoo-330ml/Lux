@@ -78,7 +78,7 @@ FNOS 当前运行 revision：`9979c4ba`；schema version：`160`。部署后 out
 
 `item_metadata_completeness.retry_after` 只控制本地 completeness 检查失败后的重新领取，不代表在线 provider 的退避。自动 `FILL_MISSING` 的 provider 不可用结果保存在 `metadata_reidentify_job_items.error='SCRAPER_UNAVAILABLE'`，当前仅通过 `DEFERRED` job 的一小时窗口去重；持续不可用时，后续扫描会再次创建相同请求。能力级 scraper attempt 也不能替代 job 级退避，因为尚未获得 provider identity 或 scraper 服务整体不可用时没有可用的能力 attempt key。
 
-LUX-402 将给有自动请求快照的 job item 保存自动失败次数及到期时间。同一 fingerprint/capability 在 5 分钟、30 分钟、最多 6 小时的退避期内合并/去重；到期后由下一次自动扫描重试，并将次数延续到新 job。输入快照变化不继承旧退避，管理员手动 retry 立即解禁；无快照人工 job 不改变语义。
+已实现（LUX-402，本地未部署）：双后端 job item migration 增加自动失败次数和截止时间。同一 fingerprint/capability 在 5 分钟、30 分钟、最多 6 小时的退避期内合并/去重；到期后由下一次自动扫描重试，并将次数延续到新 job。输入快照变化不继承旧退避，管理员手动 retry 立即解禁；无快照人工 job 不改变语义。旧的自动 deferred provider 失败在迁移时获得首次 5 分钟冷却；旧的无快照任务保留一小时去重语义。一次 SQL 读取同时检查活动任务与匹配的历史 provider 失败，不增加每批扫描的数据库往返。SQLite migration-from-0164、状态机、build/fmt/Clippy 和全目标测试已验证；两个与本任务无关的现有基线失败及 PostgreSQL 服务不可用详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-402 结果。未部署 FNOS，不能据此宣称生产 CPU 降幅。
 
 验收：持续 provider 不可用时同一输入按有界退避重试且不在冷却期重复创建 job；新 capability、fingerprint 和人工 retry 不被旧请求退避误伤。
 
