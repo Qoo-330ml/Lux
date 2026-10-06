@@ -525,6 +525,7 @@ impl Database {
                 item_id: item_id.clone(),
                 input_fingerprint: Some(fingerprint),
                 capabilities_json,
+                automatic_retry_count: 0,
             });
         }
         Ok(requests)

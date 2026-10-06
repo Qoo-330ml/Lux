@@ -4380,6 +4380,370 @@ async fn changed_fill_request_is_not_deduplicated_by_recent_provider_deferral()
     Ok(())
 }
 
+async fn fail_fill_missing_job_with_unavailable_provider(
+    database: &Database,
+    job_id: &str,
+    item_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.to_owned()]
+    );
+    database
+        .finish_metadata_reidentify_item(job_id, item_id, "FAILED", 0, Some("SCRAPER_UNAVAILABLE"))
+        .await?;
+    database
+        .finish_metadata_reidentify_job(job_id, "DEFERRED", Some("DEFERRED_PROVIDER_UNAVAILABLE"))
+        .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill backoff", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id = "fill-backoff-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    let first_fingerprint = b"fill-backoff-input-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    let first_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: first_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &first_result,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    let first_job_id = first_dispatch.scheduled_job_ids[0].clone();
+    fail_fill_missing_job_with_unavailable_provider(&database, &first_job_id, item_id).await?;
+
+    let first_backoff: (i64, i64) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after - unixepoch()
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(first_backoff.0, 1);
+    assert!((299..=300).contains(&first_backoff.1));
+
+    let suppressed = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.to_owned()])
+        .await?;
+    assert!(suppressed.scheduled_job_ids.is_empty());
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+    let due_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.to_owned()])
+        .await?;
+    assert_eq!(due_dispatch.scheduled_job_ids.len(), 1);
+    let second_job_id = due_dispatch.scheduled_job_ids[0].clone();
+    assert_ne!(second_job_id, first_job_id);
+    let inherited_count: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_count FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(inherited_count, 1);
+
+    fail_fill_missing_job_with_unavailable_provider(&database, &second_job_id, item_id).await?;
+    let second_backoff: (i64, i64) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after - unixepoch()
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(second_backoff.0, 2);
+    assert!((1_799..=1_800).contains(&second_backoff.1));
+
+    assert!(
+        database
+            .retry_metadata_reidentify_job(&second_job_id)
+            .await?
+    );
+    let manual_retry_state: (String, Option<i64>) = database
+        .query_as(
+            "SELECT items.status, items.automatic_retry_after
+             FROM metadata_reidentify_job_items items
+             WHERE items.job_id = ? AND items.item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(manual_retry_state, ("PENDING".to_owned(), None));
+    fail_fill_missing_job_with_unavailable_provider(&database, &second_job_id, item_id).await?;
+    let capped_backoff: (i64, i64) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after - unixepoch()
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&second_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(capped_backoff.0, 3);
+    assert!((21_599..=21_600).contains(&capped_backoff.1));
+
+    let changed_fingerprint = b"fill-backoff-input-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    let changed_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: changed_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let changed_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &changed_result,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    assert_eq!(changed_dispatch.scheduled_job_ids.len(), 1);
+    let changed_job_id = &changed_dispatch.scheduled_job_ids[0];
+    let changed_retry_state: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(changed_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(changed_retry_state, (0, None));
+
+    fail_fill_missing_job_with_unavailable_provider(&database, changed_job_id, item_id).await?;
+    let changed_capability_request = [crate::storage::MetadataFillMissingRequest {
+        item_id: item_id.to_owned(),
+        input_fingerprint: Some(changed_fingerprint.to_vec()),
+        capabilities_json: "[\"BACKDROP\"]".to_owned(),
+        automatic_retry_count: 0,
+    }];
+    let mut transaction = database.begin_metadata_write_transaction().await?;
+    let changed_capability_job_ids = database
+        .enqueue_or_update_fill_missing_requests_in_transaction(
+            &mut transaction,
+            &library_id,
+            &changed_capability_request,
+        )
+        .await?;
+    transaction.commit().await?;
+    assert_eq!(changed_capability_job_ids.len(), 1);
+    let changed_capability_retry_state: (i64, Option<i64>, String) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after, request_capabilities_json
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&changed_capability_job_ids[0])
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        changed_capability_retry_state,
+        (0, None, "[\"BACKDROP\"]".to_owned())
+    );
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill backoff scope", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = [
+        "fill-backoff-manual",
+        "fill-backoff-reidentify",
+        "fill-backoff-full-refresh",
+        "fill-backoff-cancelled",
+    ];
+    for item_id in item_ids {
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    let manual_job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &[item_ids[0].to_owned()])
+        .await?;
+    fail_fill_missing_job_with_unavailable_provider(&database, &manual_job_id, item_ids[0]).await?;
+    for (job_id, item_id, mode) in [
+        ("retry-reidentify", item_ids[1], "REIDENTIFY"),
+        ("retry-full-refresh", item_ids[2], "FULL_REFRESH"),
+    ] {
+        database
+            .create_metadata_reidentify_job(job_id, &[item_id.to_owned()], mode)
+            .await?;
+        fail_fill_missing_job_with_unavailable_provider(&database, job_id, item_id).await?;
+    }
+
+    let cancelled_item = item_ids[3];
+    let fingerprint = b"cancelled-fill-backoff-input";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(cancelled_item, "POSTER", fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(cancelled_item, "POSTER", fingerprint)
+            .await?
+    );
+    let result = [NewItemMetadataCompletenessResult {
+        item_id: cancelled_item,
+        capability: "POSTER",
+        input_fingerprint: fingerprint,
+        is_missing: true,
+        checked_at: 20,
+    }];
+    let dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &result,
+            &[cancelled_item.to_owned()],
+        )
+        .await?;
+    let cancelled_job_id = &dispatch.scheduled_job_ids[0];
+    assert!(
+        database
+            .claim_metadata_reidentify_job(cancelled_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(cancelled_job_id, 1)
+            .await?,
+        vec![cancelled_item.to_owned()]
+    );
+    assert!(
+        database
+            .request_metadata_reidentify_job_cancel(cancelled_job_id)
+            .await?
+    );
+    database
+        .finish_metadata_reidentify_item(
+            cancelled_job_id,
+            cancelled_item,
+            "FAILED",
+            0,
+            Some("SCRAPER_UNAVAILABLE"),
+        )
+        .await?;
+    database
+        .finish_metadata_reidentify_job(
+            cancelled_job_id,
+            "DEFERRED",
+            Some("DEFERRED_PROVIDER_UNAVAILABLE"),
+        )
+        .await?;
+
+    let retry_states: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT items.item_id, items.automatic_retry_count, items.automatic_retry_after
+         FROM metadata_reidentify_job_items items
+         WHERE items.job_id IN (?, ?, ?, ?)
+         ORDER BY items.item_id",
+    )
+    .bind(&manual_job_id)
+    .bind("retry-reidentify")
+    .bind("retry-full-refresh")
+    .bind(cancelled_job_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(retry_states.len(), 4);
+    for (_, retry_count, retry_after) in retry_states {
+        assert_eq!(retry_count, 0);
+        assert_eq!(retry_after, None);
+    }
+
+    database.close().await;
+    Ok(())
+}
+
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_progressive_scan_metadata_storage_contract()

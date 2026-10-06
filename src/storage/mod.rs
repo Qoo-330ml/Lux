@@ -21,6 +21,7 @@ pub(crate) struct MetadataFillMissingRequest {
     pub(crate) item_id: String,
     pub(crate) input_fingerprint: Option<Vec<u8>>,
     pub(crate) capabilities_json: String,
+    pub(crate) automatic_retry_count: i64,
 }
 
 #[allow(dead_code)] // Scanner jobs use the queued IDs to wake the existing worker.
