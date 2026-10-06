@@ -8590,6 +8590,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-06）：新增独立容量为 2 的进程级 semaphore；每个补缺 item worker 在完整处理期间同时持有补缺 permit 与原有 metadata permit。固定 SQLite fixture 并行运行两个各含 4 个 item 的补缺 job，通过 job-item `RUNNING` 状态统计进程实际 claim 的并发 worker，最大值不超过 2。取消等待 permit 的第二个 job 后，它会在第一个 job 仍占用两个 permit 时结束；独立单测还验证通知被消费后，后续 permit 等待仍会看到锁存的取消状态。相关测试二进制中的 FILL_MISSING 执行用例用异步 mutex 串行，避免共享进程级 semaphore 造成测试相互干扰。`tests/reidentify.rs` 14 项通过，补缺 semaphore 与取消锁存单测通过；build、fmt 和全目标全 feature Clippy 通过。`cargo test --locked --all-targets` 的 library 测试为 734 passed、11 ignored，随后在无关的 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）；本任务没有修改该访问范围行为。开发机架构为 `arm64`；未部署 FNOS，也未测量 CPU 或生产墙钟收益。
 
+#### LUX-401：保留活动 FILL_MISSING 中变化后的补全意图
+
+范围：自动扫描按 item 级去重活动和近期 `DEFERRED` 的 `FILL_MISSING`。当本地 completeness 输入指纹或当前 missing capability 集在旧 job 处理期间变化时，item 级去重可能吞掉新请求；近期 DEFERRED 也可能挡住实际上不同的新能力请求。为 job item 持久保存自动请求的 input fingerprint 与规范化 capability set，并在 claim 时保存处理快照。相同快照继续合并/去重；queued item 更新为最新快照；running item 在新快照到达后只复跑一次最新状态；近期 DEFERRED 仅抑制同快照。旧数据和人工创建的无快照 job 保持兼容，公共任务 DTO 不变。
+
+验收：
+
+- [x] SQLite/PostgreSQL 迁移为 job item 增加可空请求指纹、请求 capability set 与 claim 快照；SQLite 162→163 升级回归确认旧任务状态、计数和快照默认值保持正确。
+- [x] 新的不同 fingerprint 或 capability set 不被近期 DEFERRED item 错误去重；相同快照仍去重，queued job 合并仍有界。
+- [x] 请求在 item RUNNING 期间变化时，当前 worker 结束后该 item 回到 PENDING 并使用最新快照复跑；同一输入重复请求不触发复跑或并发重复 worker。
+- [x] 取消、重试、worker 异常恢复和非 FILL_MISSING job 状态/计数语义保持正确，任务 API DTO 不变。
+- [ ] SQLite 状态机回归、migration-from-empty 与 build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同经可用的集成目标验证。
+
+短计划与文件：先在 `src/storage/repository_tests.rs` 为 RUNNING item 收到新 fingerprint/capability 后仍需处理新意图写失败回归；新增 `migrations/0163_metadata_fill_request_snapshots.sql` 与 `migrations-postgres/0163_metadata_fill_request_snapshots.sql`；实现涉及 `src/storage/mod.rs`、`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`，以及 schema version 断言和迁移序列检查；最后更新本任务记录、`docs/PERFORMANCE.md` 与 `docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。只处理自动 FILL_MISSING 请求快照，不扩展到其他 metadata 模式。
+
+结果（2026-10-06）：相同快照重试对 job/item 表执行 0 次 INSERT、0 次 UPDATE；queued 输入变化更新既有 item 一次；RUNNING 期间出现变化的请求在 worker 收尾后重新进入 PENDING，取消不会重排，显式 retry 使用最新 fingerprint。迁移版本推进到 163，更新 SQLite/PostgreSQL schema-version 断言和迁移序列检查。定向状态机、旧任务 migration、claim/recovery fixture、`admin_health`、`ready_version`、`storage` 通过；build、fmt 和全目标全 feature Clippy 通过。全目标测试 `--no-fail-fast` 中 737 个库测试通过、11 个忽略；集成测试中 `emby_counts`（实际 1、期望 0）及 `strm`（401、期望 200）失败，前者已有独立基线记录，后者单独复跑仍失败但与本任务改动路径无关；`library_cover_generation` 全套时曾失败，独立复跑 5 项通过。PostgreSQL 测试端口 127.0.0.1:55432 未监听且 Docker 不可用，故未运行 PostgreSQL 集成迁移；本机 `arm64`，未部署 FNOS，也未测 CPU/生产墙钟收益。完整完成门仍未满足。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

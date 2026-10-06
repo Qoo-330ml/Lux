@@ -16,6 +16,13 @@ pub(crate) struct NewItemMetadataCompletenessCheck<'a> {
     pub(crate) input_fingerprint: &'a [u8],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MetadataFillMissingRequest {
+    pub(crate) item_id: String,
+    pub(crate) input_fingerprint: Option<Vec<u8>>,
+    pub(crate) capabilities_json: String,
+}
+
 #[allow(dead_code)] // Scanner jobs use the queued IDs to wake the existing worker.
 #[derive(Debug, Default)]
 pub(crate) struct ItemMetadataCompletenessCommit {

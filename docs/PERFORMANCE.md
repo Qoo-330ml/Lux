@@ -1470,3 +1470,9 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 源码中单个 `FILL_MISSING` job 的默认 worker 并发为 2，但原有进程级 metadata semaphore 容量为 16，因此多个同时执行的补缺 job 总计可能占用最多 16 个 metadata worker。现在所有补缺 job 共享容量为 2 的独立进程级 semaphore；每个 item worker 在处理期间同时持有该 permit 和既有 metadata permit，其他 metadata 模式不受补缺专用限制。
 
 固定 SQLite fixture 同时运行两个各 4 个 item 的补缺 job，通过查询这两个 job 的 `RUNNING` item 数观测已 claim 的 worker 并发，最大值不超过 2。取消回归验证第二个 job 等待 permit 时，取消会在占用 permit 的首个 job 结束前让其转入 `CANCELLED`；单测也验证取消通知被消费后，之后的等待仍能观察到锁存状态。测试用异步 mutex 串行化同一测试二进制里会实际运行 FILL_MISSING 的用例，避免共享进程级 semaphore 产生测试相互干扰。`tests/reidentify.rs` 14 项、取消锁存单测、build、fmt 和全目标全 feature Clippy 通过。全目标测试的 library 部分为 734 passed、11 ignored，随后在独立的 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）。以上仅验证并发上界与取消状态边界，不测量 CPU 或墙钟收益；没有在 FNOS、PostgreSQL 或 NAS 上部署和验证，不据此推断生产 CPU 收益。
+
+### LUX-401 自动补缺请求快照与重复写入
+
+自动 completeness 调度现在为每个 `FILL_MISSING` job item 保存输入 fingerprint 和规范化 capability 集；claim 时复制一份处理快照。重复且相同的请求只读当前任务状态，不执行 job/item 插入或更新。queued item 收到变化请求时批量更新既有 job item；running item 在当前 worker 结束后最多回到 `PENDING` 一次，并且该次不增加 `processed_count`。近期 provider-unavailable `DEFERRED` 只抑制完全相同的快照。
+
+固定 SQLite storage 回归通过触发器计数确认：重复同快照请求对 job/item 表执行 0 次 INSERT、0 次 UPDATE；queued 中出现新 fingerprint 时执行 0 次 INSERT、1 次 item UPDATE、0 次 job INSERT。状态机测试还验证 capability 集变化、运行项只重跑一次、同快照稳定完成、取消不重跑、worker 失败后的显式 retry 使用最新 fingerprint、近期 DEFERRED 同快照去重和变化快照重新排队。该计数是单 item fixture 的 DML 边界，不是完整性流程 SQL 总数或墙钟基准；未测量数据库 CPU、FNOS、PostgreSQL 或 NAS 收益，也未部署。

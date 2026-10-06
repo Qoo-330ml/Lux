@@ -111,7 +111,7 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
             "degraded"
         }
     );
-    assert_eq!(body["schemaVersion"], 162);
+    assert_eq!(body["schemaVersion"], 163);
     assert_eq!(body["jobs"]["scanRunning"], 2);
     assert_eq!(body["jobs"]["scanFailed"], 1);
     assert_eq!(body["database"]["status"], "ok");

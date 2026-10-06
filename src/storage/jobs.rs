@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::MetadataFillMissingRequest;
 use std::{collections::HashMap, time::Instant};
 
 const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
@@ -13,6 +14,15 @@ const SCAN_LOCAL_METADATA_SOURCE_IDENTITY_BATCH_SIZE: usize = 500;
 pub(crate) const MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE: usize = 250;
 // Four bind values per path; 100 paths stays below SQLite's conservative parameter limit.
 const INCREMENTAL_SCAN_PATH_BATCH_SIZE: usize = 100;
+
+struct ActiveFillMissingItem {
+    job_id: String,
+    job_status: String,
+    item_status: String,
+    error: Option<String>,
+    request_fingerprint: Option<Vec<u8>>,
+    request_capabilities_json: String,
+}
 
 fn parse_scan_local_metadata_non_retryable_item_ids(
     value: &str,
@@ -8413,10 +8423,10 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         library_id: &str,
-        item_ids: &[String],
+        requests: &[MetadataFillMissingRequest],
     ) -> Result<Vec<String>, StorageError> {
         let mut job_ids = Vec::new();
-        let mut remaining = item_ids.to_vec();
+        let mut remaining = requests.to_vec();
         if let Some((queued_job_id, queued_count)) = self
             .query_as::<(String, i64)>(
                 "SELECT id, total_count
@@ -8483,6 +8493,181 @@ impl Database {
         Ok(job_ids)
     }
 
+    pub(crate) async fn enqueue_or_update_fill_missing_requests_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        requests: &[MetadataFillMissingRequest],
+    ) -> Result<Vec<String>, StorageError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut active_by_item = HashMap::with_capacity(requests.len());
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE OF jobs, job_items"
+        } else {
+            ""
+        };
+        for batch in requests.chunks(100) {
+            if batch.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT jobs.id AS job_id, jobs.status AS job_status,
+                        job_items.item_id, job_items.status AS item_status,
+                        job_items.error, job_items.request_fingerprint,
+                        job_items.request_capabilities_json
+                 FROM metadata_reidentify_job_items job_items
+                 JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+                 WHERE jobs.mode = 'FILL_MISSING'
+                   AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
+                   AND jobs.cancel_requested = 0
+                   AND (
+                       (jobs.status = 'QUEUED'
+                        AND job_items.status IN ('PENDING', 'RUNNING', 'COMPLETED'))
+                       OR (jobs.status = 'RUNNING'
+                           AND job_items.status IN ('PENDING', 'RUNNING'))
+                       OR (jobs.status = 'DEFERRED'
+                           AND jobs.updated_at >= unixepoch() - 3600
+                           AND job_items.status = 'FAILED'
+                           AND job_items.error = 'SCRAPER_UNAVAILABLE')
+                   )
+                   AND job_items.item_id IN ({placeholders})
+                 ORDER BY CASE WHEN jobs.status IN ('QUEUED', 'RUNNING') THEN 0 ELSE 1 END,
+                          CASE WHEN job_items.status = 'RUNNING' THEN 0 ELSE 1 END,
+                          jobs.created_at, jobs.id{lock_clause}"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for request in batch {
+                statement = statement.bind(&request.item_id);
+            }
+            for row in statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let item_id: String = row.get("item_id");
+                active_by_item
+                    .entry(item_id)
+                    .or_insert_with(|| ActiveFillMissingItem {
+                        job_id: row.get("job_id"),
+                        job_status: row.get("job_status"),
+                        item_status: row.get("item_status"),
+                        error: row.get("error"),
+                        request_fingerprint: row.get("request_fingerprint"),
+                        request_capabilities_json: row.get("request_capabilities_json"),
+                    });
+            }
+        }
+
+        let mut queued_updates = HashMap::<String, Vec<MetadataFillMissingRequest>>::new();
+        let mut completed_queued_updates = HashMap::<String, i64>::new();
+        let mut remaining = Vec::new();
+        for request in requests {
+            let Some(active_item) = active_by_item.get(&request.item_id) else {
+                remaining.push(request.clone());
+                continue;
+            };
+            let matches_snapshot = active_item.request_fingerprint.as_deref()
+                == request.input_fingerprint.as_deref()
+                && active_item.request_capabilities_json == request.capabilities_json;
+            if active_item.job_status == "DEFERRED" {
+                if !matches_snapshot
+                    || active_item.item_status != "FAILED"
+                    || active_item.error.as_deref() != Some("SCRAPER_UNAVAILABLE")
+                {
+                    remaining.push(request.clone());
+                }
+            } else if !matches_snapshot {
+                if active_item.job_status == "QUEUED" && active_item.item_status == "COMPLETED" {
+                    *completed_queued_updates
+                        .entry(active_item.job_id.clone())
+                        .or_default() += 1;
+                }
+                queued_updates
+                    .entry(active_item.job_id.clone())
+                    .or_default()
+                    .push(request.clone());
+            }
+        }
+
+        for (job_id, updates) in queued_updates {
+            for batch in updates.chunks(100) {
+                let placeholders = std::iter::repeat_n("?", batch.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let fingerprint_cases = std::iter::repeat_n("WHEN ? THEN ?", batch.len())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let capability_cases = std::iter::repeat_n("WHEN ? THEN ?", batch.len())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let query = format!(
+                    "UPDATE metadata_reidentify_job_items
+                     SET request_fingerprint = CASE item_id {fingerprint_cases}
+                             ELSE request_fingerprint END,
+                         request_capabilities_json = CASE item_id {capability_cases}
+                             ELSE request_capabilities_json END,
+                         status = CASE WHEN status = 'COMPLETED' THEN 'PENDING' ELSE status END,
+                         candidate_count = CASE WHEN status = 'COMPLETED' THEN 0 ELSE candidate_count END,
+                         error = CASE WHEN status = 'COMPLETED' THEN NULL ELSE error END,
+                         updated_at = unixepoch()
+                     WHERE job_id = ? AND status IN ('PENDING', 'RUNNING', 'COMPLETED')
+                       AND item_id IN ({placeholders})"
+                );
+                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                for request in batch {
+                    statement = statement
+                        .bind(&request.item_id)
+                        .bind(request.input_fingerprint.as_deref());
+                }
+                for request in batch {
+                    statement = statement
+                        .bind(&request.item_id)
+                        .bind(&request.capabilities_json);
+                }
+                statement = statement.bind(&job_id);
+                for request in batch {
+                    statement = statement.bind(&request.item_id);
+                }
+                statement
+                    .execute(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            }
+        }
+        for (job_id, count) in completed_queued_updates {
+            self.query(
+                "UPDATE metadata_reidentify_jobs
+                 SET processed_count = CASE WHEN processed_count >= ?
+                     THEN processed_count - ? ELSE 0 END,
+                     updated_at = unixepoch()
+                 WHERE id = ? AND status = 'QUEUED'",
+            )
+            .bind(count)
+            .bind(count)
+            .bind(job_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+
+        self.enqueue_fill_missing_jobs_in_transaction(transaction, library_id, &remaining)
+            .await
+    }
+
     pub(crate) async fn create_or_merge_fill_missing_job(
         &self,
         library_id: &str,
@@ -8544,7 +8729,15 @@ impl Database {
                 StorageError::Conflict("fill-missing job has no schedulable items".to_owned())
             })?
         } else {
-            self.enqueue_fill_missing_jobs_in_transaction(&mut transaction, library_id, &remaining)
+            let requests = remaining
+                .iter()
+                .map(|item_id| MetadataFillMissingRequest {
+                    item_id: item_id.clone(),
+                    input_fingerprint: None,
+                    capabilities_json: "[]".to_owned(),
+                })
+                .collect::<Vec<_>>();
+            self.enqueue_fill_missing_jobs_in_transaction(&mut transaction, library_id, &requests)
                 .await?
                 .into_iter()
                 .next()
@@ -8566,25 +8759,31 @@ impl Database {
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         job_id: &str,
-        item_ids: &[String],
+        requests: &[MetadataFillMissingRequest],
     ) -> Result<(), StorageError> {
         let values = std::iter::repeat_n(
             format!(
                 "(?, ?, 'PENDING', (SELECT {METADATA_REIDENTIFY_PRIORITY_CASE}
-                 FROM media_items WHERE id = ?))"
+                 FROM media_items WHERE id = ?), ?, ?)"
             ),
-            item_ids.len(),
+            requests.len(),
         )
         .collect::<Vec<_>>()
         .join(", ");
         let query = format!(
             "INSERT INTO metadata_reidentify_job_items
-                 (job_id, item_id, status, priority)
+                 (job_id, item_id, status, priority, request_fingerprint,
+                  request_capabilities_json)
              VALUES {values}"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
-        for item_id in item_ids {
-            statement = statement.bind(job_id).bind(item_id).bind(item_id);
+        for request in requests {
+            statement = statement
+                .bind(job_id)
+                .bind(&request.item_id)
+                .bind(&request.item_id)
+                .bind(request.input_fingerprint.as_deref())
+                .bind(&request.capabilities_json);
         }
         statement
             .execute(&mut **transaction)
@@ -9125,7 +9324,10 @@ impl Database {
                      LIMIT ?
                  )
                  UPDATE metadata_reidentify_job_items
-                 SET status = 'RUNNING', updated_at = unixepoch()
+                 SET status = 'RUNNING',
+                     claimed_request_fingerprint = request_fingerprint,
+                     claimed_request_capabilities_json = request_capabilities_json,
+                     updated_at = unixepoch()
                  WHERE job_id = ? AND status = 'PENDING'
                    AND item_id IN (SELECT item_id FROM eligible)
                    AND EXISTS (
@@ -9168,34 +9370,70 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE metadata_reidentify_job_items
-             SET status = ?, candidate_count = ?, error = ?, updated_at = unixepoch()
-             WHERE job_id = ? AND item_id = ? AND status = 'RUNNING'",
-        )
-        .bind(status)
-        .bind(candidate_count)
-        .bind(error)
-        .bind(job_id)
-        .bind(item_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
-            "UPDATE metadata_reidentify_jobs
-             SET processed_count = processed_count + 1, updated_at = unixepoch()
-             WHERE id = ?",
-        )
-        .bind(job_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let query = "WITH changed_metadata_fill_request AS (
+                         SELECT item.job_id, item.item_id
+                         FROM metadata_reidentify_job_items item
+                         JOIN metadata_reidentify_jobs job ON job.id = item.job_id
+                         WHERE item.job_id = ? AND item.item_id = ?
+                           AND item.status = 'RUNNING'
+                           AND job.mode = 'FILL_MISSING' AND job.cancel_requested = 0
+                           AND (
+                               item.request_fingerprint <> item.claimed_request_fingerprint
+                               OR (item.request_fingerprint IS NULL
+                                   AND item.claimed_request_fingerprint IS NOT NULL)
+                               OR (item.request_fingerprint IS NOT NULL
+                                   AND item.claimed_request_fingerprint IS NULL)
+                               OR item.request_capabilities_json <>
+                                  item.claimed_request_capabilities_json
+                           )
+                     )
+                     UPDATE metadata_reidentify_job_items
+                     SET status = CASE WHEN EXISTS (
+                             SELECT 1 FROM changed_metadata_fill_request
+                         ) THEN 'PENDING' ELSE ? END,
+                         candidate_count = CASE WHEN EXISTS (
+                             SELECT 1 FROM changed_metadata_fill_request
+                         ) THEN 0 ELSE ? END,
+                         error = CASE WHEN EXISTS (
+                             SELECT 1 FROM changed_metadata_fill_request
+                         ) THEN NULL ELSE ? END,
+                         claimed_request_fingerprint = NULL,
+                         claimed_request_capabilities_json = '[]',
+                         updated_at = unixepoch()
+                     WHERE job_id = ? AND item_id = ? AND status = 'RUNNING'
+                     RETURNING status";
+        let item_status = self
+            .query_scalar::<String>(query)
+            .bind(job_id)
+            .bind(item_id)
+            .bind(status)
+            .bind(candidate_count)
+            .bind(error)
+            .bind(job_id)
+            .bind(item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if item_status
+            .as_deref()
+            .is_some_and(|item_status| item_status != "PENDING")
+        {
+            self.query(
+                "UPDATE metadata_reidentify_jobs
+                 SET processed_count = processed_count + 1, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(job_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -9215,7 +9453,10 @@ impl Database {
         let result = self
             .query(
                 "UPDATE metadata_reidentify_job_items
-                 SET status = 'FAILED', candidate_count = 0, error = ?, updated_at = unixepoch()
+                 SET status = 'FAILED', candidate_count = 0, error = ?,
+                     claimed_request_fingerprint = NULL,
+                     claimed_request_capabilities_json = '[]',
+                     updated_at = unixepoch()
                  WHERE job_id = ? AND status = 'RUNNING'",
             )
             .bind(error)
@@ -9261,7 +9502,10 @@ impl Database {
         let result = self
             .query(
                 "UPDATE metadata_reidentify_job_items
-             SET status = 'PENDING', error = NULL, updated_at = unixepoch()
+             SET status = 'PENDING', error = NULL,
+                 claimed_request_fingerprint = NULL,
+                 claimed_request_capabilities_json = '[]',
+                 updated_at = unixepoch()
              WHERE job_id = ? AND status = 'RUNNING'",
             )
             .bind(job_id)
@@ -9302,7 +9546,10 @@ impl Database {
             self.query(
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'FAILED', candidate_count = 0,
-                     error = 'JOB_CANCELLED', updated_at = unixepoch()
+                     error = 'JOB_CANCELLED',
+                     claimed_request_fingerprint = NULL,
+                     claimed_request_capabilities_json = '[]',
+                     updated_at = unixepoch()
                  WHERE job_id = ? AND status IN ('PENDING', 'RUNNING')",
             )
             .bind(job_id)
@@ -9413,6 +9660,8 @@ impl Database {
             self.query(
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
+                     claimed_request_fingerprint = NULL,
+                     claimed_request_capabilities_json = '[]',
                      updated_at = unixepoch()
                  WHERE job_id = ? AND status IN ('FAILED', 'RUNNING', 'PENDING', 'CANCELLED')",
             )

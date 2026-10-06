@@ -1,8 +1,9 @@
 use super::*;
 use crate::storage::{
-    ItemMetadataCompletenessCommit, NewItemMetadataCompletenessCheck,
+    ItemMetadataCompletenessCommit, MetadataFillMissingRequest, NewItemMetadataCompletenessCheck,
     NewItemMetadataCompletenessResult,
 };
+use std::collections::BTreeSet;
 
 const MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH: usize = 64;
 const MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES: usize = 256;
@@ -401,53 +402,19 @@ impl Database {
                         .map(|row| row.get::<String, _>("id")),
                 );
             }
-            let mut active_fill_missing_ids = HashSet::new();
-            for ids in schedulable_ids.chunks(100) {
-                if ids.is_empty() {
-                    continue;
-                }
-                let placeholders = std::iter::repeat_n("?", ids.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let query = format!(
-                    "SELECT DISTINCT job_items.item_id
-                     FROM metadata_reidentify_job_items job_items
-                     JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
-                     WHERE jobs.mode = 'FILL_MISSING'
-                       AND jobs.status IN ('QUEUED', 'RUNNING', 'DEFERRED')
-                       AND (jobs.status <> 'DEFERRED'
-                            OR jobs.updated_at >= unixepoch() - 3600)
-                       AND jobs.cancel_requested = 0
-                       AND (
-                           job_items.status IN ('PENDING', 'RUNNING')
-                           OR (jobs.status = 'DEFERRED'
-                               AND job_items.status = 'FAILED'
-                               AND job_items.error = 'SCRAPER_UNAVAILABLE')
-                       )
-                       AND job_items.item_id IN ({placeholders})"
-                );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query));
-                for item_id in ids {
-                    statement = statement.bind(item_id);
-                }
-                active_fill_missing_ids.extend(
-                    statement
-                        .fetch_all(&mut *transaction)
-                        .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?
-                        .into_iter()
-                        .map(|row| row.get::<String, _>("item_id")),
-                );
-            }
-            schedulable_ids.retain(|item_id| !active_fill_missing_ids.contains(item_id));
-            commit.scheduled_job_ids = self
-                .enqueue_fill_missing_jobs_in_transaction(
+            let requests = self
+                .build_metadata_fill_missing_requests(
                     &mut transaction,
                     library_id,
                     &schedulable_ids,
+                    results,
+                )
+                .await?;
+            commit.scheduled_job_ids = self
+                .enqueue_or_update_fill_missing_requests_in_transaction(
+                    &mut transaction,
+                    library_id,
+                    &requests,
                 )
                 .await?;
         }
@@ -460,6 +427,107 @@ impl Database {
                 source,
             })?;
         Ok(commit)
+    }
+
+    async fn build_metadata_fill_missing_requests(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        item_ids: &[String],
+        results: &[NewItemMetadataCompletenessResult<'_>],
+    ) -> Result<Vec<MetadataFillMissingRequest>, StorageError> {
+        let requested_item_ids = item_ids.iter().map(String::as_str).collect::<HashSet<_>>();
+        let mut fingerprints = HashMap::<String, Vec<u8>>::with_capacity(item_ids.len());
+        for result in results {
+            if !requested_item_ids.contains(result.item_id) {
+                continue;
+            }
+            if let Some(existing) = fingerprints.get(result.item_id) {
+                if existing.as_slice() != result.input_fingerprint {
+                    return Err(StorageError::Conflict(
+                        "fill-missing item has inconsistent completeness fingerprints".into(),
+                    ));
+                }
+            } else {
+                fingerprints.insert(result.item_id.to_owned(), result.input_fingerprint.to_vec());
+            }
+        }
+
+        let mut missing_by_item = HashMap::<String, Vec<(String, Option<Vec<u8>>)>>::new();
+        for item_batch in item_ids.chunks(100) {
+            if item_batch.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", item_batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT completeness.item_id, completeness.capability,
+                        completeness.input_fingerprint
+                 FROM item_metadata_completeness completeness
+                 JOIN media_items item ON item.id = completeness.item_id
+                 WHERE item.library_id = ? AND item.removed_at IS NULL
+                   AND item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
+                   AND completeness.local_state = 'READY'
+                   AND completeness.is_missing = 1
+                   AND completeness.item_id IN ({placeholders})
+                 ORDER BY completeness.item_id, completeness.updated_at DESC,
+                          completeness.checked_at DESC, completeness.capability"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+            for item_id in item_batch {
+                statement = statement.bind(item_id);
+            }
+            for row in statement
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                missing_by_item
+                    .entry(row.get("item_id"))
+                    .or_default()
+                    .push((row.get("capability"), row.get("input_fingerprint")));
+            }
+        }
+
+        let mut requests = Vec::with_capacity(item_ids.len());
+        for item_id in item_ids {
+            let Some(missing) = missing_by_item.get(item_id) else {
+                continue;
+            };
+            let fingerprint = fingerprints.get(item_id).cloned().or_else(|| {
+                missing
+                    .iter()
+                    .find_map(|(_, fingerprint)| fingerprint.clone())
+            });
+            let Some(fingerprint) = fingerprint else {
+                continue;
+            };
+            let capabilities = missing
+                .iter()
+                .filter(|(_, candidate_fingerprint)| {
+                    candidate_fingerprint.as_deref() == Some(fingerprint.as_slice())
+                })
+                .map(|(capability, _)| capability.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            if capabilities.is_empty() {
+                continue;
+            }
+            let capabilities_json = serde_json::to_string(&capabilities).map_err(|_| {
+                StorageError::Conflict("fill-missing capability set could not be encoded".into())
+            })?;
+            requests.push(MetadataFillMissingRequest {
+                item_id: item_id.clone(),
+                input_fingerprint: Some(fingerprint),
+                capabilities_json,
+            });
+        }
+        Ok(requests)
     }
 
     pub(crate) async fn prepare_item_metadata_completeness_check(

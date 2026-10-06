@@ -3941,7 +3941,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         (
             "FILL_MISSING".to_owned(),
             "QUEUED".to_owned(),
-            2,
+            4,
             "ITEMS".to_owned()
         )
     );
@@ -3953,10 +3953,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .fetch_all(database.pool())
         .await
         .expect("scheduled item page");
-    assert_eq!(
-        scheduled_items,
-        vec![item_ids[0].clone(), item_ids[1].clone()]
-    );
+    assert_eq!(scheduled_items, item_ids.clone());
 
     let queued_merge_fingerprint = b"queued-merge-v1";
     assert!(
@@ -4002,7 +3999,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             .fetch_one(database.pool())
             .await
             .expect("read merged queued job count"),
-        2
+        4
     );
 
     let replayed = database
@@ -4206,6 +4203,30 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     .execute(database.pool())
     .await
     .expect("set a non-provider deferred error");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'COMPLETED'
+         WHERE item_id = ? AND status = 'PENDING'
+           AND job_id IN (
+               SELECT id FROM metadata_reidentify_jobs
+               WHERE mode = 'FILL_MISSING' AND status = 'QUEUED'
+           )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("finish the changed snapshot job before testing deferred retry");
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'COMPLETED', processed_count = total_count
+         WHERE mode = 'FILL_MISSING' AND status = 'QUEUED' AND id IN (
+             SELECT job_id FROM metadata_reidentify_job_items WHERE item_id = ?
+         )",
+    )
+    .bind(&item_ids[3])
+    .execute(database.pool())
+    .await
+    .expect("close the queued snapshot job before testing deferred retry");
     let retried_non_provider_failure = database
         .complete_local_metadata_and_enqueue_fill_missing_with_policy(
             &library_id,
@@ -4251,6 +4272,112 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     assert_eq!(retried_expired_provider_failure.scheduled_job_ids.len(), 1);
 
     database.close().await;
+}
+
+#[tokio::test]
+async fn changed_fill_request_is_not_deduplicated_by_recent_provider_deferral()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Deferred snapshot", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id = "deferred-snapshot-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    let first_fingerprint = b"deferred-input-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    let first_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: first_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &first_result,
+            &[item_id.into()],
+        )
+        .await?;
+    let first_job_id = &first.scheduled_job_ids[0];
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs SET status = 'DEFERRED', updated_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(first_job_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+
+    let same_snapshot = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.into()])
+        .await?;
+    assert!(same_snapshot.scheduled_job_ids.is_empty());
+
+    let changed_fingerprint = b"deferred-input-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", changed_fingerprint)
+            .await?
+    );
+    let changed_result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: changed_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let changed = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &changed_result,
+            &[item_id.into()],
+        )
+        .await?;
+    assert_eq!(changed.scheduled_job_ids.len(), 1);
+    assert_ne!(changed.scheduled_job_ids[0], *first_job_id);
+    Ok(())
 }
 
 #[tokio::test]
@@ -9256,6 +9383,10 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
                 status TEXT NOT NULL,
                 priority INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL DEFAULT 0,
+                request_fingerprint BLOB,
+                request_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                claimed_request_fingerprint BLOB,
+                claimed_request_capabilities_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (job_id, item_id)
             )",
     )
@@ -10299,6 +10430,10 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
                 candidate_count INTEGER NOT NULL,
                 error TEXT,
                 updated_at INTEGER NOT NULL,
+                request_fingerprint BLOB,
+                request_capabilities_json TEXT NOT NULL DEFAULT '[]',
+                claimed_request_fingerprint BLOB,
+                claimed_request_capabilities_json TEXT NOT NULL DEFAULT '[]',
                 PRIMARY KEY (job_id, item_id)
             )",
     )
@@ -12967,6 +13102,613 @@ async fn fill_missing_job_creation_coalesces_active_items() -> Result<(), Box<dy
         .create_or_merge_fill_missing_job(&library_id, &item_ids[..1])
         .await?;
     assert_ne!(retried_expired_deferred_job, retried_non_provider_failure);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_fill_missing_job_keeps_empty_request_snapshot_defaults()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Snapshot migration", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_id = "legacy-fill-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &[item_id.to_owned()])
+        .await?;
+    let snapshot: (Option<Vec<u8>>, String, Option<Vec<u8>>, String) = database
+        .query_as(
+            "SELECT request_fingerprint, request_capabilities_json,
+                    claimed_request_fingerprint, claimed_request_capabilities_json
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(snapshot, (None, "[]".to_owned(), None, "[]".to_owned()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn changed_local_fill_request_during_running_item_is_not_lost()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Running Request Movie (2025)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Running.Request.Movie.2025.mkv"), b"video").await?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Running fill request", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("media root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String = database
+        .query_scalar(
+            "SELECT id FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id LIMIT 1",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+    let library_id = library.id.to_string();
+
+    let first_fingerprint = b"fill-request-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", first_fingerprint)
+            .await?
+    );
+    let first_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: first_fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &first_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(first_commit.scheduled_job_ids.len(), 1);
+    let job_id = &first_commit.scheduled_job_ids[0];
+    sqlx::query(
+        "CREATE TABLE fill_request_write_probe (
+             item_inserts INTEGER NOT NULL DEFAULT 0,
+             item_updates INTEGER NOT NULL DEFAULT 0,
+             job_inserts INTEGER NOT NULL DEFAULT 0
+         );
+         INSERT INTO fill_request_write_probe DEFAULT VALUES;
+         CREATE TRIGGER fill_request_item_insert_probe AFTER INSERT
+         ON metadata_reidentify_job_items
+         BEGIN
+             UPDATE fill_request_write_probe SET item_inserts = item_inserts + 1;
+         END;
+         CREATE TRIGGER fill_request_item_update_probe AFTER UPDATE
+         ON metadata_reidentify_job_items
+         BEGIN
+             UPDATE fill_request_write_probe SET item_updates = item_updates + 1;
+         END;
+         CREATE TRIGGER fill_request_job_insert_probe AFTER INSERT
+         ON metadata_reidentify_jobs
+         BEGIN
+             UPDATE fill_request_write_probe SET job_inserts = job_inserts + 1;
+         END;",
+    )
+    .execute(database.pool())
+    .await?;
+    let repeated_request = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(repeated_request.scheduled_job_ids.is_empty());
+    let repeated_writes: (i64, i64, i64) = database
+        .query_as("SELECT item_inserts, item_updates, job_inserts FROM fill_request_write_probe")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(repeated_writes, (0, 0, 0), "same input performs no job DML");
+
+    let queued_fingerprint = b"fill-request-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", queued_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", queued_fingerprint)
+            .await?
+    );
+    let queued_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: queued_fingerprint,
+        is_missing: true,
+        checked_at: 11,
+    }];
+    let queued_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &queued_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(queued_commit.scheduled_job_ids.is_empty());
+    let changed_queued_writes: (i64, i64, i64) = database
+        .query_as("SELECT item_inserts, item_updates, job_inserts FROM fill_request_write_probe")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        changed_queued_writes,
+        (0, 1, 0),
+        "queued input changes update the existing job item once"
+    );
+    let queued_snapshot: Vec<u8> = database
+        .query_scalar(
+            "SELECT request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(queued_snapshot, queued_fingerprint);
+
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    let same_running_request = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(same_running_request.scheduled_job_ids.is_empty());
+
+    let second_fingerprint = b"fill-request-v3";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", second_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", second_fingerprint)
+            .await?
+    );
+    let second_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: second_fingerprint,
+        is_missing: true,
+        checked_at: 12,
+    }];
+    let second_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &second_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(second_commit.scheduled_job_ids.is_empty());
+
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "CREDITS", second_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "CREDITS", second_fingerprint)
+            .await?
+    );
+    let added_capability_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "CREDITS",
+        input_fingerprint: second_fingerprint,
+        is_missing: true,
+        checked_at: 13,
+    }];
+    let changed_capability_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &added_capability_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(changed_capability_commit.scheduled_job_ids.is_empty());
+    let latest_capabilities: String = database
+        .query_scalar(
+            "SELECT request_capabilities_json FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(latest_capabilities, "[\"CREDITS\",\"POSTER\"]");
+
+    database
+        .finish_metadata_reidentify_item(job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+    assert_eq!(
+        database.next_metadata_reidentify_item(job_id).await?,
+        Some(item_id.clone()),
+        "the changed request must be claimable after the active item finishes"
+    );
+    let processed_count: i64 = database
+        .query_scalar("SELECT processed_count FROM metadata_reidentify_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(processed_count, 0, "a requeued item is not yet processed");
+
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    assert_eq!(
+        database
+            .fail_running_metadata_reidentify_items(job_id, "WORKER_FAILED")
+            .await?,
+        1
+    );
+    database
+        .finish_metadata_reidentify_job(job_id, "FAILED", Some("ITEM_FAILED"))
+        .await?;
+    assert!(database.retry_metadata_reidentify_job(job_id).await?);
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    let claimed_after_worker_retry: Vec<u8> = database
+        .query_scalar(
+            "SELECT claimed_request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(job_id)
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(claimed_after_worker_retry, second_fingerprint);
+    database
+        .finish_metadata_reidentify_item(job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+    assert_eq!(database.next_metadata_reidentify_item(job_id).await?, None);
+    let completed_count: i64 = database
+        .query_scalar("SELECT processed_count FROM metadata_reidentify_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(completed_count, 1, "only the final pass is counted");
+
+    database
+        .query("UPDATE metadata_reidentify_jobs SET status = 'QUEUED' WHERE id = ?")
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+    let completed_item_new_fingerprint = b"fill-request-completed-new-input";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                completed_item_new_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                completed_item_new_fingerprint,
+            )
+            .await?
+    );
+    let completed_item_new_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: completed_item_new_fingerprint,
+        is_missing: true,
+        checked_at: 12,
+    }];
+    let completed_item_new_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &completed_item_new_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(completed_item_new_commit.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database.next_metadata_reidentify_item(job_id).await?,
+        Some(item_id.clone()),
+        "a changed request reopens a completed item in a queued retry"
+    );
+    let requeued_processed_count: i64 = database
+        .query_scalar("SELECT processed_count FROM metadata_reidentify_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(requeued_processed_count, 0);
+    assert!(database.claim_metadata_reidentify_job(job_id).await?);
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    database
+        .finish_metadata_reidentify_item(job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+
+    let cancelled_fingerprint = b"fill-request-v4";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(&item_id, "POSTER", cancelled_fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(&item_id, "POSTER", cancelled_fingerprint)
+            .await?
+    );
+    let cancelled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: cancelled_fingerprint,
+        is_missing: true,
+        checked_at: 13,
+    }];
+    let cancelled_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &cancelled_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    let cancelled_job_id = &cancelled_commit.scheduled_job_ids[0];
+    assert!(
+        database
+            .claim_metadata_reidentify_job(cancelled_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(cancelled_job_id, 1)
+            .await?,
+        vec![item_id.clone()]
+    );
+    let newer_cancelled_fingerprint = b"fill-request-v5";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &item_id,
+                "POSTER",
+                newer_cancelled_fingerprint,
+            )
+            .await?
+    );
+    assert!(database
+        .claim_item_metadata_completeness_check(
+            &item_id,
+            "POSTER",
+            newer_cancelled_fingerprint,
+        )
+        .await?);
+    let newer_cancelled_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "POSTER",
+        input_fingerprint: newer_cancelled_fingerprint,
+        is_missing: true,
+        checked_at: 14,
+    }];
+    database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &newer_cancelled_result,
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(
+        database
+            .request_metadata_reidentify_job_cancel(cancelled_job_id)
+            .await?
+    );
+    database
+        .finish_metadata_reidentify_item(cancelled_job_id, &item_id, "COMPLETED", 1, None)
+        .await?;
+    assert_eq!(
+        database
+            .next_metadata_reidentify_item(cancelled_job_id)
+            .await?,
+        None,
+        "a cancellation request must prevent a follow-up pass"
+    );
+
+    let worker_error_item_id = "fill-request-worker-error-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Worker Error', 'worker error', 'LOCAL_CONFIRMED')",
+        )
+        .bind(worker_error_item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let worker_first_fingerprint = b"worker-input-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_first_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_first_fingerprint,
+            )
+            .await?
+    );
+    let worker_first_result = [NewItemMetadataCompletenessResult {
+        item_id: worker_error_item_id,
+        capability: "POSTER",
+        input_fingerprint: worker_first_fingerprint,
+        is_missing: true,
+        checked_at: 15,
+    }];
+    let worker_first_commit = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &worker_first_result,
+            &[worker_error_item_id.into()],
+        )
+        .await?;
+    let worker_job_id = &worker_first_commit.scheduled_job_ids[0];
+    assert!(
+        database
+            .claim_metadata_reidentify_job(worker_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(worker_job_id, 1)
+            .await?,
+        vec![worker_error_item_id]
+    );
+    let worker_latest_fingerprint = b"worker-input-v2";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_latest_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                worker_error_item_id,
+                "POSTER",
+                worker_latest_fingerprint,
+            )
+            .await?
+    );
+    let worker_latest_result = [NewItemMetadataCompletenessResult {
+        item_id: worker_error_item_id,
+        capability: "POSTER",
+        input_fingerprint: worker_latest_fingerprint,
+        is_missing: true,
+        checked_at: 16,
+    }];
+    database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &worker_latest_result,
+            &[worker_error_item_id.into()],
+        )
+        .await?;
+    assert_eq!(
+        database
+            .fail_running_metadata_reidentify_items(worker_job_id, "WORKER_FAILED")
+            .await?,
+        1
+    );
+    let latest_after_failure: Vec<u8> = database
+        .query_scalar(
+            "SELECT request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(worker_job_id)
+        .bind(worker_error_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(latest_after_failure, worker_latest_fingerprint);
+    database
+        .finish_metadata_reidentify_job(worker_job_id, "FAILED", Some("ITEM_FAILED"))
+        .await?;
+    assert!(
+        database
+            .retry_metadata_reidentify_job(worker_job_id)
+            .await?
+    );
+    assert!(
+        database
+            .claim_metadata_reidentify_job(worker_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(worker_job_id, 1)
+            .await?,
+        vec![worker_error_item_id]
+    );
+    let claimed_after_retry: Vec<u8> = database
+        .query_scalar(
+            "SELECT claimed_request_fingerprint FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(worker_job_id)
+        .bind(worker_error_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(claimed_after_retry, worker_latest_fingerprint);
     Ok(())
 }
 

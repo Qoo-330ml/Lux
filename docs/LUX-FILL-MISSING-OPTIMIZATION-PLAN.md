@@ -19,7 +19,7 @@ FNOS 当前运行 revision：`9979c4ba`；schema version：`160`。部署后 out
 
 日期：2026-10-05
 
-状态：待项目所有者确认后实施
+状态：LUX-401 的 job item 请求快照部分已在隔离 worktree 本地实现并完成 SQLite 定向验证；未部署。退避策略、剩余调度策略和 FNOS 指标仍按下文计划处理。
 
 ## 目标
 
@@ -90,7 +90,7 @@ FNOS 当前运行 revision：`9979c4ba`；schema version：`160`。部署后 out
 - 新 provider identity 是否替代了旧 provider identity；
 - 当前 job 是否覆盖了新的 capability plan。
 
-拟修复：为 FILL_MISSING item 记录稳定的 `input_fingerprint` 和 capability mask，或增加独立的 `metadata_fill_missing_requests` 幂等表。原子入队使用 `(item_id, input_fingerprint, capability_mask)` 判断重复。
+已实施（LUX-401，本地未部署）：双后端 job item migration 增加请求 fingerprint、规范化 capability JSON 与 claim 快照。相同快照沿用现有任务；queued item 更新为最新快照；running item 保存更新后的期望值，并在当前处理结束后最多重新排队一次；近期 `DEFERRED/SCRAPER_UNAVAILABLE` 只抑制相同快照。旧任务和手动创建的无快照 item 保持兼容。当前验证是固定 SQLite 状态机，不证明 PostgreSQL/NAS 性能或 FNOS CPU 收益。
 
 验收：旧 job 不会阻止新 capability；相同输入不会产生第二个有效 job；并发扫描和并发手动刷新只保留一个有效请求。
 
@@ -145,8 +145,8 @@ FNOS 当前运行 revision：`9979c4ba`；schema version：`160`。部署后 out
 内容：
 
 1. 增加 capability mask/input fingerprint 的持久边界；
-2. 原子化“检查并入队”；
-3. queued job 合并；
+2. 原子化“检查并入队”，为变化中的 queued/running intent 保留最新请求；
+3. queued job 合并并按签名更新/去重；
 4. 保留 SQLite/PostgreSQL 从空库迁移和并发写测试。
 
 验证：双后端 migration、并发入队测试、SQL 次数和 job 数量基准。
