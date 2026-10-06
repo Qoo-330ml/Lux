@@ -30,7 +30,6 @@ pub(crate) struct ItemMetadataCompletenessCommit {
     pub(crate) scheduled_job_ids: Vec<String>,
 }
 
-pub(crate) use repository::MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE;
 pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 pub use repository::{
     Database, DatabaseDiagnosticsSnapshot, DatabaseLifecycleCleanupReport, PersonListOptions,

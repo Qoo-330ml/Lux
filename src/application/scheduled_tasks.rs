@@ -6,7 +6,10 @@ use std::{
 };
 
 use time::OffsetDateTime;
-use tokio::{sync::Mutex, time::interval};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::interval,
+};
 
 use crate::{
     application::{
@@ -61,6 +64,7 @@ pub struct ScheduledTaskService {
     library_covers: Option<LibraryCoverService>,
     danmaku: Option<DanmakuService>,
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
+    thumbnail_retry_semaphore: Arc<Semaphore>,
 }
 
 struct TaskCursor {
@@ -168,6 +172,9 @@ impl ScheduledTaskService {
             library_covers: None,
             danmaku: None,
             cursors: Arc::new(Mutex::new(HashMap::new())),
+            thumbnail_retry_semaphore: Arc::new(Semaphore::new(
+                THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE as usize,
+            )),
         }
     }
 
@@ -393,12 +400,16 @@ impl ScheduledTaskService {
             return;
         };
         let now = OffsetDateTime::now_utc().unix_timestamp();
+        let available = self.thumbnail_retry_semaphore.available_permits();
+        if available == 0 {
+            return;
+        }
         let retries = match self
             .database
             .claim_due_thumbnail_scraper_retries(
                 now,
                 now.saturating_add(THUMBNAIL_SCRAPER_RETRY_LEASE_SECONDS),
-                THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE,
+                THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE.min(available as i64),
             )
             .await
         {
@@ -409,11 +420,15 @@ impl ScheduledTaskService {
             }
         };
         for retry in retries {
+            let Ok(permit) = self.thumbnail_retry_semaphore.clone().try_acquire_owned() else {
+                break;
+            };
             let database = self.database.clone();
             let metadata = metadata.clone();
             let thumbnails = thumbnails.clone();
             tokio::spawn(async move {
                 run_thumbnail_scraper_retry(database, metadata, thumbnails, retry).await;
+                drop(permit);
             });
         }
     }

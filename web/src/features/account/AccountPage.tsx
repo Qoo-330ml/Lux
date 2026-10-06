@@ -90,7 +90,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
   const logout = useMutation({
     mutationFn: () => api.logout(),
     onSuccess: () => {
-      queryClient.removeQueries({ queryKey: queryKeys.me });
+      queryClient.clear();
       navigate("/login", { replace: true });
     },
   });

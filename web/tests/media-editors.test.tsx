@@ -7,6 +7,7 @@ import { MediaImageEditor } from "../src/features/media/MediaImageEditor";
 import { MediaMetadataEditor } from "../src/features/media/MediaMetadataEditor";
 import { MediaSubtitleEditor } from "../src/features/media/MediaSubtitleEditor";
 import { api } from "../src/lib/api/client";
+import type { ImageSearchResult } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -75,6 +76,26 @@ describe("media editors", () => {
     await act(async () => container.querySelectorAll<HTMLButtonElement>(".lux-select-trigger")[0]?.click());
     await act(async () => document.querySelector<HTMLButtonElement>("[role=option][data-value='en-US']")?.click());
     expect(search).toHaveBeenLastCalledWith("item-1", { imageType: "POSTER", language: "en-US", source: "" });
+  });
+
+  it("ignores image search results from a type that is no longer selected", async () => {
+    vi.spyOn(api, "itemImages").mockResolvedValue({ images: [] });
+    let resolveSearch!: (value: { images: ImageSearchResult[] }) => void;
+    vi.spyOn(api, "searchItemImages").mockReturnValue(new Promise((resolve) => { resolveSearch = resolve; }));
+    const select = vi.spyOn(api, "selectItemImage").mockResolvedValue({
+      image: { imageType: "LOGO", imageIndex: 0, url: "logo.png" },
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+
+    await act(async () => root.render(<MediaImageEditor item={{ id: "item-1", title: "示例电影" }} onClose={() => undefined} />));
+    await act(async () => container.querySelector<HTMLButtonElement>(".lux-image-editor-toolbar .lux-button")?.click());
+    await act(async () => container.querySelectorAll<HTMLButtonElement>(".lux-image-type-tabs [role=tab]")[1]?.click());
+    await act(async () => resolveSearch({ images: [{ id: "poster-old", imageType: "POSTER", imageIndex: 0, source: "TMDB", url: "poster.png" }] }));
+
+    expect(container.querySelector(".lux-image-result")).toBeNull();
+    expect(select).not.toHaveBeenCalled();
   });
 
   it("marks the current image container with the selected image type", async () => {

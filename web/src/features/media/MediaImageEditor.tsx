@@ -41,6 +41,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
   const [searching, setSearching] = useState(false);
   const [selecting, setSelecting] = useState<string>();
   const [error, setError] = useState<string>();
+  const searchGeneration = useRef(0);
 
   useEffect(() => {
     closeRef.current?.focus();
@@ -65,25 +66,30 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
   }
 
   async function searchWithFilters(nextLanguage: string, nextSource: string) {
+    const generation = ++searchGeneration.current;
+    const requestedImageType = imageType;
     setSearching(true);
     setError(undefined);
     try {
       const response = await api.searchItemImages(item.id, { imageType, language: nextLanguage, source: nextSource });
-      setResults(response.images ?? []);
+      if (generation === searchGeneration.current && requestedImageType === imageType) {
+        setResults(response.images ?? []);
+      }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : "图片搜索失败，请重试。");
+      if (generation === searchGeneration.current) setError(cause instanceof Error ? cause.message : "图片搜索失败，请重试。");
     } finally {
-      setSearching(false);
+      if (generation === searchGeneration.current) setSearching(false);
     }
   }
 
   async function select(result: ImageSearchResult) {
+    const selectedImageType = imageType;
     setSelecting(result.id);
     setError(undefined);
     try {
-      const response = await api.selectItemImage(item.id, { imageType, url: result.url, language: result.language });
+      const response = await api.selectItemImage(item.id, { imageType: selectedImageType, url: result.url, language: result.language });
       setImages((current) => [
-        ...current.filter((image) => image.imageType !== imageType || image.imageIndex !== 0),
+        ...current.filter((image) => image.imageType !== selectedImageType || image.imageIndex !== 0),
         response.image,
       ]);
     } catch (cause) {
@@ -109,7 +115,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
         <div className="lux-image-editor-body">
           <div className="lux-image-type-tabs" role="tablist" aria-label="图像类型">
             {imageTypes.map((entry) => (
-              <button key={entry.value} className={entry.value === imageType ? "is-active" : ""} type="button" role="tab" aria-selected={entry.value === imageType} onClick={() => { setImageType(entry.value); setResults([]); }}>
+              <button key={entry.value} className={entry.value === imageType ? "is-active" : ""} type="button" role="tab" aria-selected={entry.value === imageType} onClick={() => { searchGeneration.current += 1; setImageType(entry.value); setResults([]); setSearching(false); }}>
                 <ImageIcon size={15} /> {entry.label}
               </button>
             ))}

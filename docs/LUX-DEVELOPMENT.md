@@ -8525,7 +8525,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] 定向 Rust 测试、build、fmt、Clippy 和差异检查通过；全目标 Rust 测试结果及已有独立失败如实记录。
 - [x] 性能记录区分 FNOS 基线执行计划与本地 SQLite 查询计划，不把未部署变更表述为生产收益。
 
-预计文件：`src/storage/jobs.rs`、`migrations/0162_scan_job_failed_count_index.sql`、`migrations-postgres/0162_scan_job_failed_count_index.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+预计文件：`src/storage/jobs.rs`、`migrations/0163_scan_job_failed_count_index.sql`、`migrations-postgres/0163_scan_job_failed_count_index.sql`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
 
 结果（2026-10-06）：管理健康计数从一次历史表条件聚合改为两个可由状态部分索引覆盖的 `COUNT(*)` 子查询；新增 SQLite/PostgreSQL `FAILED` 部分索引，schema 版本为 162。SQLite 空库迁移、计数与 `EXPLAIN QUERY PLAN` 单测通过；`admin_health`、dashboard、ready/version、storage 目标通过，storage 47 项全过；scanner 17 项、danmaku 7 项、scanning_jobs 80 项通过。全量 `cargo test --locked --all-targets` 的库测试为 729 passed、11 ignored；随后在既有无关 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）。`scanning_jobs` 全目标中另有一个用例并行运行时超时，单独串行复跑通过。Build、fmt、all-target Clippy 和 `git diff --check` 通过。本机没有 PostgreSQL 服务，Docker daemon 未启动，PostgreSQL 迁移未做运行时验证；FNOS 上仍是旧 revision，未部署、未测生产收益。
 
@@ -8602,9 +8602,11 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] 取消、重试、worker 异常恢复和非 FILL_MISSING job 状态/计数语义保持正确，任务 API DTO 不变。
 - [ ] SQLite 状态机回归、migration-from-empty 与 build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同经可用的集成目标验证。
 
-短计划与文件：先在 `src/storage/repository_tests.rs` 为 RUNNING item 收到新 fingerprint/capability 后仍需处理新意图写失败回归；新增 `migrations/0163_metadata_fill_request_snapshots.sql` 与 `migrations-postgres/0163_metadata_fill_request_snapshots.sql`；实现涉及 `src/storage/mod.rs`、`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`，以及 schema version 断言和迁移序列检查；最后更新本任务记录、`docs/PERFORMANCE.md` 与 `docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。只处理自动 FILL_MISSING 请求快照，不扩展到其他 metadata 模式。
+短计划与文件：先在 `src/storage/repository_tests.rs` 为 RUNNING item 收到新 fingerprint/capability 后仍需处理新意图写失败回归；新增 `migrations/0164_metadata_fill_request_snapshots.sql` 与 `migrations-postgres/0164_metadata_fill_request_snapshots.sql`；实现涉及 `src/storage/mod.rs`、`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`，以及 schema version 断言和迁移序列检查；最后更新本任务记录、`docs/PERFORMANCE.md` 与 `docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。只处理自动 FILL_MISSING 请求快照，不扩展到其他 metadata 模式。
 
 结果（2026-10-06）：相同快照重试对 job/item 表执行 0 次 INSERT、0 次 UPDATE；queued 输入变化更新既有 item 一次；RUNNING 期间出现变化的请求在 worker 收尾后重新进入 PENDING，取消不会重排，显式 retry 使用最新 fingerprint。迁移版本推进到 163，更新 SQLite/PostgreSQL schema-version 断言和迁移序列检查。定向状态机、旧任务 migration、claim/recovery fixture、`admin_health`、`ready_version`、`storage` 通过；build、fmt 和全目标全 feature Clippy 通过。全目标测试 `--no-fail-fast` 中 737 个库测试通过、11 个忽略；集成测试中 `emby_counts`（实际 1、期望 0）及 `strm`（401、期望 200）失败，前者已有独立基线记录，后者单独复跑仍失败但与本任务改动路径无关；`library_cover_generation` 全套时曾失败，独立复跑 5 项通过。PostgreSQL 测试端口 127.0.0.1:55432 未监听且 Docker 不可用，故未运行 PostgreSQL 集成迁移；本机 `arm64`，未部署 FNOS，也未测 CPU/生产墙钟收益。完整完成门仍未满足。
+
+发布集成说明（2026-10-06，0.5.19）：保留 GitHub `test` 已发布的 `0162_filesystem_entry_directory_prefix_index.sql` 及全部历史迁移内容。LUX-395/LUX-401 尚未部署的迁移分别顺延为 0163/0164，同步双后端迁移列表、schema-version 断言和请求快照升级 fixture 的起始版本。上方测试结果对应功能分支原编号（162/163），不代表重新编号后的集成验证；本次按项目所有者要求不运行测试、构建或 lint，仅做 Git 差异、迁移编号/引用和合并保留检查。
 
 #### 本轮代码质量与性能优化收口
 

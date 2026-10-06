@@ -8288,7 +8288,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE strm_probe_jobs
-             SET status = ?, error = ?, finished_at = unixepoch(), updated_at = unixepoch()
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
         .bind(status)
@@ -10358,7 +10360,9 @@ impl Database {
     ) -> Result<(), StorageError> {
         self.query(
             "UPDATE scan_jobs
-             SET status = ?, error = ?, cursor = NULL, current_item = NULL,
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 cursor = NULL, current_item = NULL,
                  scan_phase = 'IDLE',
                  finished_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ? AND (status IN ('PENDING', 'RUNNING')
@@ -11524,21 +11528,13 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) async fn delete_media_sources(
+    pub(crate) async fn delete_media_sources_atomically(
         &self,
-        source_pairs: &[(&str, &str)],
+        sources: &[(String, String)],
     ) -> Result<bool, StorageError> {
-        if source_pairs.is_empty() {
-            return Ok(true);
+        if sources.is_empty() {
+            return Ok(false);
         }
-        if source_pairs.len() > MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE {
-            return Err(StorageError::Conflict(
-                "media source delete batch is too large".to_owned(),
-            ));
-        }
-        let source_placeholders = std::iter::repeat_n("?", source_pairs.len())
-            .collect::<Vec<_>>()
-            .join(", ");
         let mut transaction = self
             .pool
             .begin()
@@ -11547,6 +11543,39 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        for source_batch in sources.chunks(MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE) {
+            let source_pairs = source_batch
+                .iter()
+                .map(|(item_id, source_id)| (item_id.as_str(), source_id.as_str()))
+                .collect::<Vec<_>>();
+            if !self
+                .delete_media_sources_in_transaction(&mut transaction, &source_pairs)
+                .await?
+            {
+                return Ok(false);
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    async fn delete_media_sources_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        source_pairs: &[(&str, &str)],
+    ) -> Result<bool, StorageError> {
+        if source_pairs.is_empty() {
+            return Ok(true);
+        }
+        let source_placeholders = std::iter::repeat_n("?", source_pairs.len())
+            .collect::<Vec<_>>()
+            .join(", ");
         let mut lookup = self.query_as::<(String, String, Option<String>, Option<String>)>(
             sqlx::AssertSqlSafe(format!(
                 "SELECT ms.id, ms.item_id, old_item.parent_id, old_item.series_id
@@ -11559,7 +11588,7 @@ impl Database {
             lookup = lookup.bind(source_id);
         }
         let rows = lookup
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -11597,7 +11626,7 @@ impl Database {
             delete_query = delete_query.bind(source_id).bind(item_id);
         }
         let deleted = delete_query
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -11606,19 +11635,12 @@ impl Database {
         if usize::try_from(deleted.rows_affected()).unwrap_or(usize::MAX) != source_pairs.len() {
             return Ok(false);
         }
-        self.mark_media_items_removed_in_transaction(&mut transaction, &item_ids)
+        self.mark_media_items_removed_in_transaction(transaction, &item_ids)
             .await?;
-        self.mark_media_items_removed_in_transaction(&mut transaction, &parent_ids)
+        self.mark_media_items_removed_in_transaction(transaction, &parent_ids)
             .await?;
-        self.mark_media_items_removed_in_transaction(&mut transaction, &series_ids)
+        self.mark_media_items_removed_in_transaction(transaction, &series_ids)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         Ok(true)
     }
 
@@ -11669,6 +11691,70 @@ mod tests {
     };
     use crate::config::Config;
     use sqlx::Row;
+
+    #[tokio::test]
+    async fn finishing_a_cancelled_strm_job_cannot_restore_terminal_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query("INSERT INTO strm_probe_jobs (id, operation_id, library_id, status, concurrency) VALUES ('job', 'op', 'lib', 'RUNNING', 1)")
+            .execute(database.pool())
+            .await?;
+        database.request_strm_probe_job_cancel("job").await?;
+        database
+            .finish_strm_probe_job("job", "COMPLETED", None)
+            .await?;
+        let status: String = database
+            .query_scalar("SELECT status FROM strm_probe_jobs WHERE id = 'job'")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(status, "CANCELLED");
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finishing_a_cancelled_scan_job_cannot_restore_terminal_status()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+                 VALUES ('job', 'lib', 'RECONCILE_LIBRARY', 'RUNNING', 'generation')",
+            )
+            .execute(database.pool())
+            .await?;
+        database.request_scan_job_cancel("job").await?;
+        database
+            .finish_scan_job("job", "COMPLETED", Some("late worker completion"))
+            .await?;
+        let (status, error): (String, Option<String>) = database
+            .query_as("SELECT status, error FROM scan_jobs WHERE id = 'job'")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(status, "CANCELLED");
+        assert_eq!(error, None);
+        database.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn local_metadata_completeness_reuses_current_source_identities()
@@ -12411,9 +12497,11 @@ mod tests {
         }
 
         database.reset_query_count();
+        let invalid_sources = [("wrong-item", "source-a"), ("item", "missing")]
+            .map(|(item_id, source_id)| (item_id.to_owned(), source_id.to_owned()));
         assert!(
             !database
-                .delete_media_sources(&[("wrong-item", "source-a"), ("item", "missing")])
+                .delete_media_sources_atomically(&invalid_sources)
                 .await?
         );
         assert_eq!(
@@ -12429,21 +12517,87 @@ mod tests {
             2
         );
         database.reset_query_count();
-        let oversized = vec![("item", "source-a"); MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE + 1];
-        assert!(database.delete_media_sources(&oversized).await.is_err());
-        assert_eq!(
-            database.query_count(),
-            0,
-            "oversized batches fail before SQL"
-        );
-
-        database.reset_query_count();
-        let sources = [("item", "source-a"), ("item", "source-b")];
-        assert!(database.delete_media_sources(&sources).await?);
+        let sources = [("item", "source-a"), ("item", "source-b")]
+            .map(|(item_id, source_id)| (item_id.to_owned(), source_id.to_owned()));
+        assert!(database.delete_media_sources_atomically(&sources).await?);
         assert_eq!(
             database.query_count(),
             3,
             "two source rows should share one lookup, delete, and hierarchy cleanup"
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert!(
+            database
+                .query_scalar::<Option<i64>>("SELECT removed_at FROM media_items WHERE id = 'item'")
+                .fetch_one(database.pool())
+                .await?
+                .is_some()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deleting_media_sources_atomically_rolls_back_across_batches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('item', 'lib', 'MOVIE', 'Item', 'item', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        let sources = (0..=MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE)
+            .map(|index| ("item".to_owned(), format!("source-{index}")))
+            .collect::<Vec<_>>();
+        for (_, source_id) in &sources {
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, 'item', 'LOCAL_FILE', 1, 'PENDING')",
+                )
+                .bind(source_id)
+                .execute(database.pool())
+                .await?;
+        }
+
+        let mut missing_source = sources.clone();
+        missing_source[MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE].1 = "missing".to_owned();
+        assert!(
+            !database
+                .delete_media_sources_atomically(&missing_source)
+                .await?
+        );
+        assert_eq!(
+            database
+                .query_scalar::<i64>("SELECT COUNT(*) FROM media_sources WHERE item_id = 'item'")
+                .fetch_one(database.pool())
+                .await?,
+            i64::try_from(sources.len())?
+        );
+
+        database.reset_query_count();
+        assert!(database.delete_media_sources_atomically(&sources).await?);
+        assert_eq!(
+            database.query_count(),
+            6,
+            "each of two source batches should use one lookup, delete, and hierarchy cleanup"
         );
         assert_eq!(
             database
