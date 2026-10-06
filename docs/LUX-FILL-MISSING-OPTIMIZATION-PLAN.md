@@ -74,13 +74,13 @@ FNOS 当前运行 revision：`9979c4ba`；schema version：`160`。部署后 out
 - provider ID、scraper、锁定状态、策略或缺失 capability 变化时 fingerprint 改变；
 - XML 排列、NFO 缓存重建不改变 fingerprint。
 
-### P1：`retry_after` 没有形成退避闭环
+### P1：provider 不可用的自动 job 缺少逐 item 退避
 
-表中已有 `retry_after`，但 completeness 完成路径会清空它，provider 不可用的 `DEFERRED` 任务也没有把下次自动尝试时间写回 completeness。结果是系统只能依赖任务状态查询或下一次扫描，缺少按能力和 provider 的退避控制。
+`item_metadata_completeness.retry_after` 只控制本地 completeness 检查失败后的重新领取，不代表在线 provider 的退避。自动 `FILL_MISSING` 的 provider 不可用结果保存在 `metadata_reidentify_job_items.error='SCRAPER_UNAVAILABLE'`，当前仅通过 `DEFERRED` job 的一小时窗口去重；持续不可用时，后续扫描会再次创建相同请求。能力级 scraper attempt 也不能替代 job 级退避，因为尚未获得 provider identity 或 scraper 服务整体不可用时没有可用的能力 attempt key。
 
-拟修复：为 provider unavailable、低置信度和永久 unsupported 分开记录 retry policy；自动扫描只处理 `retry_after IS NULL OR retry_after <= now` 的记录。
+LUX-402 将给有自动请求快照的 job item 保存自动失败次数及到期时间。同一 fingerprint/capability 在 5 分钟、30 分钟、最多 6 小时的退避期内合并/去重；到期后由下一次自动扫描重试，并将次数延续到新 job。输入快照变化不继承旧退避，管理员手动 retry 立即解禁；无快照人工 job 不改变语义。
 
-验收：provider 不可用时按 5 分钟、30 分钟、6 小时等有界退避；同一失败期间不创建重复 job；人工重试绕过退避。
+验收：持续 provider 不可用时同一输入按有界退避重试且不在冷却期重复创建 job；新 capability、fingerprint 和人工 retry 不被旧请求退避误伤。
 
 ### P1：任务去重粒度只有 item，没有 capability/fingerprint 证据
 
@@ -94,13 +94,13 @@ FNOS 当前运行 revision：`9979c4ba`；schema version：`160`。部署后 out
 
 验收：旧 job 不会阻止新 capability；相同输入不会产生第二个有效 job；并发扫描和并发手动刷新只保留一个有效请求。
 
-### P2：每个批次都可能新建 job，缺少 queued job 合并
+### P2：多条 QUEUED job 时追加逻辑只检查最旧任务
 
-当前每批最多 100 个 item，但不同 local metadata batch 会分别创建 job。大量小批次会产生许多小 job，即使它们属于同一 library、同一策略和相近时间窗口。
+当前入口会把新 item 合并到该库最旧的一条 `QUEUED FILL_MISSING` job，最多 100 项；如果这条任务已满，即使同库还有较新的未满 `QUEUED` job，入口仍会新建 job，而不会继续填充其他可用队列容量。通常扫描请求会复用同一条队列，但已有多条队列时会形成小 job。
 
-拟修复：同一 library 的自动 `FILL_MISSING` 在短窗口内优先追加到一个 `QUEUED` job；只在 job 已 claim、输入 fingerprint 不兼容或达到上限时创建新 job。每个 job 仍保持 item 上限和分页上限。
+后续独立修复应按创建顺序遍历有剩余容量的 queued job，或一次查询各 queued job 的可用容量并有界分配；不能修改 `RUNNING` job，所有 job 仍不超过 100 项。
 
-验收：同一批扫描产生的 50 个小请求合并为有界数量的 job；运行中 job 不被修改，避免 worker 看到不一致输入。
+验收：同一媒体库存在多条未满 queued job 时，新 item 按序填满已有容量，再创建新 job；每个 item 只出现一次，且 job/item 计数一致。
 
 ### P2：全量扫描策略和实时补全策略边界不够清晰
 
