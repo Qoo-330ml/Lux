@@ -504,3 +504,141 @@ async fn emby_media_folders_applies_pagination_across_accessible_libraries()
     assert_eq!(body["Items"].as_array().map(Vec::len), Some(1));
     Ok(())
 }
+
+#[tokio::test]
+async fn modified_notification_and_admin_endpoint_refresh_local_metadata_precisely()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    for (directory, file) in [
+        ("Alpha (2020)", "Alpha.2020.mkv"),
+        ("Beta (2021)", "Beta.2021.mkv"),
+    ] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(file), b"movie").await?;
+        tokio::fs::write(movie_dir.join("poster.jpg"), b"jpg").await?;
+    }
+    let root = libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    let wait_for_posters = |expected: i64| {
+        let database = database.clone();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                loop {
+                    let posters: i64 = sqlx::query_scalar(
+                        "SELECT COUNT(DISTINCT item_id) FROM item_images
+                         WHERE image_type = 'POSTER'",
+                    )
+                    .fetch_one(database.pool())
+                    .await?;
+                    if posters == expected {
+                        return Ok::<_, sqlx::Error>(());
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            })
+            .await
+        }
+    };
+    wait_for_posters(2).await??;
+    // Items that lost their images although nothing changed on disk.
+    sqlx::query("DELETE FROM item_images")
+        .execute(database.pool())
+        .await?;
+
+    let key = AdminApiKeyService::new(config.config_dir.clone(), database.clone())
+        .rotate()
+        .await?;
+    let (base_url, _server) = start_server(config, database.clone(), setup).await?;
+    let client = reqwest::Client::new();
+
+    // An Emby-compatible "Modified" notification for one directory re-indexes just that one.
+    let response = client
+        .post(format!("{base_url}/Library/Media/Updated"))
+        .query(&[("api_key", key.as_str())])
+        .json(&json!({
+            "Updates": [{
+                "Path": media_root.join("Alpha (2020)").to_string_lossy(),
+                "UpdateType": "Modified"
+            }]
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response.json::<serde_json::Value>().await?;
+    assert_eq!(body["localMetadataEntries"], 1);
+    wait_for_posters(1).await??;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    wait_for_posters(1).await??;
+
+    // "Created" only queues the incremental scan; it must not trigger the extra refresh.
+    let response = client
+        .post(format!("{base_url}/Library/Media/Updated"))
+        .query(&[("api_key", key.as_str())])
+        .json(&json!({
+            "Updates": [{
+                "Path": media_root.join("Beta (2021)").to_string_lossy(),
+                "UpdateType": "Created"
+            }]
+        }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    assert_eq!(
+        response.json::<serde_json::Value>().await?["localMetadataEntries"],
+        0
+    );
+
+    // The admin endpoint takes library-relative directories.
+    let response = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{}/refresh-local-metadata",
+            library.id
+        ))
+        .header("X-Lux-Api-Key", &key)
+        .json(&json!({ "rootId": root.id, "paths": ["Beta (2021)"] }))
+        .send()
+        .await?;
+    assert_eq!(response.status(), StatusCode::ACCEPTED);
+    let body = response.json::<serde_json::Value>().await?;
+    assert_eq!(body["scope"], "LOCAL_METADATA");
+    assert_eq!(body["entries"], 1);
+    wait_for_posters(2).await??;
+
+    for paths in [json!([]), json!(["."]), json!(["../outside"])] {
+        let response = client
+            .post(format!(
+                "{base_url}/api/v1/admin/libraries/{}/refresh-local-metadata",
+                library.id
+            ))
+            .header("X-Lux-Api-Key", &key)
+            .json(&json!({ "paths": paths }))
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{paths}"
+        );
+    }
+    Ok(())
+}

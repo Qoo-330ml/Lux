@@ -692,6 +692,89 @@ impl Database {
             .collect())
     }
 
+    /// Filesystem entry ids of the media sources (video / STRM files) below the given library
+    /// root directories, at any depth.
+    ///
+    /// Used to re-run local metadata (NFO and image) indexing for exact directories without
+    /// walking the whole root. Directories are relative to the root and must not be empty.
+    pub(crate) async fn list_media_source_entry_ids_under_directories(
+        &self,
+        library_root_id: &str,
+        directories: &[String],
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        let mut ids = Vec::new();
+        for chunk in directories.chunks(SCAN_DML_CHUNK_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let remaining = limit.saturating_sub(i64::try_from(ids.len()).unwrap_or(i64::MAX));
+            if remaining <= 0 {
+                break;
+            }
+            let values = std::iter::repeat_n("(?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            // PostgreSQL: byte-order range operators served by idx_filesystem_entries_dir_prefix,
+            // driven from the directories with LATERAL (a plain join is planned as a full scan of
+            // filesystem_entries; see postgres_sidecar_target_query).
+            let query = if self.backend == DatabaseBackend::Postgres {
+                format!(
+                    "WITH sd(directory) AS (VALUES {values})
+                     SELECT DISTINCT matched.id
+                     FROM sd
+                     CROSS JOIN LATERAL (
+                         SELECT fe.id FROM filesystem_entries fe
+                         WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                           AND fe.entry_kind = 'FILE'
+                           AND (fe.relative_path ~>=~ (sd.directory || '/'))
+                           AND (fe.relative_path ~<~ (sd.directory || '0'))
+                           AND EXISTS (
+                               SELECT 1 FROM media_sources ms
+                               WHERE ms.filesystem_entry_id = fe.id
+                           )
+                         OFFSET 0
+                     ) matched
+                     ORDER BY matched.id
+                     LIMIT ?"
+                )
+            } else {
+                format!(
+                    "WITH sd(directory) AS (VALUES {values})
+                     SELECT DISTINCT fe.id
+                     FROM sd
+                     CROSS JOIN filesystem_entries fe
+                     WHERE fe.library_root_id = ? AND fe.is_missing = 0
+                       AND fe.entry_kind = 'FILE'
+                       AND fe.relative_path >= sd.directory || '/'
+                       AND fe.relative_path < sd.directory || '0'
+                       AND EXISTS (
+                           SELECT 1 FROM media_sources ms WHERE ms.filesystem_entry_id = fe.id
+                       )
+                     ORDER BY fe.id
+                     LIMIT ?"
+                )
+            };
+            let mut statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(query));
+            for directory in chunk {
+                statement = statement.bind(directory);
+            }
+            let rows = statement
+                .bind(library_root_id)
+                .bind(remaining)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            ids.extend(rows);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
     pub(crate) async fn list_scan_local_metadata_sources(
         &self,
         filesystem_entry_ids: &[String],

@@ -1433,3 +1433,106 @@ async fn failed_local_poster_insert_does_not_mark_image_stage_complete()
     assert_eq!(image_count, 3, "retry should index all local posters");
     Ok(())
 }
+
+#[tokio::test]
+async fn local_metadata_refresh_reindexes_only_the_requested_directories()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    for (directory, file) in [
+        ("Alpha (2020)", "Alpha.2020.mkv"),
+        ("Beta (2021)", "Beta.2021.mkv"),
+    ] {
+        let movie_dir = media_root.join(directory);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(file), b"movie").await?;
+        tokio::fs::write(movie_dir.join("poster.jpg"), b"jpg").await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let open: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM scan_local_metadata_batches
+                 WHERE status IN ('PENDING', 'RUNNING')",
+            )
+            .fetch_one(database.pool())
+            .await?;
+            if open == 0 {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    let posters = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(DISTINCT item_id) FROM item_images WHERE image_type = 'POSTER'",
+        )
+        .fetch_one(database.pool())
+        .await
+    };
+    assert_eq!(posters().await?, 2, "the initial scan indexes both posters");
+
+    // Simulate items that lost their images although the files on disk are unchanged.
+    sqlx::query("DELETE FROM item_images")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(posters().await?, 0);
+
+    let accepted = jobs
+        .start_local_metadata_refresh(library.id, None, &["Alpha (2020)".to_owned()])
+        .await?;
+    assert_eq!(accepted.directories, 1);
+    assert_eq!(accepted.entries, 1);
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if posters().await? == 1 {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+
+    let restored_title: String = sqlx::query_scalar(
+        "SELECT mi.title FROM media_items mi
+         JOIN item_images i ON i.item_id = mi.id AND i.image_type = 'POSTER'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(restored_title.starts_with("Alpha"), "{restored_title}");
+    // The other directory was not part of the request and stays untouched.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert_eq!(posters().await?, 1);
+
+    // Invalid paths are rejected instead of silently matching nothing.
+    assert!(
+        jobs.start_local_metadata_refresh(library.id, None, &["../escape".to_owned()])
+            .await
+            .is_err()
+    );
+    assert!(
+        jobs.start_local_metadata_refresh(library.id, None, &[])
+            .await
+            .is_err()
+    );
+    Ok(())
+}

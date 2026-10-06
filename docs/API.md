@@ -65,6 +65,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：将媒体库加入或移出普通用户的显式访问范围。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF；没有任何显式允许项时，用户默认可访问全部已启用媒体库，有显式允许项时仅能访问这些媒体库。
 - `POST /api/v1/admin/libraries/{libraryId}/scan`：创建并异步执行分批扫描任务，返回 202 和 job 状态。
 - `POST /api/v1/admin/libraries/{libraryId}/scan-path`：管理员按媒体库根目录下的相对路径创建局部 `INCREMENTAL_SCAN`。请求体为 `{ "rootId": "<libraryRootId>", "path": "Movies/NewMovie", "recursive": true }`；单根媒体库可省略 `rootId`，多根媒体库必须提供。`path` 必须是非空的库内相对路径，不接受 `.`, `..`、绝对路径、反斜杠穿越或 Windows 盘符；当前 `recursive` 必须为 `true`。接口只入队路径并返回 202，不在 HTTP 请求中扫描目录。
+- `POST /api/v1/admin/libraries/{libraryId}/refresh-local-metadata`：管理员对库内**精确目录**重新索引本地 NFO 与图片，不扫描整个根目录。用于外部工具（刮削器、Immortal 等）在视频文件未变化时写入或修复了旁车文件的场景：局部扫描只处理指纹变化的文件，全库回填要遍历根目录所有文件，两者都不适用。请求体为 `{ "rootId": "<libraryRootId>", "paths": ["Movies/NewMovie"] }`；单根媒体库可省略 `rootId`。`paths` 为库内相对目录（至少 1 个、最多 2000 个，规则同 `scan-path`），目录下任意深度的视频/STRM 文件都会被重新索引（单次最多 20000 个条目）。接口返回 202 和 `{ "scope": "LOCAL_METADATA", "directories": n, "entries": m }`，实际工作在后台串行执行；路径无效或列表为空返回 422。
 - `POST /api/v1/admin/libraries/{libraryId}/reconcile`：按当前库配置创建并异步执行一次调和扫描；已停用或不存在的媒体库返回 404。
 - `POST /api/v1/admin/jobs/{jobId}/cancel`：请求取消扫描任务，返回 202。
 - `GET /api/v1/admin/jobs?page=1&pageSize=50&status=FAILED`：管理员分页查看扫描任务，可按 `PENDING`、`RUNNING`、`COMPLETED`、`CANCELLED` 或 `FAILED` 过滤。
