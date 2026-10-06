@@ -606,10 +606,13 @@ impl Database {
     ) -> Result<bool, StorageError> {
         self.query(
             "UPDATE emby_migration_jobs
-             SET status = ?, phase = ?, error = ?, updated_at = unixepoch(),
+             SET status = CASE WHEN cancel_requested = 1 THEN 'CANCELLED' ELSE ? END,
+                 phase = ?,
+                 error = CASE WHEN cancel_requested = 1 THEN NULL ELSE ? END,
+                 updated_at = unixepoch(),
                  started_at = CASE WHEN ? = 'RUNNING' AND started_at IS NULL THEN unixepoch() ELSE started_at END,
-                 finished_at = CASE WHEN ? IN ('COMPLETED', 'CANCELLED', 'FAILED') THEN unixepoch() ELSE finished_at END
-             WHERE id = ?",
+                 finished_at = CASE WHEN cancel_requested = 1 OR ? IN ('COMPLETED', 'CANCELLED', 'FAILED') THEN unixepoch() ELSE finished_at END
+             WHERE id = ? AND status IN ('PENDING', 'RUNNING')",
         )
         .bind(status)
         .bind(phase)

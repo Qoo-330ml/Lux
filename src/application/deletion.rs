@@ -1,12 +1,16 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     path::{Component, PathBuf},
+    sync::{Arc, OnceLock, Weak},
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::json;
-use tokio::fs;
+use tokio::{
+    fs,
+    sync::{Mutex, OwnedMutexGuard},
+};
 
 use crate::{
     application::{
@@ -14,8 +18,26 @@ use crate::{
         notification_template::bounded_display_text,
         webhooks::{WebhookEventType, WebhookService},
     },
-    storage::{Database, MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE, StorageError},
+    storage::{Database, StorageError},
 };
+
+static MEDIA_DELETE_LOCKS: OnceLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> = OnceLock::new();
+
+async fn acquire_media_delete_lock(item_id: &str) -> OwnedMutexGuard<()> {
+    let locks = MEDIA_DELETE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let lock = {
+        let mut locks = locks.lock().await;
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(item_id).and_then(Weak::upgrade) {
+            lock
+        } else {
+            let lock = Arc::new(Mutex::new(()));
+            locks.insert(item_id.to_owned(), Arc::downgrade(&lock));
+            lock
+        }
+    };
+    lock.lock_owned().await
+}
 
 #[derive(Clone)]
 pub struct MediaDeleteService {
@@ -41,6 +63,7 @@ impl MediaDeleteService {
         item_id: &str,
         source_id: Option<&str>,
     ) -> Result<MediaDeleteReport, MediaDeleteError> {
+        let deletion_guard = acquire_media_delete_lock(item_id).await;
         let sources = match source_id {
             Some(source_id) => self
                 .database
@@ -153,18 +176,47 @@ impl MediaDeleteService {
                 }
             }
         }
-        for path in &paths {
-            fs::remove_file(path).await?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let mut staged_paths = Vec::with_capacity(paths.len());
+        for (index, path) in paths.iter().enumerate() {
+            let parent = path
+                .parent()
+                .ok_or_else(|| MediaDeleteError::PathOutsideRoot(path.clone()))?;
+            let staged = parent.join(format!(".lux-delete-{nonce}-{index}"));
+            if let Err(error) = fs::rename(path, &staged).await {
+                restore_staged_paths(&staged_paths).await;
+                return Err(error.into());
+            }
+            staged_paths.push((path.clone(), staged));
         }
-        for source_batch in sources.chunks(MAX_MEDIA_SOURCE_DELETE_BATCH_SIZE) {
-            let source_pairs = source_batch
-                .iter()
-                .map(|source| (source.item_id.as_str(), source.source_id.as_str()))
-                .collect::<Vec<_>>();
-            if !self.database.delete_media_sources(&source_pairs).await? {
+        let source_keys = sources
+            .iter()
+            .map(|source| (source.item_id.clone(), source.source_id.clone()))
+            .collect::<Vec<_>>();
+        match self
+            .database
+            .delete_media_sources_atomically(&source_keys)
+            .await
+        {
+            Ok(true) => {}
+            Ok(false) => {
+                restore_staged_paths(&staged_paths).await;
                 return Err(MediaDeleteError::ItemNotFound);
             }
+            Err(error) => {
+                restore_staged_paths(&staged_paths).await;
+                return Err(error.into());
+            }
         }
+        for (_, staged) in &staged_paths {
+            if let Err(error) = fs::remove_file(staged).await {
+                tracing::warn!(path = %staged.display(), %error, "staged media deletion cleanup failed");
+            }
+        }
+        drop(deletion_guard);
         let report = MediaDeleteReport {
             item_id: item_id.to_owned(),
             source_ids: sources
@@ -201,6 +253,19 @@ impl MediaDeleteService {
             }
         }
         Ok(report)
+    }
+}
+
+async fn restore_staged_paths(staged_paths: &[(PathBuf, PathBuf)]) {
+    for (original, staged) in staged_paths.iter().rev() {
+        if let Err(error) = fs::rename(staged, original).await {
+            tracing::error!(
+                original_path = %original.display(),
+                staged_path = %staged.display(),
+                %error,
+                "failed to restore staged media after deletion rollback"
+            );
+        }
     }
 }
 
@@ -255,5 +320,81 @@ impl From<std::io::Error> for MediaDeleteError {
 impl From<StorageError> for MediaDeleteError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::{MediaDeleteService, acquire_media_delete_lock};
+    use crate::{
+        application::{libraries::LibraryService, scanner::LibraryScanner},
+        config::Config,
+        library::LibraryKind,
+        storage::Database,
+    };
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn delete_waits_for_other_deletion_of_the_same_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&root).await?;
+        let media_file = root.join("Example.Movie.2024.mkv");
+        tokio::fs::write(&media_file, b"fixture").await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-UTF-8 path")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+
+        let (item_id, source_id): (String, String) = sqlx::query_as(
+            "SELECT mi.id, ms.id FROM media_items mi
+             JOIN media_sources ms ON ms.item_id = mi.id
+             WHERE mi.library_id = ? AND mi.item_type = 'MOVIE' LIMIT 1",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        let deletion_guard = acquire_media_delete_lock(&item_id).await;
+        let deletion = MediaDeleteService::new(database.clone());
+        let deletion_item_id = item_id.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let mut task = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            deletion.delete(&deletion_item_id, Some(&source_id)).await
+        });
+        started_rx.await?;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut task)
+                .await
+                .is_err(),
+            "deletion must wait while another request holds the item lock"
+        );
+
+        let remaining_sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(remaining_sources, 1);
+        assert!(media_file.exists());
+
+        drop(deletion_guard);
+        task.await??;
+        assert!(!media_file.exists());
+        Ok(())
     }
 }

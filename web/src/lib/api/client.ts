@@ -198,7 +198,7 @@ function writeStoredCsrfToken(value: string | null) {
 }
 
 function readCsrfToken(): string {
-  return inMemoryCsrfToken || readStoredCsrfToken() || readCookie(csrfCookie);
+  return readStoredCsrfToken() || inMemoryCsrfToken || readCookie(csrfCookie);
 }
 
 async function readJson<T>(response: Response): Promise<T | undefined> {
@@ -603,8 +603,8 @@ export class LuxApiClient {
     );
   }
 
-  children(itemId: string, options: { itemType?: string; seasonId?: string } = {}) {
-    const params = new URLSearchParams({ page: "1", pageSize: "60" });
+  children(itemId: string, options: { itemType?: string; seasonId?: string; pageSize?: number } = {}) {
+    const params = new URLSearchParams({ page: "1", pageSize: String(options.pageSize ?? 100) });
     if (options.itemType) params.set("itemType", options.itemType);
     if (options.seasonId) params.set("seasonId", options.seasonId);
     return this.request<PageResponse<MediaItem>>(

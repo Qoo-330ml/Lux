@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Search, UserRound } from "lucide-react";
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import type { MediaActor } from "../../lib/api/types";
@@ -10,6 +10,7 @@ export function SearchPage() {
   const [params, setParams] = useSearchParams();
   const initial = params.get("q") ?? "";
   const [query, setQuery] = useState(initial);
+  useEffect(() => setQuery(initial), [initial]);
   const result = useQuery({
     queryKey: ["search", initial],
     queryFn: () => api.search(initial),
