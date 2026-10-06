@@ -242,6 +242,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(admin_start_library_path_scan),
         )
         .route(
+            "/api/v1/admin/libraries/{library_id}/refresh-local-metadata",
+            post(admin_refresh_library_local_metadata),
+        )
+        .route(
             "/api/v1/admin/libraries/{library_id}/reidentify",
             post(admin_start_library_reidentify),
         )

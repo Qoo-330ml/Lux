@@ -3654,6 +3654,13 @@ pub struct IncrementalScanChange {
     pub kind: ChangeKind,
 }
 
+/// What a local metadata refresh request queued.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalMetadataRefreshAccepted {
+    pub directories: usize,
+    pub entries: usize,
+}
+
 impl ScanJobService {
     pub fn new(database: Database) -> Self {
         let log_store = database.log_store();
@@ -4136,6 +4143,149 @@ impl ScanJobService {
         )
         .await;
         self.get_job(&job.id).await
+    }
+
+    /// Re-runs local metadata indexing (NFO and images) for the media files below exact
+    /// directories of a library root, without walking the rest of the root.
+    ///
+    /// This fills the gap between a path scan, which only looks at files whose fingerprint
+    /// changed, and a library backfill, which walks every file of the root: after an external
+    /// tool writes or repairs sidecars (a scraper publishing a poster, a rebuilt item that lost
+    /// its images) nothing about the video files changes, so only this refreshes them.
+    /// Work runs in the background; the returned counts describe what was queued.
+    pub async fn start_local_metadata_refresh(
+        &self,
+        library_id: LibraryId,
+        library_root_id: Option<&str>,
+        directories: &[String],
+    ) -> Result<LocalMetadataRefreshAccepted, ScanJobError> {
+        const MAX_DIRECTORIES: usize = 2_000;
+        const MAX_ENTRIES: i64 = 20_000;
+        if directories.is_empty() {
+            return Err(ScanJobError::NoChanges);
+        }
+        if directories.len() > MAX_DIRECTORIES {
+            return Err(ScanJobError::Scanner(ScannerError::InvalidRelativePath(
+                format!("at most {MAX_DIRECTORIES} directories per request"),
+            )));
+        }
+        let library_id = library_id.to_string();
+        let Some(library) = self.database.find_library(&library_id).await? else {
+            return Err(ScanJobError::LibraryNotFound);
+        };
+        if !library.is_enabled {
+            return Err(ScanJobError::LibraryNotFound);
+        }
+        let roots = self.database.list_library_roots(&library_id).await?;
+        let root = match library_root_id {
+            Some(root_id) => roots
+                .into_iter()
+                .find(|root| root.id == root_id)
+                .ok_or_else(|| {
+                    ScanJobError::Scanner(ScannerError::InvalidRootId(root_id.to_owned()))
+                })?,
+            None => {
+                let mut roots = roots.into_iter();
+                let Some(root) = roots.next() else {
+                    return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                        "library has no configured roots".to_owned(),
+                    )));
+                };
+                if roots.next().is_some() {
+                    return Err(ScanJobError::Scanner(ScannerError::InvalidRootId(
+                        "library has multiple roots; rootId is required".to_owned(),
+                    )));
+                }
+                root
+            }
+        };
+        let mut normalized = Vec::with_capacity(directories.len());
+        for directory in directories {
+            let directory = normalize_incremental_path(directory)?;
+            let directory = directory.trim_end_matches('/').to_owned();
+            if !directory.is_empty() && !normalized.contains(&directory) {
+                normalized.push(directory);
+            }
+        }
+        let entry_ids = self
+            .database
+            .list_media_source_entry_ids_under_directories(&root.id, &normalized, MAX_ENTRIES)
+            .await?;
+        let accepted = LocalMetadataRefreshAccepted {
+            directories: normalized.len(),
+            entries: entry_ids.len(),
+        };
+        if entry_ids.is_empty() {
+            return Ok(accepted);
+        }
+        let service = self.clone();
+        tokio::spawn(async move {
+            service.run_local_metadata_refresh(entry_ids).await;
+        });
+        Ok(accepted)
+    }
+
+    async fn run_local_metadata_refresh(&self, entry_ids: Vec<String>) {
+        // One refresh at a time: it is cheap per entry, but a burst of notifications must not
+        // compete with scans for the database.
+        static REFRESH_LOCK: OnceLock<Semaphore> = OnceLock::new();
+        let Ok(_permit) = REFRESH_LOCK
+            .get_or_init(|| Semaphore::new(1))
+            .acquire()
+            .await
+        else {
+            return;
+        };
+        let enricher = MetadataEnricher::new(self.database.clone());
+        let enricher = match self.local_nfo.clone() {
+            Some(local_nfo) => enricher.with_nfo_store(local_nfo),
+            None => enricher,
+        };
+        let mut failed_items = 0_usize;
+        for chunk in entry_ids.chunks(64) {
+            if let Err(error) = enricher.index_scan_local_metadata_batch_images(chunk).await {
+                tracing::warn!(%error, "local metadata refresh could not index images");
+                failed_items += 1;
+                continue;
+            }
+            match enricher
+                .enrich_scan_local_metadata_batch_nfo(chunk, &[])
+                .await
+            {
+                Ok(ScanLocalMetadataNfoBatch {
+                    report,
+                    source_identities,
+                }) => {
+                    failed_items += report.failed_item_ids.len();
+                    if let Err(error) = complete_local_metadata_completeness(
+                        &self.database,
+                        self.metadata_selection.as_ref(),
+                        self.metadata_reidentify.as_ref(),
+                        None,
+                        &source_identities,
+                        &report.non_retryable_failed_item_ids,
+                        &self.user_events,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, "local metadata refresh could not update completeness");
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "local metadata refresh could not read NFOs");
+                    failed_items += 1;
+                }
+            }
+        }
+        tracing::info!(
+            entries = entry_ids.len(),
+            failed_items,
+            "local metadata refresh finished"
+        );
+        if let Some(home) = &self.home {
+            home.invalidate();
+        }
+        self.user_events.publish_home_coalesced().await;
     }
 
     pub async fn create_path_scan_job(

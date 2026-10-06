@@ -605,6 +605,11 @@ pub(super) async fn emby_media_updated(
         crate::domain::ids::LibraryId,
         Vec<crate::application::scanner::IncrementalScanChange>,
     >::new();
+    // Directories whose sidecars an external tool says it rewrote ("Modified"). The videos in
+    // them are unchanged, so the incremental scan below would skip them: re-index NFO and images
+    // for exactly these directories as well.
+    let mut refresh_by_root =
+        HashMap::<(crate::domain::ids::LibraryId, String), Vec<String>>::new();
     for update in request.updates {
         let path = PathBuf::from(update.path.trim());
         let Some((root, root_path)) = emby_matching_root(&roots, &path) else {
@@ -622,6 +627,26 @@ pub(super) async fn emby_media_updated(
         if relative_path.is_empty() {
             continue;
         }
+        if update.update_type.trim().eq_ignore_ascii_case("modified") {
+            let directory = if tokio::fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_dir())
+            {
+                Some(relative_path.to_owned())
+            } else {
+                FsPath::new(relative_path)
+                    .parent()
+                    .and_then(|parent| parent.to_str())
+                    .filter(|parent| !parent.is_empty())
+                    .map(str::to_owned)
+            };
+            if let Some(directory) = directory {
+                refresh_by_root
+                    .entry((library_id, root.id.clone()))
+                    .or_default()
+                    .push(directory);
+            }
+        }
         changes_by_library.entry(library_id).or_default().push(
             crate::application::scanner::IncrementalScanChange {
                 root_id: root.id.clone(),
@@ -632,6 +657,18 @@ pub(super) async fn emby_media_updated(
     }
     if changes_by_library.is_empty() {
         return StatusCode::NOT_FOUND.into_response();
+    }
+    let mut refreshed_entries = 0_usize;
+    for ((library_id, root_id), directories) in refresh_by_root {
+        match scan_jobs
+            .start_local_metadata_refresh(library_id, Some(&root_id), &directories)
+            .await
+        {
+            Ok(accepted) => refreshed_entries += accepted.entries,
+            Err(error) => {
+                tracing::warn!(%library_id, ?error, "local metadata refresh was not queued");
+            }
+        }
     }
 
     let mut jobs = Vec::with_capacity(changes_by_library.len());
@@ -655,6 +692,7 @@ pub(super) async fn emby_media_updated(
         StatusCode::ACCEPTED,
         Json(json!({
             "scope": "PATH",
+            "localMetadataEntries": refreshed_entries,
             "jobs": jobs.iter().map(scan_job_json).collect::<Vec<_>>(),
         })),
     )

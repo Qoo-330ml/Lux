@@ -204,6 +204,7 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 
 | 请求 | 成功行为 | 主要错误行为 |
 |---|---|---|
+| `POST /Library/Media/Updated` | 管理员 token/API key。按 `Updates[].Path`（Lux 视角的绝对路径）入队局部增量扫描，返回 `202`、`scope: "PATH"`。`UpdateType: "Modified"` 时，额外对该目录（路径是文件时取其父目录）精确重新索引 NFO 与图片，用于外部工具改写旁车文件而视频未变的场景，响应的 `localMetadataEntries` 为受影响的条目数；`Created` 等其他类型只入队扫描 | 普通用户 `403`；路径不属于任何媒体库 `404`；服务未就绪 `503` |
 | `POST /Library/Refresh` | 管理员 token/API key 使用空 body 触发所有启用媒体库的异步全量校验，返回 `202` 和 `scope: "ALL"`、`jobs`；已有活动任务直接复用 | 普通用户 `403`；服务未就绪 `503` |
 | `POST /Users/New?Name=...` | 允许空 body、无 `Content-Type`；从查询参数读取名称，返回创建用户 DTO `200`；原有 JSON/XML body 仍保留 | 缺少/非法名称 `400`；重复用户名 `409`；非管理员 `403` |
 | `POST /Sessions/{sessionId}/Playing/Stop` | `sessionId` 使用 `GET /Sessions` 返回的 `Id`；会话所有者或管理员可停止，停止 HLS 资源并返回 `204`；已停止会话重复请求仍为 `204` | 未知或非本人会话 `404`；服务未就绪 `503` |
