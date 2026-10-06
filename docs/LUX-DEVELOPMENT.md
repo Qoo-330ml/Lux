@@ -8573,6 +8573,23 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-06）：Compose 注释已改为索引、ffprobe、ffmpeg 默认并发 `2/8/2`，与 Dockerfile、Compose、Rust 配置常量及相邻说明一致。`git diff --check` 通过；仅改文档，未运行 Cargo 测试。
 
+#### LUX-400：限制跨任务 FILL_MISSING worker 总并发
+
+范围：单个 `FILL_MISSING` job 虽默认最多运行 2 个 worker，但进程级 metadata semaphore 容量为 16；多个媒体库的补缺 job 同时运行时仍可能累计到 16 个在线补缺 worker。增加独立的进程级补缺 semaphore，将所有 `FILL_MISSING` job 的 item worker 总数限制为 2，并继续使用既有 metadata 全局 semaphore。`REIDENTIFY` 和 `FULL_REFRESH` 不获取补缺专用 permit；不改变每库 job 排队、item claim、任务状态、重试或 scraper 请求合同。
+
+验收：
+
+- [x] 同一 Lux 进程中来自不同 job/service 的 `FILL_MISSING` item worker 总并发最多为 2。
+- [x] 每个 worker 同时持有既有 metadata 全局 permit 和补缺 permit，worker 结束、job 退出或 future 取消时通过 RAII 释放。
+- [x] 非 `FILL_MISSING` 模式不获取补缺 permit，既有 metadata 全局并发上限保持 16。
+- [x] 双 job 并发集成回归直接统计两个 job 的 `RUNNING` item；取消等待 worker permit 的 job 会在占用 permit 的 job 释放前结束；相关 `reidentify` 定向目标和补缺 semaphore 单测通过。
+- [x] 完成 Rust build、fmt、all-target Clippy 与全目标 Rust 测试并如实记录已有的独立失败。
+- [x] 性能记录仅陈述代码并发上界与固定 stub 测试结果，不推断 FNOS CPU、墙钟、PostgreSQL 或 NAS 收益。
+
+文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先运行双 job 回归复现旧实现允许多个补缺 worker 同时超过 2，再添加进程级补缺 semaphore。
+
+结果（2026-10-06）：新增独立容量为 2 的进程级 semaphore；每个补缺 item worker 在完整处理期间同时持有补缺 permit 与原有 metadata permit。固定 SQLite fixture 并行运行两个各含 4 个 item 的补缺 job，通过 job-item `RUNNING` 状态统计进程实际 claim 的并发 worker，最大值不超过 2。取消等待 permit 的第二个 job 后，它会在第一个 job 仍占用两个 permit 时结束；独立单测还验证通知被消费后，后续 permit 等待仍会看到锁存的取消状态。相关测试二进制中的 FILL_MISSING 执行用例用异步 mutex 串行，避免共享进程级 semaphore 造成测试相互干扰。`tests/reidentify.rs` 14 项通过，补缺 semaphore 与取消锁存单测通过；build、fmt 和全目标全 feature Clippy 通过。`cargo test --locked --all-targets` 的 library 测试为 734 passed、11 ignored，随后在无关的 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）；本任务没有修改该访问范围行为。开发机架构为 `arm64`；未部署 FNOS，也未测量 CPU 或生产墙钟收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

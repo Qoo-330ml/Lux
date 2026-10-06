@@ -1464,3 +1464,9 @@ FNOS 上运行的 `pdzhou/lux:test` revision `bd32e0d`，PostgreSQL `scan_jobs` 
 provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 `FAILED/SCRAPER_UNAVAILABLE`。此前扫描 completeness 调度和通用 FILL_MISSING 创建入口虽限制 1 小时内的 DEFERRED job，但又只选取 `PENDING/RUNNING` item，导致 provider-unavailable item 实际不受该窗口去重。现在两处都将 1 小时内此错误分类的失败 item 纳入既有去重判断；其他失败可以立即重试，provider-unavailable item 超过窗口后也可重新排队。
 
 验证只覆盖固定 SQLite storage 状态机回归，确认两个入口的 enqueue/job 去重边界；没有比较运行时创建速率、provider 请求量、墙钟、FNOS CPU、PostgreSQL 或 NAS 性能，不据此推断生产收益。
+
+### LUX-400 跨 job 的 FILL_MISSING worker 上界
+
+源码中单个 `FILL_MISSING` job 的默认 worker 并发为 2，但原有进程级 metadata semaphore 容量为 16，因此多个同时执行的补缺 job 总计可能占用最多 16 个 metadata worker。现在所有补缺 job 共享容量为 2 的独立进程级 semaphore；每个 item worker 在处理期间同时持有该 permit 和既有 metadata permit，其他 metadata 模式不受补缺专用限制。
+
+固定 SQLite fixture 同时运行两个各 4 个 item 的补缺 job，通过查询这两个 job 的 `RUNNING` item 数观测已 claim 的 worker 并发，最大值不超过 2。取消回归验证第二个 job 等待 permit 时，取消会在占用 permit 的首个 job 结束前让其转入 `CANCELLED`；单测也验证取消通知被消费后，之后的等待仍能观察到锁存状态。测试用异步 mutex 串行化同一测试二进制里会实际运行 FILL_MISSING 的用例，避免共享进程级 semaphore 产生测试相互干扰。`tests/reidentify.rs` 14 项、取消锁存单测、build、fmt 和全目标全 feature Clippy 通过。全目标测试的 library 部分为 734 passed、11 ignored，随后在独立的 `tests/emby_counts.rs:159` 失败（实际 1、期望 0）。以上仅验证并发上界与取消状态边界，不测量 CPU 或墙钟收益；没有在 FNOS、PostgreSQL 或 NAS 上部署和验证，不据此推断生产 CPU 收益。

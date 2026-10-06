@@ -1,13 +1,16 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::{Arc, Mutex, OnceLock},
+    sync::{
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex as AsyncMutex, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
 };
 use uuid::Uuid;
@@ -34,6 +37,7 @@ use crate::{
 
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
+const METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT: usize = 2;
 const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
@@ -41,11 +45,23 @@ const METADATA_PROGRESS_EVENT_INTERVAL: Duration = Duration::from_secs(1);
 const AUTO_MATCH_MIN_SCORE: f64 = 85.0;
 
 static METADATA_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static METADATA_FILL_MISSING_GLOBAL_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn metadata_global_permits() -> Arc<Semaphore> {
     METADATA_GLOBAL_PERMITS
         .get_or_init(|| Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT)))
         .clone()
+}
+
+fn metadata_fill_missing_global_permits() -> Arc<Semaphore> {
+    METADATA_FILL_MISSING_GLOBAL_PERMITS
+        .get_or_init(|| Arc::new(Semaphore::new(METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT)))
+        .clone()
+}
+
+struct MetadataWorkerPermit {
+    _global: OwnedSemaphorePermit,
+    _fill_missing: Option<OwnedSemaphorePermit>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -77,6 +93,7 @@ pub struct MetadataReidentifyService {
     webhooks: Option<WebhookService>,
     progress_events: MetadataProgressEventGate,
     worker_permits: Arc<Semaphore>,
+    fill_missing_worker_permits: Arc<Semaphore>,
     running_jobs: MetadataJobOwners,
     library_job_creation: Arc<AsyncMutex<()>>,
     actor_enrichment: ActorEnrichmentQueue,
@@ -112,7 +129,32 @@ impl MetadataProgressEventGate {
 
 #[derive(Clone, Default)]
 struct MetadataJobOwners {
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<Mutex<HashMap<String, Arc<MetadataJobCancellation>>>>,
+}
+
+#[derive(Default)]
+struct MetadataJobCancellation {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl MetadataJobCancellation {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Release);
+        self.notify.notify_waiters();
+    }
+
+    async fn cancelled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 impl MetadataJobOwners {
@@ -120,19 +162,37 @@ impl MetadataJobOwners {
         let Ok(mut active) = self.active.lock() else {
             return None;
         };
-        if !active.insert(job_id.to_owned()) {
+        if active.contains_key(job_id) {
             return None;
         }
+        let cancellation = Arc::new(MetadataJobCancellation::default());
+        active.insert(job_id.to_owned(), Arc::clone(&cancellation));
         Some(MetadataJobOwnerGuard {
             job_id: job_id.to_owned(),
             active: Arc::clone(&self.active),
+            cancellation,
         })
+    }
+
+    fn notify_cancel_requested(&self, job_id: &str) {
+        if let Ok(active) = self.active.lock()
+            && let Some(cancellation) = active.get(job_id)
+        {
+            cancellation.cancel();
+        }
     }
 }
 
 struct MetadataJobOwnerGuard {
     job_id: String,
-    active: Arc<Mutex<HashSet<String>>>,
+    active: Arc<Mutex<HashMap<String, Arc<MetadataJobCancellation>>>>,
+    cancellation: Arc<MetadataJobCancellation>,
+}
+
+impl MetadataJobOwnerGuard {
+    fn cancellation(&self) -> &MetadataJobCancellation {
+        &self.cancellation
+    }
 }
 
 enum RefreshItemOutcome {
@@ -176,6 +236,7 @@ impl MetadataReidentifyService {
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
+            fill_missing_worker_permits: metadata_fill_missing_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -208,6 +269,7 @@ impl MetadataReidentifyService {
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
+            fill_missing_worker_permits: metadata_fill_missing_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -234,6 +296,7 @@ impl MetadataReidentifyService {
             webhooks: None,
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
+            fill_missing_worker_permits: metadata_fill_missing_global_permits(),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -533,7 +596,7 @@ impl MetadataReidentifyService {
     }
 
     pub async fn run(&self, job_id: &str) {
-        let Some(_owner) = self.running_jobs.claim(job_id) else {
+        let Some(owner) = self.running_jobs.claim(job_id) else {
             return;
         };
         let Ok(Some(job)) = self.database.find_metadata_reidentify_job(job_id).await else {
@@ -629,16 +692,24 @@ impl MetadataReidentifyService {
                 let queue_wait_started = Instant::now();
                 let available_slots = concurrency.saturating_sub(workers.len());
                 let mut worker_permits = Vec::with_capacity(available_slots);
-                let Ok(first_worker_permit) =
-                    Arc::clone(&self.worker_permits).acquire_owned().await
+                let Some(first_worker_permit) = acquire_metadata_worker_permit_or_cancel(
+                    owner.cancellation(),
+                    &self.worker_permits,
+                    &self.fill_missing_worker_permits,
+                    mode,
+                )
+                .await
                 else {
                     queue_exhausted = true;
                     break;
                 };
                 worker_permits.push(first_worker_permit);
                 for _ in 1..available_slots {
-                    let Ok(worker_permit) = Arc::clone(&self.worker_permits).try_acquire_owned()
-                    else {
+                    let Some(worker_permit) = try_acquire_metadata_worker_permit(
+                        &self.worker_permits,
+                        &self.fill_missing_worker_permits,
+                        mode,
+                    ) else {
                         break;
                     };
                     worker_permits.push(worker_permit);
@@ -1426,6 +1497,7 @@ impl MetadataReidentifyService {
         {
             return Err(MetadataReidentifyError::JobNotCancelable);
         }
+        self.running_jobs.notify_cancel_requested(job_id);
         self.admin_events.publish(AdminEventScope::Jobs);
         Ok(())
     }
@@ -1651,6 +1723,58 @@ fn metadata_worker_concurrency(recommended: usize) -> usize {
     recommended.clamp(1, METADATA_GLOBAL_WORKER_LIMIT)
 }
 
+async fn acquire_metadata_worker_permit(
+    global_permits: &Arc<Semaphore>,
+    fill_missing_permits: &Arc<Semaphore>,
+    mode: MetadataRefreshMode,
+) -> Option<MetadataWorkerPermit> {
+    let fill_missing = if matches!(mode, MetadataRefreshMode::FillMissing) {
+        Some(
+            Arc::clone(fill_missing_permits)
+                .acquire_owned()
+                .await
+                .ok()?,
+        )
+    } else {
+        None
+    };
+    let global = Arc::clone(global_permits).acquire_owned().await.ok()?;
+    Some(MetadataWorkerPermit {
+        _global: global,
+        _fill_missing: fill_missing,
+    })
+}
+
+async fn acquire_metadata_worker_permit_or_cancel(
+    cancellation: &MetadataJobCancellation,
+    global_permits: &Arc<Semaphore>,
+    fill_missing_permits: &Arc<Semaphore>,
+    mode: MetadataRefreshMode,
+) -> Option<MetadataWorkerPermit> {
+    tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        permit = acquire_metadata_worker_permit(global_permits, fill_missing_permits, mode) => permit,
+    }
+}
+
+fn try_acquire_metadata_worker_permit(
+    global_permits: &Arc<Semaphore>,
+    fill_missing_permits: &Arc<Semaphore>,
+    mode: MetadataRefreshMode,
+) -> Option<MetadataWorkerPermit> {
+    let fill_missing = if matches!(mode, MetadataRefreshMode::FillMissing) {
+        Some(Arc::clone(fill_missing_permits).try_acquire_owned().ok()?)
+    } else {
+        None
+    };
+    let global = Arc::clone(global_permits).try_acquire_owned().ok()?;
+    Some(MetadataWorkerPermit {
+        _global: global,
+        _fill_missing: fill_missing,
+    })
+}
+
 fn metadata_worker_default_concurrency(backend: DatabaseBackend) -> usize {
     match backend {
         DatabaseBackend::Sqlite => SQLITE_METADATA_DEFAULT_CONCURRENCY,
@@ -1714,17 +1838,21 @@ mod tests {
         collections::BTreeMap,
         error::Error,
         sync::{Arc, Mutex},
+        time::Duration,
     };
 
     use serde_json::Value;
     use tempfile::TempDir;
+    use tokio::sync::Semaphore;
 
     use super::{
-        AUTO_MATCH_MIN_SCORE, METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage,
-        MetadataCandidateView, MetadataRefreshMode, MetadataRequestPlan, best_automatic_candidate,
-        candidate_count_for_page, metadata_global_permits, metadata_request_plan_is_complete,
-        metadata_worker_concurrency, metadata_worker_configured_concurrency,
-        metadata_worker_default_concurrency,
+        AUTO_MATCH_MIN_SCORE, METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT,
+        METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage, MetadataCandidateView,
+        MetadataJobOwners, MetadataRefreshMode, MetadataRequestPlan,
+        acquire_metadata_worker_permit_or_cancel, best_automatic_candidate,
+        candidate_count_for_page, metadata_fill_missing_global_permits, metadata_global_permits,
+        metadata_request_plan_is_complete, metadata_worker_concurrency,
+        metadata_worker_configured_concurrency, metadata_worker_default_concurrency,
     };
     use crate::{
         application::{
@@ -2779,6 +2907,51 @@ mod tests {
         let second = metadata_global_permits();
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.available_permits(), METADATA_GLOBAL_WORKER_LIMIT);
+    }
+
+    #[test]
+    fn fill_missing_worker_permits_are_process_global_and_hard_capped() {
+        let first = metadata_fill_missing_global_permits();
+        let second = metadata_fill_missing_global_permits();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(first.available_permits() <= METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn fill_missing_cancellation_remains_latched_after_notification_is_consumed() {
+        let owners = MetadataJobOwners::default();
+        let owner = owners
+            .claim("cancelled-metadata-job")
+            .expect("job owner should be available");
+        let global_permits = Arc::new(Semaphore::new(METADATA_GLOBAL_WORKER_LIMIT));
+        let fill_missing_permits = Arc::new(Semaphore::new(0));
+        owners.notify_cancel_requested("cancelled-metadata-job");
+
+        let first_wait = acquire_metadata_worker_permit_or_cancel(
+            owner.cancellation(),
+            &global_permits,
+            &fill_missing_permits,
+            MetadataRefreshMode::FillMissing,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), first_wait)
+                .await
+                .expect("first wait should observe the cancellation notification")
+                .is_none()
+        );
+
+        let second_wait = acquire_metadata_worker_permit_or_cancel(
+            owner.cancellation(),
+            &global_permits,
+            &fill_missing_permits,
+            MetadataRefreshMode::FillMissing,
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), second_wait)
+                .await
+                .expect("subsequent waits must still observe the cancellation")
+                .is_none()
+        );
     }
 
     #[test]
