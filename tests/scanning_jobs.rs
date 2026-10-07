@@ -6444,7 +6444,7 @@ async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn s
     let second_root = temp_dir.path().join("second");
     tokio::fs::create_dir_all(&first_root).await?;
     tokio::fs::create_dir_all(&second_root).await?;
-    for index in 0..128 {
+    for index in 0..512 {
         tokio::fs::write(
             first_root.join(format!("First.Movie.{}.mkv", 2000 + index)),
             b"fixture",
@@ -6465,40 +6465,55 @@ async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn s
         )
         .await?;
 
-    let scan_lock = Arc::new(Semaphore::new(1));
-    let held_permit = scan_lock.clone().acquire_owned().await?;
-    let first_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
-    let second_jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock.clone());
-    let first_job = first_jobs.create_movie_scan_job(first_library.id).await?;
-    let second_job = second_jobs.create_movie_scan_job(second_library.id).await?;
+    let scan_lock = Arc::new(Semaphore::new(2));
+    let jobs = ScanJobService::new(database.clone()).with_scan_lock(scan_lock);
+    let first_job = jobs.create_movie_scan_job(first_library.id).await?;
+    let second_job = jobs.create_movie_scan_job(second_library.id).await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_overlapping_full_scans
+         BEFORE UPDATE OF status ON scan_jobs
+         WHEN NEW.job_type = 'RECONCILE_LIBRARY' AND NEW.status = 'RUNNING'
+           AND EXISTS (
+               SELECT 1 FROM scan_jobs active
+               WHERE active.job_type = 'RECONCILE_LIBRARY'
+                 AND active.status = 'RUNNING' AND active.id <> NEW.id
+           )
+         BEGIN SELECT RAISE(ABORT, 'overlapping full scans'); END",
+    )
+    .execute(database.pool())
+    .await?;
     let first_job_id = first_job.id.clone();
     let second_job_id = second_job.id.clone();
-
+    let first_jobs = jobs.clone();
     let first_worker =
         tokio::spawn(async move { first_jobs.run_to_completion(&first_job_id, 50, None).await });
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+                .bind(&first_job.id)
+                .fetch_one(database.pool())
+                .await?;
+            if status == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        Ok::<(), sqlx::Error>(())
+    })
+    .await??;
+    let second_jobs = jobs.clone();
     let second_worker = tokio::spawn(async move {
         second_jobs
             .run_to_completion(&second_job_id, 50, None)
             .await
     });
-    tokio::time::sleep(Duration::from_millis(20)).await;
 
-    let first_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
-        .bind(&first_job.id)
-        .fetch_one(database.pool())
-        .await?;
-    let second_status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
-        .bind(&second_job.id)
-        .fetch_one(database.pool())
-        .await?;
-    assert_eq!(first_status, "PENDING");
-    assert_eq!(second_status, "PENDING");
-
-    drop(held_permit);
-    first_worker.await??;
-    second_worker.await??;
-
+    tokio::time::timeout(Duration::from_secs(30), async {
+        first_worker.await??;
+        second_worker.await??;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .await??;
     let statuses: Vec<(String, String)> =
         sqlx::query_as("SELECT id, status FROM scan_jobs WHERE id IN (?, ?) ORDER BY id")
             .bind(&first_job.id)

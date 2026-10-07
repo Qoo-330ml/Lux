@@ -8653,6 +8653,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-07）：补缺调用现在显式区分 `ScanJob` 与 `LibrarySetting` trigger，并解析成 `UseLibrarySetting`、`Enabled` 或 `Disabled` 策略；存储入口同样接收具名策略类型。全量任务和后台回填继续读取库级新扫描设置，增量扫描继续服从任务开关，已删除任务禁用在线探测。策略单测和 `progressive_scan_metadata_dispatch_is_atomic_and_deduplicated` 通过；build、fmt、全目标全 feature Clippy 和差异检查通过。没有 schema/API 变化，也未据此推断 FNOS CPU 收益。
 
+#### LUX-405：验证跨媒体库全量扫描串行队列
+
+范围：应用共享的 `ScanJobService` 使用容量为 1 的 `full_scan_queue` 逐个执行全量扫描，但现有测试使用共享的 `scan_lock` 挂起所有任务、并为每个扫描服务分别创建队列，未实际验证这个串行队列。将回归改为两个媒体库共享同一个扫描服务，给共享扫描工作 semaphore 留出并发容量，并在 SQLite 中拒绝第二个全量任务进入 RUNNING，以证明扫描队列本身提供串行约束。增量扫描在全量扫描让出共享扫描工作资源时的优先行为保持不变。
+
+验收：
+
+- [x] 两个不同媒体库的全量 job 通过同一个扫描服务并发启动时，同一时刻最多一个 `RECONCILE_LIBRARY` 处于 RUNNING，最终两者都完成。
+- [x] 测试中的共享 `scan_lock` 有足够 permit，不会替代 `full_scan_queue` 成为串行原因；已有增量优先回归继续通过。
+- [x] `scanning_jobs` 定向目标、build、fmt、全目标全 feature Clippy 和差异检查通过；性能记录不外推 CPU 或 NAS 收益。
+
+预计文件：`tests/scanning_jobs.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先将旧回归改为能在无 `full_scan_queue` 的实现中失败，再验证当前容量为 1 的生命周期队列。
+
+结果（2026-10-07）：回归使用共享 `ScanJobService` 和 2 个扫描 semaphore permit，并由 SQLite trigger 拒绝并发全量任务进入 `RUNNING`；两个不同媒体库的 job 都完成。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs` 81/81 通过；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。`cargo test --locked --all-targets --no-fail-fast` 仍有四个失败目标：`emby_counts` 与 `strm` 的旧基线失败、插件安装状态查询计数用例在并行全套中偶发多计一次（隔离复跑通过）、以及一个增量扫描用例超时（完整 `scanning_jobs` 定向目标复跑通过）。默认扫描并发为 2，全量扫描队列容量为 1。验证环境为 arm64；没有据此推断 FNOS CPU 或 NAS 性能收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
