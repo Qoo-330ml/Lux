@@ -43,7 +43,7 @@
 
 扫描器会把所有“当前可请求”的 item 放入 `eligible_fill_missing_item_ids`，即使本轮没有新的 completeness claim。存储层随后根据旧的 `READY + is_missing=1` 再创建任务。
 
-已实现：只有本轮新 claim 且 `is_missing=true` 的 item 才进入自动入队列表。相同 fingerprint/capability 的重复扫描由请求快照和存储层去重覆盖；当前 FNOS 是否运行该逻辑尚未重新核实。
+已实现：只有本轮新 claim 且 `is_missing=true` 的 item 才进入自动入队列表。相同 fingerprint/capability 的重复扫描由请求快照和存储层去重覆盖。2026-10-07 现场复核显示 FNOS 仍运行 revision `8412cc2a`、schema 164，尚未包含本地 0165 优化分支。
 
 验收：相同 item、相同 fingerprint、没有新的 completeness claim 时，重复扫描不创建新 job。
 
@@ -51,7 +51,7 @@
 
 旧逻辑只检查 `QUEUED/RUNNING`。provider 不可用后，任务变为 `DEFERRED`，下一次扫描仍会再次创建相同 item 的任务。
 
-已实现：近期带相同请求快照的 `DEFERRED` provider 失败参与去重；LUX-402 再增加逐 item 冷却时间。当前 FNOS 是否运行该逻辑尚未重新核实。
+已实现：近期带相同请求快照的 `DEFERRED` provider 失败参与去重；LUX-402 再增加逐 item 冷却时间。当前 FNOS 为 revision `8412cc2a`、schema 164，未部署本地优化分支。
 
 验收：同一 item 在 deferred 冷却窗口内不重复入队；人工 retry 仍可立即执行。
 
@@ -71,7 +71,7 @@
 
 `item_metadata_completeness.retry_after` 只控制本地 completeness 检查失败后的重新领取，不代表在线 provider 的退避。自动 `FILL_MISSING` 的 provider 不可用结果保存在 `metadata_reidentify_job_items.error='SCRAPER_UNAVAILABLE'`，当前仅通过 `DEFERRED` job 的一小时窗口去重；持续不可用时，后续扫描会再次创建相同请求。能力级 scraper attempt 也不能替代 job 级退避，因为尚未获得 provider identity 或 scraper 服务整体不可用时没有可用的能力 attempt key。
 
-已实现（LUX-402，本地未部署）：双后端 job item migration 增加自动失败次数和截止时间。同一 fingerprint/capability 在 5 分钟、30 分钟、最多 6 小时的退避期内合并/去重；到期后由下一次自动扫描重试，并将次数延续到新 job。输入快照变化不继承旧退避，管理员手动 retry 立即解禁；无快照人工 job 不改变语义。迁移只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却；旧的无快照任务保留一小时去重语义。一次 SQL 读取同时检查活动任务与匹配的历史 provider 失败，不增加每批扫描的数据库往返。SQLite migration/state-machine、PostgreSQL storage contract、build/fmt/Clippy 和定向测试已验证；全目标结果及两个在干净基线复现的集成失败详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-402 结果。未部署 FNOS，不能据此宣称生产 CPU 降幅。
+已实现（LUX-402，本地未部署）：双后端 job item migration 增加自动失败次数、截止时间和一次性消费标记。同一 fingerprint/capability 在 5 分钟、30 分钟、最多 6 小时的退避期内合并/去重；到期后由下一次自动扫描重试，并将次数延续到新 job。派发重试时在同一事务中批量消费旧到期失败记录，防止重试完成后由历史记录再次解锁；手动 retry 和新请求快照会清除消费标记。输入快照变化不继承旧退避；无快照人工 job 不改变原有一小时去重语义。迁移只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却。一次有界 SQL 读取同时检查活动任务与匹配的历史 provider 失败；只有实际派发到期重试时才执行一次有界批量更新。SQLite 状态机、迁移和 PostgreSQL storage contract 覆盖成功重试与手动 retry；build/fmt/Clippy 和定向测试已验证。全目标结果及两个在干净基线复现的集成失败详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-402 结果。未部署 FNOS，不能据此宣称生产 CPU 降幅。
 
 验收：持续 provider 不可用时同一输入按有界退避重试且不在冷却期重复创建 job；新 capability、fingerprint 和人工 retry 不被旧请求退避误伤。
 
@@ -83,7 +83,7 @@
 - 新 provider identity 是否替代了旧 provider identity；
 - 当前 job 是否覆盖了新的 capability plan。
 
-已实施（LUX-401，本地未部署）：双后端 job item migration 增加请求 fingerprint、规范化 capability JSON 与 claim 快照。相同快照沿用现有任务；queued item 更新为最新快照；running item 保存更新后的期望值，并在当前处理结束后最多重新排队一次；近期 `DEFERRED/SCRAPER_UNAVAILABLE` 只抑制相同快照。旧任务和手动创建的无快照 item 保持兼容。当前验证是固定 SQLite 状态机，不证明 PostgreSQL/NAS 性能或 FNOS CPU 收益。
+已实施（LUX-401，本地未部署）：双后端 job item migration 增加请求 fingerprint、规范化 capability JSON 与 claim 快照。相同快照沿用现有任务；queued item 更新为最新快照；running item 保存更新后的期望值，并在当前处理结束后最多重新排队一次；近期 `DEFERRED/SCRAPER_UNAVAILABLE` 只抑制相同快照。旧任务和手动创建的无快照 item 保持兼容。SQLite 状态机及 PostgreSQL 16 集成合同通过；不代表 FNOS CPU 或 NAS 性能收益。
 
 验收：旧 job 不会阻止新 capability；相同输入不会产生第二个有效 job；并发扫描和并发手动刷新只保留一个有效请求。
 

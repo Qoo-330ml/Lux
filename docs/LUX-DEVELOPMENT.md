@@ -8610,12 +8610,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-402：provider 不可用时对自动 FILL_MISSING 进行逐 item 退避
 
-范围：当前自动 `FILL_MISSING` 在 scraper/provider 不可用后将 job 置为 `DEFERRED`，并只依赖固定一小时去重窗口。对于持续不可用的 provider，周期扫描可能每小时再次创建相同 item 请求。为带自动请求快照的 job item 持久化退避次数和下次自动重试时间；同一 fingerprint/capability 快照在到期前去重，到期后由后续自动扫描重试。退避依次为 5 分钟、30 分钟、最多 6 小时。新请求快照不继承旧快照的退避；无快照的人工 job 不改变现有语义。管理员显式重试立即解除等待，但保留自动失败次数；取消任务不增加次数。
+范围：当前自动 `FILL_MISSING` 在 scraper/provider 不可用后将 job 置为 `DEFERRED`，并只依赖固定一小时去重窗口。对于持续不可用的 provider，周期扫描可能每小时再次创建相同 item 请求。为带自动请求快照的 job item 持久化退避次数、下次自动重试时间和到期记录是否已用于一次重试；同一 fingerprint/capability 快照在到期前去重，到期后由后续自动扫描重试一次，避免已完成的重试继续被旧失败记录触发。退避依次为 5 分钟、30 分钟、最多 6 小时。新请求快照不继承旧快照的退避；无快照的人工 job 不改变现有语义。管理员显式重试立即解除等待、清除已消费标记并保留自动失败次数；取消任务不增加次数。
 
 验收：
 
-- [x] SQLite/PostgreSQL migration 增加自动退避次数和到期时间；旧的自动 `DEFERRED/SCRAPER_UNAVAILABLE` 且带请求快照的 item 升级后有安全的首次到期时间，历史任务状态和计数不变。
+- [x] SQLite/PostgreSQL migration 增加自动退避次数、到期时间和一次性消费标记；旧的自动 `DEFERRED/SCRAPER_UNAVAILABLE` 且带请求快照的 item 升级后有安全的首次到期时间，历史任务状态和计数不变。
 - [x] 同一请求快照在到期前不创建新 job；到期后可创建新 job，并继承该快照此前的失败次数。
+- [x] 到期重试派发后旧失败记录不再重复触发自动重试；管理员手动重试会重新启用该记录的自动退避。
 - [x] 连续 provider 失败按 5 分钟、30 分钟、最多 6 小时退避；新 fingerprint/capability 不等待旧快照；人工 retry 可立即领取。
 - [x] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
 - [x] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在 PostgreSQL 16 集成环境通过。
@@ -8625,6 +8626,10 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 结果（2026-10-07）：新增双后端 migration 0165，为 provider 失败后的自动快照 item 保存失败次数和截止时间；退避为 5 分钟、30 分钟、最高 6 小时，并在新 job 中继承相同 fingerprint/capability 的次数。migration 只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却，保持任务状态和计数；无快照旧任务仍沿用一小时去重。相同快照冷却去重、新 fingerprint/capability、显式 retry、取消、其他错误及非 `FILL_MISSING` 模式均有状态机回归。去重检查保留单条有界 SQL 查询，不额外增加扫描调度往返。SQLite migration/state-machine 测试、`tests/storage.rs` 49 项、`tests/postgres_database.rs -- --include-ignored` 16 项及 PostgreSQL progressive-scan storage contract 1 项通过；后者直接验证 provider 失败后的冷却、到期重试和失败次数继承。`cargo build --locked`、fmt、全目标全 feature Clippy 通过。全目标 Rust 测试库部分为 746 passed、0 failed、11 ignored；仅 `emby_counts`（实际 1、期望 0）与 `strm`（401、期望 200）失败，两者均在干净 `origin/test=8412cc2a` 上独立复现。开发机 `arm64`；FNOS 尚未部署本分支，未据此宣称生产 CPU 或真实重试节奏改善。
 
 补充结果（2026-10-07）：端到端扫描回归发现并修复 READY 且仍缺失的完整度记录不会在冷却到期后重新入队的问题。当前扫描只对本轮已确认仍缺失、且自动匹配可用的候选 ID 检查到期的 provider 失败；查询限制在每批最多 512 个扫描条目，并复用完整度 claim 事务。0165 不再更新历史 job item 表，而是在 `server_settings` 写入单个首次冷却截止时间；旧失败行继续保持原状态和计数，运行时按兼容规则视为已失败一次。调整旧测试夹具，使它同时把 item 级 retry deadline 设为已到期；精确扫描回归通过，`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81 通过。最终 `cargo test --locked --all-targets --no-fail-fast` 的库测试为 746 passed、0 failed、11 ignored；集成目标仅 `emby_counts`（实际 1、期望 0）及 `strm`（401、期望 200）失败，两者此前均在干净 `origin/test=8412cc2a` 上独立复现。`cargo build --locked`、fmt、全目标全 feature Clippy 通过。此前 PostgreSQL 不可用；恢复 PostgreSQL 16.15 临时实例后，修正 PostgreSQL 合同夹具绕过 `Database` SQL 适配器、把 `?` 占位符原样发给 PostgreSQL 的问题，`postgres_database` 集成目标 16/16 和 progressive-scan storage contract 1/1 通过。开发机为 `arm64`；本分支未部署 FNOS，未据此宣称生产 CPU 或重试流量改善。
+
+补充审查结果（2026-10-07）：SQLite 回归复现到期重试完成后，旧 `DEFERRED/SCRAPER_UNAVAILABLE` 记录仍会触发后续自动入队。未发布的 0165 增加默认关闭的一次性消费标记；派发到期重试时在同一事务内批量消费旧失败记录，完整度扫描与补缺任务去重忽略已消费记录。手动 retry 和新请求快照会重置标记。SQLite 状态机和迁移回归通过，PostgreSQL progressive-scan storage contract 覆盖相同的成功重试路径；FNOS 当前仍在 schema 164，尚未应用该 migration。
+
+最终验证（2026-10-07）：新增消费标记后的 `cargo test --locked --all-targets --no-fail-fast` 库测试为 747 passed、0 failed、11 ignored；集成目标仅 `emby_counts`（实际 1、期望 0）和 `strm`（401、期望 200）失败，两项此前均在干净 `origin/test=8412cc2a` 上独立复现。`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81、PostgreSQL 16 集成用例 16/16 通过；`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。开发机为 `arm64`；FNOS 仍未部署此分支，不能据此声称生产 CPU 已下降。
 
 #### LUX-403：复用有空位的 queued FILL_MISSING job
 

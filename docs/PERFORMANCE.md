@@ -1479,7 +1479,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 
 ### LUX-402 自动 FILL_MISSING provider 退避
 
-自动补缺 item 在 provider 不可用后保存失败次数与下一次重试时间，延迟依次为 5 分钟、30 分钟并封顶 6 小时。相同 fingerprint/capability 快照在截止时间前命中现有 deferred item，不创建新 job；到期后新 job 继承此前失败次数。快照改变、人工 retry、无快照任务和其他 metadata 模式保持原有语义。为使 READY 且仍缺失的完整度条目能在后续扫描中触发重试，每个最多 512 条的完整度检查批次会针对本轮仍缺失且自动匹配可用的候选 ID 查询到期失败项。该 `EXISTS` 查询只针对当前批次 ID，复用完整度 claim 事务，不扫描全库或增加事务往返。
+自动补缺 item 在 provider 不可用后保存失败次数与下一次重试时间，延迟依次为 5 分钟、30 分钟并封顶 6 小时。相同 fingerprint/capability 快照在截止时间前命中现有 deferred item，不创建新 job；到期后新 job 继承此前失败次数，并在同一事务中将旧到期失败记录标记为已消费，避免重试成功后历史行再次解锁任务。人工 retry 和新请求快照会重置该标记。快照改变、无快照任务和其他 metadata 模式保持原有语义。为使 READY 且仍缺失的完整度条目能在后续扫描中触发重试，每个最多 512 条的完整度检查批次会针对本轮仍缺失且自动匹配可用的候选 ID 查询到期失败项。该 `EXISTS` 查询只针对当前批次 ID，复用完整度 claim 事务，不扫描全库或增加事务往返；只在到期重试时对相关旧失败行执行一次有界批量更新。
 
 0165 对旧失败记录使用一个共享的首次冷却截止时间，不再批量更新 `metadata_reidentify_job_items`。SQLite 迁移回归确认旧 job/item 状态和计数不变且迁移没有更新历史 item 行；SQLite 扫描与状态机回归覆盖 READY 缺失状态到期后重新入队、冷却时间和失败次数继承。精确扫描回归通过，`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81 通过；构建、fmt 和全目标全 feature Clippy 通过。全目标测试库为 746 passed、0 failed、11 ignored；全部集成目标仅 `emby_counts` 和 `strm` 失败，二者此前在干净 `origin/test=8412cc2a` 上独立复现。此前 PostgreSQL 环境不可用；恢复 PostgreSQL 16.15 临时实例并修正测试夹具绕过 `Database` SQL 适配器、直接发送 `?` 占位符的问题后，`postgres_database` 16/16、progressive-scan storage contract 1/1 通过。以上是固定测试与 SQL 边界，不测量运行时 CPU、重试流量、墙钟、FNOS 或 NAS 收益。
 

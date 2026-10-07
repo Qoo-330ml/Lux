@@ -4630,6 +4630,170 @@ async fn automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_sc
 }
 
 #[tokio::test]
+async fn automatic_fill_missing_retry_backoff_is_consumed_after_a_successful_retry()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Retry consumption", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    let item_id = "retry-consumption-item";
+    database
+        .query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+    let fingerprint = b"retry-consumption-input";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(item_id, "POSTER", fingerprint)
+            .await?
+    );
+    let result = [NewItemMetadataCompletenessResult {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint,
+        is_missing: true,
+        checked_at: 10,
+    }];
+    let first_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &result,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    let first_job_id = first_dispatch.scheduled_job_ids[0].clone();
+    fail_fill_missing_job_with_unavailable_provider(&database, &first_job_id, item_id).await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+
+    let retry_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.to_owned()])
+        .await?;
+    assert_eq!(retry_dispatch.scheduled_job_ids.len(), 1);
+    let retry_job_id = retry_dispatch.scheduled_job_ids[0].clone();
+    let consumed_legacy_retry: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(consumed_legacy_retry, 1);
+    assert!(
+        database
+            .claim_metadata_reidentify_job(&retry_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(&retry_job_id, 1)
+            .await?,
+        vec![item_id.to_owned()]
+    );
+    database
+        .finish_metadata_reidentify_item(&retry_job_id, item_id, "COMPLETED", 1, None)
+        .await?;
+    database
+        .finish_metadata_reidentify_job(&retry_job_id, "COMPLETED", None)
+        .await?;
+
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id,
+        capability: "POSTER",
+        input_fingerprint: fingerprint,
+    }];
+    let (claimed_indices, due_retry_item_ids) = database
+        .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+            &retry_check,
+            &library_id,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    assert!(claimed_indices.is_empty());
+    assert!(
+        due_retry_item_ids.is_empty(),
+        "a historical expired failure must not trigger another automatic retry"
+    );
+
+    assert!(
+        database
+            .retry_metadata_reidentify_job(&first_job_id)
+            .await?
+    );
+    assert!(
+        database
+            .claim_metadata_reidentify_job(&first_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(&first_job_id, 1)
+            .await?,
+        vec![item_id.to_owned()]
+    );
+    database
+        .finish_metadata_reidentify_item(
+            &first_job_id,
+            item_id,
+            "FAILED",
+            0,
+            Some("SCRAPER_UNAVAILABLE"),
+        )
+        .await?;
+    database
+        .finish_metadata_reidentify_job(
+            &first_job_id,
+            "DEFERRED",
+            Some("DEFERRED_PROVIDER_UNAVAILABLE"),
+        )
+        .await?;
+    let manual_retry_backoff: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_consumed
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(manual_retry_backoff, (2, Some(0)));
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -5130,6 +5294,84 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .bind(&library_id)
         .execute(database.pool())
         .await?;
+
+    let failed_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    let failed_job_id = failed_dispatch
+        .scheduled_job_ids
+        .first()
+        .ok_or("PostgreSQL provider-unavailable job was not scheduled")?
+        .clone();
+    fail_fill_missing_job_with_unavailable_provider(&database, &failed_job_id, &replay_item_id)
+        .await?;
+    database
+        .query(
+            "UPDATE metadata_reidentify_job_items
+             SET automatic_retry_after = unixepoch() - 1
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&failed_job_id)
+        .bind(&replay_item_id)
+        .execute(database.pool())
+        .await?;
+    let retry_dispatch = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    let retry_job_id = retry_dispatch
+        .scheduled_job_ids
+        .first()
+        .ok_or("PostgreSQL due retry was not scheduled")?
+        .clone();
+    let consumed_retry: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&failed_job_id)
+        .bind(&replay_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(consumed_retry, 1);
+    assert!(
+        database
+            .claim_metadata_reidentify_job(&retry_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(&retry_job_id, 1)
+            .await?,
+        vec![replay_item_id.clone()]
+    );
+    database
+        .finish_metadata_reidentify_item(&retry_job_id, &replay_item_id, "COMPLETED", 1, None)
+        .await?;
+    database
+        .finish_metadata_reidentify_job(&retry_job_id, "COMPLETED", None)
+        .await?;
+    let retry_check = [NewItemMetadataCompletenessCheck {
+        item_id: &replay_item_id,
+        capability: "POSTER",
+        input_fingerprint: replay_fingerprint,
+    }];
+    let (claimed_retry, due_retry_item_ids) = database
+        .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+            &retry_check,
+            &library_id,
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    assert!(claimed_retry.is_empty());
+    assert!(due_retry_item_ids.is_empty());
 
     let completeness_fingerprint_v2 = b"postgres-batch-input-v2";
     let replacement_check = [NewItemMetadataCompletenessCheck {

@@ -28,6 +28,7 @@ struct DeferredFillMissingRetryState {
     has_retry_deadline: bool,
     retry_pending: bool,
     recently_deferred: bool,
+    deferred_job_items: Vec<(String, String)>,
 }
 
 fn parse_scan_local_metadata_non_retryable_item_ids(
@@ -8689,6 +8690,7 @@ impl Database {
                      AND jobs.cancel_requested = 0
                      AND job_items.status = 'FAILED'
                      AND job_items.error = 'SCRAPER_UNAVAILABLE'
+                     AND job_items.automatic_retry_consumed = 0
                      AND ({deferred_snapshot_predicates})
                  )
                  ORDER BY CASE WHEN jobs.status IN ('QUEUED', 'RUNNING') THEN 0 ELSE 1 END,
@@ -8715,31 +8717,37 @@ impl Database {
                     source,
                 })?
             {
+                let job_id: String = row.get("job_id");
                 let item_id: String = row.get("item_id");
                 let job_status: String = row.get("job_status");
                 if job_status == "DEFERRED" {
                     let fingerprint: Option<Vec<u8>> = row.get("request_fingerprint");
                     let capabilities: String = row.get("request_capabilities_json");
+                    let has_retry_deadline = row.get::<i64, _>("has_retry_deadline") != 0;
+                    let retry_pending = row.get::<i64, _>("retry_pending") != 0;
+                    let recently_deferred = row.get::<i64, _>("recently_deferred") != 0;
                     let retry = deferred_by_snapshot
-                        .entry((item_id, fingerprint, capabilities))
+                        .entry((item_id.clone(), fingerprint, capabilities))
                         .or_insert(DeferredFillMissingRetryState {
                             automatic_retry_count: 0,
                             has_retry_deadline: false,
                             retry_pending: false,
                             recently_deferred: false,
+                            deferred_job_items: Vec::new(),
                         });
                     retry.automatic_retry_count = retry
                         .automatic_retry_count
                         .max(row.get("automatic_retry_count"));
-                    retry.has_retry_deadline |= row.get::<i64, _>("has_retry_deadline") != 0;
-                    retry.retry_pending |= row.get::<i64, _>("retry_pending") != 0;
-                    retry.recently_deferred |= row.get::<i64, _>("recently_deferred") != 0;
+                    retry.has_retry_deadline |= has_retry_deadline;
+                    retry.retry_pending |= retry_pending;
+                    retry.recently_deferred |= recently_deferred;
+                    retry.deferred_job_items.push((job_id, item_id));
                     continue;
                 }
                 active_by_item
                     .entry(item_id)
                     .or_insert_with(|| ActiveFillMissingItem {
-                        job_id: row.get("job_id"),
+                        job_id,
                         job_status,
                         item_status: row.get("item_status"),
                         request_fingerprint: row.get("request_fingerprint"),
@@ -8751,6 +8759,7 @@ impl Database {
         let mut queued_updates = HashMap::<String, Vec<MetadataFillMissingRequest>>::new();
         let mut completed_queued_updates = HashMap::<String, i64>::new();
         let mut remaining = Vec::new();
+        let mut consumed_deferred_retry_job_items = Vec::new();
         for request in requests {
             if let Some(active_item) = active_by_item.get(&request.item_id) {
                 let matches_snapshot = active_item.request_fingerprint.as_deref()
@@ -8786,12 +8795,40 @@ impl Database {
                     let mut retry = request.clone();
                     retry.automatic_retry_count = deferred.automatic_retry_count;
                     remaining.push(retry);
+                    consumed_deferred_retry_job_items
+                        .extend(deferred.deferred_job_items.iter().cloned());
                 } else if !deferred.recently_deferred {
                     remaining.push(request.clone());
                 }
             } else {
                 remaining.push(request.clone());
             }
+        }
+
+        consumed_deferred_retry_job_items.sort_unstable();
+        consumed_deferred_retry_job_items.dedup();
+        for batch in consumed_deferred_retry_job_items.chunks(BATCH_INSERT_CHUNK_SIZE) {
+            let values = std::iter::repeat_n("(?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "UPDATE metadata_reidentify_job_items
+                 SET automatic_retry_consumed = 1, updated_at = unixepoch()
+                 WHERE automatic_retry_consumed = 0
+                   AND status = 'FAILED' AND error = 'SCRAPER_UNAVAILABLE'
+                   AND (job_id, item_id) IN ({values})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for (job_id, item_id) in batch {
+                statement = statement.bind(job_id).bind(item_id);
+            }
+            statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
         }
 
         for (job_id, updates) in queued_updates {
@@ -8814,6 +8851,7 @@ impl Database {
                          status = CASE WHEN status = 'COMPLETED' THEN 'PENDING' ELSE status END,
                          candidate_count = CASE WHEN status = 'COMPLETED' THEN 0 ELSE candidate_count END,
                          error = CASE WHEN status = 'COMPLETED' THEN NULL ELSE error END,
+                         automatic_retry_consumed = 0,
                          automatic_retry_count = 0,
                          automatic_retry_after = NULL,
                          updated_at = unixepoch()
@@ -9612,6 +9650,12 @@ impl Database {
                          error = CASE WHEN EXISTS (
                              SELECT 1 FROM changed_metadata_fill_request
                          ) THEN NULL ELSE ? END,
+                         automatic_retry_consumed = CASE
+                             WHEN EXISTS (SELECT 1 FROM provider_unavailable_metadata_fill)
+                               OR EXISTS (SELECT 1 FROM changed_metadata_fill_request)
+                                 THEN 0
+                             ELSE automatic_retry_consumed
+                         END,
                          automatic_retry_count = CASE
                              WHEN EXISTS (SELECT 1 FROM provider_unavailable_metadata_fill)
                                  THEN CASE WHEN automatic_retry_count < 3
@@ -9900,6 +9944,7 @@ impl Database {
                 "UPDATE metadata_reidentify_job_items
                  SET status = 'PENDING', candidate_count = 0, error = NULL,
                      automatic_retry_after = NULL,
+                     automatic_retry_consumed = 0,
                      claimed_request_fingerprint = NULL,
                      claimed_request_capabilities_json = '[]',
                      updated_at = unixepoch()

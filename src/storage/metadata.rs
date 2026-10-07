@@ -214,6 +214,7 @@ impl Database {
                          AND jobs.status = 'DEFERRED' AND jobs.cancel_requested = 0
                          AND retry_items.status = 'FAILED'
                          AND retry_items.error = 'SCRAPER_UNAVAILABLE'
+                         AND retry_items.automatic_retry_consumed = 0
                          AND retry_items.request_fingerprint IS NOT NULL
                          AND COALESCE(
                              retry_items.automatic_retry_after,

@@ -5,6 +5,10 @@ ALTER TABLE metadata_reidentify_job_items
 ALTER TABLE metadata_reidentify_job_items
     ADD COLUMN automatic_retry_after BIGINT;
 
+ALTER TABLE metadata_reidentify_job_items
+    ADD COLUMN automatic_retry_consumed INTEGER NOT NULL DEFAULT 0
+        CHECK (automatic_retry_consumed IN (0, 1));
+
 INSERT INTO server_settings (key, value)
 VALUES (
     'metadata_fill_missing_legacy_retry_after',

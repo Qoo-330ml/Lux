@@ -107,6 +107,7 @@ fn metadata_migrations_preserve_historical_version_sequence()
     for migration in [&sqlite_retry, &postgres_retry] {
         assert!(migration.contains("automatic_retry_count"));
         assert!(migration.contains("automatic_retry_after"));
+        assert!(migration.contains("automatic_retry_consumed"));
         assert!(migration.contains("metadata_fill_missing_legacy_retry_after"));
         assert!(migration.contains("+ 300"));
         assert!(!migration.contains("UPDATE metadata_reidentify_job_items"));
@@ -808,9 +809,9 @@ async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
 
     let database = Database::connect(&config).await?;
     assert_eq!(database.schema_version().await?, 165);
-    let jobs: Vec<(String, String, i64, i64, i64)> = sqlx::query_as(
+    let jobs: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT jobs.id, jobs.status, jobs.processed_count, jobs.total_count,
-                items.automatic_retry_count
+                items.automatic_retry_count, items.automatic_retry_consumed
          FROM metadata_reidentify_jobs jobs
          JOIN metadata_reidentify_job_items items ON items.job_id = jobs.id
          ORDER BY jobs.id",
@@ -819,20 +820,23 @@ async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
     .await?;
     assert_eq!(
         jobs.iter()
-            .map(|(id, status, processed, total, retry_count)| {
-                (
-                    id.as_str(),
-                    status.as_str(),
-                    *processed,
-                    *total,
-                    *retry_count,
-                )
-            })
+            .map(
+                |(id, status, processed, total, retry_count, retry_consumed)| {
+                    (
+                        id.as_str(),
+                        status.as_str(),
+                        *processed,
+                        *total,
+                        *retry_count,
+                        *retry_consumed,
+                    )
+                }
+            )
             .collect::<Vec<_>>(),
         vec![
-            ("retry-automatic-job", "DEFERRED", 1, 1, 0),
-            ("retry-no-snapshot-job", "DEFERRED", 1, 1, 0),
-            ("retry-other-error-job", "DEFERRED", 1, 1, 0),
+            ("retry-automatic-job", "DEFERRED", 1, 1, 0, 0),
+            ("retry-no-snapshot-job", "DEFERRED", 1, 1, 0, 0),
+            ("retry-other-error-job", "DEFERRED", 1, 1, 0, 0),
         ]
     );
     let retry_deadlines: Vec<(String, Option<i64>)> = sqlx::query_as(
