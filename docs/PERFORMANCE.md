@@ -1476,3 +1476,9 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 自动 completeness 调度现在为每个 `FILL_MISSING` job item 保存输入 fingerprint 和规范化 capability 集；claim 时复制一份处理快照。重复且相同的请求只读当前任务状态，不执行 job/item 插入或更新。queued item 收到变化请求时批量更新既有 job item；running item 在当前 worker 结束后最多回到 `PENDING` 一次，并且该次不增加 `processed_count`。近期 provider-unavailable `DEFERRED` 只抑制完全相同的快照。
 
 固定 SQLite storage 回归通过触发器计数确认：重复同快照请求对 job/item 表执行 0 次 INSERT、0 次 UPDATE；queued 中出现新 fingerprint 时执行 0 次 INSERT、1 次 item UPDATE、0 次 job INSERT。状态机测试还验证 capability 集变化、运行项只重跑一次、同快照稳定完成、取消不重跑、worker 失败后的显式 retry 使用最新 fingerprint、近期 DEFERRED 同快照去重和变化快照重新排队。该计数是单 item fixture 的 DML 边界，不是完整性流程 SQL 总数或墙钟基准；未测量数据库 CPU、FNOS、PostgreSQL 或 NAS 收益，也未部署。
+
+### LUX-403 queued FILL_MISSING 容量复用
+
+在固定 SQLite fixture 中，先生成 3 个 queued job（100、100、50 项），再增加 1 项时复用第三个 job，job 数保持 3；继续增加 80 项后，先填满第三个 job 再创建 31 项的第四个 job，最终分布为 100/100/100/31，共 331 项。旧逻辑会在最早 job 已满时另建 job，即使后面仍有空位。
+
+该结果只证明有界队列分配的状态与 job 数；未测量多次扫描下的查询延迟、CPU、FNOS、PostgreSQL 或 NAS 收益。PostgreSQL `FOR UPDATE` 查询未在集成服务上运行。

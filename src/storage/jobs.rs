@@ -8516,25 +8516,39 @@ impl Database {
         library_id: &str,
         requests: &[MetadataFillMissingRequest],
     ) -> Result<Vec<String>, StorageError> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut job_ids = Vec::new();
         let mut remaining = requests.to_vec();
-        if let Some((queued_job_id, queued_count)) = self
-            .query_as::<(String, i64)>(
-                "SELECT id, total_count
-                 FROM metadata_reidentify_jobs
-                 WHERE library_id = ? AND mode = 'FILL_MISSING'
-                   AND status = 'QUEUED' AND cancel_requested = 0
-                 ORDER BY created_at, id
-                 LIMIT 1",
-            )
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT id, total_count
+             FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'
+               AND status = 'QUEUED' AND cancel_requested = 0 AND total_count < 100
+             ORDER BY created_at, id
+             LIMIT ?{lock_clause}"
+        );
+        let queued_jobs = self
+            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(query))
             .bind(library_id)
-            .fetch_optional(&mut **transaction)
+            .bind(i64::try_from(remaining.len()).unwrap_or(i64::MAX))
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })?
-        {
+            })?;
+        for (queued_job_id, queued_count) in queued_jobs {
+            if remaining.is_empty() {
+                break;
+            }
             let capacity = 100usize.saturating_sub(usize::try_from(queued_count).unwrap_or(100));
             let take = capacity.min(remaining.len());
             if take > 0 {
