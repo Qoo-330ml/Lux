@@ -8698,10 +8698,12 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 单个 item 的 scraper 预检错误会进入现有 `FILL_MISSING` worker 与退避状态机；相同快照在冷却期不重复派发。
-- [ ] scraper 预检成功但没有已配置 scraper 时不创建 job；关闭自动匹配或没有可请求 capability 时也不创建 job。
-- [ ] 定向回归先证明旧逻辑会把预检错误永久留在 READY missing，再验证修复；相关 scanner/storage 测试、fmt、Clippy 和差异检查通过。
-- [ ] 不增加数据库/API 变化，不把这项恢复性修复描述为已验证的 CPU 降幅。
+- [x] 已配置 scraper 的预检错误允许新确认缺失项进入现有 `FILL_MISSING` worker，由 `SCRAPER_UNAVAILABLE` 退避；同一快照冷却期去重由 LUX-402 storage 回归覆盖。
+- [x] 预检成功但没有 scraper、自动匹配关闭或没有可请求 capability 时不创建自动 job；决策单测和现有扫描策略回归通过。
+- [x] 预检错误恢复路径的回归、scanner/scanning_jobs/storage 定向覆盖、fmt、Clippy 和差异检查通过；全目标失败项与独立复测结果如下。
+- [x] 无数据库/API 变化；没有把本地恢复性修复描述为已验证的 FNOS CPU 降幅。
+
+结果（2026-10-07）：预检失败与明确不可用状态现在分开处理。已配置 scraper 的 item 级或整批预检错误会进入现有补全 worker，错误由 worker 记录为 `SCRAPER_UNAVAILABLE` 并使用 LUX-402 退避；明确无 scraper 仍不入队。`cargo test --locked --all-targets --no-fail-fast` 中 library tests 为 750 passed、12 ignored，`scanning_jobs` 81/81、`scanned_metadata` 16/16、`storage` 49/49 通过；全目标的 `emby_counts` 与 `strm` 失败已在干净 `origin/test=8412cc2a` 基线复现，`libraries_api` 全目标并行运行时失败后独立复跑 13/13 通过。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。该分支未部署到 FNOS，也没有生产 CPU 降幅证据。
 
 短计划与文件：预计修改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先在 scanner 单测中固定“预检错误继续排队、明确无 scraper 不排队”的决策，再把预检错误送入已有 provider-unavailable job 流程，最后运行窄测试与相关完整检查。
 

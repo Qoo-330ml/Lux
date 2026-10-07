@@ -2,7 +2,7 @@
 
 ## 当前实现状态
 
-截至 2026-10-07，LUX-401 至 LUX-406 的重复补全、扫描调度和扫描后本地 metadata 读取优化已在本地分支实现，并有 SQLite/PostgreSQL 合同或定向回归覆盖。当前 worktree 的修复尚未部署到 FNOS；本地 ARM 测试不能证明服务器 CPU 已下降。
+截至 2026-10-07，LUX-401 至 LUX-407 的重复补全、扫描调度、预检失败恢复和扫描后本地 metadata 读取优化已在本地分支实现，并有 SQLite/PostgreSQL 合同或定向回归覆盖。当前 worktree 的修复尚未部署到 FNOS；本地 ARM 测试不能证明服务器 CPU 已下降。
 
 - 自动 `FILL_MISSING` 仅由本轮新确认的 missing claim 触发；稳定 fingerprint 与请求快照用于区分真正变化的补全意图。
 - 活动任务和带快照的近期 provider 失败参与去重；自动 provider 失败在 5 分钟、30 分钟、最高 6 小时的退避期内不重复创建请求。
@@ -80,7 +80,7 @@
 
 本地 completeness worker 在持久化 missing 结果前调用 `has_selected_scrapers_for_items`。当某个已配置 scraper 的插件客户端暂时不可用时，该查询返回 item 级错误；当前实现记录日志并把 item 标记为本轮不可自动入队，随后却仍将 completeness 保存为 `READY + is_missing=1`。同一 fingerprint 之后不会再次被 claim，所以即使 scraper 恢复，该 item 也可能不再进入补全队列。
 
-计划修复（LUX-407）：区分成功返回“没有 scraper”与预检错误。前者保持不入队；后者把新确认缺失项提交给现有 `FILL_MISSING` worker，让 worker 将失败记录为 `SCRAPER_UNAVAILABLE` 并应用已有逐 item 退避。不得新增独立重试表或定时扫描；人工任务和关闭自动匹配的语义保持不变。
+已实现（LUX-407，本地未部署）：区分成功返回“没有 scraper”与预检错误。前者保持不入队；后者把新确认缺失项提交给现有 `FILL_MISSING` worker，让 worker 将失败记录为 `SCRAPER_UNAVAILABLE` 并应用已有逐 item 退避。没有新增重试表、定时扫描、数据库迁移或 API 变化；人工任务和关闭自动匹配的语义保持不变。预检决策回归、扫描相关集成目标及相关存储目标通过；全目标测试中的基线失败和 `libraries_api` 单独复测结果记录在 `docs/LUX-DEVELOPMENT.md` 的 LUX-407 结果中。未部署 FNOS，未验证生产 CPU 降幅。
 
 验收：预检错误通过既有退避状态机恢复重试；明确无 scraper、自动匹配关闭或没有可请求 capability 时仍不创建自动 job。
 

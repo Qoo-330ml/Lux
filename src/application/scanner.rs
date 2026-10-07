@@ -3450,6 +3450,10 @@ fn newly_confirmed_fill_missing_item_ids(
     item_ids
 }
 
+fn scraper_preflight_allows_fill_missing(available: Option<bool>, failed: bool) -> bool {
+    failed || available == Some(true)
+}
+
 async fn complete_local_metadata_completeness(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
@@ -3554,27 +3558,29 @@ async fn complete_local_metadata_completeness_for_item_ids(
             && auto_match_policy.allows_scraper_lookup()
         {
             if metadata_reidentify.is_some() {
-                if let Some(error) = scraper_availability_error.as_deref() {
+                let availability = scraper_availability_by_item.get(item_id);
+                let lookup_failed = if let Some(error) = scraper_availability_error.as_deref() {
                     tracing::warn!(
                         item_id = %item_id,
                         error,
                         "local metadata can confirm missing capabilities but scraper availability could not be checked"
                     );
-                    false
+                    true
+                } else if let Some(Err(error)) = availability {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        %error,
+                        "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                    );
+                    true
                 } else {
-                    match scraper_availability_by_item.get(item_id) {
-                        Some(Ok(available)) => *available,
-                        Some(Err(error)) => {
-                            tracing::warn!(
-                                item_id = %item_id,
-                                %error,
-                                "local metadata can confirm missing capabilities but scraper availability could not be checked"
-                            );
-                            false
-                        }
-                        None => false,
-                    }
-                }
+                    false
+                };
+                let available = availability
+                    .and_then(|result| result.as_ref().ok())
+                    .copied();
+                // The metadata worker can persist SCRAPER_UNAVAILABLE and apply its bounded retry.
+                scraper_preflight_allows_fill_missing(available, lookup_failed)
             } else {
                 false
             }
@@ -12263,8 +12269,8 @@ mod tests {
         newly_confirmed_fill_missing_item_ids, normalize_incremental_path, parse_episode_filename,
         parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
         read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
-        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
-        stat_manifest_root_sync,
+        scraper_preflight_allows_fill_missing, stat_manifest_directory_file_batch_sync,
+        stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -12448,6 +12454,14 @@ mod tests {
             vec!["new-missing".to_owned()]
         );
         assert!(newly_confirmed_fill_missing_item_ids(&checks, &[]).is_empty());
+    }
+
+    #[test]
+    fn scraper_preflight_failure_enters_bounded_fill_missing_retry() {
+        assert!(scraper_preflight_allows_fill_missing(None, true));
+        assert!(scraper_preflight_allows_fill_missing(Some(true), false));
+        assert!(!scraper_preflight_allows_fill_missing(Some(false), false));
+        assert!(!scraper_preflight_allows_fill_missing(None, false));
     }
 
     fn unsupported_scraper_call<T: Send + 'static>(
