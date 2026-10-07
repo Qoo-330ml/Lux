@@ -3119,24 +3119,6 @@ impl Database {
         Ok(metadata.remove(item_id))
     }
 
-    pub(crate) async fn find_movie_nfo_auxiliary_fields(
-        &self,
-        item_id: &str,
-    ) -> Result<Option<(String, i64)>, StorageError> {
-        self.query(
-            "SELECT sort_title, added_at FROM media_items
-             WHERE id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
-        )
-        .bind(item_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map(|row| row.map(|row| (row.get("sort_title"), row.get("added_at"))))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
-    }
-
     pub(crate) async fn list_media_item_metadata_by_ids(
         &self,
         item_ids: &[String],

@@ -1521,3 +1521,9 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-410 普通电影页图片登记边界
 
 固定 SQLite 两电影 fixture 中，普通 `enrich_movie_library` 原先对每项各执行一次图片登记，加上来源页读取共 3 次 storage query-wrapper 调用；现在同页两项共享一个图片登记事务，共 2 次。每批最多 16 项，与 storage 接受的 item 上限一致。对其中一项注入图片 upsert 失败后，批事务回滚并按 item 重试，另一电影仍登记成功。此 fixture 只证明批次边界和错误隔离，不测量端到端墙钟、磁盘性能、PostgreSQL/NAS 争用或 FNOS CPU。
+
+### LUX-411 电影 NFO 写回上下文读取
+
+固定 SQLite 单电影 fixture 中，probe NFO 首次写回原先分开读取 source/context 与辅助字段，共 4 次 storage query-wrapper 调用；合并 context 后为 3 次，减少 1 次（25%）。修改电影 NFO 的 fixture 也验证单次读取 item type、source、sort title 和 added_at，变化写回总计 3 次调用（context、mirror policy、状态同步）。回归覆盖非电影和软删除条目不注入电影辅助字段，以及既有 sort title/dateadded 输出。
+
+该计数来自应用层 storage query-wrapper，不统计 BEGIN/COMMIT、文件系统时延、SQL 执行时间或数据库往返；未测量墙钟、PostgreSQL、FNOS 或 NAS 性能，也不据此推断生产 CPU 收益。

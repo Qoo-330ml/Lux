@@ -8749,6 +8749,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：普通电影 enrichment 逐 16 项收集图片后复用现有有界图片事务，NFO 仍按 item 顺序处理；批次写失败后退回逐 item 事务并隔离错误。两电影本地 fanart fixture 中扫描 source 查询与图片登记共由 3 次 storage query-wrapper 调用降为 2 次；trigger 注入一项写失败时，另一项仍登记成功。新增单测通过，`scanned_metadata` 16/16、`series_metadata` 3/3、fmt、library all-features Clippy 与 `git diff --check` 通过。性能记录仅描述该 SQLite fixture 查询调用数，不外推墙钟或 FNOS CPU。
 
+#### LUX-411：合并电影 NFO source 与辅助字段上下文读取
+
+范围：电影 NFO/probe 写回分别读取 item 类型、preferred source、sort title 和 added_at。新增单 item NFO writeback context 查询，一次返回 target 所需 source/type 与 sort_title/added_at，供电影 NFO target、sorttitle/dateadded 和 probe source 校验复用。保持图片写回使用的通用批量 context 合同不变。保留 MOVIE 限制、首选 source/missing 检查、NFO 路径规则和 source ID freshness；不改变对外 API 或存储 schema。
+
+验收：
+
+- [x] probe 详情写回从上下文查询和辅助字段查询合为一次读；状态同步写入仍保持原事务边界，错误 source、非电影、STRM source 仍拒绝。
+- [x] 电影 NFO 写回从 item kind、source、辅助字段多次读取合并为一次 context 读取；`sorttitle`、`dateadded` 内容一致，非电影和软删除条目不注入电影辅助字段。
+- [x] NFO writer 与 candidate writeback regression、fmt、相关 Clippy 和 `git diff --check` 通过；性能记录只陈述固定 SQLite query-wrapper 调用数。
+
+短计划与文件：预计改 `src/storage/catalog.rs`、`src/storage/media.rs`、`src/application/nfo.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先把 probe 的 storage 查询调用断言由 4 调至 3 并确认失败，再新增单 item 查询并移除不再使用的辅助字段查询，最后覆盖电影 NFO 的辅助 XML 字段和拒绝路径。
+
+结果（2026-10-08）：电影 NFO 与 probe 写回复用单次 NFO writeback context 查询；条件投影保留旧辅助字段仅对未软删除 MOVIE 生效的语义，source 选择仍限制为原有媒体类型。固定 SQLite fixture 中 probe 写回由 4 次降为 3 次 storage query-wrapper 调用；变化中的电影 NFO 写回总计 3 次（context、mirror policy、状态同步）。定向 NFO 单测 1/1、`nfo_writer` 26/26、candidate 模块 22/22、候选写回失败回归 1/1、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。查询计数不代表 PostgreSQL、墙钟或 FNOS CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

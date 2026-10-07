@@ -2286,8 +2286,19 @@ impl NfoWriteService {
         item_id: &str,
         patch: &MovieNfoMetadata,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        let target = self.item_nfo_target(item_id).await?;
-        let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
+        let Some((item_type, season_number, sort_title, added_at, source)) = self
+            .database
+            .find_movie_nfo_writeback_context(item_id)
+            .await?
+        else {
+            return Err(NfoWriteError::ItemNotFound);
+        };
+        let source = source.ok_or(NfoWriteError::ItemNotFound)?;
+        let target = self
+            .item_nfo_target_from_source(&item_type, season_number, &source)
+            .await?;
+        let sort_title = non_empty(sort_title.as_deref()).map(str::to_owned);
+        let date_added = added_at.and_then(nfo_date_added);
         let write = write_nfo_atomically_with_rewriter(
             &target,
             |original| {
@@ -2310,17 +2321,17 @@ impl NfoWriteService {
         source_id: &str,
         probe: &MediaProbeResult,
     ) -> Result<bool, NfoWriteError> {
-        let mut contexts = self
+        let Some((item_type, _, sort_title, added_at, writeback_source)) = self
             .database
-            .list_media_item_writeback_contexts_by_ids(&[item_id.to_owned()])
-            .await?;
-        let Some(context) = contexts.remove(item_id) else {
+            .find_movie_nfo_writeback_context(item_id)
+            .await?
+        else {
             return Ok(false);
         };
-        if context.item_type != "MOVIE" {
+        if item_type != "MOVIE" {
             return Ok(false);
         }
-        let Some(writeback_source) = context.source else {
+        let Some(writeback_source) = writeback_source else {
             return Ok(false);
         };
         let is_strm = Path::new(&writeback_source.relative_path)
@@ -2333,7 +2344,8 @@ impl NfoWriteService {
         let target = self
             .item_nfo_target_from_source("MOVIE", None, &writeback_source)
             .await?;
-        let (sort_title, date_added) = self.movie_nfo_auxiliary_fields(item_id).await?;
+        let sort_title = non_empty(sort_title.as_deref()).map(str::to_owned);
+        let date_added = added_at.and_then(nfo_date_added);
         let write = write_nfo_atomically_with_rewriter(
             &target,
             |original| {
@@ -2349,23 +2361,6 @@ impl NfoWriteService {
         .await?;
         self.finish_item_write(item_id, target, write).await?;
         Ok(true)
-    }
-
-    async fn movie_nfo_auxiliary_fields(
-        &self,
-        item_id: &str,
-    ) -> Result<(Option<String>, Option<String>), NfoWriteError> {
-        let Some((sort_title, added_at)) = self
-            .database
-            .find_movie_nfo_auxiliary_fields(item_id)
-            .await?
-        else {
-            return Ok((None, None));
-        };
-        Ok((
-            non_empty(Some(sort_title.as_str())).map(str::to_owned),
-            nfo_date_added(added_at),
-        ))
     }
 
     pub async fn write_item_series_nfo(
@@ -3134,6 +3129,11 @@ mod tests {
             bitrate: Some(500_000),
             streams: vec![],
         };
+        sqlx::query("UPDATE media_items SET sort_title = ?, added_at = 0 WHERE id = ?")
+            .bind("00 example movie")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
         sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
             .bind(r#"{"images":{"writeToMetadata":true}}"#)
             .bind(library.id.to_string())
@@ -3149,11 +3149,13 @@ mod tests {
         );
         assert_eq!(
             database.query_count(),
-            4,
-            "context, auxiliary, mirror policy, and combined state sync"
+            3,
+            "item context, mirror policy, and combined state sync"
         );
         let content = fs::read_to_string(&target).await?;
         assert!(content.contains("<custom>keep</custom>"));
+        assert!(content.contains("<sorttitle>00 example movie</sorttitle>"));
+        assert!(content.contains("<dateadded>1970-01-01 00:00:00</dateadded>"));
         assert!(root.join("movie.nfo").exists());
         let mirror = library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
         assert_eq!(fs::read_to_string(&mirror).await?, content);
@@ -3166,11 +3168,39 @@ mod tests {
         );
         assert_eq!(
             database.query_count(),
-            2,
+            1,
             "an unchanged NFO skips mirror policy lookup and state sync"
         );
         assert_eq!(fs::read_to_string(&target).await?, content);
         assert_eq!(fs::read_to_string(&mirror).await?, content);
+
+        database.reset_query_count();
+        writer
+            .write_item_movie_nfo(
+                &item_id,
+                &MovieNfoMetadata {
+                    base: NfoMetadata {
+                        title: Some("Example with details".to_owned()),
+                        ..NfoMetadata::default()
+                    },
+                    ..MovieNfoMetadata::default()
+                },
+            )
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            3,
+            "movie item context, mirror policy, and combined state sync"
+        );
+        let movie_content = fs::read_to_string(&target).await?;
+        assert!(
+            movie_content.contains("<sorttitle>00 example movie</sorttitle>"),
+            "{movie_content}"
+        );
+        assert!(
+            movie_content.contains("<dateadded>1970-01-01 00:00:00</dateadded>"),
+            "{movie_content}"
+        );
 
         database.reset_query_count();
         assert!(
@@ -3179,7 +3209,7 @@ mod tests {
                 .await?
         );
         assert_eq!(database.query_count(), 1);
-        assert_eq!(fs::read_to_string(&target).await?, content);
+        assert_eq!(fs::read_to_string(&target).await?, movie_content);
 
         sqlx::query("UPDATE media_items SET item_type = 'VIDEO' WHERE id = ?")
             .bind(&item_id)
@@ -3195,8 +3225,53 @@ mod tests {
                 .write_item_probe_details("missing-item", &source_id, &probe)
                 .await?
         );
+        writer
+            .write_item_movie_nfo(
+                &item_id,
+                &MovieNfoMetadata {
+                    base: NfoMetadata {
+                        title: Some("Video item".to_owned()),
+                        ..NfoMetadata::default()
+                    },
+                    ..MovieNfoMetadata::default()
+                },
+            )
+            .await?;
+        let video_nfo = fs::read_to_string(root.join("Example.Movie.2020.nfo")).await?;
+        assert!(!video_nfo.contains("<sorttitle>"), "{video_nfo}");
+        assert!(!video_nfo.contains("<dateadded>"), "{video_nfo}");
 
-        sqlx::query("UPDATE media_items SET item_type = 'MOVIE' WHERE id = ?")
+        sqlx::query("UPDATE media_items SET item_type = 'MOVIE', removed_at = 1 WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        fs::remove_file(&target).await?;
+        fs::remove_file(root.join("Example.Movie.2020.nfo")).await?;
+        writer
+            .write_item_movie_nfo(
+                &item_id,
+                &MovieNfoMetadata {
+                    base: NfoMetadata {
+                        title: Some("Removed movie".to_owned()),
+                        ..NfoMetadata::default()
+                    },
+                    ..MovieNfoMetadata::default()
+                },
+            )
+            .await?;
+        let removed_movie_nfo = fs::read_to_string(&target).await?;
+        assert!(
+            !removed_movie_nfo.contains("<sorttitle>"),
+            "{removed_movie_nfo}"
+        );
+        assert!(
+            !removed_movie_nfo.contains("<dateadded>"),
+            "{removed_movie_nfo}"
+        );
+        fs::write(&target, &movie_content).await?;
+        fs::write(&mirror, &movie_content).await?;
+
+        sqlx::query("UPDATE media_items SET removed_at = NULL WHERE id = ?")
             .bind(&item_id)
             .execute(database.pool())
             .await?;
@@ -3216,7 +3291,7 @@ mod tests {
                 .write_item_probe_details(&item_id, &source_id, &probe)
                 .await?
         );
-        assert_eq!(fs::read_to_string(&target).await?, content);
+        assert_eq!(fs::read_to_string(&target).await?, movie_content);
         Ok(())
     }
 
