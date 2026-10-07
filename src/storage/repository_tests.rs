@@ -5084,6 +5084,33 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         )
         .await?;
     assert!(duplicate_policy_replay.scheduled_job_ids.is_empty());
+    let existing_fill_missing_job_id = enabled_policy_replay
+        .scheduled_job_ids
+        .first()
+        .ok_or("enabled policy replay did not schedule a fill-missing job")?;
+    assert!(
+        database
+            .claim_metadata_reidentify_job(existing_fill_missing_job_id)
+            .await?
+    );
+    assert_eq!(
+        database
+            .claim_next_metadata_reidentify_items(existing_fill_missing_job_id, 1)
+            .await?,
+        vec![replay_item_id.clone()]
+    );
+    database
+        .finish_metadata_reidentify_item(
+            existing_fill_missing_job_id,
+            &replay_item_id,
+            "COMPLETED",
+            1,
+            None,
+        )
+        .await?;
+    database
+        .finish_metadata_reidentify_job(existing_fill_missing_job_id, "COMPLETED", None)
+        .await?;
     database
         .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
         .bind(&library_id)
@@ -5442,6 +5469,8 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     )
     .execute(database.pool())
     .await?;
+    // Drain the earlier queued job above so this injected failure exercises new-job insertion,
+    // rather than correctly reusing that job's remaining capacity.
     assert!(
         database
             .complete_local_metadata_and_enqueue_fill_missing(
@@ -5496,6 +5525,113 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     assert_eq!(replayed.updated_count, 0);
     assert!(replayed.scheduled_job_ids.is_empty());
 
+    fail_fill_missing_job_with_unavailable_provider(
+        &database,
+        &scheduled.scheduled_job_ids[0],
+        &item_id,
+    )
+    .await?;
+    let retry_pending = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(retry_pending.scheduled_job_ids.is_empty());
+    let failed_retry_state: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&scheduled.scheduled_job_ids[0])
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let now: i64 = database
+        .query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(failed_retry_state.0, 1);
+    assert!(failed_retry_state.1.is_some_and(|retry_at| retry_at > now));
+
+    database
+        .query(
+            "UPDATE metadata_reidentify_job_items SET automatic_retry_after = 0
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&scheduled.scheduled_job_ids[0])
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let due_retry = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert_eq!(due_retry.scheduled_job_ids.len(), 1);
+    assert_ne!(
+        due_retry.scheduled_job_ids[0],
+        scheduled.scheduled_job_ids[0]
+    );
+    let inherited_retry_state: (i64, Option<i64>) = database
+        .query_as(
+            "SELECT automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(&due_retry.scheduled_job_ids[0])
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(inherited_retry_state, (1, None));
+
+    let queued_capacity_fingerprint = b"postgres-queued-capacity-v1";
+    assert!(
+        database
+            .prepare_item_metadata_completeness_check(
+                &replay_item_id,
+                "TRAILER",
+                queued_capacity_fingerprint,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .claim_item_metadata_completeness_check(
+                &replay_item_id,
+                "TRAILER",
+                queued_capacity_fingerprint,
+            )
+            .await?
+    );
+    let queued_capacity_result = [NewItemMetadataCompletenessResult {
+        item_id: &replay_item_id,
+        capability: "TRAILER",
+        input_fingerprint: queued_capacity_fingerprint,
+        is_missing: true,
+        checked_at: 1_003,
+    }];
+    database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &queued_capacity_result,
+            std::slice::from_ref(&replay_item_id),
+        )
+        .await?;
+    let reused_queued_job_id: String = database
+        .query_scalar(
+            "SELECT job_id FROM metadata_reidentify_job_items
+             WHERE item_id = ? AND status = 'PENDING'
+               AND job_id = ?",
+        )
+        .bind(&replay_item_id)
+        .bind(&due_retry.scheduled_job_ids[0])
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(reused_queued_job_id, due_retry.scheduled_job_ids[0]);
+
     let still_fingerprint = b"postgres-still-v1";
     assert!(
         database
@@ -5530,7 +5666,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             )
             .fetch_one(database.pool())
             .await?,
-        2
+        3
     );
 
     let pagination_root_path = temp_dir.path().join("Pagination Movies");
