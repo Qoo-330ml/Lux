@@ -3600,12 +3600,26 @@ async fn complete_local_metadata_completeness_for_item_ids(
                     },
                 )
                 .collect::<Vec<_>>();
-            let claimed_indices = database
-                .prepare_and_claim_item_metadata_completeness_checks(&requests)
+            let mut due_retry_candidates = check_batch
+                .iter()
+                .filter(|(_, _, _, is_missing, eligible)| *is_missing && *eligible)
+                .map(|(item_id, _, _, _, _)| item_id.clone())
+                .collect::<Vec<_>>();
+            due_retry_candidates.sort_unstable();
+            due_retry_candidates.dedup();
+            let (claimed_indices, due_retry_item_ids) = database
+                .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+                    &requests,
+                    &library_id,
+                    &due_retry_candidates,
+                )
                 .await
                 .map_err(|error| error.to_string())?;
-            let metadata_fill_missing =
+            let mut metadata_fill_missing =
                 newly_confirmed_fill_missing_item_ids(check_batch, &claimed_indices);
+            metadata_fill_missing.extend(due_retry_item_ids);
+            metadata_fill_missing.sort_unstable();
+            metadata_fill_missing.dedup();
             if claimed_indices.is_empty() && metadata_fill_missing.is_empty() {
                 continue;
             }
@@ -13867,6 +13881,83 @@ mod tests {
             "an opted-in incremental job keeps its creation-time policy snapshot"
         );
 
+        let first_fill_missing_job_id = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM metadata_reidentify_jobs
+             WHERE mode = 'FILL_MISSING' AND library_id = ?
+             ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                let status: String =
+                    sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                        .bind(&first_fill_missing_job_id)
+                        .fetch_one(database.pool())
+                        .await?;
+                if !matches!(status.as_str(), "QUEUED" | "RUNNING") {
+                    return Ok::<(), sqlx::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+        sqlx::query(
+            "UPDATE metadata_reidentify_job_items
+             SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE',
+                 automatic_retry_count = 1, automatic_retry_after = unixepoch() - 1
+             WHERE job_id = ?",
+        )
+        .bind(&first_fill_missing_job_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE metadata_reidentify_jobs
+             SET status = 'DEFERRED', error = 'DEFERRED_PROVIDER_UNAVAILABLE',
+                 finished_at = unixepoch(), updated_at = unixepoch()
+             WHERE id = ?",
+        )
+        .bind(&first_fill_missing_job_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 1 WHERE id = ?")
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        tokio::fs::write(
+            movie_dir.join("Incremental.Policy.Movie.2024.mkv"),
+            b"changed movie",
+        )
+        .await?;
+        let retry_scan_job = jobs
+            .enqueue_incremental_changes(
+                library.id,
+                vec![super::IncrementalScanChange {
+                    root_id: root.root.id.to_string(),
+                    relative_path: "Incremental Policy Movie (2024)".to_owned(),
+                    kind: crate::application::watch::ChangeKind::Modify,
+                }],
+            )
+            .await?;
+        jobs.run_to_completion_with_metadata(&retry_scan_job.id, 100, None, Some(metadata.clone()))
+            .await?;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs
+                 WHERE mode = 'FILL_MISSING' AND library_id = ?",
+            )
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await?,
+            2,
+            "a later automatic scan must retry a due provider failure when completeness is still READY"
+        );
+        sqlx::query("UPDATE libraries SET realtime_metadata_auto_match_enabled = 0 WHERE id = ?")
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+
         let opted_out_movie_dir = media_root.join("Opted Out Policy Movie (2024)");
         tokio::fs::create_dir_all(&opted_out_movie_dir).await?;
         tokio::fs::write(
@@ -13928,8 +14019,8 @@ mod tests {
             .bind(&library_id)
             .fetch_one(database.pool())
             .await?,
-            1,
-            "a saved incremental opt-out is respected even when the live library switch is enabled"
+            2,
+            "a saved incremental opt-out does not add another job after a due retry"
         );
         Ok(())
     }

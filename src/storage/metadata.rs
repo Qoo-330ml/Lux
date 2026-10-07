@@ -36,12 +36,34 @@ impl Database {
         &self,
         checks: &[NewItemMetadataCompletenessCheck<'_>],
     ) -> Result<Vec<usize>, StorageError> {
+        self.prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+            checks,
+            "",
+            &[],
+        )
+        .await
+        .map(|(claimed_indices, _)| claimed_indices)
+    }
+
+    pub(crate) async fn prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+        &self,
+        checks: &[NewItemMetadataCompletenessCheck<'_>],
+        library_id: &str,
+        due_fill_missing_retry_candidates: &[String],
+    ) -> Result<(Vec<usize>, Vec<String>), StorageError> {
         if checks.len() > MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE {
             return Err(StorageError::Conflict(
                 "metadata completeness check batch exceeds the storage limit".into(),
             ));
         }
+        if due_fill_missing_retry_candidates.len() > MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE
+        {
+            return Err(StorageError::Conflict(
+                "metadata fill-missing retry candidate batch exceeds the storage limit".into(),
+            ));
+        }
         let mut unique_checks = HashSet::with_capacity(checks.len());
+        let mut checked_item_ids = HashSet::with_capacity(checks.len());
         for check in checks {
             validate_item_metadata_completeness_key(
                 check.item_id,
@@ -53,9 +75,20 @@ impl Database {
                     "metadata completeness check batch contains a duplicate item capability".into(),
                 ));
             }
+            checked_item_ids.insert(check.item_id);
+        }
+        let mut unique_retry_candidates =
+            HashSet::with_capacity(due_fill_missing_retry_candidates.len());
+        for item_id in due_fill_missing_retry_candidates {
+            if item_id.trim().is_empty() || !checked_item_ids.contains(item_id.as_str()) {
+                return Err(StorageError::Conflict(
+                    "metadata fill-missing retry candidates must belong to the check batch".into(),
+                ));
+            }
+            unique_retry_candidates.insert(item_id.clone());
         }
         if checks.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
 
         let _write_guard = self.acquire_metadata_write_lock().await;
@@ -153,6 +186,61 @@ impl Database {
                 }
             }
         }
+        let mut due_fill_missing_retry_item_ids = Vec::new();
+        if !unique_retry_candidates.is_empty() {
+            if library_id.trim().is_empty() {
+                return Err(StorageError::Conflict(
+                    "metadata fill-missing retry lookup requires a library".into(),
+                ));
+            }
+            let candidate_ids = unique_retry_candidates.into_iter().collect::<Vec<_>>();
+            let requested_values = std::iter::repeat_n("(?)", candidate_ids.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested(item_id) AS (VALUES {requested_values})
+                 SELECT requested.item_id
+                 FROM requested
+                 JOIN media_items ON media_items.id = requested.item_id
+                 LEFT JOIN server_settings legacy_retry
+                   ON legacy_retry.key = 'metadata_fill_missing_legacy_retry_after'
+                 WHERE media_items.library_id = ? AND media_items.removed_at IS NULL
+                   AND EXISTS (
+                       SELECT 1
+                       FROM metadata_reidentify_job_items retry_items
+                       JOIN metadata_reidentify_jobs jobs ON jobs.id = retry_items.job_id
+                       WHERE retry_items.item_id = requested.item_id
+                         AND jobs.library_id = ? AND jobs.mode = 'FILL_MISSING'
+                         AND jobs.status = 'DEFERRED' AND jobs.cancel_requested = 0
+                         AND retry_items.status = 'FAILED'
+                         AND retry_items.error = 'SCRAPER_UNAVAILABLE'
+                         AND retry_items.request_fingerprint IS NOT NULL
+                         AND COALESCE(
+                             retry_items.automatic_retry_after,
+                             CASE WHEN retry_items.automatic_retry_count = 0
+                                  THEN CAST(legacy_retry.value AS BIGINT)
+                                  ELSE NULL END
+                         ) <= unixepoch()
+                   )
+                 ORDER BY requested.item_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in &candidate_ids {
+                statement = statement.bind(item_id);
+            }
+            due_fill_missing_retry_item_ids = statement
+                .bind(library_id)
+                .bind(library_id)
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .into_iter()
+                .map(|row| row.get::<String, _>("item_id"))
+                .collect();
+        }
         transaction
             .commit()
             .await
@@ -160,7 +248,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(claimed_indices)
+        Ok((claimed_indices, due_fill_missing_retry_item_ids))
     }
 
     pub(crate) async fn complete_local_metadata_and_enqueue_fill_missing(
