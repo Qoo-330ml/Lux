@@ -1321,40 +1321,70 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
     ) {
         let mut directory_cache = DirectoryPathCache::default();
-        for source in sources {
-            report.items_processed += 1;
-            let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self.enrich_movie_nfo(&source.item_id, &media_path).await {
-                Ok(nfo_report) => {
-                    let failed = nfo_report.nfo_failed > 0;
-                    report.merge(nfo_report);
-                    if failed {
-                        report.mark_item_failed(&source.item_id);
+        for source_page in sources.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
+            let mut image_items = Vec::with_capacity(source_page.len());
+            for source in source_page {
+                report.items_processed += 1;
+                let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
+                match self.enrich_movie_nfo(&source.item_id, &media_path).await {
+                    Ok(nfo_report) => {
+                        let failed = nfo_report.nfo_failed > 0;
+                        report.merge(nfo_report);
+                        if failed {
+                            report.mark_item_failed(&source.item_id);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id = %source.item_id,
+                            %error,
+                            "local movie NFO failed; continuing with images and remaining items"
+                        );
+                        report.nfo_failed += 1;
+                        report.mark_item_error(&source.item_id, &error);
                     }
                 }
-                Err(error) => {
-                    tracing::warn!(
-                        item_id = %source.item_id,
-                        %error,
-                        "local movie NFO failed; continuing with images and remaining items"
-                    );
-                    report.nfo_failed += 1;
-                    report.mark_item_error(&source.item_id, &error);
+
+                if let Some(item) =
+                    prepare_scan_local_movie_image_batch_item(source, &mut directory_cache, report)
+                        .await
+                {
+                    image_items.push(item);
                 }
             }
 
+            if image_items.is_empty() {
+                continue;
+            }
             match self
-                .index_movie_images(&source.item_id, &media_path, &mut directory_cache)
+                .database
+                .insert_item_images_batch_at_indices(&image_items)
                 .await
             {
                 Ok(images_found) => report.images_found += images_found,
-                Err(error) => {
+                Err(batch_error) => {
                     tracing::warn!(
-                        item_id = %source.item_id,
-                        %error,
-                        "local movie image directory failed; continuing with remaining items"
+                        item_count = image_items.len(),
+                        %batch_error,
+                        "local movie image page failed; retrying items individually"
                     );
-                    report.mark_item_failed(&source.item_id);
+                    for item in &image_items {
+                        match self
+                            .database
+                            .insert_item_images_batch_at_indices(std::slice::from_ref(item))
+                            .await
+                        {
+                            Ok(images_found) => report.images_found += images_found,
+                            Err(error) => {
+                                tracing::warn!(
+                                    item_id = %item.item_id,
+                                    %error,
+                                    "local movie image registration failed"
+                                );
+                                report.mark_item_failed(&item.item_id);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1445,63 +1475,6 @@ impl MetadataEnricher {
             return Ok(MetadataReport::default());
         };
         self.enrich_nfo_item(item_id, &nfo_path).await
-    }
-
-    async fn index_movie_images(
-        &self,
-        item_id: &str,
-        media_path: &Path,
-        directory_cache: &mut DirectoryPathCache,
-    ) -> Result<usize, MetadataError> {
-        let image_paths = directory_cache
-            .get(media_path.parent().unwrap_or(Path::new(".")))
-            .await?;
-        let images =
-            if let Some(media_stem) = media_path.file_stem().and_then(|value| value.to_str()) {
-                find_local_images_for_media(image_paths.iter(), media_stem)
-            } else {
-                find_local_images(image_paths.iter())
-            };
-        let has_primary_artwork = images
-            .iter()
-            .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
-        let prepared = prepare_local_images(images).await;
-        let mut image_indexes = BTreeMap::<&'static str, i64>::new();
-        let mut records = Vec::new();
-        for result in prepared {
-            let prepared = match result {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        path = %error.path.display(),
-                        error = %error.error,
-                        "local movie image could not be read; skipping image"
-                    );
-                    continue;
-                }
-            };
-            let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
-            records.push(ItemImageInsert {
-                image_type: prepared.image.image_type.as_str().to_owned(),
-                image_index,
-                local_path: prepared.image.path.to_string_lossy().into_owned(),
-                file_size: prepared.file_size,
-                width: prepared.dimensions.map(|(width, _)| width),
-                height: prepared.dimensions.map(|(_, height)| height),
-                content_tag: prepared.content_tag,
-                source: "LOCAL".to_owned(),
-                source_url: None,
-            });
-        }
-        self.database
-            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
-                item_id: item_id.to_owned(),
-                images: records,
-                clear_poster_fallback: has_primary_artwork,
-            }])
-            .await
-            .map_err(MetadataError::Storage)
     }
 
     pub async fn enrich_series_library(
@@ -2398,6 +2371,106 @@ pub(crate) fn nfo_fingerprint_from_stamp(path: &Path, size: u64, modified_at: u1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn movie_library_image_registration_batches_multiple_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        let mut fanart_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 255, 0, 255]),
+        ))
+        .write_to(&mut fanart_png, image::ImageFormat::Png)?;
+        for (folder, stem) in [
+            ("Movie One (2024)", "Movie.One.2024"),
+            ("Movie Two (2024)", "Movie.Two.2024"),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join("fanart.png"), fanart_png.get_ref()).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone());
+        database.reset_query_count();
+        let report = enricher.enrich_movie_library(library.id).await?;
+
+        assert_eq!(report.items_processed, 2);
+        assert_eq!(report.images_found, 2);
+        assert_eq!(
+            database.query_count(),
+            2,
+            "one source page query and one shared image insert should cover both movies"
+        );
+        let images: Vec<(String, String)> = sqlx::query_as(
+            "SELECT media_items.title, item_images.image_type
+             FROM item_images
+             JOIN media_items ON media_items.id = item_images.item_id
+             ORDER BY media_items.title",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            images,
+            vec![
+                ("Movie One".to_owned(), "FANART".to_owned()),
+                ("Movie Two".to_owned(), "FANART".to_owned())
+            ]
+        );
+
+        let item_ids: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, title FROM media_items WHERE library_id = ? ORDER BY title")
+                .bind(library.id.to_string())
+                .fetch_all(database.pool())
+                .await?;
+        let blocked_item_id = item_ids.first().ok_or("missing first movie")?.0.clone();
+        sqlx::query(
+            "CREATE TRIGGER reject_one_movie_image BEFORE INSERT ON item_images
+             WHEN NEW.item_id = (SELECT id FROM media_items WHERE title = 'Movie One')
+             BEGIN SELECT RAISE(ABORT, 'injected item image failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let mut changed_fanart = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 255, 255]),
+        ))
+        .write_to(&mut changed_fanart, image::ImageFormat::Png)?;
+        tokio::fs::write(
+            media_root.join("Movie Two (2024)").join("fanart.png"),
+            changed_fanart.get_ref(),
+        )
+        .await?;
+
+        let recovery_report = enricher.enrich_movie_library(library.id).await?;
+        assert_eq!(recovery_report.images_found, 1);
+        assert!(recovery_report.failed_item_ids.contains(&blocked_item_id));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn scan_local_metadata_nfo_retains_home_video_path_errors()

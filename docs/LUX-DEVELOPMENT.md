@@ -8737,6 +8737,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：重复 probe 写回的 SQLite fixture 从 3 次 storage query-wrapper 调用降为 2 次；首次有内容变化的写入仍创建 mirror 并同步 NFO 状态。NFO writer 单测 4/4、格式检查及 library 全 feature Clippy 通过。重复写回复用写入前已读取的 `FileStamp` 计算原有 metadata fingerprint，单测确认结果与 stat 算法逐字节一致；没有据 SQL 调用数推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
 
+#### LUX-410：合并普通电影 metadata 页的图片登记
+
+范围：`enrich_movie_sources` 目前在每部电影的 NFO 处理后立即单独写入本地图片；改为按最多 16 个电影收集图片记录后复用现有批量图片事务。保持 NFO 处理顺序、图片发现和 fallback 规则、每个条目的文件读取错误隔离；批量事务失败时退回逐条写入，以免一个条目的写入错误阻断同页其他电影。扫描 outbox 路径已有的首张海报时机和 16 项批处理不变。
+
+- [x] 普通电影 metadata 页按最多 16 个 item 合并图片登记；超过上限时切页，且每条图片仍按原有路径、索引和 fallback 规则保存。
+- [x] 单个条目的目录/图片错误与批量事务失败继续隔离；能成功的其他条目仍登记，报告的 `images_found` 与原单条路径一致。
+- [x] 固定 SQLite 两电影 fixture 的图片写入 query-wrapper 次数从逐项 2 次降为单批 1 次；电影 NFO 和扫描 outbox 图片回归、格式、相关 Clippy 与 `git diff --check` 通过，不推断墙钟或生产 CPU。
+
+短计划与文件：预计只改 `src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先在 metadata 单测中用两部电影和本地 poster 锁定当前逐项登记 SQL 调用，再在 16 项页内收集共享 helper 的准备结果并批量提交，最后验证单项错误恢复。
+
+结果（2026-10-08）：普通电影 enrichment 逐 16 项收集图片后复用现有有界图片事务，NFO 仍按 item 顺序处理；批次写失败后退回逐 item 事务并隔离错误。两电影本地 fanart fixture 中扫描 source 查询与图片登记共由 3 次 storage query-wrapper 调用降为 2 次；trigger 注入一项写失败时，另一项仍登记成功。新增单测通过，`scanned_metadata` 16/16、`series_metadata` 3/3、fmt、library all-features Clippy 与 `git diff --check` 通过。性能记录仅描述该 SQLite fixture 查询调用数，不外推墙钟或 FNOS CPU。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

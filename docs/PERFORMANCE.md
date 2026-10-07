@@ -1517,3 +1517,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-409 unchanged NFO 写回调用边界
 
 固定 SQLite 单 item fixture 首次 probe 写入 NFO 并启用 metadata mirror 时执行 4 次 storage query-wrapper 调用；紧接着重复完全相同的 probe，调用数由旧路径的 3 次降至 2 次。省去的是 unchanged NFO 路径的 mirror 策略读取；数据库 NFO 状态同步原本已只在文件变化时执行。未变化路径复用原子写入流程已读取的 `FileStamp` 生成 metadata fingerprint；回归确认其字节与原 stat 算法一致，并确认既有 mirror 内容不变。storage query-wrapper 不统计文件系统时延、BEGIN/COMMIT 或 SQL 执行时间；此结果不代表墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+
+### LUX-410 普通电影页图片登记边界
+
+固定 SQLite 两电影 fixture 中，普通 `enrich_movie_library` 原先对每项各执行一次图片登记，加上来源页读取共 3 次 storage query-wrapper 调用；现在同页两项共享一个图片登记事务，共 2 次。每批最多 16 项，与 storage 接受的 item 上限一致。对其中一项注入图片 upsert 失败后，批事务回滚并按 item 重试，另一电影仍登记成功。此 fixture 只证明批次边界和错误隔离，不测量端到端墙钟、磁盘性能、PostgreSQL/NAS 争用或 FNOS CPU。
