@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
@@ -639,18 +639,18 @@ impl SeriesEnrichmentMode {
     }
 }
 
-fn local_metadata_source_path(source: StoredScanLocalMetadataSource) -> StoredMediaSourcePath {
+fn local_metadata_source_path(source: &StoredScanLocalMetadataSource) -> StoredMediaSourcePath {
     StoredMediaSourcePath {
-        source_id: source.source_id,
-        item_id: source.item_id,
-        probe_status: source.probe_status,
-        root_path: source.root_path,
-        relative_path: source.relative_path,
+        source_id: source.source_id.clone(),
+        item_id: source.item_id.clone(),
+        probe_status: source.probe_status.clone(),
+        root_path: source.root_path.clone(),
+        relative_path: source.relative_path.clone(),
     }
 }
 
 fn split_scan_local_metadata_sources(
-    sources: Vec<StoredScanLocalMetadataSource>,
+    sources: &[StoredScanLocalMetadataSource],
 ) -> (
     Vec<StoredMediaSourcePath>,
     Vec<StoredMediaSourcePath>,
@@ -670,10 +670,10 @@ fn split_scan_local_metadata_sources(
                     episodes.push(StoredSeriesMetadataSource {
                         series_id: series_id.clone(),
                         season_id: season_id.clone(),
-                        episode_id: source.item_id,
+                        episode_id: source.item_id.clone(),
                         season_number: source.season_number,
-                        root_path: source.root_path,
-                        relative_path: source.relative_path,
+                        root_path: source.root_path.clone(),
+                        relative_path: source.relative_path.clone(),
                     });
                 }
             }
@@ -688,6 +688,92 @@ fn split_scan_local_metadata_sources(
         ))
     });
     (movies, home_videos, episodes)
+}
+
+#[derive(Default)]
+struct ScanLocalMetadataNfoSnapshot {
+    nfo_paths_by_item: HashMap<String, PathBuf>,
+    nfo_errors_by_item: HashMap<String, MetadataError>,
+    metadata_by_item: HashMap<String, StoredMediaMetadata>,
+}
+
+enum NfoMetadataLookup<'a> {
+    OnDemand,
+    Snapshot(&'a mut HashMap<String, StoredMediaMetadata>),
+}
+
+async fn scan_local_metadata_nfo_paths(
+    sources: &[StoredScanLocalMetadataSource],
+) -> ScanLocalMetadataNfoSnapshot {
+    let mut snapshot = ScanLocalMetadataNfoSnapshot::default();
+    let mut seen_series = HashSet::<&str>::new();
+    let mut seen_seasons = HashSet::<&str>::new();
+    for source in sources {
+        let root = Path::new(&source.root_path);
+        let media_path = root.join(&source.relative_path);
+        match source.item_type.as_str() {
+            "MOVIE" => {
+                if let Some(path) = find_nfo_path(&media_path).await {
+                    snapshot
+                        .nfo_paths_by_item
+                        .insert(source.item_id.clone(), path);
+                }
+            }
+            "VIDEO" => {
+                let path = media_path.with_extension("nfo");
+                match fs::try_exists(&path).await {
+                    Ok(true) => {
+                        snapshot
+                            .nfo_paths_by_item
+                            .insert(source.item_id.clone(), path);
+                    }
+                    Ok(false) => {}
+                    Err(io_error) => {
+                        snapshot.nfo_errors_by_item.insert(
+                            source.item_id.clone(),
+                            MetadataError::Io {
+                                path,
+                                source: io_error,
+                            },
+                        );
+                    }
+                }
+            }
+            "EPISODE" => {
+                if let Some(path) = find_episode_nfo(&media_path).await {
+                    snapshot
+                        .nfo_paths_by_item
+                        .insert(source.item_id.clone(), path);
+                }
+                let Some(series_dir) = series_directory(root, &source.relative_path) else {
+                    continue;
+                };
+                if let Some(series_id) = source.series_id.as_deref()
+                    && seen_series.insert(series_id)
+                    && let Some(path) = find_tvshow_nfo(&series_dir).await
+                {
+                    snapshot
+                        .nfo_paths_by_item
+                        .insert(series_id.to_owned(), path);
+                }
+                if let (Some(season_id), Some(season_number)) =
+                    (source.season_id.as_deref(), source.season_number)
+                    && seen_seasons.insert(season_id)
+                {
+                    let season_dir = media_path.parent().unwrap_or(&series_dir);
+                    if let Some(path) =
+                        find_season_nfo(&series_dir, season_dir, season_number).await
+                    {
+                        snapshot
+                            .nfo_paths_by_item
+                            .insert(season_id.to_owned(), path);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    snapshot
 }
 
 impl MetadataEnricher {
@@ -741,6 +827,7 @@ impl MetadataEnricher {
             &mut report,
             &mut series_context,
             SeriesEnrichmentMode::ImagesAndNfo,
+            None,
         )
         .await?;
         Ok(report)
@@ -863,6 +950,7 @@ impl MetadataEnricher {
                 &mut batch_report,
                 &mut series_context,
                 SeriesEnrichmentMode::ImagesAndNfo,
+                None,
             )
             .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -921,12 +1009,12 @@ impl MetadataEnricher {
     pub(crate) async fn index_scan_local_metadata_batch_images(
         &self,
         filesystem_entry_ids: &[String],
-    ) -> Result<MetadataReport, MetadataError> {
+    ) -> Result<ScanLocalMetadataImageBatch, MetadataError> {
         let sources = self
             .database
             .list_scan_local_metadata_sources(filesystem_entry_ids)
             .await?;
-        let (movies, _, episodes) = split_scan_local_metadata_sources(sources);
+        let (movies, _, episodes) = split_scan_local_metadata_sources(&sources);
         let mut report = MetadataReport::default();
         let mut directory_cache = DirectoryPathCache::default();
         if let Some((first_movie, remaining_movies)) = movies.split_first() {
@@ -949,9 +1037,10 @@ impl MetadataEnricher {
             &mut report,
             &mut series_context,
             SeriesEnrichmentMode::ImagesOnly,
+            None,
         )
         .await;
-        Ok(report)
+        Ok(ScanLocalMetadataImageBatch { report, sources })
     }
 
     async fn index_scan_local_movie_image_page(
@@ -980,52 +1069,58 @@ impl MetadataEnricher {
 
     pub(crate) async fn enrich_scan_local_metadata_batch_nfo(
         &self,
-        filesystem_entry_ids: &[String],
+        source_snapshot: Vec<StoredScanLocalMetadataSource>,
         excluded_item_ids: &[String],
     ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
-        let mut sources = self
+        let excluded_item_ids = excluded_item_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut sources = source_snapshot
+            .into_iter()
+            .filter(|source| !excluded_item_ids.contains(source.item_id.as_str()))
+            .collect::<Vec<_>>();
+        let requested_source_identities = sources
+            .iter()
+            .map(|source| (source.item_id.clone(), source.source_id.clone()))
+            .collect::<Vec<_>>();
+        let current_item_ids = self
             .database
-            .list_scan_local_metadata_sources(filesystem_entry_ids)
+            .list_current_scan_local_metadata_item_ids(&requested_source_identities)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        sources.retain(|source| current_item_ids.contains(&source.item_id));
+        let mut nfo_snapshot = scan_local_metadata_nfo_paths(&sources).await;
+        let mut metadata_item_ids = nfo_snapshot
+            .nfo_paths_by_item
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        metadata_item_ids.sort_unstable();
+        nfo_snapshot.metadata_by_item = self
+            .database
+            .list_media_item_metadata_by_ids(&metadata_item_ids)
             .await?;
-        sources.retain(|source| !excluded_item_ids.contains(&source.item_id));
         let source_identities = sources
             .iter()
             .map(|source| (source.item_id.clone(), source.source_id.clone()))
             .collect();
-        let (movies, home_videos, episodes) = split_scan_local_metadata_sources(sources);
+        let (movies, home_videos, episodes) = split_scan_local_metadata_sources(&sources);
         let mut report = MetadataReport::default();
         for source in movies {
             report.items_processed += 1;
-            let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self.enrich_movie_nfo(&source.item_id, &media_path).await {
-                Ok(nfo_report) => {
-                    let failed = nfo_report.nfo_failed > 0;
-                    report.merge(nfo_report);
-                    if failed {
-                        report.mark_item_failed(&source.item_id);
-                    }
-                }
-                Err(error) => {
-                    if let MetadataError::ConflictingMovieIdentity {
-                        conflicting_item_id,
-                        ..
-                    } = &error
-                    {
-                        tracing::warn!(
-                            item_id = %source.item_id,
-                            conflicting_item_id = %conflicting_item_id,
-                            %error,
-                            "local movie NFO failed"
-                        );
-                    } else {
-                        tracing::warn!(item_id = %source.item_id, %error, "local movie NFO failed");
-                    }
-                    report.nfo_failed += 1;
-                    report.mark_item_error(&source.item_id, &error);
-                }
+            if let Some(nfo_path) = nfo_snapshot.nfo_paths_by_item.remove(&source.item_id) {
+                self.enrich_nfo_item_best_effort_with_metadata(
+                    &mut report,
+                    &source.item_id,
+                    &nfo_path,
+                    NfoMetadataLookup::Snapshot(&mut nfo_snapshot.metadata_by_item),
+                )
+                .await;
             }
         }
-        self.enrich_home_video_sources(home_videos, &mut report)
+        self.enrich_home_video_sources_with_snapshot(home_videos, &mut report, &mut nfo_snapshot)
             .await;
         let mut series_context = SeriesEnrichmentContext::tracking_hierarchy();
         self.enrich_series_scan_job_sources(
@@ -1033,6 +1128,7 @@ impl MetadataEnricher {
             &mut report,
             &mut series_context,
             SeriesEnrichmentMode::NfoOnly,
+            Some(&mut nfo_snapshot),
         )
         .await;
         Ok(ScanLocalMetadataNfoBatch {
@@ -1150,6 +1246,7 @@ impl MetadataEnricher {
             &mut batch_report,
             &mut series_context,
             SeriesEnrichmentMode::ImagesAndNfo,
+            None,
         )
         .await;
         let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -1182,9 +1279,10 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
+        nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
     ) {
         if let Err(error) = self
-            .enrich_series_sources(sources, report, context, mode)
+            .enrich_series_sources(sources, report, context, mode, nfo_snapshot)
             .await
         {
             tracing::warn!(%error, "local series metadata batch failed");
@@ -1270,18 +1368,23 @@ impl MetadataEnricher {
         for source in sources {
             report.items_processed += 1;
             let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-            match self
-                .enrich_home_video_nfo(&source.item_id, &media_path)
-                .await
-            {
-                Ok(nfo_report) => {
-                    let failed = nfo_report.nfo_failed > 0;
-                    report.merge(nfo_report);
-                    if failed {
-                        report.mark_item_failed(&source.item_id);
-                    }
+            let nfo_path = media_path.with_extension("nfo");
+            match fs::try_exists(&nfo_path).await {
+                Ok(true) => {
+                    self.enrich_nfo_item_best_effort_with_metadata(
+                        report,
+                        &source.item_id,
+                        &nfo_path,
+                        NfoMetadataLookup::OnDemand,
+                    )
+                    .await;
                 }
-                Err(error) => {
+                Ok(false) => {}
+                Err(io_error) => {
+                    let error = MetadataError::Io {
+                        path: nfo_path,
+                        source: io_error,
+                    };
                     tracing::warn!(
                         item_id = %source.item_id,
                         %error,
@@ -1290,6 +1393,36 @@ impl MetadataEnricher {
                     report.nfo_failed += 1;
                     report.mark_item_error(&source.item_id, &error);
                 }
+            }
+        }
+    }
+
+    async fn enrich_home_video_sources_with_snapshot(
+        &self,
+        sources: Vec<StoredMediaSourcePath>,
+        report: &mut MetadataReport,
+        snapshot: &mut ScanLocalMetadataNfoSnapshot,
+    ) {
+        for source in sources {
+            report.items_processed += 1;
+            if let Some(error) = snapshot.nfo_errors_by_item.remove(&source.item_id) {
+                tracing::warn!(
+                    item_id = %source.item_id,
+                    %error,
+                    "local home video NFO could not be checked"
+                );
+                report.nfo_failed += 1;
+                report.mark_item_error(&source.item_id, &error);
+                continue;
+            }
+            if let Some(nfo_path) = snapshot.nfo_paths_by_item.remove(&source.item_id) {
+                self.enrich_nfo_item_best_effort_with_metadata(
+                    report,
+                    &source.item_id,
+                    &nfo_path,
+                    NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item),
+                )
+                .await;
             }
         }
     }
@@ -1311,24 +1444,6 @@ impl MetadataEnricher {
         let Some(nfo_path) = find_nfo_path(media_path).await else {
             return Ok(MetadataReport::default());
         };
-        self.enrich_nfo_item(item_id, &nfo_path).await
-    }
-
-    async fn enrich_home_video_nfo(
-        &self,
-        item_id: &str,
-        media_path: &Path,
-    ) -> Result<MetadataReport, MetadataError> {
-        let nfo_path = media_path.with_extension("nfo");
-        let exists = fs::try_exists(&nfo_path)
-            .await
-            .map_err(|source| MetadataError::Io {
-                path: nfo_path.clone(),
-                source,
-            })?;
-        if !exists {
-            return Ok(MetadataReport::default());
-        }
         self.enrich_nfo_item(item_id, &nfo_path).await
     }
 
@@ -1412,6 +1527,7 @@ impl MetadataEnricher {
                 &mut report,
                 &mut series_context,
                 SeriesEnrichmentMode::ImagesAndNfo,
+                None,
             )
             .await?;
             if last_page {
@@ -1428,6 +1544,7 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
+        mut nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
     ) -> Result<(), MetadataError> {
         let process_images = mode.process_images();
         let process_nfo = mode.process_nfo();
@@ -1459,9 +1576,27 @@ impl MetadataEnricher {
                 .as_deref()
                 .is_none_or(|id| id != source.series_id.as_str());
             if new_series {
-                if process_nfo && let Some(nfo_path) = find_tvshow_nfo(&series_dir).await {
-                    self.enrich_nfo_item_best_effort(report, &source.series_id, &nfo_path)
-                        .await;
+                let nfo_path = if process_nfo {
+                    match nfo_snapshot.as_deref_mut() {
+                        Some(snapshot) => snapshot.nfo_paths_by_item.remove(&source.series_id),
+                        None => find_tvshow_nfo(&series_dir).await,
+                    }
+                } else {
+                    None
+                };
+                if let Some(nfo_path) = nfo_path {
+                    self.enrich_nfo_item_best_effort_with_metadata(
+                        report,
+                        &source.series_id,
+                        &nfo_path,
+                        match nfo_snapshot.as_deref_mut() {
+                            Some(snapshot) => {
+                                NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item)
+                            }
+                            None => NfoMetadataLookup::OnDemand,
+                        },
+                    )
+                    .await;
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
                     match self
@@ -1521,12 +1656,27 @@ impl MetadataEnricher {
                 season_paths.extend(directory_paths.iter().cloned());
             }
             if new_season {
-                if process_nfo
-                    && let Some(nfo_path) =
-                        find_season_nfo(&series_dir, season_dir, season_number).await
-                {
-                    self.enrich_nfo_item_best_effort(report, &source.season_id, &nfo_path)
-                        .await;
+                let nfo_path = if process_nfo {
+                    match nfo_snapshot.as_deref_mut() {
+                        Some(snapshot) => snapshot.nfo_paths_by_item.remove(&source.season_id),
+                        None => find_season_nfo(&series_dir, season_dir, season_number).await,
+                    }
+                } else {
+                    None
+                };
+                if let Some(nfo_path) = nfo_path {
+                    self.enrich_nfo_item_best_effort_with_metadata(
+                        report,
+                        &source.season_id,
+                        &nfo_path,
+                        match nfo_snapshot.as_deref_mut() {
+                            Some(snapshot) => {
+                                NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item)
+                            }
+                            None => NfoMetadataLookup::OnDemand,
+                        },
+                    )
+                    .await;
                 }
                 if process_images {
                     match self
@@ -1560,9 +1710,27 @@ impl MetadataEnricher {
                 .as_deref()
                 .is_none_or(|id| id != source.episode_id.as_str());
             if new_episode {
-                if process_nfo && let Some(nfo_path) = find_episode_nfo(&media_path).await {
-                    self.enrich_nfo_item_best_effort(report, &source.episode_id, &nfo_path)
-                        .await;
+                let nfo_path = if process_nfo {
+                    match nfo_snapshot.as_deref_mut() {
+                        Some(snapshot) => snapshot.nfo_paths_by_item.remove(&source.episode_id),
+                        None => find_episode_nfo(&media_path).await,
+                    }
+                } else {
+                    None
+                };
+                if let Some(nfo_path) = nfo_path {
+                    self.enrich_nfo_item_best_effort_with_metadata(
+                        report,
+                        &source.episode_id,
+                        &nfo_path,
+                        match nfo_snapshot.as_deref_mut() {
+                            Some(snapshot) => {
+                                NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item)
+                            }
+                            None => NfoMetadataLookup::OnDemand,
+                        },
+                    )
+                    .await;
                 }
                 if process_images {
                     match self
@@ -1591,13 +1759,25 @@ impl MetadataEnricher {
         Ok(())
     }
 
-    async fn enrich_nfo_item_best_effort(
+    async fn enrich_nfo_item_best_effort_with_metadata(
         &self,
         report: &mut MetadataReport,
         item_id: &str,
         nfo_path: &Path,
+        metadata: NfoMetadataLookup<'_>,
     ) {
-        match self.enrich_nfo_item(item_id, nfo_path).await {
+        let enriched = match metadata {
+            NfoMetadataLookup::OnDemand => self.enrich_nfo_item(item_id, nfo_path).await,
+            NfoMetadataLookup::Snapshot(metadata_by_item) => {
+                self.enrich_nfo_item_with_metadata(
+                    item_id,
+                    nfo_path,
+                    metadata_by_item.remove(item_id),
+                )
+                .await
+            }
+        };
+        match enriched {
             Ok(nfo_report) => {
                 let failed = nfo_report.nfo_failed > 0;
                 report.merge(nfo_report);
@@ -1606,12 +1786,24 @@ impl MetadataEnricher {
                 }
             }
             Err(error) => {
-                tracing::warn!(
-                    item_id,
-                    path = %nfo_path.display(),
-                    %error,
-                    "local NFO enrichment failed; continuing with remaining metadata"
-                );
+                if let MetadataError::ConflictingMovieIdentity {
+                    conflicting_item_id,
+                    ..
+                } = &error
+                {
+                    tracing::warn!(
+                        item_id,
+                        conflicting_item_id,
+                        %error,
+                        "local NFO enrichment failed; continuing with remaining metadata"
+                    );
+                } else {
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local NFO enrichment failed; continuing with remaining metadata"
+                    );
+                }
                 report.nfo_failed += 1;
                 report.mark_item_error(item_id, &error);
             }
@@ -1623,9 +1815,19 @@ impl MetadataEnricher {
         item_id: &str,
         nfo_path: &Path,
     ) -> Result<MetadataReport, MetadataError> {
+        let metadata = self.database.find_media_item_metadata(item_id).await?;
+        self.enrich_nfo_item_with_metadata(item_id, nfo_path, metadata)
+            .await
+    }
+
+    async fn enrich_nfo_item_with_metadata(
+        &self,
+        item_id: &str,
+        nfo_path: &Path,
+        metadata: Option<StoredMediaMetadata>,
+    ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
-        let metadata = self.database.find_media_item_metadata(item_id).await?;
         let already_checked = fingerprint.as_deref().is_some_and(|fingerprint| {
             metadata
                 .as_ref()
@@ -2110,6 +2312,12 @@ pub(crate) struct ScanLocalMetadataNfoBatch {
     pub(crate) source_identities: Vec<(String, String)>,
 }
 
+pub(crate) struct ScanLocalMetadataImageBatch {
+    pub(crate) report: MetadataReport,
+    // Reused by NFO processing after a lightweight preferred-source validation.
+    pub(crate) sources: Vec<StoredScanLocalMetadataSource>,
+}
+
 impl MetadataReport {
     fn merge(&mut self, other: Self) {
         self.nfo_loaded += other.nfo_loaded;
@@ -2187,6 +2395,147 @@ pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Err
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_retains_home_video_path_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let blocking_parent = directory.path().join("not-a-directory");
+        tokio::fs::write(&blocking_parent, b"file").await?;
+        let source = StoredScanLocalMetadataSource {
+            source_id: "source-1".to_owned(),
+            item_id: "video-1".to_owned(),
+            item_type: "VIDEO".to_owned(),
+            probe_status: "READY".to_owned(),
+            series_id: None,
+            season_id: None,
+            season_number: None,
+            root_path: directory
+                .path()
+                .to_str()
+                .ok_or("non-UTF8 temporary path")?
+                .to_owned(),
+            relative_path: "not-a-directory/video.mp4".to_owned(),
+        };
+
+        let lookups = scan_local_metadata_nfo_paths(&[source]).await;
+
+        assert!(matches!(
+            lookups.nfo_errors_by_item.get("video-1"),
+            Some(MetadataError::Io { .. })
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_reuses_the_image_stage_source_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, title) in [
+            ("Movie One (2024)", "Movie.One.2024", "Movie One"),
+            ("Movie Two (2024)", "Movie.Two.2024", "Movie Two"),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(
+                movie_dir.join(format!("{stem}.nfo")),
+                format!("<movie><title>{title}</title></movie>"),
+            )
+            .await?;
+        }
+        let no_nfo_dir = media_root.join("Movie Three (2024)");
+        tokio::fs::create_dir_all(&no_nfo_dir).await?;
+        tokio::fs::write(no_nfo_dir.join("Movie.Three.2024.mkv"), b"media").await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let entry_ids: Vec<String> = sqlx::query_scalar(
+            "SELECT id FROM filesystem_entries
+             WHERE relative_path LIKE 'Movie % (2024)/%.mkv' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), 3);
+
+        let enricher = MetadataEnricher::new(database.clone());
+        let image_batch = enricher
+            .index_scan_local_metadata_batch_images(&entry_ids)
+            .await?;
+        database.reset_query_count();
+
+        let batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(image_batch.sources, &[])
+            .await?;
+
+        assert_eq!(batch.report.items_processed, 3);
+        assert_eq!(batch.report.nfo_loaded, 2);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "two NFOs should share one metadata lookup and one source validation query"
+        );
+
+        let no_nfo_entry_id: String = sqlx::query_scalar(
+            "SELECT id FROM filesystem_entries WHERE relative_path LIKE 'Movie Three %' LIMIT 1",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        let no_nfo_image_batch = enricher
+            .index_scan_local_metadata_batch_images(std::slice::from_ref(&no_nfo_entry_id))
+            .await?;
+        database.reset_query_count();
+        let no_nfo_batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(no_nfo_image_batch.sources, &[])
+            .await?;
+        assert_eq!(no_nfo_batch.report.items_processed, 1);
+        assert_eq!(no_nfo_batch.report.nfo_loaded, 0);
+        assert_eq!(
+            database.query_count(),
+            1,
+            "a batch without NFO files should skip the media metadata lookup"
+        );
+
+        let stale_image_batch = enricher
+            .index_scan_local_metadata_batch_images(std::slice::from_ref(&entry_ids[0]))
+            .await?;
+        sqlx::query(
+            "UPDATE filesystem_entries SET is_missing = 1
+             WHERE id = ?",
+        )
+        .bind(&entry_ids[0])
+        .execute(database.pool())
+        .await?;
+        database.reset_query_count();
+        let stale_nfo_batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(stale_image_batch.sources, &[])
+            .await?;
+        assert_eq!(stale_nfo_batch.report.items_processed, 0);
+        assert!(stale_nfo_batch.source_identities.is_empty());
+        assert_eq!(
+            database.query_count(),
+            1,
+            "stale preferred sources should be rejected by the same bounded validation"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn series_image_registration_rolls_back_when_fallback_update_fails()

@@ -8677,6 +8677,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-07）：回归使用共享 `ScanJobService` 和 2 个扫描 semaphore permit，并由 SQLite trigger 拒绝并发全量任务进入 `RUNNING`；两个不同媒体库的 job 都完成。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs` 81/81 通过。全目标 Rust 测试库部分为 746 passed、0 failed、11 ignored；集成目标仅 `emby_counts` 与 `strm` 失败，两者在干净 `origin/test=8412cc2a` 上也复现，之前出现的插件查询计数波动和扫描超时本轮未复现。build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。默认扫描并发为 2，全量扫描队列容量为 1。验证环境为 arm64；没有据此推断 FNOS CPU 或 NAS 性能收益。
 
+#### LUX-406：扫描本地 NFO 阶段复用 source 与元数据读取
+
+范围：扫描本地元数据 outbox、库级补回及精确目录刷新先读取 source 并处理图片，随后又按 filesystem entry ID 完整查询一次 source。NFO 阶段改为消费图片阶段返回的 source 快照，并用有界查询确认原 source 仍是当前首选且存在；保留 NFO 处理后的既有新鲜度复核。按批次预取实际存在 NFO 的 item metadata 与路径，避免每个 NFO 各自读取完整 metadata 行；没有 NFO 的 item 不触发 metadata 查询。缩小 image work 分组复制的数据，并保留家庭视频 NFO 路径 I/O 错误的失败语义。普通增量/库级元数据路径继续按需读取，不改变 NFO 字段、任务状态、在线刮削或数据库 schema。
+
+验收：
+
+- [x] 扫描 outbox、后台本地 metadata 补回和精确目录刷新复用图片阶段的 source 快照；NFO 处理前验证当前首选 source，完成后的既有 source 新鲜度复核不变。
+- [x] 一个 NFO 批次仅对包含 NFO 的 item 做一次有界 metadata 批量读取；无 NFO 批次跳过 metadata 查询；陈旧 source 在 NFO 处理前被排除。
+- [x] MOVIE、VIDEO、EPISODE、SERIES、SEASON 的 NFO 路径和层级去重语义保持；家庭视频 `try_exists` 错误仍记录为可重试失败；非批处理路径继续按需读取。
+- [x] NFO 查询计数、陈旧 source 与路径错误单测，以及 `scanned_metadata`、`scanning_jobs`、build、fmt、Clippy 和 `git diff --check` 通过；全目标套件已执行，但 `emby_counts`、`strm` 各有一个已在干净 `origin/test` 复现的基线失败，不能记作全目标全绿；性能记录不把 SQL 调用数变化外推为 FNOS CPU 收益。
+
+预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先为家庭视频路径查询错误保留行为写回归，再复用 source snapshot、批量预取并验证 outbox、backfill、精确刷新三条入口。
+
+结果（2026-10-07）：source 快照复用、preferred-source 校验、批量 metadata 查询及家庭视频路径错误回归通过；`scanned_metadata` 16/16、`scanning_jobs` 81/81 通过。最终 `cargo build --locked`、`cargo fmt --all -- --check`、全目标全 feature Clippy 和 `git diff --check` 通过。`cargo test --locked --all-targets --no-fail-fast` 完整执行，但 `tests/emby_counts.rs` 的 auth/favorites 计数测试和 `tests/strm.rs` 的 STRM 鉴权测试各失败一次；这两项此前已在干净 `origin/test=8412cc2a` 复现，作为基线失败记录，不归因于本任务。没有据本机 ARM64 验证推断 FNOS CPU 或 NAS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

@@ -60,7 +60,7 @@ use crate::{
         StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
         StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
         StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
-        is_lite_manifest_discovery, movie_parent_folder_identity,
+        StoredScanLocalMetadataSource, is_lite_manifest_discovery, movie_parent_folder_identity,
     },
 };
 
@@ -2989,7 +2989,12 @@ async fn process_scan_local_metadata_batch(
     home: Option<&HomeService>,
     user_events: &UserEventHub,
     batch: StoredScanLocalMetadataBatch,
-) -> Option<(String, String, Vec<String>, Vec<String>)> {
+) -> Option<(
+    String,
+    String,
+    Vec<StoredScanLocalMetadataSource>,
+    Vec<String>,
+)> {
     let batch_id = batch.id.clone();
     let scan_job_id = batch.job_id.clone();
     let source_ids = match serde_json::from_str::<Vec<String>>(&batch.source_refs_json) {
@@ -3030,15 +3035,15 @@ async fn process_scan_local_metadata_batch(
         .index_scan_local_metadata_batch_images(&source_ids)
         .await
     {
-        Ok(report) if !report.failed_item_ids.is_empty() => Err(format!(
+        Ok(batch) if !batch.report.failed_item_ids.is_empty() => Err(format!(
             "{} local image item(s) failed",
-            report.failed_item_ids.len()
+            batch.report.failed_item_ids.len()
         )),
-        Ok(_) => match database
+        Ok(batch) => match database
             .mark_scan_local_metadata_images_complete(&batch_id)
             .await
         {
-            Ok(true) => Ok(()),
+            Ok(true) => Ok(batch.sources),
             Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
             Err(error) => Err(error.to_string()),
         },
@@ -3050,7 +3055,12 @@ async fn process_scan_local_metadata_batch(
     user_events.publish_home_coalesced().await;
 
     match result {
-        Ok(()) => Some((batch_id, scan_job_id, source_ids, non_retryable_item_ids)),
+        Ok(source_snapshot) => Some((
+            batch_id,
+            scan_job_id,
+            source_snapshot,
+            non_retryable_item_ids,
+        )),
         Err(error) => {
             tracing::warn!(batch_id, %error, "local image batch failed and will be retried");
             fail_scan_local_metadata_batch(database, &batch_id, &error).await;
@@ -3065,12 +3075,12 @@ async fn finish_scan_local_metadata_batch(
     context: LocalMetadataCompletionContext<'_>,
     batch_id: &str,
     scan_job_id: &str,
-    source_ids: &[String],
+    source_snapshot: Vec<StoredScanLocalMetadataSource>,
     existing_non_retryable_item_ids: &[String],
 ) {
     let mut non_retryable_item_ids = existing_non_retryable_item_ids.to_vec();
     let result = match enricher
-        .enrich_scan_local_metadata_batch_nfo(source_ids, &non_retryable_item_ids)
+        .enrich_scan_local_metadata_batch_nfo(source_snapshot, &non_retryable_item_ids)
         .await
     {
         Ok(ScanLocalMetadataNfoBatch {
@@ -3196,7 +3206,7 @@ async fn process_scan_local_metadata_backfill_images(
     home: Option<&HomeService>,
     user_events: &UserEventHub,
     page: &StoredScanLocalMetadataBackfillPage,
-) -> Result<(), String> {
+) -> Result<Vec<StoredScanLocalMetadataSource>, String> {
     let result = enricher
         .index_scan_local_metadata_batch_images(&page.entry_ids)
         .await;
@@ -3204,14 +3214,14 @@ async fn process_scan_local_metadata_backfill_images(
         home.invalidate();
     }
     user_events.publish_home_coalesced().await;
-    let report = result.map_err(|error| error.to_string())?;
-    if !report.failed_item_ids.is_empty() {
+    let batch = result.map_err(|error| error.to_string())?;
+    if !batch.report.failed_item_ids.is_empty() {
         return Err(format!(
             "{} local image item(s) failed",
-            report.failed_item_ids.len()
+            batch.report.failed_item_ids.len()
         ));
     }
-    Ok(())
+    Ok(batch.sources)
 }
 
 async fn finish_scan_local_metadata_backfill_page(
@@ -3219,10 +3229,11 @@ async fn finish_scan_local_metadata_backfill_page(
     enricher: &MetadataEnricher,
     context: LocalMetadataCompletionContext<'_>,
     page: StoredScanLocalMetadataBackfillPage,
+    source_snapshot: Vec<StoredScanLocalMetadataSource>,
 ) {
     let mut non_retryable_item_ids = page.non_retryable_item_ids.clone();
     let result = match enricher
-        .enrich_scan_local_metadata_batch_nfo(&page.entry_ids, &page.non_retryable_item_ids)
+        .enrich_scan_local_metadata_batch_nfo(source_snapshot, &page.non_retryable_item_ids)
         .await
     {
         Ok(ScanLocalMetadataNfoBatch {
@@ -4284,13 +4295,17 @@ impl ScanJobService {
         };
         let mut failed_items = 0_usize;
         for chunk in entry_ids.chunks(64) {
-            if let Err(error) = enricher.index_scan_local_metadata_batch_images(chunk).await {
-                tracing::warn!(%error, "local metadata refresh could not index images");
-                failed_items += 1;
-                continue;
-            }
+            let source_snapshot = match enricher.index_scan_local_metadata_batch_images(chunk).await
+            {
+                Ok(batch) => batch.sources,
+                Err(error) => {
+                    tracing::warn!(%error, "local metadata refresh could not index images");
+                    failed_items += 1;
+                    continue;
+                }
+            };
             match enricher
-                .enrich_scan_local_metadata_batch_nfo(chunk, &[])
+                .enrich_scan_local_metadata_batch_nfo(source_snapshot, &[])
                 .await
             {
                 Ok(ScanLocalMetadataNfoBatch {
@@ -9273,15 +9288,19 @@ impl ScanJobService {
                 }
                 match database.claim_next_scan_local_metadata_batch().await {
                     Ok(Some(batch)) => {
-                        if let Some((batch_id, scan_job_id, source_ids, non_retryable_item_ids)) =
-                            process_scan_local_metadata_batch(
-                                &database,
-                                &enricher,
-                                home.as_ref(),
-                                &user_events,
-                                batch,
-                            )
-                            .await
+                        if let Some((
+                            batch_id,
+                            scan_job_id,
+                            source_snapshot,
+                            non_retryable_item_ids,
+                        )) = process_scan_local_metadata_batch(
+                            &database,
+                            &enricher,
+                            home.as_ref(),
+                            &user_events,
+                            batch,
+                        )
+                        .await
                         {
                             let database = database.clone();
                             let enricher = enricher.clone();
@@ -9302,7 +9321,7 @@ impl ScanJobService {
                                     context,
                                     &batch_id,
                                     &scan_job_id,
-                                    &source_ids,
+                                    source_snapshot,
                                     &non_retryable_item_ids,
                                 )
                                 .await;
@@ -9326,7 +9345,7 @@ impl ScanJobService {
                                 )
                                 .await
                                 {
-                                    Ok(()) => {
+                                    Ok(source_snapshot) => {
                                         let database = database.clone();
                                         let enricher = enricher.clone();
                                         let metadata_selection = metadata_selection.clone();
@@ -9342,7 +9361,11 @@ impl ScanJobService {
                                                 user_events: &user_events,
                                             };
                                             finish_scan_local_metadata_backfill_page(
-                                                &database, &enricher, context, page,
+                                                &database,
+                                                &enricher,
+                                                context,
+                                                page,
+                                                source_snapshot,
                                             )
                                             .await;
                                             library_root_id

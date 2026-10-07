@@ -2,7 +2,7 @@
 
 ## 当前实现状态
 
-截至 2026-10-07，LUX-401 至 LUX-405 的重复补全与扫描调度修复已在本地分支实现，并有 SQLite/PostgreSQL 合同或定向回归覆盖。当前 worktree 的修复尚未部署到 FNOS；本地 ARM 测试不能证明服务器 CPU 已下降。
+截至 2026-10-07，LUX-401 至 LUX-406 的重复补全、扫描调度和扫描后本地 metadata 读取优化已在本地分支实现，并有 SQLite/PostgreSQL 合同或定向回归覆盖。当前 worktree 的修复尚未部署到 FNOS；本地 ARM 测试不能证明服务器 CPU 已下降。
 
 - 自动 `FILL_MISSING` 仅由本轮新确认的 missing claim 触发；稳定 fingerprint 与请求快照用于区分真正变化的补全意图。
 - 活动任务和带快照的近期 provider 失败参与去重；自动 provider 失败在 5 分钟、30 分钟、最高 6 小时的退避期内不重复创建请求。
@@ -10,6 +10,7 @@
 - 入队会复用按创建顺序找到的 queued job 容量，单个 job 最多 100 项。
 - 默认扫描并发为 2，全量 `RECONCILE_LIBRARY` 使用容量为 1 的共享队列；自动 `FILL_MISSING` worker 并发限制为 2。
 - 全量扫描、增量扫描、后台回填和精确目录本地刷新使用显式的补全策略来源。
+- 扫描图片阶段的 source 快照传给 NFO 阶段；NFO 处理只做一次有界 source 身份确认，按批次读取有 NFO 的条目元数据，无 NFO 条目跳过 metadata 读取。
 - 之前针对 NFO 等价写入、内部写 watcher 反馈、metadata no-op 写入及任务活动查询的本地优化保留在当前代码树中。
 
 本地改动包括请求快照/稳定 fingerprint、provider 退避、queued 容量复用、具名策略和跨库串行队列回归。生产版本和 CPU 只有在再次读取 FNOS 当前镜像、revision、schema 与运行指标后才能确认。
@@ -104,6 +105,14 @@
 - workflow 3 不得在扫描末尾再次创建整库 FILL_MISSING。
 
 已实现（LUX-404）：调用入口使用具名 trigger 和解析后的策略类型，覆盖全量扫描、增量扫描、后台回填与精确目录本地刷新，禁用时不探测刮削器；策略和存储合同回归通过。
+
+### P2：扫描图片与 NFO 阶段重复读取 source 和 metadata
+
+扫描本地 metadata outbox、库级补回和精确目录刷新会先查询 preferred source 并处理图片，随后 NFO 阶段再次按 entry ID 读取完整 source 行；每个实际存在 NFO 的 item 还会逐条读取完整 metadata 行。没有 NFO 的条目不需要 metadata 行。
+
+已实现（LUX-406）：图片阶段把已读取 source 快照传给 NFO 阶段；开始处理前用有界身份查询确认原 preferred source 仍有效，处理完成前保留原有 freshness 复核。NFO/层级路径按批次发现，metadata 只对实际存在 NFO 的 item 执行一次有界批量读取。无 NFO 批次不读 metadata；source snapshot 分组避免深拷贝无关字段；家庭视频路径检查错误继续作为条目失败上报。该优化影响本地 NFO 后处理，不创建或触发在线 `FILL_MISSING`。
+
+SQLite 回归确认两个 NFO 共用一条 metadata 批量读取、无 NFO 跳过 metadata 查询、陈旧 preferred source 被排除，并确认家庭视频 `try_exists` I/O 错误未被误判成 NFO 缺失。`scanned_metadata` 和 `scanning_jobs` 集成目标通过；不据此推断 FNOS CPU 或 NAS 收益。
 
 ## 实施与验证状态（2026-10-07）
 

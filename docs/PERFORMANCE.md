@@ -1494,3 +1494,9 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 固定 SQLite 回归同时启动两个不同媒体库的全量扫描，共用同一个 `ScanJobService`，并给共享扫描工作 semaphore 配置 2 个 permit。数据库 trigger 会拒绝第二个 `RECONCILE_LIBRARY` 进入 `RUNNING`；两个 job 最终均完成，验证串行约束来自全量扫描队列，而不是只有一个扫描 permit。默认扫描并发仍为 2，全量扫描队列容量为 1。
 
 该测试验证并发策略与跨库排队，不测量扫描墙钟、CPU、FNOS、PostgreSQL 或 NAS 性能，也不据此推断生产收益。
+
+### LUX-406 扫描本地 NFO 阶段复用 source 与 metadata 读取
+
+扫描图片阶段已经查询的 preferred source 快照现在传给 NFO 阶段；NFO 开始前通过有界 source-identity 查询排除已陈旧的 preferred source，写入前仍执行原有 freshness 复核。NFO 路径先按批次解析，数据库只批量读取确实存在 NFO 的条目 metadata，因此每个 NFO 不再单独读取完整 metadata 行；无 NFO 批次跳过 metadata 查询。批次 source 分组只复制图片/层级处理所需字段，不深拷贝完整 source 结构。家庭视频 NFO 路径检查失败仍会记录为条目错误。
+
+固定 SQLite 回归中，两个带 NFO 的电影共用一条 metadata 查询和一条 source 身份校验；包含两个 NFO 的 NFO 阶段共执行 4 条 SQL（含两条 NFO 写入）。无 NFO 的一个 item 只执行一条 source 校验，不读取 metadata；preferred source 已变陈旧时也只执行一条校验并跳过 NFO 处理。`scan_local_metadata_nfo_retains_home_video_path_errors` 验证家庭视频路径不可访问时保留 I/O 错误。`scanned_metadata` 16/16、`scanning_jobs` 81/81 通过。以上是 SQL/行为边界，不是墙钟、CPU、FNOS、PostgreSQL 或 NAS 收益测量。
