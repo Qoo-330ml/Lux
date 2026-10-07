@@ -11,9 +11,10 @@ use crate::{
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
     storage::{
-        ItemImageBatchInsert, ItemImageInsert, MetadataCapabilityResult, MetadataImageUnavailable,
-        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMediaChapterMarker,
-        NewMetadataCandidate, NewNotificationDestination, NewNotificationEvent,
+        ItemImageBatchInsert, ItemImageInsert, MetadataAutoMatchPolicy, MetadataCapabilityResult,
+        MetadataImageUnavailable, NewItemMetadataCompletenessCheck,
+        NewItemMetadataCompletenessResult, NewMediaChapterMarker, NewMetadataCandidate,
+        NewNotificationDestination, NewNotificationEvent,
     },
 };
 
@@ -2830,7 +2831,7 @@ async fn metadata_completeness_results_use_bounded_update_batches() {
             &library_id,
             &results,
             &[],
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await
         .expect("complete completeness results");
@@ -3704,7 +3705,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &incremental_disabled_result,
             std::slice::from_ref(&item_ids[0]),
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await
         .expect("incremental job policy overrides enabled full-scan policy");
@@ -3749,7 +3750,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &incremental_enabled_result,
             std::slice::from_ref(&item_ids[2]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("incremental job policy can enable auto-match for its sources");
@@ -3780,7 +3781,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &replay_result,
             std::slice::from_ref(&item_ids[3]),
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await
         .expect("persist missing without scheduling when the call disables auto-match");
@@ -3791,7 +3792,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &[],
             std::slice::from_ref(&item_ids[3]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("schedule an already-confirmed missing poster after policy changes");
@@ -3802,7 +3803,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &[],
             std::slice::from_ref(&item_ids[3]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("deduplicate replay against the active fill-missing job");
@@ -3835,7 +3836,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &[],
             std::slice::from_ref(&item_ids[3]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("deduplicate replay against the deferred fill-missing job");
@@ -4155,7 +4156,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &pagination_library_id,
             &pagination_results,
             &pagination_item_ids,
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("enqueue pagination jobs");
@@ -4232,7 +4233,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &[],
             std::slice::from_ref(&item_ids[3]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("allow retry after a non-provider failure");
@@ -4265,7 +4266,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
             &library_id,
             &[],
             std::slice::from_ref(&item_ids[3]),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await
         .expect("allow retry after deferred deduplication expires");
@@ -4905,7 +4906,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
                 &completion_library_id,
                 &results,
                 &[],
-                Some(false),
+                MetadataAutoMatchPolicy::Disabled,
             )
             .await
     });
@@ -5051,7 +5052,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &library_id,
             &replay_result,
             std::slice::from_ref(&replay_item_id),
-            Some(false),
+            MetadataAutoMatchPolicy::Disabled,
         )
         .await?;
     assert_eq!(policy_disabled.updated_count, 1);
@@ -5069,7 +5070,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &library_id,
             &[],
             std::slice::from_ref(&replay_item_id),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await?;
     assert_eq!(enabled_policy_replay.updated_count, 0);
@@ -5079,7 +5080,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &library_id,
             &[],
             std::slice::from_ref(&replay_item_id),
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await?;
     assert!(duplicate_policy_replay.scheduled_job_ids.is_empty());
@@ -5609,7 +5610,7 @@ async fn postgres_progressive_scan_metadata_storage_contract()
             &pagination_library_id,
             &pagination_results,
             &pagination_item_ids,
-            Some(true),
+            MetadataAutoMatchPolicy::Enabled,
         )
         .await?;
     assert_eq!(pagination_dispatch.updated_count, 102);
