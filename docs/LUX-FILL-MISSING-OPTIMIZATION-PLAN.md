@@ -191,6 +191,8 @@ SQLite 回归确认两个 NFO 共用一条 metadata 批量读取、无 NFO 跳�
 
 现场复查（2026-10-07 15:29–15:31，FNOS `192.168.10.50`）：`/health/ready` 正常，仍为 revision `8412cc2a`、schema 164；扫描并发环境变量仍为 2。Docker CPU 单核口径从 Lux/PostgreSQL 2.73%/37.45% 波动到 7.56%/78.44%，约 7 秒后降到 1.01%/0.35%，再过 8 秒为 4.36%/2.01%，表明是短时尖峰而非持续高位。同期数据库快照未见排队/运行 metadata item，过去 10 分钟未见新建 metadata job；16 个 Lux PostgreSQL client connection 均为空闲，采样时只有诊断查询自身处于 active，未见锁等待。历史未取消 DEFERRED `FILL_MISSING` 为 14,389 个 job、335,965 个 `SCRAPER_UNAVAILABLE` item；`pg_stat_statements` 未安装，无法归因尖峰 SQL。该采样不能证明本地分支优化收益，生产仍运行旧 revision。
 
+现场复核（2026-10-07 18:22–18:23，FNOS `192.168.10.50`，只读）：`lux` healthy，镜像 revision `8412cc2a`、schema 164，仍未包含本地 migration 0165。Docker stats 六次、间隔约 8 秒，单核 CPU 口径 Lux 为 0.25%–2.72%、PostgreSQL 为 0.36%–1.73%；内存约为 Lux 751 MiB、PostgreSQL 726–731 MiB。同期 SQL 统计过去 30 分钟没有新建 metadata job；最近完成 2 个增量扫描和 9 个全量库扫描，没有活动扫描或 metadata job。数据库连接快照为 20 idle、1 active（该诊断查询自身），未见等待事件。该窗口生产负载平稳，但运行的仍是旧 revision，因此只是新的部署前基线，不是本地优化效果，也不能代表高峰或完整扫描周期。
+
 ## 不在本次方案内
 
 - 不删除历史任务；
