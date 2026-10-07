@@ -13470,6 +13470,120 @@ async fn fill_missing_job_creation_coalesces_active_items() -> Result<(), Box<dy
 }
 
 #[tokio::test]
+async fn fill_missing_job_creation_reuses_later_queued_capacity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Fill missing queued capacity", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_ids = (0..331)
+        .map(|index| format!("queue-capacity-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[..100])
+        .await?;
+    database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[100..200])
+        .await?;
+    database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[200..250])
+        .await?;
+    let initial_jobs: Vec<(String, i64)> = database
+        .query_as(
+            "SELECT id, total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'
+             ORDER BY created_at, id",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        initial_jobs
+            .iter()
+            .map(|(_, count)| *count)
+            .collect::<Vec<_>>(),
+        vec![100, 100, 50]
+    );
+
+    let reused_job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[250..251])
+        .await?;
+    assert_eq!(reused_job_id, initial_jobs[2].0);
+
+    let jobs: Vec<(String, i64)> = database
+        .query_as(
+            "SELECT id, total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'
+             ORDER BY created_at, id",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        jobs.len(),
+        3,
+        "an available queued slot must prevent a new job"
+    );
+    assert_eq!(
+        jobs.iter().map(|(_, count)| *count).collect::<Vec<_>>(),
+        vec![100, 100, 51]
+    );
+
+    let first_reused_job_id = database
+        .create_or_merge_fill_missing_job(&library_id, &item_ids[251..])
+        .await?;
+    assert_eq!(first_reused_job_id, initial_jobs[2].0);
+    let jobs: Vec<(String, i64)> = database
+        .query_as(
+            "SELECT id, total_count FROM metadata_reidentify_jobs
+             WHERE library_id = ? AND mode = 'FILL_MISSING'
+             ORDER BY created_at, id",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(jobs.len(), 4);
+    assert_eq!(
+        jobs.iter().map(|(_, count)| *count).collect::<Vec<_>>(),
+        vec![100, 100, 100, 31]
+    );
+    let queued_items: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM metadata_reidentify_job_items
+             WHERE job_id IN (
+                 SELECT id FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'
+             )",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(queued_items, 331);
+    Ok(())
+}
+
+#[tokio::test]
 async fn legacy_fill_missing_job_keeps_empty_request_snapshot_defaults()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

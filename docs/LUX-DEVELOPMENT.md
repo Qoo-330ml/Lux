@@ -8624,6 +8624,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-07）：新增双后端 migration 0165，为 provider 失败后的自动快照 item 保存失败次数和截止时间；退避为 5 分钟、30 分钟、最高 6 小时，并在新 job 中继承相同 fingerprint/capability 的次数。migration 会给已有自动 deferred provider 失败安排首次 5 分钟冷却，保持任务状态和计数；旧的无快照 deferred 仍沿用一小时去重。相同快照冷却去重、新 fingerprint/capability、显式 retry、取消、其他错误及非 `FILL_MISSING` 模式均有回归测试。去重检查保留单条有界 SQL 查询，不额外增加扫描调度往返。SQLite 定向状态机、迁移升级、storage 全目标、build、fmt、全目标全 feature Clippy 通过；全目标测试有 743 个 library tests 通过、11 个忽略；集成目标 `emby_counts`（实际 1、预期 0）和 `strm`（401、预期 200），这两个持续失败均在未改动的基线提交 `1ffaf3b0` 上独立复现；`libraries_api` 曾出现一次瞬时 `DATABASE_UNAVAILABLE`，独立重跑 13 项全部通过。首次运行中的旧式 provider-deferral fixtures 已通过兼容兜底修复并单独复测通过。PostgreSQL 测试服务/容器 daemon 不可用，双后端 SQL 合同已静态验证但 PostgreSQL migration 未运行；本机 `arm64`，未部署或验证 FNOS CPU/真实重试节奏。
 
+#### LUX-403：复用有空位的 queued FILL_MISSING job
+
+范围：`enqueue_fill_missing_jobs_in_transaction` 当前只检查按创建时间排序的第一个 queued job。若该 job 已满，而后续 queued job 仍有容量，就会新建多余 job。分配请求时按创建顺序遍历有空位的 queued job，复用其容量；只在现有容量用尽后创建新 job。每次查询只读取最多与待分配请求数相同的有空位 job，保持分配有界；单 job 最多 100 项及跨库隔离不变。
+
+验收：
+
+- [x] 已有多个 queued job 且最早 job 已满时，新请求合并到最早的后续有空位 job，不新增 job。
+- [x] 请求跨越多个 queued job 的剩余容量时，按创建顺序填充并只为剩余请求新建 job；job/item 计数一致且每个 job 不超过 100 项。
+- [x] 并发/事务、取消、DEFERRED 去重和跨库行为保持不变；SQLite storage 回归、build、fmt、Clippy 及差异检查通过。
+- [x] 性能记录只陈述固定 fixture 中避免的多余 job 创建，不外推 CPU 或生产时延收益。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写含 3 个 queued job（100、100、50 项）和后续追加请求的失败回归，再实现有界多 job 容量分配。
+
+结果（2026-10-07）：补缺分配只查询 `total_count < 100` 的 queued job，按创建顺序复用，并将候选上限限制为待分配 item 数；PostgreSQL 查询额外锁定候选 job 行，SQLite 继续依赖现有写事务。SQLite 回归先确认旧逻辑在 `100/100/50` 后追加 item 会多建 job，再验证后续有 1 项容量时保持 3 个 job、追加 80 项后分布为 `100/100/100/31`，331 个 item 均入队。`fill_missing_job_creation` 两项、build、fmt、全目标全 feature Clippy 和差异检查通过。未连接 PostgreSQL，也未测量 FNOS CPU 或生产 job 创建率。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
