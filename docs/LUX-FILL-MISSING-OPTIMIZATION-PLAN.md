@@ -76,6 +76,14 @@
 
 验收：持续 provider 不可用时同一输入按有界退避重试且不在冷却期重复创建 job；新 capability、fingerprint 和人工 retry 不被旧请求退避误伤。
 
+### P1：scraper 预检错误会永久留下 READY missing
+
+本地 completeness worker 在持久化 missing 结果前调用 `has_selected_scrapers_for_items`。当某个已配置 scraper 的插件客户端暂时不可用时，该查询返回 item 级错误；当前实现记录日志并把 item 标记为本轮不可自动入队，随后却仍将 completeness 保存为 `READY + is_missing=1`。同一 fingerprint 之后不会再次被 claim，所以即使 scraper 恢复，该 item 也可能不再进入补全队列。
+
+计划修复（LUX-407）：区分成功返回“没有 scraper”与预检错误。前者保持不入队；后者把新确认缺失项提交给现有 `FILL_MISSING` worker，让 worker 将失败记录为 `SCRAPER_UNAVAILABLE` 并应用已有逐 item 退避。不得新增独立重试表或定时扫描；人工任务和关闭自动匹配的语义保持不变。
+
+验收：预检错误通过既有退避状态机恢复重试；明确无 scraper、自动匹配关闭或没有可请求 capability 时仍不创建自动 job。
+
 ### P1：任务去重粒度只有 item，没有 capability/fingerprint 证据
 
 `metadata_reidentify_job_items` 只保存 item 和状态。现在的 item 级去重无法区分：

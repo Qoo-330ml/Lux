@@ -8692,6 +8692,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-07）：source 快照复用、preferred-source 校验、批量 metadata 查询及家庭视频路径错误回归通过；`scanned_metadata` 16/16、`scanning_jobs` 81/81 通过。最终 `cargo build --locked`、`cargo fmt --all -- --check`、全目标全 feature Clippy 和 `git diff --check` 通过。`cargo test --locked --all-targets --no-fail-fast` 完整执行，但 `tests/emby_counts.rs` 的 auth/favorites 计数测试和 `tests/strm.rs` 的 STRM 鉴权测试各失败一次；这两项此前已在干净 `origin/test=8412cc2a` 复现，作为基线失败记录，不归因于本任务。没有据本机 ARM64 验证推断 FNOS CPU 或 NAS 收益。
 
+#### LUX-407：让 scraper 预检临时失败进入自动退避
+
+范围：本地 completeness 流程会在提交 missing 状态前预检所选 scraper。当前预检对某个 item 返回错误时只记录日志并把 item 排除在自动入队之外；同一 fingerprint 的 completeness 随后变成 `READY + is_missing=1`，后续扫描不会重新领取，因此 scraper 恢复后该 item 可能永远不再补全。对“已配置 scraper 但预检临时失败”的 item，允许创建有界 `FILL_MISSING` 请求，由现有 worker 记录 `SCRAPER_UNAVAILABLE` 并应用 LUX-402 的逐 item 退避。明确没有所选 scraper（预检成功返回 false）、自动匹配关闭或没有可请求 capability 时仍不入队。公共 API、schema 和无 scraper 的配置语义不变。
+
+验收：
+
+- [ ] 单个 item 的 scraper 预检错误会进入现有 `FILL_MISSING` worker 与退避状态机；相同快照在冷却期不重复派发。
+- [ ] scraper 预检成功但没有已配置 scraper 时不创建 job；关闭自动匹配或没有可请求 capability 时也不创建 job。
+- [ ] 定向回归先证明旧逻辑会把预检错误永久留在 READY missing，再验证修复；相关 scanner/storage 测试、fmt、Clippy 和差异检查通过。
+- [ ] 不增加数据库/API 变化，不把这项恢复性修复描述为已验证的 CPU 降幅。
+
+短计划与文件：预计修改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先在 scanner 单测中固定“预检错误继续排队、明确无 scraper 不排队”的决策，再把预检错误送入已有 provider-unavailable job 流程，最后运行窄测试与相关完整检查。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
