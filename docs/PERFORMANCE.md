@@ -1482,3 +1482,9 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 在固定 SQLite fixture 中，先生成 3 个 queued job（100、100、50 项），再增加 1 项时复用第三个 job，job 数保持 3；继续增加 80 项后，先填满第三个 job 再创建 31 项的第四个 job，最终分布为 100/100/100/31，共 331 项。旧逻辑会在最早 job 已满时另建 job，即使后面仍有空位。
 
 该结果只证明有界队列分配的状态与 job 数；未测量多次扫描下的查询延迟、CPU、FNOS、PostgreSQL 或 NAS 收益。PostgreSQL `FOR UPDATE` 查询未在集成服务上运行。
+
+### LUX-405 跨媒体库全量扫描串行队列
+
+固定 SQLite 回归同时启动两个不同媒体库的全量扫描，共用同一个 `ScanJobService`，并给共享扫描工作 semaphore 配置 2 个 permit。数据库 trigger 会拒绝第二个 `RECONCILE_LIBRARY` 进入 `RUNNING`；两个 job 最终均完成，验证串行约束来自全量扫描队列，而不是只有一个扫描 permit。默认扫描并发仍为 2，全量扫描队列容量为 1。
+
+该测试验证并发策略与跨库排队，不测量扫描墙钟、CPU、FNOS、PostgreSQL 或 NAS 性能，也不据此推断生产收益。
