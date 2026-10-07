@@ -107,8 +107,9 @@ fn metadata_migrations_preserve_historical_version_sequence()
     for migration in [&sqlite_retry, &postgres_retry] {
         assert!(migration.contains("automatic_retry_count"));
         assert!(migration.contains("automatic_retry_after"));
-        assert!(migration.contains("SCRAPER_UNAVAILABLE"));
+        assert!(migration.contains("metadata_fill_missing_legacy_retry_after"));
         assert!(migration.contains("+ 300"));
+        assert!(!migration.contains("UPDATE metadata_reidentify_job_items"));
     }
     assert!(!postgres_retry.contains("unixepoch()"));
     assert!(postgres_retry.contains("EXTRACT(EPOCH FROM CURRENT_TIMESTAMP"));
@@ -699,7 +700,7 @@ async fn sqlite_fill_request_snapshot_migration_preserves_queued_jobs()
 }
 
 #[tokio::test]
-async fn sqlite_fill_missing_retry_migration_backfills_only_automatic_provider_deferrals()
+async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config_dir = temp_dir.path().join("config");
@@ -788,6 +789,21 @@ async fn sqlite_fill_missing_retry_migration_backfills_only_automatic_provider_d
         .execute(&old_pool)
         .await?;
     }
+    sqlx::query("CREATE TABLE migration_retry_item_updates (count INTEGER NOT NULL)")
+        .execute(&old_pool)
+        .await?;
+    sqlx::query("INSERT INTO migration_retry_item_updates (count) VALUES (0)")
+        .execute(&old_pool)
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER count_legacy_retry_item_updates
+         AFTER UPDATE ON metadata_reidentify_job_items
+         BEGIN
+             UPDATE migration_retry_item_updates SET count = count + 1;
+         END",
+    )
+    .execute(&old_pool)
+    .await?;
     old_pool.close().await;
 
     let database = Database::connect(&config).await?;
@@ -814,7 +830,7 @@ async fn sqlite_fill_missing_retry_migration_backfills_only_automatic_provider_d
             })
             .collect::<Vec<_>>(),
         vec![
-            ("retry-automatic-job", "DEFERRED", 1, 1, 1),
+            ("retry-automatic-job", "DEFERRED", 1, 1, 0),
             ("retry-no-snapshot-job", "DEFERRED", 1, 1, 0),
             ("retry-other-error-job", "DEFERRED", 1, 1, 0),
         ]
@@ -826,13 +842,26 @@ async fn sqlite_fill_missing_retry_migration_backfills_only_automatic_provider_d
     .fetch_all(database.pool())
     .await?;
     assert_eq!(retry_deadlines.len(), 3);
-    for (item_id, seconds_until_retry) in retry_deadlines {
-        if item_id == "retry-automatic" {
-            assert!(seconds_until_retry.is_some_and(|seconds| (299..=300).contains(&seconds)));
-        } else {
-            assert_eq!(seconds_until_retry, None);
-        }
-    }
+    assert!(
+        retry_deadlines
+            .iter()
+            .all(|(_, seconds_until_retry)| seconds_until_retry.is_none())
+    );
+    let item_update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM migration_retry_item_updates")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        item_update_count, 0,
+        "0165 must not rewrite historical job items"
+    );
+    let legacy_retry_cooldown: i64 = sqlx::query_scalar(
+        "SELECT CAST(value AS INTEGER) - unixepoch() FROM server_settings
+         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!((299..=300).contains(&legacy_retry_cooldown));
     database.close().await;
     Ok(())
 }
