@@ -6,6 +6,8 @@ const SHUTDOWN_JOB_ERROR_CODE: &str = "SERVER_SHUTDOWN";
 const SCAN_MANIFEST_DIFF_TRANSACTION_BATCH_SIZE: usize = 500;
 const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
 const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
+// Six bound values per row keep each insert under SQLite's conservative bind limit.
+const MAX_SCAN_LOCAL_METADATA_BATCH_INSERT_ROWS: usize = 64;
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
@@ -625,6 +627,11 @@ impl Database {
         let mut unique_refs = std::collections::HashSet::with_capacity(ordered_refs.len());
         ordered_refs.retain(|(_, reference_id)| unique_refs.insert(*reference_id));
 
+        let mut batches = Vec::with_capacity(
+            ordered_refs
+                .len()
+                .div_ceil(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES),
+        );
         for (batch_index, refs) in ordered_refs
             .chunks(MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES)
             .enumerate()
@@ -640,17 +647,102 @@ impl Database {
                 .map(|(_, reference_id)| (*reference_id).to_owned())
                 .collect::<Vec<_>>();
             let id = format!("{job_id}:{library_root_id}:{batch_sequence}");
-            self.enqueue_scan_local_metadata_batch_in_transaction(
-                transaction,
-                NewScanLocalMetadataBatch {
-                    id: &id,
-                    job_id,
-                    library_root_id,
-                    batch_sequence,
-                    source_ids: &source_ids,
-                },
-            )
-            .await?;
+            if source_ids
+                .iter()
+                .any(|source_id| source_id.trim().is_empty())
+            {
+                return Err(StorageError::Conflict(
+                    "scan local metadata batch contains an empty source".into(),
+                ));
+            }
+            let source_count = i64::try_from(source_ids.len()).map_err(|_| {
+                StorageError::Conflict("scan local metadata source count overflow".into())
+            })?;
+            let source_refs_json = serde_json::to_string(&source_ids)
+                .map_err(|error| StorageError::Serialization(error.to_string()))?;
+            batches.push((batch_sequence, id, source_refs_json, source_count));
+        }
+
+        for batch_rows in batches.chunks(MAX_SCAN_LOCAL_METADATA_BATCH_INSERT_ROWS) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?)", batch_rows.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut insert = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO scan_local_metadata_batches (
+                     id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+                 ) VALUES {values}
+                 ON CONFLICT(job_id, library_root_id, batch_sequence) DO NOTHING
+                 RETURNING batch_sequence"
+            )));
+            for (batch_sequence, id, source_refs_json, source_count) in batch_rows {
+                insert = insert
+                    .bind(id)
+                    .bind(job_id)
+                    .bind(library_root_id)
+                    .bind(*batch_sequence)
+                    .bind(source_refs_json)
+                    .bind(*source_count);
+            }
+            let inserted_sequences = insert
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .into_iter()
+                .map(|row| row.get::<i64, _>(0))
+                .collect::<std::collections::HashSet<_>>();
+            if inserted_sequences.len() == batch_rows.len() {
+                continue;
+            }
+
+            let existing_sequences = batch_rows
+                .iter()
+                .map(|(sequence, _, _, _)| *sequence)
+                .filter(|sequence| !inserted_sequences.contains(sequence))
+                .collect::<Vec<_>>();
+            let placeholders = std::iter::repeat_n("?", existing_sequences.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut select = self
+                .query_as::<(i64, String, String, i64)>(sqlx::AssertSqlSafe(format!(
+                    "SELECT batch_sequence, id, source_refs_json, source_count
+                     FROM scan_local_metadata_batches
+                     WHERE job_id = ? AND library_root_id = ?
+                       AND batch_sequence IN ({placeholders})"
+                )))
+                .bind(job_id)
+                .bind(library_root_id);
+            for batch_sequence in &existing_sequences {
+                select = select.bind(batch_sequence);
+            }
+            let existing_batches =
+                select
+                    .fetch_all(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            if existing_batches.len() != existing_sequences.len()
+                || existing_batches
+                    .iter()
+                    .any(|(sequence, id, source_refs_json, source_count)| {
+                        !batch_rows.iter().any(
+                            |(expected_sequence, expected_id, expected_sources, expected_count)| {
+                                expected_sequence == sequence
+                                    && expected_id == id
+                                    && expected_sources == source_refs_json
+                                    && expected_count == source_count
+                            },
+                        )
+                    })
+            {
+                return Err(StorageError::Conflict(
+                    "scan local metadata batch sequence already has different input".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -12000,8 +12092,216 @@ mod tests {
         NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestRoot,
         prune_sidecar_directories, sidecar_target_query,
     };
-    use crate::config::Config;
+    use crate::config::{Config, DatabaseConfiguration, PostgresConnection};
     use sqlx::Row;
+
+    #[tokio::test]
+    async fn manifest_local_metadata_outbox_inserts_three_batches_with_one_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        assert_manifest_local_metadata_outbox_batches(&database).await?;
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a disposable local PostgreSQL database"]
+    async fn manifest_local_metadata_outbox_conflicts_are_validated_on_postgres()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let connection = DatabaseConfiguration::Postgres(PostgresConnection {
+            host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".into()),
+            port: std::env::var("POSTGRES_TEST_PORT")
+                .unwrap_or_else(|_| "55432".into())
+                .parse()?,
+            database: std::env::var("POSTGRES_TEST_DATABASE")?,
+            username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".into()),
+            password: std::env::var("POSTGRES_TEST_PASSWORD")?,
+            ssl_mode: "disable".into(),
+        });
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        assert_manifest_local_metadata_outbox_batches(&database).await?;
+        database.close().await;
+        Ok(())
+    }
+
+    async fn assert_manifest_local_metadata_outbox_batches(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/media', '/media', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        let source_refs = (0..513)
+            .map(|index| (format!("item-{index}"), format!("source-{index}")))
+            .collect::<Vec<_>>();
+        let source_refs = source_refs
+            .iter()
+            .map(|(item_id, source_id)| (item_id.as_str(), source_id.as_str()))
+            .collect::<Vec<_>>();
+
+        database.reset_query_count();
+        let mut transaction = database.begin_metadata_write_transaction().await?;
+        database
+            .enqueue_manifest_local_metadata_refs_in_transaction(
+                &mut transaction,
+                "job",
+                "root",
+                &source_refs,
+                0,
+            )
+            .await?;
+        transaction.commit().await?;
+        assert_eq!(
+            database.query_count(),
+            1,
+            "three durable 256-source batches should share one INSERT query"
+        );
+
+        let batches = database
+            .list_scan_local_metadata_batches(None, None, 10)
+            .await?;
+        assert_eq!(batches.len(), 3);
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| batch.source_count)
+                .collect::<Vec<_>>(),
+            vec![256, 256, 1]
+        );
+
+        database.reset_query_count();
+        let mut transaction = database.begin_metadata_write_transaction().await?;
+        database
+            .enqueue_manifest_local_metadata_refs_in_transaction(
+                &mut transaction,
+                "job",
+                "root",
+                &source_refs,
+                0,
+            )
+            .await?;
+        transaction.commit().await?;
+        assert_eq!(
+            database.query_count(),
+            2,
+            "an idempotent replay should batch insert and validate conflicts"
+        );
+
+        let changed_source_refs = source_refs
+            .iter()
+            .map(|(item_id, source_id)| {
+                if *source_id == "source-0" {
+                    (*item_id, "changed-source")
+                } else {
+                    (*item_id, *source_id)
+                }
+            })
+            .collect::<Vec<_>>();
+        let additional_sources = (513..769)
+            .map(|index| (format!("item-{index}"), format!("source-{index}")))
+            .collect::<Vec<_>>();
+        let mut changed_source_refs = changed_source_refs;
+        changed_source_refs.extend(
+            additional_sources
+                .iter()
+                .map(|(item_id, source_id)| (item_id.as_str(), source_id.as_str())),
+        );
+        database.reset_query_count();
+        let mut transaction = database.begin_metadata_write_transaction().await?;
+        let enqueue_result = database
+            .enqueue_manifest_local_metadata_refs_in_transaction(
+                &mut transaction,
+                "job",
+                "root",
+                &changed_source_refs,
+                0,
+            )
+            .await;
+        assert!(
+            enqueue_result.is_err(),
+            "changed batch content must conflict"
+        );
+        transaction.rollback().await?;
+        assert_eq!(database.query_count(), 2);
+
+        database
+            .query(
+                "UPDATE scan_local_metadata_batches SET id = 'different-id'
+                 WHERE job_id = 'job' AND library_root_id = 'root' AND batch_sequence = 0",
+            )
+            .execute(database.pool())
+            .await?;
+        database.reset_query_count();
+        let mut transaction = database.begin_metadata_write_transaction().await?;
+        let enqueue_result = database
+            .enqueue_manifest_local_metadata_refs_in_transaction(
+                &mut transaction,
+                "job",
+                "root",
+                &source_refs,
+                0,
+            )
+            .await;
+        assert!(enqueue_result.is_err(), "changed batch ID must conflict");
+        transaction.rollback().await?;
+        assert_eq!(database.query_count(), 2);
+
+        database
+            .query(
+                "UPDATE scan_local_metadata_batches SET id = 'job:root:0', source_count = 255
+                 WHERE job_id = 'job' AND library_root_id = 'root' AND batch_sequence = 0",
+            )
+            .execute(database.pool())
+            .await?;
+        database.reset_query_count();
+        let mut transaction = database.begin_metadata_write_transaction().await?;
+        let enqueue_result = database
+            .enqueue_manifest_local_metadata_refs_in_transaction(
+                &mut transaction,
+                "job",
+                "root",
+                &source_refs,
+                0,
+            )
+            .await;
+        assert!(
+            enqueue_result.is_err(),
+            "changed source count must conflict"
+        );
+        transaction.rollback().await?;
+        assert_eq!(database.query_count(), 2);
+
+        let existing_count: i64 = database
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_local_metadata_batches
+                 WHERE job_id = 'job' AND library_root_id = 'root'",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(
+            existing_count, 3,
+            "failed replay must not alter stored batches"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn finishing_a_cancelled_strm_job_cannot_restore_terminal_status()

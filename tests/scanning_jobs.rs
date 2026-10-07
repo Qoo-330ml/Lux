@@ -1975,6 +1975,20 @@ async fn streamed_manifest_rolls_back_local_outbox_with_positive_index()
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_batch(&job.id, 100).await?;
     while user_event_receiver.try_recv().is_ok() {}
+    let manifest_checkpoint_before: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT discovered_directory_count, completed_directory_count,
+                    observed_file_count, unchanged_count, add_count, change_count,
+                    remove_count, reappeared_count, applied_delta_count
+             FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let job_checkpoint_before: (i64, i64) =
+        sqlx::query_as("SELECT total_count, processed_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
     sqlx::query(
         "CREATE TRIGGER reject_scan_local_metadata_batch
          BEFORE INSERT ON scan_local_metadata_batches
@@ -2005,6 +2019,22 @@ async fn streamed_manifest_rolls_back_local_outbox_with_positive_index()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(rolled_back, (0, 0, 0));
+    let manifest_checkpoint_after: (i64, i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT discovered_directory_count, completed_directory_count,
+                    observed_file_count, unchanged_count, add_count, change_count,
+                    remove_count, reappeared_count, applied_delta_count
+             FROM scan_manifests WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let job_checkpoint_after: (i64, i64) =
+        sqlx::query_as("SELECT total_count, processed_count FROM scan_jobs WHERE id = ?")
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(manifest_checkpoint_after, manifest_checkpoint_before);
+    assert_eq!(job_checkpoint_after, job_checkpoint_before);
     Ok(())
 }
 

@@ -1330,6 +1330,12 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     let (raw_statement_count, dml_statement_count) = statement_counts.snapshot();
     let manifest_active_job_select_count = statement_counts.manifest_active_job_select_count();
     let dml_summary_counts = statement_counts.dml_summary_snapshot();
+    let local_metadata_outbox_dml_count = dml_summary_counts
+        .iter()
+        .filter(|(_, summary)| summary.starts_with("INSERT INTO SCAN_LOCAL_METADATA_BATCHES"))
+        .map(|(count, _)| count)
+        .sum::<usize>();
+    let scan_index_dml_count = dml_statement_count.saturating_sub(local_metadata_outbox_dml_count);
     let unclassified_cte_summaries = statement_counts.unclassified_cte_summary_snapshot();
     let lite_root_directory_state_updates = statement_counts
         .dml_statement_count_containing("UPDATE SCAN_MANIFEST_DIRECTORIES SET STATE");
@@ -1425,7 +1431,7 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     if matches!(backend.as_str(), "sqlite" | "postgres") {
         assert!(
             dml_statement_count < 209,
-            "LUX-275 backend batching should reduce scan DML from the 209-statement baseline; backend={backend}, observed {dml_statement_count}"
+            "LUX-275 backend batching should reduce total scan DML from the 209-statement baseline; backend={backend}, observed {dml_statement_count} including {local_metadata_outbox_dml_count} local metadata outbox statements and {scan_index_dml_count} scan-index statements"
         );
     }
     let postgres_wal_after = if backend == "postgres" {
@@ -1652,6 +1658,8 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         json!({
             "manifestSqlStatementCount": scan_statement_count,
             "manifestDmlStatementCount": dml_statement_count,
+            "manifestScanIndexDmlStatementCount": scan_index_dml_count,
+            "manifestLocalMetadataOutboxDmlStatementCount": local_metadata_outbox_dml_count,
             "manifestDmlSummaryCounts": dml_summary_counts,
             "unclassifiedCteSummaries": unclassified_cte_summaries,
             "postgresWalBytesWritten": postgres_wal_before

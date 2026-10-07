@@ -1500,3 +1500,16 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 扫描图片阶段已经查询的 preferred source 快照现在传给 NFO 阶段；NFO 开始前通过有界 source-identity 查询排除已陈旧的 preferred source，写入前仍执行原有 freshness 复核。NFO 路径先按批次解析，数据库只批量读取确实存在 NFO 的条目 metadata，因此每个 NFO 不再单独读取完整 metadata 行；无 NFO 批次跳过 metadata 查询。批次 source 分组只复制图片/层级处理所需字段，不深拷贝完整 source 结构。家庭视频 NFO 路径检查失败仍会记录为条目错误。
 
 固定 SQLite 回归中，两个带 NFO 的电影共用一条 metadata 查询和一条 source 身份校验；包含两个 NFO 的 NFO 阶段共执行 4 条 SQL（含两条 NFO 写入）。无 NFO 的一个 item 只执行一条 source 校验，不读取 metadata；preferred source 已变陈旧时也只执行一条校验并跳过 NFO 处理。`scan_local_metadata_nfo_retains_home_video_path_errors` 验证家庭视频路径不可访问时保留 I/O 错误。`scanned_metadata` 16/16、`scanning_jobs` 81/81 通过。以上是 SQL/行为边界，不是墙钟、CPU、FNOS、PostgreSQL 或 NAS 收益测量。
+
+### LUX-408 扫描本地 metadata outbox 合并写入
+
+2026-10-07 在 ARM64 开发机（`uname -m=arm64`）以同一确定性 60,000 文件 / 600 目录 fixture（SHA-256 `23de3a20c11c6a6e7cd44b76af7d1a84e85b9747e2ed2661668dbdf94dad9914`）交错运行基线与候选各三轮。基线为候选直接父提交 `9fb6abae`；为使未优化基线能完成报告，临时只放宽了基准中的 `<209` 断言，不改运行代码。候选将每个正向扫描提交中的多个 256-source outbox batch 合并为一条最多 64 行的多值 INSERT；SQLite 和 PostgreSQL 每条仍最多 384 个绑定参数。每轮均使用新空数据库；SQLite `synchronous=FULL`，PostgreSQL 为本机 Docker 16.15。表中首扫、重扫和 p95 均为毫秒，前台 p95 是扫描期间 50 个目录请求，目录列表 p95 与 batch p95 分别单独采集。
+
+| 后端 / 版本 | 首扫索引：三轮 / 中位数 | 120k target 中位数 | 无变化重扫：三轮 / 中位数 | 前台 / 目录列表 / batch p95 中位数 | SQL / DML 中位数 | outbox DML | WAL 中位数 / 最大锁等待者 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| SQLite 基线 | 3,000 / 2,966 / 3,023；**3,000** | 593 | 1,667 / 1,678 / 1,692；**1,678** | 805 / 845 / 425 | 596 / 359 | 240 | 20,826,632 bytes / - |
+| SQLite 候选 | 2,970 / 3,027 / 3,019；**3,019** | 605 | 1,768 / 1,771 / 1,652；**1,768** | 862 / 868 / 419 | 366 / 127 | 8 | 20,707,152 bytes / - |
+| PostgreSQL 基线 | 6,290 / 6,166 / 6,219；**6,219** | 1,772 | 4,296 / 3,918 / 50,371；**4,296** | 878 / 1,011 / 875 | 570 / 335 | 240 | 246,728,655 bytes / 0 |
+| PostgreSQL 候选 | 6,161 / 6,144 / 6,224；**6,161** | 1,745 | 50,468 / 3,543 / 4,239；**4,239** | 873 / 1,060 / 850 | 338 / 103 | 8 | 230,163,605 bytes / 0 |
+
+固定 60k 扫描的 outbox DML 从 240 降到 8；总 DML 在 SQLite 从 359 降到 127，在 PostgreSQL 从 335 降到 103。SQL 中位数分别从 596 降至 366、从 570 降至 338。首扫和 target 墙钟中位数接近持平；这些数据验证的是批量写入和语句数下降，不证明 CPU 或 FNOS 收益。PostgreSQL 基线第 3 轮与候选第 1 轮的无变化重扫各有一次约 50 秒离群值，阶段记录均指向 `known_path_query`；该路径不在 LUX-408 改动范围，故保留原始值并只比较中位数，不将其归因于候选。修改尚未部署 FNOS，也不外推 NAS/x86_64 性能。

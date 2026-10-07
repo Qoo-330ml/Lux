@@ -8707,6 +8707,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 短计划与文件：预计修改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。先在 scanner 单测中固定“预检错误继续排队、明确无 scraper 不排队”的决策，再把预检错误送入已有 provider-unavailable job 流程，最后运行窄测试与相关完整检查。
 
+#### LUX-408：合并扫描本地 metadata outbox 批量写入
+
+范围：workflow 3 每 256 个 source 持久化一条 `scan_local_metadata_batches`，保留该任务粒度以限制 worker 的单次载荷和重试范围；但目前同一 Manifest 事务对每条 batch 分别执行 INSERT。60,000 个文件的固定扫描产生 240 条 outbox INSERT，令现有 LUX-275 基准中的 `<209 DML` 检查在干净 `origin/test` 上失败，尽管扫描索引本身仅执行 119 条 DML。将同一事务中多个 outbox batch 合并为有界多行 INSERT，只有遇到已存在的 batch 序号时才执行一次有界读取并校验原 ID、source 列表和计数。每条 outbox 仍最多含 256 个 source；不改变 worker、重试、序号、事务或公开接口。
+
+验收：
+
+- [x] 新 batch 在一个有界多行 INSERT 中写入；故障注入回归确认 Manifest 索引、outbox 和 manifest/job checkpoint 一同回滚。
+- [x] 重放相同序号与完全相同 source 列表保持幂等；相同序号但 ID、source 列表或 source 数不同仍返回冲突；SQLite 与 PostgreSQL 均运行覆盖。
+- [x] 固定 SQLite 回归对 513 个 source 生成 3 条独立 batch，首次写入只执行 1 条 INSERT；重放使用有界冲突校验，不逐行读取。
+- [x] 每条 batch 最大仍为 256 个 source；最多 64 行、384 个绑定参数的多行 INSERT 在 SQLite 与 PostgreSQL 通过。
+- [x] `lux_270_manifest_job_scan_benchmark` 的 60k SQLite/PostgreSQL 总 DML 均低于既有 209 阈值；索引、target、无变化重扫、前台 p95、SQL/DML 与 WAL 已记录，不把本机 ARM64 数据外推至 FNOS/x86_64。
+
+短计划与文件：修改 `src/storage/jobs.rs`（批量序列化、INSERT、冲突校验及 SQLite/PostgreSQL query-count 回归）、`tests/scanning_jobs.rs`（Manifest 与 checkpoint 回滚）、`tests/performance.rs`（保持总 DML 门槛）、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先写 513-source 回归，再按最多 64 个 outbox row 构造一条多值 SQL、使用 `RETURNING` 识别新写序号，并仅在存在冲突时批量验证。已完成 storage/scanning 定向回归及 PostgreSQL 16 三轮基准；全量 Rust 质量门结果见下。
+
+结果（2026-10-08）：定向 SQLite/PostgreSQL outbox 回归、扫描事务回滚、60k SQLite/PostgreSQL 性能基准、`cargo build --locked`、`cargo fmt --all -- --check` 和全目标全 feature Clippy 通过。`cargo test --locked --all-targets --no-fail-fast` 中 library 为 751 passed、13 ignored，`scanning_jobs` 81/81、`storage` 49/49 通过；全量集成测试仅 `emby_counts` 与 `strm` 两项失败，这两项已在干净 `origin/test` 的 LUX-407 质量门中复现，与本任务改动无关。`git diff --check` 通过。本机为 ARM64；此分支未部署 FNOS，固定 fixture 的语句数改善不代表 NAS CPU 或生产墙钟收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
