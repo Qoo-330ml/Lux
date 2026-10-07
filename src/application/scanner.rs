@@ -4288,7 +4288,7 @@ impl ScanJobService {
                         &self.database,
                         self.metadata_selection.as_ref(),
                         self.metadata_reidentify.as_ref(),
-                        None,
+                        LocalMetadataCompletenessTrigger::LibrarySetting,
                         &source_identities,
                         &report.non_retryable_failed_item_ids,
                         &self.user_events,
@@ -12212,20 +12212,22 @@ mod tests {
     };
 
     use super::{
-        LibraryScanner, MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
-        MANIFEST_STREAMED_INDEX_BATCH_SIZE, MAX_STRM_TARGET_BYTES, ManifestDirectoryReader,
-        ManifestFilenameInput, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
-        MixedClassification, MixedClassificationCache, MixedManifestClassification,
-        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
-        PreparedManifestFilename, ScanJobService, ScannerError, classify_manifest_removal_outcomes,
-        classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
+        LibraryScanner, LocalMetadataCompletenessTrigger, MANIFEST_DISCOVERY_BATCH_SIZE,
+        MANIFEST_STREAMED_ENTRY_BATCH_SIZE, MANIFEST_STREAMED_INDEX_BATCH_SIZE,
+        MAX_STRM_TARGET_BYTES, ManifestDirectoryReader, ManifestFilenameInput,
+        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
+        MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
+        NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
+        ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
+        configured_scan_concurrency, infer_sibling_movie_variant_suffix,
         infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
         manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
         merge_movie_provider_ids, metadata_auto_match_policy_for_scan_job,
         newly_confirmed_fill_missing_item_ids, normalize_incremental_path, parse_episode_filename,
         parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
-        read_strm_target, safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
-        stat_manifest_relative_file_sync, stat_manifest_root_sync,
+        read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
+        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
+        stat_manifest_root_sync,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -12538,6 +12540,28 @@ mod tests {
         assert!(!MetadataAutoMatchPolicy::Disabled.allows_scraper_lookup());
         assert!(MetadataAutoMatchPolicy::UseLibrarySetting.allows_scraper_lookup());
         assert!(MetadataAutoMatchPolicy::Enabled.allows_scraper_lookup());
+    }
+
+    #[tokio::test]
+    async fn library_setting_trigger_preserves_library_completeness_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+
+        let policy = resolve_local_metadata_auto_match_policy(
+            &database,
+            LocalMetadataCompletenessTrigger::LibrarySetting,
+        )
+        .await?;
+
+        assert_eq!(policy, MetadataAutoMatchPolicy::UseLibrarySetting);
+        Ok(())
     }
 
     #[tokio::test]
