@@ -8614,15 +8614,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite/PostgreSQL migration 增加自动退避次数和到期时间；旧的自动 `DEFERRED/SCRAPER_UNAVAILABLE` item 升级后有安全的首次到期时间，历史任务状态和计数不变。
-- [ ] 同一请求快照在到期前不创建新 job；到期后可创建新 job，并继承该快照此前的失败次数。
-- [ ] 连续 provider 失败按 5 分钟、30 分钟、最多 6 小时退避；新 fingerprint/capability 不等待旧快照；人工 retry 可立即领取。
-- [ ] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
-- [ ] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在可用集成环境通过。
+- [x] SQLite/PostgreSQL migration 增加自动退避次数和到期时间；旧的自动 `DEFERRED/SCRAPER_UNAVAILABLE` 且带请求快照的 item 升级后有安全的首次到期时间，历史任务状态和计数不变。
+- [x] 同一请求快照在到期前不创建新 job；到期后可创建新 job，并继承该快照此前的失败次数。
+- [x] 连续 provider 失败按 5 分钟、30 分钟、最多 6 小时退避；新 fingerprint/capability 不等待旧快照；人工 retry 可立即领取。
+- [x] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
+- [x] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在可用集成环境通过。
 
 短计划与文件：实现涉及 `migrations/0165_metadata_fill_missing_retry_backoff.sql`、`migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql`、`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`，以及公开 schema version 断言所在的集成测试文件。先添加红色状态机回归，再实现逐 item 退避、相同快照的跨 job 次数继承和到期去重，最后分别验证 SQLite 与 PostgreSQL 合同。本任务不改元数据 API DTO 或扫描并发策略。
 
-结果（2026-10-07）：新增双后端 migration 0165，为 provider 失败后的自动快照 item 保存失败次数和截止时间；退避为 5 分钟、30 分钟、最高 6 小时，并在新 job 中继承相同 fingerprint/capability 的次数。migration 会给已有自动 deferred provider 失败安排首次 5 分钟冷却，保持任务状态和计数；旧的无快照 deferred 仍沿用一小时去重。相同快照冷却去重、新 fingerprint/capability、显式 retry、取消、其他错误及非 `FILL_MISSING` 模式均有回归测试。去重检查保留单条有界 SQL 查询，不额外增加扫描调度往返。SQLite 定向状态机、迁移升级、storage 全目标、build、fmt、全目标全 feature Clippy 通过；全目标测试有 743 个 library tests 通过、11 个忽略；集成目标 `emby_counts`（实际 1、预期 0）和 `strm`（401、预期 200），这两个持续失败均在未改动的基线提交 `1ffaf3b0` 上独立复现；`libraries_api` 曾出现一次瞬时 `DATABASE_UNAVAILABLE`，独立重跑 13 项全部通过。首次运行中的旧式 provider-deferral fixtures 已通过兼容兜底修复并单独复测通过。PostgreSQL 测试服务/容器 daemon 不可用，双后端 SQL 合同已静态验证但 PostgreSQL migration 未运行；本机 `arm64`，未部署或验证 FNOS CPU/真实重试节奏。
+结果（2026-10-07）：新增双后端 migration 0165，为 provider 失败后的自动快照 item 保存失败次数和截止时间；退避为 5 分钟、30 分钟、最高 6 小时，并在新 job 中继承相同 fingerprint/capability 的次数。migration 只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却，保持任务状态和计数；无快照旧任务仍沿用一小时去重。相同快照冷却去重、新 fingerprint/capability、显式 retry、取消、其他错误及非 `FILL_MISSING` 模式均有状态机回归。去重检查保留单条有界 SQL 查询，不额外增加扫描调度往返。SQLite migration/state-machine 测试、`tests/storage.rs` 49 项、`tests/postgres_database.rs -- --include-ignored` 16 项及 PostgreSQL progressive-scan storage contract 1 项通过；后者直接验证 provider 失败后的冷却、到期重试和失败次数继承。`cargo build --locked`、fmt、全目标全 feature Clippy 通过。全目标 Rust 测试库部分为 746 passed、0 failed、11 ignored；仅 `emby_counts`（实际 1、期望 0）与 `strm`（401、期望 200）失败，两者均在干净 `origin/test=8412cc2a` 上独立复现。开发机 `arm64`；FNOS 尚未部署本分支，未据此宣称生产 CPU 或真实重试节奏改善。
 
 #### LUX-403：复用有空位的 queued FILL_MISSING job
 
@@ -8637,7 +8637,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写含 3 个 queued job（100、100、50 项）和后续追加请求的失败回归，再实现有界多 job 容量分配。
 
-结果（2026-10-07）：补缺分配只查询 `total_count < 100` 的 queued job，按创建顺序复用，并将候选上限限制为待分配 item 数；PostgreSQL 查询额外锁定候选 job 行，SQLite 继续依赖现有写事务。SQLite 回归先确认旧逻辑在 `100/100/50` 后追加 item 会多建 job，再验证后续有 1 项容量时保持 3 个 job、追加 80 项后分布为 `100/100/100/31`，331 个 item 均入队。`fill_missing_job_creation` 两项、build、fmt、全目标全 feature Clippy 和差异检查通过。未连接 PostgreSQL，也未测量 FNOS CPU 或生产 job 创建率。
+结果（2026-10-07）：补缺分配只查询 `total_count < 100` 的 queued job，按创建顺序复用，并将候选上限限制为待分配 item 数；PostgreSQL 查询额外锁定候选 job 行，SQLite 继续依赖现有写事务。SQLite 回归先确认旧逻辑在 `100/100/50` 后追加 item 会多建 job，再验证后续有 1 项容量时保持 3 个 job、追加 80 项后分布为 `100/100/100/31`，331 个 item 均入队。`fill_missing_job_creation` 两项和 PostgreSQL progressive-scan storage contract 通过；后者验证第二个 item 复用已有 queued job。build、fmt、全目标全 feature Clippy 和差异检查通过。未测量 FNOS CPU 或生产 job 创建率。
 
 #### LUX-404：显式表达扫描完整度补缺策略
 
@@ -8651,7 +8651,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/scanner.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先检查现有策略边界测试，再引入类型并保留同一套状态断言。
 
-结果（2026-10-07）：补缺调用现在显式区分 `ScanJob` 与 `LibrarySetting` trigger，并解析成 `UseLibrarySetting`、`Enabled` 或 `Disabled` 策略；存储入口同样接收具名策略类型。全量任务和后台回填继续读取库级新扫描设置，增量扫描继续服从任务开关，已删除任务禁用在线探测。策略单测和 `progressive_scan_metadata_dispatch_is_atomic_and_deduplicated` 通过；build、fmt、全目标全 feature Clippy 和差异检查通过。没有 schema/API 变化，也未据此推断 FNOS CPU 收益。
+结果（2026-10-07）：补缺调用现在显式区分 `ScanJob` 与 `LibrarySetting` trigger，并解析成 `UseLibrarySetting`、`Enabled` 或 `Disabled` 策略；存储入口同样接收具名策略类型。全量任务、后台回填和精确目录本地刷新继续读取库级新扫描设置，增量扫描继续服从任务开关，已删除任务禁用在线探测。策略单测、精确目录刷新回归和 PostgreSQL policy/storage contract 通过；build、fmt、全目标全 feature Clippy 通过。没有 schema/API 变化，也未据此推断 FNOS CPU 收益。
 
 #### LUX-405：验证跨媒体库全量扫描串行队列
 
@@ -8665,7 +8665,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`tests/scanning_jobs.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先将旧回归改为能在无 `full_scan_queue` 的实现中失败，再验证当前容量为 1 的生命周期队列。
 
-结果（2026-10-07）：回归使用共享 `ScanJobService` 和 2 个扫描 semaphore permit，并由 SQLite trigger 拒绝并发全量任务进入 `RUNNING`；两个不同媒体库的 job 都完成。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs` 81/81 通过；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。`cargo test --locked --all-targets --no-fail-fast` 仍有四个失败目标：`emby_counts` 与 `strm` 的旧基线失败、插件安装状态查询计数用例在并行全套中偶发多计一次（隔离复跑通过）、以及一个增量扫描用例超时（完整 `scanning_jobs` 定向目标复跑通过）。默认扫描并发为 2，全量扫描队列容量为 1。验证环境为 arm64；没有据此推断 FNOS CPU 或 NAS 性能收益。
+结果（2026-10-07）：回归使用共享 `ScanJobService` 和 2 个扫描 semaphore permit，并由 SQLite trigger 拒绝并发全量任务进入 `RUNNING`；两个不同媒体库的 job 都完成。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs` 81/81 通过。全目标 Rust 测试库部分为 746 passed、0 failed、11 ignored；集成目标仅 `emby_counts` 与 `strm` 失败，两者在干净 `origin/test=8412cc2a` 上也复现，之前出现的插件查询计数波动和扫描超时本轮未复现。build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。默认扫描并发为 2，全量扫描队列容量为 1。验证环境为 arm64；没有据此推断 FNOS CPU 或 NAS 性能收益。
 
 #### 本轮代码质量与性能优化收口
 

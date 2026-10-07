@@ -1477,11 +1477,17 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 
 固定 SQLite storage 回归通过触发器计数确认：重复同快照请求对 job/item 表执行 0 次 INSERT、0 次 UPDATE；queued 中出现新 fingerprint 时执行 0 次 INSERT、1 次 item UPDATE、0 次 job INSERT。状态机测试还验证 capability 集变化、运行项只重跑一次、同快照稳定完成、取消不重跑、worker 失败后的显式 retry 使用最新 fingerprint、近期 DEFERRED 同快照去重和变化快照重新排队。该计数是单 item fixture 的 DML 边界，不是完整性流程 SQL 总数或墙钟基准；未测量数据库 CPU、FNOS、PostgreSQL 或 NAS 收益，也未部署。
 
+### LUX-402 自动 FILL_MISSING provider 退避
+
+自动补缺 item 在 provider 不可用后保存失败次数与下一次重试时间，延迟依次为 5 分钟、30 分钟并封顶 6 小时。相同 fingerprint/capability 快照在截止时间前命中现有 deferred item，不创建新 job；到期后新 job 继承此前失败次数。快照改变、人工 retry、无快照任务和其他 metadata 模式保持原有语义。dispatch 查询仍在单个有界存储调用中完成活动/历史去重，没有额外增加每批调度往返。
+
+SQLite 状态机和迁移回归验证时间边界、次数继承和排除条件。PostgreSQL `postgres_progressive_scan_metadata_storage_contract` 验证 0165 schema、provider 失败冷却、到期重试、失败次数继承及事务行为；PostgreSQL migration/storage contract 1 项通过。结果只说明固定测试中的状态与调用边界，不测量运行时 CPU、重试流量、墙钟、FNOS 或 NAS 收益。
+
 ### LUX-403 queued FILL_MISSING 容量复用
 
 在固定 SQLite fixture 中，先生成 3 个 queued job（100、100、50 项），再增加 1 项时复用第三个 job，job 数保持 3；继续增加 80 项后，先填满第三个 job 再创建 31 项的第四个 job，最终分布为 100/100/100/31，共 331 项。旧逻辑会在最早 job 已满时另建 job，即使后面仍有空位。
 
-该结果只证明有界队列分配的状态与 job 数；未测量多次扫描下的查询延迟、CPU、FNOS、PostgreSQL 或 NAS 收益。PostgreSQL `FOR UPDATE` 查询未在集成服务上运行。
+该结果只证明有界队列分配的状态与 job 数；未测量多次扫描下的查询延迟、CPU、FNOS 或 NAS 收益。PostgreSQL progressive-scan storage contract 也验证了同库新 item 复用已有 queued job，但没有测量 PostgreSQL 查询延迟或生产并发争用。
 
 ### LUX-405 跨媒体库全量扫描串行队列
 
