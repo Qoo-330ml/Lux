@@ -3450,8 +3450,25 @@ fn newly_confirmed_fill_missing_item_ids(
     item_ids
 }
 
-fn scraper_preflight_allows_fill_missing(available: Option<bool>, failed: bool) -> bool {
-    failed || available == Some(true)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScraperAvailabilityPreflight {
+    Available,
+    Unavailable,
+    Failed,
+}
+
+impl ScraperAvailabilityPreflight {
+    fn from_check_result(result: Result<Option<bool>, ()>) -> Self {
+        match result {
+            Ok(Some(true)) => Self::Available,
+            Ok(Some(false)) | Ok(None) => Self::Unavailable,
+            Err(()) => Self::Failed,
+        }
+    }
+
+    const fn allows_fill_missing(self) -> bool {
+        matches!(self, Self::Available | Self::Failed)
+    }
 }
 
 async fn complete_local_metadata_completeness(
@@ -3559,28 +3576,30 @@ async fn complete_local_metadata_completeness_for_item_ids(
         {
             if metadata_reidentify.is_some() {
                 let availability = scraper_availability_by_item.get(item_id);
-                let lookup_failed = if let Some(error) = scraper_availability_error.as_deref() {
+                let preflight_result = if let Some(error) = scraper_availability_error.as_deref() {
                     tracing::warn!(
                         item_id = %item_id,
                         error,
                         "local metadata can confirm missing capabilities but scraper availability could not be checked"
                     );
-                    true
-                } else if let Some(Err(error)) = availability {
-                    tracing::warn!(
-                        item_id = %item_id,
-                        %error,
-                        "local metadata can confirm missing capabilities but scraper availability could not be checked"
-                    );
-                    true
+                    Err(())
                 } else {
-                    false
+                    match availability {
+                        Some(Ok(available)) => Ok(Some(*available)),
+                        None => Ok(None),
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                item_id = %item_id,
+                                %error,
+                                "local metadata can confirm missing capabilities but scraper availability could not be checked"
+                            );
+                            Err(())
+                        }
+                    }
                 };
-                let available = availability
-                    .and_then(|result| result.as_ref().ok())
-                    .copied();
+                let preflight = ScraperAvailabilityPreflight::from_check_result(preflight_result);
                 // The metadata worker can persist SCRAPER_UNAVAILABLE and apply its bounded retry.
-                scraper_preflight_allows_fill_missing(available, lookup_failed)
+                preflight.allows_fill_missing()
             } else {
                 false
             }
@@ -12261,16 +12280,17 @@ mod tests {
         ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
         MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
         NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
-        ScanJobService, ScannerError, classify_manifest_removal_outcomes, classify_mixed_file,
-        configured_scan_concurrency, infer_sibling_movie_variant_suffix,
-        infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
-        manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
-        merge_movie_provider_ids, metadata_auto_match_policy_for_scan_job,
-        newly_confirmed_fill_missing_item_ids, normalize_incremental_path, parse_episode_filename,
-        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
-        read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
-        scraper_preflight_allows_fill_missing, stat_manifest_directory_file_batch_sync,
-        stat_manifest_relative_file_sync, stat_manifest_root_sync,
+        ScanJobService, ScannerError, ScraperAvailabilityPreflight,
+        classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
+        infer_sibling_movie_variant_suffix, infer_sibling_movie_variant_suffix_with_probe,
+        is_lite_manifest_discovery, manifest_file_observation_matches,
+        manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
+        metadata_auto_match_policy_for_scan_job, newly_confirmed_fill_missing_item_ids,
+        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
+        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
+        resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
+        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
+        stat_manifest_root_sync,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -12458,10 +12478,14 @@ mod tests {
 
     #[test]
     fn scraper_preflight_failure_enters_bounded_fill_missing_retry() {
-        assert!(scraper_preflight_allows_fill_missing(None, true));
-        assert!(scraper_preflight_allows_fill_missing(Some(true), false));
-        assert!(!scraper_preflight_allows_fill_missing(Some(false), false));
-        assert!(!scraper_preflight_allows_fill_missing(None, false));
+        assert!(ScraperAvailabilityPreflight::from_check_result(Err(())).allows_fill_missing());
+        assert!(
+            ScraperAvailabilityPreflight::from_check_result(Ok(Some(true))).allows_fill_missing()
+        );
+        assert!(
+            !ScraperAvailabilityPreflight::from_check_result(Ok(Some(false))).allows_fill_missing()
+        );
+        assert!(!ScraperAvailabilityPreflight::from_check_result(Ok(None)).allows_fill_missing());
     }
 
     fn unsupported_scraper_call<T: Send + 'static>(
