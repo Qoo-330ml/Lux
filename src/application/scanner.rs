@@ -51,14 +51,15 @@ use crate::{
     storage::{
         Database, FilesystemEntryMove, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE,
         ManifestDeltaBatchCommit, ManifestDiscoveryCommitResult, ManifestPostprocessingTargetPage,
-        NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewItemMetadataCompletenessCheck,
-        NewItemMetadataCompletenessResult, NewMediaItem, NewMediaSource, NewMovieFile,
-        NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
-        NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
-        NewScanManifestSeenFilesystemEntry, NewScanManifestUnresolvedFile,
-        ReconciliationBatchCommit, StorageError, StoredEpisodeIdentityCandidate,
-        StoredFilesystemEntry, StoredLibraryRoot, StoredReconciliationScanEntry, StoredScanJob,
-        StoredScanJobPath, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
+        MetadataAutoMatchPolicy, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem,
+        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMediaItem,
+        NewMediaSource, NewMovieFile, NewScanManifest, NewScanManifestDelta,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestIndexedFile,
+        NewScanManifestPositiveIndex, NewScanManifestRoot, NewScanManifestSeenFilesystemEntry,
+        NewScanManifestUnresolvedFile, ReconciliationBatchCommit, StorageError,
+        StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
+        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
+        StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
         is_lite_manifest_discovery, movie_parent_folder_identity,
     },
 };
@@ -3097,7 +3098,7 @@ async fn finish_scan_local_metadata_batch(
                     database,
                     context.metadata_selection,
                     context.metadata_reidentify,
-                    Some(scan_job_id),
+                    LocalMetadataCompletenessTrigger::ScanJob(scan_job_id),
                     &source_identities,
                     &non_retryable_item_ids,
                     context.user_events,
@@ -3249,7 +3250,7 @@ async fn finish_scan_local_metadata_backfill_page(
                     database,
                     context.metadata_selection,
                     context.metadata_reidentify,
-                    None,
+                    LocalMetadataCompletenessTrigger::LibrarySetting,
                     &source_identities,
                     &non_retryable_item_ids,
                     context.user_events,
@@ -3337,6 +3338,44 @@ async fn fail_scan_local_metadata_backfill_page(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LocalMetadataCompletenessTrigger<'a> {
+    ScanJob(&'a str),
+    LibrarySetting,
+}
+
+fn metadata_auto_match_policy_for_scan_job(job: Option<&StoredScanJob>) -> MetadataAutoMatchPolicy {
+    match job {
+        Some(job) if job.job_type == "INCREMENTAL_SCAN" => {
+            if job.auto_metadata_match {
+                MetadataAutoMatchPolicy::Enabled
+            } else {
+                MetadataAutoMatchPolicy::Disabled
+            }
+        }
+        Some(_) => MetadataAutoMatchPolicy::UseLibrarySetting,
+        None => MetadataAutoMatchPolicy::Disabled,
+    }
+}
+
+async fn resolve_local_metadata_auto_match_policy(
+    database: &Database,
+    trigger: LocalMetadataCompletenessTrigger<'_>,
+) -> Result<MetadataAutoMatchPolicy, String> {
+    match trigger {
+        LocalMetadataCompletenessTrigger::LibrarySetting => {
+            Ok(MetadataAutoMatchPolicy::UseLibrarySetting)
+        }
+        LocalMetadataCompletenessTrigger::ScanJob(scan_job_id) => {
+            let job = database
+                .find_scan_job(scan_job_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(metadata_auto_match_policy_for_scan_job(job.as_ref()))
+        }
+    }
+}
+
 type PendingLocalMetadataCompletenessCheck = (String, String, Vec<u8>, bool, bool);
 
 const METADATA_FILL_MISSING_AUTO_BATCH_LIMIT: usize = 100;
@@ -3404,7 +3443,7 @@ async fn complete_local_metadata_completeness(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
     metadata_reidentify: Option<&MetadataReidentifyService>,
-    scan_job_id: Option<&str>,
+    trigger: LocalMetadataCompletenessTrigger<'_>,
     source_identities: &[(String, String)],
     excluded_item_ids: &[String],
     user_events: &UserEventHub,
@@ -3427,7 +3466,7 @@ async fn complete_local_metadata_completeness(
         database,
         selection,
         metadata_reidentify,
-        scan_job_id,
+        trigger,
         &item_ids,
         user_events,
     )
@@ -3438,26 +3477,14 @@ async fn complete_local_metadata_completeness_for_item_ids(
     database: &Database,
     selection: Option<&MetadataSelectionService>,
     metadata_reidentify: Option<&MetadataReidentifyService>,
-    scan_job_id: Option<&str>,
+    trigger: LocalMetadataCompletenessTrigger<'_>,
     item_ids: &[String],
     user_events: &UserEventHub,
 ) -> Result<(), String> {
     let Some(selection) = selection else {
         return Ok(());
     };
-    let auto_match_policy_override = if let Some(scan_job_id) = scan_job_id {
-        match database
-            .find_scan_job(scan_job_id)
-            .await
-            .map_err(|error| error.to_string())?
-        {
-            Some(job) if job.job_type == "INCREMENTAL_SCAN" => Some(job.auto_metadata_match),
-            Some(_) => None,
-            None => Some(false),
-        }
-    } else {
-        None
-    };
+    let auto_match_policy = resolve_local_metadata_auto_match_policy(database, trigger).await?;
     let metadata_by_item = database
         .list_active_media_item_metadata_with_libraries(item_ids)
         .await
@@ -3475,7 +3502,7 @@ async fn complete_local_metadata_completeness_for_item_ids(
         .await
         .map_err(|error| error.to_string())?;
     let scraper_check_item_ids =
-        if auto_match_policy_override != Some(false) && metadata_reidentify.is_some() {
+        if auto_match_policy.allows_scraper_lookup() && metadata_reidentify.is_some() {
             item_ids
                 .iter()
                 .filter(|item_id| {
@@ -3513,7 +3540,7 @@ async fn complete_local_metadata_completeness_for_item_ids(
             continue;
         };
         let eligible_for_fill_missing = if plan.has_requestable_capability
-            && auto_match_policy_override != Some(false)
+            && auto_match_policy.allows_scraper_lookup()
         {
             if metadata_reidentify.is_some() {
                 if let Some(error) = scraper_availability_error.as_deref() {
@@ -3604,7 +3631,7 @@ async fn complete_local_metadata_completeness_for_item_ids(
                         &library_id,
                         &batch_results,
                         &eligible_chunk,
-                        auto_match_policy_override,
+                        auto_match_policy,
                     )
                     .await;
                 let completion = match completion {
@@ -9319,7 +9346,7 @@ impl ScanJobService {
                                         &database,
                                         metadata_selection.as_ref(),
                                         metadata_reidentify.as_ref(),
-                                        Some(&worker_job_id),
+                                        LocalMetadataCompletenessTrigger::ScanJob(&worker_job_id),
                                         &report.locally_enriched_item_ids,
                                         &user_events,
                                     )
@@ -12044,10 +12071,10 @@ mod tests {
         classify_mixed_file, configured_scan_concurrency, infer_sibling_movie_variant_suffix,
         infer_sibling_movie_variant_suffix_with_probe, is_lite_manifest_discovery,
         manifest_file_observation_matches, manifest_root_identity_matches, media_source_folder,
-        merge_movie_provider_ids, newly_confirmed_fill_missing_item_ids,
-        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
-        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
-        safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
+        merge_movie_provider_ids, metadata_auto_match_policy_for_scan_job,
+        newly_confirmed_fill_missing_item_ids, normalize_incremental_path, parse_episode_filename,
+        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
+        read_strm_target, safe_scan_activity_label, stat_manifest_directory_file_batch_sync,
         stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
@@ -12056,7 +12083,9 @@ mod tests {
         ScraperMetadata, ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest,
         ScraperSearchResponse, ScraperTrailersResponse,
     };
-    use crate::storage::NewItemMetadataCompletenessResult;
+    use crate::storage::{
+        MetadataAutoMatchPolicy, NewItemMetadataCompletenessResult, StoredScanJob,
+    };
     use tokio::sync::{Notify, Semaphore};
 
     #[derive(Clone)]
@@ -12310,6 +12339,55 @@ mod tests {
         assert_eq!(configured_scan_concurrency(Some(8), Some(4), 16), 8);
         assert_eq!(configured_scan_concurrency(None, Some(4), 16), 4);
         assert_eq!(configured_scan_concurrency(None, None, 16), 16);
+    }
+
+    fn stored_scan_job(job_type: &str, auto_metadata_match: bool) -> StoredScanJob {
+        StoredScanJob {
+            id: "scan-job".to_owned(),
+            library_id: "library".to_owned(),
+            job_type: job_type.to_owned(),
+            status: "RUNNING".to_owned(),
+            generation: "generation".to_owned(),
+            cursor: None,
+            processed_count: 0,
+            total_count: 0,
+            cancel_requested: false,
+            error: None,
+            created_at: 0,
+            started_at: None,
+            finished_at: None,
+            discovery_completed: false,
+            auto_metadata_match,
+            current_item: None,
+            scan_phase: "INDEXING".to_owned(),
+        }
+    }
+
+    #[test]
+    fn metadata_completeness_policy_is_explicit_for_scan_triggers() {
+        let incremental_disabled = stored_scan_job("INCREMENTAL_SCAN", false);
+        let incremental_enabled = stored_scan_job("INCREMENTAL_SCAN", true);
+        let full_scan = stored_scan_job("RECONCILE_LIBRARY", false);
+
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(Some(&incremental_disabled)),
+            MetadataAutoMatchPolicy::Disabled
+        );
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(Some(&incremental_enabled)),
+            MetadataAutoMatchPolicy::Enabled
+        );
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(Some(&full_scan)),
+            MetadataAutoMatchPolicy::UseLibrarySetting
+        );
+        assert_eq!(
+            metadata_auto_match_policy_for_scan_job(None),
+            MetadataAutoMatchPolicy::Disabled
+        );
+        assert!(!MetadataAutoMatchPolicy::Disabled.allows_scraper_lookup());
+        assert!(MetadataAutoMatchPolicy::UseLibrarySetting.allows_scraper_lookup());
+        assert!(MetadataAutoMatchPolicy::Enabled.allows_scraper_lookup());
     }
 
     #[tokio::test]

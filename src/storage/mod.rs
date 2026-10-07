@@ -1,5 +1,18 @@
 mod repository;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MetadataAutoMatchPolicy {
+    UseLibrarySetting,
+    Enabled,
+    Disabled,
+}
+
+impl MetadataAutoMatchPolicy {
+    pub(crate) const fn allows_scraper_lookup(self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+}
+
 #[allow(dead_code)] // Scanner jobs build these values after evaluating local metadata.
 pub(crate) struct NewItemMetadataCompletenessResult<'a> {
     pub(crate) item_id: &'a str,

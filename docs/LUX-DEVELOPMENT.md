@@ -8639,6 +8639,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-07）：补缺分配只查询 `total_count < 100` 的 queued job，按创建顺序复用，并将候选上限限制为待分配 item 数；PostgreSQL 查询额外锁定候选 job 行，SQLite 继续依赖现有写事务。SQLite 回归先确认旧逻辑在 `100/100/50` 后追加 item 会多建 job，再验证后续有 1 项容量时保持 3 个 job、追加 80 项后分布为 `100/100/100/31`，331 个 item 均入队。`fill_missing_job_creation` 两项、build、fmt、全目标全 feature Clippy 和差异检查通过。未连接 PostgreSQL，也未测量 FNOS CPU 或生产 job 创建率。
 
+#### LUX-404：显式表达扫描完整度补缺策略
+
+范围：扫描完整度流程用 `Option<bool>` 表达是否覆盖媒体库策略，并用 `Option<&str>` 隐含区分扫描任务与后台回填。改为显式 trigger 与策略类型：全量扫描/无任务的后台回填沿用媒体库“新扫描缺失补全”设置；实时增量按任务的 `auto_metadata_match`；已删除或找不到的扫描任务禁用在线补缺。禁用策略不得探测刮削器。保持现有配置语义、API、数据库 schema 和任务状态不变。
+
+验收：
+
+- [x] 完整度 trigger 和解析后的补缺策略均使用具名 enum，不再通过可空任务 ID/布尔值组合隐式表达策略。
+- [x] 回归覆盖全量/后台回填、增量开关开启/关闭、任务不存在及禁用时不探测刮削器；现有媒体库设置读写语义不变。
+- [x] 定向 scanner/storage 测试、build、fmt、全目标全 feature Clippy 和差异检查通过；不新增数据库/API 变化，也不据此宣称 CPU 收益。
+
+预计文件：`src/application/scanner.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先检查现有策略边界测试，再引入类型并保留同一套状态断言。
+
+结果（2026-10-07）：补缺调用现在显式区分 `ScanJob` 与 `LibrarySetting` trigger，并解析成 `UseLibrarySetting`、`Enabled` 或 `Disabled` 策略；存储入口同样接收具名策略类型。全量任务和后台回填继续读取库级新扫描设置，增量扫描继续服从任务开关，已删除任务禁用在线探测。策略单测和 `progressive_scan_metadata_dispatch_is_atomic_and_deduplicated` 通过；build、fmt、全目标全 feature Clippy 和差异检查通过。没有 schema/API 变化，也未据此推断 FNOS CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

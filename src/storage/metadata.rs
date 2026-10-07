@@ -1,7 +1,7 @@
 use super::*;
 use crate::storage::{
-    ItemMetadataCompletenessCommit, MetadataFillMissingRequest, NewItemMetadataCompletenessCheck,
-    NewItemMetadataCompletenessResult,
+    ItemMetadataCompletenessCommit, MetadataAutoMatchPolicy, MetadataFillMissingRequest,
+    NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult,
 };
 use std::collections::BTreeSet;
 
@@ -173,7 +173,7 @@ impl Database {
             library_id,
             results,
             eligible_fill_missing_item_ids,
-            None,
+            MetadataAutoMatchPolicy::UseLibrarySetting,
         )
         .await
     }
@@ -183,7 +183,7 @@ impl Database {
         library_id: &str,
         results: &[NewItemMetadataCompletenessResult<'_>],
         eligible_fill_missing_item_ids: &[String],
-        auto_match_policy_override: Option<bool>,
+        auto_match_policy: MetadataAutoMatchPolicy,
     ) -> Result<ItemMetadataCompletenessCommit, StorageError> {
         if library_id.trim().is_empty() || eligible_fill_missing_item_ids.len() > 256 {
             return Err(StorageError::Conflict(
@@ -317,20 +317,22 @@ impl Database {
             }
         }
 
-        let auto_match_enabled = if let Some(override_enabled) = auto_match_policy_override {
-            override_enabled
-        } else {
-            self.query_scalar::<i64>(
-                "SELECT scan_missing_metadata_auto_match_enabled
-                 FROM libraries WHERE id = ?",
-            )
-            .bind(library_id)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })? != 0
+        let auto_match_enabled = match auto_match_policy {
+            MetadataAutoMatchPolicy::Enabled => true,
+            MetadataAutoMatchPolicy::Disabled => false,
+            MetadataAutoMatchPolicy::UseLibrarySetting => {
+                self.query_scalar::<i64>(
+                    "SELECT scan_missing_metadata_auto_match_enabled
+                     FROM libraries WHERE id = ?",
+                )
+                .bind(library_id)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })? != 0
+            }
         };
         if auto_match_enabled {
             for ids in eligible_ids.chunks(100) {
