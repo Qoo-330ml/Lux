@@ -8610,6 +8610,8 @@ impl Database {
         }
         let mut active_by_item = HashMap::with_capacity(requests.len());
         let mut deferred_by_snapshot = HashMap::with_capacity(requests.len());
+        let mut deferred_snapshots_by_item =
+            HashMap::<String, Vec<(Option<Vec<u8>>, String)>>::new();
         let lock_clause = if self.backend == DatabaseBackend::Postgres {
             " FOR UPDATE OF jobs, job_items"
         } else {
@@ -8626,7 +8628,7 @@ impl Database {
                 .iter()
                 .map(|request| {
                     if request.input_fingerprint.is_some() {
-                        "(job_items.item_id = ? AND job_items.request_fingerprint = ? AND job_items.request_capabilities_json = ?)"
+                        "(job_items.item_id = ? AND job_items.request_fingerprint IS NOT NULL)"
                     } else {
                         "(jobs.updated_at >= unixepoch() - 3600 AND job_items.item_id = ? AND job_items.request_fingerprint IS NULL AND job_items.request_capabilities_json = ?)"
                     }
@@ -8703,9 +8705,7 @@ impl Database {
             }
             for request in batch {
                 statement = statement.bind(&request.item_id);
-                if let Some(fingerprint) = &request.input_fingerprint {
-                    statement = statement.bind(fingerprint).bind(&request.capabilities_json);
-                } else {
+                if request.input_fingerprint.is_none() {
                     statement = statement.bind(&request.capabilities_json);
                 }
             }
@@ -8723,24 +8723,32 @@ impl Database {
                 if job_status == "DEFERRED" {
                     let fingerprint: Option<Vec<u8>> = row.get("request_fingerprint");
                     let capabilities: String = row.get("request_capabilities_json");
+                    let snapshot_key = (item_id.clone(), fingerprint.clone(), capabilities.clone());
                     let has_retry_deadline = row.get::<i64, _>("has_retry_deadline") != 0;
                     let retry_pending = row.get::<i64, _>("retry_pending") != 0;
                     let recently_deferred = row.get::<i64, _>("recently_deferred") != 0;
-                    let retry = deferred_by_snapshot
-                        .entry((item_id.clone(), fingerprint, capabilities))
-                        .or_insert(DeferredFillMissingRetryState {
+                    let retry = deferred_by_snapshot.entry(snapshot_key).or_insert(
+                        DeferredFillMissingRetryState {
                             automatic_retry_count: 0,
                             has_retry_deadline: false,
                             retry_pending: false,
                             recently_deferred: false,
                             deferred_job_items: Vec::new(),
-                        });
+                        },
+                    );
                     retry.automatic_retry_count = retry
                         .automatic_retry_count
                         .max(row.get("automatic_retry_count"));
                     retry.has_retry_deadline |= has_retry_deadline;
                     retry.retry_pending |= retry_pending;
                     retry.recently_deferred |= recently_deferred;
+                    let snapshots = deferred_snapshots_by_item
+                        .entry(item_id.clone())
+                        .or_default();
+                    let snapshot = (fingerprint, capabilities);
+                    if !snapshots.contains(&snapshot) {
+                        snapshots.push(snapshot);
+                    }
                     retry.deferred_job_items.push((job_id, item_id));
                     continue;
                 }
@@ -8761,6 +8769,26 @@ impl Database {
         let mut remaining = Vec::new();
         let mut consumed_deferred_retry_job_items = Vec::new();
         for request in requests {
+            if request.input_fingerprint.is_some()
+                && let Some(snapshots) = deferred_snapshots_by_item.get(&request.item_id)
+            {
+                for (fingerprint, capabilities) in snapshots {
+                    let matches_request = fingerprint.as_deref()
+                        == request.input_fingerprint.as_deref()
+                        && capabilities == &request.capabilities_json;
+                    if matches_request {
+                        continue;
+                    }
+                    if let Some(deferred) = deferred_by_snapshot.get(&(
+                        request.item_id.clone(),
+                        fingerprint.clone(),
+                        capabilities.clone(),
+                    )) {
+                        consumed_deferred_retry_job_items
+                            .extend(deferred.deferred_job_items.iter().cloned());
+                    }
+                }
+            }
             if let Some(active_item) = active_by_item.get(&request.item_id) {
                 let matches_snapshot = active_item.request_fingerprint.as_deref()
                     == request.input_fingerprint.as_deref()

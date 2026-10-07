@@ -4346,11 +4346,20 @@ async fn changed_fill_request_is_not_deduplicated_by_recent_provider_deferral()
     .bind(item_id)
     .execute(database.pool())
     .await?;
-
     let same_snapshot = database
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.into()])
         .await?;
     assert!(same_snapshot.scheduled_job_ids.is_empty());
+
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
 
     let changed_fingerprint = b"deferred-input-v2";
     assert!(
@@ -4379,6 +4388,53 @@ async fn changed_fill_request_is_not_deduplicated_by_recent_provider_deferral()
         .await?;
     assert_eq!(changed.scheduled_job_ids.len(), 1);
     assert_ne!(changed.scheduled_job_ids[0], *first_job_id);
+
+    let changed_job_id = &changed.scheduled_job_ids[0];
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items SET status = 'COMPLETED'
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(changed_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'COMPLETED', processed_count = total_count
+         WHERE id = ?",
+    )
+    .bind(changed_job_id)
+    .execute(database.pool())
+    .await?;
+
+    let old_retry_consumed: i64 = database
+        .query_scalar(
+            "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+             WHERE job_id = ? AND item_id = ?",
+        )
+        .bind(first_job_id)
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        old_retry_consumed, 1,
+        "the newer fingerprint supersedes the old provider failure"
+    );
+    let (_, due_retries) = database
+        .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+            &[NewItemMetadataCompletenessCheck {
+                item_id,
+                capability: "POSTER",
+                input_fingerprint: changed_fingerprint,
+            }],
+            &library_id,
+            &[item_id.to_owned()],
+        )
+        .await?;
+    assert!(
+        due_retries.is_empty(),
+        "an obsolete fingerprint must not keep unlocking the completed newer request"
+    );
     Ok(())
 }
 
@@ -4400,6 +4456,209 @@ async fn fail_fill_missing_job_with_unavailable_provider(
     database
         .finish_metadata_reidentify_job(job_id, "DEFERRED", Some("DEFERRED_PROVIDER_UNAVAILABLE"))
         .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_changed_fill_request_consumes_obsolete_provider_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let connection = PostgresConnection {
+        database: database_name.clone(),
+        ..admin_connection
+    };
+    let database =
+        Database::connect_with_configuration(&config, &DatabaseConfiguration::Postgres(connection))
+            .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Postgres obsolete failure", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        database
+            .query("UPDATE libraries SET scan_missing_metadata_auto_match_enabled = 1 WHERE id = ?")
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        let item_id = "postgres-obsolete-fill-failure";
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+
+        let old_fingerprint = b"postgres-obsolete-input-v1";
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "POSTER", old_fingerprint)
+                .await?
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "POSTER", old_fingerprint)
+                .await?
+        );
+        let old_result = [NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: old_fingerprint,
+            is_missing: true,
+            checked_at: 10,
+        }];
+        let old_dispatch = database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &old_result,
+                &[item_id.into()],
+            )
+            .await?;
+        let old_job_id = old_dispatch
+            .scheduled_job_ids
+            .first()
+            .ok_or("expected old fill-missing job")?
+            .clone();
+        fail_fill_missing_job_with_unavailable_provider(&database, &old_job_id, item_id).await?;
+        database
+            .query(
+                "UPDATE metadata_reidentify_job_items
+                 SET automatic_retry_after = unixepoch() - 1
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(&old_job_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+
+        let new_fingerprint = b"postgres-obsolete-input-v2";
+        assert!(
+            database
+                .prepare_item_metadata_completeness_check(item_id, "POSTER", new_fingerprint)
+                .await?
+        );
+        assert!(
+            database
+                .claim_item_metadata_completeness_check(item_id, "POSTER", new_fingerprint)
+                .await?
+        );
+        let new_result = [NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: new_fingerprint,
+            is_missing: true,
+            checked_at: 11,
+        }];
+        let new_dispatch = database
+            .complete_local_metadata_and_enqueue_fill_missing(
+                &library_id,
+                &new_result,
+                &[item_id.into()],
+            )
+            .await?;
+        let new_job_id = new_dispatch
+            .scheduled_job_ids
+            .first()
+            .ok_or("expected new fill-missing job")?
+            .clone();
+        assert_ne!(new_job_id, old_job_id);
+        assert_eq!(
+            database
+                .query_scalar::<i64>(
+                    "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                     WHERE job_id = ? AND item_id = ?",
+                )
+                .bind(&old_job_id)
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?,
+            1,
+            "the newer fingerprint supersedes the old provider failure"
+        );
+
+        database
+            .query(
+                "UPDATE metadata_reidentify_job_items SET status = 'COMPLETED'
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(&new_job_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "UPDATE metadata_reidentify_jobs
+                 SET status = 'COMPLETED', processed_count = total_count
+                 WHERE id = ?",
+            )
+            .bind(&new_job_id)
+            .execute(database.pool())
+            .await?;
+
+        let (_, due_retries) = database
+            .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
+                &[NewItemMetadataCompletenessCheck {
+                    item_id,
+                    capability: "POSTER",
+                    input_fingerprint: new_fingerprint,
+                }],
+                &library_id,
+                &[item_id.to_owned()],
+            )
+            .await?;
+        assert!(
+            due_retries.is_empty(),
+            "an obsolete fingerprint must not unlock the completed newer request"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
     Ok(())
 }
 

@@ -8600,7 +8600,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] 新的不同 fingerprint 或 capability set 不被近期 DEFERRED item 错误去重；相同快照仍去重，queued job 合并仍有界。
 - [x] 请求在 item RUNNING 期间变化时，当前 worker 结束后该 item 回到 PENDING 并使用最新快照复跑；同一输入重复请求不触发复跑或并发重复 worker。
 - [x] 取消、重试、worker 异常恢复和非 FILL_MISSING job 状态/计数语义保持正确，任务 API DTO 不变。
-- [ ] SQLite 状态机回归、migration-from-empty 与 build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同经可用的集成目标验证。
+- [x] SQLite 状态机回归、migration-from-empty 与 build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同经可用的集成目标验证。
 
 短计划与文件：先在 `src/storage/repository_tests.rs` 为 RUNNING item 收到新 fingerprint/capability 后仍需处理新意图写失败回归；新增 `migrations/0164_metadata_fill_request_snapshots.sql` 与 `migrations-postgres/0164_metadata_fill_request_snapshots.sql`；实现涉及 `src/storage/mod.rs`、`src/storage/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository_tests.rs`，以及 schema version 断言和迁移序列检查；最后更新本任务记录、`docs/PERFORMANCE.md` 与 `docs/LUX-FILL-MISSING-OPTIMIZATION-PLAN.md`。只处理自动 FILL_MISSING 请求快照，不扩展到其他 metadata 模式。
 
@@ -8610,13 +8610,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-402：provider 不可用时对自动 FILL_MISSING 进行逐 item 退避
 
-范围：当前自动 `FILL_MISSING` 在 scraper/provider 不可用后将 job 置为 `DEFERRED`，并只依赖固定一小时去重窗口。对于持续不可用的 provider，周期扫描可能每小时再次创建相同 item 请求。为带自动请求快照的 job item 持久化退避次数、下次自动重试时间和到期记录是否已用于一次重试；同一 fingerprint/capability 快照在到期前去重，到期后由后续自动扫描重试一次，避免已完成的重试继续被旧失败记录触发。退避依次为 5 分钟、30 分钟、最多 6 小时。新请求快照不继承旧快照的退避；无快照的人工 job 不改变现有语义。管理员显式重试立即解除等待、清除已消费标记并保留自动失败次数；取消任务不增加次数。
+范围：当前自动 `FILL_MISSING` 在 scraper/provider 不可用后将 job 置为 `DEFERRED`，并只依赖固定一小时去重窗口。对于持续不可用的 provider，周期扫描可能每小时再次创建相同 item 请求。为带自动请求快照的 job item 持久化退避次数、下次自动重试时间和到期记录是否已用于一次重试；同一 fingerprint/capability 快照在到期前去重，到期后由后续自动扫描重试一次，避免已完成的重试继续被旧失败记录触发。被新 fingerprint 或 capability 取代的旧失败快照也要消费，避免旧到期记录在新请求成功后再次解锁该 item。退避依次为 5 分钟、30 分钟、最多 6 小时。新请求快照不继承旧快照的退避；无快照的人工 job 不改变现有语义。管理员显式重试立即解除等待、清除已消费标记并保留自动失败次数；取消任务不增加次数。
 
 验收：
 
 - [x] SQLite/PostgreSQL migration 增加自动退避次数、到期时间和一次性消费标记；旧的自动 `DEFERRED/SCRAPER_UNAVAILABLE` 且带请求快照的 item 升级后有安全的首次到期时间，历史任务状态和计数不变。
 - [x] 同一请求快照在到期前不创建新 job；到期后可创建新 job，并继承该快照此前的失败次数。
 - [x] 到期重试派发后旧失败记录不再重复触发自动重试；管理员手动重试会重新启用该记录的自动退避。
+- [x] 新 fingerprint/capability 替代旧请求后，旧 provider 失败记录被消费，不会在新请求成功后再次解锁同一 item。
 - [x] 连续 provider 失败按 5 分钟、30 分钟、最多 6 小时退避；新 fingerprint/capability 不等待旧快照；人工 retry 可立即领取。
 - [x] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
 - [x] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在 PostgreSQL 16 集成环境通过。
@@ -8629,7 +8630,9 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 补充审查结果（2026-10-07）：SQLite 回归复现到期重试完成后，旧 `DEFERRED/SCRAPER_UNAVAILABLE` 记录仍会触发后续自动入队。未发布的 0165 增加默认关闭的一次性消费标记；派发到期重试时在同一事务内批量消费旧失败记录，完整度扫描与补缺任务去重忽略已消费记录。手动 retry 和新请求快照会重置标记。SQLite 状态机和迁移回归通过，PostgreSQL progressive-scan storage contract 覆盖相同的成功重试路径；FNOS 当前仍在 schema 164，尚未应用该 migration。
 
-最终验证（2026-10-07）：新增消费标记后的 `cargo test --locked --all-targets --no-fail-fast` 库测试为 747 passed、0 failed、11 ignored；集成目标仅 `emby_counts`（实际 1、期望 0）和 `strm`（401、期望 200）失败，两项此前均在干净 `origin/test=8412cc2a` 上独立复现。`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81、PostgreSQL 16 集成用例 16/16 通过；`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。开发机为 `arm64`；FNOS 仍未部署此分支，不能据此声称生产 CPU 已下降。
+最终验证复核（2026-10-07）：加入旧快照被替代的回归后，`cargo test --locked --all-targets --no-fail-fast` 单测为 747 passed、0 failed、12 ignored。集成目标中 `emby_counts`（实际 1、期望 0）和 `strm`（401、期望 200）失败；两项此前均在干净 `origin/test=8412cc2a` 上独立复现。`libraries_api` 有一项在全套运行中短暂返回 `DATABASE_UNAVAILABLE`，随后该用例单独运行通过，整个 `libraries_api` 目标也 13/13 通过。`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81、`cargo test --locked --lib fill_missing` 19/19、SQLite 旧快照回归 1/1 和独立 PostgreSQL 旧快照回归 1/1 通过；`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。开发机为 `arm64`；FNOS 仍未部署此分支，不能据此声称生产 CPU 已下降。
+
+补充代码审查（2026-10-07）：新快照不再被旧 deferred 失败阻止，但原实现只消费完全相同快照的到期记录。新增 SQLite 与 PostgreSQL 回归，覆盖旧失败已到期、fingerprint 改变、新请求成功后不得再次被旧记录解锁；自动请求查询按当前批次的 item ID 读取未消费自动失败快照，并在同一事务消费被替代的旧失败。定向状态机与 PostgreSQL progressive-scan contract 通过；FNOS 当前仍在 schema 164，尚未验证生产效果。
 
 #### LUX-403：复用有空位的 queued FILL_MISSING job
 

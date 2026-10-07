@@ -71,7 +71,7 @@
 
 `item_metadata_completeness.retry_after` 只控制本地 completeness 检查失败后的重新领取，不代表在线 provider 的退避。自动 `FILL_MISSING` 的 provider 不可用结果保存在 `metadata_reidentify_job_items.error='SCRAPER_UNAVAILABLE'`，当前仅通过 `DEFERRED` job 的一小时窗口去重；持续不可用时，后续扫描会再次创建相同请求。能力级 scraper attempt 也不能替代 job 级退避，因为尚未获得 provider identity 或 scraper 服务整体不可用时没有可用的能力 attempt key。
 
-已实现（LUX-402，本地未部署）：双后端 job item migration 增加自动失败次数、截止时间和一次性消费标记。同一 fingerprint/capability 在 5 分钟、30 分钟、最多 6 小时的退避期内合并/去重；到期后由下一次自动扫描重试，并将次数延续到新 job。派发重试时在同一事务中批量消费旧到期失败记录，防止重试完成后由历史记录再次解锁；手动 retry 和新请求快照会清除消费标记。输入快照变化不继承旧退避；无快照人工 job 不改变原有一小时去重语义。迁移只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却。一次有界 SQL 读取同时检查活动任务与匹配的历史 provider 失败；只有实际派发到期重试时才执行一次有界批量更新。SQLite 状态机、迁移和 PostgreSQL storage contract 覆盖成功重试与手动 retry；build/fmt/Clippy 和定向测试已验证。全目标结果及两个在干净基线复现的集成失败详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-402 结果。未部署 FNOS，不能据此宣称生产 CPU 降幅。
+已实现（LUX-402，本地未部署）：双后端 job item migration 增加自动失败次数、截止时间和一次性消费标记。同一 fingerprint/capability 在 5 分钟、30 分钟、最多 6 小时的退避期内合并/去重；到期后由下一次自动扫描重试，并将次数延续到新 job。派发重试时在同一事务中批量消费旧到期失败记录，防止重试完成后由历史记录再次解锁；当新的 fingerprint/capability 取代旧快照时，也在新请求提交时消费旧 provider 失败，防止旧快照反复唤醒新请求。手动 retry 和新请求快照会清除消费标记。输入快照变化不继承旧退避；无快照人工 job 不改变原有一小时去重语义。迁移只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却。一次有界 SQL 读取同时检查活动任务与匹配的历史 provider 失败；只有到期重试派发或 superseded failure 被发现时才执行有界批量更新。SQLite 状态机、迁移和 PostgreSQL storage contract 覆盖成功重试、手动 retry 与旧快照替代；build/fmt/Clippy 和定向测试已验证。全目标结果及两个在干净基线复现的集成失败详见 `docs/LUX-DEVELOPMENT.md` 的 LUX-402 结果。未部署 FNOS，不能据此宣称生产 CPU 降幅。
 
 验收：持续 provider 不可用时同一输入按有界退避重试且不在冷却期重复创建 job；新 capability、fingerprint 和人工 retry 不被旧请求退避误伤。
 
@@ -179,6 +179,8 @@
 预部署现场基线（2026-10-07 13:33–13:40，FNOS `192.168.10.50`，只读采样）：运行镜像 `pdzhou/lux:test` 标记 revision `8412cc2a`，`/health/ready` 报告版本 `0.5.19`、schema 164；本地优化分支及 migration 0165 尚未部署。容器环境 `LUX_SCAN_CONCURRENCY=2`；8 个库保存值为 2、1 个库保存值为 32，但全局环境覆盖优先于库设置。采样窗口没有 PENDING/RUNNING 扫描 job，也没有最近 10 分钟新建的扫描或 metadata job；有一个旧 `FILL_MISSING` job 仍在运行，5,042 项中 processed_count 从 4,164 增至 4,361，13:39 时项目状态为 COMPLETED 4,123、FAILED 238、PENDING 680、RUNNING 1。Docker 单核口径 CPU 快照中 Lux 为 6.53%–44.52%、PostgreSQL 为 9.56%–238.59%；主机有 12 个逻辑核，13:39 单次 `top` 报告 89.7% idle。`pg_stat_activity` 快照未见 Lock 等待；`pg_stat_statements` 未安装，PostgreSQL statement logging 关闭，因此不能从该采样归因到具体 SQL。该数据是部署前短时基线，不代表稳定均值或改动后的 CPU 收益。
 
 后续只读采样（2026-10-07 15:20，FNOS `192.168.10.50`）：容器仍运行 revision `8412cc2a`、schema 164；该时刻 Docker 单次 CPU 快照 Lux 1.15%、PostgreSQL 4.63%，`FILL_MISSING` 没有 QUEUED/RUNNING job，最近 30 分钟没有新建 metadata job。历史记录仍有 14,381 个未请求取消的 DEFERRED `FILL_MISSING` job，包含 335,965 条 `SCRAPER_UNAVAILABLE` 失败 item、7,566 个不同 item；这些失败行均没有 LUX-401 请求快照，因此不会由 0165 的自动退避兼容路径批量唤醒。对当前完整度仍标记缺失、媒体库自动匹配开启且带请求快照的失败项计数为 0。该 CPU 值只是空闲时的单点快照，不能证明负载趋势或本地修复效果；分支仍未部署。
+
+现场复查（2026-10-07 15:29–15:31，FNOS `192.168.10.50`）：`/health/ready` 正常，仍为 revision `8412cc2a`、schema 164；扫描并发环境变量仍为 2。Docker CPU 单核口径从 Lux/PostgreSQL 2.73%/37.45% 波动到 7.56%/78.44%，约 7 秒后降到 1.01%/0.35%，再过 8 秒为 4.36%/2.01%，表明是短时尖峰而非持续高位。同期数据库快照未见排队/运行 metadata item，过去 10 分钟未见新建 metadata job；16 个 Lux PostgreSQL client connection 均为空闲，采样时只有诊断查询自身处于 active，未见锁等待。历史未取消 DEFERRED `FILL_MISSING` 为 14,389 个 job、335,965 个 `SCRAPER_UNAVAILABLE` item；`pg_stat_statements` 未安装，无法归因尖峰 SQL。该采样不能证明本地分支优化收益，生产仍运行旧 revision。
 
 ## 不在本次方案内
 
