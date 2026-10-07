@@ -21,7 +21,7 @@ use crate::{
     domain::ids::LibraryId,
     storage::{
         Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
-        StoredMediaMetadata, StoredMediaSourcePath, StoredScanLocalMetadataSource,
+        StoredItemImage, StoredMediaMetadata, StoredMediaSourcePath, StoredScanLocalMetadataSource,
         StoredSeriesMetadataSource,
     },
 };
@@ -1521,6 +1521,8 @@ impl MetadataEnricher {
     ) -> Result<(), MetadataError> {
         let process_images = mode.process_images();
         let process_nfo = mode.process_nfo();
+        let mut image_candidates = Vec::new();
+        let mut queued_image_items = HashSet::new();
         for source in sources {
             report.items_processed += 1;
             let root = PathBuf::from(&source.root_path);
@@ -1572,19 +1574,9 @@ impl MetadataEnricher {
                     .await;
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
-                    match self
-                        .index_images(&source.series_id, find_series_images(series_paths, None))
-                        .await
-                    {
-                        Ok(images_found) => report.images_found += images_found,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %source.series_id,
-                                %error,
-                                "local series images could not be indexed"
-                            );
-                            report.mark_item_error(&source.series_id, &error);
-                        }
+                    let images = find_series_images(series_paths, None);
+                    if !images.is_empty() && queued_image_items.insert(source.series_id.clone()) {
+                        image_candidates.push((source.series_id.clone(), images));
                     }
                 }
                 if let Some(last_series_id) = context.last_series_id.as_mut() {
@@ -1652,22 +1644,9 @@ impl MetadataEnricher {
                     .await;
                 }
                 if process_images {
-                    match self
-                        .index_images(
-                            &source.season_id,
-                            find_series_images(&season_paths, Some(season_number)),
-                        )
-                        .await
-                    {
-                        Ok(images_found) => report.images_found += images_found,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %source.season_id,
-                                %error,
-                                "local season images could not be indexed"
-                            );
-                            report.mark_item_error(&source.season_id, &error);
-                        }
+                    let images = find_series_images(&season_paths, Some(season_number));
+                    if !images.is_empty() && queued_image_items.insert(source.season_id.clone()) {
+                        image_candidates.push((source.season_id.clone(), images));
                     }
                 }
                 if let Some(last_season_id) = context.last_season_id.as_mut() {
@@ -1706,22 +1685,9 @@ impl MetadataEnricher {
                     .await;
                 }
                 if process_images {
-                    match self
-                        .index_images(
-                            &source.episode_id,
-                            find_episode_images(&season_paths, &media_path),
-                        )
-                        .await
-                    {
-                        Ok(images_found) => report.images_found += images_found,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %source.episode_id,
-                                %error,
-                                "local episode images could not be indexed"
-                            );
-                            report.mark_item_error(&source.episode_id, &error);
-                        }
+                    let images = find_episode_images(&season_paths, &media_path);
+                    if !images.is_empty() && queued_image_items.insert(source.episode_id.clone()) {
+                        image_candidates.push((source.episode_id.clone(), images));
                     }
                 }
                 if let Some(last_episode_id) = context.last_episode_id.as_mut() {
@@ -1729,6 +1695,7 @@ impl MetadataEnricher {
                 }
             }
         }
+        self.index_images_batch(image_candidates, report).await;
         Ok(())
     }
 
@@ -2019,62 +1986,142 @@ impl MetadataEnricher {
         Ok(report)
     }
 
+    async fn index_images_batch(
+        &self,
+        candidates: Vec<(String, Vec<LocalImage>)>,
+        report: &mut MetadataReport,
+    ) {
+        for page in candidates.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
+            let item_ids = page
+                .iter()
+                .map(|(item_id, _)| item_id.clone())
+                .collect::<Vec<_>>();
+            let indexed_images = match self.database.list_item_images_by_ids(&item_ids).await {
+                Ok(images) => images,
+                Err(error) => {
+                    tracing::warn!(
+                        item_count = page.len(),
+                        %error,
+                        "local series image page could not read existing images; retrying items individually"
+                    );
+                    self.index_images_individually(page, report).await;
+                    continue;
+                }
+            };
+
+            let mut inserts = Vec::with_capacity(page.len());
+            for (item_id, images) in page {
+                let indexed = indexed_images
+                    .get(item_id)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                inserts
+                    .push(prepare_local_image_batch_item(item_id, images.clone(), indexed).await);
+            }
+
+            match self
+                .database
+                .insert_item_images_batch_at_indices(&inserts)
+                .await
+            {
+                Ok(images_found) => report.images_found += images_found,
+                Err(batch_error) => {
+                    tracing::warn!(
+                        item_count = page.len(),
+                        %batch_error,
+                        "local series image page failed; retrying items individually"
+                    );
+                    self.index_images_individually(page, report).await;
+                }
+            }
+        }
+    }
+
+    async fn index_images_individually(
+        &self,
+        candidates: &[(String, Vec<LocalImage>)],
+        report: &mut MetadataReport,
+    ) {
+        for (item_id, images) in candidates {
+            match self.index_images(item_id, images.clone()).await {
+                Ok(images_found) => report.images_found += images_found,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id,
+                        %error,
+                        "local series images could not be indexed"
+                    );
+                    report.mark_item_error(item_id, &error);
+                }
+            }
+        }
+    }
+
     async fn index_images(
         &self,
         item_id: &str,
         images: Vec<LocalImage>,
     ) -> Result<usize, MetadataError> {
         let indexed_images = self.database.list_item_images(item_id).await?;
-        let images = images
-            .into_iter()
-            .filter(|image| {
-                !(image.image_type == ImageType::Thumb
-                    && indexed_images.iter().any(|indexed| {
-                        indexed.image_type.eq_ignore_ascii_case("FANART")
-                            && Path::new(&indexed.local_path) == image.path
-                    }))
-            })
-            .collect::<Vec<_>>();
-        let has_primary_artwork = images
-            .iter()
-            .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
-        let prepared = prepare_local_images(images).await;
-        let mut image_indexes = BTreeMap::<&'static str, i64>::new();
-        let mut records = Vec::new();
-        for result in prepared {
-            let prepared = match result {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    tracing::warn!(
-                        item_id,
-                        path = %error.path.display(),
-                        error = %error.error,
-                        "local series image could not be read; skipping image"
-                    );
-                    continue;
-                }
-            };
-            let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
-            records.push(ItemImageInsert {
-                image_type: prepared.image.image_type.as_str().to_owned(),
-                image_index,
-                local_path: prepared.image.path.to_string_lossy().into_owned(),
-                file_size: prepared.file_size,
-                width: prepared.dimensions.map(|(width, _)| width),
-                height: prepared.dimensions.map(|(_, height)| height),
-                content_tag: prepared.content_tag,
-                source: "LOCAL".to_owned(),
-                source_url: None,
-            });
-        }
+        let insert = prepare_local_image_batch_item(item_id, images, &indexed_images).await;
         self.database
-            .insert_item_images_batch_at_indices(&[ItemImageBatchInsert {
-                item_id: item_id.to_owned(),
-                images: records,
-                clear_poster_fallback: has_primary_artwork,
-            }])
+            .insert_item_images_batch_at_indices(&[insert])
             .await
             .map_err(MetadataError::Storage)
+    }
+}
+
+async fn prepare_local_image_batch_item(
+    item_id: &str,
+    images: Vec<LocalImage>,
+    indexed_images: &[StoredItemImage],
+) -> ItemImageBatchInsert {
+    let images = images
+        .into_iter()
+        .filter(|image| {
+            !(image.image_type == ImageType::Thumb
+                && indexed_images.iter().any(|indexed| {
+                    indexed.image_type.eq_ignore_ascii_case("FANART")
+                        && Path::new(&indexed.local_path) == image.path
+                }))
+        })
+        .collect::<Vec<_>>();
+    let clear_poster_fallback = images
+        .iter()
+        .any(|image| matches!(image.image_type, ImageType::Poster | ImageType::Thumb));
+    let prepared = prepare_local_images(images).await;
+    let mut image_indexes = BTreeMap::<&'static str, i64>::new();
+    let mut records = Vec::new();
+    for result in prepared {
+        let prepared = match result {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    path = %error.path.display(),
+                    error = %error.error,
+                    "local series image could not be read; skipping image"
+                );
+                continue;
+            }
+        };
+        let image_index = next_local_image_index(&mut image_indexes, prepared.image.image_type);
+        records.push(ItemImageInsert {
+            image_type: prepared.image.image_type.as_str().to_owned(),
+            image_index,
+            local_path: prepared.image.path.to_string_lossy().into_owned(),
+            file_size: prepared.file_size,
+            width: prepared.dimensions.map(|(width, _)| width),
+            height: prepared.dimensions.map(|(_, height)| height),
+            content_tag: prepared.content_tag,
+            source: "LOCAL".to_owned(),
+            source_url: None,
+        });
+    }
+    ItemImageBatchInsert {
+        item_id: item_id.to_owned(),
+        images: records,
+        clear_poster_fallback,
     }
 }
 
@@ -2469,6 +2516,138 @@ mod tests {
         let recovery_report = enricher.enrich_movie_library(library.id).await?;
         assert_eq!(recovery_report.images_found, 1);
         assert!(recovery_report.failed_item_ids.contains(&blocked_item_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_library_image_registration_batches_multiple_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Series");
+        let mut poster_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([255, 0, 0, 255]),
+        ))
+        .write_to(&mut poster_png, image::ImageFormat::Png)?;
+        for (series, episode) in [
+            ("First Show", "First.Show.S01E01"),
+            ("Second Show", "Second.Show.S01E01"),
+        ] {
+            let series_dir = media_root.join(series);
+            let season_dir = series_dir.join("Season 01");
+            tokio::fs::create_dir_all(&season_dir).await?;
+            tokio::fs::write(series_dir.join("poster.png"), poster_png.get_ref()).await?;
+            tokio::fs::write(season_dir.join(format!("{episode}.mkv")), b"media").await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Series", crate::library::LibraryKind::Series, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_series_library(library.id)
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone());
+        database.reset_query_count();
+        let report = enricher.enrich_series_library(library.id).await?;
+
+        assert_eq!(report.items_processed, 2);
+        assert_eq!(report.images_found, 2);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "one source page query, one existing-image read, one shared insert, and one fallback update should cover both series"
+        );
+        let images: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT media_items.title, item_images.image_type, item_images.local_path
+             FROM item_images
+             JOIN media_items ON media_items.id = item_images.item_id
+             ORDER BY media_items.title",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(images.len(), 2);
+        assert!(images.iter().all(|(title, image_type, path)| {
+            image_type == "POSTER"
+                && path.ends_with("poster.png")
+                && (title == "First Show" || title == "Second Show")
+        }));
+
+        let first_series_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND title = 'First Show'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        let first_tag_before: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&first_series_id)
+        .fetch_one(database.pool())
+        .await?;
+        let second_tag_before: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images
+             WHERE item_id = (SELECT id FROM media_items WHERE library_id = ? AND title = 'Second Show')
+               AND image_type = 'POSTER'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_one_series_image BEFORE INSERT ON item_images
+             WHEN NEW.item_id = (SELECT id FROM media_items WHERE title = 'First Show')
+             BEGIN SELECT RAISE(ABORT, 'injected series image failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let mut changed_poster = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([0, 0, 255, 255]),
+        ))
+        .write_to(&mut changed_poster, image::ImageFormat::Png)?;
+        for series in ["First Show", "Second Show"] {
+            tokio::fs::write(
+                media_root.join(series).join("poster.png"),
+                changed_poster.get_ref(),
+            )
+            .await?;
+        }
+
+        let recovery_report = enricher.enrich_series_library(library.id).await?;
+        assert_eq!(recovery_report.images_found, 1);
+        assert!(recovery_report.failed_item_ids.contains(&first_series_id));
+        let first_tag_after: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&first_series_id)
+        .fetch_one(database.pool())
+        .await?;
+        let second_tag_after: Option<String> = sqlx::query_scalar(
+            "SELECT content_tag FROM item_images
+             WHERE item_id = (SELECT id FROM media_items WHERE library_id = ? AND title = 'Second Show')
+               AND image_type = 'POSTER'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(first_tag_after, first_tag_before);
+        assert_ne!(second_tag_after, second_tag_before);
         Ok(())
     }
 

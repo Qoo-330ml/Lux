@@ -1527,3 +1527,9 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 固定 SQLite 单电影 fixture 中，probe NFO 首次写回原先分开读取 source/context 与辅助字段，共 4 次 storage query-wrapper 调用；合并 context 后为 3 次，减少 1 次（25%）。修改电影 NFO 的 fixture 也验证单次读取 item type、source、sort title 和 added_at，变化写回总计 3 次调用（context、mirror policy、状态同步）。回归覆盖非电影和软删除条目不注入电影辅助字段，以及既有 sort title/dateadded 输出。
 
 该计数来自应用层 storage query-wrapper，不统计 BEGIN/COMMIT、文件系统时延、SQL 执行时间或数据库往返；未测量墙钟、PostgreSQL、FNOS 或 NAS 性能，也不据此推断生产 CPU 收益。
+
+### LUX-412 普通剧集页图片登记边界
+
+固定 SQLite 两 series fixture（各一个 episode、各有一个 poster）中，逐 item `index_images` 路径执行 11 次 storage query-wrapper 调用；页级读取与最多 16 item 的批登记后执行 4 次，减少 7 次（约 63.6%）。新路径包括 source 页读取、已有图片页读取、图片 upsert 和 poster fallback 清理。trigger 注入首个 series 图片写失败后批事务回滚，再逐 item 重试；第二个 series 更新成功，失败项被单独记录。
+
+该数字来自应用层 query-wrapper 计数，不含 SQL 执行时长或文件系统耗时；不据此推断墙钟、PostgreSQL、FNOS 或 NAS 收益。

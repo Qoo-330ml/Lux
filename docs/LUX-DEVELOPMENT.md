@@ -8763,6 +8763,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：电影 NFO 与 probe 写回复用单次 NFO writeback context 查询；条件投影保留旧辅助字段仅对未软删除 MOVIE 生效的语义，source 选择仍限制为原有媒体类型。固定 SQLite fixture 中 probe 写回由 4 次降为 3 次 storage query-wrapper 调用；变化中的电影 NFO 写回总计 3 次（context、mirror policy、状态同步）。定向 NFO 单测 1/1、`nfo_writer` 26/26、candidate 模块 22/22、候选写回失败回归 1/1、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。查询计数不代表 PostgreSQL、墙钟或 FNOS CPU 收益。
 
+#### LUX-412：批量登记普通剧集 metadata 图片
+
+范围：普通剧集 enrichment 已按页读取 episode source，但 series、season、episode 图片仍通过 `index_images` 逐项读取已有记录并登记新记录。保留 NFO 按条目处理和系列目录读取顺序，将本页实际发现的本地图片按最多 16 个 item 聚合，批量读取已登记图片并复用现有批量写事务。保留 Thumb/Fanart 去重、poster fallback 清理、图片索引顺序和单 item 错误隔离；不增加 episode 并发，不改变扫描 worker 的 claim 与调度流程。
+
+验收：
+
+- [x] 两个 series fixture 的普通 enrichment 共用已有图片页查询与登记事务；固定 SQLite storage query-wrapper 调用数下降，图片归属、类型和报告计数正确。
+- [x] 空图片、NFO-only 模式和批写失败回退保持原有语义；单条失败不阻止同页其他 item 登记。
+- [x] series 图片与 metadata 回归、fmt、library all-features Clippy 和 `git diff --check` 通过；性能记录限定于固定 SQLite fixture。
+
+短计划与文件：只改 `src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先新增两 series/episode fixture 并锁定逐 item 查询调用数，再按 16 item 边界收集图片候选，复用批量既有图读取和图片登记；最后注入单 item 写失败确认错误隔离。
+
+结果（2026-10-08）：普通剧集 enrichment 按最多 16 个 item 收集 series/season/episode 图片候选，既有图查询与登记共用页级 storage 操作；NFO 仍逐条处理。两 series、各一个 episode、每 series 一个 poster 的固定 SQLite fixture 从 11 次降为 4 次 query-wrapper 调用；其中单次批登记事务同时 upsert 两张 poster 并清除 poster fallback。trigger 注入首个 series 写失败后批事务回滚，逐项恢复仍登记第二个 series，并只将失败 series 记录为错误。metadata module 13/13、`scanned_metadata` 16/16、`series_metadata` 3/3、fmt、library all-features Clippy 与 `git diff --check` 通过。此数据只反映 fixture 调用数，不代表 PostgreSQL、墙钟或 FNOS CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
