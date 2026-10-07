@@ -1848,7 +1848,7 @@ services:
     environment:
       LUX_HTTP_ADDR: "0.0.0.0:8097"
       LUX_CONFIG_DIR: "/config"
-      LUX_SCAN_CONCURRENCY: "8"
+      LUX_SCAN_CONCURRENCY: "2"
       LUX_PROBE_CONCURRENCY: "8"
       LUX_FFMPEG_CONCURRENCY: "2"
       RUST_LOG: "lux=info,tower_http=info"
@@ -8618,11 +8618,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] 同一请求快照在到期前不创建新 job；到期后可创建新 job，并继承该快照此前的失败次数。
 - [x] 连续 provider 失败按 5 分钟、30 分钟、最多 6 小时退避；新 fingerprint/capability 不等待旧快照；人工 retry 可立即领取。
 - [x] 仅自动且有请求快照的 `FILL_MISSING` item 使用退避；`REIDENTIFY`、`FULL_REFRESH`、人工无快照 job、取消与其他错误不受影响。
-- [x] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在可用集成环境通过。
+- [x] SQLite 状态机、migration-from-empty、旧 deferred-job 升级回归、build、fmt、全目标全 feature Clippy 通过；PostgreSQL SQL/迁移合同在 PostgreSQL 16 集成环境通过。
 
 短计划与文件：实现涉及 `migrations/0165_metadata_fill_missing_retry_backoff.sql`、`migrations-postgres/0165_metadata_fill_missing_retry_backoff.sql`、`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`tests/storage.rs`，以及公开 schema version 断言所在的集成测试文件。先添加红色状态机回归，再实现逐 item 退避、相同快照的跨 job 次数继承和到期去重，最后分别验证 SQLite 与 PostgreSQL 合同。本任务不改元数据 API DTO 或扫描并发策略。
 
 结果（2026-10-07）：新增双后端 migration 0165，为 provider 失败后的自动快照 item 保存失败次数和截止时间；退避为 5 分钟、30 分钟、最高 6 小时，并在新 job 中继承相同 fingerprint/capability 的次数。migration 只为已有自动 deferred provider 失败且带请求快照的 item 安排首次 5 分钟冷却，保持任务状态和计数；无快照旧任务仍沿用一小时去重。相同快照冷却去重、新 fingerprint/capability、显式 retry、取消、其他错误及非 `FILL_MISSING` 模式均有状态机回归。去重检查保留单条有界 SQL 查询，不额外增加扫描调度往返。SQLite migration/state-machine 测试、`tests/storage.rs` 49 项、`tests/postgres_database.rs -- --include-ignored` 16 项及 PostgreSQL progressive-scan storage contract 1 项通过；后者直接验证 provider 失败后的冷却、到期重试和失败次数继承。`cargo build --locked`、fmt、全目标全 feature Clippy 通过。全目标 Rust 测试库部分为 746 passed、0 failed、11 ignored；仅 `emby_counts`（实际 1、期望 0）与 `strm`（401、期望 200）失败，两者均在干净 `origin/test=8412cc2a` 上独立复现。开发机 `arm64`；FNOS 尚未部署本分支，未据此宣称生产 CPU 或真实重试节奏改善。
+
+补充结果（2026-10-07）：端到端扫描回归发现并修复 READY 且仍缺失的完整度记录不会在冷却到期后重新入队的问题。当前扫描只对本轮已确认仍缺失、且自动匹配可用的候选 ID 检查到期的 provider 失败；查询限制在每批最多 512 个扫描条目，并复用完整度 claim 事务。0165 不再更新历史 job item 表，而是在 `server_settings` 写入单个首次冷却截止时间；旧失败行继续保持原状态和计数，运行时按兼容规则视为已失败一次。调整旧测试夹具，使它同时把 item 级 retry deadline 设为已到期；精确扫描回归通过，`tests/storage.rs` 49/49、`tests/scanning_jobs.rs` 81/81 通过。最终 `cargo test --locked --all-targets --no-fail-fast` 的库测试为 746 passed、0 failed、11 ignored；集成目标仅 `emby_counts`（实际 1、期望 0）及 `strm`（401、期望 200）失败，两者此前均在干净 `origin/test=8412cc2a` 上独立复现。`cargo build --locked`、fmt、全目标全 feature Clippy 通过。此前 PostgreSQL 不可用；恢复 PostgreSQL 16.15 临时实例后，修正 PostgreSQL 合同夹具绕过 `Database` SQL 适配器、把 `?` 占位符原样发给 PostgreSQL 的问题，`postgres_database` 集成目标 16/16 和 progressive-scan storage contract 1/1 通过。开发机为 `arm64`；本分支未部署 FNOS，未据此宣称生产 CPU 或重试流量改善。
 
 #### LUX-403：复用有空位的 queued FILL_MISSING job
 

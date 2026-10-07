@@ -4252,7 +4252,8 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
     .expect("age prior deferred fill-missing jobs");
     sqlx::query(
         "UPDATE metadata_reidentify_job_items
-         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE'
+         SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE',
+             automatic_retry_after = unixepoch() - 1
          WHERE item_id = ? AND job_id IN (
              SELECT id FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'
          )",
@@ -5568,15 +5569,16 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     assert_eq!(failed_retry_state.0, 1);
     assert!(failed_retry_state.1.is_some_and(|retry_at| retry_at > now));
 
-    sqlx::query(
-        "UPDATE metadata_reidentify_job_items
+    database
+        .query(
+            "UPDATE metadata_reidentify_job_items
          SET automatic_retry_count = 0, automatic_retry_after = NULL
          WHERE job_id = ? AND item_id = ?",
-    )
-    .bind(&scheduled.scheduled_job_ids[0])
-    .bind(&item_id)
-    .execute(database.pool())
-    .await?;
+        )
+        .bind(&scheduled.scheduled_job_ids[0])
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
     database
         .query(
             "UPDATE server_settings SET value = CAST(unixepoch() + 300 AS TEXT)
