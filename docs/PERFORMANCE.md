@@ -1533,3 +1533,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 固定 SQLite 两 series fixture（各一个 episode、各有一个 poster）中，逐 item `index_images` 路径执行 11 次 storage query-wrapper 调用；页级读取与最多 16 item 的批登记后执行 4 次，减少 7 次（约 63.6%）。新路径包括 source 页读取、已有图片页读取、图片 upsert 和 poster fallback 清理。trigger 注入首个 series 图片写失败后批事务回滚，再逐 item 重试；第二个 series 更新成功，失败项被单独记录。
 
 该数字来自应用层 query-wrapper 计数，不含 SQL 执行时长或文件系统耗时；不据此推断墙钟、PostgreSQL、FNOS 或 NAS 收益。
+
+### LUX-413 completeness credits relation 短路
+
+本地 metadata completeness 计划先检查 NFO projection 是否同时包含导演和编剧。若 projection 不存在或任一列表为空，credits 已确定缺失，直接保留补全请求并跳过 `people.json` relation-existence 检查；只有两类 crew 信息齐全时才检查人物关系。候选模块单测覆盖缺失/完整 crew 判定。该回归验证决策边界，不统计文件系统调用总数或时延，也不代表 FNOS CPU 收益。

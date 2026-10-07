@@ -327,12 +327,10 @@ fn local_metadata_completeness_plan(
     })
 }
 
-fn credits_are_missing(
-    actor_relation_exists: bool,
+fn credits_need_actor_relation_check(
     details: Option<&crate::application::nfo::LocalNfoDetails>,
 ) -> bool {
-    !actor_relation_exists
-        || details.is_none_or(|value| value.directors.is_empty() || value.writers.is_empty())
+    details.is_some_and(|value| !value.directors.is_empty() && !value.writers.is_empty())
 }
 
 fn has_complete_external_ids(current: &StoredMediaMetadata) -> bool {
@@ -2457,12 +2455,15 @@ impl MetadataSelectionService {
         };
         let credits_missing = match current.item_type.as_str() {
             "MOVIE" | "SERIES" => {
-                let actor_relation_exists = self
-                    .people
-                    .item_actor_relation_exists(item_id)
-                    .await
-                    .map_err(MetadataSelectionError::People)?;
-                credits_are_missing(actor_relation_exists, details.as_ref())
+                if credits_need_actor_relation_check(details.as_ref()) {
+                    !self
+                        .people
+                        .item_actor_relation_exists(item_id)
+                        .await
+                        .map_err(MetadataSelectionError::People)?
+                } else {
+                    true
+                }
             }
             _ => false,
         };
@@ -4169,7 +4170,7 @@ mod tests {
         ACTOR_METADATA_FETCH_CONCURRENCY, FillMissingRequestPlan, ImageSelectionPolicy,
         MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
         MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors,
-        capability_needs_request, completeness_capabilities, credits_are_missing,
+        capability_needs_request, completeness_capabilities, credits_need_actor_relation_check,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_actors,
         generic_candidate_images, image_attempt_identities, local_metadata_completeness_plan,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
@@ -4826,16 +4827,29 @@ mod tests {
     }
 
     #[test]
-    fn fill_missing_fetches_credits_when_one_crew_list_is_missing() {
-        let details = crate::application::nfo::LocalNfoDetails {
+    fn credits_relation_check_is_needed_only_when_local_crew_details_are_complete() {
+        let missing_director = crate::application::nfo::LocalNfoDetails {
             directors: vec![crate::application::nfo::LocalNfoCredit {
                 provider_id: "director-1".to_owned(),
                 name: "Director".to_owned(),
             }],
             ..crate::application::nfo::LocalNfoDetails::default()
         };
+        let complete_crew = crate::application::nfo::LocalNfoDetails {
+            directors: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "director-1".to_owned(),
+                name: "Director".to_owned(),
+            }],
+            writers: vec![crate::application::nfo::LocalNfoCredit {
+                provider_id: "writer-1".to_owned(),
+                name: "Writer".to_owned(),
+            }],
+            ..crate::application::nfo::LocalNfoDetails::default()
+        };
 
-        assert!(credits_are_missing(true, Some(&details)));
+        assert!(!credits_need_actor_relation_check(None));
+        assert!(!credits_need_actor_relation_check(Some(&missing_director)));
+        assert!(credits_need_actor_relation_check(Some(&complete_crew)));
     }
 
     #[test]

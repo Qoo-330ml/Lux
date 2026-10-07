@@ -8777,6 +8777,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：普通剧集 enrichment 按最多 16 个 item 收集 series/season/episode 图片候选，既有图查询与登记共用页级 storage 操作；NFO 仍逐条处理。两 series、各一个 episode、每 series 一个 poster 的固定 SQLite fixture 从 11 次降为 4 次 query-wrapper 调用；其中单次批登记事务同时 upsert 两张 poster 并清除 poster fallback。trigger 注入首个 series 写失败后批事务回滚，逐项恢复仍登记第二个 series，并只将失败 series 记录为错误。metadata module 13/13、`scanned_metadata` 16/16、`series_metadata` 3/3、fmt、library all-features Clippy 与 `git diff --check` 通过。此数据只反映 fixture 调用数，不代表 PostgreSQL、墙钟或 FNOS CPU 收益。
 
+#### LUX-413：避免已知缺失 credits 时读取人物关系文件
+
+范围：本地 metadata completeness 计划对电影和系列总会检查 `people.json`，之后才判断 NFO projection 是否缺导演或编剧。若任一 crew 字段已缺失，credits 必然需要补全，人物关系是否存在不改变结果；先检查 crew completeness，仅在两类本地 crew 信息均齐全时读取 actor relation。保持自动补全能力与 NFO projection 语义不变，不新增跨请求缓存或并发。
+
+验收：
+
+- [x] 缺少 NFO projection、导演或编剧信息时仍标记 credits 缺失，且不进入 actor-relation 检查分支；两类 crew 信息齐全时继续检查 actor relation。
+- [x] 候选计划回归、fmt、相关 Clippy 和 `git diff --check` 通过；不把分支跳过描述成已测得的总体 I/O 或 FNOS CPU 收益。
+
+短计划与文件：只改 `src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先增加 crew completeness 判定回归，再让计划构建仅在 crew 信息完整时读取 actor relation，最后运行候选模块测试、fmt、Clippy 和差异检查。
+
+结果（2026-10-08）：credits 缺失判定先检查本地 NFO projection。缺少 projection、导演或编剧时直接标记缺失，不读取 `people.json`；两类 crew 信息齐全时仍检查人物关系。候选模块回归、fmt、Clippy 和 `git diff --check` 通过。本任务没有统计文件系统调用数、墙钟或生产 CPU；完整的页级 NFO projection 缓存与批量 relation 读取仍属于第 15 项剩余工作。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
