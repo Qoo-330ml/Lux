@@ -178,6 +178,8 @@
 
 预部署现场基线（2026-10-07 13:33–13:40，FNOS `192.168.10.50`，只读采样）：运行镜像 `pdzhou/lux:test` 标记 revision `8412cc2a`，`/health/ready` 报告版本 `0.5.19`、schema 164；本地优化分支及 migration 0165 尚未部署。容器环境 `LUX_SCAN_CONCURRENCY=2`；8 个库保存值为 2、1 个库保存值为 32，但全局环境覆盖优先于库设置。采样窗口没有 PENDING/RUNNING 扫描 job，也没有最近 10 分钟新建的扫描或 metadata job；有一个旧 `FILL_MISSING` job 仍在运行，5,042 项中 processed_count 从 4,164 增至 4,361，13:39 时项目状态为 COMPLETED 4,123、FAILED 238、PENDING 680、RUNNING 1。Docker 单核口径 CPU 快照中 Lux 为 6.53%–44.52%、PostgreSQL 为 9.56%–238.59%；主机有 12 个逻辑核，13:39 单次 `top` 报告 89.7% idle。`pg_stat_activity` 快照未见 Lock 等待；`pg_stat_statements` 未安装，PostgreSQL statement logging 关闭，因此不能从该采样归因到具体 SQL。该数据是部署前短时基线，不代表稳定均值或改动后的 CPU 收益。
 
+后续只读采样（2026-10-07 15:20，FNOS `192.168.10.50`）：容器仍运行 revision `8412cc2a`、schema 164；该时刻 Docker 单次 CPU 快照 Lux 1.15%、PostgreSQL 4.63%，`FILL_MISSING` 没有 QUEUED/RUNNING job，最近 30 分钟没有新建 metadata job。历史记录仍有 14,381 个未请求取消的 DEFERRED `FILL_MISSING` job，包含 335,965 条 `SCRAPER_UNAVAILABLE` 失败 item、7,566 个不同 item；这些失败行均没有 LUX-401 请求快照，因此不会由 0165 的自动退避兼容路径批量唤醒。对当前完整度仍标记缺失、媒体库自动匹配开启且带请求快照的失败项计数为 0。该 CPU 值只是空闲时的单点快照，不能证明负载趋势或本地修复效果；分支仍未部署。
+
 ## 不在本次方案内
 
 - 不删除历史任务；
