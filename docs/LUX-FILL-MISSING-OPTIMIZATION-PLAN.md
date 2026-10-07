@@ -176,6 +176,8 @@
 
 以上是部署后的观测清单，不代表当前分支已经部署或生产验收完成。代码侧的退避、队列容量、补缺策略和扫描串行约束已完成；要证明 FNOS 收益，还需核对实际运行 revision/schema，观察完整扫描周期，并对比 job 创建率、CPU 与队列等待时间。当前任务未部署代码。
 
+预部署现场基线（2026-10-07 13:33–13:40，FNOS `192.168.10.50`，只读采样）：运行镜像 `pdzhou/lux:test` 标记 revision `8412cc2a`，`/health/ready` 报告版本 `0.5.19`、schema 164；本地优化分支及 migration 0165 尚未部署。容器环境 `LUX_SCAN_CONCURRENCY=2`；8 个库保存值为 2、1 个库保存值为 32，但全局环境覆盖优先于库设置。采样窗口没有 PENDING/RUNNING 扫描 job，也没有最近 10 分钟新建的扫描或 metadata job；有一个旧 `FILL_MISSING` job 仍在运行，5,042 项中 processed_count 从 4,164 增至 4,361，13:39 时项目状态为 COMPLETED 4,123、FAILED 238、PENDING 680、RUNNING 1。Docker 单核口径 CPU 快照中 Lux 为 6.53%–44.52%、PostgreSQL 为 9.56%–238.59%；主机有 12 个逻辑核，13:39 单次 `top` 报告 89.7% idle。`pg_stat_activity` 快照未见 Lock 等待；`pg_stat_statements` 未安装，PostgreSQL statement logging 关闭，因此不能从该采样归因到具体 SQL。该数据是部署前短时基线，不代表稳定均值或改动后的 CPU 收益。
+
 ## 不在本次方案内
 
 - 不删除历史任务；
