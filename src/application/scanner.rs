@@ -13906,10 +13906,16 @@ mod tests {
         sqlx::query(
             "UPDATE metadata_reidentify_job_items
              SET status = 'FAILED', error = 'SCRAPER_UNAVAILABLE',
-                 automatic_retry_count = 1, automatic_retry_after = unixepoch() - 1
+                 automatic_retry_count = 0, automatic_retry_after = NULL
              WHERE job_id = ?",
         )
         .bind(&first_fill_missing_job_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE server_settings SET value = CAST(unixepoch() - 1 AS TEXT)
+             WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+        )
         .execute(database.pool())
         .await?;
         sqlx::query(

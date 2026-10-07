@@ -8637,15 +8637,41 @@ impl Database {
                         job_items.item_id, job_items.status AS item_status,
                         job_items.request_fingerprint,
                         job_items.request_capabilities_json,
-                        job_items.automatic_retry_count,
-                        CASE WHEN job_items.automatic_retry_after IS NULL
+                        CASE WHEN job_items.automatic_retry_count = 0
+                                  AND jobs.status = 'DEFERRED'
+                                  AND job_items.status = 'FAILED'
+                                  AND job_items.error = 'SCRAPER_UNAVAILABLE'
+                                  AND job_items.request_fingerprint IS NOT NULL
+                            THEN 1 ELSE job_items.automatic_retry_count
+                        END AS automatic_retry_count,
+                        CASE WHEN COALESCE(
+                                job_items.automatic_retry_after,
+                                CASE WHEN job_items.automatic_retry_count = 0
+                                          AND jobs.status = 'DEFERRED'
+                                          AND job_items.status = 'FAILED'
+                                          AND job_items.error = 'SCRAPER_UNAVAILABLE'
+                                          AND job_items.request_fingerprint IS NOT NULL
+                                     THEN CAST(legacy_retry.value AS BIGINT)
+                                     ELSE NULL END
+                             ) IS NULL
                             THEN 0 ELSE 1 END AS has_retry_deadline,
-                        CASE WHEN job_items.automatic_retry_after > unixepoch()
+                        CASE WHEN COALESCE(
+                                job_items.automatic_retry_after,
+                                CASE WHEN job_items.automatic_retry_count = 0
+                                          AND jobs.status = 'DEFERRED'
+                                          AND job_items.status = 'FAILED'
+                                          AND job_items.error = 'SCRAPER_UNAVAILABLE'
+                                          AND job_items.request_fingerprint IS NOT NULL
+                                     THEN CAST(legacy_retry.value AS BIGINT)
+                                     ELSE NULL END
+                             ) > unixepoch()
                             THEN 1 ELSE 0 END AS retry_pending,
                         CASE WHEN jobs.updated_at >= unixepoch() - 3600
                             THEN 1 ELSE 0 END AS recently_deferred
                  FROM metadata_reidentify_job_items job_items
                  JOIN metadata_reidentify_jobs jobs ON jobs.id = job_items.job_id
+                 LEFT JOIN server_settings legacy_retry
+                   ON legacy_retry.key = 'metadata_fill_missing_legacy_retry_after'
                  WHERE (
                      jobs.mode = 'FILL_MISSING'
                      AND jobs.status IN ('QUEUED', 'RUNNING')

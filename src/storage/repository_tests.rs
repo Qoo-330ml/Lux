@@ -4471,16 +4471,29 @@ async fn automatic_fill_missing_provider_retry_backoff_is_capped_and_snapshot_sc
     assert_eq!(first_backoff.0, 1);
     assert!((299..=300).contains(&first_backoff.1));
 
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_count = 0, automatic_retry_after = NULL
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&first_job_id)
+    .bind(item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE server_settings SET value = CAST(unixepoch() + 300 AS TEXT)
+         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+    )
+    .execute(database.pool())
+    .await?;
     let suppressed = database
         .complete_local_metadata_and_enqueue_fill_missing(&library_id, &[], &[item_id.to_owned()])
         .await?;
     assert!(suppressed.scheduled_job_ids.is_empty());
     sqlx::query(
-        "UPDATE metadata_reidentify_job_items SET automatic_retry_after = unixepoch() - 1
-         WHERE job_id = ? AND item_id = ?",
+        "UPDATE server_settings SET value = CAST(unixepoch() - 1 AS TEXT)
+         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
     )
-    .bind(&first_job_id)
-    .bind(item_id)
     .execute(database.pool())
     .await?;
     let due_dispatch = database
@@ -5555,13 +5568,35 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     assert_eq!(failed_retry_state.0, 1);
     assert!(failed_retry_state.1.is_some_and(|retry_at| retry_at > now));
 
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_count = 0, automatic_retry_after = NULL
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(&scheduled.scheduled_job_ids[0])
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
     database
         .query(
-            "UPDATE metadata_reidentify_job_items SET automatic_retry_after = 0
-             WHERE job_id = ? AND item_id = ?",
+            "UPDATE server_settings SET value = CAST(unixepoch() + 300 AS TEXT)
+             WHERE key = 'metadata_fill_missing_legacy_retry_after'",
         )
-        .bind(&scheduled.scheduled_job_ids[0])
-        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let legacy_retry_pending = database
+        .complete_local_metadata_and_enqueue_fill_missing(
+            &library_id,
+            &[],
+            std::slice::from_ref(&item_id),
+        )
+        .await?;
+    assert!(legacy_retry_pending.scheduled_job_ids.is_empty());
+    database
+        .query(
+            "UPDATE server_settings SET value = CAST(unixepoch() - 1 AS TEXT)
+             WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+        )
         .execute(database.pool())
         .await?;
     let due_retry = database
