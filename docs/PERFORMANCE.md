@@ -1513,3 +1513,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 | PostgreSQL 候选 | 6,161 / 6,144 / 6,224；**6,161** | 1,745 | 50,468 / 3,543 / 4,239；**4,239** | 873 / 1,060 / 850 | 338 / 103 | 8 | 230,163,605 bytes / 0 |
 
 固定 60k 扫描的 outbox DML 从 240 降到 8；总 DML 在 SQLite 从 359 降到 127，在 PostgreSQL 从 335 降到 103。SQL 中位数分别从 596 降至 366、从 570 降至 338。首扫和 target 墙钟中位数接近持平；这些数据验证的是批量写入和语句数下降，不证明 CPU 或 FNOS 收益。PostgreSQL 基线第 3 轮与候选第 1 轮的无变化重扫各有一次约 50 秒离群值，阶段记录均指向 `known_path_query`；该路径不在 LUX-408 改动范围，故保留原始值并只比较中位数，不将其归因于候选。修改尚未部署 FNOS，也不外推 NAS/x86_64 性能。
+
+### LUX-409 unchanged NFO 写回调用边界
+
+固定 SQLite 单 item fixture 首次 probe 写入 NFO 并启用 metadata mirror 时执行 4 次 storage query-wrapper 调用；紧接着重复完全相同的 probe，调用数由旧路径的 3 次降至 2 次。省去的是 unchanged NFO 路径的 mirror 策略读取；数据库 NFO 状态同步原本已只在文件变化时执行。未变化路径复用原子写入流程已读取的 `FileStamp` 生成 metadata fingerprint；回归确认其字节与原 stat 算法一致，并确认既有 mirror 内容不变。storage query-wrapper 不统计文件系统时延、BEGIN/COMMIT 或 SQL 执行时间；此结果不代表墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。

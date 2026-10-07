@@ -8723,6 +8723,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：定向 SQLite/PostgreSQL outbox 回归、扫描事务回滚、60k SQLite/PostgreSQL 性能基准、`cargo build --locked`、`cargo fmt --all -- --check` 和全目标全 feature Clippy 通过。`cargo test --locked --all-targets --no-fail-fast` 中 library 为 751 passed、13 ignored，`scanning_jobs` 81/81、`storage` 49/49 通过；全量集成测试仅 `emby_counts` 与 `strm` 两项失败，这两项已在干净 `origin/test` 的 LUX-407 质量门中复现，与本任务改动无关。`git diff --check` 通过。本机为 ARM64；此分支未部署 FNOS，固定 fixture 的语句数改善不代表 NAS CPU 或生产墙钟收益。
 
+#### LUX-409：跳过未变化 NFO 写回的镜像与数据库检查
+
+范围：`NfoWriteService::finish_item_write` 在 NFO 文件内容未改变时仍检查 metadata mirror、重新读取文件时间并访问数据库。未变化时复用原文件状态生成的既有 metadata fingerprint，直接返回，不检查镜像、不重新 stat，也不打开 metadata 写事务；文件发生变化时保留镜像、fingerprint 和状态同步的现有顺序及错误语义。该优化不改变 NFO 内容、文件原子写入、source freshness 或 mirror 的显式配置合同。
+
+验收：
+
+- [x] 首次 probe 写回可创建 metadata mirror 并同步 NFO 状态；重复相同写回不再查询 mirror 策略或写入数据库，NFO 与已有镜像内容保持一致。
+- [x] 未变化路径返回的 metadata fingerprint 与此前 stat 路径的 fingerprint 算法和字节完全一致；变化路径仍刷新 fingerprint 并同步数据库。
+- [x] `nfo` 定向单测、`cargo fmt --all -- --check`、相关 Clippy 与 `git diff --check` 通过；性能记录只报告固定 fixture 的 storage query-wrapper 调用数，不推断墙钟或生产 CPU。
+
+短计划与文件：预计修改 `src/application/nfo.rs`（无变化回归及快速返回）、`src/application/metadata.rs`（从已读取文件状态构造一致的 fingerprint）、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先扩展 probe 写回回归，使其在重复调用时断言 mirror 配置读取和状态写入都被跳过，再实现 fingerprint 复用。
+
+结果（2026-10-08）：重复 probe 写回的 SQLite fixture 从 3 次 storage query-wrapper 调用降为 2 次；首次有内容变化的写入仍创建 mirror 并同步 NFO 状态。NFO writer 单测 4/4、格式检查及 library 全 feature Clippy 通过。重复写回复用写入前已读取的 `FileStamp` 计算原有 metadata fingerprint，单测确认结果与 stat 算法逐字节一致；没有据 SQL 调用数推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

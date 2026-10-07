@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::application::metadata::{
     MetadataField, MetadataSource, MetadataState, NfoError, NfoMetadata, find_nfo_path,
-    nfo_fingerprint, parse_nfo, series_directory,
+    nfo_fingerprint, nfo_fingerprint_from_stamp, parse_nfo, series_directory,
 };
 use crate::application::metadata_paths::{library_item_directory, metadata_root};
 use crate::application::metadata_writeback::item_metadata_writeback_enabled;
@@ -2389,21 +2389,39 @@ impl NfoWriteService {
         target: PathBuf,
         write: NfoFileWrite,
     ) -> Result<NfoWriteReport, NfoWriteError> {
-        self.mirror_item_nfo_if_enabled(item_id, &target, &write.content)
+        let NfoFileWrite {
+            content_fingerprint,
+            content,
+            changed,
+            file_fingerprint,
+        } = write;
+        if !changed {
+            let fingerprint = match file_fingerprint {
+                Some(fingerprint) => fingerprint,
+                None => nfo_fingerprint(&target)
+                    .await
+                    .map_err(|error| io_error(&target, error))?,
+            };
+            return Ok(NfoWriteReport {
+                path: target,
+                fingerprint,
+                content_fingerprint,
+                changed,
+            });
+        }
+        self.mirror_item_nfo_if_enabled(item_id, &target, &content)
             .await?;
         let fingerprint = nfo_fingerprint(&target)
             .await
             .map_err(|error| io_error(&target, error))?;
-        if write.changed {
-            self.database
-                .sync_media_item_nfo_state(item_id, &write.content_fingerprint, &fingerprint)
-                .await?;
-        }
+        self.database
+            .sync_media_item_nfo_state(item_id, &content_fingerprint, &fingerprint)
+            .await?;
         Ok(NfoWriteReport {
             path: target,
             fingerprint,
-            content_fingerprint: write.content_fingerprint,
-            changed: write.changed,
+            content_fingerprint,
+            changed,
         })
     }
 
@@ -2695,6 +2713,7 @@ struct NfoFileWrite {
     content_fingerprint: Vec<u8>,
     content: Vec<u8>,
     changed: bool,
+    file_fingerprint: Option<Vec<u8>>,
 }
 
 async fn write_nfo_atomically_with_hook(
@@ -2727,6 +2746,8 @@ where
         return Err(NfoWriteError::SymlinkTarget(target.to_owned()));
     }
     let before = file_stamp(target).await?;
+    let file_fingerprint =
+        before.map(|stamp| nfo_fingerprint_from_stamp(target, stamp.size, stamp.modified_at));
     let original = match fs::read(target).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
@@ -2737,6 +2758,7 @@ where
         content_fingerprint: nfo_content_fingerprint(&rewritten),
         content: rewritten.clone(),
         changed: rewritten != original,
+        file_fingerprint,
     };
     if !write.changed {
         return Ok(write);
@@ -3055,6 +3077,25 @@ mod tests {
     };
 
     #[tokio::test]
+    async fn no_op_nfo_write_reuses_the_file_stamp_fingerprint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("movie.nfo");
+        fs::write(&target, b"<movie><title>Example</title></movie>").await?;
+
+        let write =
+            write_nfo_atomically_with_rewriter(&target, |original| Ok(original.to_vec()), None)
+                .await?;
+
+        assert!(!write.changed);
+        assert_eq!(
+            write.file_fingerprint,
+            Some(nfo_fingerprint(&target).await?)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn probe_nfo_write_reuses_context_and_preserves_source_guards()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -3093,7 +3134,13 @@ mod tests {
             bitrate: Some(500_000),
             streams: vec![],
         };
-        let writer = NfoWriteService::new(database.clone());
+        sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+            .bind(r#"{"images":{"writeToMetadata":true}}"#)
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let writer =
+            NfoWriteService::new_with_config_dir(database.clone(), config.config_dir.clone());
         database.reset_query_count();
         assert!(
             writer
@@ -3102,12 +3149,28 @@ mod tests {
         );
         assert_eq!(
             database.query_count(),
-            3,
-            "context, auxiliary, combined state sync and fingerprint"
+            4,
+            "context, auxiliary, mirror policy, and combined state sync"
         );
         let content = fs::read_to_string(&target).await?;
         assert!(content.contains("<custom>keep</custom>"));
         assert!(root.join("movie.nfo").exists());
+        let mirror = library_item_directory(&config.config_dir, &item_id)?.join("movie.nfo");
+        assert_eq!(fs::read_to_string(&mirror).await?, content);
+
+        database.reset_query_count();
+        assert!(
+            writer
+                .write_item_probe_details(&item_id, &source_id, &probe)
+                .await?
+        );
+        assert_eq!(
+            database.query_count(),
+            2,
+            "an unchanged NFO skips mirror policy lookup and state sync"
+        );
+        assert_eq!(fs::read_to_string(&target).await?, content);
+        assert_eq!(fs::read_to_string(&mirror).await?, content);
 
         database.reset_query_count();
         assert!(

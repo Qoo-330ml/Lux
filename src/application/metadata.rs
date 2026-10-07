@@ -2375,21 +2375,24 @@ impl MetadataReport {
 
 pub(crate) async fn nfo_fingerprint(path: &Path) -> Result<Vec<u8>, std::io::Error> {
     let metadata = fs::metadata(path).await?;
-    let size = i64::try_from(metadata.len()).unwrap_or(i64::MAX);
     let modified_at = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
-        .unwrap_or(0);
-    let path = path.to_string_lossy();
-    Ok(compute_file_fingerprint(
-        &path,
-        size,
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    Ok(nfo_fingerprint_from_stamp(
+        path,
+        metadata.len(),
         modified_at,
-        None,
-        None,
     ))
+}
+
+pub(crate) fn nfo_fingerprint_from_stamp(path: &Path, size: u64, modified_at: u128) -> Vec<u8> {
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
+    let modified_at = i64::try_from(modified_at).unwrap_or(0);
+    let path = path.to_string_lossy();
+    compute_file_fingerprint(&path, size, modified_at, None, None)
 }
 
 #[cfg(test)]
