@@ -59,6 +59,36 @@ use tracing_subscriber::{
 const FOREGROUND_REQUESTS: usize = 50;
 const INCREMENTAL_FILES: usize = 100;
 const METADATA_BENCHMARK_ITEMS: usize = 32;
+
+#[test]
+fn process_peak_rss_is_reported_in_bytes() {
+    assert!(process_peak_rss_bytes().is_some_and(|bytes| bytes > 0));
+}
+
+fn process_peak_rss_bytes() -> Option<u64> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: getrusage initializes the provided structure on success.
+        let result = unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) };
+        if result != 0 {
+            return None;
+        }
+        // SAFETY: result == 0 proves getrusage initialized usage.
+        let usage = unsafe { usage.assume_init() };
+        let native_value = u64::try_from(usage.ru_maxrss).ok()?;
+        #[cfg(target_os = "macos")]
+        let bytes = native_value;
+        #[cfg(target_os = "linux")]
+        let bytes = native_value.checked_mul(1024)?;
+        Some(bytes)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        None
+    }
+}
+
 const METADATA_BENCHMARK_PNG: &[u8] = &[
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
     0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
@@ -1623,11 +1653,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "rescanSeenPathCount": rescan_presence.1,
         "rescanGenerationMarkedPathCount": rescan_presence.2,
     });
+    let process_peak_rss_bytes = process_peak_rss_bytes();
 
     let report_sections = [
         json!({
             "commit": luxd::COMMIT,
             "architecture": std::env::consts::ARCH,
+            "processPeakRssBytes": process_peak_rss_bytes,
             "databaseBackend": backend,
             "scanDiscoveryStrategy": "lite_grouped",
             "derivedIndexTriggersDisabled": derived_index_triggers_disabled,
@@ -1989,6 +2021,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "scanRunningAtApiStart": scan_running_at_api_start,
             "localPosterQueueCompleteMs": local_poster_queue_ms,
             "onlineFillMissingJobCount": online_fill_missing_job_count,
+            "processPeakRssBytes": process_peak_rss_bytes(),
         }))?
     );
     server.abort();
