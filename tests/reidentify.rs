@@ -20,7 +20,10 @@ use luxd::{
         metadata::MetadataEnricher,
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
-        reidentify::{MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyService},
+        reidentify::{
+            MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
+            MetadataReidentifyService,
+        },
         scanner::LibraryScanner,
         scraper::ScraperProvider,
         setup::SetupService,
@@ -125,6 +128,42 @@ async fn gated_empty_tmdb_stub(AxumState(gate): AxumState<BlockingRequestGate>) 
         "total_results": 0,
         "results": []
     }))
+}
+
+fn fill_missing_dispatch_job(id: &str, library_id: &str) -> MetadataReidentifyJob {
+    MetadataReidentifyJob {
+        id: id.to_owned(),
+        status: "QUEUED".to_owned(),
+        processed_count: 0,
+        total_count: 0,
+        error: None,
+        created_at: 0,
+        updated_at: 0,
+        started_at: None,
+        finished_at: None,
+        mode: "FILL_MISSING".to_owned(),
+        items: Vec::new(),
+        cancel_requested: false,
+        library_id: Some(library_id.to_owned()),
+        job_scope: "ITEMS".to_owned(),
+        pending_count: 0,
+    }
+}
+
+async fn persist_queued_dispatch_job(
+    database: &Database,
+    job: &MetadataReidentifyJob,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO metadata_reidentify_jobs
+            (id, status, total_count, mode, library_id, job_scope)
+         VALUES (?, 'QUEUED', 0, 'FILL_MISSING', ?, 'ITEMS')",
+    )
+    .bind(&job.id)
+    .bind(job.library_id.as_deref())
+    .execute(database.pool())
+    .await?;
+    Ok(())
 }
 
 async fn setup_movie_library_with_parent_folder()
@@ -1010,6 +1049,298 @@ async fn fill_missing_jobs_share_a_process_global_worker_limit()
         maximum_running_items <= 2,
         "automatic FILL_MISSING jobs must claim at most two running items process-wide; observed {maximum_running_items}"
     );
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8100".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let gate = BlockingRequestGate {
+        started: Arc::new(AtomicUsize::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(gated_empty_tmdb_stub))
+        .with_state(gate.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(5),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
+    let library = libraries
+        .create_library("Serialized fill missing", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Serialized fill missing");
+    for item_index in 0..3 {
+        let title = format!("Serialized Movie {item_index} (2024)");
+        let movie_dir = root.join(&title);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Serialized.Movie.{item_index}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+         ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 3);
+
+    let first_job = metadata
+        .create_fill_missing_job(vec![item_ids[0].clone()])
+        .await?;
+    metadata.enqueue_fill_missing_job(&first_job).await?;
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let status = metadata.get_job(&first_job.id).await?.status;
+        return Err(
+            format!("first gated scraper request did not start; job status: {status}").into(),
+        );
+    }
+
+    let second_job = metadata
+        .create_fill_missing_job(vec![item_ids[1].clone()])
+        .await?;
+    assert_ne!(first_job.id, second_job.id);
+    metadata.enqueue_fill_missing_job(&second_job).await?;
+    metadata.cancel(&second_job.id).await?;
+    let third_job = metadata
+        .create_fill_missing_job(vec![item_ids[2].clone()])
+        .await?;
+    assert_ne!(second_job.id, third_job.id);
+    metadata.enqueue_fill_missing_job(&third_job).await?;
+
+    let other_library = libraries
+        .create_library("Independent fill missing", LibraryKind::Movie, false)
+        .await?;
+    let other_root = temp_dir.path().join("Independent fill missing");
+    let other_movie_dir = other_root.join("Independent Movie (2024)");
+    tokio::fs::create_dir_all(&other_movie_dir).await?;
+    tokio::fs::write(
+        other_movie_dir.join("Independent.Movie.2024.mkv"),
+        b"fixture",
+    )
+    .await?;
+    libraries
+        .add_root(
+            other_library.id,
+            other_root.to_str().ok_or("non-utf8 root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(other_library.id)
+        .await?;
+    let other_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+         LIMIT 1",
+    )
+    .bind(other_library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let other_job = metadata
+        .create_fill_missing_job(vec![other_item_id])
+        .await?;
+    metadata.enqueue_fill_missing_job(&other_job).await?;
+    let mut misrouted_job = first_job.clone();
+    misrouted_job.library_id = Some(other_library.id.to_string());
+    assert!(matches!(
+        metadata.enqueue_fill_missing_job(&misrouted_job).await,
+        Err(luxd::application::reidentify::MetadataDispatchError::InvalidJob)
+    ));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+
+    let queued_jobs = (0..30)
+        .map(|index| {
+            fill_missing_dispatch_job(
+                &format!("queued-fill-missing-{index}"),
+                &library.id.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for job in &queued_jobs {
+        persist_queued_dispatch_job(&database, job).await?;
+        metadata.enqueue_fill_missing_job(job).await?;
+    }
+    let overflow_job = fill_missing_dispatch_job("overflow-fill-missing", &library.id.to_string());
+    persist_queued_dispatch_job(&database, &overflow_job).await?;
+    let mut first_overflow_submission = Box::pin(metadata.enqueue_fill_missing_job(&overflow_job));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut first_overflow_submission,)
+            .await
+            .is_err(),
+        "a full per-library dispatcher queue must apply backpressure"
+    );
+    let mut duplicate_overflow_submission =
+        Box::pin(metadata.enqueue_fill_missing_job(&overflow_job));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            &mut duplicate_overflow_submission,
+        )
+        .await
+        .is_err(),
+        "a duplicate must not report success while the first submission is still waiting for capacity"
+    );
+    drop(first_overflow_submission);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (first_status, second_status, third_status, other_status): (
+        String,
+        String,
+        String,
+        String,
+    ) = sqlx::query_as(
+        "SELECT
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS first_status,
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS second_status,
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS third_status,
+             (SELECT status FROM metadata_reidentify_jobs WHERE id = ?) AS other_status",
+    )
+    .bind(&first_job.id)
+    .bind(&second_job.id)
+    .bind(&third_job.id)
+    .bind(&other_job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(first_status, "RUNNING");
+    assert_eq!(second_status, "QUEUED");
+    assert_eq!(third_status, "QUEUED");
+    assert_eq!(other_status, "RUNNING");
+
+    gate.release.add_permits(2);
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) < 3 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let first_status = metadata.get_job(&first_job.id).await?.status;
+        let second_status = metadata.get_job(&second_job.id).await?.status;
+        return Err(format!(
+            "third same-library gated scraper request did not start; starts={}, jobs={first_status}/{second_status}",
+            gate.started.load(Ordering::SeqCst)
+        )
+        .into());
+    }
+    let overflow_completion = duplicate_overflow_submission
+        .await?
+        .ok_or("cancelled backpressured submission should be retryable")?;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let second_status: String =
+                sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                    .bind(&second_job.id)
+                    .fetch_one(database.pool())
+                    .await
+                    .expect("cancelled job status query should succeed");
+            let third_status: String =
+                sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+                    .bind(&third_job.id)
+                    .fetch_one(database.pool())
+                    .await
+                    .expect("next same-library job status query should succeed");
+            if second_status == "CANCELLED" && third_status == "RUNNING" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    tokio::time::timeout(Duration::from_millis(150), metadata.shutdown())
+        .await
+        .expect("dispatcher shutdown must not wait for a job blocked in the scraper");
+    assert!(matches!(
+        metadata
+            .enqueue_fill_missing_job(&fill_missing_dispatch_job(
+                "after-shutdown-fill-missing",
+                &library.id.to_string(),
+            ))
+            .await,
+        Err(luxd::application::reidentify::MetadataDispatchError::ShuttingDown)
+    ));
+    gate.release.add_permits(16);
+    if tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let statuses: Vec<String> = sqlx::query_scalar(
+                "SELECT status FROM metadata_reidentify_jobs
+                 WHERE id IN (?, ?, ?, ?) ORDER BY created_at, id",
+            )
+            .bind(&first_job.id)
+            .bind(&second_job.id)
+            .bind(&third_job.id)
+            .bind(&other_job.id)
+            .fetch_all(database.pool())
+            .await
+            .expect("metadata job status query should succeed");
+            if statuses.len() == 4
+                && statuses.iter().all(|status| {
+                    matches!(
+                        status.as_str(),
+                        "COMPLETED" | "COMPLETED_WITH_ISSUES" | "DEFERRED" | "FAILED" | "CANCELLED"
+                    )
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let first_status = metadata.get_job(&first_job.id).await?.status;
+        let second_status = metadata.get_job(&second_job.id).await?.status;
+        return Err(format!(
+            "dispatched jobs did not finish before shutdown; jobs={first_status}/{second_status}"
+        )
+        .into());
+    }
+    tokio::time::timeout(Duration::from_secs(5), overflow_completion).await??;
     tmdb_server.abort();
     Ok(())
 }

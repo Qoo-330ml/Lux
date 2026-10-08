@@ -1,6 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
+    future::Future,
     sync::{
         Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
@@ -10,8 +11,8 @@ use std::{
 
 use serde_json::{Value, json};
 use tokio::{
-    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore},
-    task::JoinSet,
+    sync::{Mutex as AsyncMutex, Notify, OwnedSemaphorePermit, Semaphore, mpsc, oneshot, watch},
+    task::{JoinHandle, JoinSet},
 };
 use uuid::Uuid;
 
@@ -38,6 +39,7 @@ use crate::{
 pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
 const METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT: usize = 2;
+const METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY: usize = 32;
 const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
@@ -94,9 +96,231 @@ pub struct MetadataReidentifyService {
     progress_events: MetadataProgressEventGate,
     worker_permits: Arc<Semaphore>,
     fill_missing_worker_permits: Arc<Semaphore>,
+    fill_missing_dispatchers: Option<MetadataFillMissingDispatchers>,
     running_jobs: MetadataJobOwners,
     library_job_creation: Arc<AsyncMutex<()>>,
     actor_enrichment: ActorEnrichmentQueue,
+}
+
+#[derive(Clone)]
+struct MetadataFillMissingDispatchers {
+    state: Arc<AsyncMutex<MetadataFillMissingDispatcherState>>,
+    shutdown_watch: watch::Sender<bool>,
+}
+
+#[derive(Default)]
+struct MetadataFillMissingDispatcherState {
+    shutting_down: bool,
+    by_library: HashMap<String, MetadataFillMissingDispatcher>,
+}
+
+struct MetadataFillMissingDispatcher {
+    sender: mpsc::Sender<String>,
+    pending_jobs: Arc<Mutex<MetadataFillMissingPendingJobs>>,
+    worker: JoinHandle<()>,
+}
+
+#[derive(Default)]
+struct MetadataFillMissingPendingJobs {
+    job_ids: HashSet<String>,
+    completion_senders: HashMap<String, oneshot::Sender<()>>,
+}
+
+#[derive(Debug)]
+pub enum MetadataDispatchError {
+    InvalidJob,
+    ShuttingDown,
+    QueueClosed,
+    StateUnavailable,
+    Storage(String),
+}
+
+impl fmt::Display for MetadataDispatchError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidJob => {
+                formatter.write_str("metadata job is not a single-library FILL_MISSING job")
+            }
+            Self::ShuttingDown => formatter.write_str("metadata job dispatcher is shutting down"),
+            Self::QueueClosed => formatter.write_str("metadata job dispatcher queue is closed"),
+            Self::StateUnavailable => {
+                formatter.write_str("metadata dispatcher state lock is unavailable")
+            }
+            Self::Storage(error) => {
+                write!(
+                    formatter,
+                    "metadata job could not be verified before dispatch: {error}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MetadataDispatchError {}
+
+impl Default for MetadataFillMissingDispatchers {
+    fn default() -> Self {
+        let (shutdown_watch, _) = watch::channel(false);
+        Self {
+            state: Arc::new(AsyncMutex::new(
+                MetadataFillMissingDispatcherState::default(),
+            )),
+            shutdown_watch,
+        }
+    }
+}
+
+async fn run_fill_missing_dispatcher_loop<F, Fut, R, RFut>(
+    mut receiver: mpsc::Receiver<String>,
+    pending_jobs: Arc<Mutex<MetadataFillMissingPendingJobs>>,
+    mut run_job: F,
+    mut recover_failed_job: R,
+) where
+    F: FnMut(String) -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+    R: FnMut(String) -> RFut + Send + 'static,
+    RFut: Future<Output = ()> + Send + 'static,
+{
+    while let Some(job_id) = receiver.recv().await {
+        if let Err(error) = tokio::spawn(run_job(job_id.clone())).await {
+            tracing::error!(
+                job_id,
+                worker_panicked = error.is_panic(),
+                worker_cancelled = error.is_cancelled(),
+                "FILL_MISSING dispatcher job runner stopped unexpectedly"
+            );
+            recover_failed_job(job_id.clone()).await;
+        }
+        let completion_sender = if let Ok(mut pending_jobs) = pending_jobs.lock() {
+            pending_jobs.job_ids.remove(&job_id);
+            pending_jobs.completion_senders.remove(&job_id)
+        } else {
+            None
+        };
+        if let Some(completion_sender) = completion_sender {
+            let _ = completion_sender.send(());
+        }
+    }
+}
+
+async fn reserve_fill_missing_queue_capacity<'a>(
+    sender: &'a mpsc::Sender<String>,
+    shutdown_watch: &mut watch::Receiver<bool>,
+) -> Result<mpsc::Permit<'a, String>, MetadataDispatchError> {
+    tokio::select! {
+        result = sender.reserve() => result.map_err(|_| MetadataDispatchError::QueueClosed),
+        changed = shutdown_watch.changed() => {
+            let _ = changed;
+            Err(MetadataDispatchError::ShuttingDown)
+        }
+    }
+}
+
+fn dispatch_panic_outcome(cancel_requested: bool) -> (&'static str, Option<&'static str>) {
+    if cancel_requested {
+        ("CANCELLED", None)
+    } else {
+        ("FAILED", Some("WORKER_PANICKED"))
+    }
+}
+
+impl MetadataFillMissingDispatchers {
+    async fn enqueue(
+        &self,
+        service: MetadataReidentifyService,
+        library_id: &str,
+        job_id: &str,
+    ) -> Result<Option<oneshot::Receiver<()>>, MetadataDispatchError> {
+        let (sender, pending_jobs, mut shutdown_watch) = {
+            let mut state = self.state.lock().await;
+            if state.shutting_down {
+                return Err(MetadataDispatchError::ShuttingDown);
+            }
+            if let Some(dispatcher) = state.by_library.get(library_id) {
+                (
+                    dispatcher.sender.clone(),
+                    Arc::clone(&dispatcher.pending_jobs),
+                    self.shutdown_watch.subscribe(),
+                )
+            } else {
+                let (sender, receiver) =
+                    mpsc::channel::<String>(METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY);
+                let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
+                let worker_pending_jobs = Arc::clone(&pending_jobs);
+                let worker_service = service.without_fill_missing_dispatchers();
+                let worker_run_service = worker_service.clone();
+                let worker_recovery_service = worker_service.clone();
+                let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
+                    receiver,
+                    worker_pending_jobs,
+                    move |job_id| {
+                        let service = worker_run_service.clone();
+                        async move { service.run(&job_id).await }
+                    },
+                    move |job_id| {
+                        let service = worker_recovery_service.clone();
+                        async move { service.fail_panicked_dispatch_job(&job_id).await }
+                    },
+                ));
+                state.by_library.insert(
+                    library_id.to_owned(),
+                    MetadataFillMissingDispatcher {
+                        sender: sender.clone(),
+                        pending_jobs: Arc::clone(&pending_jobs),
+                        worker,
+                    },
+                );
+                (sender, pending_jobs, self.shutdown_watch.subscribe())
+            }
+        };
+
+        let permit = reserve_fill_missing_queue_capacity(&sender, &mut shutdown_watch).await?;
+        let state = self.state.lock().await;
+        if state.shutting_down
+            || !state
+                .by_library
+                .get(library_id)
+                .is_some_and(|dispatcher| dispatcher.sender.same_channel(&sender))
+        {
+            return Err(MetadataDispatchError::ShuttingDown);
+        }
+        let mut pending = pending_jobs
+            .lock()
+            .map_err(|_| MetadataDispatchError::StateUnavailable)?;
+        if !pending.job_ids.insert(job_id.to_owned()) {
+            return Ok(None);
+        }
+        let (completion_sender, completion_receiver) = oneshot::channel();
+        pending
+            .completion_senders
+            .insert(job_id.to_owned(), completion_sender);
+        permit.send(job_id.to_owned());
+        drop(pending);
+        drop(state);
+        Ok(Some(completion_receiver))
+    }
+
+    async fn is_shutting_down(&self) -> Result<bool, MetadataDispatchError> {
+        Ok(self.state.lock().await.shutting_down)
+    }
+
+    async fn shutdown(&self) -> Option<Vec<JoinHandle<()>>> {
+        let dispatchers = {
+            let mut state = self.state.lock().await;
+            if state.shutting_down {
+                return None;
+            }
+            state.shutting_down = true;
+            self.shutdown_watch.send_replace(true);
+            std::mem::take(&mut state.by_library)
+        };
+        let mut workers = Vec::with_capacity(dispatchers.len());
+        for (_, dispatcher) in dispatchers {
+            drop(dispatcher.sender);
+            workers.push(dispatcher.worker);
+        }
+        Some(workers)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -217,8 +441,58 @@ impl Drop for MetadataJobOwnerGuard {
 }
 
 impl MetadataReidentifyService {
-    pub(crate) async fn shutdown(&self) {
-        self.actor_enrichment.shutdown().await;
+    pub async fn shutdown(&self) {
+        if let Some(dispatchers) = self.fill_missing_dispatchers.as_ref() {
+            if let Some(workers) = dispatchers.shutdown().await {
+                let actor_enrichment = self.actor_enrichment.clone();
+                tokio::spawn(async move {
+                    for worker in workers {
+                        if let Err(error) = worker.await {
+                            tracing::error!(
+                                worker_panicked = error.is_panic(),
+                                worker_cancelled = error.is_cancelled(),
+                                "FILL_MISSING dispatcher stopped during shutdown"
+                            );
+                        }
+                    }
+                    actor_enrichment.shutdown().await;
+                });
+            }
+        } else {
+            self.actor_enrichment.shutdown().await;
+        }
+    }
+
+    async fn fail_panicked_dispatch_job(&self, job_id: &str) {
+        if let Err(error) = self
+            .database
+            .fail_running_metadata_reidentify_items(job_id, "WORKER_PANICKED")
+            .await
+        {
+            tracing::error!(job_id, %error, "panicked metadata job items could not be reconciled");
+        }
+        let cancel_requested = self
+            .database
+            .metadata_reidentify_job_cancel_requested(job_id)
+            .await
+            .unwrap_or(false);
+        let (status, error_code) = dispatch_panic_outcome(cancel_requested);
+        match self
+            .database
+            .finish_metadata_reidentify_job(job_id, status, error_code)
+            .await
+        {
+            Ok(()) => self.publish_job_finished(job_id),
+            Err(error) => {
+                tracing::error!(job_id, %error, "panicked metadata job could not be marked failed")
+            }
+        }
+    }
+
+    fn without_fill_missing_dispatchers(&self) -> Self {
+        let mut service = self.clone();
+        service.fill_missing_dispatchers = None;
+        service
     }
 
     pub fn new<T>(database: Database, scraper: T) -> Self
@@ -237,6 +511,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -270,6 +545,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -297,6 +573,7 @@ impl MetadataReidentifyService {
             progress_events: MetadataProgressEventGate::default(),
             worker_permits: metadata_global_permits(),
             fill_missing_worker_permits: metadata_fill_missing_global_permits(),
+            fill_missing_dispatchers: Some(MetadataFillMissingDispatchers::default()),
             running_jobs: MetadataJobOwners::default(),
             library_job_creation: Arc::new(AsyncMutex::new(())),
             actor_enrichment: ActorEnrichmentQueue::new(),
@@ -362,6 +639,55 @@ impl MetadataReidentifyService {
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
         self.create_job_with_mode(item_ids, MetadataRefreshMode::FillMissing)
             .await
+    }
+
+    pub async fn enqueue_fill_missing_job(
+        &self,
+        job: &MetadataReidentifyJob,
+    ) -> Result<Option<oneshot::Receiver<()>>, MetadataDispatchError> {
+        if job.mode != MetadataRefreshMode::FillMissing.as_str() {
+            return Err(MetadataDispatchError::InvalidJob);
+        }
+        let Some(library_id) = job.library_id.as_deref() else {
+            return Err(MetadataDispatchError::InvalidJob);
+        };
+        self.enqueue_fill_missing_job_verified(&job.id, Some(library_id))
+            .await
+    }
+
+    pub(crate) async fn enqueue_fill_missing_job_id(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<oneshot::Receiver<()>>, MetadataDispatchError> {
+        self.enqueue_fill_missing_job_verified(job_id, None).await
+    }
+
+    async fn enqueue_fill_missing_job_verified(
+        &self,
+        job_id: &str,
+        expected_library_id: Option<&str>,
+    ) -> Result<Option<oneshot::Receiver<()>>, MetadataDispatchError> {
+        let Some(dispatchers) = self.fill_missing_dispatchers.as_ref() else {
+            return Err(MetadataDispatchError::ShuttingDown);
+        };
+        if dispatchers.is_shutting_down().await? {
+            return Err(MetadataDispatchError::ShuttingDown);
+        }
+        let job = self
+            .database
+            .find_metadata_reidentify_job(job_id)
+            .await
+            .map_err(|error| MetadataDispatchError::Storage(error.to_string()))?
+            .ok_or(MetadataDispatchError::InvalidJob)?;
+        let Some(library_id) = job.library_id.as_deref() else {
+            return Err(MetadataDispatchError::InvalidJob);
+        };
+        if job.mode != MetadataRefreshMode::FillMissing.as_str()
+            || expected_library_id.is_some_and(|expected| expected != library_id)
+        {
+            return Err(MetadataDispatchError::InvalidJob);
+        }
+        dispatchers.enqueue(self.clone(), library_id, job_id).await
     }
 
     pub(crate) async fn search_item_candidates(
@@ -1843,16 +2169,17 @@ mod tests {
 
     use serde_json::Value;
     use tempfile::TempDir;
-    use tokio::sync::Semaphore;
+    use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
     use super::{
         AUTO_MATCH_MIN_SCORE, METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT,
         METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage, MetadataCandidateView,
-        MetadataJobOwners, MetadataRefreshMode, MetadataRequestPlan,
-        acquire_metadata_worker_permit_or_cancel, best_automatic_candidate,
-        candidate_count_for_page, metadata_fill_missing_global_permits, metadata_global_permits,
-        metadata_request_plan_is_complete, metadata_worker_concurrency,
+        MetadataFillMissingPendingJobs, MetadataJobOwners, MetadataRefreshMode,
+        MetadataRequestPlan, acquire_metadata_worker_permit_or_cancel, best_automatic_candidate,
+        candidate_count_for_page, dispatch_panic_outcome, metadata_fill_missing_global_permits,
+        metadata_global_permits, metadata_request_plan_is_complete, metadata_worker_concurrency,
         metadata_worker_configured_concurrency, metadata_worker_default_concurrency,
+        reserve_fill_missing_queue_capacity, run_fill_missing_dispatcher_loop,
     };
     use crate::{
         application::{
@@ -2963,5 +3290,107 @@ mod tests {
             needs_images: true,
             ..MetadataRequestPlan::default()
         }));
+    }
+
+    #[tokio::test]
+    async fn fill_missing_dispatcher_continues_after_a_job_runner_panics() {
+        let (sender, receiver) = mpsc::channel(2);
+        let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
+        let mut completion_receivers = Vec::new();
+        {
+            let mut pending = pending_jobs.lock().expect("pending jobs lock");
+            for job_id in ["panics", "continues"] {
+                let (completion_sender, completion_receiver) = oneshot::channel();
+                pending.job_ids.insert(job_id.to_owned());
+                pending
+                    .completion_senders
+                    .insert(job_id.to_owned(), completion_sender);
+                completion_receivers.push(completion_receiver);
+            }
+        }
+        sender.send("panics".to_owned()).await.expect("queue open");
+        sender
+            .send("continues".to_owned())
+            .await
+            .expect("queue open");
+        drop(sender);
+
+        let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
+        let run_completed = completed_tx.clone();
+        let recovered = completed_tx;
+        run_fill_missing_dispatcher_loop(
+            receiver,
+            Arc::clone(&pending_jobs),
+            move |job_id| {
+                let completed = run_completed.clone();
+                async move {
+                    if job_id == "panics" {
+                        panic!("injected dispatcher job panic");
+                    }
+                    let _ = completed.send(format!("ran:{job_id}"));
+                }
+            },
+            move |job_id| {
+                let recovered = recovered.clone();
+                async move {
+                    let _ = recovered.send(format!("recovered:{job_id}"));
+                }
+            },
+        )
+        .await;
+
+        let observed = [
+            completed_rx.recv().await.expect("panic recovery recorded"),
+            completed_rx.recv().await.expect("next job still ran"),
+        ];
+        assert!(observed.contains(&"recovered:panics".to_owned()));
+        assert!(observed.contains(&"ran:continues".to_owned()));
+        for completion in completion_receivers {
+            completion.await.expect("dispatch completion signaled");
+        }
+        assert!(
+            pending_jobs
+                .lock()
+                .expect("pending jobs lock")
+                .job_ids
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn fill_missing_dispatcher_shutdown_wakes_a_submission_waiting_for_capacity() {
+        let (sender, _receiver) = mpsc::channel(1);
+        sender
+            .send("already-queued".to_owned())
+            .await
+            .expect("queue open");
+        let (shutdown_sender, _) = watch::channel(false);
+        let mut shutdown_watch = shutdown_sender.subscribe();
+        let mut waiting = Box::pin(reserve_fill_missing_queue_capacity(
+            &sender,
+            &mut shutdown_watch,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err(),
+            "a full dispatcher must apply backpressure before shutdown"
+        );
+        shutdown_sender.send_replace(true);
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_millis(100), waiting)
+                .await
+                .expect("shutdown should wake the waiting submission"),
+            Err(super::MetadataDispatchError::ShuttingDown)
+        ));
+    }
+
+    #[test]
+    fn panicked_fill_missing_job_preserves_a_requested_cancellation() {
+        assert_eq!(dispatch_panic_outcome(true), ("CANCELLED", None));
+        assert_eq!(
+            dispatch_panic_outcome(false),
+            ("FAILED", Some("WORKER_PANICKED"))
+        );
     }
 }

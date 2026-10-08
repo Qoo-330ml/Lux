@@ -3720,20 +3720,45 @@ async fn complete_local_metadata_completeness_for_item_ids(
                         return Err(error.to_string());
                     }
                 };
-                scheduled_job_ids.extend(completion.scheduled_job_ids);
+                scheduled_job_ids.extend(
+                    completion
+                        .scheduled_job_ids
+                        .into_iter()
+                        .map(|job_id| (library_id.clone(), job_id)),
+                );
             }
         }
     }
     if let Some(metadata_reidentify) = metadata_reidentify.cloned()
         && !scheduled_job_ids.is_empty()
     {
-        let user_events = user_events.clone();
-        tokio::spawn(async move {
-            for job_id in scheduled_job_ids {
-                metadata_reidentify.run(&job_id).await;
-                user_events.publish_home_coalesced().await;
+        let mut completions = Vec::with_capacity(scheduled_job_ids.len());
+        for (library_id, job_id) in scheduled_job_ids {
+            match metadata_reidentify
+                .enqueue_fill_missing_job_id(&job_id)
+                .await
+            {
+                Ok(Some(completion)) => completions.push(completion),
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        library_id,
+                        job_id,
+                        %error,
+                        "local metadata completeness job could not be dispatched"
+                    );
+                }
             }
-        });
+        }
+        if !completions.is_empty() {
+            let user_events = user_events.clone();
+            tokio::spawn(async move {
+                for completion in completions {
+                    let _ = completion.await;
+                    user_events.publish_home_coalesced().await;
+                }
+            });
+        }
     }
     Ok(())
 }
@@ -10424,10 +10449,22 @@ impl ScanJobService {
                 return;
             }
         };
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            metadata.run(&job_id).await;
-        });
+        if let Err(error) = metadata.enqueue_fill_missing_job(&job).await {
+            tracing::warn!(
+                scan_job_id,
+                %error,
+                "scan completed but automatic metadata matching could not be dispatched"
+            );
+            self.record_event(
+                scan_job_id,
+                "ERROR",
+                "METADATA_AUTO_MATCH_QUEUE_FAILED",
+                "自动元数据匹配任务创建失败",
+                "{}",
+            )
+            .await;
+            return;
+        }
         let details = format!(
             r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
             job.total_count, job.id
@@ -10483,7 +10520,6 @@ impl ScanJobService {
             );
             return;
         };
-        let mut queued_job_ids = Vec::new();
         for item_ids in item_ids.chunks(100) {
             let job = match metadata.create_fill_missing_job(item_ids.to_vec()).await {
                 Ok(job) => job,
@@ -10504,7 +10540,23 @@ impl ScanJobService {
                     continue;
                 }
             };
-            queued_job_ids.push(job.id.clone());
+            if let Err(error) = metadata.enqueue_fill_missing_job(&job).await {
+                tracing::warn!(
+                    scan_job_id,
+                    item_count = item_ids.len(),
+                    %error,
+                    "incremental scan completed but automatic metadata matching could not be dispatched"
+                );
+                self.record_event(
+                    scan_job_id,
+                    "ERROR",
+                    "METADATA_AUTO_MATCH_QUEUE_FAILED",
+                    "自动元数据匹配任务创建失败",
+                    "{}",
+                )
+                .await;
+                continue;
+            }
             let details = format!(
                 r#"{{"itemCount":{},"jobId":"{}","mode":"FILL_MISSING"}}"#,
                 job.total_count, job.id
@@ -10517,13 +10569,6 @@ impl ScanJobService {
                 &details,
             )
             .await;
-        }
-        if !queued_job_ids.is_empty() {
-            tokio::spawn(async move {
-                for job_id in queued_job_ids {
-                    metadata.run(&job_id).await;
-                }
-            });
         }
     }
 

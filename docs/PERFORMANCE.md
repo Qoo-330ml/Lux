@@ -1577,3 +1577,9 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 ### LUX-423 local metadata worker job-state fallback
 
 本地 metadata worker 在无 pending target 且没有 Notify 时，scan job 状态 reload fallback 从 1 秒调至 5 秒；Notify 和 stop watch 仍即时唤醒。worker 初始读取失败的 retry 与 image-stage waiter 保持 1 秒。通知回归断言仍为一次 query；5 秒配置回归锁定状态查询间隔。该配置变化会把跨进程状态观察延迟扩大到最多 5 秒，没有测量总体查询数、CPU 或 FNOS 收益。
+
+### LUX-424 扫描生成的 FILL_MISSING dispatcher
+
+全量扫描、增量扫描以及 completeness completion 产生的 `FILL_MISSING` job 按 library 交给持久 dispatcher。每个已触发 library 保留一个 runner，同库 job 顺序执行；每个队列容量为 32，队列满时提交方等待，仍在队列或运行中的相同 job ID 会合并。提交先取得容量，再在 shutdown 状态锁内去重和入队，避免取消留下虚假的 pending ID，也避免关闭之后越过队列边界。关闭会唤醒容量等待者并拒绝新提交；已接收队列在 Tokio runtime 仍运行期间排空，关闭调用不会等待长 job。单个 job runner panic 会将该 job 标记为失败并继续处理后续队列。扫描路径不再为每个补全 job 建立完整 runner task；completeness 路径保留一个轻量完成观察任务以维持首页失效事件时序。
+
+现有全局 `FILL_MISSING` item worker semaphore 仍限制最多 2 个 item 同时运行。测试锁定同库串行、32 项背压、重复 ID、背压取消后的重试、错误 library 路由、关闭唤醒、长 job 期间 shutdown 快速返回和单个 runner panic 后继续处理；这只说明调度上界，不统计总体 Tokio task 数、SQL、墙钟、CPU 或 FNOS 收益。管理员直接请求与计划任务入口仍待后续接入同一 dispatcher。

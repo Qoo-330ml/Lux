@@ -8935,6 +8935,24 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：worker 空闲时的 scan job 状态 refresh 从 1 秒 fallback 改为 5 秒；通知和 stop watch 仍即时唤醒，worker 启动读取错误及 image-stage waiter 的 1 秒 fallback 未改变。`local_metadata_worker_` 定向测试 4/4、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。只确认 fallback 配置和通知语义，未测总体 query/CPU 或 FNOS 收益；跨进程状态观察最迟延至 5 秒。
 
+#### LUX-424：扫描生成的 FILL_MISSING job 使用按 library 复用的 dispatcher
+
+范围：扫描后处理当前会为每个 `FILL_MISSING` job 建立独立 Tokio task。增加按 library 复用的持久 dispatcher，以有界队列接收 job ID，并由单个 runner 按序处理同一 library 的 job；队列满时对提交方施加背压，已持久化的 job 不得丢弃。将全量扫描、增量扫描和 completeness completion 生成的补全任务接入 dispatcher，保持数据库 job 生命周期、扫描事件、取消语义和现有全局最多两个 `FILL_MISSING` item worker 不变。dispatcher 关闭后拒绝新提交；服务关闭调用不等待队列执行完，已接收任务在 Tokio runtime 仍运行期间继续排空。
+
+验收：
+
+- [x] 同一 library 同时最多运行一个 `FILL_MISSING` job；另一 library 可有独立 dispatcher，item worker 总并发仍不超过 2。
+- [x] dispatcher 队列有明确容量，队列满时提交受背压；重复 job ID 不重复排队，失败提交不会遗失数据库中的 job。
+- [x] 全量扫描和增量扫描的自动补全入口均提交到 dispatcher，不再为每个 job 建立完整 runner task；扫描 job 事件内容保持一致。
+- [x] 关闭后拒绝新提交；关闭唤醒队列容量等待者，已接收队列在 runtime 仍运行期间排空，关闭调用不等待长 job；取消中的 job 按原语义完成收尾。
+- [x] 同 library 串行、不同 library 可调度、队列背压、重复提交、错误 library 路由、关闭唤醒和单个 job runner panic 后继续处理有自动化覆盖；定向 reidentify/scanning jobs、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 调度入口限于扫描和本地 completeness 自动补全；管理员直接请求和计划任务作为独立后续接线任务，不得绕过 dispatcher 扩大 runner 数量。
+- [x] 性能记录只报告队列容量、runner 数和已有 item worker 上限，不推断运行时 CPU、数据库耗时或 FNOS/NAS 收益。
+
+预计文件：`src/application/reidentify.rs`、`src/application/scanner.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加同库串行调度回归，再接入有界 dispatcher 并验证关闭行为。
+
+结果（2026-10-08）：扫描和本地 completeness 自动补全共用按 library 的容量 32 dispatcher；enqueue 先预留容量再在 shutdown 锁内去重，校验 job 的持久化 library/mode，关闭唤醒背压提交，单个 job runner panic 后将该 job 标记为 FAILED 并继续队列。`tests/reidentify.rs` 15/15、`tests/scanning_jobs.rs` 81/81、build、fmt、全目标全 feature Clippy、`git diff --check` 通过。全量测试的 library 部分 765 passed、13 ignored；随后在 `tests/emby_counts.rs:159` 遇到已于基线 `2b64ba65` 复现的无关计数失败（实际 1、预期 0）。本机 ARM64；没有 FNOS/NAS、PostgreSQL 或运行时 task 数/CPU A/B 证据。管理员和计划任务入口仍属后续任务。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
