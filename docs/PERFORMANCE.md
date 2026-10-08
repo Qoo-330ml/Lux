@@ -182,6 +182,21 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 
 page 耗时从本地 NFO 批处理入口开始，覆盖 source 校验、NFO 读取与解析、人物处理和 deferred credits flush。批次/耗时样本是进程内资源指标；指标名采用固定白名单，不记录 item ID、媒体路径或错误文本。ScanJobService 的 outbox、job worker、手动 refresh 和 scan 后处理共享同一个 `ResourceMetrics` 实例。该记录描述观测口径，不是吞吐基准，也不代表 PostgreSQL、FNOS/NAS 或 CPU 收益。
 
+### LUX-440 本地 NFO actor credits storage transaction 指标
+
+本地 NFO 页 deferred actor credits 每次调用批量 replacement storage API 时记录一次固定名称指标。单个事务最多包含 16 个 item；若页内条目更多，则按实际 chunk 分别计数。
+
+| 指标 | 口径 |
+|---|---|
+| `batch.local_nfo_actor_credits_tx.count` | 已尝试的 credits storage transaction 数；storage API 返回错误也计一次 |
+| `batch.local_nfo_actor_credits_tx.items` | 送入 replacement API 的 item 数累计值 |
+| `batch.local_nfo_actor_credits_tx.max_items` | 单个 transaction 的最大 item replacement 数 |
+| `batch.local_nfo_actor_credits_tx.credit_entries` | 送入 replacement API 前，各 item relation 中 actor credit 条目数之和；不是去重后的数据库行数 |
+| `batch.local_nfo_actor_credits_tx.success.count` / `batch.local_nfo_actor_credits_tx.error.count` | storage API 成功返回或错误返回的 transaction 数 |
+| `metadata.stageP95Ms.local_nfo_actor_credits_tx` | 最近最多 128 个事务耗时样本的 p95，毫秒 |
+
+事务计时包围完整的 storage replacement 调用，因此覆盖其内部锁等待、SQL 执行和 commit。credits transaction 失败会将对应 chunk item 标记为失败，也会反映在所属 NFO page 的错误计数中。指标只在进程内累计，不含 item/person ID、路径、标签或错误文本。测试验证输入数量、成功/失败、recent-window p95 和失败后的成功重试；这些自动化结果不代表 FNOS/NAS、PostgreSQL 延迟或 CPU 收益。
+
 ## ARM 开发机检查
 
 - 架构：后续记录 `uname -m` 输出（当前为 `arm64`）。

@@ -1,5 +1,7 @@
 use std::collections::{HashMap, HashSet};
 
+use crate::observability::resources::ResourceMetrics;
+
 use super::*;
 
 impl PeopleService {
@@ -198,9 +200,22 @@ impl PeopleService {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn flush_deferred_nfo_actor_credits(
         &self,
         deferred_credits: &DeferredNfoActorCredits,
+    ) -> Vec<NfoActorCreditsFlushFailure> {
+        self.flush_deferred_nfo_actor_credits_with_metrics(
+            deferred_credits,
+            &ResourceMetrics::new(),
+        )
+        .await
+    }
+
+    pub(crate) async fn flush_deferred_nfo_actor_credits_with_metrics(
+        &self,
+        deferred_credits: &DeferredNfoActorCredits,
+        resources: &ResourceMetrics,
     ) -> Vec<NfoActorCreditsFlushFailure> {
         let pending = std::mem::take(&mut *deferred_credits.pending.lock().await);
         let Some(database) = &self.database else {
@@ -218,10 +233,21 @@ impl PeopleService {
                     )
                 })
                 .collect::<Vec<_>>();
-            if let Err(error) = database
+            let credit_entry_count = chunk
+                .iter()
+                .map(|pending| pending.credits.len())
+                .fold(0_usize, usize::saturating_add);
+            let started_at = std::time::Instant::now();
+            let result = database
                 .replace_person_credits_batch_with_fingerprint(&replacements)
-                .await
-            {
+                .await;
+            resources.record_local_nfo_actor_credit_transaction(
+                chunk.len(),
+                credit_entry_count,
+                started_at.elapsed(),
+                result.is_ok(),
+            );
+            if let Err(error) = result {
                 failures.push(NfoActorCreditsFlushFailure {
                     item_ids: chunk
                         .iter()

@@ -1253,7 +1253,10 @@ impl MetadataEnricher {
             (&self.people, deferred_actor_credits.as_ref())
         {
             for failure in people
-                .flush_deferred_nfo_actor_credits(deferred_actor_credits)
+                .flush_deferred_nfo_actor_credits_with_metrics(
+                    deferred_actor_credits,
+                    &self.resources,
+                )
                 .await
             {
                 tracing::warn!(
@@ -3302,6 +3305,36 @@ mod tests {
             2
         );
         assert!(metrics.metadata.stage_p95_ms.contains_key("local_nfo_page"));
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.count"],
+            2
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.items"],
+            4
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.max_items"],
+            2
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.credit_entries"],
+            4
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.success.count"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_actor_credits_tx.error.count"],
+            1
+        );
+        assert!(
+            metrics
+                .metadata
+                .stage_p95_ms
+                .contains_key("local_nfo_actor_credits_tx")
+        );
         let indexed_items: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM person_index_item_state
              WHERE item_id IN (

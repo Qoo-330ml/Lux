@@ -9172,6 +9172,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：移除了扫描 completeness、outbox/backfill 与图片 batch 合同上 7 处“下一阶段消费者”类型抑制和两个实现块级宽泛抑制。正常 build 先暴露 8 组确实只供 storage 合同回归使用的入口/字段；核对调用点后，将例外缩小到具体方法、类型或测试专用常量，并为每项注明它覆盖的持久化行为。没有删仍由回归覆盖的单项状态转换，也未改变 schema、队列状态、事务边界或运行期入口。`cargo test --locked --lib storage::repository::repository_tests` 119 passed、8 ignored；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本轮仍保留的其他范围 dead-code 抑制属于 scan-manifest LUX-266/267 边界、字幕/Emby migration 接口和测试夹具；本任务没有扩大清理范围。
 
+#### LUX-440：记录本地人物 credits 事务耗时与 item 写入量
+
+范围：LUX-435 已将本地 NFO 页人物 credits 按最多 16 个 item 共用一个 storage transaction，但当前运行指标只记录整页耗时。每个 deferred credits storage transaction 增加固定低基数指标：事务数、transaction 输入 item replacement 数及最大批量、输入 actor credit 条目数、成功/失败数和最近 128 个事务耗时样本的 p95。复用 LUX-438 的 `ResourceMetrics`，不记录 item ID、路径、人物 ID 或错误文本；credit 条目数表示去重前的输入量，不伪称数据库实际变更行数。
+
+验收：
+
+- [x] deferred NFO credits 的每个 storage transaction 只记录一次指标；计数区分 transaction 数、输入 item replacement 数、最大每事务 item 数、credit 条目数和成功/失败。
+- [x] 事务耗时覆盖 storage 锁、事务执行与 commit；最近 128 个样本计算 `stageP95Ms`，指标名固定且无 item/person 标签。
+- [x] 本地 NFO page 回归验证 credits 失败会计为失败事务并与现有 page 错误指标一致；成功回归验证 item/credit 数准确。
+- [x] people relation、metadata page 与 metrics 定向测试、build、fmt、Clippy、差异检查通过；文档明确计数口径和本机验证边界，不声称生产收益。
+
+预计文件：`src/observability/resources.rs`、`src/application/people/relations.rs`、`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加资源快照及失败 credits page 的回归，再在每个 deferred storage transaction 周围记录固定名称指标并复用 MetadataEnricher 的 metrics。
+
+结果（2026-10-08）：本地 NFO page 的每个 deferred credits storage 调用均记录固定低基数 transaction 指标。计时覆盖 replacement storage 调用，包括 storage lock、事务执行和 commit；credit entry 数按送入 storage 前的 relation 输入条目计，不冒充数据库变更行数。回归注入 credits 写入失败并重试，确认失败和成功 transaction 各计一次、输入 item/credit 数为 4、最大每事务 2 item，page 错误计数同步增加。资源指标的固定名称、输入/结果计数和最近 128 个样本 p95 单测通过；people deferred credits 与 NFO page 回归通过。`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；本机 ARM64。`cargo test --locked --all-targets --no-fail-fast` 的 library 部分 781 passed、13 ignored，集成测试中 4 项仍失败：`emby_counts`（实际 1、期望 0）、`metadata`（unchanged NFO 期望加载 1、实际 0）、`metadata_selection`（等待可选 actor enrichment 超时）和 `strm`（401、期望 200）。这些与父提交 `855d890a` 的既有验收记录相同；该父提交是当前 HEAD 的祖先，相关集成测试文件未改动，其余已执行目标通过。没有把本机测试推断为生产 PostgreSQL 延迟、FNOS/NAS 或 CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

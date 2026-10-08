@@ -127,6 +127,58 @@ impl ResourceMetrics {
         self.record_metadata_stage(stage, duration);
     }
 
+    pub fn record_local_nfo_actor_credit_transaction(
+        &self,
+        item_replacement_count: usize,
+        credit_entry_count: usize,
+        duration: Duration,
+        success: bool,
+    ) {
+        const STAGE: &str = "local_nfo_actor_credits_tx";
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        let item_count = u64::try_from(item_replacement_count).unwrap_or(u64::MAX);
+        let credit_count = u64::try_from(credit_entry_count).unwrap_or(u64::MAX);
+        increment_counter(
+            &mut metrics.counters,
+            "batch.local_nfo_actor_credits_tx.count",
+            1,
+        );
+        increment_counter(
+            &mut metrics.counters,
+            "batch.local_nfo_actor_credits_tx.items",
+            item_count,
+        );
+        increment_counter(
+            &mut metrics.counters,
+            "batch.local_nfo_actor_credits_tx.credit_entries",
+            credit_count,
+        );
+        let max_items = metrics
+            .counters
+            .entry("batch.local_nfo_actor_credits_tx.max_items".to_owned())
+            .or_default();
+        *max_items = (*max_items).max(item_count);
+        increment_counter(
+            &mut metrics.counters,
+            if success {
+                "batch.local_nfo_actor_credits_tx.success.count"
+            } else {
+                "batch.local_nfo_actor_credits_tx.error.count"
+            },
+            1,
+        );
+        let samples = metrics
+            .durations_ms
+            .entry(STAGE.to_owned())
+            .or_insert_with(|| VecDeque::with_capacity(METADATA_METRIC_SAMPLE_CAPACITY));
+        if samples.len() == METADATA_METRIC_SAMPLE_CAPACITY {
+            samples.pop_front();
+        }
+        samples.push_back(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    }
+
     pub fn record_metadata_request(&self, capability: &str, cache_hit: bool) {
         let Some(capability) = metadata_capability_name(capability) else {
             return;
@@ -987,6 +1039,66 @@ mod tests {
                 .metadata
                 .counters
                 .contains_key("batch.item-123.count")
+        );
+    }
+
+    #[tokio::test]
+    async fn local_nfo_actor_credit_transaction_metrics_track_inputs_and_outcomes() {
+        let metrics = ResourceMetrics::new();
+        metrics.record_local_nfo_actor_credit_transaction(1, 2, Duration::from_millis(10), true);
+        metrics.record_local_nfo_actor_credit_transaction(2, 3, Duration::from_millis(20), false);
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_actor_credits_tx.count"],
+            2
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_actor_credits_tx.items"],
+            3
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_actor_credits_tx.max_items"],
+            2
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_actor_credits_tx.credit_entries"],
+            5
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_actor_credits_tx.success.count"],
+            1
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_actor_credits_tx.error.count"],
+            1
+        );
+        assert_eq!(
+            snapshot.metadata.stage_p95_ms["local_nfo_actor_credits_tx"],
+            20
+        );
+    }
+
+    #[tokio::test]
+    async fn local_nfo_actor_credit_transaction_p95_uses_only_the_recent_window() {
+        let metrics = ResourceMetrics::new();
+        for duration_ms in 0..130 {
+            metrics.record_local_nfo_actor_credit_transaction(
+                1,
+                1,
+                Duration::from_millis(duration_ms),
+                true,
+            );
+        }
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_actor_credits_tx.count"],
+            130
+        );
+        assert_eq!(
+            snapshot.metadata.stage_p95_ms["local_nfo_actor_credits_tx"],
+            123
         );
     }
 
