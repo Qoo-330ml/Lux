@@ -375,6 +375,7 @@ struct PendingNfoActorCredits {
     item_id: String,
     credits: Vec<NewPersonCredit>,
     source_fingerprint: Option<String>,
+    relation_checksum: String,
 }
 
 pub(crate) struct NfoActorCreditsFlushFailure {
@@ -998,6 +999,7 @@ fn detected_profile_image_format(bytes: &[u8]) -> Option<(&'static str, &'static
 mod tests {
     use std::{
         collections::{BTreeMap, BTreeSet, HashSet},
+        path::Path,
         sync::Arc,
     };
     use tokio::sync::Mutex as AsyncMutex;
@@ -1026,6 +1028,32 @@ mod tests {
         0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
         0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
     ];
+
+    async fn assert_relation_checksum_matches_file(
+        database: &Database,
+        config_dir: &Path,
+        item_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let relation_bytes =
+            tokio::fs::read(library_item_directory(config_dir, item_id)?.join("people.json"))
+                .await?;
+        let expected_checksum = Sha256::digest(&relation_bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>();
+        let stored_checksum: Option<String> = sqlx::query_scalar(
+            "SELECT relation_checksum FROM person_index_item_state WHERE item_id = ?",
+        )
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            stored_checksum.as_deref(),
+            Some(expected_checksum.as_str()),
+            "the index state must checksum the exact bytes written to people.json for {item_id}"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn person_index_rebuild_requests_coalesce_while_a_run_is_active() {
@@ -2653,6 +2681,8 @@ mod tests {
         service
             .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
             .await?;
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-1").await?;
+
         assert!(
             service
                 .item_actor_relation_is_current("item-1", &source_fingerprint)
@@ -2768,6 +2798,9 @@ mod tests {
                 .item_actor_relation_is_current("item-b", &fingerprint_b)
                 .await?
         );
+        for item_id in ["item-a", "item-b"] {
+            assert_relation_checksum_matches_file(&database, &config.config_dir, item_id).await?;
+        }
         database.close().await;
         Ok(())
     }

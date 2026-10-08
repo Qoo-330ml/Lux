@@ -59,6 +59,10 @@ pub(super) fn encode_fingerprint(fingerprint: &[u8]) -> String {
     encoded
 }
 
+pub(super) fn relation_snapshot_checksum(bytes: &[u8]) -> String {
+    encode_fingerprint(&Sha256::digest(bytes))
+}
+
 pub(super) fn decode_fingerprint(value: &str) -> Option<Vec<u8>> {
     if value.is_empty() || value.len() % 2 != 0 {
         return None;

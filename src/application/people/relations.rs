@@ -230,6 +230,7 @@ impl PeopleService {
                         pending.item_id.as_str(),
                         pending.credits.as_slice(),
                         pending.source_fingerprint.as_deref(),
+                        Some(pending.relation_checksum.as_str()),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -239,7 +240,7 @@ impl PeopleService {
                 .fold(0_usize, usize::saturating_add);
             let started_at = std::time::Instant::now();
             let result = database
-                .replace_person_credits_batch_with_fingerprint(&replacements)
+                .replace_person_credits_batch_with_relation_checksum(&replacements)
                 .await;
             resources.record_local_nfo_actor_credit_transaction(
                 chunk.len(),
@@ -352,6 +353,7 @@ impl PeopleService {
         }
         let bytes = serde_json::to_vec_pretty(&relation)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        let relation_checksum = relation_snapshot_checksum(&bytes);
         write_atomically(relation_path, &bytes).await?;
         if let Some(database) = &self.database {
             let credits = relation
@@ -360,10 +362,11 @@ impl PeopleService {
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits_with_fingerprint(
+                .replace_person_credits_with_relation_checksum(
                     item_id,
                     &credits,
                     relation.source_fingerprint.as_deref(),
+                    Some(&relation_checksum),
                 )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
@@ -699,6 +702,7 @@ impl PeopleService {
         };
         let bytes = serde_json::to_vec_pretty(&relation)
             .map_err(|source| PeopleError::Serialization(source.to_string()))?;
+        let relation_checksum = relation_snapshot_checksum(&bytes);
         write_atomically(relation_path, &bytes).await?;
         if let Some(database) = &self.database {
             let credits = relation
@@ -715,13 +719,15 @@ impl PeopleService {
                         item_id: item_id.to_owned(),
                         credits,
                         source_fingerprint: relation.source_fingerprint.clone(),
+                        relation_checksum,
                     });
             } else {
                 database
-                    .replace_person_credits_with_fingerprint(
+                    .replace_person_credits_with_relation_checksum(
                         item_id,
                         &credits,
                         relation.source_fingerprint.as_deref(),
+                        Some(&relation_checksum),
                     )
                     .await
                     .map_err(|error| PeopleError::Storage(error.to_string()))?;

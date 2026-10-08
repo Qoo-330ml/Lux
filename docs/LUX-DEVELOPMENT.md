@@ -9366,18 +9366,31 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-453：从人物关系文件快照贯通 checksum 写入
 
-范围：在读取 `people.json` 时保留实际原始字节并计算 SHA-256 小写十六进制；所有关系文件更新路径在文件原子替换后，将同一份待写字节的 checksum 随 credits 一起交给 LUX-452 storage API。包含 NFO deferred credits 页批次和索引重建读取，避免从解析对象重新序列化计算或重复读取文件。文件系统与数据库不能共享原子事务；DB 写失败后关系文件仍可作为恢复来源，索引 current 检查必须由后续任务识别不一致。
+范围：人物关系持久化和 NFO deferred credits 页批次对即将原子写入的 `people.json` 字节计算 SHA-256 小写十六进制，并将同一份待写字节的 checksum 随 credits 一起交给 LUX-452 storage API。不从解析对象再次序列化计算，也不重复读取文件。人物 metadata 改写留给 LUX-454；读取快照、索引重建与 current 检查留给 LUX-455。文件系统与数据库不能共享原子事务；DB 写失败后关系文件仍可作为恢复来源。
 
 验收：
 
-- [ ] checksum 对实际写入或读取的原始文件字节计算，不重序列化关系对象，也不额外读取同一文件。
-- [ ] 人物关系持久化、person metadata 更新、NFO deferred credits 批次与索引重建均将正确 checksum 与 credits/fingerprint 一起提交。
-- [ ] relation 文件先提交而 credits 事务失败后，后续 current 判断有足够 checksum 状态检测不一致；不改变文件格式和 public API。
-- [ ] `tests/people_api.rs` 覆盖关系文件变化但 source fingerprint 不变时保存新 checksum；相关 storage/people tests、build、fmt、Clippy 与差异检查通过。
+- [x] checksum 对即将持久化的原始文件字节计算，不重序列化关系对象，也不额外读取同一文件。
+- [x] 人物关系 immediate 持久化与 NFO deferred credits 批次均将正确 checksum 与 credits/fingerprint 一起提交。
+- [x] `service.rs` 人物服务回归覆盖 immediate 与 deferred 写回均保存实际文件 checksum；相关 storage/people tests、build、fmt、Clippy 与差异检查通过。
 
-预计文件：`src/application/people/helpers.rs`、`src/application/people/relations.rs`、`src/application/people/metadata.rs`、`src/application/people/rebuild.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 raw snapshot checksum 读写回归，再贯通 immediate/deferred credits 路径。
+预计文件：`src/application/people/helpers.rs`、`src/application/people/relations.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 raw snapshot checksum 读写回归，再贯通 immediate/deferred credits 路径。
 
-#### LUX-454：按人物关系快照 checksum 判定运行索引是否 current
+结果（2026-10-09）：即将写入的关系 JSON 字节只序列化一次，并对同一份字节计算 SHA-256 小写十六进制；immediate relation persist 与 deferred NFO credits flush 在 credits transaction 中保存相同 checksum。服务回归核对数据库值等于实际文件字节 checksum。`application::people::service::tests` 39/39、`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。PostgreSQL/FNOS 未运行；跨文件系统与数据库的恢复校验留给 LUX-455。
+
+#### LUX-454：人物 metadata 改写同步关系快照 checksum
+
+范围：`update_item_actor_metadata` 和 `update_person_metadata` 会改写 `people.json` 并替换对应 credits；将待写文件原始字节的 SHA-256 checksum 与 credits、source fingerprint 一起提交，避免这些写回路径留下 checksum 为空或过期的索引状态。迁移完调用方后，将不再使用的 fingerprint-only 单项 wrapper 限制为测试使用。文件格式和 public API 不变，文件系统与数据库的持久化边界仍分别处理。
+
+验收：
+
+- [ ] actor metadata 与 person metadata 更新后，数据库保存的 relation checksum 等于实际 `people.json` 字节的 SHA-256。
+- [ ] relation 文件先写入、credits/checksum 事务失败时保留文件作为恢复来源；不重复读盘或重序列化计算 checksum。
+- [ ] service 回归覆盖两种 metadata 更新路径；相关 people tests、build、fmt、Clippy 与差异检查通过。
+
+预计文件：`src/application/people/metadata.rs`、`src/application/people/service.rs`、`src/storage/people.rs`、`docs/LUX-DEVELOPMENT.md`。先在现有 metadata 更新回归中加入实际文件 checksum 断言，再将 checksum 传入 credits transaction，并把已退出生产路径的 wrapper 限制为测试使用。
+
+#### LUX-455：按人物关系快照 checksum 判定运行索引是否 current
 
 范围：将人物关系 skip/current 检查统一切换为 source fingerprint、原始 relation checksum 和 schema version 三者比较。checksum 缺失的旧行和文件变化但 source fingerprint 不变的记录必须判 stale，并进入现有批量重建流程；无数据库时保留当前文件内 source fingerprint 校验语义。
 
@@ -9385,7 +9398,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 - [ ] `item_actor_relation_is_current`、`nfo_relation_snapshot_is_current` 与 index rebuild skip 路径都比较关系 checksum。
 - [ ] 旧行 checksum 为 NULL、文件 checksum 改变、source fingerprint 改变或 schema version 变化都会触发重建；全部匹配才跳过。
-- [ ] `tests/people_api.rs` 覆盖旧 NULL 行和相同 source fingerprint 下文件字节改变；storage 回归覆盖 checksum、source fingerprint 和 schema version 三维匹配。
+- [ ] service/storage 回归覆盖旧 NULL 行和相同 source fingerprint 下文件字节改变；rebuild skip path 只有在 checksum、source fingerprint 和 schema version 均匹配时才跳过。
 - [ ] 相关 people/storage tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
 
 预计文件：`src/storage/library.rs`、`src/application/people/service.rs`、`src/application/people/rebuild.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先锁定 checksum mismatch/legacy stale 回归，再替换 current 判定入口。
