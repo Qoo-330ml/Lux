@@ -14872,6 +14872,124 @@ async fn changed_local_fill_request_during_running_item_is_not_lost()
 }
 
 #[tokio::test]
+async fn person_credit_page_replacement_commits_all_items_atomically() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("People", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    for item_id in ["credit-page-a", "credit-page-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+
+    let credit = |person_id: &str| NewPersonCredit {
+        person_id: person_id.to_owned(),
+        lux_person_id: None,
+        person_type: "Actor".to_owned(),
+        person_name: person_id.to_owned(),
+        provider: "tmdb".to_owned(),
+        role: "Actor".to_owned(),
+        sort_order: 0,
+        biography: None,
+        birthday: None,
+        deathday: None,
+        known_for_department: None,
+        place_of_birth: None,
+        provider_ids: std::collections::BTreeMap::new(),
+        genres: Vec::new(),
+        tags: Vec::new(),
+        production_locations: Vec::new(),
+        premiere_date: None,
+        production_year: None,
+        taglines: Vec::new(),
+    };
+    let credits_a = [credit("actor-a")];
+    let credits_b = [credit("actor-b")];
+    let replacements = [
+        ("credit-page-a", credits_a.as_slice(), Some("fingerprint-a")),
+        ("credit-page-b", credits_b.as_slice(), Some("fingerprint-b")),
+    ];
+
+    sqlx::query(
+        "CREATE TRIGGER fail_second_person_credit_page_state
+         BEFORE INSERT ON person_index_item_state
+         WHEN NEW.item_id = 'credit-page-b'
+         BEGIN SELECT RAISE(ABORT, 'forced second item failure'); END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("failure trigger");
+    assert!(
+        database
+            .replace_person_credits_batch_with_fingerprint(&replacements)
+            .await
+            .is_err()
+    );
+    let row_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits
+         WHERE item_id IN ('credit-page-a', 'credit-page-b')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("credits after rollback");
+    assert_eq!(row_count, 0, "the failed page must roll back both items");
+    let state_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_index_item_state
+         WHERE item_id IN ('credit-page-a', 'credit-page-b')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("states after rollback");
+    assert_eq!(state_count, 0, "the failed page must roll back both states");
+
+    sqlx::query("DROP TRIGGER fail_second_person_credit_page_state")
+        .execute(database.pool())
+        .await
+        .expect("drop failure trigger");
+    database
+        .replace_person_credits_batch_with_fingerprint(&replacements)
+        .await
+        .expect("replace whole page");
+    assert!(
+        database
+            .person_index_item_state_is_current("credit-page-a", Some("fingerprint-a"))
+            .await
+            .expect("first item fingerprint")
+    );
+    assert!(
+        database
+            .person_index_item_state_is_current("credit-page-b", Some("fingerprint-b"))
+            .await
+            .expect("second item fingerprint")
+    );
+    let stored_credit_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM person_credits
+         WHERE item_id IN ('credit-page-a', 'credit-page-b')",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("stored page credits");
+    assert_eq!(stored_credit_count, 2);
+}
+
+#[tokio::test]
 async fn person_credit_refresh_preserves_unchanged_rows() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

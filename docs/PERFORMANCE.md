@@ -1625,3 +1625,7 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 ### LUX-432 人物 relation 与 credits revision 一致性
 
 当 relation 旁车 fingerprint 与请求匹配时，有数据库的 PeopleService 还查询 `person_index_item_state`，只有相同 source fingerprint 和 relation schema 才跳过同步。文件写入成功而 credits/index 更新失败时，下一次扫描会重试 credits；无数据库的服务仍只依据 relation 文件。该自愈检查每次已匹配 relation 增加一次应用层数据库查询；没有将 JSON 文件与 SQL 放入同一原子事务，也没有测量吞吐或墙钟收益。
+
+### LUX-433 人物 credits 索引恢复写事务
+
+人物索引重建仍按最多 100 个 item 读取关系、批量解析身份；credit replacement 改为每 16 个 item 一个 metadata write transaction 和 credits 锁，一个 100-item 页最多 7 个事务，避免过去逐 item 最多 100 次事务。单个 chunk 内的 SQL 失败会回滚该 chunk；此前已提交的 chunk 保留 fingerprint，重试时可跳过已完成 item。每 item 的已有 credits 查询和 DML 仍保留，所以这不是总 SQL 调用数对比，也没有 PostgreSQL 时延、锁等待、FNOS/NAS 或 CPU 测量。

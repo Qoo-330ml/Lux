@@ -2,6 +2,7 @@ use super::*;
 
 const PERSON_MANIFEST_IDENTITY_BATCH_SIZE: usize = 100;
 const PERSON_MANIFEST_STATE_QUERY_BATCH_SIZE: usize = 100;
+const PERSON_CREDIT_REPLACEMENT_BATCH_SIZE: usize = 16;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PersonCreditKey {
@@ -375,9 +376,52 @@ impl Database {
         credits: &[NewPersonCredit],
         source_fingerprint: Option<&str>,
     ) -> Result<(), StorageError> {
-        let _metadata_write_guard = self.acquire_metadata_write_lock().await;
-        let _write_guard = self.person_credits_write_lock.lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.replace_person_credits_batch_with_fingerprint(&[(
+            item_id,
+            credits,
+            source_fingerprint,
+        )])
+        .await
+    }
+
+    pub(crate) async fn replace_person_credits_batch_with_fingerprint(
+        &self,
+        replacements: &[(&str, &[NewPersonCredit], Option<&str>)],
+    ) -> Result<(), StorageError> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
+        for replacement_chunk in replacements.chunks(PERSON_CREDIT_REPLACEMENT_BATCH_SIZE) {
+            let _metadata_write_guard = self.acquire_metadata_write_lock().await;
+            let _write_guard = self.person_credits_write_lock.lock().await;
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            for (item_id, credits, source_fingerprint) in replacement_chunk {
+                self.replace_person_credits_in_transaction(
+                    &mut transaction,
+                    item_id,
+                    credits,
+                    *source_fingerprint,
+                )
+                .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn replace_person_credits_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_id: &str,
+        credits: &[NewPersonCredit],
+        source_fingerprint: Option<&str>,
+    ) -> Result<(), StorageError> {
         let mut seen_keys = HashSet::with_capacity(credits.len());
         let mut duplicates_skipped = 0;
         let mut prepared = Vec::with_capacity(credits.len());
@@ -413,7 +457,7 @@ impl Database {
                  WHERE item_id = ?",
             )
             .bind(item_id)
-            .fetch_all(&mut *transaction)
+            .fetch_all(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -454,7 +498,7 @@ impl Database {
                     .bind(&key.role);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -528,7 +572,7 @@ impl Database {
                     .bind(&credit.lux_person_id);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -553,19 +597,12 @@ impl Database {
         )
         .bind(item_id)
         .bind(source_fingerprint)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
         Ok(())
     }
 

@@ -509,18 +509,24 @@ impl PeopleService {
                 .into_iter()
                 .map(|(provider, provider_id, person_id)| ((provider, provider_id), person_id))
                 .collect::<BTreeMap<_, _>>();
-            for (item_id, relation) in pending {
-                let credits =
-                    self.person_credits_from_relation_with_lookup(&relation, &identity_lookup);
-                database
-                    .replace_person_credits_with_fingerprint(
-                        &item_id,
-                        &credits,
-                        relation.source_fingerprint.as_deref(),
-                    )
-                    .await
-                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
-            }
+            let credit_replacements = pending
+                .into_iter()
+                .map(|(item_id, relation)| {
+                    let credits =
+                        self.person_credits_from_relation_with_lookup(&relation, &identity_lookup);
+                    (item_id, credits, relation.source_fingerprint)
+                })
+                .collect::<Vec<_>>();
+            let credit_replacement_refs = credit_replacements
+                .iter()
+                .map(|(item_id, credits, fingerprint)| {
+                    (item_id.as_str(), credits.as_slice(), fingerprint.as_deref())
+                })
+                .collect::<Vec<_>>();
+            database
+                .replace_person_credits_batch_with_fingerprint(&credit_replacement_refs)
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()))?;
             if let Some(cursor_id) = cursor_id.as_deref()
                 && database
                     .update_person_index_rebuild_progress(

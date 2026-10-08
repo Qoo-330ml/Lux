@@ -9071,6 +9071,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：有数据库的 PeopleService 现在只有在旁车 source fingerprint 与数据库 `person_index_item_state` fingerprint/schema revision 同时匹配时才跳过 NFO actor 同步；无数据库服务继续只检查旁车。回归曾在旧逻辑下观察到数据库 credits/index state 删除后仍返回 current，修复后返回 stale，重新写入后恢复 current。NFO relation 单测 3/3、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；该方案通过后续扫描自愈，不提供文件与数据库的跨持久化原子提交，也没有测量运行时收益。
 
+#### LUX-433：按人物索引恢复页批量提交 credits
+
+范围：人物索引重建已按最多 100 个 item 读取关系，并批量解析 canonical identities，但对每个 item 分别获取 metadata/credits 写锁并提交事务。新增批量 credits replacement，使每个最多 16 个 item 的有界写 chunk 共享一次写锁和 metadata transaction，再按现有每 item fingerprint、去重、删除过期 credit、条件 UPSERT 和 relation schema 状态写入。接入 index rebuild 页；保留页内 identity lookup、进度游标和 cancellation 检查边界，不改变 schema/API。
+
+验收：
+
+- [x] 批量存储回归验证多个 item 的 credits 与 fingerprint 一致，且同一写 chunk 内 SQL 错误回滚该 chunk，避免部分更新。
+- [x] 人物索引重建服务与管理 API 定向回归通过，build、fmt、Clippy 与差异检查通过。
+- [x] 代码路径确认每 100 个 item 至多获取 7 次 credits 写锁/metadata transaction；性能记录只陈述事务边界，不外推生产时延或数据库收益。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、`src/application/people/rebuild.rs`、两份开发/性能记录。第一步先添加批量 storage contract 回归，第二步实现单事务批量写入，第三步把重建页连接到新入口。
+
+结果（2026-10-08）：人物索引重建的最多 100-item 页现在交给 credits batch replacement；storage 每 16 个 item 共享一次 metadata/credits 写锁和事务，因此每页最多 7 个事务，事务内保留逐 item 既有键读取、差异删除、条件 UPSERT 与 fingerprint 更新。两 item 回归验证第二个 item 的 SQL 失败会回滚整个当前 16-item chunk，且成功重试后两条索引状态与 credits 正确。storage unchanged-row 回归、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和差异检查通过。本机 ARM64；没有统计 PostgreSQL query latency、生产事务耗时、FNOS/NAS 或 CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
