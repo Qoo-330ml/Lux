@@ -168,6 +168,20 @@ LUX-200 的后台元数据指标通过管理员健康资源接口中的 `resourc
 
 本机架构需以 `uname -m` 记录；ARM64 测试结果不能外推到目标 NAS/x86_64。
 
+## 本地 NFO page 运行指标
+
+管理员资源快照中的 `metadata.counters` 固定记录本地 NFO page：
+
+| 指标 | 口径 |
+|---|---|
+| `batch.local_nfo_page.count` | NFO page 调用次数 |
+| `batch.local_nfo_page.items` | 每次调用入口处 source snapshot 条目数的累计值，包含后续被排除或校验为过期的条目 |
+| `batch.local_nfo_page.max_items` | 单次调用入口处 source snapshot 的最大条目数 |
+| `batch.local_nfo_page.success.count` / `batch.local_nfo_page.error.count` | 完整成功或含 item/批次错误的 page 数；一个 page 只计入其中一项 |
+| `metadata.stageP95Ms.local_nfo_page` | 最近最多 128 个 page 耗时样本的 p95，毫秒 |
+
+page 耗时从本地 NFO 批处理入口开始，覆盖 source 校验、NFO 读取与解析、人物处理和 deferred credits flush。批次/耗时样本是进程内资源指标；指标名采用固定白名单，不记录 item ID、媒体路径或错误文本。ScanJobService 的 outbox、job worker、手动 refresh 和 scan 后处理共享同一个 `ResourceMetrics` 实例。该记录描述观测口径，不是吞吐基准，也不代表 PostgreSQL、FNOS/NAS 或 CPU 收益。
+
 ## ARM 开发机检查
 
 - 架构：后续记录 `uname -m` 输出（当前为 `arm64`）。

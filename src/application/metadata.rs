@@ -4,6 +4,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,7 @@ use crate::{
         people::{DeferredNfoActorCredits, PeopleService},
     },
     domain::ids::LibraryId,
+    observability::resources::ResourceMetrics,
     storage::{
         Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
         StoredItemImage, StoredMediaMetadata, StoredMediaSourcePath, StoredScanLocalMetadataSource,
@@ -667,6 +669,7 @@ pub struct MetadataEnricher {
     database: Database,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
+    resources: ResourceMetrics,
 }
 
 #[derive(Default)]
@@ -855,7 +858,13 @@ impl MetadataEnricher {
             database,
             people: None,
             local_nfo: None,
+            resources: ResourceMetrics::new(),
         }
+    }
+
+    pub fn with_resource_metrics(mut self, resources: ResourceMetrics) -> Self {
+        self.resources = resources;
+        self
     }
 
     pub fn with_people(mut self, people: PeopleService) -> Self {
@@ -1144,6 +1153,28 @@ impl MetadataEnricher {
     }
 
     pub(crate) async fn enrich_scan_local_metadata_batch_nfo(
+        &self,
+        source_snapshot: Vec<StoredScanLocalMetadataSource>,
+        excluded_item_ids: &[String],
+    ) -> Result<ScanLocalMetadataNfoBatch, MetadataError> {
+        let item_count = source_snapshot.len();
+        let started = Instant::now();
+        let result = self
+            .enrich_scan_local_metadata_batch_nfo_inner(source_snapshot, excluded_item_ids)
+            .await;
+        let complete = result
+            .as_ref()
+            .is_ok_and(|batch| batch.report.failed_item_ids.is_empty());
+        self.resources.record_metadata_batch(
+            "local_nfo_page",
+            item_count,
+            started.elapsed(),
+            complete,
+        );
+        result
+    }
+
+    async fn enrich_scan_local_metadata_batch_nfo_inner(
         &self,
         source_snapshot: Vec<StoredScanLocalMetadataSource>,
         excluded_item_ids: &[String],
@@ -3189,7 +3220,10 @@ mod tests {
         assert_eq!(entry_ids.len(), entries.len());
 
         let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
-        let enricher = MetadataEnricher::new(database.clone()).with_people(people.clone());
+        let resources = ResourceMetrics::new();
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_people(people.clone())
+            .with_resource_metrics(resources.clone());
         let image_batch = enricher
             .index_scan_local_metadata_batch_images(&entry_ids)
             .await?;
@@ -3256,6 +3290,18 @@ mod tests {
             .await?;
         assert_eq!(retry_batch.report.nfo_failed, 1);
         assert_eq!(retry_batch.report.failed_item_ids, vec![invalid_item_id]);
+        let metrics = resources.snapshot().await;
+        assert_eq!(metrics.metadata.counters["batch.local_nfo_page.count"], 2);
+        assert_eq!(metrics.metadata.counters["batch.local_nfo_page.items"], 6);
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_page.max_items"],
+            3
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_page.error.count"],
+            2
+        );
+        assert!(metrics.metadata.stage_p95_ms.contains_key("local_nfo_page"));
         let indexed_items: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM person_index_item_state
              WHERE item_id IN (

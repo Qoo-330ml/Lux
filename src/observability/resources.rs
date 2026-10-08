@@ -92,6 +92,41 @@ impl ResourceMetrics {
         samples.push_back(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
     }
 
+    pub fn record_metadata_batch(
+        &self,
+        stage: &str,
+        item_count: usize,
+        duration: Duration,
+        complete: bool,
+    ) {
+        let Some(stage) = metadata_batch_name(stage) else {
+            return;
+        };
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        let item_count = u64::try_from(item_count).unwrap_or(u64::MAX);
+        increment_counter(&mut metrics.counters, &format!("batch.{stage}.count"), 1);
+        increment_counter(
+            &mut metrics.counters,
+            &format!("batch.{stage}.items"),
+            item_count,
+        );
+        let max_items = metrics
+            .counters
+            .entry(format!("batch.{stage}.max_items"))
+            .or_default();
+        *max_items = (*max_items).max(item_count);
+        let outcome = if complete { "success" } else { "error" };
+        increment_counter(
+            &mut metrics.counters,
+            &format!("batch.{stage}.{outcome}.count"),
+            1,
+        );
+        drop(metrics);
+        self.record_metadata_stage(stage, duration);
+    }
+
     pub fn record_metadata_request(&self, capability: &str, cache_hit: bool) {
         let Some(capability) = metadata_capability_name(capability) else {
             return;
@@ -309,8 +344,16 @@ fn metadata_capability_name(value: &str) -> Option<&'static str> {
     })
 }
 
+fn metadata_batch_name(value: &str) -> Option<&'static str> {
+    Some(match value {
+        "local_nfo_page" => "local_nfo_page",
+        _ => return None,
+    })
+}
+
 fn metadata_stage_name(value: &str) -> Option<&'static str> {
     match value {
+        "local_nfo_page" => Some("local_nfo_page"),
         "queue_wait" => Some("queue_wait"),
         "queue_claim" => Some("queue_claim"),
         "item_total" => Some("item_total"),
@@ -914,6 +957,37 @@ mod tests {
         assert_eq!(snapshot.metadata.stage_p95_ms["images"], 20);
         assert_eq!(snapshot.metadata.stage_p95_ms["queue_claim"], 300);
         assert_eq!(snapshot.metadata.stage_p95_ms["cache_persist"], 12);
+    }
+
+    #[tokio::test]
+    async fn metadata_batch_metrics_track_bounded_local_nfo_pages() {
+        let metrics = ResourceMetrics::new();
+        metrics.record_metadata_batch("local_nfo_page", 3, Duration::from_millis(10), true);
+        metrics.record_metadata_batch("local_nfo_page", 2, Duration::from_millis(35), false);
+        metrics.record_metadata_batch("item-123", 1, Duration::from_millis(1), true);
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(snapshot.metadata.counters["batch.local_nfo_page.count"], 2);
+        assert_eq!(snapshot.metadata.counters["batch.local_nfo_page.items"], 5);
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_page.max_items"],
+            3
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_page.success.count"],
+            1
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_page.error.count"],
+            1
+        );
+        assert_eq!(snapshot.metadata.stage_p95_ms["local_nfo_page"], 35);
+        assert!(
+            !snapshot
+                .metadata
+                .counters
+                .contains_key("batch.item-123.count")
+        );
     }
 
     #[test]

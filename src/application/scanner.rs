@@ -4390,7 +4390,8 @@ impl ScanJobService {
         else {
             return;
         };
-        let enricher = MetadataEnricher::new(self.database.clone());
+        let enricher = MetadataEnricher::new(self.database.clone())
+            .with_resource_metrics(self.resources.clone());
         let enricher = match self.local_nfo.clone() {
             Some(local_nfo) => enricher.with_nfo_store(local_nfo),
             None => enricher,
@@ -9373,10 +9374,11 @@ impl ScanJobService {
         let metadata_reidentify = self.metadata_reidentify.clone();
         let home = self.home.clone();
         let user_events = self.user_events.clone();
+        let resources = self.resources.clone();
         let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
         let image_notifications = Arc::clone(&self.local_metadata_image_notifications);
         tokio::spawn(async move {
-            let enricher = MetadataEnricher::new(database.clone());
+            let enricher = MetadataEnricher::new(database.clone()).with_resource_metrics(resources);
             let enricher = match local_nfo {
                 Some(local_nfo) => enricher.with_nfo_store(local_nfo),
                 None => enricher,
@@ -9538,6 +9540,7 @@ impl ScanJobService {
         let metadata_reidentify = self.metadata_reidentify.clone();
         let home = self.home.clone();
         let user_events = self.user_events.clone();
+        let resources = self.resources.clone();
         let target_root_validator = self.clone();
         let scan_job_id = scan_job_id.to_owned();
         let notifications = Arc::clone(&self.metadata_notifications);
@@ -9547,7 +9550,7 @@ impl ScanJobService {
         }
         let worker_job_id = scan_job_id.clone();
         let task = tokio::spawn(async move {
-            let enricher = MetadataEnricher::new(database.clone());
+            let enricher = MetadataEnricher::new(database.clone()).with_resource_metrics(resources);
             let enricher = match people {
                 Some(people) => enricher.with_people(people),
                 None => enricher,
@@ -10690,7 +10693,8 @@ impl ScanJobService {
         if self.database.find_library(&job.library_id).await?.is_none() {
             return Ok(());
         }
-        let enricher = MetadataEnricher::new(self.database.clone());
+        let enricher = MetadataEnricher::new(self.database.clone())
+            .with_resource_metrics(self.resources.clone());
         let enricher = match self.people.clone() {
             Some(people) => enricher.with_people(people),
             None => enricher,

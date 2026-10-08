@@ -9143,6 +9143,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：本地 scan NFO page 共享的 deferred context 现在也合并 canonical person manifest restore-pending 标记。并发写入两个不同人物 manifest 的回归确认数据库标记只调用一次，且两个文件都保存各自最新 identity 与 checksum；重复 checksum 不调用标记。标记成功后才原子写 manifest，因此写入失败会保留 PENDING 供后续恢复。非 NFO 人物资产路径仍即时标记。定向单测通过；`tests/people_api.rs` 10/10、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、全目标全 feature Clippy 和差异检查通过。本任务只记录每页一次标记调用上界，不推断时延、PostgreSQL、FNOS/NAS 或 CPU 收益。
 
+#### LUX-438：记录本地 NFO 页运行指标
+
+范围：管理员健康资源已提供固定低基数 `resources.metadata.counters` 和有界 `stageP95Ms`，但本地扫描 NFO page 尚未记录实际运行数据。增加固定 `local_nfo_page` 指标：每页调用数、输入 item 总数、最大 page size、含 item 错误的 page 数，以及该阶段最近 128 个样本的 p95 墙钟时间。耗时范围包含 source 校验、NFO 读取/解析、人物处理和 deferred credits flush。保留现有健康响应形状，不记录 item ID、路径或错误文本；PostgreSQL 单 SQL 延迟由 LUX-436 的可选 `pg_stat_statements` 提供。
+
+验收：
+
+- [x] 本地 NFO page 执行一次时，健康资源计数器准确增加一次并记录 page 输入条目数；p95 stage 有有界样本。
+- [x] item 级 NFO 或 credits 错误将该 page 记为失败；未知指标名不进入输出，标签不含 item ID、路径或错误内容。
+- [x] ScanJobService 的 outbox、job worker、手动 refresh 和 scan 后处理共用同一个 ResourceMetrics 实例。
+- [x] metrics 与本地 NFO page 自动化回归、metadata/scan 定向测试、build、fmt、Clippy、差异检查通过，并记录指标口径及本机验证限制。
+
+预计文件：`src/observability/resources.rs`、`src/application/metadata.rs`、`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 metrics snapshot 和 NFO page 的失败回归，再实现固定名称批次计数与共享指标注入。
+
+结果（2026-10-08）：本地 NFO page 记录固定 `local_nfo_page` 批次计数、输入条目累计数、最大 page 大小、成功/失败页数及最近 128 个耗时样本的 p95。失败页包含 item 级 NFO/credits 失败和批次级错误；计时覆盖 source 校验、NFO 读取/解析、人物处理及 deferred credits flush。ScanJobService 的 outbox、job worker、手动 refresh 与 scan 后处理都向 MetadataEnricher 传入同一个 ResourceMetrics。指标名称白名单阻止未知名字进入输出，不包含 item ID、路径或错误文本。metrics 单测、metadata 14/14、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有运行独立吞吐基准或 FNOS/NAS/PostgreSQL A/B，不据此声称 CPU、SQL 延迟或生产收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
