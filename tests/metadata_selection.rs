@@ -40,7 +40,7 @@ use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::Notify};
 use uuid::Uuid;
 
 const PNG_1X1: &[u8] = &[
@@ -2499,6 +2499,8 @@ async fn workflow_two_scan_automatically_matches_and_writes_metadata()
         .execute(fixture.database.pool())
         .await?;
 
+    let actor_detail_started = Arc::new(Notify::new());
+    let actor_detail_release = Arc::new(Notify::new());
     let tmdb_app = Router::new()
         .route(
             "/3/movie/999",
@@ -2526,18 +2528,24 @@ async fn workflow_two_scan_automatically_matches_and_writes_metadata()
                 }))
             }),
         )
-        .route(
-            "/3/person/10",
-            get(|| async {
-                tokio::time::sleep(Duration::from_millis(1500)).await;
-                Json(json!({
-                    "id": 10,
-                    "name": "后台演员",
-                    "biography": "后台补全的人物简介",
-                    "birthday": "1970-01-01"
-                }))
-            }),
-        )
+        .route("/3/person/10", {
+            let actor_detail_started_for_route = Arc::clone(&actor_detail_started);
+            let actor_detail_release_for_route = Arc::clone(&actor_detail_release);
+            get(move || {
+                let actor_detail_started = Arc::clone(&actor_detail_started_for_route);
+                let actor_detail_release = Arc::clone(&actor_detail_release_for_route);
+                async move {
+                    actor_detail_started.notify_one();
+                    actor_detail_release.notified().await;
+                    Json(json!({
+                        "id": 10,
+                        "name": "后台演员",
+                        "biography": "后台补全的人物简介",
+                        "birthday": "1970-01-01"
+                    }))
+                }
+            })
+        })
         .fallback(any(|| async { (StatusCode::NOT_FOUND, Json(json!({}))) }));
     let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
     let tmdb_address = tmdb_listener.local_addr()?;
@@ -2572,26 +2580,27 @@ async fn workflow_two_scan_automatically_matches_and_writes_metadata()
         .bind(&scan_job.id)
         .execute(fixture.database.pool())
         .await?;
-    let metadata_started = Instant::now();
     scan_jobs
         .run_to_completion_with_metadata(&scan_job.id, 100, None, Some(metadata))
         .await?;
 
-    for _ in 0..80 {
-        let status: String = sqlx::query_scalar(
-            "SELECT status FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
-        )
-        .fetch_one(fixture.database.pool())
-        .await?;
-        if status == "COMPLETED" || status == "FAILED" {
-            break;
+    let metadata_job_status = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM metadata_reidentify_jobs ORDER BY created_at DESC LIMIT 1",
+            )
+            .fetch_one(fixture.database.pool())
+            .await?;
+            if matches!(status.as_str(), "COMPLETED" | "FAILED") {
+                return Ok::<_, sqlx::Error>(status);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(
-        metadata_started.elapsed() < Duration::from_secs(1),
-        "metadata job waited for optional actor enrichment"
-    );
+    })
+    .await??;
+    assert_eq!(metadata_job_status, "COMPLETED");
+    tokio::time::timeout(Duration::from_secs(1), actor_detail_started.notified()).await?;
+    actor_detail_release.notify_one();
     let status: String =
         sqlx::query_scalar("SELECT identification_status FROM media_items WHERE id = ?")
             .bind(&fixture.item_id)

@@ -9263,6 +9263,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：原测试以管理员 token 传入 viewer `UserId`，管理员权限因此包含 Shows 库，稳定得到 `SeriesCount = 1`；用 viewer 登录 token 请求后，viewer 可见范围的影片计数与收藏计数均符合预期。`cargo test --locked --test emby_counts` 1/1 通过。
 
+#### LUX-446：用可控门闩验证自动元数据任务不等待可选人物详情
+
+范围：自动匹配测试用“整个 scan + metadata job 必须在 1 秒内完成”的墙钟断言验证可选 actor enrichment 不阻塞；该固定阈值受本机及 CI 负载影响，无法区分扫描本身耗时和人物详情网络等待。将 mock 人物详情响应改为测试控制的门闩：metadata job 进入终态后才放行人物详情响应，并继续确认人物简介最终写入。生产任务调度和 enrichment worker 保持不变。
+
+验收：
+
+- [x] 自动 metadata job 必须在被门闩暂停的人物详情响应前完成；之后响应释放，人物简介在有界等待内持久化。
+- [x] `cargo test --locked --test metadata_selection`、fmt 与 `git diff --check` 通过。
+
+预计文件：`tests/metadata_selection.rs`、`docs/LUX-DEVELOPMENT.md`。先复现固定 1 秒阈值因实际 1.15 秒工作流耗时而失败，再改为确定性请求门闩与终态断言。
+
+结果（2026-10-08）：原失败重现为 1.15 秒，低于 mock 人物详情请求的 1.5 秒响应延迟，因此并非任务等待该响应；固定的 1 秒总时延限制误判了本机工作流耗时。新回归在 actor endpoint 收到请求后保持其未响应，确认 metadata job 已 `COMPLETED` 后才释放，并继续验证人物 NFO 得到补充。`cargo test --locked --test metadata_selection` 31/31 通过。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
