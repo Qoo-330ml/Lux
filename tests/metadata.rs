@@ -759,7 +759,8 @@ async fn unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_chang
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     tokio::fs::write(&nfo_path, nfo.as_bytes()).await?;
     let second = enricher.enrich_movie_library(library.id).await?;
-    assert_eq!(second.nfo_loaded, 1);
+    assert_eq!(second.nfo_loaded, 0);
+    assert_eq!(second.nfo_skipped, 1);
 
     let after: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
         "SELECT nfo_metadata_json, nfo_metadata_fingerprint

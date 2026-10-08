@@ -9187,6 +9187,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：本地 NFO page 的每个 deferred credits storage 调用均记录固定低基数 transaction 指标。计时覆盖 replacement storage 调用，包括 storage lock、事务执行和 commit；credit entry 数按送入 storage 前的 relation 输入条目计，不冒充数据库变更行数。回归注入 credits 写入失败并重试，确认失败和成功 transaction 各计一次、输入 item/credit 数为 4、最大每事务 2 item，page 错误计数同步增加。资源指标的固定名称、输入/结果计数和最近 128 个样本 p95 单测通过；people deferred credits 与 NFO page 回归通过。`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；本机 ARM64。`cargo test --locked --all-targets --no-fail-fast` 的 library 部分 781 passed、13 ignored，集成测试中 4 项仍失败：`emby_counts`（实际 1、期望 0）、`metadata`（unchanged NFO 期望加载 1、实际 0）、`metadata_selection`（等待可选 actor enrichment 超时）和 `strm`（401、期望 200）。这些与父提交 `855d890a` 的既有验收记录相同；该父提交是当前 HEAD 的祖先，相关集成测试文件未改动，其余已执行目标通过。没有把本机测试推断为生产 PostgreSQL 延迟、FNOS/NAS 或 CPU 收益。
 
+#### LUX-441：让 unchanged NFO revision 回归匹配语义 fingerprint
+
+范围：LUX-416 已规定 NFO stat fingerprint 变化但文件内容 SHA-256 未变、cache defaults 完整且 actor relation current 时跳过 XML 解析并只同步 stat fingerprint。集成测试 `unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_changes` 仍断言旧行为 `nfo_loaded = 1`，导致已优化的 `metadata` target 失败。修正测试为断言该次调用 `nfo_skipped = 1`、`nfo_loaded = 0`，并继续验证 rich NFO snapshot 不变；内容确实变化时重新解析的既有回归保持不变。不修改生产逻辑。
+
+验收：
+
+- [x] 相同内容、变化的 file revision 返回 skipped 且保留 rich snapshot。
+- [x] `cargo test --locked --test metadata`、fmt 与差异检查通过；既有 changed-content 回归仍验证重新加载。
+
+预计文件：`tests/metadata.rs`、`docs/LUX-DEVELOPMENT.md`。先隔离复现旧断言失败，再更新为 LUX-416 的语义 fingerprint 合同并运行 metadata 集成目标。
+
+结果（2026-10-08）：隔离复跑确认旧断言稳定要求 `nfo_loaded = 1`，与当前语义 fingerprint 命中行为冲突；将回归改为要求 `nfo_loaded = 0`、`nfo_skipped = 1`，仍校验 snapshot 未变化。`cargo test --locked --test metadata` 20/20 通过，其中 changed-content 回归继续验证 NFO 会重新加载；fmt 与 `git diff --check` 通过。修正后 `cargo test --locked --all-targets --no-fail-fast` 的 library 测试为 781 passed、13 ignored；`metadata` 20/20 通过。全量门禁仍有 3 个已在父提交 `855d890a` 记录的独立失败：`emby_counts`（计数 1、期望 0）、`metadata_selection`（等待可选 actor enrichment 超时）、`strm`（401、期望 200）；本次没有修改这些测试文件或对应行为。只修正测试合同，没有改变生产代码。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
