@@ -779,6 +779,51 @@ impl LocalNfoMetadataStore {
         self.read_item(item_id).await
     }
 
+    pub(crate) async fn read_item_if_usable_with_fingerprint(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(LocalNfoDetails, Vec<u8>)>, LocalNfoMetadataStoreError> {
+        let Some((json, source_fingerprint)) = self
+            .database
+            .media_item_nfo_metadata_snapshot(item_id)
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)?
+        else {
+            return Ok(None);
+        };
+        if json.len() > MAX_LOCAL_NFO_BYTES {
+            tracing::warn!(
+                item_id,
+                "derived local NFO cache is too large; clearing it for rebuild"
+            );
+            self.database
+                .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                .await
+                .map_err(LocalNfoMetadataStoreError::Storage)?;
+            return Ok(None);
+        }
+        let Some(source_fingerprint) =
+            source_fingerprint.filter(|value| valid_nfo_content_fingerprint(value))
+        else {
+            return Ok(None);
+        };
+        match serde_json::from_str(&json) {
+            Ok(details) => Ok(Some((details, source_fingerprint))),
+            Err(error) => {
+                tracing::warn!(
+                    item_id,
+                    error = %error,
+                    "derived local NFO cache is malformed; clearing it for rebuild"
+                );
+                self.database
+                    .clear_media_item_nfo_metadata_if_json(item_id, &json)
+                    .await
+                    .map_err(LocalNfoMetadataStoreError::Storage)?;
+                Ok(None)
+            }
+        }
+    }
+
     pub async fn exists(&self, item_id: &str) -> Result<bool, LocalNfoMetadataStoreError> {
         self.database
             .media_item_nfo_metadata_state(item_id)

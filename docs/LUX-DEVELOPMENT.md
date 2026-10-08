@@ -8818,6 +8818,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：idle worker 收到 target Notify 后不再查询 scan job；仍会回到 pending-target 查询，且只有 1 秒 fallback 会检查最新 scan job 状态。SQLite idle fixture 在一次 Notify 后的 query-wrapper 调用由 2 降为 1；stop watch、pending 状态及 scan job 持久化语义未变。候选 worker 与图片等待回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；不推断 PostgreSQL、墙钟或 FNOS 收益。
 
+#### LUX-416：用 NFO 内容指纹跳过无语义变化的重复解析
+
+范围：数据库的 metadata fingerprint 仍使用路径、大小和 mtime 作为快速 stat 指纹。stat 指纹变化时，若 rich NFO cache 保存的原始内容 SHA-256 与当前文件字节一致、NFO defaults 已完整且 actor relation 不需重建，则跳过 XML 解析和完整 metadata 更新，只把新的 stat 指纹写回；内容哈希不同或任何前置条件不满足时保留原解析/修复路径。不尝试仅凭 mtime/大小抑制外部写入，不改变缓存 schema、字段优先级或 actor relation 恢复。
+
+验收：
+
+- [x] 同一 XML 内容位于新旁车路径时命中 rich cache，不解析、不重复更新完整 metadata，并持久化新 stat fingerprint。
+- [x] 相同流程中随后修改 NFO 标题会重新解析并更新媒体标题；缓存不屏蔽内容变化。
+- [x] NFO cache、metadata 模块定向回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录说明仍要读取并哈希旁车字节；本任务只减少 XML 解析和 metadata 更新，不外推墙钟或 FNOS 收益。
+
+短计划与文件：修改 `src/storage/catalog.rs`（同查询读取 cache JSON 与 SHA-256）、`src/application/nfo.rs`（validated cache snapshot API）、`src/application/metadata.rs`（保守内容命中及测试）、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先添加 same-content/new-path 回归并确认旧逻辑仍加载 NFO，再在 rich cache 指纹匹配时跳过解析；最后同时验证内容变化路径。
+
+结果（2026-10-08）：本轮已读取 metadata 快照后，在本地 NFO 文件字节与 rich cache 内容 SHA-256 一致且 defaults 完整、actor relation 正常时复用缓存并只同步新的路径/大小/mtime 指纹。旧实现下 new-path/same-content 回归的 `nfo_skipped` 为 0；按旧路径 6 次 query-wrapper 调用计算，新路径执行 3 次，且随后修改标题仍执行 NFO 加载。cache JSON 与 SHA-256 现在通过一条 query-wrapper 查询同时读取，原 unchanged stat 命中 fixture 也从 3 次降为 2 次。保守路径仍需读取全部 NFO 字节并计算 SHA-256，因此没有消除 NAS 文件读取；不外推 PostgreSQL、墙钟、FNOS 或 CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

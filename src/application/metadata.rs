@@ -1776,7 +1776,7 @@ impl MetadataEnricher {
         });
         let cached_nfo = if let Some(local_nfo) = &self.local_nfo {
             local_nfo
-                .read_item_if_usable(item_id)
+                .read_item_if_usable_with_fingerprint(item_id)
                 .await
                 .map_err(MetadataError::NfoCache)?
         } else {
@@ -1799,7 +1799,7 @@ impl MetadataEnricher {
             false
         };
         if already_checked && !rich_cache_missing && !actor_relation_missing {
-            if let (Some(metadata), Some(details)) = (metadata.as_ref(), cached_nfo.as_ref())
+            if let (Some(metadata), Some((details, _))) = (metadata.as_ref(), cached_nfo.as_ref())
                 && local_nfo_defaults_missing(metadata, details)
             {
                 self.database
@@ -1820,6 +1820,21 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        let source_fingerprint = nfo_content_fingerprint(&bytes);
+        if !actor_relation_missing
+            && let (Some(metadata), Some((details, cached_fingerprint))) =
+                (metadata.as_ref(), cached_nfo.as_ref())
+            && cached_fingerprint == &source_fingerprint
+            && !local_nfo_defaults_missing(metadata, details)
+        {
+            if let Some(fingerprint) = fingerprint.as_deref() {
+                self.database
+                    .mark_media_item_metadata_checked(item_id, fingerprint)
+                    .await?;
+            }
+            report.nfo_skipped = 1;
+            return Ok(report);
+        }
         let projection = match parse_local_nfo_projection(&bytes) {
             Ok(projection) => projection,
             Err(_) => {
@@ -1881,7 +1896,6 @@ impl MetadataEnricher {
                 });
             }
         }
-        let source_fingerprint = nfo_content_fingerprint(&bytes);
         let local_rating = projection.details.rating;
         if let Some(local_nfo) = &self.local_nfo {
             let current = local_nfo
@@ -2908,7 +2922,7 @@ mod tests {
         assert_eq!(report.nfo_skipped, 1);
         assert_eq!(
             database.query_count(),
-            3,
+            2,
             "unchanged NFO with complete defaults should only read metadata and its rich cache"
         );
         let retained_provider_ids: String =
@@ -2923,6 +2937,85 @@ mod tests {
                 .fetch_one(database.pool())
                 .await?;
         assert_eq!(retained_premiere_date.as_deref(), Some("2025-01-02"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identical_nfo_content_at_a_new_path_reuses_the_rich_cache()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::nfo::LocalNfoDetails;
+
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_id = "same-content-new-path-item";
+        let original_path = directory.path().join("original.nfo");
+        let moved_path = directory.path().join("moved.nfo");
+        let nfo_bytes = b"<movie><title>Local title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>";
+        tokio::fs::write(&original_path, nfo_bytes).await?;
+        tokio::fs::write(&moved_path, nfo_bytes).await?;
+        let original_fingerprint = nfo_fingerprint(&original_path).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                provider_ids_json, premiere_date, metadata_fingerprint
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', ?, ?, ?)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(r#"{"tmdb":"99"}"#)
+        .bind("2025-01-02")
+        .bind(original_fingerprint)
+        .execute(database.pool())
+        .await?;
+
+        let details = LocalNfoDetails {
+            premiered: Some("2026-01-02".to_owned()),
+            provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
+            ..LocalNfoDetails::default()
+        };
+        LocalNfoMetadataStore::new(database.clone())
+            .write_item(item_id, &nfo_content_fingerprint(nfo_bytes), &details)
+            .await?;
+
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        database.reset_query_count();
+        let report = enricher.enrich_nfo_item(item_id, &moved_path).await?;
+
+        assert_eq!(report.nfo_skipped, 1);
+        assert_eq!(report.nfo_loaded, 0);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "a stat fingerprint change with identical content should only sync the new stat fingerprint"
+        );
+        let stored_fingerprint: Vec<u8> =
+            sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(stored_fingerprint, nfo_fingerprint(&moved_path).await?);
+
+        tokio::fs::write(
+            &moved_path,
+            b"<movie><title>Changed title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>",
+        )
+        .await?;
+        let changed_report = enricher.enrich_nfo_item(item_id, &moved_path).await?;
+        assert_eq!(changed_report.nfo_loaded, 1);
+        assert_eq!(changed_report.nfo_skipped, 0);
+        let title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(title, "Changed title");
         Ok(())
     }
 

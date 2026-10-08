@@ -5788,6 +5788,24 @@ impl Database {
         })
     }
 
+    pub(crate) async fn media_item_nfo_metadata_snapshot(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(String, Option<Vec<u8>>)>, StorageError> {
+        self.query_as(
+            "SELECT nfo_metadata_json, nfo_metadata_fingerprint
+             FROM media_items
+             WHERE id = ? AND nfo_metadata_json IS NOT NULL",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn media_item_nfo_metadata_state(
         &self,
         item_id: &str,

@@ -1545,3 +1545,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-415 idle metadata worker 查询
 
 本地 metadata worker 在没有 pending target 时收到 Notify，原先查询 pending 状态后还会重读 scan job；固定 SQLite idle fixture 的一次唤醒是 2 次 query-wrapper 调用。现在 Notify 后直接重查 pending target，scan job 行只在 1 秒 fallback 读取，单次唤醒变为 1 次。该计数不含 SQL 执行时长，不外推 PostgreSQL、墙钟或 FNOS 收益。
+
+### LUX-416 unchanged NFO content fast path
+
+固定 SQLite 单 item fixture 原路径在 stat 指纹因 NFO 所在路径变化后会读取并解析 XML、复核 rich-cache fingerprint，再写 metadata：约 6 次 query-wrapper 调用。现在读取 NFO 字节并计算 SHA-256 后，与 rich cache 同查询取得的内容指纹比较；内容完全相同时且默认字段完整、actor relation 不需修复，只写回新的 stat fingerprint，3 次 query-wrapper 调用。原 stat 指纹匹配且默认值完整的 unchanged fixture 也因 cache JSON 与 fingerprint 单查询读取，从 3 次降为 2 次。后续标题内容变化回归仍进入解析与更新路径。此优化仍需读取全部旁车字节；query-wrapper 不代表文件系统时延、墙钟、PostgreSQL 或 FNOS CPU。
