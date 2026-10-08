@@ -24,8 +24,8 @@ use crate::{
         plugins::PluginService,
         probe::MediaProbeService,
         reidentify::{
-            MetadataRefreshMode, MetadataReidentifyError, MetadataReidentifyJob,
-            MetadataReidentifyService,
+            MetadataDispatchError, MetadataRefreshMode, MetadataReidentifyError,
+            MetadataReidentifyJob, MetadataReidentifyService,
         },
         scanner::{BACKGROUND_SCAN_BATCH_SIZE, ScanJob, ScanJobError, ScanJobService},
         schedule::{
@@ -117,6 +117,7 @@ pub enum ScheduledTaskError {
     ServiceUnavailable,
     Scan(ScanJobError),
     Metadata(MetadataReidentifyError),
+    MetadataDispatch(MetadataDispatchError),
     Strm(StrmProbeError),
     Chapter(ChapterDetectionError),
     Cover(LibraryCoverError),
@@ -136,6 +137,7 @@ impl fmt::Display for ScheduledTaskError {
             }
             Self::Scan(error) => error.fmt(formatter),
             Self::Metadata(error) => error.fmt(formatter),
+            Self::MetadataDispatch(error) => error.fmt(formatter),
             Self::Strm(error) => error.fmt(formatter),
             Self::Chapter(error) => error.fmt(formatter),
             Self::Cover(error) => error.fmt(formatter),
@@ -519,11 +521,10 @@ impl ScheduledTaskService {
             .create_library_refresh_job(library_id, MetadataRefreshMode::FillMissing)
             .await
             .map_err(ScheduledTaskError::Metadata)?;
-        let worker = service.clone();
-        let job_id = job.id.clone();
-        tokio::spawn(async move {
-            worker.run(&job_id).await;
-        });
+        service
+            .enqueue_fill_missing_job(&job)
+            .await
+            .map_err(ScheduledTaskError::MetadataDispatch)?;
         Ok(ScheduledTaskRun::Metadata { job })
     }
 

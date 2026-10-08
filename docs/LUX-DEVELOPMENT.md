@@ -8983,6 +8983,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：管理员显式 retry 在 job 重排后复用 LUX-425 调度 helper；dispatcher 关闭时 HTTP 返回 `503 DATABASE_UNAVAILABLE`，job 留在 `QUEUED`。新回归在修复前观察到原 handler 错误返回 `202`，修复后通过。`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有 FNOS/NAS 或运行时收益证据。计划任务入口仍需独立接入与验证。
 
+#### LUX-427：计划 metadata job 复用 library dispatcher
+
+范围：`METADATA_PARSE` 计划任务当前为每个新建的 `FILL_MISSING` job 直接 spawn runner。改为通过 LUX-424 library dispatcher 入队，并将 dispatcher 失败作为计划任务启动错误返回，同时保留已创建的 `QUEUED` job。计划任务成功结果仍返回相同 job DTO。thumbnail scraper retry 的等待完成语义不属于此任务。
+
+验收：
+
+- [x] 计划 metadata job 进入对应 library dispatcher，不直接 spawn 完整 `FILL_MISSING` runner。
+- [x] dispatcher 不可用时计划任务返回错误，job 保持 queued；可用时仍返回同一 metadata job 结果。
+- [x] scheduled task 与 reidentify 定向回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录说明计划入口复用每库 runner，不推断生产收益。
+
+预计文件：`src/application/scheduled_tasks.rs`、`src/api/admin_handlers.rs`、`tests/scheduled_tasks.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加 dispatcher 关闭时的计划任务回归，再接入 dispatcher 并保留既有返回值。
+
+结果（2026-10-08）：`METADATA_PARSE` 计划任务通过 library dispatcher 入队；调度错误使用独立 `MetadataDispatch` 类型并映射成服务不可用。可用路径返回原 metadata job，关闭路径返回错误且 job 留在 `QUEUED`。修复前回归观察到关闭后仍返回成功，修复后通过。`tests/scheduled_tasks.rs` 6/6、`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有生产吞吐或 FNOS/NAS 性能证据。thumbnail scraper retry 仍需单独处理其等待语义。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

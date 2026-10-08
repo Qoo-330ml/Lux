@@ -1595,3 +1595,9 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 管理员重试终态 `FILL_MISSING` job 后，按 job 持久化的 library ID 复用 LUX-424 dispatcher；`FULL_REFRESH` 与 `REIDENTIFY` 继续走原 runner。dispatcher 关闭时返回结构化 `503 DATABASE_UNAVAILABLE`，已重排的 job 保持 `QUEUED`。回归曾在旧路径观察到关闭后仍返回 `202`，修复后验证拒绝提交及持久化状态。
 
 该项只验证路由和 job 状态边界，不测量任务总量、吞吐、墙钟、生产 CPU 或 FNOS/NAS 收益；计划任务仍待检查。
+
+### LUX-427 计划 metadata job 复用 dispatcher
+
+`METADATA_PARSE` 计划任务创建的 `FILL_MISSING` job 现在经 library dispatcher 入队，并等待有界队列容量；dispatcher 错误作为调度任务启动错误返回。关闭回归验证计划任务报告失败且新 job 保持 `QUEUED`，可用路径回归仍返回原 metadata job。
+
+此项不测量任务总数、调度延迟、吞吐、墙钟、生产 CPU 或 FNOS/NAS 收益；thumbnail scraper retry 属于另一条需要等待结果的路径。

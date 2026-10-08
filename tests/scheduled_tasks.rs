@@ -1,17 +1,108 @@
 use std::fs;
 
+mod common;
+
+use common::{TestScraper, TestScraperConfig};
 use luxd::application::{
     chapter_detector::{ChapterDetectionService, DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID},
-    libraries::LibrarySettingsPatch,
+    libraries::{LibraryService, LibrarySettingsPatch},
     plugins::{MEDIA_INFO_PLUGIN_ID, PluginService},
-    scanner::ScanJobService,
+    reidentify::MetadataReidentifyService,
+    scanner::{LibraryScanner, ScanJobService},
     schedule::DANMAKU_MATCH_TASK_TYPE,
-    scheduled_tasks::ScheduledTaskService,
+    scheduled_tasks::{METADATA_TASK_TYPE, ScheduledTaskService},
+    scraper::ScraperProvider,
     strm_probe::StrmProbeService,
 };
 use luxd::{config::Config, library::LibraryKind, storage::Database};
 use serde_json::Map;
 use serde_json::json;
+
+#[tokio::test]
+async fn scheduled_metadata_task_reports_dispatcher_shutdown_and_keeps_job_queued()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Scheduled metadata", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Scheduled Movie (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Scheduled.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    libraries
+        .update_settings(
+            library.id,
+            LibrarySettingsPatch {
+                metadata_schedule: Some(Some("* * * * *".to_owned())),
+                ..LibrarySettingsPatch::default()
+            },
+        )
+        .await?;
+
+    let metadata = MetadataReidentifyService::new(
+        database.clone(),
+        ScraperProvider::from_adapter(TestScraper::new(TestScraperConfig::default())?),
+    );
+    let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+    let scheduler = ScheduledTaskService::new(
+        database.clone(),
+        plugins.clone(),
+        StrmProbeService::new(database.clone(), plugins),
+        None,
+    )
+    .with_library_services(
+        ScanJobService::new(database.clone()),
+        Some(metadata.clone()),
+        None,
+        None,
+    );
+
+    let accepted = scheduler
+        .run_task("LIBRARY", &library.id.to_string(), METADATA_TASK_TYPE)
+        .await?;
+    let accepted_job = match accepted {
+        luxd::application::scheduled_tasks::ScheduledTaskRun::Metadata { job } => job,
+        _ => return Err("metadata task returned a different job type".into()),
+    };
+    assert_eq!(accepted_job.mode, "FILL_MISSING");
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'FAILED', error = 'TEST_RETRY', finished_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&accepted_job.id)
+    .execute(database.pool())
+    .await?;
+    metadata.shutdown().await;
+    let result = scheduler
+        .run_task("LIBRARY", &library.id.to_string(), METADATA_TASK_TYPE)
+        .await;
+    assert!(
+        result.is_err(),
+        "a closed dispatcher must reject the scheduled job"
+    );
+    let queued_jobs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metadata_reidentify_jobs
+         WHERE library_id = ? AND mode = 'FILL_MISSING' AND status = 'QUEUED'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(queued_jobs, 1, "the persisted job must remain retryable");
+    Ok(())
+}
 
 #[tokio::test]
 async fn enabled_strm_task_runs_once_per_matching_cron_minute()

@@ -2737,6 +2737,7 @@ pub(crate) fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskErro
         ScheduledTaskError::ServiceUnavailable
         | ScheduledTaskError::Scan(_)
         | ScheduledTaskError::Metadata(_)
+        | ScheduledTaskError::MetadataDispatch(_)
         | ScheduledTaskError::Strm(_)
         | ScheduledTaskError::Chapter(_)
         | ScheduledTaskError::Cover(_)
