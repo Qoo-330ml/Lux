@@ -8863,6 +8863,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：普通电影每页最多 4 个 NFO task 并行，任务完成后再补充下一项，最终按输入顺序合并 report；坏 NFO 只使对应电影失败，健康电影仍更新，图片 page transaction 和逐 item 失败回退保持。metadata 单测 13/13、`scanned_metadata` 16/16、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本轮 `cargo test --locked --all-targets` 的 library 测试 760 passed、13 ignored，随后 `tests/emby_counts.rs:159` 再次出现已在未改动基线 `2b64ba65` 复现的实际计数 1、期望 0。性能证据仅确认本地并发上限与结果顺序，没有墙钟、FNOS CPU、PostgreSQL 或 NAS A/B 数据。
 
+#### LUX-419：剧集与分集本地 NFO 有界并发
+
+范围：普通剧集 metadata 页按 series/season/episode 顺序遍历以保留层级图片语义，但各层 NFO enrichment 也在该循环中串行执行。收集当前 source page 中实际存在的 series、season、episode NFO request，再复用 LUX-418 的最多 4 路有界 task helper；保留 source 顺序归并、NFO snapshot metadata 不重复查询、Item 级错误隔离与 `tvshow.nfo`/season/episode 文件选择规则。目录/NFO 路径发现、图片扫描、人物 credits 跨 item 批量写入不属于本任务。
+
+验收：
+
+- [x] 当前 page 中层级 NFO request 最多并发 4 个，按 series/season/episode 原顺序归并统计；没有 NFO 的 item 不创建 task。
+- [x] snapshot metadata 仍被消费一次且不触发逐 item metadata 查询；单 item OnDemand NFO 路径不变。
+- [x] hierarchy、season/episode NFO 路径、NFO failure isolation、series/scanned-series metadata 定向测试、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。
+- [x] 性能记录仅报告 task 上界，不外推墙钟、NAS 或 FNOS 收益。
+
+短计划与文件：修改 `src/application/metadata.rs` 收集拥有型 series NFO request 并以 LUX-418 有界 helper 执行；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`。先覆盖 request/snapshot 消费语义，再连接当前 page 执行，最后运行 `series_metadata`、`scanned_series_metadata` 和候选测试。
+
+结果（2026-10-08）：series、season、episode NFO 路径按层级遍历收集后使用与电影相同的 4-task 上限；snapshot metadata 随 request 一次取出，仍走无额外 metadata read 的 enrichment 入口，OnDemand 调用保留原入口。层级/image traversal 未移动，NFO requests 按其被发现的源顺序汇总 report。`series_metadata` 3/3、`scanned_series_metadata` 2/2、metadata task-order/concurrency 与 NFO isolation 回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。性能记录只陈述并发上限，没有墙钟、query 计数、FNOS 或 NAS 收益数据。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

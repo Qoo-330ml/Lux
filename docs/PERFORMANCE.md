@@ -1557,3 +1557,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-418 普通电影 NFO 并发上界
 
 `enrich_movie_sources` 对每个最多 16 item 的来源页使用 `JoinSet`，最多同时运行 4 个 NFO enrichment；已有 task 完成后才领取下一 item，并按来源顺序合并 report。测试使用 12 个异步任务确认运行中的任务上限为 4，电影 fixture 验证一个坏 NFO不会阻断同页健康电影。此任务未改变 SQL 数量，也未测量墙钟；事务锁仍会约束写阶段并发。不能从本地调度上界推断 FNOS CPU 或 NAS 收益。
+
+### LUX-419 普通剧集 NFO 并发上界
+
+每个已加载的 series metadata page 会依层级遍历收集存在的 `tvshow.nfo`、season NFO 和 episode NFO，交给共享有界 helper，最多运行 4 个 enrichment task，再按发现顺序汇总结果。filesystem 的目录扫描和图片索引仍在原 hierarchy traversal 中执行，NFO 旁车的查找及读取没有消除。该记录只描述调度并发上限；没有采集 SQL/墙钟基准，也不推断 PostgreSQL、FNOS 或 NAS 收益。

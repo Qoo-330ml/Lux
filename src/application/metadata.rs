@@ -763,6 +763,13 @@ struct ScanLocalMetadataNfoSnapshot {
     metadata_by_item: HashMap<String, StoredMediaMetadata>,
 }
 
+struct SeriesNfoRequest {
+    item_id: String,
+    nfo_path: PathBuf,
+    metadata: Option<StoredMediaMetadata>,
+    on_demand: bool,
+}
+
 enum NfoMetadataLookup<'a> {
     OnDemand,
     Snapshot(&'a mut HashMap<String, StoredMediaMetadata>),
@@ -1617,6 +1624,7 @@ impl MetadataEnricher {
         let process_nfo = mode.process_nfo();
         let mut image_candidates = Vec::new();
         let mut queued_image_items = HashSet::new();
+        let mut nfo_requests = Vec::new();
         for source in sources {
             report.items_processed += 1;
             let root = PathBuf::from(&source.root_path);
@@ -1654,18 +1662,15 @@ impl MetadataEnricher {
                     None
                 };
                 if let Some(nfo_path) = nfo_path {
-                    self.enrich_nfo_item_best_effort_with_metadata(
-                        report,
-                        &source.series_id,
-                        &nfo_path,
-                        match nfo_snapshot.as_deref_mut() {
-                            Some(snapshot) => {
-                                NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item)
-                            }
-                            None => NfoMetadataLookup::OnDemand,
-                        },
-                    )
-                    .await;
+                    let metadata = nfo_snapshot
+                        .as_deref_mut()
+                        .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.series_id));
+                    nfo_requests.push(SeriesNfoRequest {
+                        item_id: source.series_id.clone(),
+                        nfo_path,
+                        metadata,
+                        on_demand: nfo_snapshot.is_none(),
+                    });
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
                     let images = find_series_images(series_paths, None);
@@ -1724,18 +1729,15 @@ impl MetadataEnricher {
                     None
                 };
                 if let Some(nfo_path) = nfo_path {
-                    self.enrich_nfo_item_best_effort_with_metadata(
-                        report,
-                        &source.season_id,
-                        &nfo_path,
-                        match nfo_snapshot.as_deref_mut() {
-                            Some(snapshot) => {
-                                NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item)
-                            }
-                            None => NfoMetadataLookup::OnDemand,
-                        },
-                    )
-                    .await;
+                    let metadata = nfo_snapshot
+                        .as_deref_mut()
+                        .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.season_id));
+                    nfo_requests.push(SeriesNfoRequest {
+                        item_id: source.season_id.clone(),
+                        nfo_path,
+                        metadata,
+                        on_demand: nfo_snapshot.is_none(),
+                    });
                 }
                 if process_images {
                     let images = find_series_images(&season_paths, Some(season_number));
@@ -1765,18 +1767,15 @@ impl MetadataEnricher {
                     None
                 };
                 if let Some(nfo_path) = nfo_path {
-                    self.enrich_nfo_item_best_effort_with_metadata(
-                        report,
-                        &source.episode_id,
-                        &nfo_path,
-                        match nfo_snapshot.as_deref_mut() {
-                            Some(snapshot) => {
-                                NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item)
-                            }
-                            None => NfoMetadataLookup::OnDemand,
-                        },
-                    )
-                    .await;
+                    let metadata = nfo_snapshot
+                        .as_deref_mut()
+                        .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.episode_id));
+                    nfo_requests.push(SeriesNfoRequest {
+                        item_id: source.episode_id.clone(),
+                        nfo_path,
+                        metadata,
+                        on_demand: nfo_snapshot.is_none(),
+                    });
                 }
                 if process_images {
                     let images = find_episode_images(&season_paths, &media_path);
@@ -1786,6 +1785,56 @@ impl MetadataEnricher {
                 }
                 if let Some(last_episode_id) = context.last_episode_id.as_mut() {
                     *last_episode_id = source.episode_id.clone();
+                }
+            }
+        }
+        let nfo_item_ids = nfo_requests
+            .iter()
+            .map(|request| request.item_id.clone())
+            .collect::<Vec<_>>();
+        let nfo_results =
+            run_bounded_tasks_in_order(nfo_requests, LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY, {
+                let enricher = self.clone();
+                move |request| {
+                    let enricher = enricher.clone();
+                    async move {
+                        let item_id = request.item_id.clone();
+                        let result = if request.on_demand {
+                            enricher
+                                .enrich_nfo_item(&request.item_id, &request.nfo_path)
+                                .await
+                        } else {
+                            enricher
+                                .enrich_nfo_item_with_metadata(
+                                    &request.item_id,
+                                    &request.nfo_path,
+                                    request.metadata,
+                                )
+                                .await
+                        };
+                        (item_id, result)
+                    }
+                }
+            })
+            .await;
+        for (result, item_id) in nfo_results.into_iter().zip(nfo_item_ids) {
+            match result {
+                Ok((_, Ok(nfo_report))) => {
+                    let failed = nfo_report.nfo_failed > 0;
+                    report.merge(nfo_report);
+                    if failed {
+                        report.mark_item_failed(&item_id);
+                    }
+                }
+                Ok((_, Err(error))) => {
+                    tracing::warn!(item_id = %item_id, %error, "local series NFO failed");
+                    report.nfo_failed += 1;
+                    report.mark_item_error(&item_id, &error);
+                }
+                Err(error) => {
+                    tracing::error!(item_id = %item_id, %error, "local series NFO task failed unexpectedly");
+                    report.nfo_failed += 1;
+                    report.mark_item_failed(&item_id);
                 }
             }
         }
