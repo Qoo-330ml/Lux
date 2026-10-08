@@ -46,7 +46,7 @@ impl PeopleService {
             .await?;
         create_private_dir(&person_dir).await?;
         let image_path = format!("{PERSON_IMAGE}.{extension}");
-        write_atomically(&person_dir.join(&image_path), &image_bytes).await?;
+        write_atomically_if_changed(&person_dir.join(&image_path), &image_bytes).await?;
         let relative_image_path = person_dir
             .join(&image_path)
             .strip_prefix(metadata_root(&self.config_dir))
@@ -68,11 +68,11 @@ impl PeopleService {
         let provider_index_path =
             people_index_path_for_provider(&self.config_dir, &provider, person_id)
                 .map_err(PeopleError::from)?;
-        write_atomically(&provider_index_path, &index_bytes).await?;
+        write_atomically_if_changed(&provider_index_path, &index_bytes).await?;
         if provider.eq_ignore_ascii_case("tmdb") {
             let index_path =
                 people_index_path(&self.config_dir, person_id).map_err(PeopleError::from)?;
-            write_atomically(&index_path, &index_bytes).await?;
+            write_atomically_if_changed(&index_path, &index_bytes).await?;
         }
         Ok(())
     }
@@ -451,7 +451,7 @@ impl PeopleService {
             ));
         }
         let image_path = person_dir.join(format!("{PERSON_IMAGE}.{extension}"));
-        write_atomically(&image_path, &bytes).await?;
+        write_atomically_if_changed(&image_path, &bytes).await?;
         Ok(Some(format!("{PERSON_IMAGE}.{extension}")))
     }
 

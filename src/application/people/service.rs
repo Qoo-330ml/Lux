@@ -1007,6 +1007,7 @@ mod tests {
         MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES, PENDING_PERSON_MANIFEST, PERSON_MANIFEST,
         PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService, PersonIdentity,
         PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions, PersonMetadata,
+        write_atomically_if_changed,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
@@ -1035,6 +1036,47 @@ mod tests {
         assert!(coordinator.finish().await);
         assert!(!coordinator.finish().await);
         assert!(coordinator.begin().await);
+    }
+
+    #[tokio::test]
+    async fn atomic_person_asset_write_skips_identical_content_and_replaces_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("profile.bin");
+        assert!(write_atomically_if_changed(&path, b"first").await?);
+        let first_inode = tokio::fs::metadata(&path).await?.ino();
+        assert!(!write_atomically_if_changed(&path, b"first").await?);
+        assert_eq!(tokio::fs::metadata(&path).await?.ino(), first_inode);
+        assert_eq!(tokio::fs::metadata(&path).await?.mode() & 0o777, 0o600);
+
+        assert!(write_atomically_if_changed(&path, b"second").await?);
+        assert_eq!(tokio::fs::read(&path).await?, b"second");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn atomic_person_asset_write_rejects_symlink_targets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let target = directory.path().join("target.bin");
+        let symlink = directory.path().join("profile.bin");
+        let non_file = directory.path().join("profile-directory");
+        tokio::fs::write(&target, b"target").await?;
+        tokio::fs::symlink(&target, &symlink).await?;
+        tokio::fs::create_dir(&non_file).await?;
+
+        let error = write_atomically_if_changed(&symlink, b"replacement")
+            .await
+            .expect_err("symlink targets must remain rejected");
+        assert!(matches!(error, PeopleError::Symlink(_)));
+        let error = write_atomically_if_changed(&non_file, b"replacement")
+            .await
+            .expect_err("non-file targets must remain rejected");
+        assert!(matches!(error, PeopleError::Serialization(_)));
+        assert_eq!(tokio::fs::read(target).await?, b"target");
+        Ok(())
     }
 
     #[tokio::test]
@@ -2212,6 +2254,8 @@ mod tests {
     #[tokio::test]
     async fn uploaded_profile_image_is_written_in_person_directory()
     -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
         let config = tempfile::tempdir()?;
         let service = PeopleService::new(config.path().to_owned());
         service
@@ -2233,6 +2277,24 @@ mod tests {
             index["imagePath"]
                 .as_str()
                 .is_some_and(|path| path.ends_with("/folder.png"))
+        );
+
+        let image_inode = tokio::fs::metadata(&person_image).await?.ino();
+        let index_path = people_index_path_for_provider(config.path(), "tmdb", "9")?;
+        let index_inode = tokio::fs::metadata(&index_path).await?.ino();
+        let legacy_index_path =
+            crate::application::metadata_paths::people_index_path(config.path(), "9")?;
+        let legacy_index_inode = tokio::fs::metadata(&legacy_index_path).await?.ino();
+
+        service
+            .update_person_image("9", "演员甲", Some("tmdb"), Some("image/png"), PNG_1X1)
+            .await?;
+
+        assert_eq!(tokio::fs::metadata(&person_image).await?.ino(), image_inode);
+        assert_eq!(tokio::fs::metadata(&index_path).await?.ino(), index_inode);
+        assert_eq!(
+            tokio::fs::metadata(&legacy_index_path).await?.ino(),
+            legacy_index_inode
         );
         Ok(())
     }

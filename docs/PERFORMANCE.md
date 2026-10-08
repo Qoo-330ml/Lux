@@ -1698,3 +1698,7 @@ worker 现在一次 storage query 同时读取 pending 状态与 MOVIE、VIDEO�
 actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallback 时，一页只枚举一次 `people/items`，最多读取 4096 个 directory entry；缓存完整目录内的缺失 ID 时跳过 legacy per-item stat，只为目录中命中的 ID 读取 relation JSON。超过上限或目录读取失败会对未确定 item 回退原路径检查，因此旧目录很大时不会无界遍历。固定回归确认共享 legacy listing 只初始化一次、命中的 relation 仍被解析，以及不可读目录触发逐路径 fallback。
 
 该项复用现有每页最多 4 个 item 的并发上限；路径 canonicalization、新式每 item relation 检查和图片 discovery 仍各自执行。未统计真实目录大小、旁车字节数、文件系统调用总量或耗时；性能描述只基于固定行为回归，不推断墙钟、PostgreSQL、FNOS/NAS 或 CPU 收益。
+
+### LUX-448 相同人物图片与 provider index 的 no-op 写入
+
+重复上传同一 profile 图片的固定回归中，旧路径会替换人物图片及两个 TMDb index 文件；候选路径在 inode 保持不变时复用现有文件。不同字节与缺失文件仍经原子临时文件写入。相同内容路径仍会读取同长度目标并校正私有权限，因此这里记录的是跳过临时文件写入、`fsync` 与 `rename` 的行为，不代表文件系统总调用或墙钟下降；没有测量图片下载请求、FNOS/NAS、生产 I/O 或 CPU 收益。

@@ -1178,6 +1178,44 @@ pub(super) async fn write_atomically(path: &Path, bytes: &[u8]) -> Result<(), Pe
     result
 }
 
+pub(super) async fn write_atomically_if_changed(
+    path: &Path,
+    bytes: &[u8],
+) -> Result<bool, PeopleError> {
+    use tokio::io::AsyncReadExt;
+
+    if let Some(metadata) = safe_metadata(path).await? {
+        if !metadata.is_file() {
+            return Err(PeopleError::Serialization(
+                "people data path is not a file".to_owned(),
+            ));
+        }
+        if metadata.len() == bytes.len() as u64 {
+            let file = fs::File::open(path)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            let mut existing = Vec::with_capacity(bytes.len());
+            file.take((bytes.len() as u64).saturating_add(1))
+                .read_to_end(&mut existing)
+                .await
+                .map_err(|source| PeopleError::Io {
+                    path: path.to_owned(),
+                    source,
+                })?;
+            if existing == bytes {
+                restrict_permissions(path, false).await?;
+                return Ok(false);
+            }
+        }
+    }
+
+    write_atomically(path, bytes).await?;
+    Ok(true)
+}
+
 pub(super) async fn acquire_person_manifest_lock(manifest_path: &Path) -> Result<(), PeopleError> {
     acquire_exclusive_file_lock(&manifest_path.with_file_name(".person.json.lock")).await
 }

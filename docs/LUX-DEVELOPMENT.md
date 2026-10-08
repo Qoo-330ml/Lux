@@ -9290,6 +9290,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：共享 key 单独请求稳定返回 401；带真实 `X-Emby-Token` 的 PlaybackInfo 返回 200，响应播放 URL 不含共享 key。完整 STRM 集成目标 1/1 通过，现有 Emby 302 handoff 与本地 path 播放断言保持。
 
+#### LUX-448：跳过相同人物图片与 provider index 的原子替换
+
+范围：人物 profile 图片和 provider index 的写入目前即使目标字节完全相同，也会创建临时文件、写入、`fsync` 并 `rename`。新增按现有安全 metadata 检查和有界内容读取判断是否相同的原子写入口；相同内容保留原文件，不同或缺失内容仍走原子替换。图片权限约束必须在跳过与写入两条路径都执行；不改变图片下载、provider identity 或 index rebuild 语义。
+
+验收：
+
+- [x] 重复上传相同图片后，人物图片和 provider index 文件不被替换；测试通过 inode 保持验证。
+- [x] 不同图片字节仍原子替换图片及索引；缺失文件仍按原路径创建。
+- [x] 非普通文件和符号链接仍被拒绝，目标权限仍为私有；不扩大可读取图片的最大输入范围。
+- [x] people service 定向测试、fmt、build、Clippy 和 `git diff --check` 通过；性能记录只说明固定回归验证的文件替换边界，不推断墙钟、FNOS/NAS 或生产收益。
+
+预计文件：`src/application/people/helpers.rs`、`src/application/people/assets.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先扩展重复图片上传回归确认原实现会替换 inode，再增加安全的 unchanged-write 路径并复测。
+
+结果（2026-10-09）：相同 profile 图片再次写入时，人物图片、provider index 和 legacy TMDb index 三个目标均保留原 inode；helper 回归确认缺失目标仍创建、不同内容走原子写、相同内容保持私有权限，符号链接和目录目标拒绝。旧实现回归先稳定观察到重复上传替换了人物图片 inode。People service 定向测试 39/39 通过；`cargo build --locked`、`cargo test --locked --all-targets --quiet`（791 library tests 通过、13 忽略，集成目标全部通过）、fmt、全 target/all features Clippy 与 `git diff --check` 通过。本机 `arm64`。固定测试只证明跳过相同内容的临时文件写入、`fsync` 和 `rename`，不测量总文件系统调用或墙钟，也不外推 FNOS/NAS/生产收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
