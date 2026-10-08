@@ -9422,6 +9422,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：rebuild 同一次安全读取同时计算 raw-byte checksum 并解析 relation；skip 现在比较 source fingerprint、relation checksum、state schema version，batch credits commit 保存该 checksum。相同 source fingerprint 下改写 actor bytes 的回归先失败后通过，且验证 rebuild 保存值与实际文件匹配。删除无调用方 fingerprint-only batch wrapper。people service 40/40、storage checksums/current 回归通过；全量 `cargo test --locked --all-targets` 通过（798 passed、13 ignored；PostgreSQL 16 项因本机无实例而 ignored），`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 通过。本机 `arm64`，未部署 FNOS/生产测量。
 
+#### LUX-457：本地 metadata 页复用重复 episode NFO 路径检查
+
+范围：本地 metadata 页在逐 episode 发现 NFO 时，先检查媒体同名 NFO，再回退到同目录 `episode.nfo`。同一目录的多个 episode 或多个媒体版本会重复检查相同 sidecar 路径。为一次 page 的 NFO 路径发现增加惰性存在性缓存，避免重复文件系统查询；保持同名 NFO 优先级、`episode.nfo` fallback、每个 item 的路径映射及现有错误传播语义。缓存仅在本次 page 内有效，不缓存解析内容，不改变 NFO 选择、安全校验和 metadata 写回。
+
+验收：
+
+- [x] 两个 episode 共用 `episode.nfo` 时都解析到相同目标，page 内重复 sidecar 目标只触发一次文件系统存在性检查。
+- [x] 同名 NFO 仍优先于 `episode.nfo`；存在性检查错误仍按原逻辑终止该 item 的 NFO 查找。
+- [x] NFO 路径发现和剧集 metadata 定向回归、fmt、全目标全 feature Clippy、全量 `cargo test --locked --all-targets` 与 `git diff --check` 通过；不推断 NAS/FNOS 墙钟或 CPU 收益。
+
+短计划与文件：修改 `src/application/metadata.rs`，给本地 NFO page 增加仅 page 生命周期的 sidecar existence cache，并回归共享 fallback 与同名优先级；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md` 记录调用边界及限制。先加可观测 probe-count 回归，再接入缓存，最后运行库内 metadata 与剧集 NFO 目标。
+
+结果（2026-10-09）：一次本地 scan NFO page 用惰性 `PathBuf` cache 复用 episode sidecar 的 `try_exists` 结果；三 episode 回归确认两项共享同一 `episode.nfo`，第三项仍优先同名 NFO，page 对四个唯一候选路径各检查一次。OnDemand 单 item 入口保留独立 cache，缓存不跨 page；文件系统错误仍被 `Option` 传播并停止该 item 的 fallback 查找。新增 metadata library regression 与 `series_metadata` 3/3 通过；第二轮全量 `cargo test --locked --all-targets` 通过，`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。PostgreSQL 专项 16 项因本机无实例而 ignored。本机 ARM64，未测量 NAS/FNOS 文件系统墙钟或 CPU。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

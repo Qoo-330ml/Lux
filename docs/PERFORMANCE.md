@@ -1712,3 +1712,7 @@ actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallba
 已检查且内容未变化的本地 NFO，在 rich cache 命中但 provider ID 或 premiere date 为空时，会把默认值修复暂存到当前 page state batch；最多 16 个 metadata 更新/默认修复共用一次 metadata 写锁和事务。固定 SQLite 回归确认默认字段只补空值、已有非空字段不被覆盖、无变化不执行 UPDATE，且混合状态批次中途失败会整体回滚。应用层仍逐 item 回退并保留 NFO 错误隔离。
 
 事务指标固定记录 transaction 次数、输入 item 数、metadata/default-repair 分类、成功/失败及最近 128 个耗时样本的 p95；回归确认失败 page transaction 和逐项 fallback 均被计入，且不暴露 item/path/SQL。这里记录的是事务尝试与输入批次形状，不代表 SQL 语句数减少或事务墙钟下降；未验证 PostgreSQL/FNOS/NAS 负载或 CPU 收益。
+
+### LUX-457 本地 scan NFO sidecar 路径检查缓存
+
+本地 metadata page 按完整候选 `PathBuf` 缓存 episode NFO sidecar 的 `try_exists` 结果，仅覆盖当前 page。三 episode 固定回归中，两个 item 复用同目录 `episode.nfo`，第三个 item 仍选用优先级更高的同名 NFO；四个不同候选路径各检查一次，共用 sidecar 不重复检查。filesystem error 继续按原 `Option` 语义终止该 item 的 fallback。缓存不保留到下一页、不复用解析后的 XML，也未测量实际系统调用墙钟、NAS/FNOS 或 CPU 收益。
