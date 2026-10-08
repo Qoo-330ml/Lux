@@ -1561,3 +1561,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-419 普通剧集 NFO 并发上界
 
 每个已加载的 series metadata page 会依层级遍历收集存在的 `tvshow.nfo`、season NFO 和 episode NFO，交给共享有界 helper，最多运行 4 个 enrichment task，再按发现顺序汇总结果。filesystem 的目录扫描和图片索引仍在原 hierarchy traversal 中执行，NFO 旁车的查找及读取没有消除。该记录只描述调度并发上限；没有采集 SQL/墙钟基准，也不推断 PostgreSQL、FNOS 或 NAS 收益。
+
+### LUX-420 local metadata completion waiter
+
+completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到通知时的 fallback 查询间隔由 1 秒增至 5 秒；当前同进程完成路径会发出通知。跨进程数据库状态变化可见窗口相应为最多 5 秒。通知 fixture 确认 target 完成后在 250ms 内唤醒。没有采集总体 SQL 或墙钟数据，不据此外推 CPU 收益。

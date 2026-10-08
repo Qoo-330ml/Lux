@@ -8878,6 +8878,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：series、season、episode NFO 路径按层级遍历收集后使用与电影相同的 4-task 上限；snapshot metadata 随 request 一次取出，仍走无额外 metadata read 的 enrichment 入口，OnDemand 调用保留原入口。层级/image traversal 未移动，NFO requests 按其被发现的源顺序汇总 report。`series_metadata` 3/3、`scanned_series_metadata` 2/2、metadata task-order/concurrency 与 NFO isolation 回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。性能记录只陈述并发上限，没有墙钟、query 计数、FNOS 或 NAS 收益数据。
 
+#### LUX-420：降低本地 metadata 完成等待 fallback 轮询
+
+范围：扫描 job 等待本地 metadata target 完成时，每秒 fallback 会重新查询 pending target，即使同进程 worker 完成路径会发送 `Notify`。将此 completion waiter 的 fallback 独立调至 5 秒；通知到达仍立即检查数据库。worker 对 scan job 状态的 1 秒 fallback 保持不变，图片阶段等待也保持原有间隔。跨进程变更最迟通过 fallback 被观察到。
+
+验收：
+
+- [x] 同进程 metadata completion 通知能在 250ms 内唤醒等待者，不等待 5 秒 fallback。
+- [x] fallback 常量仅应用于 completion waiter，worker 状态刷新与 image waiter 的容错间隔未改变。
+- [x] scanner waiter 与 scanning_jobs 定向回归、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。
+- [x] 性能记录区分 waiter fallback 频率和 worker refresh 频率，不推断生产 CPU 收益。
+
+结果（2026-10-08）：completion waiter pending-state 查询从每秒 fallback 降至每 5 秒一次；本进程 worker 的 `notify_waiters` 仍即时唤醒。新增 fixture 在 target 由 PENDING 变为 DONE 后触发 Notify，250ms 内返回；image waiter 原 250ms 通知回归也通过。`scanning_jobs` 81/81、全目标全 feature Clippy、fmt 和 `git diff --check` 通过。跨进程写入的检测延迟窗口扩大至最多 5 秒，性能记录不外推 CPU、PostgreSQL 或 FNOS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

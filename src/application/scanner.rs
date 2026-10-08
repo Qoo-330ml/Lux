@@ -87,6 +87,7 @@ use manifest::*;
 
 const MISSING_ENTRY_BATCH_SIZE: usize = 500;
 const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
+const LOCAL_METADATA_COMPLETION_FALLBACK: Duration = Duration::from_secs(5);
 const LOCAL_METADATA_BATCH_SIZE: usize = 16;
 const LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_SCAN_LOCK_RETRY_DELAYS_MS: [u64; 3] = [250, 750, 1_500];
@@ -9701,10 +9702,10 @@ impl ScanJobService {
                 let notified = notify.notified();
                 tokio::select! {
                     _ = notified => {}
-                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_COMPLETION_FALLBACK) => {}
                 }
             } else {
-                tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+                tokio::time::sleep(LOCAL_METADATA_COMPLETION_FALLBACK).await;
             }
         }
         Ok(())
@@ -13560,6 +13561,64 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
             .await
             .expect("image waiter should wake before the fallback")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_completion_waiter_uses_notification_before_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "local-metadata-completion-waiter";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_job_targets
+             (job_id, target_type, target_id, item_id, change_kind, metadata_state)
+             VALUES (?, 'ITEM', 'item-1', 'item-1', 'NEW', 'PENDING')",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let notify = Arc::new(Notify::new());
+        jobs.metadata_notifications
+            .lock()
+            .map_err(|_| "metadata notification registry poisoned")?
+            .insert(job_id.to_owned(), Arc::clone(&notify));
+        let waiter_jobs = jobs.clone();
+        let waiter = tokio::spawn(async move { waiter_jobs.wait_for_local_metadata(job_id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        sqlx::query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'item-1'",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+        notify.notify_waiters();
+        tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
+            .await
+            .expect("completion notification should beat the fallback")??;
         Ok(())
     }
 
