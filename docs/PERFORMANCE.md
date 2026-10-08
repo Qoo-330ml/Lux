@@ -1611,3 +1611,9 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 ### LUX-429 FILL_MISSING idle coalescing window
 
 按 library 的 dispatcher 空闲并收到首个 job 后等待 1 秒，再 claim；这段时间里后续条目请求仍可被 storage 合并进相同的 `QUEUED` job，dispatcher 对重复 job ID 不重复排队。dispatcher 有积压时，后续 job 按序立即执行；队列再次为空后收到的新 job 才重新等待 1 秒。`RUNNING` job 的输入不变。此策略使空闲后的首个补全 job 最多额外等待 1 秒；固定回归验证了 storage 合并和 runner 时序，但没有测量真实请求批次、SQL、吞吐、生产 CPU 或 FNOS/NAS 收益。
+
+### LUX-430 scan-run 等待通知与 scan-lock 退避
+
+删除媒体库时，进程内 active scan run 的最后一个 guard 结束后通过 `Notify` 唤醒删除等待者；等待者在检查 registry 前先注册通知，因此 guard 即使恰好在注册与检查之间释放，也会被观察到。原 30 秒删除超时和阻止新 run 的 library fence 保持不变。扫描优先级与 manifest materialization 的数据库条件仍需跨进程轮询，间隔按 10、20、40、80、160、250ms 增长并封顶；相应的进程外状态变化观察窗口最多 250ms。拿到 scan semaphore 后仍复核数据库条件。
+
+单测覆盖退避边界，删除回归覆盖终态 job 对应的活跃 run 等待、释放后完成和 fence。没有采集总体 SQL 数、实际等待时长、CPU、FNOS 或 NAS 性能数据。

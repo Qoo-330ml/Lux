@@ -98,6 +98,12 @@ const MAX_SCAN_LOCAL_METADATA_SOURCE_IDS: usize = 256;
 const SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
 const SCAN_LOCAL_METADATA_COMPLETENESS_CHECK_BATCH_SIZE: usize = 512;
 const MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT: usize = 4;
+const SCAN_LOCK_DATABASE_WAIT_BACKOFF_MS: [u64; 6] = [10, 20, 40, 80, 160, 250];
+
+fn scan_lock_database_wait_backoff(retry_number: usize) -> Duration {
+    let delay_index = retry_number.min(SCAN_LOCK_DATABASE_WAIT_BACKOFF_MS.len() - 1);
+    Duration::from_millis(SCAN_LOCK_DATABASE_WAIT_BACKOFF_MS[delay_index])
+}
 
 #[derive(Clone)]
 pub struct LibraryScanner {
@@ -2932,6 +2938,7 @@ struct ActiveScanJobRun {
 struct ScanRunRegistry {
     active_runs: HashMap<String, ActiveScanJobRun>,
     deleting_libraries: HashMap<String, usize>,
+    run_finished: Arc<Notify>,
 }
 
 struct ScanJobRunGuard {
@@ -2941,22 +2948,28 @@ struct ScanJobRunGuard {
 
 impl Drop for ScanJobRunGuard {
     fn drop(&mut self) {
-        let mut registry = match self.registry.lock() {
-            Ok(registry) => registry,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let remove_job = if let Some(active_run) = registry.active_runs.get_mut(&self.job_id) {
-            if active_run.run_count > 1 {
-                active_run.run_count -= 1;
-                false
+        let (remove_job, run_finished) = {
+            let mut registry = match self.registry.lock() {
+                Ok(registry) => registry,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let remove_job = if let Some(active_run) = registry.active_runs.get_mut(&self.job_id) {
+                if active_run.run_count > 1 {
+                    active_run.run_count -= 1;
+                    false
+                } else {
+                    true
+                }
             } else {
-                true
+                false
+            };
+            if remove_job {
+                registry.active_runs.remove(&self.job_id);
             }
-        } else {
-            false
+            (remove_job, Arc::clone(&registry.run_finished))
         };
         if remove_job {
-            registry.active_runs.remove(&self.job_id);
+            run_finished.notify_waiters();
         }
     }
 }
@@ -3939,6 +3952,35 @@ impl ScanJobService {
         registry.active_runs.contains_key(job_id)
     }
 
+    async fn wait_for_scan_job_runs_to_finish(&self, job_ids: &[String]) {
+        loop {
+            let run_finished = {
+                let registry = match self.scan_run_registry.lock() {
+                    Ok(registry) => registry,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                Arc::clone(&registry.run_finished)
+            };
+            let notified = run_finished.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let has_active_runs = {
+                let registry = match self.scan_run_registry.lock() {
+                    Ok(registry) => registry,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                job_ids
+                    .iter()
+                    .any(|job_id| registry.active_runs.contains_key(job_id))
+            };
+            if !has_active_runs {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     async fn ensure_lite_manifest_discovery_session(
         &self,
         manifest_id: &str,
@@ -4112,17 +4154,12 @@ impl ScanJobService {
                 self.cancel_running_job(&job_id).await?;
             }
         }
-        let wait_for_active_runs = async {
-            while active_job_ids
-                .iter()
-                .any(|job_id| self.scan_job_run_is_active(job_id))
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-        if tokio::time::timeout(LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT, wait_for_active_runs)
-            .await
-            .is_err()
+        if tokio::time::timeout(
+            LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT,
+            self.wait_for_scan_job_runs_to_finish(&active_job_ids),
+        )
+        .await
+        .is_err()
         {
             return Err(ScanJobError::LibraryDeletionScanTimeout);
         }
@@ -10219,6 +10256,7 @@ impl ScanJobService {
         &self,
         job_id: &str,
     ) -> Result<OwnedSemaphorePermit, ScanJobError> {
+        let mut database_wait_retry = 0_usize;
         loop {
             let job = self.database.find_scan_job(job_id).await?;
             let Some(job) = job else {
@@ -10230,7 +10268,8 @@ impl ScanJobService {
                     .has_unready_manifest_target_materialization_for_library(&job.library_id)
                     .await?
             {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(scan_lock_database_wait_backoff(database_wait_retry)).await;
+                database_wait_retry = database_wait_retry.saturating_add(1);
                 continue;
             }
             let is_postprocessing_target_materializer = job.job_type == "RECONCILE_LIBRARY"
@@ -10257,7 +10296,8 @@ impl ScanJobService {
                 false
             };
             if is_full_scan && has_incremental {
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::time::sleep(scan_lock_database_wait_backoff(database_wait_retry)).await;
+                database_wait_retry = database_wait_retry.saturating_add(1);
                 continue;
             }
 
@@ -10277,7 +10317,8 @@ impl ScanJobService {
                 return Ok(permit);
             }
             drop(permit);
-            tokio::time::sleep(Duration::from_millis(10)).await;
+            tokio::time::sleep(scan_lock_database_wait_backoff(database_wait_retry)).await;
+            database_wait_retry = database_wait_retry.saturating_add(1);
         }
     }
 
@@ -12376,8 +12417,8 @@ mod tests {
         normalize_incremental_path, notify_local_metadata_images_waiter, parse_episode_filename,
         parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
         read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
-        stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
-        stat_manifest_root_sync,
+        scan_lock_database_wait_backoff, stat_manifest_directory_file_batch_sync,
+        stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
     use crate::application::scraper::{
         ScraperAdapter, ScraperCreditsResponse, ScraperError, ScraperExternalIdsResponse,
@@ -12782,9 +12823,26 @@ mod tests {
         );
 
         drop(active_run);
-        let _deletion_guard = preparation.await??;
+        let _deletion_guard =
+            tokio::time::timeout(std::time::Duration::from_secs(1), preparation).await??;
         libraries.delete_library(library.id).await?;
         Ok(())
+    }
+
+    #[test]
+    fn scan_lock_database_wait_backoff_starts_at_ten_ms_and_caps_at_250_ms() {
+        let delays = (0..=6)
+            .map(scan_lock_database_wait_backoff)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            delays,
+            [10, 20, 40, 80, 160, 250, 250].map(std::time::Duration::from_millis)
+        );
+        assert_eq!(
+            scan_lock_database_wait_backoff(usize::MAX),
+            std::time::Duration::from_millis(250)
+        );
     }
 
     #[test]

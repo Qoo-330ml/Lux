@@ -9028,6 +9028,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：library dispatcher 在空闲后 claim 首个 `FILL_MISSING` job 前等待 1 秒；期间新请求可并入同一个 QUEUED job，重复 ID 继续复用原 completion 通知。队列已积压时不逐 job 增加延迟，队列再次排空后新请求重新获得窗口。`tests/reidentify.rs` 16/16、对应 dispatcher library 单测通过；build、fmt、全目标全 feature Clippy 和差异检查通过。本机架构为 ARM64。`cargo test --locked --all-targets` 的 library 部分 766 passed、13 ignored，随后在既有 `tests/emby_counts.rs:159` 失败（实际 1、预期 0；此前 LUX-424 记录已在基线 `2b64ba65` 复现）。未部署 FNOS，也没有生产 job 聚合、吞吐、SQL 或 CPU 测量。
 
+#### LUX-430：消除扫描 run 等待的短间隔轮询
+
+范围：删除媒体库时等待进程内 active scan run 当前每 10ms 检查一次共享 registry；改为 guard 结束时通知，并在等待前注册通知后再复核活动状态，避免丢失唤醒。扫描 job 等待增量 job 或 manifest materialization 的数据库条件仍需跨进程观察，将固定 10ms query loop 改为 10ms 起步、最高 250ms 的有界指数退避；取得 scan semaphore 后的条件复核和重试保留。删除超时、library fence、全量/增量优先关系及跨进程最终可见语义不变。
+
+验收：
+
+- [x] Library deletion 等待 active run 使用 race-safe Notify；guard 释放后立即重新检查，仍保持 30 秒总超时及拒绝新 run 的 fence。
+- [x] scan-lock 数据库条件等待按 10ms、20ms、40ms、80ms、160ms、250ms 退避并封顶；scan permit 获取后的状态复核不变。
+- [x] 自动化覆盖 backoff 边界和删除等待/新 run fence；scanner/scanning jobs 定向回归、build、fmt、Clippy 与差异检查通过。
+- [x] 性能记录只描述轮询/回退间隔与跨进程观察上限，不推断生产 CPU、FNOS 或 NAS 收益。
+
+预计文件：`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先新增 backoff 边界回归并加强现有 deletion/active-run 测试，再接入 race-safe Notify 与有界数据库退避。
+
+结果（2026-10-08）：active run 的最后一个 guard 移除 registry 项后通知等待者；删除等待先注册并启用通知，再复核活动项，避免通知早于 await 时丢失唤醒。原 30 秒超时和 deletion fence 保留。数据库条件等待采用 10、20、40、80、160、250ms 并封顶，拿到 scan semaphore 后仍重新读取优先级条件。退避边界单测、删除 active run/fence 单测、`tests/scanning_jobs.rs` 删除 worker 回归和 `tests/library_deletion.rs` 通过；build、fmt、Clippy 与 `git diff --check` 通过。本机架构 ARM64；记录的 250ms 是进程外数据库变化的退避观察窗口上限，不表示生产 CPU、FNOS 或 NAS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
