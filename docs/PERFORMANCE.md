@@ -1601,3 +1601,9 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 `METADATA_PARSE` 计划任务创建的 `FILL_MISSING` job 现在经 library dispatcher 入队，并等待有界队列容量；dispatcher 错误作为调度任务启动错误返回。关闭回归验证计划任务报告失败且新 job 保持 `QUEUED`，可用路径回归仍返回原 metadata job。
 
 此项不测量任务总数、调度延迟、吞吐、墙钟、生产 CPU 或 FNOS/NAS 收益；thumbnail scraper retry 属于另一条需要等待结果的路径。
+
+### LUX-428 thumbnail scraper retry 复用 dispatcher
+
+thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 enqueue 等 dispatcher completion；storage 把请求合并到已排队 job、dispatcher 未提供新 completion receiver 时，以 1 秒间隔读取 job 终态。只有终态后才检查 poster/thumb 并更新 retry attempt。enqueue 失败时释放 lease、保留尝试次数并安排内部错误恢复时间。
+
+固定测试 gate 住 provider search，确认 job 运行期间 retry 仍为 `RUNNING`、attempt count 不变；provider 放行并且 metadata job 终态后才推进 retry。关闭 dispatcher 回归确认 job 留在 `QUEUED`、retry 恢复为 `PENDING` 且次数不变。该测试不测量真实任务时延、请求吞吐或生产 CPU，不推断 FNOS/NAS 收益。

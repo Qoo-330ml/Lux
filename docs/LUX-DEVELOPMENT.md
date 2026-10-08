@@ -8998,6 +8998,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：`METADATA_PARSE` 计划任务通过 library dispatcher 入队；调度错误使用独立 `MetadataDispatch` 类型并映射成服务不可用。可用路径返回原 metadata job，关闭路径返回错误且 job 留在 `QUEUED`。修复前回归观察到关闭后仍返回成功，修复后通过。`tests/scheduled_tasks.rs` 6/6、`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有生产吞吐或 FNOS/NAS 性能证据。thumbnail scraper retry 仍需单独处理其等待语义。
 
+#### LUX-428：thumbnail scraper retry 复用 dispatcher 并等待完成
+
+范围：到期的 thumbnail scraper retry 会创建 `FILL_MISSING` job 后直接 `metadata.run()`，再检查 poster/thumb 是否仍缺失。改为提交到 LUX-424 library dispatcher；独占入队使用完成通知，job 被合并且没有新的通知接收端时使用低频状态 fallback 等到该 job 终态，再执行原图片检查。dispatcher 不可用时释放 thumbnail retry lease、保留原尝试次数并记录错误；不提前推进退避次数。
+
+验收：
+
+- [x] thumbnail retry 不再绕过 dispatcher；图片缺失检查只在对应 FILL_MISSING job 终态后执行。
+- [x] dispatcher 入队失败释放 retry lease，保持可恢复状态且不增加 attempt count；失败隔离与原截图 fallback 不变。
+- [x] thumbnail/scheduled task 定向回归、reidentify 回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录限定于 dispatcher 路由及等待语义，不推断生产收益。
+
+预计文件：`src/application/scheduled_tasks.rs`、`tests/scheduled_tasks.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 dispatcher 关闭时的到期 thumbnail retry 回归，再接入完成通知与 duplicate-job fallback。
+
+结果（2026-10-08）：thumbnail retry 现经 library dispatcher 提交 FILL_MISSING；独占队列项等待 dispatcher 完成通知，合并项以 1 秒 fallback 读取 job 终态。关闭 dispatcher 时释放 retry lease、保留原 attempt count，job 保持可重试的 QUEUED。测试分别验证拒绝入队的恢复状态，以及 provider 被 gate 时不提前消费 attempt、job 完成后才继续图片缺失检查。旧实现的关闭回归曾观察到 3 秒后 retry 和 metadata job 仍 RUNNING。`tests/scheduled_tasks.rs` 8/8、`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；无生产吞吐或 FNOS/NAS 性能证据。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
