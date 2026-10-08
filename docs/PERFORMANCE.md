@@ -1553,3 +1553,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-417 completeness 页 NFO projection context
 
 固定 SQLite 单电影 fixture 中，projection fallback 走 `read_item_projection(item_id)` 时会额外执行 2 次 query-wrapper 调用来读取 item kind 与 source path；复用 completeness 页已加载的 writeback context 后，projection 本身为 0 次额外 query-wrapper 调用。批量 context 查询已计入页级读取路径，测试单独比较 projection 阶段。NFO 文件仍需读取，source/media/directory 仍需 canonicalize 并验证 root 边界；未测文件系统墙钟、PostgreSQL、NAS 或 FNOS 负载。
+
+### LUX-418 普通电影 NFO 并发上界
+
+`enrich_movie_sources` 对每个最多 16 item 的来源页使用 `JoinSet`，最多同时运行 4 个 NFO enrichment；已有 task 完成后才领取下一 item，并按来源顺序合并 report。测试使用 12 个异步任务确认运行中的任务上限为 4，电影 fixture 验证一个坏 NFO不会阻断同页健康电影。此任务未改变 SQL 数量，也未测量墙钟；事务锁仍会约束写阶段并发。不能从本地调度上界推断 FNOS CPU 或 NAS 收益。

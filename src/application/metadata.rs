@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
+    future::Future,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
 };
@@ -32,7 +33,72 @@ const MIN_SCAN_JOB_METADATA_BATCH_SIZE: usize = 8;
 const MAX_SCAN_JOB_METADATA_BATCH_SIZE: usize = 32;
 const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
 const LOCAL_IMAGE_ITEM_BATCH_SIZE: usize = 16;
+const LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY: usize = 4;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn spawn_bounded_task<I, F, Fut, T>(
+    pending: &mut JoinSet<(usize, T)>,
+    task_indices: &mut HashMap<tokio::task::Id, usize>,
+    items: &mut impl Iterator<Item = (usize, I)>,
+    operation: &F,
+) -> bool
+where
+    I: Send + 'static,
+    F: Fn(I) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let Some((index, item)) = items.next() else {
+        return false;
+    };
+    let operation = operation.clone();
+    let task = pending.spawn(async move { (index, operation(item).await) });
+    task_indices.insert(task.id(), index);
+    true
+}
+
+async fn run_bounded_tasks_in_order<I, F, Fut, T>(
+    items: Vec<I>,
+    concurrency_limit: usize,
+    operation: F,
+) -> Vec<Result<T, tokio::task::JoinError>>
+where
+    I: Send + 'static,
+    F: Fn(I) -> Fut + Clone + Send + Sync + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    let concurrency_limit = concurrency_limit.max(1);
+    let item_count = items.len();
+    let mut pending = JoinSet::new();
+    let mut task_indices = HashMap::with_capacity(items.len());
+    let mut item_iter = items.into_iter().enumerate();
+    let mut results = (0..item_count)
+        .map(|_| None)
+        .collect::<Vec<Option<Result<T, tokio::task::JoinError>>>>();
+
+    for _ in 0..concurrency_limit {
+        if !spawn_bounded_task(&mut pending, &mut task_indices, &mut item_iter, &operation) {
+            break;
+        }
+    }
+    while let Some(result) = pending.join_next_with_id().await {
+        match result {
+            Ok((task_id, (index, value))) => {
+                task_indices.remove(&task_id);
+                results[index] = Some(Ok(value));
+            }
+            Err(error) => {
+                let task_id = error.id();
+                if let Some(index) = task_indices.remove(&task_id) {
+                    results[index] = Some(Err(error));
+                }
+            }
+        }
+        spawn_bounded_task(&mut pending, &mut task_indices, &mut item_iter, &operation);
+    }
+    results.into_iter().flatten().collect()
+}
 
 fn merged_provider_ids_json(
     current_json: Option<&str>,
@@ -1322,19 +1388,35 @@ impl MetadataEnricher {
     ) {
         let mut directory_cache = DirectoryPathCache::default();
         for source_page in sources.chunks(LOCAL_IMAGE_ITEM_BATCH_SIZE) {
-            let mut image_items = Vec::with_capacity(source_page.len());
-            for source in source_page {
-                report.items_processed += 1;
-                let media_path = PathBuf::from(&source.root_path).join(&source.relative_path);
-                match self.enrich_movie_nfo(&source.item_id, &media_path).await {
-                    Ok(nfo_report) => {
+            report.items_processed += source_page.len();
+            let nfo_requests = source_page
+                .iter()
+                .map(|source| {
+                    (
+                        source.item_id.clone(),
+                        PathBuf::from(&source.root_path).join(&source.relative_path),
+                    )
+                })
+                .collect();
+            let nfo_results =
+                run_bounded_tasks_in_order(nfo_requests, LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY, {
+                    let enricher = self.clone();
+                    move |(item_id, media_path)| {
+                        let enricher = enricher.clone();
+                        async move { enricher.enrich_movie_nfo(&item_id, &media_path).await }
+                    }
+                })
+                .await;
+            for (source, result) in source_page.iter().zip(nfo_results) {
+                match result {
+                    Ok(Ok(nfo_report)) => {
                         let failed = nfo_report.nfo_failed > 0;
                         report.merge(nfo_report);
                         if failed {
                             report.mark_item_failed(&source.item_id);
                         }
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::warn!(
                             item_id = %source.item_id,
                             %error,
@@ -1343,8 +1425,20 @@ impl MetadataEnricher {
                         report.nfo_failed += 1;
                         report.mark_item_error(&source.item_id, &error);
                     }
+                    Err(error) => {
+                        tracing::error!(
+                            item_id = %source.item_id,
+                            %error,
+                            "local movie NFO task failed unexpectedly"
+                        );
+                        report.nfo_failed += 1;
+                        report.mark_item_failed(&source.item_id);
+                    }
                 }
+            }
 
+            let mut image_items = Vec::with_capacity(source_page.len());
+            for source in source_page {
                 if let Some(item) =
                     prepare_scan_local_movie_image_batch_item(source, &mut directory_cache, report)
                         .await
@@ -2434,6 +2528,35 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn bounded_task_helper_caps_concurrency_and_preserves_input_order() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let max_active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let results = run_bounded_tasks_in_order((0..12).collect(), 4, {
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            move |value| {
+                let active = Arc::clone(&active);
+                let max_active = Arc::clone(&max_active);
+                async move {
+                    let running = active.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                    max_active.fetch_max(running, std::sync::atomic::Ordering::SeqCst);
+                    tokio::task::yield_now().await;
+                    active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                    value * 2
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(max_active.load(std::sync::atomic::Ordering::SeqCst), 4);
+        let results = results
+            .into_iter()
+            .map(|result| result.expect("bounded task should finish"))
+            .collect::<Vec<_>>();
+        assert_eq!(results, (0..12).map(|value| value * 2).collect::<Vec<_>>());
+    }
+
+    #[tokio::test]
     async fn movie_library_image_registration_batches_multiple_items()
     -> Result<(), Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
@@ -2530,6 +2653,76 @@ mod tests {
         let recovery_report = enricher.enrich_movie_library(library.id).await?;
         assert_eq!(recovery_report.images_found, 1);
         assert!(recovery_report.failed_item_ids.contains(&blocked_item_id));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn movie_library_keeps_nfo_errors_isolated_per_item()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, nfo) in [
+            (
+                "Broken Movie (2024)",
+                "Broken.Movie.2024",
+                "<movie><title>Broken</movie>",
+            ),
+            (
+                "Healthy Movie (2024)",
+                "Healthy.Movie.2024",
+                "<movie><title>Healthy From NFO</title></movie>",
+            ),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.nfo")), nfo).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_ids: HashMap<String, String> =
+            sqlx::query_as("SELECT id, title FROM media_items WHERE library_id = ?")
+                .bind(library.id.to_string())
+                .fetch_all(database.pool())
+                .await?
+                .into_iter()
+                .map(|(item_id, title)| (title, item_id))
+                .collect();
+
+        let report = MetadataEnricher::new(database.clone())
+            .enrich_movie_library(library.id)
+            .await?;
+
+        assert_eq!(report.items_processed, 2);
+        assert_eq!(report.nfo_loaded, 1);
+        assert_eq!(report.nfo_failed, 1);
+        assert_eq!(
+            report.failed_item_ids,
+            vec![item_ids.get("Broken Movie").ok_or("broken item")?.clone()]
+        );
+        let healthy_title: String =
+            sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+                .bind(item_ids.get("Healthy Movie").ok_or("healthy item")?)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(healthy_title, "Healthy From NFO");
         Ok(())
     }
 

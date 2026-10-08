@@ -8848,6 +8848,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：projection 查询计数回归确认，复用页级 writeback context 后不再执行逐 item kind/source SQL，projection 阶段由 2 次 query-wrapper 调用降为 0；NFO 文件读取及 canonicalize/root 校验保持。`nfo_writer` 26/26、metadata candidate 单测 22/22、`metadata_selection` 31/31、`scanning_jobs` 81/81、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `uname -m=arm64`。`cargo test --locked --all-targets` 的 library 测试 758 passed、13 ignored，随后在 `tests/emby_counts.rs:159` 遇到实际计数 1、期望 0；在未包含 LUX-417 改动的 `2b64ba65` 隔离工作树复跑同一目标得到相同失败，因此记为已有基线失败而非本任务回归。仅报告本地 SQLite 查询边界，不外推文件系统、PostgreSQL、NAS 或 FNOS 收益。
 
+#### LUX-418：电影本地 NFO 有界并发
+
+范围：普通电影 metadata enrichment 已按 16 个 item 分页并批量登记图片，但 NFO 仍逐条执行。对每页独立电影 NFO 使用最多 4 个并发任务，保持结果按来源顺序归并、item 错误隔离、report 计数以及现有图片批事务/单 item 失败回退。不扩展到 series/episode NFO、在线刮削、人物写入或调度器。
+
+验收：
+
+- [x] 有自动化回归证明任务并发数不超过 4、输入结果顺序稳定且所有 item 均被处理。
+- [x] 每个电影 NFO 的错误仍只标记该 item；图片批登记和失败回退行为保持。
+- [x] metadata/scanned_metadata 定向目标、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。
+- [x] 性能记录只描述本地 worker 并发上界，不把 SQL 并发或 fixture 推断为 FNOS CPU/墙钟收益。
+
+短计划与文件：修改 `src/application/metadata.rs`，使用可测试的有界 task helper 驱动电影 NFO page；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md` 记录范围及验收。先写并发上限/顺序回归，再替换逐条 NFO loop，最后验证图片失败隔离与目标测试。
+
+结果（2026-10-08）：普通电影每页最多 4 个 NFO task 并行，任务完成后再补充下一项，最终按输入顺序合并 report；坏 NFO 只使对应电影失败，健康电影仍更新，图片 page transaction 和逐 item 失败回退保持。metadata 单测 13/13、`scanned_metadata` 16/16、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本轮 `cargo test --locked --all-targets` 的 library 测试 760 passed、13 ignored，随后 `tests/emby_counts.rs:159` 再次出现已在未改动基线 `2b64ba65` 复现的实际计数 1、期望 0。性能证据仅确认本地并发上限与结果顺序，没有墙钟、FNOS CPU、PostgreSQL 或 NAS A/B 数据。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
