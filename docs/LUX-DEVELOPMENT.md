@@ -9336,6 +9336,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：unchanged NFO 的缺失 provider ID/premiere date repair 与 metadata 更新共用最多 16 项的页级 metadata 写事务；仅补缺失字段，并发已补齐值不会覆盖；无变化不会执行 UPDATE。混合写批次故障回归确认事务回滚，应用层逐 item fallback 保持错误隔离，指标覆盖批次及 fallback 的成功/失败与耗时。移除被新入口替代的无用 storage wrapper。定向测试通过；`cargo build --locked`、`cargo test --locked --all-targets`（库 796 passed、13 ignored，所有集成目标通过）、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `arm64`；PostgreSQL 专用测试/基准按标记未运行，未部署 FNOS/NAS，也没有生产 CPU 或墙钟收益测量。
 
+#### LUX-451：为人物关系运行索引预留快照 checksum
+
+范围：`person_index_item_state` 目前只记录 NFO source fingerprint 与 relation schema version。人物关系文件可以在 source fingerprint 不变时变化；如果文件原子替换成功而 credits transaction 失败，旧索引状态仍可能被误判为 current。新增 nullable `relation_checksum` 列以保存 `people.json` 完整快照 checksum；旧行迁移后 checksum 为空，后续消费路径必须将其视为 stale。文件快照继续作为配置卷恢复来源，数据库仍只是运行索引；本任务不声称文件系统与数据库可共享原子事务，也不改变 public API、人物关系模型或关系文件格式。
+
+验收：
+
+- [ ] SQLite 与 PostgreSQL 均新增 nullable `person_index_item_state.relation_checksum`，历史 migration 文件和 checksum 不变。
+- [ ] 从空库运行全部 migration 后新列存在；从已有 0165 schema 升级保留 relation state 行和原 source fingerprint/schema version，checksum 初始为空。
+- [ ] migration 序号/双后端合同回归、`tests/storage.rs`、build、fmt、Clippy 与 `git diff --check` 通过。
+
+预计文件：`migrations/0166_person_index_relation_checksum.sql`、`migrations-postgres/0166_person_index_relation_checksum.sql`、`tests/storage.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/scanner.rs`、`tests/postgres_database.rs`、`docs/LUX-DEVELOPMENT.md`。新 migration 会提升当前 schema version；因此本任务也更新这些测试目标中的 latest-schema 断言。先添加既有 state 行升级回归并确认旧 schema 缺少该列，再增加双后端 additive migration 与空库/升级验证；随后由独立应用任务将 checksum 写入 credits transaction 并在跳过路径比较。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
