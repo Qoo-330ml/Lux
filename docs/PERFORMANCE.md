@@ -1639,3 +1639,7 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 本地 scan metadata NFO page 原先在每个 item 的 relation 文件写完后分别获取 credits 写锁并提交事务。现在先完成页内 relation 文件处理，再每 16 个 item 调用一次批量 credits replacement；含 N 项待提交 actor relation 的页面最多执行 `ceil(N/16)` 次 credits replacement 事务。固定回归覆盖两个 relation 先于 flush 写入、flush 前数据库 revision 仍为 stale、flush 后恢复 current；注入 credits SQL 错误时同一 16-item chunk 的 credits/index state 整体回滚，扫描报告该 chunk item 失败，其他 NFO 文件解析错误仍按 item 隔离。
 
 该记录描述调用和事务边界，不是 SQL 执行次数或事务耗时测量。普通人物 API、在线刮削和单条目 enrichment 保持即时持久化；未测量 PostgreSQL 时延、锁等待、FNOS/NAS 或 CPU 收益。
+
+### LUX-436 PostgreSQL query statistics 诊断
+
+数据库诊断报告现在可选读取 `pg_stat_statements` 当前数据库的最多 20 条累计高执行时间语句，包含 query ID、调用数、总/均值/最大执行时间、行数和 shared block hit/read，不返回 SQL 文本或参数。extension 未预加载、未安装、无权读取或查询超时会返回不可用状态；SQLite 标记为不适用。该改动没有测量或改善任何 SQL 延迟；返回值受 extension 启用时间及 `pg_stat_statements_reset()` 影响，只用于后续定位热点。

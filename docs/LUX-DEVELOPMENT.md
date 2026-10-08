@@ -9113,6 +9113,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：本地 scan NFO page 先完成每项 relation、manifest、NFO 和图片处理，再把 credits 按最多 16 项一组提交；每页 N 项至多执行 `ceil(N/16)` 次 credits replacement 事务。relation 文件早于 credits flush 写入；如果批事务失败，该 chunk 内 item 被报告为失败，数据库 revision 不 current，后续扫描可重试。普通人物 API、在线刮削及单条目 NFO enrichment 仍即时提交。deferred persistence、page flush/错误隔离、metadata NFO 单测、`tests/people_api.rs` 10/10、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、Clippy 和差异检查通过。本机 ARM64。全目标库测试 775 passed、13 ignored；集成目标中 `emby_counts`、`metadata`、`metadata_selection`、`strm` 四个失败已在父提交 `855d890a` 独立复现，`watch` 的 SQLite 锁冲突单独复跑通过。未据此推断生产 SQL 延迟、FNOS/NAS 或 CPU 收益。
 
+#### LUX-436：在 PostgreSQL 诊断报告中提供 pg_stat_statements 摘要
+
+范围：当前数据库诊断报告没有 SQL 聚合执行时间，扫描/metadata 优化只能依赖 query-wrapper 计数和本机 fixture。若连接的 PostgreSQL 已预加载并启用 `pg_stat_statements`，报告新增最多 20 条当前数据库的 statement 聚合指标：query ID、调用数、总/均值/最大执行时间、返回行数和 shared block hit/read。报告不返回 SQL 文本或参数，不尝试创建 extension、改变 PostgreSQL 配置或自动重启服务；extension 未预加载、未创建或当前角色无权读取时明确报告不可用。SQLite 标记为不适用。
+
+验收：
+
+- [x] PostgreSQL extension 可用时输出有界、脱敏的 query statistics；不改变现有 database diagnostics 字段和权限。
+- [x] extension 缺失、未预加载或权限不足时诊断仍成功并标记不可用；SQLite 报告为不适用。
+- [x] 自动化覆盖 available/unavailable JSON 合同；PostgreSQL 集成验证可用时执行，并说明未启用时的限制。
+- [x] `docs/API.md` 记录管理员可选启用步骤、报告字段和无自动数据库变更的行为；性能记录不把诊断值作为改动后的基准。
+
+预计文件：`src/storage/database_diagnostics.rs`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 SQLite/可用状态合同回归，再实现可选只读查询与 unavailable 降级。
+
+结果（2026-10-08）：PostgreSQL 诊断现在只在服务端预加载且当前数据库已安装 `pg_stat_statements` 时读取当前库累计统计，最多返回 20 条 query ID、调用数、总/均值/最大执行时间、行数和 shared block hit/read；不返回 SQL 文本或参数。未预加载、extension 缺失、权限不足、不可用或超时均降级为显式状态，SQLite 标记 `NOT_APPLICABLE`。SQLite 合同、不可用状态单测和 `cargo test --locked --lib database_diagnostics -- --include-ignored` 通过；集成测试在本机 PostgreSQL 配置下通过可用/不可用合同。build、fmt、全目标全 feature Clippy 通过。最终 all-targets 库测试 777 passed、13 ignored；集成目标 `emby_counts`（实际 1、期望 0）、`metadata`（unchanged NFO 期望 nfo_loaded=1，实际 0）、`metadata_selection`（optional actor enrichment wait）及 `strm`（401/200）均在本任务父提交 `855d890a` 独立复现；`watch` 全目标 5/5 通过。本机 ARM64；API 文档提供 DBA 手动启用步骤。本任务没有测量 query latency 或优化收益，统计值只作为后续诊断信号。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

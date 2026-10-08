@@ -3,6 +3,8 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 const MAX_DIAGNOSTIC_RELATIONS: i64 = 10_000;
+const MAX_POSTGRES_STATEMENTS: i64 = 20;
+const POSTGRES_STATEMENTS_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
 pub struct DatabaseDiagnosticsSnapshot {
@@ -153,6 +155,7 @@ impl Database {
             "pageSizeBytes": page_size, "pageCount": page_count,
             "freelistPages": freelist_count, "relations": relations,
             "indexes": index_details, "schemaSizes": schema_sizes,
+            "queryStatistics": { "status": "NOT_APPLICABLE", "topStatements": [] },
             "relationSizesAvailable": dbstat_available,
             "relationSizesNote": if dbstat_available { "SQLite dbstat" } else { "SQLite dbstat unavailable" },
             "relationsTruncated": relations_truncated,
@@ -277,15 +280,93 @@ impl Database {
                 .unwrap_or_default()
                 .cmp(&left["totalBytes"].as_i64().unwrap_or_default())
         });
+        let query_statistics = self.collect_postgres_query_statistics().await;
         Ok(json!({
             "backend": "POSTGRESQL", "engineVersion": engine_version,
             "databaseName": database_name, "databaseBytes": database_bytes,
             "databaseBytesKind": "EXACT", "relations": relations,
             "schemaSizes": schema_sizes,
             "indexes": indexes, "rowCountsAreEstimates": true,
+            "queryStatistics": query_statistics,
             "relationsTruncated": relations_truncated,
             "indexesTruncated": indexes_truncated,
         }))
+    }
+
+    async fn collect_postgres_query_statistics(&self) -> Value {
+        let configuration = self
+            .query_as::<(String, bool)>(
+                "SELECT current_setting('shared_preload_libraries')::TEXT AS preload_libraries,
+                        EXISTS (
+                            SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements'
+                        ) AS extension_installed",
+            )
+            .fetch_one(&self.pool)
+            .await;
+        let (preload_libraries, extension_installed) = match configuration {
+            Ok(configuration) => configuration,
+            Err(_) => return unavailable_query_statistics("UNAVAILABLE"),
+        };
+        if !shared_preload_contains_pg_stat_statements(&preload_libraries) {
+            return unavailable_query_statistics("NOT_PRELOADED");
+        }
+        if !extension_installed {
+            return unavailable_query_statistics("EXTENSION_MISSING");
+        }
+
+        let statements = tokio::time::timeout(
+            POSTGRES_STATEMENTS_TIMEOUT,
+            self.query(
+                "SELECT queryid::TEXT AS query_id, calls::BIGINT AS calls,
+                        total_exec_time::DOUBLE PRECISION AS total_exec_time_ms,
+                        mean_exec_time::DOUBLE PRECISION AS mean_exec_time_ms,
+                        max_exec_time::DOUBLE PRECISION AS max_exec_time_ms,
+                        rows::BIGINT AS rows,
+                        shared_blks_hit::BIGINT AS shared_blocks_hit,
+                        shared_blks_read::BIGINT AS shared_blocks_read
+                 FROM pg_stat_statements
+                 WHERE dbid = (SELECT oid FROM pg_database WHERE datname = current_database())
+                   AND queryid IS NOT NULL
+                 ORDER BY total_exec_time DESC
+                 LIMIT ?",
+            )
+            .bind(MAX_POSTGRES_STATEMENTS)
+            .fetch_all(&self.pool),
+        )
+        .await;
+        let rows = match statements {
+            Err(_) => return unavailable_query_statistics("QUERY_TIMEOUT"),
+            Ok(Err(error)) => {
+                let status = if error
+                    .as_database_error()
+                    .and_then(|database_error| database_error.code())
+                    .as_deref()
+                    == Some("42501")
+                {
+                    "INSUFFICIENT_PRIVILEGE"
+                } else {
+                    "UNAVAILABLE"
+                };
+                return unavailable_query_statistics(status);
+            }
+            Ok(Ok(rows)) => rows,
+        };
+        let top_statements = rows
+            .iter()
+            .map(|row| {
+                json!({
+                    "queryId": row.try_get::<String, _>("query_id").unwrap_or_default(),
+                    "calls": row.try_get::<i64, _>("calls").unwrap_or_default(),
+                    "totalExecTimeMs": row.try_get::<f64, _>("total_exec_time_ms").unwrap_or_default(),
+                    "meanExecTimeMs": row.try_get::<f64, _>("mean_exec_time_ms").unwrap_or_default(),
+                    "maxExecTimeMs": row.try_get::<f64, _>("max_exec_time_ms").unwrap_or_default(),
+                    "rows": row.try_get::<i64, _>("rows").unwrap_or_default(),
+                    "sharedBlocksHit": row.try_get::<i64, _>("shared_blocks_hit").unwrap_or_default(),
+                    "sharedBlocksRead": row.try_get::<i64, _>("shared_blocks_read").unwrap_or_default(),
+                })
+            })
+            .collect::<Vec<_>>();
+        json!({ "status": "AVAILABLE", "topStatements": top_statements })
     }
 
     fn diagnostics_error(&self, source: sqlx::Error) -> StorageError {
@@ -294,6 +375,17 @@ impl Database {
             source,
         }
     }
+}
+
+fn shared_preload_contains_pg_stat_statements(preload_libraries: &str) -> bool {
+    preload_libraries
+        .split(',')
+        .map(str::trim)
+        .any(|library| library.trim_matches('"') == "pg_stat_statements")
+}
+
+fn unavailable_query_statistics(status: &str) -> Value {
+    json!({ "status": status, "topStatements": [] })
 }
 
 #[cfg(test)]
@@ -315,6 +407,10 @@ mod tests {
             .expect("diagnostics");
 
         assert_eq!(report.details["backend"], "SQLITE");
+        assert_eq!(
+            report.details["queryStatistics"]["status"],
+            "NOT_APPLICABLE"
+        );
         assert!(report.details["databaseBytes"].as_u64().unwrap_or_default() > 0);
         assert!(report.details["pageCount"].as_i64().unwrap_or_default() > 0);
         assert!(
@@ -352,6 +448,28 @@ mod tests {
                 .contains(config.config_dir.to_string_lossy().as_ref())
         );
         database.close().await;
+    }
+
+    #[test]
+    fn pg_stat_statements_preload_detection_matches_a_complete_library_name() {
+        assert!(shared_preload_contains_pg_stat_statements(
+            "pg_stat_statements,auto_explain"
+        ));
+        assert!(shared_preload_contains_pg_stat_statements(
+            "auto_explain, pg_stat_statements"
+        ));
+        assert!(!shared_preload_contains_pg_stat_statements(
+            "pg_stat_statements_test"
+        ));
+        assert!(!shared_preload_contains_pg_stat_statements(""));
+    }
+
+    #[test]
+    fn unavailable_query_statistics_returns_a_bounded_empty_result() {
+        let report = unavailable_query_statistics("NOT_PRELOADED");
+        assert_eq!(report["status"], "NOT_PRELOADED");
+        assert_eq!(report["topStatements"], json!([]));
+        assert!(report.get("query").is_none());
     }
 
     #[tokio::test]
@@ -400,12 +518,62 @@ mod tests {
         )
         .await
         .expect("test database");
+        let preload_libraries: String =
+            sqlx::query_scalar("SELECT current_setting('shared_preload_libraries')::TEXT")
+                .fetch_one(&admin_pool)
+                .await
+                .expect("read PostgreSQL preload configuration");
+        let extension_ready = if shared_preload_contains_pg_stat_statements(&preload_libraries) {
+            sqlx::query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+                .execute(database.pool())
+                .await
+                .is_ok()
+        } else {
+            false
+        };
+        if extension_ready {
+            let _: i64 = database
+                .query_scalar("SELECT 424242::BIGINT")
+                .fetch_one(database.pool())
+                .await
+                .expect("record a statement in pg_stat_statements");
+        }
         let report = database
             .collect_database_diagnostics()
             .await
             .expect("diagnostics");
 
         assert_eq!(report.details["backend"], "POSTGRESQL");
+        let query_statistics = &report.details["queryStatistics"];
+        assert!(matches!(
+            query_statistics["status"].as_str(),
+            Some(
+                "AVAILABLE"
+                    | "NOT_PRELOADED"
+                    | "EXTENSION_MISSING"
+                    | "INSUFFICIENT_PRIVILEGE"
+                    | "QUERY_TIMEOUT"
+                    | "UNAVAILABLE"
+            )
+        ));
+        if query_statistics["status"] == "AVAILABLE" {
+            let statements = query_statistics["topStatements"]
+                .as_array()
+                .expect("available query statistics include statements");
+            assert!(statements.len() <= 20);
+            for statement in statements {
+                assert!(statement["queryId"].as_str().is_some());
+                assert!(statement["calls"].as_u64().is_some());
+                assert!(statement["totalExecTimeMs"].as_f64().is_some());
+                assert!(statement.get("query").is_none());
+                assert!(statement.get("statement").is_none());
+            }
+        } else {
+            assert_eq!(query_statistics["topStatements"], json!([]));
+        }
+        if extension_ready {
+            assert_eq!(query_statistics["status"], "AVAILABLE");
+        }
         assert!(report.details["databaseBytes"].as_i64().unwrap_or_default() > 0);
         assert!(
             report.details["relations"]
