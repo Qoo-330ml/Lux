@@ -8766,17 +8766,17 @@ impl ScanJobService {
         &self,
         job_id: &str,
     ) -> Result<(), ScanJobError> {
-        let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? else {
+        let Some(manifest) = self
+            .database
+            .get_scan_manifest_postprocessing_state_by_job(job_id)
+            .await?
+        else {
             return Ok(());
         };
         if !matches!(manifest.workflow_version, 2 | 3) || manifest.discovery_format_version != 3 {
             return Ok(());
         }
-        for root in self
-            .database
-            .list_scan_manifest_postprocessing_roots(&manifest.id)
-            .await?
-        {
+        for root in manifest.roots {
             if !root.has_positive_rows {
                 continue;
             }
@@ -8792,7 +8792,10 @@ impl ScanJobService {
                 });
             if !root_matches {
                 self.database
-                    .mark_scan_manifest_root_unavailable(&manifest.id, &root.library_root_id)
+                    .mark_scan_manifest_root_unavailable(
+                        &manifest.manifest_id,
+                        &root.library_root_id,
+                    )
                     .await?;
                 self.record_event(
                     job_id,
@@ -9473,21 +9476,24 @@ impl ScanJobService {
                 if matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
                     return;
                 }
-                let pending = match database
-                    .has_pending_scan_job_metadata_targets(&worker_job_id)
+                let page = match database
+                    .load_scan_job_metadata_page(
+                        &worker_job_id,
+                        i64::try_from(LOCAL_METADATA_BATCH_SIZE).unwrap_or(i64::MAX),
+                    )
                     .await
                 {
-                    Ok(pending) => pending,
+                    Ok(page) => Some(page),
                     Err(error) => {
                         tracing::warn!(
                             scan_job_id = %worker_job_id,
                             %error,
-                            "local metadata worker could not check pending targets"
+                            "local metadata worker could not load pending target page"
                         );
-                        false
+                        None
                     }
                 };
-                if pending {
+                if let Some(page) = page.filter(|page| page.has_pending) {
                     if let Err(error) = target_root_validator
                         .verify_manifest_postprocessing_target_roots(&worker_job_id)
                         .await
@@ -9514,7 +9520,7 @@ impl ScanJobService {
                         continue;
                     }
                     match enricher
-                        .enrich_scan_job_targets(&worker_job_id, LOCAL_METADATA_BATCH_SIZE)
+                        .enrich_scan_job_metadata_page(&worker_job_id, page)
                         .await
                     {
                         Ok(report) if report.items_processed > 0 => {
@@ -13488,6 +13494,145 @@ mod tests {
         let notification_queries = database.query_count();
         ScanJobService::stop_local_metadata_worker(&mut worker).await;
         assert_eq!(notification_queries, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_worker_defers_targets_when_manifest_root_identity_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let media_root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&media_root).await?;
+        tokio::fs::write(media_root.join("Movie.mkv"), b"movie").await?;
+        tokio::fs::write(
+            media_root.join("Movie.nfo"),
+            "<movie><title>Must Not Be Read</title></movie>",
+        )
+        .await?;
+
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root = libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?
+            .root;
+        let jobs = ScanJobService::new(database.clone());
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        let manifest_id: String =
+            sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = ?")
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+        sqlx::query(
+            "INSERT INTO scan_manifest_roots (
+                 manifest_id, library_root_id, state, postprocessing_target_stage
+             ) VALUES (?, ?, 'COMPLETE', 'NEW')
+             ON CONFLICT(manifest_id, library_root_id) DO UPDATE SET
+                 state = 'COMPLETE', postprocessing_target_stage = 'NEW'",
+        )
+        .bind(&manifest_id)
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at, device, inode
+             ) VALUES (?, ?, '', 1, 'DIRECTORY', 0, 1, 0, 0)
+             ON CONFLICT(manifest_id, library_root_id, relative_path, observation_sequence)
+             DO UPDATE SET device = 0, inode = 0",
+        )
+        .bind(&manifest_id)
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let item_id = "manifest-root-mismatch-item";
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Original title', 'original title', 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, last_seen_change_kind
+             ) VALUES ('manifest-root-mismatch-entry', ?, 'Movie.mkv', 'FILE',
+                       5, 1, ?, 'NEW')",
+        )
+        .bind(root.id.to_string())
+        .bind(&job.generation)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, is_default
+             ) VALUES ('manifest-root-mismatch-source', ?, 'LOCAL_FILE',
+                       'manifest-root-mismatch-entry', 1)",
+        )
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'PENDING')",
+        )
+        .bind(&job.id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+
+        let mut worker = Some(jobs.start_local_metadata_worker(&job.id));
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let target_state: String = sqlx::query_scalar(
+                    "SELECT metadata_state FROM scan_job_targets
+                     WHERE job_id = ? AND item_id = ?",
+                )
+                .bind(&job.id)
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+                if target_state == "FAILED" {
+                    break Ok::<(), sqlx::Error>(());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await??;
+        ScanJobService::stop_local_metadata_worker(&mut worker).await;
+
+        let title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+            .bind(item_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(title, "Original title");
+        let root_available: i64 =
+            sqlx::query_scalar("SELECT is_available FROM library_roots WHERE id = ?")
+                .bind(root.id.to_string())
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(root_available, 0);
         Ok(())
     }
 

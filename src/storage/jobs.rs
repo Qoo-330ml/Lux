@@ -2406,6 +2406,93 @@ impl Database {
         })
     }
 
+    pub(crate) async fn get_scan_manifest_postprocessing_state_by_job(
+        &self,
+        job_id: &str,
+    ) -> Result<Option<StoredScanManifestPostprocessingState>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT manifest.id AS manifest_id,
+                        manifest.workflow_version,
+                        manifest.discovery_format_version,
+                        root.library_root_id,
+                        library_root.canonical_path,
+                        root.postprocessing_target_stage,
+                        root.postprocessing_target_cursor,
+                        observed.device,
+                        observed.inode,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM filesystem_entries entry
+                            WHERE entry.library_root_id = root.library_root_id
+                              AND entry.last_seen_generation = job.generation
+                              AND entry.entry_kind = 'FILE'
+                              AND entry.last_seen_change_kind = root.postprocessing_target_stage
+                              AND entry.relative_path > COALESCE(root.postprocessing_target_cursor, '')
+                        ) THEN 1 ELSE 0 END AS has_stage_rows,
+                        CASE WHEN EXISTS (
+                            SELECT 1 FROM filesystem_entries entry
+                            WHERE entry.library_root_id = root.library_root_id
+                              AND entry.last_seen_generation = job.generation
+                              AND entry.entry_kind = 'FILE'
+                              AND entry.last_seen_change_kind IN ('NEW', 'CHANGED', 'SIDECAR')
+                        ) THEN 1 ELSE 0 END AS has_positive_rows
+                 FROM scan_manifests manifest
+                 JOIN scan_jobs job ON job.id = manifest.job_id
+                 LEFT JOIN scan_manifest_roots root ON root.manifest_id = manifest.id
+                 LEFT JOIN library_roots library_root ON library_root.id = root.library_root_id
+                 LEFT JOIN scan_manifest_entries observed
+                   ON observed.manifest_id = root.manifest_id
+                  AND observed.library_root_id = root.library_root_id
+                  AND observed.relative_path = ''
+                  AND observed.observation_sequence = (
+                      SELECT MAX(latest.observation_sequence)
+                      FROM scan_manifest_entries latest
+                      WHERE latest.manifest_id = root.manifest_id
+                        AND latest.library_root_id = root.library_root_id
+                        AND latest.relative_path = ''
+                  )
+                 WHERE manifest.job_id = ?
+                 ORDER BY root.library_root_id",
+            )
+            .bind(job_id)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let mut state: Option<StoredScanManifestPostprocessingState> = None;
+        for row in rows {
+            let Some(manifest_id) = row.get::<Option<String>, _>("manifest_id") else {
+                continue;
+            };
+            let current_state =
+                state.get_or_insert_with(|| StoredScanManifestPostprocessingState {
+                    manifest_id,
+                    workflow_version: row.get("workflow_version"),
+                    discovery_format_version: row.get("discovery_format_version"),
+                    roots: Vec::new(),
+                });
+            let Some(library_root_id) = row.get::<Option<String>, _>("library_root_id") else {
+                continue;
+            };
+            current_state
+                .roots
+                .push(StoredScanManifestPostprocessingRoot {
+                    library_root_id,
+                    canonical_path: row.get("canonical_path"),
+                    expected_device: row.get("device"),
+                    expected_inode: row.get("inode"),
+                    target_stage: row.get("postprocessing_target_stage"),
+                    target_cursor: row.get("postprocessing_target_cursor"),
+                    has_stage_rows: row.get::<i64, _>("has_stage_rows") != 0,
+                    has_positive_rows: row.get::<i64, _>("has_positive_rows") != 0,
+                });
+        }
+        Ok(state)
+    }
+
     pub(crate) async fn list_scan_manifest_postprocessing_roots(
         &self,
         manifest_id: &str,
@@ -7940,6 +8027,185 @@ impl Database {
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
+        })
+    }
+
+    pub(crate) async fn load_scan_job_metadata_page(
+        &self,
+        job_id: &str,
+        limit: i64,
+    ) -> Result<StoredScanJobMetadataPage, StorageError> {
+        let rows = self
+            .query(
+                "WITH pending_targets AS (
+                     SELECT target_id, item_id
+                     FROM scan_job_targets
+                     WHERE job_id = ? AND target_type = 'ITEM'
+                       AND metadata_state = 'PENDING'
+                 ), source_candidates AS (
+                     SELECT * FROM (
+                     SELECT 0 AS source_order, t.target_id, 'MOVIE' AS target_kind,
+                            ms.id AS source_id, ms.item_id, ms.probe_status,
+                            lr.canonical_path AS root_path, fe.relative_path,
+                            CAST(NULL AS TEXT) AS series_id,
+                            CAST(NULL AS TEXT) AS season_id,
+                            CAST(NULL AS INTEGER) AS season_number
+                     FROM pending_targets t
+                     JOIN media_items mi ON mi.id = t.item_id AND mi.item_type = 'MOVIE'
+                     JOIN media_sources ms ON ms.id = (
+                         SELECT preferred.id FROM media_sources preferred
+                         JOIN filesystem_entries preferred_fe
+                           ON preferred_fe.id = preferred.filesystem_entry_id
+                         WHERE preferred.item_id = t.item_id
+                           AND preferred_fe.is_missing = 0
+                         ORDER BY preferred.is_default DESC, preferred.id
+                         LIMIT 1
+                     )
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     WHERE fe.is_missing = 0
+                     ORDER BY t.target_id
+                     LIMIT ?
+                     ) movie_page
+                     UNION ALL
+                     SELECT * FROM (
+                     SELECT 1 AS source_order, t.target_id, 'VIDEO' AS target_kind,
+                            ms.id AS source_id, ms.item_id, ms.probe_status,
+                            lr.canonical_path AS root_path, fe.relative_path,
+                            CAST(NULL AS TEXT) AS series_id,
+                            CAST(NULL AS TEXT) AS season_id,
+                            CAST(NULL AS INTEGER) AS season_number
+                     FROM pending_targets t
+                     JOIN media_items mi ON mi.id = t.item_id AND mi.item_type = 'VIDEO'
+                     JOIN media_sources ms ON ms.id = (
+                         SELECT preferred.id FROM media_sources preferred
+                         JOIN filesystem_entries preferred_fe
+                           ON preferred_fe.id = preferred.filesystem_entry_id
+                         WHERE preferred.item_id = t.item_id
+                           AND preferred_fe.is_missing = 0
+                         ORDER BY preferred.is_default DESC, preferred.id
+                         LIMIT 1
+                     )
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     WHERE fe.is_missing = 0
+                     ORDER BY t.target_id
+                     LIMIT ?
+                     ) home_video_page
+                     UNION ALL
+                     SELECT * FROM (
+                     SELECT 2 AS source_order, t.target_id, 'EPISODE' AS target_kind,
+                            ms.id AS source_id, episode.id AS item_id, ms.probe_status,
+                            lr.canonical_path AS root_path, fe.relative_path,
+                            series.id AS series_id, season.id AS season_id,
+                            season.season_number
+                     FROM pending_targets t
+                     JOIN media_items episode ON episode.id = t.item_id
+                       AND episode.item_type = 'EPISODE'
+                     JOIN media_items season ON season.id = episode.parent_id
+                       AND season.item_type = 'SEASON'
+                     JOIN media_items series ON series.id = episode.series_id
+                       AND series.item_type = 'SERIES'
+                     JOIN media_sources ms ON ms.id = (
+                         SELECT preferred.id FROM media_sources preferred
+                         JOIN filesystem_entries preferred_fe
+                           ON preferred_fe.id = preferred.filesystem_entry_id
+                         WHERE preferred.item_id = episode.id
+                           AND preferred_fe.is_missing = 0
+                         ORDER BY preferred.is_default DESC, preferred.id
+                         LIMIT 1
+                     )
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     JOIN library_roots lr ON lr.id = fe.library_root_id
+                     WHERE fe.is_missing = 0
+                     ORDER BY t.target_id
+                     LIMIT ?
+                     ) episode_page
+                 ), selected_sources AS (
+                     SELECT * FROM source_candidates
+                     WHERE source_order = (SELECT MIN(source_order) FROM source_candidates)
+                     ORDER BY target_id
+                     LIMIT ?
+                 )
+                 SELECT CASE WHEN EXISTS(SELECT 1 FROM pending_targets) THEN 1 ELSE 0 END
+                            AS has_pending,
+                        COALESCE(selected.target_kind, '') AS target_kind,
+                        COALESCE(selected.source_id, '') AS source_id,
+                        COALESCE(selected.item_id, '') AS item_id,
+                        COALESCE(selected.probe_status, '') AS probe_status,
+                        COALESCE(selected.root_path, '') AS root_path,
+                        COALESCE(selected.relative_path, '') AS relative_path,
+                        COALESCE(selected.series_id, '') AS series_id,
+                        COALESCE(selected.season_id, '') AS season_id,
+                        selected.season_number
+                 FROM (SELECT 1 AS singleton) singleton
+                 LEFT JOIN selected_sources selected ON TRUE
+                 ORDER BY selected.target_id",
+            )
+            .bind(job_id)
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        let mut has_pending = false;
+        let mut movies = Vec::new();
+        let mut home_videos = Vec::new();
+        let mut episodes = Vec::new();
+        for row in rows {
+            has_pending = row.get::<i64, _>("has_pending") != 0;
+            let target_kind: String = row.get("target_kind");
+            if target_kind.is_empty() {
+                continue;
+            }
+            match target_kind.as_str() {
+                "MOVIE" => movies.push(StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                }),
+                "VIDEO" => home_videos.push(StoredMediaSourcePath {
+                    source_id: row.get("source_id"),
+                    item_id: row.get("item_id"),
+                    probe_status: row.get("probe_status"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                }),
+                "EPISODE" => episodes.push(StoredSeriesMetadataSource {
+                    series_id: row.get("series_id"),
+                    season_id: row.get("season_id"),
+                    episode_id: row.get("item_id"),
+                    season_number: row.get("season_number"),
+                    root_path: row.get("root_path"),
+                    relative_path: row.get("relative_path"),
+                }),
+                _ => {
+                    return Err(StorageError::Conflict(
+                        "unknown local metadata target type".to_owned(),
+                    ));
+                }
+            }
+        }
+        let sources = if !movies.is_empty() {
+            StoredScanJobMetadataSources::Movies(movies)
+        } else if !home_videos.is_empty() {
+            StoredScanJobMetadataSources::HomeVideos(home_videos)
+        } else if !episodes.is_empty() {
+            StoredScanJobMetadataSources::Episodes(episodes)
+        } else {
+            StoredScanJobMetadataSources::None
+        };
+        Ok(StoredScanJobMetadataPage {
+            has_pending,
+            sources,
         })
     }
 

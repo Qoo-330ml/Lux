@@ -9216,6 +9216,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：扫描 worker 每页改为一次 combined storage 调用，在同一 metadata write transaction 内 claim、写 READY 结果、筛选 due retry 和调度补缺；due retry 候选也按 100 项分片。205 项 SQLite 回归确认查询包装器计数从未分片时的 11 次变为 13 次（due retry 查询为 3 片），明确记录这是大页的有界查询代价。故障注入覆盖新 job item 插入失败和 due retry 消费后插入失败，两者均整体回滚；并发回归使用独立 SQLite database handles。`metadata_completeness` 定向测试 8/8、原子提交测试、205 项分页测试和 PostgreSQL `postgres_progressive_scan_metadata_storage_contract` 通过；`cargo build --locked`、fmt、全目标全 feature Clippy 通过。`cargo test --locked --all-targets --no-fail-fast` 的 library 为 780 passed、13 ignored；全量集成仅有三个已在父提交 `855d890a` 记录的独立失败：`emby_counts`（实际 1、期望 0）、`metadata_selection`（可选 actor enrichment 等待超时）、`strm`（401、期望 200）；本轮 `watch` 5/5 通过。`git diff --check` 通过。本机 `arm64`；没有运行 FNOS/NAS 性能验证，也不推断 PostgreSQL 时延、吞吐或 CPU 收益。
 
+#### LUX-443：合并本地 metadata worker 的 pending、page 与 manifest 状态读取
+
+范围：本地 metadata worker 每个处理批次先查询 pending target，再读取 manifest 和 postprocessing roots，最后按电影、home video、episode 顺序最多查询三次目标页。将 pending 状态与按既有优先级选出的首个有界 target page 合并为一个 storage 查询；将 manifest workflow/discovery 状态与 root 身份记录合并为一个 storage 查询。worker 直接处理已读取的 page，不重新查询；仍在每个有 pending 的批次处理前 stat 正向 manifest roots，并保留身份不匹配时标记 pending target 失败、记录脱敏事件的行为。无可用 source 但仍有 pending target 时，继续进入原有 source unavailable 失败路径。无 schema、公共 API 或 target 顺序变化。
+
+验收：
+
+- [x] 一个有界 storage page 查询同时返回 `has_pending` 与最多请求上限的 target source；优先级仍为 MOVIE、VIDEO、EPISODE，每类内按 target ID 稳定排序。无 source 但有 pending 时能区分于无 pending。
+- [x] manifest 与所有 postprocessing root 身份信息由单个 storage 查询加载；每个 pending 批次仍执行本地 root identity stat，变化时不处理媒体文件并保留原有失败/告警语义。
+- [x] worker 不再单独调用 pending existence 查询，也不重复加载 metadata page；空闲通知回归仍为一次 query-wrapper 调用。
+- [x] SQLite 回归覆盖三种 target 类型、顺序、无 source pending、无 pending 和 root metadata；PostgreSQL storage contract、相关 scanner/metadata 测试、build、fmt、Clippy、`git diff --check` 通过。
+- [x] 性能记录只对比固定 fixture 的 query-wrapper 调用边界，不推断 SQL 墙钟、FNOS/NAS CPU 或 PostgreSQL 生产收益。
+
+预计文件：`src/application/scanner.rs`、`src/application/metadata.rs`、`src/storage/jobs.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先写 storage 查询计数与 source-order 回归，再实现 page/manifest 合并查询并让 worker 消费已加载 page。
+
+结果（2026-10-08）：本地 metadata worker 一次读取 pending 状态与首个有界 source page，保持 MOVIE、VIDEO、EPISODE 优先级以及每类按 target ID 的稳定顺序；pending 条目无 source 时仍与无 pending 区分。manifest workflow/discovery 状态、全部 root identity 与 target cursor 信息合并为一次 storage query，仍在每个 pending 批次 stat 正向 roots；root identity 变化时目标被标记 FAILED、root 标为不可用，NFO 不会被应用。固定 SQLite query-wrapper 回归覆盖三类顺序和 source unavailable 状态，worker/manifest 回归覆盖 root mismatch。`metadata` 20/20、`scanned_metadata` 16/16、`scanning_jobs` 81/81、PostgreSQL `postgres_progressive_scan_metadata_storage_contract`、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。全量 all-targets 有三个失败目标（`emby_counts`、`metadata_selection`、`strm`），与父提交 `855d890a` 已记录的独立失败一致；相关集成测试文件未被本任务修改。开发机 `arm64`；未在 FNOS/NAS 上部署或测量运行性能，query-wrapper 计数不代表 SQL 墙钟。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

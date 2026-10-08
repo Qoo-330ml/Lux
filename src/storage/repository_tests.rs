@@ -5,6 +5,7 @@ use crate::{
         candidates::MetadataCandidateService,
         catalog::CatalogService,
         libraries::LibraryService,
+        metadata::MetadataEnricher,
         scanner::{LibraryScanner, ScanJobService},
         setup::SetupService,
     },
@@ -33,6 +34,361 @@ async fn refresh_recommendation_stats(database: &Database) {
             .await
             .expect("refresh recommendation stats")
     );
+}
+
+#[tokio::test]
+async fn scan_job_metadata_target_selection_uses_one_query_without_a_local_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('metadata-target-without-source', ?, 'MOVIE', 'Movie', 'movie', 'PENDING')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', 'metadata-target-without-source',
+                       'metadata-target-without-source', 'NEW', 'PENDING')",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_scan_job_targets(&job.id, 32)
+        .await?;
+
+    assert_eq!(report.items_processed, 0);
+    assert_eq!(
+        database.query_count(),
+        1,
+        "pending state and the unavailable-source result should share one bounded page query"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_job_metadata_page_preserves_kind_priority_and_item_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Mixed", LibraryKind::Mixed, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root_path = root_path.to_str().ok_or("non-UTF8 test root")?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('metadata-page-root', ?, ?, ?, 1, 0)",
+        )
+        .bind(library.id.to_string())
+        .bind(root_path)
+        .bind(root_path)
+        .execute(database.pool())
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+
+    for (item_id, item_type, parent_id, series_id, season_number) in [
+        ("movie-z", "MOVIE", None, None, None),
+        ("movie-a", "MOVIE", None, None, None),
+        ("video-a", "VIDEO", None, None, None),
+        ("series-a", "SERIES", None, None, None),
+        (
+            "season-a",
+            "SEASON",
+            Some("series-a"),
+            Some("series-a"),
+            Some(1_i64),
+        ),
+        (
+            "episode-a",
+            "EPISODE",
+            Some("season-a"),
+            Some("series-a"),
+            Some(1_i64),
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id, season_number,
+                     title, sort_title, identification_status
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_type)
+            .bind(parent_id)
+            .bind(series_id)
+            .bind(season_number)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    for item_id in ["movie-z", "movie-a", "video-a", "episode-a"] {
+        let entry_id = format!("entry-{item_id}");
+        let source_id = format!("source-{item_id}");
+        let relative_path = format!("{item_id}.mkv");
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES (?, 'metadata-page-root', ?, 'FILE', 1, 1, 'generation')",
+            )
+            .bind(&entry_id)
+            .bind(&relative_path)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default
+                 ) VALUES (?, ?, 'LOCAL_FILE', ?, 1)",
+            )
+            .bind(&source_id)
+            .bind(item_id)
+            .bind(&entry_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, item_id, change_kind, metadata_state
+                 ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'PENDING')",
+            )
+            .bind(&job.id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 1).await?;
+    assert!(page.has_pending);
+    let StoredScanJobMetadataSources::Movies(movies) = page.sources else {
+        return Err("movie targets should have priority over other media types".into());
+    };
+    assert_eq!(movies.len(), 1);
+    assert_eq!(movies[0].item_id, "movie-a");
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id IN ('movie-a', 'movie-z')",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query("DELETE FROM media_sources WHERE item_id = 'movie-z'")
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'PENDING'
+             WHERE job_id = ? AND target_id = 'movie-z'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    let StoredScanJobMetadataSources::HomeVideos(videos) = page.sources else {
+        return Err("home video targets should follow movies".into());
+    };
+    assert_eq!(
+        videos
+            .iter()
+            .map(|source| source.item_id.as_str())
+            .collect::<Vec<_>>(),
+        ["video-a"]
+    );
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'video-a'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    let StoredScanJobMetadataSources::Episodes(episodes) = page.sources else {
+        return Err("episode targets should follow home videos".into());
+    };
+    assert_eq!(episodes.len(), 1);
+    assert_eq!(episodes[0].episode_id, "episode-a");
+    assert_eq!(episodes[0].series_id, "series-a");
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'episode-a'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    assert!(
+        page.has_pending,
+        "an unavailable movie source remains pending"
+    );
+    assert!(matches!(page.sources, StoredScanJobMetadataSources::None));
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'FAILED'
+             WHERE job_id = ? AND target_id = 'movie-z'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    assert!(!page.has_pending);
+    assert!(matches!(page.sources, StoredScanJobMetadataSources::None));
+    assert_eq!(database.query_count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn scan_manifest_postprocessing_state_loads_roots_in_one_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root_path = root_path.to_str().ok_or("non-UTF8 test root")?;
+    database
+        .query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('manifest-state-root', ?, ?, ?, 1, 0)",
+        )
+        .bind(library.id.to_string())
+        .bind(root_path)
+        .bind(root_path)
+        .execute(database.pool())
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "UPDATE scan_manifests SET state = 'POSTPROCESSING', workflow_version = 3,
+                 discovery_format_version = 3, discovery_mode = 'LITE'
+             WHERE job_id = ?",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_roots (
+                 manifest_id, library_root_id, state, postprocessing_target_stage
+             ) VALUES (?, 'manifest-state-root', 'COMPLETE', 'NEW')
+             ON CONFLICT(manifest_id, library_root_id) DO UPDATE SET
+                 state = 'COMPLETE', postprocessing_target_stage = 'NEW'",
+        )
+        .bind(&manifest_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_entries (
+                 manifest_id, library_root_id, relative_path, observation_sequence,
+                 entry_kind, size, modified_at, device, inode
+             ) VALUES (?, 'manifest-state-root', '', 1,
+                       'DIRECTORY', 0, 1, 11, 22)
+             ON CONFLICT(manifest_id, library_root_id, relative_path, observation_sequence)
+             DO UPDATE SET device = 11, inode = 22",
+        )
+        .bind(&manifest_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, last_seen_change_kind
+             ) VALUES ('manifest-positive-entry', 'manifest-state-root', 'movie.mkv',
+                       'FILE', 1, 1, ?, 'NEW')",
+        )
+        .bind(&job.generation)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    let state = database
+        .get_scan_manifest_postprocessing_state_by_job(&job.id)
+        .await?
+        .ok_or("scan manifest state should be present")?;
+    assert_eq!(state.manifest_id, manifest_id);
+    assert_eq!(state.workflow_version, 3);
+    assert_eq!(state.discovery_format_version, 3);
+    assert_eq!(state.roots.len(), 1);
+    assert_eq!(state.roots[0].expected_device, Some(11));
+    assert_eq!(state.roots[0].expected_inode, Some(22));
+    assert!(state.roots[0].has_positive_rows);
+    assert!(state.roots[0].has_stage_rows);
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    assert!(
+        database
+            .get_scan_manifest_postprocessing_state_by_job("missing-manifest-job")
+            .await?
+            .is_none()
+    );
+    assert_eq!(database.query_count(), 1);
+    Ok(())
 }
 
 #[tokio::test]
@@ -5627,6 +5983,56 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     assert_eq!(item_ids.len(), 2);
     let item_id = item_ids[0].clone();
     let replay_item_id = item_ids[1].clone();
+    let scan_job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    let scan_job_id = scan_job.id;
+    let manifest_id: String = sqlx::query_scalar("SELECT id FROM scan_manifests WHERE job_id = $1")
+        .bind(&scan_job_id)
+        .fetch_one(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_manifest_roots (
+                 manifest_id, library_root_id, state, postprocessing_target_stage
+             ) VALUES (?, ?, 'COMPLETE', 'NEW')
+             ON CONFLICT(manifest_id, library_root_id) DO UPDATE SET
+                 state = 'COMPLETE', postprocessing_target_stage = 'NEW'",
+        )
+        .bind(&manifest_id)
+        .bind(&root_id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'PENDING')
+             ON CONFLICT(job_id, target_type, target_id) DO UPDATE SET metadata_state = 'PENDING'",
+        )
+        .bind(&scan_job_id)
+        .bind(&item_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let metadata_page = database
+        .load_scan_job_metadata_page(&scan_job_id, 8)
+        .await?;
+    assert!(metadata_page.has_pending);
+    assert!(matches!(
+        metadata_page.sources,
+        StoredScanJobMetadataSources::Movies(ref sources)
+            if sources.iter().any(|source| source.item_id == item_id)
+    ));
+    assert_eq!(database.query_count(), 1);
+    database.reset_query_count();
+    let manifest_state = database
+        .get_scan_manifest_postprocessing_state_by_job(&scan_job_id)
+        .await?
+        .ok_or("PostgreSQL scan manifest should be present")?;
+    assert!(!manifest_state.roots.is_empty());
+    assert_eq!(database.query_count(), 1);
 
     let combined_fingerprint = b"postgres-combined-completeness-v1";
     let combined_result = [NewItemMetadataCompletenessResult {

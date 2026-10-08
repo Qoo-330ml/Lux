@@ -3212,6 +3212,28 @@ pub(crate) struct StoredSeriesMetadataSource {
 }
 
 #[derive(Debug)]
+pub(crate) struct StoredScanJobMetadataPage {
+    pub(crate) has_pending: bool,
+    pub(crate) sources: StoredScanJobMetadataSources,
+}
+
+#[derive(Debug)]
+pub(crate) enum StoredScanJobMetadataSources {
+    None,
+    Movies(Vec<StoredMediaSourcePath>),
+    HomeVideos(Vec<StoredMediaSourcePath>),
+    Episodes(Vec<StoredSeriesMetadataSource>),
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredScanManifestPostprocessingState {
+    pub(crate) manifest_id: String,
+    pub(crate) workflow_version: i64,
+    pub(crate) discovery_format_version: i64,
+    pub(crate) roots: Vec<StoredScanManifestPostprocessingRoot>,
+}
+
+#[derive(Debug)]
 pub(crate) struct StoredChapterDetectionSource {
     pub(crate) source_id: String,
     pub(crate) item_id: String,

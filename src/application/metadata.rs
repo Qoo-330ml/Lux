@@ -24,8 +24,8 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
-        StoredItemImage, StoredMediaMetadata, StoredMediaSourcePath, StoredScanLocalMetadataSource,
-        StoredSeriesMetadataSource,
+        StoredItemImage, StoredMediaMetadata, StoredMediaSourcePath, StoredScanJobMetadataPage,
+        StoredScanJobMetadataSources, StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
     },
 };
 
@@ -1281,135 +1281,141 @@ impl MetadataEnricher {
         limit: usize,
     ) -> Result<MetadataReport, MetadataError> {
         let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let page = self
+            .database
+            .load_scan_job_metadata_page(scan_job_id, limit)
+            .await?;
+        self.enrich_scan_job_metadata_page(scan_job_id, page).await
+    }
+
+    pub(crate) async fn enrich_scan_job_metadata_page(
+        &self,
+        scan_job_id: &str,
+        page: StoredScanJobMetadataPage,
+    ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
-        let movie_sources = self
-            .database
-            .list_scan_job_target_movie_items_page(scan_job_id, limit, 0)
-            .await?;
-        if !movie_sources.is_empty() {
-            let item_ids = movie_sources
-                .iter()
-                .map(|source| source.item_id.clone())
-                .collect::<Vec<_>>();
-            let mut batch_report = MetadataReport::default();
-            self.enrich_movie_sources(movie_sources, &mut batch_report)
+        match page.sources {
+            StoredScanJobMetadataSources::None => Ok(report),
+            StoredScanJobMetadataSources::Movies(movie_sources) => {
+                let item_ids = movie_sources
+                    .iter()
+                    .map(|source| source.item_id.clone())
+                    .collect::<Vec<_>>();
+                let mut batch_report = MetadataReport::default();
+                self.enrich_movie_sources(movie_sources, &mut batch_report)
+                    .await;
+                let failed_item_ids = batch_report.failed_item_ids.clone();
+                report.merge(batch_report);
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &failed_item_ids,
+                        "METADATA",
+                        "FAILED",
+                    )
+                    .await?;
+                let completed_item_ids = item_ids
+                    .into_iter()
+                    .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &completed_item_ids,
+                        "METADATA",
+                        "DONE",
+                    )
+                    .await?;
+                report
+                    .locally_enriched_item_ids
+                    .extend(completed_item_ids.iter().cloned());
+                Ok(report)
+            }
+            StoredScanJobMetadataSources::HomeVideos(home_video_sources) => {
+                let item_ids = home_video_sources
+                    .iter()
+                    .map(|source| source.item_id.clone())
+                    .collect::<Vec<_>>();
+                let mut batch_report = MetadataReport::default();
+                self.enrich_home_video_sources(home_video_sources, &mut batch_report)
+                    .await;
+                let failed_item_ids = batch_report.failed_item_ids.clone();
+                report.merge(batch_report);
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &failed_item_ids,
+                        "METADATA",
+                        "FAILED",
+                    )
+                    .await?;
+                let completed_item_ids = item_ids
+                    .into_iter()
+                    .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &completed_item_ids,
+                        "METADATA",
+                        "DONE",
+                    )
+                    .await?;
+                report
+                    .locally_enriched_item_ids
+                    .extend(completed_item_ids.iter().cloned());
+                Ok(report)
+            }
+            StoredScanJobMetadataSources::Episodes(series_sources) => {
+                let item_ids = series_sources
+                    .iter()
+                    .map(|source| source.episode_id.clone())
+                    .collect::<Vec<_>>();
+                let mut batch_report = MetadataReport::default();
+                let mut series_context = SeriesEnrichmentContext::default();
+                self.enrich_series_scan_job_sources(
+                    series_sources,
+                    &mut batch_report,
+                    &mut series_context,
+                    SeriesEnrichmentMode::ImagesAndNfo,
+                    None,
+                    None,
+                )
                 .await;
-            let failed_item_ids = batch_report.failed_item_ids.clone();
-            report.merge(batch_report);
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &failed_item_ids,
-                    "METADATA",
-                    "FAILED",
-                )
-                .await?;
-            let completed_item_ids = item_ids
-                .into_iter()
-                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
-                .collect::<Vec<_>>();
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &completed_item_ids,
-                    "METADATA",
-                    "DONE",
-                )
-                .await?;
-            report
-                .locally_enriched_item_ids
-                .extend(completed_item_ids.iter().cloned());
-            return Ok(report);
+                let failed_item_ids = batch_report.failed_item_ids.clone();
+                report.merge(batch_report);
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &failed_item_ids,
+                        "METADATA",
+                        "FAILED",
+                    )
+                    .await?;
+                let completed_item_ids = item_ids
+                    .into_iter()
+                    .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
+                    .collect::<Vec<_>>();
+                self.database
+                    .mark_scan_job_target_stage(
+                        scan_job_id,
+                        "ITEM",
+                        &completed_item_ids,
+                        "METADATA",
+                        "DONE",
+                    )
+                    .await?;
+                report
+                    .locally_enriched_item_ids
+                    .extend(completed_item_ids.iter().cloned());
+                Ok(report)
+            }
         }
-
-        let home_video_sources = self
-            .database
-            .list_scan_job_target_home_video_items_page(scan_job_id, limit, 0)
-            .await?;
-        if !home_video_sources.is_empty() {
-            let item_ids = home_video_sources
-                .iter()
-                .map(|source| source.item_id.clone())
-                .collect::<Vec<_>>();
-            let mut batch_report = MetadataReport::default();
-            self.enrich_home_video_sources(home_video_sources, &mut batch_report)
-                .await;
-            let failed_item_ids = batch_report.failed_item_ids.clone();
-            report.merge(batch_report);
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &failed_item_ids,
-                    "METADATA",
-                    "FAILED",
-                )
-                .await?;
-            let completed_item_ids = item_ids
-                .into_iter()
-                .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
-                .collect::<Vec<_>>();
-            self.database
-                .mark_scan_job_target_stage(
-                    scan_job_id,
-                    "ITEM",
-                    &completed_item_ids,
-                    "METADATA",
-                    "DONE",
-                )
-                .await?;
-            report
-                .locally_enriched_item_ids
-                .extend(completed_item_ids.iter().cloned());
-            return Ok(report);
-        }
-
-        let series_sources = self
-            .database
-            .list_scan_job_target_series_items_page(scan_job_id, limit, 0)
-            .await?;
-        if series_sources.is_empty() {
-            return Ok(report);
-        }
-        let item_ids = series_sources
-            .iter()
-            .map(|source| source.episode_id.clone())
-            .collect::<Vec<_>>();
-        let mut batch_report = MetadataReport::default();
-        let mut series_context = SeriesEnrichmentContext::default();
-        self.enrich_series_scan_job_sources(
-            series_sources,
-            &mut batch_report,
-            &mut series_context,
-            SeriesEnrichmentMode::ImagesAndNfo,
-            None,
-            None,
-        )
-        .await;
-        let failed_item_ids = batch_report.failed_item_ids.clone();
-        report.merge(batch_report);
-        self.database
-            .mark_scan_job_target_stage(scan_job_id, "ITEM", &failed_item_ids, "METADATA", "FAILED")
-            .await?;
-        let completed_item_ids = item_ids
-            .into_iter()
-            .filter(|item_id| !failed_item_ids.iter().any(|failed| failed == item_id))
-            .collect::<Vec<_>>();
-        self.database
-            .mark_scan_job_target_stage(
-                scan_job_id,
-                "ITEM",
-                &completed_item_ids,
-                "METADATA",
-                "DONE",
-            )
-            .await?;
-        report
-            .locally_enriched_item_ids
-            .extend(completed_item_ids.iter().cloned());
-        Ok(report)
     }
 
     async fn enrich_series_scan_job_sources(
