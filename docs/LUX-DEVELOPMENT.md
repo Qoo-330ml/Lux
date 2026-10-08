@@ -9085,6 +9085,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：人物索引重建的最多 100-item 页现在交给 credits batch replacement；storage 每 16 个 item 共享一次 metadata/credits 写锁和事务，因此每页最多 7 个事务，事务内保留逐 item 既有键读取、差异删除、条件 UPSERT 与 fingerprint 更新。两 item 回归验证第二个 item 的 SQL 失败会回滚整个当前 16-item chunk，且成功重试后两条索引状态与 credits 正确。storage unchanged-row 回归、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和差异检查通过。本机 ARM64；没有统计 PostgreSQL query latency、生产事务耗时、FNOS/NAS 或 CPU 收益。
 
+#### LUX-434：合并重复的 person manifest restore pending 写入
+
+范围：person manifest 每次 checksum 变化都会标记单行 `person_manifest_restore_state` 为 `PENDING`。批量 actor/person 更新中，若该行已经是当前 schema 的 `PENDING`，避免重复 UPDATE 与 timestamp churn；仍须在状态为 `COMPLETED` 或 schema version 变化时写回。保留存储调用和跨进程可见状态，不增加内存缓存、事件或 schema。
+
+验收：
+
+- [x] storage 回归证明重复标记当前 `PENDING` 不触发 UPDATE；从 `COMPLETED` 恢复 pending 和 schema version 变化仍触发更新。
+- [x] manifest restore/rebuild 与 people API 定向回归、build、fmt、Clippy 和差异检查通过。
+- [x] 性能记录仅描述避免的数据库行 UPDATE，不声称消除了 storage 调用或测得生产收益。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、两份开发/性能记录。先增加 UPDATE trigger 计数回归，再为 UPSERT 增加 conflict update predicate。
+
+结果（2026-10-08）：`mark_person_manifest_restore_pending` 的 UPSERT 仅当状态不是当前 schema 的 PENDING 时执行 conflict UPDATE。storage trigger 回归确认重复 pending 为 0 次 UPDATE，而 COMPLETED→PENDING 与 schema version 变化各执行一次更新。manifest checksum restore、legacy migration completion、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和差异检查通过。本机 ARM64；确认的只是数据库 UPDATE 行数边界，不外推端到端 storage 调用数、墙钟或 FNOS/NAS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

@@ -1629,3 +1629,7 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 ### LUX-433 人物 credits 索引恢复写事务
 
 人物索引重建仍按最多 100 个 item 读取关系、批量解析身份；credit replacement 改为每 16 个 item 一个 metadata write transaction 和 credits 锁，一个 100-item 页最多 7 个事务，避免过去逐 item 最多 100 次事务。单个 chunk 内的 SQL 失败会回滚该 chunk；此前已提交的 chunk 保留 fingerprint，重试时可跳过已完成 item。每 item 的已有 credits 查询和 DML 仍保留，所以这不是总 SQL 调用数对比，也没有 PostgreSQL 时延、锁等待、FNOS/NAS 或 CPU 测量。
+
+### LUX-434 person manifest restore pending no-op
+
+重复将相同 schema 的 restore state 标记为 `PENDING` 时，UPSERT 不再更新数据库行和 `updated_at`；`COMPLETED` 状态或 schema 变化仍执行 UPDATE。trigger 固定回归确认 UPDATE 为 0 次或 1 次。这不跳过调用方的 storage 查询入口，也没有测量生产更新频率、事务耗时或数据库收益。

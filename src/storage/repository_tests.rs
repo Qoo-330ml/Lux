@@ -14990,6 +14990,69 @@ async fn person_credit_page_replacement_commits_all_items_atomically() {
 }
 
 #[tokio::test]
+async fn person_manifest_restore_pending_skips_unchanged_state_updates() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    database
+        .mark_person_manifest_restore_pending(3)
+        .await
+        .expect("mark restore pending");
+    sqlx::query(
+        "CREATE TABLE person_manifest_restore_update_probe (count INTEGER NOT NULL);
+         INSERT INTO person_manifest_restore_update_probe (count) VALUES (0);
+         CREATE TRIGGER person_manifest_restore_update_probe_trigger
+         AFTER UPDATE ON person_manifest_restore_state
+         BEGIN
+             UPDATE person_manifest_restore_update_probe SET count = count + 1;
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("update probe");
+
+    database
+        .mark_person_manifest_restore_pending(3)
+        .await
+        .expect("repeat current pending state");
+    let update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_manifest_restore_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("probe after duplicate pending state");
+    assert_eq!(update_count, 0);
+
+    database
+        .mark_person_manifest_restore_completed(3)
+        .await
+        .expect("complete restore");
+    database
+        .mark_person_manifest_restore_pending(3)
+        .await
+        .expect("requeue after completion");
+    database
+        .mark_person_manifest_restore_pending(4)
+        .await
+        .expect("requeue for a new schema");
+    let update_count: i64 =
+        sqlx::query_scalar("SELECT count FROM person_manifest_restore_update_probe")
+            .fetch_one(database.pool())
+            .await
+            .expect("probe after meaningful changes");
+    assert_eq!(update_count, 3);
+    let (status, schema_version): (String, i64) = sqlx::query_as(
+        "SELECT status, schema_version FROM person_manifest_restore_state WHERE id = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("restore state");
+    assert_eq!((status.as_str(), schema_version), ("PENDING", 4));
+}
+
+#[tokio::test]
 async fn person_credit_refresh_preserves_unchanged_rows() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

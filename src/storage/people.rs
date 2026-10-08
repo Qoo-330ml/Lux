@@ -1789,7 +1789,7 @@ impl Database {
         self.query(
             "INSERT INTO legacy_person_migration_state (id, status, schema_version, updated_at)
              VALUES (1, 'COMPLETED', ?, ?)
-             ON CONFLICT(id) DO UPDATE SET
+            ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 schema_version = excluded.schema_version,
                 updated_at = excluded.updated_at",
@@ -1815,7 +1815,9 @@ impl Database {
              ON CONFLICT(id) DO UPDATE SET
                 status = excluded.status,
                 schema_version = excluded.schema_version,
-                updated_at = excluded.updated_at",
+                updated_at = excluded.updated_at
+             WHERE person_manifest_restore_state.status <> 'PENDING'
+                OR person_manifest_restore_state.schema_version <> excluded.schema_version",
         )
         .bind(schema_version)
         .bind(current_unix_timestamp())
