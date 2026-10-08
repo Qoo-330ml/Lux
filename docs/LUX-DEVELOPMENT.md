@@ -9342,11 +9342,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] SQLite 与 PostgreSQL 均新增 nullable `person_index_item_state.relation_checksum`，历史 migration 文件和 checksum 不变。
-- [ ] 从空库运行全部 migration 后新列存在；从已有 0165 schema 升级保留 relation state 行和原 source fingerprint/schema version，checksum 初始为空。
-- [ ] migration 序号/双后端合同回归、`tests/storage.rs`、build、fmt、Clippy 与 `git diff --check` 通过。
+- [x] SQLite 与 PostgreSQL 均新增 nullable `person_index_item_state.relation_checksum`，历史 migration 文件和 checksum 不变。
+- [x] 从空库运行全部 migration 后新列存在；从已有 0165 schema 升级保留 relation state 行和原 source fingerprint/schema version，checksum 初始为空。
+- [x] migration 序号/双后端合同回归、`tests/storage.rs`、build、fmt、Clippy 与 `git diff --check` 通过。
 
 预计文件：`migrations/0166_person_index_relation_checksum.sql`、`migrations-postgres/0166_person_index_relation_checksum.sql`、`tests/storage.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/scanner.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/ready_version.rs`、`docs/LUX-DEVELOPMENT.md`。新 migration 会提升当前 schema version；因此本任务也更新这些测试目标中的 latest-schema 断言。先添加既有 state 行升级回归并确认旧 schema 缺少该列，再增加双后端 additive migration 与空库/升级验证；随后由独立应用任务将 checksum 写入 credits transaction 并在跳过路径比较。
+
+结果（2026-10-09）：SQLite/PostgreSQL 均新增 nullable `relation_checksum`，旧 migration 未修改。SQLite `tests/storage.rs` 51/51 通过，覆盖从空库迁移和从 0165 升级时保留 source fingerprint、relation schema version 与时间戳，旧 checksum 为 NULL；静态双后端合同确认 PostgreSQL 使用相同 additive nullable DDL。schema-version 相关 `scanning_jobs` 81/81、`scanner` 17/17、`danmaku` 7/7、`admin_health` 1/1、`ready_version` 2/2 通过；PostgreSQL 数据库目标 16 项因本机无 PostgreSQL 实例而 ignored。`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本次 `cargo test --locked --all-targets` 的 796 个库测试通过、13 项忽略；集成测试在 `watch` 中遇到 SQLite `database is locked`。该目标独立复跑 5/5 通过，其后 5 个 Web/webhook 目标也通过，因此记录为并行测试时的偶发锁冲突，不归因于 migration。开发机 `arm64`；未部署 PostgreSQL/FNOS，也没有生产性能验证。应用层 checksum 写入与比较留给后续独立任务。
 
 #### 本轮代码质量与性能优化收口
 
