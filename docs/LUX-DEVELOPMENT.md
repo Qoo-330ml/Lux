@@ -9346,7 +9346,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [ ] 从空库运行全部 migration 后新列存在；从已有 0165 schema 升级保留 relation state 行和原 source fingerprint/schema version，checksum 初始为空。
 - [ ] migration 序号/双后端合同回归、`tests/storage.rs`、build、fmt、Clippy 与 `git diff --check` 通过。
 
-预计文件：`migrations/0166_person_index_relation_checksum.sql`、`migrations-postgres/0166_person_index_relation_checksum.sql`、`tests/storage.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/scanner.rs`、`tests/postgres_database.rs`、`docs/LUX-DEVELOPMENT.md`。新 migration 会提升当前 schema version；因此本任务也更新这些测试目标中的 latest-schema 断言。先添加既有 state 行升级回归并确认旧 schema 缺少该列，再增加双后端 additive migration 与空库/升级验证；随后由独立应用任务将 checksum 写入 credits transaction 并在跳过路径比较。
+预计文件：`migrations/0166_person_index_relation_checksum.sql`、`migrations-postgres/0166_person_index_relation_checksum.sql`、`tests/storage.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/scanner.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/ready_version.rs`、`docs/LUX-DEVELOPMENT.md`。新 migration 会提升当前 schema version；因此本任务也更新这些测试目标中的 latest-schema 断言。先添加既有 state 行升级回归并确认旧 schema 缺少该列，再增加双后端 additive migration 与空库/升级验证；随后由独立应用任务将 checksum 写入 credits transaction 并在跳过路径比较。
 
 #### 本轮代码质量与性能优化收口
 
