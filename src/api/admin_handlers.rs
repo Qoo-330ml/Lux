@@ -7020,11 +7020,9 @@ pub(crate) async fn admin_retry_metadata_reidentify(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let worker = reidentify.clone();
-    let worker_job_id = job.id.clone();
-    tokio::spawn(async move {
-        worker.run(&worker_job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,

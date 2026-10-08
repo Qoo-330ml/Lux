@@ -8968,6 +8968,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：整库 reidentify、整库 metadata refresh 和 item metadata refresh 的 `FILL_MISSING` 均经由按 library dispatcher 入队；其他模式继续使用原 worker。dispatcher 关闭回归确认 API 返回 `503 DATABASE_UNAVAILABLE`，新建 job 保持 `QUEUED`。`tests/reidentify.rs` 15/15、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；不代表 FNOS/NAS、PostgreSQL 或运行时吞吐/CPU 收益。管理员显式 retry 入口和计划任务入口不属于本任务，仍需逐项核验。
 
+#### LUX-426：管理员重试 FILL_MISSING job 复用 library dispatcher
+
+范围：管理员 `POST /api/v1/admin/metadata/reidentify/{job_id}` retry 当前在将终态 job 重排为 `QUEUED` 后，直接为每个 job spawn runner。对 `FILL_MISSING` 重试复用 LUX-424 library dispatcher；`FULL_REFRESH` 与 `REIDENTIFY` 保持原 runner。dispatcher 关闭/不可用时返回结构化 `503 DATABASE_UNAVAILABLE`，重排后的 job 留在 `QUEUED` 供之后重试；成功响应和审计事件保持不变。不包含计划任务入口。
+
+验收：
+
+- [x] 管理员 FILL_MISSING retry 通过 job 持久化 library 进入 dispatcher；不得直接 spawn 完整 runner。
+- [x] dispatcher 关闭时 retry 返回结构化服务不可用，持久化 job 保持可重试状态；其他模式的 retry 合同不变。
+- [x] HTTP 回归、reidentify dispatcher 定向回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录说明 retry 复用每库 dispatcher，不推断生产收益。
+
+预计文件：`src/api/admin_handlers.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加 dispatcher 已关闭时的 FILL_MISSING retry HTTP 回归，再复用 LUX-425 调度 helper。
+
+结果（2026-10-08）：管理员显式 retry 在 job 重排后复用 LUX-425 调度 helper；dispatcher 关闭时 HTTP 返回 `503 DATABASE_UNAVAILABLE`，job 留在 `QUEUED`。新回归在修复前观察到原 handler 错误返回 `202`，修复后通过。`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有 FNOS/NAS 或运行时收益证据。计划任务入口仍需独立接入与验证。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

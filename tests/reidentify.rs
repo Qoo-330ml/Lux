@@ -690,6 +690,43 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
         queued_after_dispatch_failure, 1,
         "a created job must remain queued and retryable if dispatch is unavailable"
     );
+    let queued_job_id: String = sqlx::query_scalar(
+        "SELECT id FROM metadata_reidentify_jobs
+         WHERE mode = 'FILL_MISSING' AND status = 'QUEUED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'FAILED', error = 'TEST_RETRY', finished_at = unixepoch()
+         WHERE id = ?",
+    )
+    .bind(&queued_job_id)
+    .execute(database.pool())
+    .await?;
+    let retry_unavailable = client
+        .post(format!(
+            "{base_url}/api/v1/admin/metadata/reidentify/{queued_job_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(
+        retry_unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let retry_unavailable_body: Value = retry_unavailable.json().await?;
+    assert_eq!(
+        retry_unavailable_body["error"]["code"],
+        "DATABASE_UNAVAILABLE"
+    );
+    let retry_job_status: String =
+        sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&queued_job_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(retry_job_status, "QUEUED");
 
     server.abort();
     tmdb_server.abort();

@@ -1589,3 +1589,9 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 管理员整库 reidentify、整库 metadata refresh 与单条目 metadata refresh 的 `FILL_MISSING` job 现在进入 LUX-424 的 library dispatcher；每个已触发 library 仍由一个 runner 顺序执行，队列满时 HTTP 提交等待容量。`FULL_REFRESH` 和 `REIDENTIFY` 保持现有 runner。dispatcher 关闭时管理员收到结构化 `503 DATABASE_UNAVAILABLE`；job 已先持久化，保持 `QUEUED` 供恢复后重试。
 
 `tests/reidentify.rs` 15/15 通过，包含三种管理员入口的正常完成和 dispatcher 关闭时保留 queued job。此项不测量管理员请求速率、总体 Tokio task 数、SQL、墙钟、生产吞吐或 CPU，不推断 FNOS/NAS 收益；显式 retry 与计划任务路径仍待检查。
+
+### LUX-426 管理员 FILL_MISSING retry 复用 dispatcher
+
+管理员重试终态 `FILL_MISSING` job 后，按 job 持久化的 library ID 复用 LUX-424 dispatcher；`FULL_REFRESH` 与 `REIDENTIFY` 继续走原 runner。dispatcher 关闭时返回结构化 `503 DATABASE_UNAVAILABLE`，已重排的 job 保持 `QUEUED`。回归曾在旧路径观察到关闭后仍返回 `202`，修复后验证拒绝提交及持久化状态。
+
+该项只验证路由和 job 状态边界，不测量任务总量、吞吐、墙钟、生产 CPU 或 FNOS/NAS 收益；计划任务仍待检查。
