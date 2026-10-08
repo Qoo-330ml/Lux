@@ -9250,6 +9250,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：固定测试确认同一 page 内共享 sidecar 只解析一次、不同 target 不共享、下一页读取变更后的内容，错误类型保持且 database projection 可避开失效 source；relation cache 一页只枚举一次，读取命中的旧 JSON，不可读目录和超过 4096 项后的未确定 ID 均走原路径 fallback。候选 page planning 回归、NFO projection 回归、relation cache 3 项回归、`nfo_writer` 26/26、`scanned_metadata` 16/16、build、fmt 和全目标全 feature Clippy 通过。全量测试的库单测为 789 通过、13 忽略；集成阶段在 `emby_counts` 失败并停止（未收藏计数期望 0、实际 1）。单独运行 `metadata_selection` 为 30/31（可选 actor enrichment 等待超时），`strm` 的认证请求返回 401 而期望 200；这些失败此前已在父提交记录，且对应集成测试不在本任务改动中。开发机 `arm64`；未测文件系统耗时、PostgreSQL、FNOS/NAS 或生产 CPU 收益。
 
+#### LUX-445：以 viewer 身份验证 Emby viewer 计数权限
+
+范围：`tests/emby_counts.rs` 的 viewer 计数断言使用管理员 token，同时传入 viewer `UserId`，因此请求仍保留管理员的媒体库权限；该夹具不能证明 viewer 只能统计获授权的媒体库。用 viewer 自己登录得到的 token 发起计数请求，保持其仅获电影库权限的 fixture，并继续核验 viewer 收藏数。生产鉴权逻辑和 Emby 管理员代查语义不变。
+
+验收：
+
+- [x] viewer token 只统计 viewer 有权限的媒体库，并正确按 viewer 收藏状态筛选；管理员 token 的全库计数断言保持。
+- [x] `cargo test --locked --test emby_counts`、fmt 与 `git diff --check` 通过。
+
+预计文件：`tests/emby_counts.rs`、`docs/LUX-DEVELOPMENT.md`。先复现管理员 token 触发 viewer 权限断言失败，再改为 viewer token 并运行专用集成测试。
+
+结果（2026-10-08）：原测试以管理员 token 传入 viewer `UserId`，管理员权限因此包含 Shows 库，稳定得到 `SeriesCount = 1`；用 viewer 登录 token 请求后，viewer 可见范围的影片计数与收藏计数均符合预期。`cargo test --locked --test emby_counts` 1/1 通过。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
