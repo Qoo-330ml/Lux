@@ -9392,18 +9392,33 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：actor metadata 与 person metadata 两种改写都对即将写入的 JSON 字节计算 checksum，并与对应 credits/source fingerprint 在同一数据库事务持久化；写文件仍先于数据库事务，失败时保留可供后续重建读取的文件。旧 fingerprint-only 单项入口只供测试使用。回归先在旧实现下失败（数据库 checksum 为 NULL），再以 39/39 people service tests 通过；`cargo build --locked`、全目标全 feature Clippy、fmt 与 `git diff --check` 通过。全目标测试在合并实现状态下通过（797 passed、13 ignored；其中 16 个 PostgreSQL 专项因无本地 PostgreSQL 而 ignored）。本机 `arm64`，未做 FNOS/生产性能验证。
 
-#### LUX-455：按人物关系快照 checksum 判定运行索引是否 current
+#### LUX-455：人物关系 current 检查比较快照 checksum
 
-范围：将人物关系 skip/current 检查统一切换为 source fingerprint、原始 relation checksum 和 schema version 三者比较。checksum 缺失的旧行和文件变化但 source fingerprint 不变的记录必须判 stale，并进入现有批量重建流程；无数据库时保留当前文件内 source fingerprint 校验语义。
+范围：`item_actor_relation_is_current` 与 `nfo_relation_snapshot_is_current` 读取关系文件原始字节，并要求数据库中的 source fingerprint、relation checksum 和 schema version 三者匹配。checksum 缺失的旧行和文件变化但 source fingerprint 不变的记录必须判 stale；无数据库时保留当前文件内 source fingerprint 校验语义。索引重建的 checksum-aware skip/write 留给 LUX-456。
 
 验收：
 
-- [ ] `item_actor_relation_is_current`、`nfo_relation_snapshot_is_current` 与 index rebuild skip 路径都比较关系 checksum。
-- [ ] 旧行 checksum 为 NULL、文件 checksum 改变、source fingerprint 改变或 schema version 变化都会触发重建；全部匹配才跳过。
-- [ ] service/storage 回归覆盖旧 NULL 行和相同 source fingerprint 下文件字节改变；rebuild skip path 只有在 checksum、source fingerprint 和 schema version 均匹配时才跳过。
-- [ ] 相关 people/storage tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+- [x] `item_actor_relation_is_current` 与 `nfo_relation_snapshot_is_current` 都比较关系 checksum。
+- [x] 旧行 checksum 为 NULL、文件 checksum 改变、source fingerprint 改变或 schema version 变化都会触发重建；全部匹配才跳过。
+- [x] service/storage 回归覆盖旧 NULL 行和相同 source fingerprint 下文件字节改变；storage predicate 仅在 checksum、source fingerprint 和 schema version 均匹配时返回 current。
+- [x] 相关 people/storage tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
 
-预计文件：`src/storage/library.rs`、`src/application/people/service.rs`、`src/application/people/rebuild.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先锁定 checksum mismatch/legacy stale 回归，再替换 current 判定入口。
+预计文件：`src/storage/library.rs`、`src/application/people/service.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先锁定 checksum mismatch/legacy stale 回归，再替换 current 判定入口。
+
+结果（2026-10-09）：service current 判断从关系文件一次读取的 raw bytes 计算 SHA-256，并要求数据库 source fingerprint、relation checksum、relation schema version 都匹配；NULL checksum、不同文件字节、不同 fingerprint 或 schema version 都判为 stale。SQLite service 与 storage 定向回归通过；不带 checksum 的旧 current API 暂供 rebuild 使用，LUX-456 将迁移后移除。PostgreSQL/FNOS 未运行，未据此推断生产收益。
+
+#### LUX-456：人物关系索引重建比较并保存快照 checksum
+
+范围：索引重建读取新旧关系文件时保留原始字节，并只解析一次；skip 判定比较 source fingerprint、文件 checksum 和 relation schema version，重建时把该次读取的 checksum 与 credits/fingerprint 在同一事务保存。旧 checksum 为 NULL 或文件 checksum 已变化时进入现有批量重建。文件格式和 rebuild job 状态机不变。
+
+验收：
+
+- [ ] rebuild skip 只有三维 state 与关系快照完全匹配才跳过；旧 checksum 为 NULL 或关系文件变化时重建。
+- [ ] rebuild credits batch 使用所读 raw bytes 的 checksum，不重读关系文件或重序列化关系对象计算。
+- [ ] service regression 覆盖相同 source fingerprint 下文件 bytes 变化，确认 rebuild 更新 credits 和 checksum；不改变 legacy relation 路径读取语义。
+- [ ] people tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+
+预计文件：`src/storage/people.rs`、`src/application/people/rebuild.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 changed-bytes rebuild 回归，再贯通 raw snapshot checksum 到 batch commit。
 
 #### 本轮代码质量与性能优化收口
 

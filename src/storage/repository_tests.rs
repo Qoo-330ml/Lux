@@ -14010,26 +14010,49 @@ async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
     assert_eq!(second_page_after_delete, ["item-z"]);
 
     database
-        .replace_person_credits_with_fingerprint("item-a", &[], Some("fingerprint-a"))
+        .replace_person_credits_with_relation_checksum(
+            "item-a",
+            &[],
+            Some("fingerprint-a"),
+            Some("relation-a"),
+        )
         .await
         .expect("store fingerprint");
     assert!(
         database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-a"),
+            )
             .await
-            .expect("same fingerprint")
+            .expect("matching fingerprint and relation checksum")
     );
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", None)
+            .person_index_item_state_matches_snapshot("item-a", None, Some("relation-a"))
             .await
             .expect("missing fingerprint must not be current")
     );
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-b"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-b"),
+                Some("relation-a"),
+            )
             .await
             .expect("changed fingerprint")
+    );
+    assert!(
+        !database
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-b"),
+            )
+            .await
+            .expect("changed relation checksum")
     );
     sqlx::query(
         "UPDATE person_index_item_state
@@ -14041,7 +14064,11 @@ async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
     .expect("change relation schema version");
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-a"),
+            )
             .await
             .expect("changed relation schema version")
     );
@@ -14051,7 +14078,11 @@ async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
         .expect("clear person credits");
     assert!(
         !database
-            .person_index_item_state_is_current("item-a", Some("fingerprint-a"))
+            .person_index_item_state_matches_snapshot(
+                "item-a",
+                Some("fingerprint-a"),
+                Some("relation-a"),
+            )
             .await
             .expect("cleared relation must be rebuilt")
     );
@@ -14132,15 +14163,26 @@ async fn person_credit_writes_persist_relation_checksums_and_legacy_writes_clear
     .expect("read batched relation checksum");
     assert_eq!(stored_batch_checksum.as_deref(), Some("relation-batch"));
 
+    assert!(
+        database
+            .person_index_item_state_matches_snapshot(
+                "item-checksum",
+                Some("source-v1"),
+                Some("relation-v2")
+            )
+            .await
+            .expect("matching source and relation checksums")
+    );
+
     database
         .replace_person_credits_with_fingerprint("item-checksum", &[], Some("source-v1"))
         .await
         .expect("legacy writer stores no relation checksum");
     assert!(
-        database
-            .person_index_item_state_is_current("item-checksum", Some("source-v1"))
+        !database
+            .person_index_item_state_matches_snapshot("item-checksum", Some("source-v1"), None)
             .await
-            .expect("legacy current check remains compatible")
+            .expect("legacy checksum-free state must be stale")
     );
     let stored_checksum_after_legacy_write: Option<String> = sqlx::query_scalar(
         "SELECT relation_checksum FROM person_index_item_state WHERE item_id = 'item-checksum'",

@@ -762,9 +762,11 @@ impl PeopleService {
         let path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
-        let Some(relation) = read_relation(&path).await? else {
+        let Some(relation_bytes) = read_people_file(&path).await? else {
             return Ok(false);
         };
+        let relation_checksum = relation_snapshot_checksum(&relation_bytes);
+        let relation = parse_relation(&relation_bytes)?;
         let relation_is_current = relation
             .source_fingerprint
             .as_deref()
@@ -775,7 +777,11 @@ impl PeopleService {
         }
         if let Some(database) = &self.database {
             return database
-                .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
+                .person_index_item_state_matches_snapshot(
+                    item_id,
+                    relation.source_fingerprint.as_deref(),
+                    Some(&relation_checksum),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()));
         }
@@ -789,9 +795,11 @@ impl PeopleService {
         let path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
-        let Some(relation) = read_relation(&path).await? else {
+        let Some(relation_bytes) = read_people_file(&path).await? else {
             return Ok(false);
         };
+        let relation_checksum = relation_snapshot_checksum(&relation_bytes);
+        let relation = parse_relation(&relation_bytes)?;
         let source_fingerprint = relation
             .source_fingerprint
             .as_deref()
@@ -802,7 +810,11 @@ impl PeopleService {
         };
         if let Some(database) = &self.database {
             return database
-                .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
+                .person_index_item_state_matches_snapshot(
+                    item_id,
+                    relation.source_fingerprint.as_deref(),
+                    Some(&relation_checksum),
+                )
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()));
         }
@@ -2666,7 +2678,7 @@ mod tests {
         .execute(database.pool())
         .await?;
         let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
-        let source_fingerprint = [1_u8, 2, 3];
+        let source_fingerprint = [1_u8; 32];
         let actors = [ActorCredit {
             id: "9".to_owned(),
             provider: None,
@@ -2719,6 +2731,43 @@ mod tests {
                 .item_actor_relation_is_current("item-1", &source_fingerprint)
                 .await?
         );
+        assert!(service.nfo_relation_snapshot_is_current("item-1").await?);
+
+        sqlx::query(
+            "UPDATE person_index_item_state SET relation_checksum = NULL WHERE item_id = ?",
+        )
+        .bind("item-1")
+        .execute(database.pool())
+        .await?;
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?,
+            "legacy checksum-free index state must be rebuilt"
+        );
+        assert!(!service.nfo_relation_snapshot_is_current("item-1").await?);
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        assert!(service.nfo_relation_snapshot_is_current("item-1").await?);
+
+        let relation_path =
+            library_item_directory(&config.config_dir, "item-1")?.join("people.json");
+        let relation_bytes = tokio::fs::read(&relation_path).await?;
+        let changed_bytes = [relation_bytes.as_slice(), b"\n"].concat();
+        tokio::fs::write(&relation_path, changed_bytes).await?;
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?,
+            "changed relation bytes must be stale even when the source fingerprint is unchanged"
+        );
+        assert!(
+            !service.nfo_relation_snapshot_is_current("item-1").await?,
+            "NFO relation reuse must compare the persisted relation checksum"
+        );
+        tokio::fs::write(&relation_path, &relation_bytes).await?;
+        assert!(service.nfo_relation_snapshot_is_current("item-1").await?);
 
         database.clear_person_credits("item-1").await?;
 

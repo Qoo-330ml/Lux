@@ -459,6 +459,39 @@ impl Database {
             })
     }
 
+    pub(crate) async fn person_index_item_state_matches_snapshot(
+        &self,
+        item_id: &str,
+        source_fingerprint: Option<&str>,
+        relation_checksum: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let (Some(source_fingerprint), Some(relation_checksum)) =
+            (source_fingerprint, relation_checksum)
+        else {
+            return Ok(false);
+        };
+        let row = self
+            .query(
+                "SELECT source_fingerprint, relation_schema_version, relation_checksum
+                 FROM person_index_item_state WHERE item_id = ?",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.is_some_and(|row| {
+            row.get::<Option<String>, _>("source_fingerprint")
+                .as_deref()
+                == Some(source_fingerprint)
+                && row.get::<Option<String>, _>("relation_checksum").as_deref()
+                    == Some(relation_checksum)
+                && row.get::<i64, _>("relation_schema_version") == 2
+        }))
+    }
+
     pub(crate) async fn person_index_item_state_is_current(
         &self,
         item_id: &str,
