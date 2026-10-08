@@ -625,11 +625,21 @@ impl PeopleService {
         let Some(relation) = read_relation(&path).await? else {
             return Ok(false);
         };
-        Ok(relation
+        let relation_is_current = relation
             .source_fingerprint
             .as_deref()
             .and_then(decode_fingerprint)
-            .is_some_and(|stored| stored == source_fingerprint))
+            .is_some_and(|stored| stored == source_fingerprint);
+        if !relation_is_current {
+            return Ok(false);
+        }
+        if let Some(database) = &self.database {
+            return database
+                .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()));
+        }
+        Ok(true)
     }
 
     pub async fn nfo_relation_snapshot_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
@@ -2285,6 +2295,74 @@ mod tests {
                 .await?,
         )?;
         assert_eq!(relation["generation"], 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nfo_relation_current_requires_matching_persisted_credit_revision()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind("item-1")
+        .bind(library.id.to_string())
+        .bind("测试电影")
+        .bind("测试电影")
+        .execute(database.pool())
+        .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let source_fingerprint = [1_u8, 2, 3];
+        let actors = [ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        assert!(
+            service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?
+        );
+
+        database.clear_person_credits("item-1").await?;
+
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?,
+            "relation file alone must not hide a missing credit-index revision"
+        );
+
+        service
+            .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        assert!(
+            service
+                .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?
+        );
+        database.close().await;
         Ok(())
     }
 

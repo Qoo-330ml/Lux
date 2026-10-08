@@ -1621,3 +1621,7 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 ### LUX-431 人物 manifest 跨进程锁退避
 
 争用中的人物 relation/manifest 文件锁等待改为 10、20、40、80、160、250ms 并封顶，使用 1 秒单调截止时间；未争用时仍立即取得 `create_new` 锁，超过 300 秒的 stale lock 继续清理。固定本地回归确认退避边界、未占用锁成功和持续占用锁返回 `TimedOut`。最大锁等待合同仍约 1 秒，理论轮询次数由 100 次降至约 8 次；没有测量真实文件系统耗时、并发冲突率或生产收益。
+
+### LUX-432 人物 relation 与 credits revision 一致性
+
+当 relation 旁车 fingerprint 与请求匹配时，有数据库的 PeopleService 还查询 `person_index_item_state`，只有相同 source fingerprint 和 relation schema 才跳过同步。文件写入成功而 credits/index 更新失败时，下一次扫描会重试 credits；无数据库的服务仍只依据 relation 文件。该自愈检查每次已匹配 relation 增加一次应用层数据库查询；没有将 JSON 文件与 SQL 放入同一原子事务，也没有测量吞吐或墙钟收益。

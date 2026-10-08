@@ -9057,6 +9057,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：人物 relation/manifest 文件锁等待改用 1 秒单调截止时间及 10、20、40、80、160、250ms 后封顶的退避；未占用锁仍立即通过 `create_new` 获取，stale lock 仍按 300 秒阈值处理。helper 边界和锁超时/立即获取单测、`tests/people_api.rs` 10/10、person relation 持久化与 NFO fingerprint 单测通过；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机架构 ARM64；没有文件系统基准、FNOS/NAS 或生产 CPU 测量。
 
+#### LUX-432：校验人物 relation 与 credits 索引 revision 一致
+
+范围：NFO actor 同步先原子写 `people.json`，再替换数据库 `person_credits` 与 `person_index_item_state`。如果文件写入成功而数据库事务失败，当前 `item_actor_relation_is_current` 仅比较旁车 fingerprint，会把不完整持久化误判为完成，后续扫描跳过 credits 恢复。只有旁车 fingerprint 与请求一致、且数据库 person-index item state 也记录相同 fingerprint/schema 时才返回 current；无数据库的 standalone `PeopleService` 保持原来的旁车检查语义。不改变文件格式或数据库 schema。
+
+验收：
+
+- [x] 回归覆盖 relation 文件已是当前 fingerprint、credits/index state 缺失时判为 stale；重试持久化后恢复 current。
+- [x] 已有 NFO relation revision、people API 和 metadata/NFO 定向回归通过；无数据库服务语义保持。
+- [x] 文档明确该检查提供失败后的自愈，不声称文件和数据库进入同一个原子事务，也不外推运行时收益。
+
+预计文件：`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加模拟 relation 文件已提交但数据库索引 state 未提交的回归，再把数据库 revision 纳入 current 判断。
+
+结果（2026-10-08）：有数据库的 PeopleService 现在只有在旁车 source fingerprint 与数据库 `person_index_item_state` fingerprint/schema revision 同时匹配时才跳过 NFO actor 同步；无数据库服务继续只检查旁车。回归曾在旧逻辑下观察到数据库 credits/index state 删除后仍返回 current，修复后返回 stale，重新写入后恢复 current。NFO relation 单测 3/3、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；该方案通过后续扫描自愈，不提供文件与数据库的跨持久化原子提交，也没有测量运行时收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
