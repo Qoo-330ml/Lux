@@ -2306,10 +2306,29 @@ impl NfoWriteService {
         item_id: &str,
     ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
         let target = self.item_nfo_target(item_id).await?;
+        self.read_item_projection_at_target(&target).await
+    }
+
+    pub(crate) async fn read_item_projection_with_writeback_context(
+        &self,
+        season_number: Option<i64>,
+        context: &crate::storage::StoredMediaWritebackContext,
+    ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
+        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
+        let target = self
+            .item_nfo_target_from_source(&context.item_type, season_number, source)
+            .await?;
+        self.read_item_projection_at_target(&target).await
+    }
+
+    async fn read_item_projection_at_target(
+        &self,
+        target: &Path,
+    ) -> Result<Option<LocalNfoProjection>, NfoWriteError> {
         let bytes = match fs::read(&target).await {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(io_error(&target, error)),
+            Err(error) => return Err(io_error(target, error)),
         };
         parse_local_nfo_projection(&bytes)
             .map(Some)
@@ -3132,6 +3151,62 @@ mod tests {
             write.file_fingerprint,
             Some(nfo_fingerprint(&target).await?)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn nfo_projection_reuses_a_preloaded_writeback_context()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("Movies");
+        fs::create_dir_all(&root).await?;
+        fs::write(root.join("Example.Movie.2020.mkv"), b"fixture").await?;
+        fs::write(
+            root.join("Example.Movie.2020.nfo"),
+            b"<movie><title>Example Movie</title></movie>",
+        )
+        .await?;
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String = sqlx::query_scalar("SELECT id FROM media_items LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+        let contexts = database
+            .list_media_item_writeback_contexts_by_ids(std::slice::from_ref(&item_id))
+            .await?;
+        let context = contexts.get(&item_id).ok_or("writeback context")?;
+        let writer = NfoWriteService::new(database.clone());
+
+        database.reset_query_count();
+        let from_context = writer
+            .read_item_projection_with_writeback_context(None, context)
+            .await?
+            .ok_or("NFO projection from context")?;
+        assert_eq!(
+            from_context.metadata.title.as_deref(),
+            Some("Example Movie")
+        );
+        assert_eq!(database.query_count(), 0);
+
+        database.reset_query_count();
+        let from_item = writer
+            .read_item_projection(&item_id)
+            .await?
+            .ok_or("NFO projection from item")?;
+        assert_eq!(from_item.details, from_context.details);
+        assert_eq!(database.query_count(), 2);
         Ok(())
     }
 

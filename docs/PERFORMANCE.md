@@ -1549,3 +1549,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-416 unchanged NFO content fast path
 
 固定 SQLite 单 item fixture 原路径在 stat 指纹因 NFO 所在路径变化后会读取并解析 XML、复核 rich-cache fingerprint，再写 metadata：约 6 次 query-wrapper 调用。现在读取 NFO 字节并计算 SHA-256 后，与 rich cache 同查询取得的内容指纹比较；内容完全相同时且默认字段完整、actor relation 不需修复，只写回新的 stat fingerprint，3 次 query-wrapper 调用。原 stat 指纹匹配且默认值完整的 unchanged fixture 也因 cache JSON 与 fingerprint 单查询读取，从 3 次降为 2 次。后续标题内容变化回归仍进入解析与更新路径。此优化仍需读取全部旁车字节；query-wrapper 不代表文件系统时延、墙钟、PostgreSQL 或 FNOS CPU。
+
+### LUX-417 completeness 页 NFO projection context
+
+固定 SQLite 单电影 fixture 中，projection fallback 走 `read_item_projection(item_id)` 时会额外执行 2 次 query-wrapper 调用来读取 item kind 与 source path；复用 completeness 页已加载的 writeback context 后，projection 本身为 0 次额外 query-wrapper 调用。批量 context 查询已计入页级读取路径，测试单独比较 projection 阶段。NFO 文件仍需读取，source/media/directory 仍需 canonicalize 并验证 root 边界；未测文件系统墙钟、PostgreSQL、NAS 或 FNOS 负载。

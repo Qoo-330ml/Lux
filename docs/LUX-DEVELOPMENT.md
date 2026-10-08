@@ -8833,6 +8833,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：本轮已读取 metadata 快照后，在本地 NFO 文件字节与 rich cache 内容 SHA-256 一致且 defaults 完整、actor relation 正常时复用缓存并只同步新的路径/大小/mtime 指纹。旧实现下 new-path/same-content 回归的 `nfo_skipped` 为 0；按旧路径 6 次 query-wrapper 调用计算，新路径执行 3 次，且随后修改标题仍执行 NFO 加载。cache JSON 与 SHA-256 现在通过一条 query-wrapper 查询同时读取，原 unchanged stat 命中 fixture 也从 3 次降为 2 次。保守路径仍需读取全部 NFO 字节并计算 SHA-256，因此没有消除 NAS 文件读取；不外推 PostgreSQL、墙钟、FNOS 或 CPU 收益。
 
+#### LUX-417：completeness 页复用 NFO projection 的 writeback context
+
+范围：`local_metadata_completeness_plans` 已批量读取每页 item 的 writeback context，图片策略消费该 context，但 rich NFO cache 缺失时 projection fallback 仍逐 item 查询 item kind 和 source path。让 NFO projection 读取复用同页 context，并从当前页 metadata 快照取 SEASON 必需的 season number。继续 canonicalize source、media file、目标目录并验证都位于配置 root 内；context 缺少可写回 source 时保持 ItemNotFound 语义。单 item completeness 规划继续使用既有按需读取路径。
+
+验收：
+
+- [x] metadata 页中 NFO projection 文件读取复用已批量加载的 writeback context，不再对每个 item 重查 kind/source；单 item 入口仍正常读取。
+- [x] MOVIE、EPISODE、SERIES、SEASON 的目标路径与根目录保护保持，SEASON 使用相同编号选择规则；缺失 source 语义不变。
+- [x] query-wrapper 回归、NFO/candidate/scanner 定向测试、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录只报告 context SQL 调用数，不把 canonicalize 或 NAS 文件 I/O 推断为已消除。
+
+短计划与文件：修改 `src/application/nfo.rs`（按上下文读取 projection）、`src/application/candidates.rs`（completion 页复用）和两份优化记录。先写 context/projection 查询计数回归，再连接页内消费，最后跑 NFO 与 candidate 相关检查。
+
+结果（2026-10-08）：projection 查询计数回归确认，复用页级 writeback context 后不再执行逐 item kind/source SQL，projection 阶段由 2 次 query-wrapper 调用降为 0；NFO 文件读取及 canonicalize/root 校验保持。`nfo_writer` 26/26、metadata candidate 单测 22/22、`metadata_selection` 31/31、`scanning_jobs` 81/81、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `uname -m=arm64`。`cargo test --locked --all-targets` 的 library 测试 758 passed、13 ignored，随后在 `tests/emby_counts.rs:159` 遇到实际计数 1、期望 0；在未包含 LUX-417 改动的 `2b64ba65` 隔离工作树复跑同一目标得到相同失败，因此记为已有基线失败而非本任务回归。仅报告本地 SQLite 查询边界，不外推文件系统、PostgreSQL、NAS 或 FNOS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

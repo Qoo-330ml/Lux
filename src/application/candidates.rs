@@ -2384,6 +2384,7 @@ impl MetadataSelectionService {
                     current,
                     image_policy,
                     actual_missing_image_mask,
+                    Some(writeback_context),
                 )
                 .await?;
             let should_read_attempt_state =
@@ -2441,12 +2442,18 @@ impl MetadataSelectionService {
         current: &StoredMediaMetadata,
         image_policy: ImageSelectionPolicy,
         actual_missing_image_mask: u16,
+        writeback_context: Option<&crate::storage::StoredMediaWritebackContext>,
     ) -> Result<(MetadataRequestPlan, Option<(String, String)>), MetadataSelectionError> {
         let details = current.nfo_metadata_json.as_deref().and_then(|value| {
             serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
         });
         let details = if details.is_some() {
             details
+        } else if let Some(context) = writeback_context {
+            self.nfo
+                .read_item_projection_with_writeback_context(current.season_number, context)
+                .await?
+                .map(|projection| projection.details)
         } else {
             self.nfo
                 .read_item_projection(item_id)
@@ -2541,6 +2548,7 @@ impl MetadataSelectionService {
                 current,
                 image_policy,
                 actual_missing_image_mask,
+                None,
             )
             .await?;
         let capability_identity = matches!(attempt_mode, MetadataAttemptMode::RespectRetryState)
