@@ -2896,6 +2896,7 @@ pub struct ScanJobService {
     cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     scan_run_registry: Arc<Mutex<ScanRunRegistry>>,
     metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    local_metadata_image_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     local_metadata_outbox_worker_started: Arc<AtomicBool>,
     local_metadata_outbox_notify: Arc<Notify>,
     lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
@@ -2906,6 +2907,17 @@ struct LocalMetadataWorkerHandle {
     task: JoinHandle<()>,
     job_id: String,
     notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+}
+
+fn notify_local_metadata_images_waiter(
+    notifications: &Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    scan_job_id: &str,
+) {
+    if let Ok(registry) = notifications.lock()
+        && let Some(notify) = registry.get(scan_job_id)
+    {
+        notify.notify_one();
+    }
 }
 
 #[derive(Default)]
@@ -3769,6 +3781,7 @@ impl ScanJobService {
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
             scan_run_registry: Arc::new(Mutex::new(ScanRunRegistry::default())),
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
+            local_metadata_image_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_metadata_outbox_worker_started: Arc::new(AtomicBool::new(false)),
             local_metadata_outbox_notify: Arc::new(Notify::new()),
             lite_manifest_discovery: Arc::new(Mutex::new(HashMap::new())),
@@ -9297,6 +9310,7 @@ impl ScanJobService {
         let home = self.home.clone();
         let user_events = self.user_events.clone();
         let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
+        let image_notifications = Arc::clone(&self.local_metadata_image_notifications);
         tokio::spawn(async move {
             let enricher = MetadataEnricher::new(database.clone());
             let enricher = match local_nfo {
@@ -9327,6 +9341,7 @@ impl ScanJobService {
                         )
                         .await
                         {
+                            notify_local_metadata_images_waiter(&image_notifications, &scan_job_id);
                             let database = database.clone();
                             let enricher = enricher.clone();
                             let metadata_selection = metadata_selection.clone();
@@ -9692,6 +9707,17 @@ impl ScanJobService {
     }
 
     async fn wait_for_local_metadata_images(&self, scan_job_id: &str) -> Result<(), ScanJobError> {
+        let notify =
+            self.local_metadata_image_notifications
+                .lock()
+                .ok()
+                .map(|mut notifications| {
+                    Arc::clone(
+                        notifications
+                            .entry(scan_job_id.to_owned())
+                            .or_insert_with(|| Arc::new(Notify::new())),
+                    )
+                });
         while self
             .database
             .has_pending_scan_local_metadata_images(scan_job_id)
@@ -9704,7 +9730,17 @@ impl ScanJobService {
             {
                 break;
             }
-            tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+            if let Some(notify) = &notify {
+                tokio::select! {
+                    _ = notify.notified() => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                }
+            } else {
+                tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK).await;
+            }
+        }
+        if let Ok(mut notifications) = self.local_metadata_image_notifications.lock() {
+            notifications.remove(scan_job_id);
         }
         Ok(())
     }
@@ -12286,9 +12322,9 @@ mod tests {
         is_lite_manifest_discovery, manifest_file_observation_matches,
         manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
         metadata_auto_match_policy_for_scan_job, newly_confirmed_fill_missing_item_ids,
-        normalize_incremental_path, parse_episode_filename, parse_movie_filename,
-        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
-        resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
+        normalize_incremental_path, notify_local_metadata_images_waiter, parse_episode_filename,
+        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
+        read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
         stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
         stat_manifest_root_sync,
     };
@@ -13452,6 +13488,74 @@ mod tests {
             receiver.try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_image_waiter_wakes_when_batch_images_complete()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let media_root = temp_dir.path().join("Movies");
+        tokio::fs::create_dir_all(&media_root).await?;
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let root = libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?
+            .root;
+        let job_id = "image-waiter-job";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches
+             (id, job_id, library_root_id, batch_sequence, source_refs_json, source_count, status)
+             VALUES ('image-waiter-batch', ?, ?, 0, '[\"source\"]', 1, 'RUNNING')",
+        )
+        .bind(job_id)
+        .bind(root.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let waiter_jobs = jobs.clone();
+        let waiter =
+            tokio::spawn(async move { waiter_jobs.wait_for_local_metadata_images(job_id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "the image batch is still pending");
+
+        assert!(
+            database
+                .mark_scan_local_metadata_images_complete("image-waiter-batch")
+                .await?
+        );
+        notify_local_metadata_images_waiter(
+            &jobs.local_metadata_image_notifications,
+            "image-waiter-job",
+        );
+        tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
+            .await
+            .expect("image waiter should wake before the fallback")??;
         Ok(())
     }
 

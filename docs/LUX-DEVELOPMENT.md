@@ -8790,6 +8790,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：credits 缺失判定先检查本地 NFO projection。缺少 projection、导演或编剧时直接标记缺失，不读取 `people.json`；两类 crew 信息齐全时仍检查人物关系。候选模块回归、fmt、Clippy 和 `git diff --check` 通过。本任务没有统计文件系统调用数、墙钟或生产 CPU；完整的页级 NFO projection 缓存与批量 relation 读取仍属于第 15 项剩余工作。
 
+#### LUX-414：本地 metadata 图片完成时唤醒对应扫描等待者
+
+范围：`wait_for_local_metadata_images` 当前按 1 秒 fallback 轮询数据库，即使本进程中的 outbox worker 已持久化对应 job 的图片阶段完成。为等待中的 job 注册独立 Notify；图片 worker 成功持久化 `images_completed_at` 后唤醒该 job 的等待者。保留周期 fallback，覆盖跨进程状态变化、通知注册竞态和 worker 恢复；失败重试不误报完成。
+
+验收：
+
+- [x] 图片阶段完成的持久化状态后发送对应 job 通知，等待者收到通知后重新读取数据库并退出等待；失败图片批次继续按原有重试策略等待。
+- [x] 回归证明通知可让等待路径早于 1 秒 fallback 返回；fmt、相关 Clippy、`git diff --check` 通过。
+- [x] 性能记录仅说明查询等待边界，不外推文件处理墙钟、PostgreSQL、FNOS 或 NAS 收益。
+
+短计划与文件：只改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先添加包含未完成 image batch 的 scanner 回归并观察 1 秒轮询超时，再增加独立 job 通知注册和完成信号，最后验证扫描等待与批次重试行为。
+
+结果（2026-10-08）：outbox 图片阶段成功写入 `images_completed_at` 后通知对应 job；等待方收到通知后重新查询数据库，周期 fallback 仍为 1 秒。通知单测先保持 batch 为 pending，再完成它并要求 250ms 内唤醒（不含开始时的 50ms 等待）；定向回归、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。失败批次不发送完成通知，仍按原有延迟重试。本结果不测量 SQL 时延、扫描墙钟或 FNOS CPU。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

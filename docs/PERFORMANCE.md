@@ -1537,3 +1537,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-413 completeness credits relation 短路
 
 本地 metadata completeness 计划先检查 NFO projection 是否同时包含导演和编剧。若 projection 不存在或任一列表为空，credits 已确定缺失，直接保留补全请求并跳过 `people.json` relation-existence 检查；只有两类 crew 信息齐全时才检查人物关系。候选模块单测覆盖缺失/完整 crew 判定。该回归验证决策边界，不统计文件系统调用总数或时延，也不代表 FNOS CPU 收益。
+
+### LUX-414 图片阶段等待通知
+
+扫描 job 等待本地 metadata 图片阶段时，原路径每秒重查一次数据库。现在 outbox worker 在成功保存图片阶段完成状态后通知同 job 的等待者；该等待者会重新读取数据库，1 秒 fallback 保留用于跨进程变更和恢复。固定 SQLite scanner 测试确认 pending batch 转为 completed 并发出通知后，等待在 250ms 内结束。未统计查询数或时延，不外推文件处理墙钟、PostgreSQL、FNOS 或 NAS 收益。
