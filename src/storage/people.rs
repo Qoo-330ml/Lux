@@ -386,23 +386,6 @@ impl Database {
         .await
     }
 
-    pub(crate) async fn replace_person_credits_batch_with_fingerprint(
-        &self,
-        replacements: &[(&str, &[NewPersonCredit], Option<&str>)],
-    ) -> Result<(), StorageError> {
-        if replacements.is_empty() {
-            return Ok(());
-        }
-        let replacements_with_checksum = replacements
-            .iter()
-            .map(|(item_id, credits, source_fingerprint)| {
-                (*item_id, *credits, *source_fingerprint, None)
-            })
-            .collect::<Vec<_>>();
-        self.replace_person_credits_batch_with_relation_checksum(&replacements_with_checksum)
-            .await
-    }
-
     pub(crate) async fn replace_person_credits_with_relation_checksum(
         &self,
         item_id: &str,

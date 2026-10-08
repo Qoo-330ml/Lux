@@ -2791,6 +2791,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn relation_rebuild_does_not_skip_changed_bytes_with_same_source_fingerprint()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind("item-rebuild")
+        .bind(library.id.to_string())
+        .bind("测试电影")
+        .bind("测试电影")
+        .execute(database.pool())
+        .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let source_fingerprint = [1_u8, 2, 3];
+        let actors = [ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        service
+            .persist_nfo_item_actors("item-rebuild", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        service.rebuild_person_credit_index().await?;
+
+        let relation_path =
+            library_item_directory(&config.config_dir, "item-rebuild")?.join("people.json");
+        let relation_bytes = tokio::fs::read(&relation_path).await?;
+        let mut relation: serde_json::Value = serde_json::from_slice(&relation_bytes)?;
+        relation["actors"][0]["name"] = serde_json::Value::String("演员乙".to_owned());
+        tokio::fs::write(&relation_path, serde_json::to_vec_pretty(&relation)?).await?;
+
+        sqlx::query("UPDATE person_index_item_state SET updated_at = 1 WHERE item_id = ?")
+            .bind("item-rebuild")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "UPDATE person_index_rebuild_jobs
+             SET status = 'QUEUED', cursor_id = NULL, processed_count = 1,
+                 total_count = 1, cancel_requested = 0, run_token = NULL
+             WHERE library_id = ?",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        assert_eq!(service.rebuild_person_credit_index().await?, 1);
+        let updated_at: i64 =
+            sqlx::query_scalar("SELECT updated_at FROM person_index_item_state WHERE item_id = ?")
+                .bind("item-rebuild")
+                .fetch_one(database.pool())
+                .await?;
+        assert!(
+            updated_at > 1,
+            "changed snapshot bytes must trigger rebuilding"
+        );
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-rebuild")
+            .await?;
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn deferred_nfo_actor_credits_become_current_after_batch_flush()
     -> Result<(), Box<dyn std::error::Error>> {
         use crate::{config::Config, storage::Database};

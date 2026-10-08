@@ -9405,7 +9405,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/storage/library.rs`、`src/application/people/service.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先锁定 checksum mismatch/legacy stale 回归，再替换 current 判定入口。
 
-结果（2026-10-09）：service current 判断从关系文件一次读取的 raw bytes 计算 SHA-256，并要求数据库 source fingerprint、relation checksum、relation schema version 都匹配；NULL checksum、不同文件字节、不同 fingerprint 或 schema version 都判为 stale。SQLite service 与 storage 定向回归通过；不带 checksum 的旧 current API 暂供 rebuild 使用，LUX-456 将迁移后移除。PostgreSQL/FNOS 未运行，未据此推断生产收益。
+结果（2026-10-09）：service current 判断从关系文件一次读取的 raw bytes 计算 SHA-256，并要求数据库 source fingerprint、relation checksum、relation schema version 都匹配；NULL checksum、不同文件字节、不同 fingerprint 或 schema version 都判为 stale。SQLite service 与 storage 定向回归通过；rebuild 现已在 LUX-456 接入同一 checksum 判定并移除旧 current API。PostgreSQL/FNOS 未运行，未据此推断生产收益。
 
 #### LUX-456：人物关系索引重建比较并保存快照 checksum
 
@@ -9413,12 +9413,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] rebuild skip 只有三维 state 与关系快照完全匹配才跳过；旧 checksum 为 NULL 或关系文件变化时重建。
-- [ ] rebuild credits batch 使用所读 raw bytes 的 checksum，不重读关系文件或重序列化关系对象计算。
-- [ ] service regression 覆盖相同 source fingerprint 下文件 bytes 变化，确认 rebuild 更新 credits 和 checksum；不改变 legacy relation 路径读取语义。
-- [ ] people tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+- [x] rebuild skip 只有三维 state 与关系快照完全匹配才跳过；旧 checksum 为 NULL 或关系文件变化时重建。
+- [x] rebuild credits batch 使用所读 raw bytes 的 checksum，不重读关系文件或重序列化关系对象计算。
+- [x] service regression 覆盖相同 source fingerprint 下文件 bytes 变化，确认 rebuild 更新 credits 和 checksum；不改变 legacy relation 路径读取语义。
+- [x] people tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
 
-预计文件：`src/storage/people.rs`、`src/application/people/rebuild.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 changed-bytes rebuild 回归，再贯通 raw snapshot checksum 到 batch commit。
+预计文件：`src/storage/library.rs`、`src/storage/people.rs`、`src/application/people/rebuild.rs`、`src/application/people/service.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 changed-bytes rebuild 回归，再贯通 raw snapshot checksum 到 batch commit，并删除不再被消费的 fingerprint-only batch wrapper。
+
+结果（2026-10-09）：rebuild 同一次安全读取同时计算 raw-byte checksum 并解析 relation；skip 现在比较 source fingerprint、relation checksum、state schema version，batch credits commit 保存该 checksum。相同 source fingerprint 下改写 actor bytes 的回归先失败后通过，且验证 rebuild 保存值与实际文件匹配。删除无调用方 fingerprint-only batch wrapper。people service 40/40、storage checksums/current 回归通过；全量 `cargo test --locked --all-targets` 通过（798 passed、13 ignored；PostgreSQL 16 项因本机无实例而 ignored），`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 通过。本机 `arm64`，未部署 FNOS/生产测量。
 
 #### 本轮代码质量与性能优化收口
 

@@ -492,34 +492,6 @@ impl Database {
         }))
     }
 
-    pub(crate) async fn person_index_item_state_is_current(
-        &self,
-        item_id: &str,
-        source_fingerprint: Option<&str>,
-    ) -> Result<bool, StorageError> {
-        let Some(source_fingerprint) = source_fingerprint else {
-            return Ok(false);
-        };
-        let row = self
-            .query(
-                "SELECT source_fingerprint, relation_schema_version
-                 FROM person_index_item_state WHERE item_id = ?",
-            )
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(row.is_some_and(|row| {
-            row.get::<Option<String>, _>("source_fingerprint")
-                .as_deref()
-                == Some(source_fingerprint)
-                && row.get::<i64, _>("relation_schema_version") == 2
-        }))
-    }
-
     pub(crate) async fn list_library_scrapers(
         &self,
         library_id: &str,

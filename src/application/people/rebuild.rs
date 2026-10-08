@@ -427,7 +427,7 @@ impl PeopleService {
                     }
                     Err(error) => return Err(error),
                 };
-                let Some((relation_path, relation)) = relation else {
+                let Some((relation_path, relation, relation_checksum)) = relation else {
                     let cleared = database
                         .clear_person_credits(item_id)
                         .await
@@ -475,9 +475,10 @@ impl PeopleService {
                 }
                 if !force_rebuild
                     && database
-                        .person_index_item_state_is_current(
+                        .person_index_item_state_matches_snapshot(
                             item_id,
                             relation.source_fingerprint.as_deref(),
+                            Some(&relation_checksum),
                         )
                         .await
                         .map_err(|error| PeopleError::Storage(error.to_string()))?
@@ -497,7 +498,7 @@ impl PeopleService {
                             .map(|identity| (identity.provider.clone(), identity.id.clone())),
                     );
                 }
-                pending.push((item_id.clone(), relation));
+                pending.push((item_id.clone(), relation, relation_checksum));
                 processed_count += 1;
                 cursor_id = Some(item_id.clone());
             }
@@ -511,20 +512,30 @@ impl PeopleService {
                 .collect::<BTreeMap<_, _>>();
             let credit_replacements = pending
                 .into_iter()
-                .map(|(item_id, relation)| {
+                .map(|(item_id, relation, relation_checksum)| {
                     let credits =
                         self.person_credits_from_relation_with_lookup(&relation, &identity_lookup);
-                    (item_id, credits, relation.source_fingerprint)
+                    (
+                        item_id,
+                        credits,
+                        relation.source_fingerprint,
+                        relation_checksum,
+                    )
                 })
                 .collect::<Vec<_>>();
             let credit_replacement_refs = credit_replacements
                 .iter()
-                .map(|(item_id, credits, fingerprint)| {
-                    (item_id.as_str(), credits.as_slice(), fingerprint.as_deref())
+                .map(|(item_id, credits, fingerprint, relation_checksum)| {
+                    (
+                        item_id.as_str(),
+                        credits.as_slice(),
+                        fingerprint.as_deref(),
+                        Some(relation_checksum.as_str()),
+                    )
                 })
                 .collect::<Vec<_>>();
             database
-                .replace_person_credits_batch_with_fingerprint(&credit_replacement_refs)
+                .replace_person_credits_batch_with_relation_checksum(&credit_replacement_refs)
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
             if let Some(cursor_id) = cursor_id.as_deref()
@@ -943,7 +954,7 @@ impl PeopleService {
     async fn read_person_relation_with_path(
         &self,
         item_id: &str,
-    ) -> Result<Option<(PathBuf, StoredPeopleRelation)>, PeopleError> {
+    ) -> Result<Option<(PathBuf, StoredPeopleRelation, String)>, PeopleError> {
         let new_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
@@ -951,11 +962,20 @@ impl PeopleService {
             .legacy_people_dir()
             .join(LEGACY_ITEMS_DIR)
             .join(format!("{item_id}.json"));
-        match read_relation(&new_path).await? {
-            Some(relation) => Ok(Some((new_path, relation))),
-            None => Ok(read_relation(&legacy_path)
-                .await?
-                .map(|relation| (legacy_path, relation))),
+        match read_people_file(&new_path).await? {
+            Some(bytes) => {
+                let relation = parse_relation(&bytes)?;
+                let checksum = relation_snapshot_checksum(&bytes);
+                Ok(Some((new_path, relation, checksum)))
+            }
+            None => match read_people_file(&legacy_path).await? {
+                Some(bytes) => {
+                    let relation = parse_relation(&bytes)?;
+                    let checksum = relation_snapshot_checksum(&bytes);
+                    Ok(Some((legacy_path, relation, checksum)))
+                }
+                None => Ok(None),
+            },
         }
     }
 }
