@@ -8953,6 +8953,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：扫描和本地 completeness 自动补全共用按 library 的容量 32 dispatcher；enqueue 先预留容量再在 shutdown 锁内去重，校验 job 的持久化 library/mode，关闭唤醒背压提交，单个 job runner panic 后将该 job 标记为 FAILED 并继续队列。`tests/reidentify.rs` 15/15、`tests/scanning_jobs.rs` 81/81、build、fmt、全目标全 feature Clippy、`git diff --check` 通过。全量测试的 library 部分 765 passed、13 ignored；随后在 `tests/emby_counts.rs:159` 遇到已于基线 `2b64ba65` 复现的无关计数失败（实际 1、预期 0）。本机 ARM64；没有 FNOS/NAS、PostgreSQL 或运行时 task 数/CPU A/B 证据。管理员和计划任务入口仍属后续任务。
 
+#### LUX-425：管理员 FILL_MISSING 请求复用按 library dispatcher
+
+范围：管理员的整库 reidentify、整库 metadata refresh 和单条目 metadata refresh 中，`FILL_MISSING` 仍直接为每个持久化 job spawn runner。统一通过 LUX-424 dispatcher 接收这三类管理员创建的 `FILL_MISSING` job；`FULL_REFRESH` 与 `REIDENTIFY` 继续沿用当前 runner。队列背压时管理员请求等待 dispatcher 容量；dispatcher 关闭或队列不可用时返回结构化服务不可用错误，持久化 job 保持可重试；成功响应、审计事件和 job DTO 不变。本任务不接计划任务、thumbnail retry 或调度窗口。
+
+验收：
+
+- [x] 三个管理员 FILL_MISSING 入口都进入对应 library dispatcher，不再直接 spawn job runner。
+- [x] FULL_REFRESH、REIDENTIFY 的执行与响应合同不变；队列关闭时 FILL_MISSING 返回服务不可用，持久化 job 保持可重试。
+- [x] 管理员 item/library FILL_MISSING HTTP 回归、reidentify dispatcher 定向回归、build、fmt、Clippy 和 diff check 通过。
+- [x] 性能记录说明管理员路径复用每库一个 runner，不推断生产吞吐或 CPU 收益。
+
+预计文件：`src/api/admin_handlers.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先补管理员 refresh HTTP 回归，再接入 dispatcher。
+
+结果（2026-10-08）：整库 reidentify、整库 metadata refresh 和 item metadata refresh 的 `FILL_MISSING` 均经由按 library dispatcher 入队；其他模式继续使用原 worker。dispatcher 关闭回归确认 API 返回 `503 DATABASE_UNAVAILABLE`，新建 job 保持 `QUEUED`。`tests/reidentify.rs` 15/15、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；不代表 FNOS/NAS、PostgreSQL 或运行时吞吐/CPU 收益。管理员显式 retry 入口和计划任务入口不属于本任务，仍需逐项核验。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

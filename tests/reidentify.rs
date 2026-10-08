@@ -282,10 +282,9 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     );
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(
-        AppState::ready(config, database.clone(), setup, auth, emby_auth)
-            .with_scraper(tmdb.provider()),
-    );
+    let app_state = AppState::ready(config, database.clone(), setup, auth, emby_auth)
+        .with_scraper(tmdb.provider());
+    let app = app_with_state(app_state.clone());
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -566,6 +565,46 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     assert_eq!(library_job["job"]["mode"], "FILL_MISSING");
     assert_eq!(library_job["job"]["status"], "COMPLETED");
 
+    let library_refresh_fill_started = client
+        .post(format!(
+            "{base_url}/api/v1/admin/libraries/{}/metadata/refresh",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "FILL_MISSING" }))
+        .send()
+        .await?;
+    assert_eq!(
+        library_refresh_fill_started.status(),
+        reqwest::StatusCode::ACCEPTED
+    );
+    let library_refresh_fill_body: Value = library_refresh_fill_started.json().await?;
+    let library_refresh_fill_job_id = library_refresh_fill_body["job"]["id"]
+        .as_str()
+        .ok_or("missing library FILL_MISSING metadata refresh job ID")?
+        .to_owned();
+    assert_eq!(library_refresh_fill_body["job"]["mode"], "FILL_MISSING");
+    let mut library_refresh_fill_job = Value::Null;
+    for _ in 0..80 {
+        let response = client
+            .get(format!(
+                "{base_url}/api/v1/admin/metadata/reidentify/{library_refresh_fill_job_id}"
+            ))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        library_refresh_fill_job = response.json().await?;
+        if matches!(
+            library_refresh_fill_job["job"]["status"].as_str(),
+            Some("COMPLETED" | "COMPLETED_WITH_ISSUES" | "FAILED" | "DEFERRED")
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(library_refresh_fill_job["job"]["status"], "COMPLETED");
+
     let listed = client
         .get(format!(
             "{base_url}/api/v1/admin/metadata/reidentify?page=1&pageSize=50"
@@ -624,6 +663,33 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
     assert_eq!(refresh_job["job"]["mode"], "FULL_REFRESH");
     assert_eq!(refresh_job["job"]["status"], "COMPLETED");
     assert_eq!(refresh_job["job"]["items"][0]["candidateCount"], 0);
+
+    app_state.shutdown_background_workers().await;
+    let unavailable = client
+        .post(format!(
+            "{base_url}/api/v1/admin/items/{item_id}/metadata/refresh"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "mode": "FILL_MISSING" }))
+        .send()
+        .await?;
+    assert_eq!(
+        unavailable.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let unavailable_body: Value = unavailable.json().await?;
+    assert_eq!(unavailable_body["error"]["code"], "DATABASE_UNAVAILABLE");
+    let queued_after_dispatch_failure: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM metadata_reidentify_jobs
+         WHERE mode = 'FILL_MISSING' AND status = 'QUEUED'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        queued_after_dispatch_failure, 1,
+        "a created job must remain queued and retryable if dispatch is unavailable"
+    );
 
     server.abort();
     tmdb_server.abort();

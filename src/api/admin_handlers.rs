@@ -233,6 +233,37 @@ impl MetadataRefreshRequestMode {
     }
 }
 
+async fn schedule_admin_metadata_job(
+    reidentify: &crate::application::reidentify::MetadataReidentifyService,
+    job: &crate::application::reidentify::MetadataReidentifyJob,
+) -> Result<(), crate::application::reidentify::MetadataDispatchError> {
+    if job.mode == crate::application::reidentify::MetadataRefreshMode::FillMissing.as_str() {
+        reidentify.enqueue_fill_missing_job(job).await?;
+    } else {
+        let worker = reidentify.clone();
+        let job_id = job.id.clone();
+        tokio::spawn(async move {
+            worker.run(&job_id).await;
+        });
+    }
+    Ok(())
+}
+
+fn metadata_dispatch_unavailable(
+    headers: &HeaderMap,
+    job_id: &str,
+    error: crate::application::reidentify::MetadataDispatchError,
+) -> Response {
+    tracing::warn!(job_id, %error, "administrator metadata job could not be dispatched");
+    api_error(
+        headers,
+        StatusCode::SERVICE_UNAVAILABLE,
+        lux::ApiErrorCode::DatabaseUnavailable,
+        "元数据任务队列暂不可用，请稍后重试",
+    )
+    .into_response()
+}
+
 pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -1340,10 +1371,9 @@ pub(crate) async fn admin_start_library_reidentify(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        reidentify.run(&job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,
@@ -1435,10 +1465,9 @@ pub(crate) async fn admin_start_library_metadata_refresh(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        reidentify.run(&job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,
@@ -1583,10 +1612,9 @@ pub(crate) async fn admin_start_item_metadata_refresh(
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
     };
-    let job_id = job.id.clone();
-    tokio::spawn(async move {
-        reidentify.run(&job_id).await;
-    });
+    if let Err(error) = schedule_admin_metadata_job(&reidentify, &job).await {
+        return metadata_dispatch_unavailable(&headers, &job.id, error);
+    }
     record_audit_event(
         &state,
         &headers,

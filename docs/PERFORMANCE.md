@@ -1583,3 +1583,9 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 全量扫描、增量扫描以及 completeness completion 产生的 `FILL_MISSING` job 按 library 交给持久 dispatcher。每个已触发 library 保留一个 runner，同库 job 顺序执行；每个队列容量为 32，队列满时提交方等待，仍在队列或运行中的相同 job ID 会合并。提交先取得容量，再在 shutdown 状态锁内去重和入队，避免取消留下虚假的 pending ID，也避免关闭之后越过队列边界。关闭会唤醒容量等待者并拒绝新提交；已接收队列在 Tokio runtime 仍运行期间排空，关闭调用不会等待长 job。单个 job runner panic 会将该 job 标记为失败并继续处理后续队列。扫描路径不再为每个补全 job 建立完整 runner task；completeness 路径保留一个轻量完成观察任务以维持首页失效事件时序。
 
 现有全局 `FILL_MISSING` item worker semaphore 仍限制最多 2 个 item 同时运行。测试锁定同库串行、32 项背压、重复 ID、背压取消后的重试、错误 library 路由、关闭唤醒、长 job 期间 shutdown 快速返回和单个 runner panic 后继续处理；这只说明调度上界，不统计总体 Tokio task 数、SQL、墙钟、CPU 或 FNOS 收益。管理员直接请求与计划任务入口仍待后续接入同一 dispatcher。
+
+### LUX-425 管理员 FILL_MISSING 入口复用 dispatcher
+
+管理员整库 reidentify、整库 metadata refresh 与单条目 metadata refresh 的 `FILL_MISSING` job 现在进入 LUX-424 的 library dispatcher；每个已触发 library 仍由一个 runner 顺序执行，队列满时 HTTP 提交等待容量。`FULL_REFRESH` 和 `REIDENTIFY` 保持现有 runner。dispatcher 关闭时管理员收到结构化 `503 DATABASE_UNAVAILABLE`；job 已先持久化，保持 `QUEUED` 供恢复后重试。
+
+`tests/reidentify.rs` 15/15 通过，包含三种管理员入口的正常完成和 dispatcher 关闭时保留 queued job。此项不测量管理员请求速率、总体 Tokio task 数、SQL、墙钟、生产吞吐或 CPU，不推断 FNOS/NAS 收益；显式 retry 与计划任务路径仍待检查。
