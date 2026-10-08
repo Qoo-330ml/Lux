@@ -9128,6 +9128,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：PostgreSQL 诊断现在只在服务端预加载且当前数据库已安装 `pg_stat_statements` 时读取当前库累计统计，最多返回 20 条 query ID、调用数、总/均值/最大执行时间、行数和 shared block hit/read；不返回 SQL 文本或参数。未预加载、extension 缺失、权限不足、不可用或超时均降级为显式状态，SQLite 标记 `NOT_APPLICABLE`。SQLite 合同、不可用状态单测和 `cargo test --locked --lib database_diagnostics -- --include-ignored` 通过；集成测试在本机 PostgreSQL 配置下通过可用/不可用合同。build、fmt、全目标全 feature Clippy 通过。最终 all-targets 库测试 777 passed、13 ignored；集成目标 `emby_counts`（实际 1、期望 0）、`metadata`（unchanged NFO 期望 nfo_loaded=1，实际 0）、`metadata_selection`（optional actor enrichment wait）及 `strm`（401/200）均在本任务父提交 `855d890a` 独立复现；`watch` 全目标 5/5 通过。本机 ARM64；API 文档提供 DBA 手动启用步骤。本任务没有测量 query latency 或优化收益，统计值只作为后续诊断信号。
 
+#### LUX-437：本地 NFO 页合并人物 manifest restore 标记
+
+范围：一个本地 NFO page 可能修改多个 Lux canonical person manifest；manifest 内容仍需按人物目录分别校验 checksum、持锁并原子写入，但每个人物目前都会重复调用相同数据库 restore-pending 标记。让 LUX-435 的 page context 在首个 checksum 确认变化的 manifest 写入前，最多提交一次当前 schema 的 restore-pending 状态。普通人物 API 和在线刮削仍保持即时标记；checksum 不变时不标记；文件锁与文件写入仍按人物独立，不声称跨文件原子提交。
+
+验收：
+
+- [x] 同一 deferred NFO page 中多个 manifest 均有变化时，只调用一次数据库 restore-pending 写入，且每个人物 manifest 都写入最新 checksum。
+- [x] unchanged checksum 不触发 pending；写文件失败时数据库已标记 pending，之后恢复可重试。
+- [x] 普通人物 API 的即时 restore-pending 语义不变；deferred credits 和 NFO page 回归继续通过。
+- [x] people API、NFO metadata、build、fmt、Clippy、差异检查通过；性能记录仅报告每页状态写调用边界。
+
+预计文件：`src/application/people/service.rs`、`src/application/people/relations.rs`、`src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先直接测试两个 manifest 共用 deferred context 的 storage 调用数，再将 page context 接入 canonical manifest 写入。
+
+结果（2026-10-08）：本地 scan NFO page 共享的 deferred context 现在也合并 canonical person manifest restore-pending 标记。并发写入两个不同人物 manifest 的回归确认数据库标记只调用一次，且两个文件都保存各自最新 identity 与 checksum；重复 checksum 不调用标记。标记成功后才原子写 manifest，因此写入失败会保留 PENDING 供后续恢复。非 NFO 人物资产路径仍即时标记。定向单测通过；`tests/people_api.rs` 10/10、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、全目标全 feature Clippy 和差异检查通过。本任务只记录每页一次标记调用上界，不推断时延、PostgreSQL、FNOS/NAS 或 CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

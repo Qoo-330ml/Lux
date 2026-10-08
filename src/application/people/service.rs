@@ -342,6 +342,12 @@ pub struct ActorPersistReport {
 #[derive(Clone, Default)]
 pub(crate) struct DeferredNfoActorCredits {
     pending: Arc<AsyncMutex<Vec<PendingNfoActorCredits>>>,
+    manifest_restore_pending: Arc<AsyncMutex<bool>>,
+}
+
+pub(super) struct PersonManifestWriteOptions<'a> {
+    pub metadata: Option<&'a PersonMetadata>,
+    pub deferred_restore_pending: Option<&'a DeferredNfoActorCredits>,
 }
 
 struct PendingNfoActorCredits {
@@ -586,6 +592,22 @@ impl PeopleService {
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
         }
         Ok(())
+    }
+
+    async fn ensure_person_manifest_restore_pending(
+        &self,
+        deferred: Option<&DeferredNfoActorCredits>,
+    ) -> Result<(), PeopleError> {
+        if let Some(deferred) = deferred {
+            let mut marked = deferred.manifest_restore_pending.lock().await;
+            if !*marked {
+                self.mark_person_manifest_restore_pending().await?;
+                *marked = true;
+            }
+            Ok(())
+        } else {
+            self.mark_person_manifest_restore_pending().await
+        }
     }
 
     pub(super) async fn relation_lock_for(&self, relation_path: &Path) -> Arc<AsyncMutex<()>> {
@@ -880,9 +902,9 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::{
-        ActorCredit, DeferredNfoActorCredits, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION,
-        PERSON_NFO, PeopleError, PeopleService, PersonIdentity, PersonIndexRebuildCoordinator,
-        PersonManifest, PersonMetadata,
+        ActorCredit, DeferredNfoActorCredits, PENDING_PERSON_MANIFEST, PERSON_MANIFEST,
+        PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService, PersonIdentity,
+        PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions, PersonMetadata,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
@@ -2483,6 +2505,118 @@ mod tests {
                 .item_actor_relation_is_current("item-b", &fingerprint_b)
                 .await?
         );
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_nfo_person_manifests_share_one_restore_pending_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let deferred_credits = DeferredNfoActorCredits::default();
+        let identities_a = [PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "person-a".to_owned(),
+        }];
+        let identities_b = [PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "person-b".to_owned(),
+        }];
+        let person_dir_a = lux_person_directory(&config.config_dir, "演员甲", "lux-000001")?;
+        let person_dir_b = lux_person_directory(&config.config_dir, "演员乙", "lux-000002")?;
+        let actor_a = ActorCredit {
+            id: "person-a".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: identities_a.to_vec(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+        let actor_b = ActorCredit {
+            id: "person-b".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: identities_b.to_vec(),
+            name: "演员乙".to_owned(),
+            character: None,
+            order: Some(1),
+            profile_url: None,
+            person: None,
+        };
+
+        database.reset_query_count();
+        let (result_a, result_b) = tokio::join!(
+            service.persist_person_assets_with_deferred_manifest(
+                &actor_a,
+                "tmdb",
+                "person-a",
+                Some("lux-000001"),
+                &identities_a,
+                Some(&deferred_credits),
+            ),
+            service.persist_person_assets_with_deferred_manifest(
+                &actor_b,
+                "tmdb",
+                "person-b",
+                Some("lux-000002"),
+                &identities_b,
+                Some(&deferred_credits),
+            )
+        );
+        assert!(
+            !result_a
+                .pending_assets
+                .iter()
+                .any(|asset| asset == PENDING_PERSON_MANIFEST)
+        );
+        assert!(
+            !result_b
+                .pending_assets
+                .iter()
+                .any(|asset| asset == PENDING_PERSON_MANIFEST)
+        );
+
+        assert_eq!(database.query_count(), 1);
+        assert!(person_dir_a.join(PERSON_MANIFEST).is_file());
+        assert!(person_dir_b.join(PERSON_MANIFEST).is_file());
+        let manifest_a: PersonManifest =
+            serde_json::from_slice(&tokio::fs::read(person_dir_a.join(PERSON_MANIFEST)).await?)?;
+        let manifest_b: PersonManifest =
+            serde_json::from_slice(&tokio::fs::read(person_dir_b.join(PERSON_MANIFEST)).await?)?;
+        assert_eq!(manifest_a.identities, identities_a);
+        assert_eq!(manifest_b.identities, identities_b);
+        assert!(!manifest_a.checksum.is_empty());
+        assert!(!manifest_b.checksum.is_empty());
+
+        database.reset_query_count();
+        service
+            .persist_person_manifest(
+                &person_dir_a,
+                "lux-000001",
+                "演员甲",
+                "tmdb",
+                &identities_a,
+                PersonManifestWriteOptions {
+                    metadata: None,
+                    deferred_restore_pending: Some(&DeferredNfoActorCredits::default()),
+                },
+            )
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            0,
+            "unchanged manifest checksums must not mark restore pending"
+        );
+
         database.close().await;
         Ok(())
     }

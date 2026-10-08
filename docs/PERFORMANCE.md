@@ -1643,3 +1643,9 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 ### LUX-436 PostgreSQL query statistics 诊断
 
 数据库诊断报告现在可选读取 `pg_stat_statements` 当前数据库的最多 20 条累计高执行时间语句，包含 query ID、调用数、总/均值/最大执行时间、行数和 shared block hit/read，不返回 SQL 文本或参数。extension 未预加载、未安装、无权读取或查询超时会返回不可用状态；SQLite 标记为不适用。该改动没有测量或改善任何 SQL 延迟；返回值受 extension 启用时间及 `pg_stat_statements_reset()` 影响，只用于后续定位热点。
+
+### LUX-437 本地 NFO 页人物 manifest restore 标记
+
+固定 SQLite 回归中，同一个 deferred NFO page context 并发持久化两个有变化的人物 manifest，restore-pending storage 调用由每人一次合并为每页一次；两个 manifest 均保留各自新 checksum。重复 checksum 为 0 次标记调用。数据库标记先于原子文件写入，因此原子写失败后 PENDING 状态仍保留供恢复。普通人物 API 和非 NFO 写入继续每次即时标记。
+
+这里只统计该状态标记的应用层 storage query-wrapper 调用边界；manifest 文件读取、人物锁、原子写入、后续 credits flush、SQL 执行时间和墙钟均未计量，不外推 PostgreSQL、FNOS/NAS 或 CPU 收益。

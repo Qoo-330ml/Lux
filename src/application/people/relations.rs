@@ -316,7 +316,10 @@ impl PeopleService {
                     &actor.name,
                     &actor_provider,
                     &actor.identities,
-                    actor.person.as_ref(),
+                    PersonManifestWriteOptions {
+                        metadata: actor.person.as_ref(),
+                        deferred_restore_pending: None,
+                    },
                 )
                 .await?;
             }
@@ -585,12 +588,13 @@ impl PeopleService {
             }
             let has_stable_identity = person_key.is_some();
             let assets = if has_stable_identity {
-                self.persist_person_assets(
+                self.persist_person_assets_with_deferred_manifest(
                     actor,
                     actor_provider,
                     actor_id,
                     person_key.as_deref(),
                     &identities,
+                    deferred_credits,
                 )
                 .await
             } else {
@@ -710,6 +714,26 @@ impl PeopleService {
         provider_id: &str,
         person_key: Option<&str>,
         identities: &[PersonIdentity],
+    ) -> PersonAssetResult {
+        self.persist_person_assets_with_deferred_manifest(
+            actor,
+            provider,
+            provider_id,
+            person_key,
+            identities,
+            None,
+        )
+        .await
+    }
+
+    pub(super) async fn persist_person_assets_with_deferred_manifest(
+        &self,
+        actor: &ActorCredit,
+        provider: &str,
+        provider_id: &str,
+        person_key: Option<&str>,
+        identities: &[PersonIdentity],
+        deferred_restore_pending: Option<&DeferredNfoActorCredits>,
     ) -> PersonAssetResult {
         let lock_key = person_key
             .filter(|key| key.starts_with("lux-"))
@@ -839,7 +863,10 @@ impl PeopleService {
                     &actor.name,
                     provider,
                     identities,
-                    actor.person.as_ref(),
+                    PersonManifestWriteOptions {
+                        metadata: actor.person.as_ref(),
+                        deferred_restore_pending,
+                    },
                 )
                 .await
             {
@@ -1003,7 +1030,7 @@ impl PeopleService {
         display_name: &str,
         source_provider: &str,
         identities: &[PersonIdentity],
-        metadata: Option<&PersonMetadata>,
+        options: PersonManifestWriteOptions<'_>,
     ) -> Result<(), PeopleError> {
         let manifest_path = person_dir.join(PERSON_MANIFEST);
         acquire_person_manifest_lock(&manifest_path).await?;
@@ -1067,7 +1094,7 @@ impl PeopleService {
                     .cmp(&right.provider)
                     .then(left.id.cmp(&right.id))
             });
-            if let Some(metadata) = metadata {
+            if let Some(metadata) = options.metadata {
                 for field in person_metadata_fields(metadata) {
                     manifest
                         .field_sources
@@ -1101,7 +1128,8 @@ impl PeopleService {
             manifest.checksum = digest.iter().map(|byte| format!("{byte:02x}")).collect();
             let bytes = serde_json::to_vec_pretty(&manifest)
                 .map_err(|source| PeopleError::Serialization(source.to_string()))?;
-            self.mark_person_manifest_restore_pending().await?;
+            self.ensure_person_manifest_restore_pending(options.deferred_restore_pending)
+                .await?;
             write_atomically(&manifest_path, &bytes).await
         }
         .await;
