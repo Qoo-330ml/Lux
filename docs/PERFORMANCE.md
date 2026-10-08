@@ -1678,3 +1678,9 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 固定 SQLite 回归中，同一个 deferred NFO page context 并发持久化两个有变化的人物 manifest，restore-pending storage 调用由每人一次合并为每页一次；两个 manifest 均保留各自新 checksum。重复 checksum 为 0 次标记调用。数据库标记先于原子文件写入，因此原子写失败后 PENDING 状态仍保留供恢复。普通人物 API 和非 NFO 写入继续每次即时标记。
 
 这里只统计该状态标记的应用层 storage query-wrapper 调用边界；manifest 文件读取、人物锁、原子写入、后续 credits flush、SQL 执行时间和墙钟均未计量，不外推 PostgreSQL、FNOS/NAS 或 CPU 收益。
+
+### LUX-442 completeness claim/commit transaction boundary
+
+本地 metadata completeness 的每个最多 512-check 批次现在通过一次 storage 调用，在同一个 metadata write transaction 中 prepare/claim、提交新结果、筛 due provider retry，并创建或合并补缺 job。旧路径先执行一个 claim transaction；有结果或 due retry 时再执行一个至六个 completion/scheduling transaction（FILL_MISSING 查询和写入仍按每 100 项分片）。因此需持久化的批次由 2–7 个 transaction/acquire 周期变为 1 个；READY 且 fingerprint 未变、没有 due retry 的批次旧路径已只执行一次 claim transaction，新路径仍为一次合并 transaction。结果行在 storage 中仍以最多 100 条 SQL 分片更新，job 输入仍保留 100-item 分片。
+
+SQLite 故障注入在 job row 已插入、job item 写入失败时确认 completeness claim/READY 变化和 job row 全部回滚；移除故障并由独立 database handles 并发重试后只提交一份结果及一个 job。另在 due provider retry 已进入消费流程后注入 job item 写入失败，确认 `automatic_retry_consumed`、job/item 和 completeness 状态全部回滚。due retry 候选查询也按 100 个 item 分片；205 项固定 fixture 的 query-wrapper 总数从未分片时的 11 次变为 13 次，其中 due retry 查询为 3 片。这是超出单片大小时有界查询的代价，不表示查询变快。该记录描述事务边界和固定回归，不代表 SQL 执行调用数下降、事务墙钟缩短或 PostgreSQL/FNOS/NAS CPU 收益。新 transaction 会连续持有同一 metadata write lock 完成最多 512 项工作；真实 contention 与时延仍需在 PostgreSQL/FNOS 负载下测量。LUX-421 的 9→7 query-wrapper 计数仍仅描述其原 completion 子路径，不是此合并路径的端到端 SQL 基准。

@@ -2488,6 +2488,311 @@ async fn progressive_scan_metadata_completeness_is_versioned_and_paged() {
 }
 
 #[tokio::test]
+async fn local_metadata_completeness_claim_result_and_enqueue_are_atomic() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Atomic Completeness (2025)");
+    tokio::fs::create_dir_all(&movie_dir)
+        .await
+        .expect("movie directory");
+    tokio::fs::write(movie_dir.join("Atomic.Completeness.2025.mkv"), b"video")
+        .await
+        .expect("movie file");
+
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Atomic completeness", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    libraries
+        .add_root(library.id, media_root.to_str().expect("media root"))
+        .await
+        .expect("library root");
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await
+        .expect("index movie");
+    let library_id = library.id.to_string();
+    let item_id = database
+        .query_scalar::<String>(
+            "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+        )
+        .bind(&library_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("movie item");
+    let results = [
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "POSTER",
+            input_fingerprint: b"atomic-completeness-v1",
+            is_missing: true,
+            checked_at: 1,
+        },
+        NewItemMetadataCompletenessResult {
+            item_id: &item_id,
+            capability: "METADATA",
+            input_fingerprint: b"atomic-completeness-v1",
+            is_missing: false,
+            checked_at: 1,
+        },
+    ];
+    let eligible_item_ids = [item_id.clone()];
+
+    sqlx::query(
+        "CREATE TRIGGER reject_atomic_fill_missing_item
+         BEFORE INSERT ON metadata_reidentify_job_items
+         WHEN EXISTS (
+             SELECT 1 FROM metadata_reidentify_jobs
+             WHERE id = NEW.job_id AND mode = 'FILL_MISSING'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'forced fill-missing enqueue failure');
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("install enqueue failure trigger");
+
+    assert!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library_id,
+                &results,
+                &eligible_item_ids,
+                MetadataAutoMatchPolicy::Enabled,
+            )
+            .await
+            .is_err(),
+        "enqueue failure should abort the combined transaction"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_metadata_completeness
+                 WHERE item_id = ?",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("count completeness rows after rollback"),
+        0,
+        "failed transaction must not leave a RUNNING or READY claim"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'",
+            )
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("count fill-missing jobs after rollback"),
+        0
+    );
+
+    sqlx::query("DROP TRIGGER reject_atomic_fill_missing_item")
+        .execute(database.pool())
+        .await
+        .expect("remove enqueue failure trigger");
+    let independent_database = Database::connect(&config)
+        .await
+        .expect("independent database handle");
+    let (retry_a, retry_b) = tokio::join!(
+        database.complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        ),
+        independent_database.complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        ),
+    );
+    let retry_a = retry_a.expect("first retry should commit");
+    let retry_b = retry_b.expect("duplicate retry should commit without changes");
+    assert_eq!(retry_a.updated_count + retry_b.updated_count, 2);
+    assert_eq!(
+        retry_a.scheduled_job_ids.len() + retry_b.scheduled_job_ids.len(),
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM item_metadata_completeness
+                 WHERE item_id = ? AND local_state = 'READY'",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read completed completeness states"),
+        2
+    );
+    let job_id = retry_a
+        .scheduled_job_ids
+        .first()
+        .or_else(|| retry_b.scheduled_job_ids.first())
+        .expect("one concurrent request schedules a job");
+    fail_fill_missing_job_with_unavailable_provider(&database, job_id, &item_id)
+        .await
+        .expect("mark the first job deferred for provider unavailability");
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET automatic_retry_after = unixepoch() - 1
+         WHERE job_id = ? AND item_id = ?",
+    )
+    .bind(job_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await
+    .expect("make the provider retry due");
+    let disabled_retry = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Disabled,
+        )
+        .await
+        .expect("disabled auto-match must preserve due retry without enqueueing");
+    assert_eq!(disabled_retry.updated_count, 0);
+    assert!(disabled_retry.scheduled_job_ids.is_empty());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(job_id)
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read retry state after disabled policy"),
+        0
+    );
+    sqlx::query(
+        "CREATE TRIGGER reject_atomic_fill_missing_retry_item
+         BEFORE INSERT ON metadata_reidentify_job_items
+         WHEN EXISTS (
+             SELECT 1 FROM metadata_reidentify_jobs
+             WHERE id = NEW.job_id AND mode = 'FILL_MISSING'
+         )
+         BEGIN
+             SELECT RAISE(ABORT, 'forced retried fill-missing enqueue failure');
+         END",
+    )
+    .execute(database.pool())
+    .await
+    .expect("install retry enqueue failure trigger");
+    assert!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library_id,
+                &results,
+                &eligible_item_ids,
+                MetadataAutoMatchPolicy::Enabled,
+            )
+            .await
+            .is_err(),
+        "retry enqueue failure should abort retry consumption"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(job_id)
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read retry state after rollback"),
+        0,
+        "failed retry enqueue must restore the deferred retry"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs
+                 WHERE library_id = ? AND mode = 'FILL_MISSING'",
+            )
+            .bind(&library_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("count jobs after retry rollback"),
+        1,
+        "failed retry enqueue must not leave a partial job"
+    );
+    sqlx::query("DROP TRIGGER reject_atomic_fill_missing_retry_item")
+        .execute(database.pool())
+        .await
+        .expect("remove retry enqueue failure trigger");
+    let enabled_retry = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        )
+        .await
+        .expect("enabled auto-match must schedule the due provider retry");
+    assert_eq!(enabled_retry.updated_count, 0);
+    assert_eq!(enabled_retry.scheduled_job_ids.len(), 1);
+    assert_ne!(enabled_retry.scheduled_job_ids[0], *job_id);
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT automatic_retry_consumed FROM metadata_reidentify_job_items
+                 WHERE job_id = ? AND item_id = ?",
+            )
+            .bind(job_id)
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await
+            .expect("read consumed retry state"),
+        1
+    );
+    sqlx::query(
+        "UPDATE metadata_reidentify_job_items
+         SET status = 'COMPLETED' WHERE job_id = ?",
+    )
+    .bind(&enabled_retry.scheduled_job_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("complete the retried fill-missing item");
+    sqlx::query(
+        "UPDATE metadata_reidentify_jobs
+         SET status = 'COMPLETED', processed_count = total_count WHERE id = ?",
+    )
+    .bind(&enabled_retry.scheduled_job_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("complete the retried fill-missing job");
+    let unchanged = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &eligible_item_ids,
+            MetadataAutoMatchPolicy::Enabled,
+        )
+        .await
+        .expect("unchanged ready completeness should be a no-op");
+    assert_eq!(unchanged.updated_count, 0);
+    assert!(unchanged.scheduled_job_ids.is_empty());
+    independent_database.close().await;
+    database.close().await;
+}
+
+#[tokio::test]
 async fn progressive_scan_metadata_completeness_batches_are_atomic_and_versioned() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
@@ -2853,6 +3158,65 @@ async fn metadata_completeness_results_use_bounded_update_batches() {
     assert_eq!(ready_count, RESULT_COUNT as i64);
     assert_eq!(missing_count, RESULT_COUNT.div_ceil(2) as i64);
 
+    database.close().await;
+}
+
+#[tokio::test]
+async fn local_metadata_due_retry_candidates_use_bounded_query_batches() {
+    const ITEM_COUNT: usize = 205;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Completeness retry batches", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let library_id = library.id.to_string();
+    let item_ids = (0..ITEM_COUNT)
+        .map(|index| format!("completeness-retry-item-{index:03}"))
+        .collect::<Vec<_>>();
+    for item_id in &item_ids {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let results = item_ids
+        .iter()
+        .map(|item_id| NewItemMetadataCompletenessResult {
+            item_id,
+            capability: "POSTER",
+            input_fingerprint: b"completeness-retry-batch-v1",
+            is_missing: false,
+            checked_at: 10,
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    let commit = database
+        .complete_local_metadata_completeness_batch_with_policy(
+            &library_id,
+            &results,
+            &item_ids,
+            MetadataAutoMatchPolicy::Disabled,
+        )
+        .await
+        .expect("complete a candidate page larger than one SQL chunk");
+
+    assert_eq!(commit.updated_count, ITEM_COUNT);
+    assert_eq!(database.query_count(), 13);
     database.close().await;
 }
 
@@ -5264,6 +5628,50 @@ async fn postgres_progressive_scan_metadata_storage_contract()
     let item_id = item_ids[0].clone();
     let replay_item_id = item_ids[1].clone();
 
+    let combined_fingerprint = b"postgres-combined-completeness-v1";
+    let combined_result = [NewItemMetadataCompletenessResult {
+        item_id: &item_id,
+        capability: "COMBINED_CHECK",
+        input_fingerprint: combined_fingerprint,
+        is_missing: false,
+        checked_at: 999,
+    }];
+    assert_eq!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library.id.to_string(),
+                &combined_result,
+                &[],
+                MetadataAutoMatchPolicy::Disabled,
+            )
+            .await?
+            .updated_count,
+        1
+    );
+    assert_eq!(
+        database
+            .complete_local_metadata_completeness_batch_with_policy(
+                &library.id.to_string(),
+                &combined_result,
+                &[],
+                MetadataAutoMatchPolicy::Disabled,
+            )
+            .await?
+            .updated_count,
+        0,
+        "the same PostgreSQL fingerprint should be complete only once"
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        0,
+        "a non-missing combined result must not create a fill-missing job"
+    );
+
     let completeness_fingerprint_v1 = b"postgres-batch-input-v1";
     let completeness_checks = [
         NewItemMetadataCompletenessCheck {
@@ -6194,6 +6602,10 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         is_missing: true,
         checked_at: 1_003,
     }];
+    let fill_missing_jobs_before_deduplicated: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'")
+        .fetch_one(database.pool())
+        .await?;
     let deduplicated = database
         .complete_local_metadata_and_enqueue_fill_missing(
             &library_id,
@@ -6203,14 +6615,13 @@ async fn postgres_progressive_scan_metadata_storage_contract()
         .await?;
     assert_eq!(deduplicated.updated_count, 1);
     assert!(deduplicated.scheduled_job_ids.is_empty());
+    let fill_missing_jobs_after_deduplicated: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'")
+        .fetch_one(database.pool())
+        .await?;
     assert_eq!(
-        database
-            .query_scalar::<i64>(
-                "SELECT COUNT(*) FROM metadata_reidentify_jobs WHERE mode = 'FILL_MISSING'",
-            )
-            .fetch_one(database.pool())
-            .await?,
-        3
+        fill_missing_jobs_after_deduplicated, fill_missing_jobs_before_deduplicated,
+        "a deduplicated completeness result must not create another job"
     );
 
     let pagination_root_path = temp_dir.path().join("Pagination Movies");

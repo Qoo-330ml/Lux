@@ -9200,6 +9200,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：隔离复跑确认旧断言稳定要求 `nfo_loaded = 1`，与当前语义 fingerprint 命中行为冲突；将回归改为要求 `nfo_loaded = 0`、`nfo_skipped = 1`，仍校验 snapshot 未变化。`cargo test --locked --test metadata` 20/20 通过，其中 changed-content 回归继续验证 NFO 会重新加载；fmt 与 `git diff --check` 通过。修正后 `cargo test --locked --all-targets --no-fail-fast` 的 library 测试为 781 passed、13 ignored；`metadata` 20/20 通过。全量门禁仍有 3 个已在父提交 `855d890a` 记录的独立失败：`emby_counts`（计数 1、期望 0）、`metadata_selection`（等待可选 actor enrichment 超时）、`strm`（401、期望 200）；本次没有修改这些测试文件或对应行为。只修正测试合同，没有改变生产代码。
 
+#### LUX-442：原子提交本地 completeness claim、结果与补缺调度
+
+范围：本地 metadata completeness worker 目前先以一个 storage transaction prepare/claim 一页 checks，再以一个或最多六个 transaction 写入 completeness 结果并创建或合并 `FILL_MISSING` job。由于本地检查计划已在进入 storage 前完成，claim 和结果提交之间没有耗时工作；把同一最多 512-check 批次的 prepare/claim、READY 结果写入、due provider retry 筛选及补缺调度放进同一个 metadata write transaction。保留输入 fingerprint、已 READY/RUNNING 去重、失败/取消重领、library/item 锁顺序、自动补缺策略和 job/item 去重语义。事务失败时整批回滚，不留下已提交的 RUNNING claim 或部分 job 状态；不改变 schema 或公共 API。
+
+验收：
+
+- [x] scanner 每个 completeness check batch 只调用一次合并 storage 操作；最多 512 个 check/result 与最多 512 个候选可在同一事务内处理，due retry 筛选与 FILL_MISSING SQL 均按最多 100 个 item 分片，不重复写入结果。
+- [x] 同 fingerprint 的 READY/RUNNING 不重领；变化 fingerprint 与可重试 FAILED/CANCELLED 可完成一次检查；due provider-unavailable retry、不可用 scraper 退避和 library 自动策略与当前行为一致。
+- [x] 注入 enqueue SQL 失败时，原子事务不遗留 RUNNING/READY 部分结果或 metadata job/item；在到期 retry 已进入消费流程后再注入失败，也会回滚 retry 消费和 job/item 变更；移除故障后同一输入可以成功重试且只创建有效 job。
+- [x] 覆盖多个 capability、已 READY missing、due retry、自动策略关闭、独立数据库连接并发重复提交和 205 项分页；SQLite/PostgreSQL storage 合同、build、fmt、Clippy、`git diff --check` 通过。
+- [x] 性能记录按事务路径说明每个批次由 2–7 个 metadata write transactions 降至 1 个；不将事务数推断为 SQL 时延、PostgreSQL/NAS/FNOS 吞吐或 CPU 收益。
+
+预计文件：`src/storage/metadata.rs`、`src/application/scanner.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加故障注入回归，再合并 storage 事务并切换 scanner 调用，最后更新事务边界记录。
+
+结果（2026-10-08）：扫描 worker 每页改为一次 combined storage 调用，在同一 metadata write transaction 内 claim、写 READY 结果、筛选 due retry 和调度补缺；due retry 候选也按 100 项分片。205 项 SQLite 回归确认查询包装器计数从未分片时的 11 次变为 13 次（due retry 查询为 3 片），明确记录这是大页的有界查询代价。故障注入覆盖新 job item 插入失败和 due retry 消费后插入失败，两者均整体回滚；并发回归使用独立 SQLite database handles。`metadata_completeness` 定向测试 8/8、原子提交测试、205 项分页测试和 PostgreSQL `postgres_progressive_scan_metadata_storage_contract` 通过；`cargo build --locked`、fmt、全目标全 feature Clippy 通过。`cargo test --locked --all-targets --no-fail-fast` 的 library 为 780 passed、13 ignored；全量集成仅有三个已在父提交 `855d890a` 记录的独立失败：`emby_counts`（实际 1、期望 0）、`metadata_selection`（可选 actor enrichment 等待超时）、`strm`（401、期望 200）；本轮 `watch` 5/5 通过。`git diff --check` 通过。本机 `arm64`；没有运行 FNOS/NAS 性能验证，也不推断 PostgreSQL 时延、吞吐或 CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

@@ -7,6 +7,7 @@ use std::collections::BTreeSet;
 
 const MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH: usize = 64;
 const MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES: usize = 256;
+#[cfg(test)]
 const MAX_ITEM_METADATA_COMPLETENESS_ERROR_BYTES: usize = 4096;
 #[allow(dead_code)] // The test-only confirmed-missing listing API enforces this bound.
 const MAX_ITEM_METADATA_COMPLETENESS_PAGE_SIZE: i64 = 100;
@@ -100,6 +101,38 @@ impl Database {
             .collect::<Vec<_>>();
         self.lock_media_items_for_update(&mut transaction, &item_ids)
             .await?;
+        let claimed_indices = self
+            .claim_local_metadata_completeness_checks_in_transaction(&mut transaction, checks)
+            .await?;
+        let mut candidate_ids = unique_retry_candidates.into_iter().collect::<Vec<_>>();
+        candidate_ids.sort_unstable();
+        if !candidate_ids.is_empty() && library_id.trim().is_empty() {
+            return Err(StorageError::Conflict(
+                "metadata fill-missing retry lookup requires a library".into(),
+            ));
+        }
+        let due_fill_missing_retry_item_ids = self
+            .list_due_local_metadata_fill_missing_retries_in_transaction(
+                &mut transaction,
+                library_id,
+                &candidate_ids,
+            )
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((claimed_indices, due_fill_missing_retry_item_ids))
+    }
+
+    async fn claim_local_metadata_completeness_checks_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        checks: &[NewItemMetadataCompletenessCheck<'_>],
+    ) -> Result<Vec<usize>, StorageError> {
         let mut claimed_indices = Vec::with_capacity(checks.len());
         for (batch_index, batch) in checks
             .chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE)
@@ -132,7 +165,7 @@ impl Database {
                     .bind(check.input_fingerprint.to_vec());
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -164,7 +197,7 @@ impl Database {
                     .bind(check.input_fingerprint.to_vec());
             }
             let claimed_keys = claim_statement
-                .fetch_all(&mut *transaction)
+                .fetch_all(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -187,15 +220,21 @@ impl Database {
                 }
             }
         }
-        let mut due_fill_missing_retry_item_ids = Vec::new();
-        if !unique_retry_candidates.is_empty() {
-            if library_id.trim().is_empty() {
-                return Err(StorageError::Conflict(
-                    "metadata fill-missing retry lookup requires a library".into(),
-                ));
-            }
-            let candidate_ids = unique_retry_candidates.into_iter().collect::<Vec<_>>();
-            let requested_values = std::iter::repeat_n("(?)", candidate_ids.len())
+        Ok(claimed_indices)
+    }
+
+    async fn list_due_local_metadata_fill_missing_retries_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        candidate_ids: &[String],
+    ) -> Result<Vec<String>, StorageError> {
+        if candidate_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut due_item_ids = Vec::new();
+        for batch in candidate_ids.chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE) {
+            let requested_values = std::iter::repeat_n("(?)", batch.len())
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
@@ -227,22 +266,252 @@ impl Database {
                  ORDER BY requested.item_id"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for item_id in &candidate_ids {
+            for item_id in batch {
                 statement = statement.bind(item_id);
             }
-            due_fill_missing_retry_item_ids = statement
-                .bind(library_id)
-                .bind(library_id)
-                .fetch_all(&mut *transaction)
+            statement = statement.bind(library_id).bind(library_id);
+            let rows = statement
+                .fetch_all(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
-                })?
-                .into_iter()
-                .map(|row| row.get::<String, _>("item_id"))
-                .collect();
+                })?;
+            due_item_ids.extend(rows.into_iter().map(|row| row.get::<String, _>("item_id")));
         }
+        due_item_ids.sort_unstable();
+        due_item_ids.dedup();
+        Ok(due_item_ids)
+    }
+
+    async fn complete_local_metadata_results_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        results: &[NewItemMetadataCompletenessResult<'_>],
+        eligible_fill_missing_item_ids: &[String],
+        auto_match_policy: MetadataAutoMatchPolicy,
+    ) -> Result<ItemMetadataCompletenessCommit, StorageError> {
+        let mut commit = ItemMetadataCompletenessCommit::default();
+        for batch in results.chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?)", batch.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "WITH requested(item_id, capability, input_fingerprint, is_missing, checked_at) AS (VALUES {values})
+                 UPDATE item_metadata_completeness
+                 SET local_state = 'READY',
+                     is_missing = (
+                         SELECT requested.is_missing FROM requested
+                         WHERE requested.item_id = item_metadata_completeness.item_id
+                           AND requested.capability = item_metadata_completeness.capability
+                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                     ),
+                     checked_at = (
+                         SELECT requested.checked_at FROM requested
+                         WHERE requested.item_id = item_metadata_completeness.item_id
+                           AND requested.capability = item_metadata_completeness.capability
+                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                     ),
+                     retry_after = NULL, error = NULL, updated_at = unixepoch()
+                 WHERE local_state = 'RUNNING'
+                   AND EXISTS (
+                       SELECT 1 FROM requested
+                       WHERE requested.item_id = item_metadata_completeness.item_id
+                         AND requested.capability = item_metadata_completeness.capability
+                         AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM media_items
+                       WHERE id = item_metadata_completeness.item_id
+                         AND library_id = ? AND removed_at IS NULL
+                   )
+                 RETURNING item_id, is_missing"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for result in batch {
+                statement = statement
+                    .bind(result.item_id)
+                    .bind(result.capability.trim())
+                    .bind(result.input_fingerprint.to_vec())
+                    .bind(database_flag(result.is_missing))
+                    .bind(result.checked_at);
+            }
+            let rows = statement
+                .bind(library_id)
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            commit.updated_count = commit.updated_count.saturating_add(rows.len());
+        }
+
+        if !eligible_fill_missing_item_ids.is_empty() {
+            let auto_match_enabled = match auto_match_policy {
+                MetadataAutoMatchPolicy::Enabled => true,
+                MetadataAutoMatchPolicy::Disabled => false,
+                MetadataAutoMatchPolicy::UseLibrarySetting => {
+                    self.query_scalar::<i64>(
+                        "SELECT scan_missing_metadata_auto_match_enabled
+                         FROM libraries WHERE id = ?",
+                    )
+                    .bind(library_id)
+                    .fetch_one(&mut **transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })? != 0
+                }
+            };
+            if auto_match_enabled {
+                let requests = self
+                    .build_metadata_fill_missing_requests(
+                        transaction,
+                        library_id,
+                        eligible_fill_missing_item_ids,
+                        results,
+                    )
+                    .await?;
+                commit.scheduled_job_ids = self
+                    .enqueue_or_update_fill_missing_requests_in_transaction(
+                        transaction,
+                        library_id,
+                        &requests,
+                    )
+                    .await?;
+            }
+        }
+        Ok(commit)
+    }
+
+    pub(crate) async fn complete_local_metadata_completeness_batch_with_policy(
+        &self,
+        library_id: &str,
+        results: &[NewItemMetadataCompletenessResult<'_>],
+        fill_missing_candidate_item_ids: &[String],
+        auto_match_policy: MetadataAutoMatchPolicy,
+    ) -> Result<ItemMetadataCompletenessCommit, StorageError> {
+        if library_id.trim().is_empty()
+            || results.len() > MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE
+            || fill_missing_candidate_item_ids.len()
+                > MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE
+        {
+            return Err(StorageError::Conflict(
+                "invalid local metadata completeness batch".into(),
+            ));
+        }
+        let mut unique_results = HashSet::with_capacity(results.len());
+        let mut result_item_ids = HashSet::with_capacity(results.len());
+        let mut checks = Vec::with_capacity(results.len());
+        for result in results {
+            validate_item_metadata_completeness_key(
+                result.item_id,
+                result.capability,
+                result.input_fingerprint,
+            )?;
+            if !unique_results.insert((result.item_id, result.capability.trim())) {
+                return Err(StorageError::Conflict(
+                    "metadata completeness result contains a duplicate item capability".into(),
+                ));
+            }
+            result_item_ids.insert(result.item_id);
+            checks.push(NewItemMetadataCompletenessCheck {
+                item_id: result.item_id,
+                capability: result.capability,
+                input_fingerprint: result.input_fingerprint,
+            });
+        }
+        let mut unique_candidates = HashSet::with_capacity(fill_missing_candidate_item_ids.len());
+        for item_id in fill_missing_candidate_item_ids {
+            if item_id.trim().is_empty() || !result_item_ids.contains(item_id.as_str()) {
+                return Err(StorageError::Conflict(
+                    "fill-missing candidates must belong to the completeness batch".into(),
+                ));
+            }
+            unique_candidates.insert(item_id.clone());
+        }
+        if checks.is_empty() {
+            return Ok(ItemMetadataCompletenessCommit::default());
+        }
+        let mut candidate_ids = unique_candidates.into_iter().collect::<Vec<_>>();
+        candidate_ids.sort_unstable();
+
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let library_exists = if self.backend == crate::config::DatabaseBackend::Postgres {
+            self.query_scalar::<String>("SELECT id FROM libraries WHERE id = ? FOR UPDATE")
+                .bind(library_id)
+                .fetch_optional(&mut *transaction)
+                .await
+        } else {
+            self.query_scalar::<String>("SELECT id FROM libraries WHERE id = ?")
+                .bind(library_id)
+                .fetch_optional(&mut *transaction)
+                .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        if library_exists.is_none() {
+            return Err(StorageError::Conflict(
+                "metadata completeness library was not found".into(),
+            ));
+        }
+        let lock_ids = checks
+            .iter()
+            .map(|check| check.item_id.to_owned())
+            .chain(candidate_ids.iter().cloned())
+            .collect::<Vec<_>>();
+        self.lock_media_items_for_update(&mut transaction, &lock_ids)
+            .await?;
+
+        let claimed_indices = self
+            .claim_local_metadata_completeness_checks_in_transaction(&mut transaction, &checks)
+            .await?;
+        let due_retry_item_ids = self
+            .list_due_local_metadata_fill_missing_retries_in_transaction(
+                &mut transaction,
+                library_id,
+                &candidate_ids,
+            )
+            .await?;
+        let candidate_set = candidate_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        let mut eligible_item_ids = due_retry_item_ids;
+        let claimed_results = claimed_indices
+            .iter()
+            .map(|index| {
+                let result = &results[*index];
+                if result.is_missing && candidate_set.contains(result.item_id) {
+                    eligible_item_ids.push(result.item_id.to_owned());
+                }
+                NewItemMetadataCompletenessResult {
+                    item_id: result.item_id,
+                    capability: result.capability,
+                    input_fingerprint: result.input_fingerprint,
+                    is_missing: result.is_missing,
+                    checked_at: result.checked_at,
+                }
+            })
+            .collect::<Vec<_>>();
+        eligible_item_ids.sort_unstable();
+        eligible_item_ids.dedup();
+
+        let commit = self
+            .complete_local_metadata_results_in_transaction(
+                &mut transaction,
+                library_id,
+                &claimed_results,
+                &eligible_item_ids,
+                auto_match_policy,
+            )
+            .await?;
         transaction
             .commit()
             .await
@@ -250,7 +519,7 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok((claimed_indices, due_fill_missing_retry_item_ids))
+        Ok(commit)
     }
 
     #[allow(dead_code)] // Storage tests cover atomic completion and enqueue semantics.
@@ -345,96 +614,15 @@ impl Database {
         self.lock_media_items_for_update(&mut transaction, &lock_ids)
             .await?;
 
-        let mut commit = ItemMetadataCompletenessCommit::default();
-        for batch in results.chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE) {
-            let values = std::iter::repeat_n("(?, ?, ?, ?, ?)", batch.len())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let query = format!(
-                "WITH requested(item_id, capability, input_fingerprint, is_missing, checked_at) AS (VALUES {values})
-                 UPDATE item_metadata_completeness
-                 SET local_state = 'READY',
-                     is_missing = (
-                         SELECT requested.is_missing FROM requested
-                         WHERE requested.item_id = item_metadata_completeness.item_id
-                           AND requested.capability = item_metadata_completeness.capability
-                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
-                     ),
-                     checked_at = (
-                         SELECT requested.checked_at FROM requested
-                         WHERE requested.item_id = item_metadata_completeness.item_id
-                           AND requested.capability = item_metadata_completeness.capability
-                           AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
-                     ),
-                     retry_after = NULL, error = NULL, updated_at = unixepoch()
-                 WHERE local_state = 'RUNNING'
-                   AND EXISTS (
-                       SELECT 1 FROM requested
-                       WHERE requested.item_id = item_metadata_completeness.item_id
-                         AND requested.capability = item_metadata_completeness.capability
-                         AND requested.input_fingerprint = item_metadata_completeness.input_fingerprint
-                   )
-                   AND EXISTS (
-                       SELECT 1 FROM media_items
-                       WHERE id = item_metadata_completeness.item_id
-                         AND library_id = ? AND removed_at IS NULL
-                   )
-                 RETURNING item_id, is_missing"
-            );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
-            for result in batch {
-                statement = statement
-                    .bind(result.item_id)
-                    .bind(result.capability.trim())
-                    .bind(result.input_fingerprint.to_vec())
-                    .bind(database_flag(result.is_missing))
-                    .bind(result.checked_at);
-            }
-            let rows = statement
-                .bind(library_id)
-                .fetch_all(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            commit.updated_count = commit.updated_count.saturating_add(rows.len());
-        }
-
-        let auto_match_enabled = match auto_match_policy {
-            MetadataAutoMatchPolicy::Enabled => true,
-            MetadataAutoMatchPolicy::Disabled => false,
-            MetadataAutoMatchPolicy::UseLibrarySetting => {
-                self.query_scalar::<i64>(
-                    "SELECT scan_missing_metadata_auto_match_enabled
-                     FROM libraries WHERE id = ?",
-                )
-                .bind(library_id)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })? != 0
-            }
-        };
-        if auto_match_enabled && !eligible_ids.is_empty() {
-            let requests = self
-                .build_metadata_fill_missing_requests(
-                    &mut transaction,
-                    library_id,
-                    &eligible_ids,
-                    results,
-                )
-                .await?;
-            commit.scheduled_job_ids = self
-                .enqueue_or_update_fill_missing_requests_in_transaction(
-                    &mut transaction,
-                    library_id,
-                    &requests,
-                )
-                .await?;
-        }
+        let commit = self
+            .complete_local_metadata_results_in_transaction(
+                &mut transaction,
+                library_id,
+                results,
+                &eligible_ids,
+                auto_match_policy,
+            )
+            .await?;
 
         transaction
             .commit()
@@ -678,6 +866,7 @@ impl Database {
         Ok(changed.is_some())
     }
 
+    #[cfg(test)]
     pub(crate) async fn fail_item_metadata_completeness_check(
         &self,
         item_id: &str,

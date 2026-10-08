@@ -52,14 +52,13 @@ use crate::{
         Database, FilesystemEntryMove, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE,
         ManifestDeltaBatchCommit, ManifestDiscoveryCommitResult, ManifestPostprocessingTargetPage,
         MetadataAutoMatchPolicy, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem,
-        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMediaItem,
-        NewMediaSource, NewMovieFile, NewScanManifest, NewScanManifestDelta,
-        NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestIndexedFile,
-        NewScanManifestPositiveIndex, NewScanManifestRoot, NewScanManifestSeenFilesystemEntry,
-        NewScanManifestUnresolvedFile, ReconciliationBatchCommit, StorageError,
-        StoredEpisodeIdentityCandidate, StoredFilesystemEntry, StoredLibraryRoot,
-        StoredReconciliationScanEntry, StoredScanJob, StoredScanJobPath,
-        StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
+        NewItemMetadataCompletenessResult, NewMediaItem, NewMediaSource, NewMovieFile,
+        NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
+        NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
+        NewScanManifestSeenFilesystemEntry, NewScanManifestUnresolvedFile,
+        ReconciliationBatchCommit, StorageError, StoredEpisodeIdentityCandidate,
+        StoredFilesystemEntry, StoredLibraryRoot, StoredReconciliationScanEntry, StoredScanJob,
+        StoredScanJobPath, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
         StoredScanLocalMetadataSource, is_lite_manifest_discovery, movie_parent_folder_identity,
     },
 };
@@ -3416,67 +3415,6 @@ async fn resolve_local_metadata_auto_match_policy(
 
 type PendingLocalMetadataCompletenessCheck = (String, String, Vec<u8>, bool, bool);
 
-const METADATA_FILL_MISSING_AUTO_BATCH_LIMIT: usize = 100;
-
-fn local_metadata_completeness_commit_batches<'a>(
-    results: &[NewItemMetadataCompletenessResult<'a>],
-    eligible_item_ids: &[String],
-) -> Vec<(Vec<NewItemMetadataCompletenessResult<'a>>, Vec<String>)> {
-    if results.is_empty() && eligible_item_ids.is_empty() {
-        return Vec::new();
-    }
-
-    let eligible_chunks = eligible_item_ids
-        .chunks(METADATA_FILL_MISSING_AUTO_BATCH_LIMIT)
-        .map(<[String]>::to_vec)
-        .collect::<Vec<_>>();
-    let batch_count = eligible_chunks.len().max(1);
-    let mut batches = (0..batch_count)
-        .map(|index| {
-            (
-                Vec::new(),
-                eligible_chunks.get(index).cloned().unwrap_or_default(),
-            )
-        })
-        .collect::<Vec<_>>();
-    let mut batch_by_item_id = HashMap::with_capacity(eligible_item_ids.len());
-    for (batch_index, item_ids) in eligible_chunks.iter().enumerate() {
-        for item_id in item_ids {
-            batch_by_item_id.insert(item_id.as_str(), batch_index);
-        }
-    }
-
-    for result in results {
-        let batch_index = batch_by_item_id.get(result.item_id).copied().unwrap_or(0);
-        batches[batch_index]
-            .0
-            .push(NewItemMetadataCompletenessResult {
-                item_id: result.item_id,
-                capability: result.capability,
-                input_fingerprint: result.input_fingerprint,
-                is_missing: result.is_missing,
-                checked_at: result.checked_at,
-            });
-    }
-
-    batches
-}
-
-fn newly_confirmed_fill_missing_item_ids(
-    checks: &[PendingLocalMetadataCompletenessCheck],
-    claimed_indices: &[usize],
-) -> Vec<String> {
-    let mut item_ids = claimed_indices
-        .iter()
-        .filter_map(|index| checks.get(*index))
-        .filter(|(_, _, _, is_missing, eligible)| *is_missing && *eligible)
-        .map(|(item_id, _, _, _, _)| item_id.clone())
-        .collect::<Vec<_>>();
-    item_ids.sort_unstable();
-    item_ids.dedup();
-    item_ids
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ScraperAvailabilityPreflight {
     Available,
@@ -3653,44 +3591,9 @@ async fn complete_local_metadata_completeness_for_item_ids(
     let mut scheduled_job_ids = Vec::new();
     for (library_id, checks) in checks_by_library {
         for check_batch in checks.chunks(SCAN_LOCAL_METADATA_COMPLETENESS_CHECK_BATCH_SIZE) {
-            let requests = check_batch
+            let results = check_batch
                 .iter()
-                .map(
-                    |(item_id, capability, fingerprint, _, _)| NewItemMetadataCompletenessCheck {
-                        item_id,
-                        capability,
-                        input_fingerprint: fingerprint,
-                    },
-                )
-                .collect::<Vec<_>>();
-            let mut due_retry_candidates = check_batch
-                .iter()
-                .filter(|(_, _, _, is_missing, eligible)| *is_missing && *eligible)
-                .map(|(item_id, _, _, _, _)| item_id.clone())
-                .collect::<Vec<_>>();
-            due_retry_candidates.sort_unstable();
-            due_retry_candidates.dedup();
-            let (claimed_indices, due_retry_item_ids) = database
-                .prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
-                    &requests,
-                    &library_id,
-                    &due_retry_candidates,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut metadata_fill_missing =
-                newly_confirmed_fill_missing_item_ids(check_batch, &claimed_indices);
-            metadata_fill_missing.extend(due_retry_item_ids);
-            metadata_fill_missing.sort_unstable();
-            metadata_fill_missing.dedup();
-            if claimed_indices.is_empty() && metadata_fill_missing.is_empty() {
-                continue;
-            }
-            let results = claimed_indices
-                .iter()
-                .map(|index| {
-                    let (item_id, capability, input_fingerprint, is_missing, _) =
-                        &check_batch[*index];
+                .map(|(item_id, capability, input_fingerprint, is_missing, _)| {
                     NewItemMetadataCompletenessResult {
                         item_id,
                         capability,
@@ -3700,46 +3603,28 @@ async fn complete_local_metadata_completeness_for_item_ids(
                     }
                 })
                 .collect::<Vec<_>>();
-            let commit_batches =
-                local_metadata_completeness_commit_batches(&results, &metadata_fill_missing);
-            for (batch_results, eligible_chunk) in commit_batches {
-                let completion = database
-                    .complete_local_metadata_and_enqueue_fill_missing_with_policy(
-                        &library_id,
-                        &batch_results,
-                        &eligible_chunk,
-                        auto_match_policy,
-                    )
-                    .await;
-                let completion = match completion {
-                    Ok(completion) => completion,
-                    Err(error) => {
-                        for index in &claimed_indices {
-                            let (item_id, capability, input_fingerprint, _, _) =
-                                &check_batch[*index];
-                            if let Err(fail_error) = database
-                                .fail_item_metadata_completeness_check(
-                                    item_id,
-                                    capability,
-                                    input_fingerprint,
-                                    None,
-                                    "local completeness result could not be persisted",
-                                )
-                                .await
-                            {
-                                tracing::warn!(%fail_error, "failed to release a local completeness claim");
-                            }
-                        }
-                        return Err(error.to_string());
-                    }
-                };
-                scheduled_job_ids.extend(
-                    completion
-                        .scheduled_job_ids
-                        .into_iter()
-                        .map(|job_id| (library_id.clone(), job_id)),
-                );
-            }
+            let mut fill_missing_candidate_item_ids = check_batch
+                .iter()
+                .filter(|(_, _, _, is_missing, eligible)| *is_missing && *eligible)
+                .map(|(item_id, _, _, _, _)| item_id.clone())
+                .collect::<Vec<_>>();
+            fill_missing_candidate_item_ids.sort_unstable();
+            fill_missing_candidate_item_ids.dedup();
+            let completion = database
+                .complete_local_metadata_completeness_batch_with_policy(
+                    &library_id,
+                    &results,
+                    &fill_missing_candidate_item_ids,
+                    auto_match_policy,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            scheduled_job_ids.extend(
+                completion
+                    .scheduled_job_ids
+                    .into_iter()
+                    .map(|job_id| (library_id.clone(), job_id)),
+            );
         }
     }
     if let Some(metadata_reidentify) = metadata_reidentify.cloned()
@@ -12417,10 +12302,10 @@ mod tests {
         infer_sibling_movie_variant_suffix, infer_sibling_movie_variant_suffix_with_probe,
         is_lite_manifest_discovery, manifest_file_observation_matches,
         manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
-        metadata_auto_match_policy_for_scan_job, newly_confirmed_fill_missing_item_ids,
-        normalize_incremental_path, notify_local_metadata_images_waiter, parse_episode_filename,
-        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
-        read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
+        metadata_auto_match_policy_for_scan_job, normalize_incremental_path,
+        notify_local_metadata_images_waiter, parse_episode_filename, parse_movie_filename,
+        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
+        resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
         scan_lock_database_wait_backoff, stat_manifest_directory_file_batch_sync,
         stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
@@ -12430,182 +12315,13 @@ mod tests {
         ScraperMetadata, ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest,
         ScraperSearchResponse, ScraperTrailersResponse,
     };
-    use crate::storage::{
-        MetadataAutoMatchPolicy, NewItemMetadataCompletenessResult, StoredScanJob,
-    };
+    use crate::storage::{MetadataAutoMatchPolicy, StoredScanJob};
     use tokio::sync::{Notify, Semaphore};
 
     #[derive(Clone)]
     struct GateSearchScraper {
         search_started: Arc<Notify>,
         release_search: Arc<Semaphore>,
-    }
-
-    fn assert_local_metadata_results_are_partitioned_once(
-        batches: &[(Vec<NewItemMetadataCompletenessResult<'_>>, Vec<String>)],
-        results: &[NewItemMetadataCompletenessResult<'_>],
-        eligible_item_ids: &[String],
-    ) {
-        let committed_result_count = batches
-            .iter()
-            .map(|(batch_results, _)| batch_results.len())
-            .sum::<usize>();
-        assert_eq!(committed_result_count, results.len());
-
-        let mut scheduled_item_occurrences = HashMap::<&str, usize>::new();
-        for (_, item_ids) in batches {
-            for item_id in item_ids {
-                *scheduled_item_occurrences
-                    .entry(item_id.as_str())
-                    .or_default() += 1;
-            }
-        }
-        assert_eq!(scheduled_item_occurrences.len(), eligible_item_ids.len());
-        assert!(
-            eligible_item_ids
-                .iter()
-                .all(|item_id| { scheduled_item_occurrences.get(item_id.as_str()) == Some(&1) })
-        );
-
-        let mut result_occurrences = HashMap::<(&str, &str), usize>::new();
-        for (batch_results, _) in batches {
-            for result in batch_results {
-                *result_occurrences
-                    .entry((result.item_id, result.capability))
-                    .or_default() += 1;
-            }
-        }
-        assert!(result_occurrences.values().all(|count| *count == 1));
-    }
-
-    #[test]
-    fn local_metadata_completeness_commit_batches_write_512_results_once() {
-        let eligible_item_ids = (0..256)
-            .map(|index| format!("item-{index:03}"))
-            .collect::<Vec<_>>();
-        let input_fingerprint = b"local-completeness-input-v1";
-        let results = eligible_item_ids
-            .iter()
-            .flat_map(|item_id| {
-                ["POSTER", "METADATA"].map(|capability| NewItemMetadataCompletenessResult {
-                    item_id,
-                    capability,
-                    input_fingerprint,
-                    is_missing: true,
-                    checked_at: 1,
-                })
-            })
-            .collect::<Vec<_>>();
-        let batches =
-            super::local_metadata_completeness_commit_batches(&results, &eligible_item_ids);
-
-        assert_eq!(batches.len(), 3);
-        assert_eq!(
-            batches
-                .iter()
-                .map(|(_, item_ids)| item_ids.len())
-                .collect::<Vec<_>>(),
-            [100, 100, 56]
-        );
-        assert!(batches.iter().all(|(_, item_ids)| item_ids.len() <= 100));
-        assert_eq!(results.len(), 512);
-        assert_local_metadata_results_are_partitioned_once(&batches, &results, &eligible_item_ids);
-        assert_eq!(results.len() * batches.len(), 1_536);
-    }
-
-    #[test]
-    fn local_metadata_completeness_commit_batches_keep_ready_and_ineligible_results() {
-        let mut eligible_item_ids = (0..201)
-            .map(|index| format!("item-{index:03}"))
-            .collect::<Vec<_>>();
-        let previously_ready_missing_item_id = "ready-without-new-claim".to_owned();
-        eligible_item_ids.push(previously_ready_missing_item_id.clone());
-        let input_fingerprint = b"local-completeness-input-v1";
-        let mut results = eligible_item_ids[..100]
-            .iter()
-            .chain(eligible_item_ids[200..201].iter())
-            .flat_map(|item_id| {
-                ["POSTER", "METADATA"].map(|capability| NewItemMetadataCompletenessResult {
-                    item_id,
-                    capability,
-                    input_fingerprint,
-                    is_missing: true,
-                    checked_at: 1,
-                })
-            })
-            .collect::<Vec<_>>();
-        results.push(NewItemMetadataCompletenessResult {
-            item_id: "not-eligible",
-            capability: "METADATA",
-            input_fingerprint,
-            is_missing: true,
-            checked_at: 1,
-        });
-
-        let batches =
-            super::local_metadata_completeness_commit_batches(&results, &eligible_item_ids);
-
-        assert_eq!(batches.len(), 3);
-        assert_eq!(
-            batches
-                .iter()
-                .map(|(_, item_ids)| item_ids.len())
-                .collect::<Vec<_>>(),
-            [100, 100, 2]
-        );
-        assert!(batches[1].0.is_empty());
-        assert!(batches[2].1.contains(&previously_ready_missing_item_id));
-        assert!(
-            !batches[2]
-                .0
-                .iter()
-                .any(|result| result.item_id == previously_ready_missing_item_id)
-        );
-        assert!(
-            batches[0]
-                .0
-                .iter()
-                .any(|result| result.item_id == "not-eligible")
-        );
-        assert_local_metadata_results_are_partitioned_once(&batches, &results, &eligible_item_ids);
-
-        let result_only_batches =
-            super::local_metadata_completeness_commit_batches(&results[results.len() - 1..], &[]);
-        assert_eq!(result_only_batches.len(), 1);
-        assert_eq!(result_only_batches[0].0.len(), 1);
-        assert!(result_only_batches[0].1.is_empty());
-    }
-
-    #[test]
-    fn fill_missing_dispatch_only_uses_newly_claimed_missing_items() {
-        let checks = vec![
-            (
-                "new-missing".to_owned(),
-                "POSTER".to_owned(),
-                vec![1],
-                true,
-                true,
-            ),
-            (
-                "already-ready-missing".to_owned(),
-                "POSTER".to_owned(),
-                vec![2],
-                true,
-                true,
-            ),
-            (
-                "new-complete".to_owned(),
-                "POSTER".to_owned(),
-                vec![3],
-                false,
-                true,
-            ),
-        ];
-        assert_eq!(
-            newly_confirmed_fill_missing_item_ids(&checks, &[0]),
-            vec!["new-missing".to_owned()]
-        );
-        assert!(newly_confirmed_fill_missing_item_ids(&checks, &[]).is_empty());
     }
 
     #[test]
