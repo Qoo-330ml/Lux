@@ -3446,6 +3446,12 @@ pub(crate) struct MediaMetadataUpdate<'a> {
     pub(crate) locked_fields_json: &'a str,
 }
 
+pub(crate) struct LocalNfoDefaultsRepair<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) provider_ids: &'a BTreeMap<String, String>,
+    pub(crate) premiere_date: Option<&'a str>,
+}
+
 pub(crate) struct ExternalSubtitleUpdate<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) media_source_id: &'a str,

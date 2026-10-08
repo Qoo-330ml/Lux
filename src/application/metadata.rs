@@ -27,9 +27,10 @@ use crate::{
     domain::ids::LibraryId,
     observability::resources::ResourceMetrics,
     storage::{
-        Database, ItemImageBatchInsert, ItemImageInsert, MediaMetadataUpdate, StorageError,
-        StoredItemImage, StoredMediaMetadata, StoredMediaSourcePath, StoredScanJobMetadataPage,
-        StoredScanJobMetadataSources, StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
+        Database, ItemImageBatchInsert, ItemImageInsert, LocalNfoDefaultsRepair,
+        MediaMetadataUpdate, StorageError, StoredItemImage, StoredMediaMetadata,
+        StoredMediaSourcePath, StoredScanJobMetadataPage, StoredScanJobMetadataSources,
+        StoredScanLocalMetadataSource, StoredSeriesMetadataSource,
     },
 };
 
@@ -780,7 +781,8 @@ struct DeferredLocalNfoMetadataUpdates {
 #[derive(Default)]
 struct DeferredLocalNfoMetadataState {
     pending: Vec<DeferredLocalNfoMetadataUpdate>,
-    failed_updates: Vec<(String, String)>,
+    pending_default_repairs: Vec<DeferredLocalNfoDefaultsRepair>,
+    failed_updates: Vec<DeferredLocalNfoMetadataFailure>,
 }
 
 #[derive(Clone)]
@@ -797,6 +799,47 @@ struct DeferredLocalNfoMetadataUpdate {
     metadata_fingerprint: Vec<u8>,
     provenance_json: String,
     locked_fields_json: String,
+}
+
+#[derive(Clone)]
+struct DeferredLocalNfoDefaultsRepair {
+    item_id: String,
+    provider_ids: BTreeMap<String, String>,
+    premiere_date: Option<String>,
+}
+
+impl DeferredLocalNfoDefaultsRepair {
+    fn new(
+        item_id: &str,
+        provider_ids: &BTreeMap<String, String>,
+        premiere_date: Option<&str>,
+    ) -> Self {
+        Self {
+            item_id: item_id.to_owned(),
+            provider_ids: provider_ids.clone(),
+            premiere_date: premiere_date.map(str::to_owned),
+        }
+    }
+
+    fn as_repair(&self) -> LocalNfoDefaultsRepair<'_> {
+        LocalNfoDefaultsRepair {
+            item_id: &self.item_id,
+            provider_ids: &self.provider_ids,
+            premiere_date: self.premiere_date.as_deref(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DeferredLocalNfoFailureStage {
+    Loaded,
+    Skipped,
+}
+
+struct DeferredLocalNfoMetadataFailure {
+    item_id: String,
+    error: String,
+    stage: DeferredLocalNfoFailureStage,
 }
 
 impl DeferredLocalNfoMetadataUpdate {
@@ -848,19 +891,50 @@ impl DeferredLocalNfoMetadataUpdates {
         std::mem::take(&mut self.state.lock().await.pending)
     }
 
-    async fn has_pending(&self) -> bool {
-        !self.state.lock().await.pending.is_empty()
+    async fn push_default_repair(
+        &self,
+        item_id: &str,
+        provider_ids: &BTreeMap<String, String>,
+        premiere_date: Option<&str>,
+    ) {
+        self.state
+            .lock()
+            .await
+            .pending_default_repairs
+            .push(DeferredLocalNfoDefaultsRepair::new(
+                item_id,
+                provider_ids,
+                premiere_date,
+            ));
     }
 
-    async fn record_failure(&self, item_id: String, error: String) {
+    async fn take_default_repairs(&self) -> Vec<DeferredLocalNfoDefaultsRepair> {
+        std::mem::take(&mut self.state.lock().await.pending_default_repairs)
+    }
+
+    async fn has_pending(&self) -> bool {
+        let state = self.state.lock().await;
+        !state.pending.is_empty() || !state.pending_default_repairs.is_empty()
+    }
+
+    async fn record_failure(
+        &self,
+        item_id: String,
+        error: String,
+        stage: DeferredLocalNfoFailureStage,
+    ) {
         self.state
             .lock()
             .await
             .failed_updates
-            .push((item_id, error));
+            .push(DeferredLocalNfoMetadataFailure {
+                item_id,
+                error,
+                stage,
+            });
     }
 
-    async fn take_failures(&self) -> Vec<(String, String)> {
+    async fn take_failures(&self) -> Vec<DeferredLocalNfoMetadataFailure> {
         std::mem::take(&mut self.state.lock().await.failed_updates)
     }
 }
@@ -1360,11 +1434,22 @@ impl MetadataEnricher {
         let deferred_metadata_updates = &nfo_snapshot.deferred_metadata_updates;
         self.flush_deferred_local_nfo_metadata_updates(deferred_metadata_updates)
             .await;
-        for (item_id, error) in deferred_metadata_updates.take_failures().await {
-            tracing::warn!(item_id, %error, "local NFO metadata update failed");
-            report.nfo_loaded = report.nfo_loaded.saturating_sub(1);
+        for failure in deferred_metadata_updates.take_failures().await {
+            tracing::warn!(
+                item_id = %failure.item_id,
+                error = %failure.error,
+                "local NFO metadata update failed"
+            );
+            match failure.stage {
+                DeferredLocalNfoFailureStage::Loaded => {
+                    report.nfo_loaded = report.nfo_loaded.saturating_sub(1);
+                }
+                DeferredLocalNfoFailureStage::Skipped => {
+                    report.nfo_skipped = report.nfo_skipped.saturating_sub(1);
+                }
+            }
             report.nfo_failed += 1;
-            report.mark_item_failed(&item_id);
+            report.mark_item_failed(&failure.item_id);
         }
         if let (Some(people), Some(deferred_actor_credits)) =
             (&self.people, deferred_actor_credits.as_ref())
@@ -1397,39 +1482,106 @@ impl MetadataEnricher {
         deferred_updates: &DeferredLocalNfoMetadataUpdates,
     ) {
         let updates = deferred_updates.take_pending().await;
-        for chunk in updates.chunks(LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE) {
-            let batch_updates = chunk
+        let repairs = deferred_updates.take_default_repairs().await;
+        let mut update_offset = 0;
+        let mut repair_offset = 0;
+        while update_offset < updates.len() || repair_offset < repairs.len() {
+            let update_end =
+                (update_offset + LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE).min(updates.len());
+            let update_count = update_end - update_offset;
+            let repair_end = (repair_offset + LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE - update_count)
+                .min(repairs.len());
+            let update_chunk = &updates[update_offset..update_end];
+            let repair_chunk = &repairs[repair_offset..repair_end];
+            let batch_updates = update_chunk
                 .iter()
                 .map(DeferredLocalNfoMetadataUpdate::as_update)
                 .collect::<Vec<_>>();
+            let batch_repairs = repair_chunk
+                .iter()
+                .map(DeferredLocalNfoDefaultsRepair::as_repair)
+                .collect::<Vec<_>>();
+            let transaction_started = std::time::Instant::now();
             let result = self
                 .database
-                .update_media_item_metadata_batch(&batch_updates)
+                .commit_local_nfo_state_batch(&batch_updates, &batch_repairs)
                 .await;
+            self.resources.record_local_nfo_state_transaction(
+                update_chunk.len(),
+                repair_chunk.len(),
+                transaction_started.elapsed(),
+                result.is_ok(),
+            );
             drop(batch_updates);
+            drop(batch_repairs);
             if let Err(batch_error) = result {
                 tracing::warn!(
-                    item_count = chunk.len(),
+                    item_count = update_chunk.len() + repair_chunk.len(),
                     %batch_error,
                     "local NFO metadata page transaction failed; retrying items individually"
                 );
-                for update in chunk {
-                    if let Err(error) = self
+                for update in update_chunk {
+                    let transaction_started = std::time::Instant::now();
+                    let result = self
                         .database
                         .update_media_item_metadata(update.as_update())
-                        .await
-                    {
+                        .await;
+                    self.resources.record_local_nfo_state_transaction(
+                        1,
+                        0,
+                        transaction_started.elapsed(),
+                        result.is_ok(),
+                    );
+                    if let Err(error) = result {
                         tracing::warn!(
                             item_id = %update.item_id,
                             %error,
                             "local NFO metadata update failed"
                         );
                         deferred_updates
-                            .record_failure(update.item_id.clone(), error.to_string())
+                            .record_failure(
+                                update.item_id.clone(),
+                                error.to_string(),
+                                DeferredLocalNfoFailureStage::Loaded,
+                            )
+                            .await;
+                    }
+                }
+                for repair in repair_chunk {
+                    let repair_update = repair.as_repair();
+                    let transaction_started = std::time::Instant::now();
+                    let result = self
+                        .database
+                        .repair_local_nfo_defaults(
+                            repair_update.item_id,
+                            repair_update.provider_ids,
+                            repair_update.premiere_date,
+                        )
+                        .await;
+                    self.resources.record_local_nfo_state_transaction(
+                        0,
+                        1,
+                        transaction_started.elapsed(),
+                        result.is_ok(),
+                    );
+                    if let Err(error) = result {
+                        tracing::warn!(
+                            item_id = %repair.item_id,
+                            %error,
+                            "local NFO default repair failed"
+                        );
+                        deferred_updates
+                            .record_failure(
+                                repair.item_id.clone(),
+                                error.to_string(),
+                                DeferredLocalNfoFailureStage::Skipped,
+                            )
                             .await;
                     }
                 }
             }
+            update_offset = update_end;
+            repair_offset = repair_end;
         }
     }
 
@@ -2243,13 +2395,23 @@ impl MetadataEnricher {
             if let (Some(metadata), Some((details, _))) = (metadata.as_ref(), cached_nfo.as_ref())
                 && local_nfo_defaults_missing(metadata, details)
             {
-                self.database
-                    .repair_local_nfo_defaults(
-                        item_id,
-                        &details.provider_ids,
-                        local_nfo_premiere_date(details),
-                    )
-                    .await?;
+                if let Some(deferred_updates) = deferred_metadata_updates.as_ref() {
+                    deferred_updates
+                        .push_default_repair(
+                            item_id,
+                            &details.provider_ids,
+                            local_nfo_premiere_date(details),
+                        )
+                        .await;
+                } else {
+                    self.database
+                        .repair_local_nfo_defaults(
+                            item_id,
+                            &details.provider_ids,
+                            local_nfo_premiere_date(details),
+                        )
+                        .await?;
+                }
             }
             report.nfo_skipped = 1;
             return Ok(report);
@@ -3706,7 +3868,9 @@ mod tests {
         .execute(database.pool())
         .await?;
 
-        let enricher = MetadataEnricher::new(database.clone());
+        let resources = ResourceMetrics::new();
+        let enricher =
+            MetadataEnricher::new(database.clone()).with_resource_metrics(resources.clone());
         let image_batch = enricher
             .index_scan_local_metadata_batch_images(&entry_ids)
             .await?;
@@ -3717,6 +3881,37 @@ mod tests {
         assert_eq!(batch.report.nfo_loaded, 1);
         assert_eq!(batch.report.nfo_failed, 1);
         assert_eq!(batch.report.failed_item_ids, [failed_item_id.as_str()]);
+        let metrics = resources.snapshot().await;
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.count"], 3,
+            "page transaction and fallback writes must all be recorded"
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.items"],
+            3
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.metadata_updates"],
+            3
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.default_repairs"],
+            0
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.success.count"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.error.count"],
+            2
+        );
+        assert!(
+            metrics
+                .metadata
+                .stage_p95_ms
+                .contains_key("local_nfo_state_tx")
+        );
         let titles: Vec<String> = sqlx::query_scalar(
             "SELECT title FROM media_items
              WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY title",
@@ -3725,6 +3920,149 @@ mod tests {
         .fetch_all(database.pool())
         .await?;
         assert_eq!(titles, ["Movie Two", "Updated One"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn unchanged_nfo_defaults_share_the_page_state_write_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::application::nfo::LocalNfoDetails;
+
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        let item_id = "unchanged-nfo-defaults-item";
+        let nfo_path = directory.path().join("movie.nfo");
+        let nfo_bytes = b"<movie><title>Local title</title><tmdbid>42</tmdbid><premiered>2026-01-02</premiered></movie>";
+        tokio::fs::write(&nfo_path, nfo_bytes).await?;
+        let fingerprint = nfo_fingerprint(&nfo_path).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                provider_ids_json, metadata_fingerprint
+             ) VALUES (?, ?, 'MOVIE', 'Local title', 'local title', 'LOCAL_CONFIRMED', '{}', ?)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(&fingerprint)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('deferred-metadata-item', ?, 'MOVIE', 'Before', 'before', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let details = LocalNfoDetails {
+            premiered: Some("2026-01-02".to_owned()),
+            provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
+            ..LocalNfoDetails::default()
+        };
+        let local_nfo = LocalNfoMetadataStore::new(database.clone());
+        local_nfo
+            .write_item(item_id, &nfo_content_fingerprint(nfo_bytes), &details)
+            .await?;
+        let metadata = database
+            .find_media_item_metadata(item_id)
+            .await?
+            .ok_or("unchanged media metadata should exist")?;
+        let resources = ResourceMetrics::new();
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(local_nfo)
+            .with_resource_metrics(resources.clone());
+        let deferred = DeferredLocalNfoMetadataUpdates::default();
+        database.reset_query_count();
+        let report = enricher
+            .enrich_nfo_item_with_metadata(
+                item_id,
+                &nfo_path,
+                Some(metadata),
+                None,
+                Some(deferred.clone()),
+            )
+            .await?;
+        assert_eq!(report.nfo_skipped, 1);
+        assert_eq!(
+            database.query_count(),
+            1,
+            "the unchanged NFO should only read its rich cache before page flush"
+        );
+        let defaults_before_flush: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT provider_ids_json, premiere_date FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(defaults_before_flush, (Some("{}".to_owned()), None));
+
+        let metadata_fingerprint = [8_u8; 32];
+        deferred
+            .push(MediaMetadataUpdate {
+                item_id: "deferred-metadata-item",
+                title: "After",
+                original_title: None,
+                overview: None,
+                production_year: None,
+                premiere_date: None,
+                rating: None,
+                rating_source: None,
+                provider_ids_json: None,
+                metadata_fingerprint: &metadata_fingerprint,
+                provenance_json: "{}",
+                locked_fields_json: "{}",
+            })
+            .await;
+        enricher
+            .flush_deferred_local_nfo_metadata_updates(&deferred)
+            .await;
+        assert!(deferred.take_failures().await.is_empty());
+        let metrics = resources.snapshot().await;
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.count"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.items"],
+            2
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.metadata_updates"],
+            1
+        );
+        assert_eq!(
+            metrics.metadata.counters["batch.local_nfo_state_tx.default_repairs"],
+            1
+        );
+        assert!(
+            metrics
+                .metadata
+                .stage_p95_ms
+                .contains_key("local_nfo_state_tx")
+        );
+
+        let defaults_after_flush: (String, Option<String>) =
+            sqlx::query_as("SELECT provider_ids_json, premiere_date FROM media_items WHERE id = ?")
+                .bind(item_id)
+                .fetch_one(database.pool())
+                .await?;
+        let updated_title: String =
+            sqlx::query_scalar("SELECT title FROM media_items WHERE id = 'deferred-metadata-item'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            defaults_after_flush,
+            (r#"{"tmdb":"42"}"#.to_owned(), Some("2026-01-02".to_owned()))
+        );
+        assert_eq!(updated_title, "After");
+        database.close().await;
         Ok(())
     }
 

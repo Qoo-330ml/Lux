@@ -179,6 +179,60 @@ impl ResourceMetrics {
         samples.push_back(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
     }
 
+    pub fn record_local_nfo_state_transaction(
+        &self,
+        metadata_update_count: usize,
+        default_repair_count: usize,
+        duration: Duration,
+        success: bool,
+    ) {
+        const STAGE: &str = "local_nfo_state_tx";
+        let Ok(mut metrics) = self.metadata.lock() else {
+            return;
+        };
+        let metadata_update_count = u64::try_from(metadata_update_count).unwrap_or(u64::MAX);
+        let default_repair_count = u64::try_from(default_repair_count).unwrap_or(u64::MAX);
+        let item_count = metadata_update_count.saturating_add(default_repair_count);
+        increment_counter(&mut metrics.counters, "batch.local_nfo_state_tx.count", 1);
+        increment_counter(
+            &mut metrics.counters,
+            "batch.local_nfo_state_tx.items",
+            item_count,
+        );
+        increment_counter(
+            &mut metrics.counters,
+            "batch.local_nfo_state_tx.metadata_updates",
+            metadata_update_count,
+        );
+        increment_counter(
+            &mut metrics.counters,
+            "batch.local_nfo_state_tx.default_repairs",
+            default_repair_count,
+        );
+        let max_items = metrics
+            .counters
+            .entry("batch.local_nfo_state_tx.max_items".to_owned())
+            .or_default();
+        *max_items = (*max_items).max(item_count);
+        increment_counter(
+            &mut metrics.counters,
+            if success {
+                "batch.local_nfo_state_tx.success.count"
+            } else {
+                "batch.local_nfo_state_tx.error.count"
+            },
+            1,
+        );
+        let samples = metrics
+            .durations_ms
+            .entry(STAGE.to_owned())
+            .or_insert_with(|| VecDeque::with_capacity(METADATA_METRIC_SAMPLE_CAPACITY));
+        if samples.len() == METADATA_METRIC_SAMPLE_CAPACITY {
+            samples.pop_front();
+        }
+        samples.push_back(u64::try_from(duration.as_millis()).unwrap_or(u64::MAX));
+    }
+
     pub fn record_metadata_request(&self, capability: &str, cache_hit: bool) {
         let Some(capability) = metadata_capability_name(capability) else {
             return;
@@ -406,6 +460,7 @@ fn metadata_batch_name(value: &str) -> Option<&'static str> {
 fn metadata_stage_name(value: &str) -> Option<&'static str> {
     match value {
         "local_nfo_page" => Some("local_nfo_page"),
+        "local_nfo_state_tx" => Some("local_nfo_state_tx"),
         "queue_wait" => Some("queue_wait"),
         "queue_claim" => Some("queue_claim"),
         "item_total" => Some("item_total"),
@@ -1077,6 +1132,44 @@ mod tests {
             snapshot.metadata.stage_p95_ms["local_nfo_actor_credits_tx"],
             20
         );
+    }
+
+    #[tokio::test]
+    async fn local_nfo_state_transaction_metrics_track_batch_shape_and_duration() {
+        let metrics = ResourceMetrics::new();
+        metrics.record_local_nfo_state_transaction(3, 2, Duration::from_millis(10), true);
+        metrics.record_local_nfo_state_transaction(1, 0, Duration::from_millis(20), false);
+
+        let snapshot = metrics.snapshot().await;
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_state_tx.count"],
+            2
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_state_tx.items"],
+            6
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_state_tx.metadata_updates"],
+            4
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_state_tx.default_repairs"],
+            2
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_state_tx.max_items"],
+            5
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_state_tx.success.count"],
+            1
+        );
+        assert_eq!(
+            snapshot.metadata.counters["batch.local_nfo_state_tx.error.count"],
+            1
+        );
+        assert_eq!(snapshot.metadata.stage_p95_ms["local_nfo_state_tx"], 20);
     }
 
     #[tokio::test]

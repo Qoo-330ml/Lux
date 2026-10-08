@@ -9320,6 +9320,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：本地 NFO metadata/provider ID/premiere date/fingerprint 更新按最多 16 个 item 共用一次 metadata 写锁和事务；标题或年份改变前先提交已暂存状态，再检查同页身份冲突。注入批次中途 UPDATE 失败后，存储回归确认整个 chunk 回滚；应用层逐项回退，成功项保留、失败项单独标记。`cargo test --locked --all-targets` 的 793 项库测试与所有集成目标通过（13 项忽略）；`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 通过。本机 ARM64。SQL UPDATE 仍逐 item 执行；未测量事务墙钟或部署后 PostgreSQL/FNOS/NAS 收益。
 
+#### LUX-450：合并本地 NFO 缺失默认字段修复事务
+
+范围：unchanged NFO 的 semantic fingerprint、rich cache 和 actor relation 均已命中时，会跳过重新解析；若 provider ID 或 premiere date 仍缺失，当前 `repair_local_nfo_defaults` 对每个 item 单独获取 metadata 写锁并开启事务。将该修复接入 local NFO page 的 deferred 状态写入，按最多 16 个 item 共用一次 metadata 写锁和事务；只补填仍为空的 provider ID/premiere date，保留并发写入时已补齐的字段，并与 LUX-449 的 metadata 状态批次共享页级 flush。批次失败时逐 item 回退并保持失败隔离。记录固定低基数的 state transaction 次数、metadata/default-repair item 数、成功/失败与有界耗时 p95；普通单 item/在线 NFO enrichment 仍立即修复且不进入 page 指标。
+
+验收：
+
+- [x] 本地 NFO page 的已检查 NFO 缺失默认字段修复纳入页级批次；单 item/在线路径保留即时写入。
+- [x] provider ID 仅合并新 key、premiere date 仅填空；并发或预先存在的非空值不被覆盖；无字段变化不执行 UPDATE。
+- [x] 批次后续写失败会整体回滚，应用层逐 item 回退并仅报告实际失败项。
+- [x] state transaction 指标覆盖页级批次与失败后的逐项回退，且不记录 item ID、路径或 SQL 文本。
+- [x] 定向 storage 与 metadata page 回归、build、fmt、Clippy、全目标测试和差异检查通过；性能记录区分事务合并与逐 item SQL 语句数。
+
+预计文件：`src/application/metadata.rs`、`src/storage/catalog.rs`、`src/storage/mod.rs`、`src/storage/repository_tests.rs`、`src/observability/resources.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 storage 混合写批次回滚、metadata deferred repair 与 transaction metric 回归，再把 unchanged-NFO repair 接入既有页级 flush。
+
+结果（2026-10-09）：unchanged NFO 的缺失 provider ID/premiere date repair 与 metadata 更新共用最多 16 项的页级 metadata 写事务；仅补缺失字段，并发已补齐值不会覆盖；无变化不会执行 UPDATE。混合写批次故障回归确认事务回滚，应用层逐 item fallback 保持错误隔离，指标覆盖批次及 fallback 的成功/失败与耗时。移除被新入口替代的无用 storage wrapper。定向测试通过；`cargo build --locked`、`cargo test --locked --all-targets`（库 796 passed、13 ignored，所有集成目标通过）、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `arm64`；PostgreSQL 专用测试/基准按标记未运行，未部署 FNOS/NAS，也没有生产 CPU 或墙钟收益测量。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

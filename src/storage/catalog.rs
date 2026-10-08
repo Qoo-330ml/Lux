@@ -2577,90 +2577,15 @@ impl Database {
         if provider_ids.is_empty() && premiere_date.is_none() {
             return Ok(());
         }
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let current = self
-            .query_as::<(Option<String>, Option<String>)>(
-                "SELECT provider_ids_json, premiere_date
-                 FROM media_items
-                 WHERE id = ? AND removed_at IS NULL",
-            )
-            .bind(item_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some((current_provider_ids, current_premiere_date)) = current else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(());
-        };
-
-        let mut merged = current_provider_ids
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
-            .unwrap_or_default();
-        let mut provider_ids_json = None;
-        let mut provider_ids_changed = false;
-        for (provider, provider_id) in provider_ids {
-            let provider = provider.trim();
-            let provider_id = provider_id.trim();
-            if provider.is_empty()
-                || provider_id.is_empty()
-                || merged
-                    .keys()
-                    .any(|existing| existing.eq_ignore_ascii_case(provider))
-            {
-                continue;
-            }
-            merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
-            provider_ids_changed = true;
-        }
-        if provider_ids_changed {
-            provider_ids_json = Some(
-                serde_json::to_string(&merged)
-                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
-            );
-        }
-        let premiere_date = premiere_date
-            .filter(|value| !value.trim().is_empty())
-            .filter(|_| {
-                current_premiere_date
-                    .as_deref()
-                    .is_none_or(|value| value.trim().is_empty())
-            });
-        if provider_ids_json.is_some() || premiere_date.is_some() {
-            self.query(
-                "UPDATE media_items
-                 SET provider_ids_json = COALESCE(?, provider_ids_json),
-                     premiere_date = COALESCE(?, premiere_date),
-                     updated_at = unixepoch()
-                 WHERE id = ? AND removed_at IS NULL",
-            )
-            .bind(provider_ids_json)
-            .bind(premiere_date)
-            .bind(item_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        self.commit_local_nfo_state_batch(
+            &[],
+            &[LocalNfoDefaultsRepair {
+                item_id,
+                provider_ids,
+                premiere_date,
+            }],
+        )
+        .await
     }
 
     pub(crate) async fn update_local_provider_ids_for_identity_if_empty(
@@ -5703,15 +5628,32 @@ impl Database {
             })
     }
 
-    pub(crate) async fn update_media_item_metadata_batch(
+    pub(crate) async fn commit_local_nfo_state_batch(
         &self,
         updates: &[MediaMetadataUpdate<'_>],
+        defaults_repairs: &[LocalNfoDefaultsRepair<'_>],
     ) -> Result<(), StorageError> {
-        for update_chunk in updates.chunks(MEDIA_METADATA_UPDATE_BATCH_SIZE) {
+        let defaults_repairs = defaults_repairs
+            .iter()
+            .filter(|repair| !repair.provider_ids.is_empty() || repair.premiere_date.is_some())
+            .collect::<Vec<_>>();
+        let mut update_offset = 0;
+        let mut repair_offset = 0;
+        while update_offset < updates.len() || repair_offset < defaults_repairs.len() {
+            let update_end = (update_offset + MEDIA_METADATA_UPDATE_BATCH_SIZE).min(updates.len());
+            let update_count = update_end - update_offset;
+            let repair_end = (repair_offset + MEDIA_METADATA_UPDATE_BATCH_SIZE - update_count)
+                .min(defaults_repairs.len());
+            let update_chunk = &updates[update_offset..update_end];
+            let repair_chunk = &defaults_repairs[repair_offset..repair_end];
             let _write_guard = self.acquire_metadata_write_lock().await;
             let mut transaction = self.begin_metadata_write_transaction().await?;
             for update in update_chunk {
                 self.update_media_item_metadata_in_transaction(&mut transaction, update)
+                    .await?;
+            }
+            for repair in repair_chunk {
+                self.repair_local_nfo_defaults_in_transaction(&mut transaction, repair)
                     .await?;
             }
             transaction
@@ -5721,6 +5663,84 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
+            update_offset = update_end;
+            repair_offset = repair_end;
+        }
+        Ok(())
+    }
+
+    async fn repair_local_nfo_defaults_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        repair: &LocalNfoDefaultsRepair<'_>,
+    ) -> Result<(), StorageError> {
+        if repair.provider_ids.is_empty() && repair.premiere_date.is_none() {
+            return Ok(());
+        }
+        let current = self
+            .query_as::<(Option<String>, Option<String>)>(
+                "SELECT provider_ids_json, premiere_date
+                 FROM media_items
+                 WHERE id = ? AND removed_at IS NULL",
+            )
+            .bind(repair.item_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((current_provider_ids, current_premiere_date)) = current else {
+            return Ok(());
+        };
+
+        let mut merged = current_provider_ids
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok())
+            .unwrap_or_default();
+        let mut provider_ids_json = None;
+        for (provider, provider_id) in repair.provider_ids {
+            let provider = provider.trim();
+            let provider_id = provider_id.trim();
+            if provider.is_empty()
+                || provider_id.is_empty()
+                || merged
+                    .keys()
+                    .any(|existing| existing.eq_ignore_ascii_case(provider))
+            {
+                continue;
+            }
+            merged.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
+            provider_ids_json = Some(
+                serde_json::to_string(&merged)
+                    .map_err(|error| StorageError::Serialization(error.to_string()))?,
+            );
+        }
+        let premiere_date = repair
+            .premiere_date
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| {
+                current_premiere_date
+                    .as_deref()
+                    .is_none_or(|value| value.trim().is_empty())
+            });
+        if provider_ids_json.is_some() || premiere_date.is_some() {
+            self.query(
+                "UPDATE media_items
+                 SET provider_ids_json = COALESCE(?, provider_ids_json),
+                     premiere_date = COALESCE(?, premiere_date),
+                     updated_at = unixepoch()
+                 WHERE id = ? AND removed_at IS NULL",
+            )
+            .bind(provider_ids_json)
+            .bind(premiere_date)
+            .bind(repair.item_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         }
         Ok(())
     }

@@ -58,7 +58,7 @@ pub(crate) use repository::{
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
     EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
     ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata, LibrarySettingsUpdate,
-    MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, ManifestDeltaBatchCommit,
+    LocalNfoDefaultsRepair, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, ManifestDeltaBatchCommit,
     ManifestDeltaBatchCommitResult, ManifestDiscoveryCommitResult, ManifestExistingFileUpdate,
     ManifestPostprocessingTargetBatchResult, ManifestPostprocessingTargetPage,
     MediaInfoChapterUpdate, MediaMetadataUpdate, MediaProbeUpdate, MediaStreamUpdate,

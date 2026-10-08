@@ -1706,3 +1706,9 @@ actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallba
 ### LUX-449 本地 NFO metadata 状态写事务
 
 本地 NFO page 的 metadata/provider ID/premiere date/fingerprint 更新按最多 16 个 item 共用一次 metadata 写锁和事务；identity conflict 检查会在标题或年份变更前刷新此前暂存项，因此部分批次会早于 16 项提交。16 个 item 的 SQL `UPDATE` 语句仍分别执行。跨 item 故障回归证明批次事务在后续 UPDATE 失败时整体回滚；应用层随后逐 item 回退，以保留单条错误隔离。该记录说明事务和锁的合并边界，不声称 SQL 调用数减少、事务墙钟缩短或 PostgreSQL/FNOS/NAS CPU 改善。
+
+### LUX-450 本地 NFO 默认字段修复与 metadata 状态批次
+
+已检查且内容未变化的本地 NFO，在 rich cache 命中但 provider ID 或 premiere date 为空时，会把默认值修复暂存到当前 page state batch；最多 16 个 metadata 更新/默认修复共用一次 metadata 写锁和事务。固定 SQLite 回归确认默认字段只补空值、已有非空字段不被覆盖、无变化不执行 UPDATE，且混合状态批次中途失败会整体回滚。应用层仍逐 item 回退并保留 NFO 错误隔离。
+
+事务指标固定记录 transaction 次数、输入 item 数、metadata/default-repair 分类、成功/失败及最近 128 个耗时样本的 p95；回归确认失败 page transaction 和逐项 fallback 均被计入，且不暴露 item/path/SQL。这里记录的是事务尝试与输入批次形状，不代表 SQL 语句数减少或事务墙钟下降；未验证 PostgreSQL/FNOS/NAS 负载或 CPU 收益。

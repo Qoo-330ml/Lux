@@ -12,8 +12,8 @@ use crate::{
     config::{Config, DatabaseBackend, DatabaseConfiguration, PostgresConnection},
     library::LibraryKind,
     storage::{
-        ItemImageBatchInsert, ItemImageInsert, MetadataAutoMatchPolicy, MetadataCapabilityResult,
-        MetadataImageUnavailable, NewItemMetadataCompletenessCheck,
+        ItemImageBatchInsert, ItemImageInsert, LocalNfoDefaultsRepair, MetadataAutoMatchPolicy,
+        MetadataCapabilityResult, MetadataImageUnavailable, NewItemMetadataCompletenessCheck,
         NewItemMetadataCompletenessResult, NewMediaChapterMarker, NewMetadataCandidate,
         NewNotificationDestination, NewNotificationEvent,
     },
@@ -153,7 +153,7 @@ async fn local_nfo_metadata_batch_rolls_back_all_updates_on_a_batch_error()
 
     assert!(
         database
-            .update_media_item_metadata_batch(&updates)
+            .commit_local_nfo_state_batch(&updates, &[])
             .await
             .is_err()
     );
@@ -164,6 +164,121 @@ async fn local_nfo_metadata_batch_rolls_back_all_updates_on_a_batch_error()
     .fetch_all(database.pool())
     .await?;
     assert_eq!(titles, ["Old title", "Old title"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_nfo_state_batch_rolls_back_metadata_and_fills_only_missing_defaults()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 provider_ids_json
+             ) VALUES ('nfo-state-metadata', ?, 'MOVIE', 'Old title', 'old title',
+                       'LOCAL_CONFIRMED', '{}'),
+                      ('nfo-state-defaults', ?, 'MOVIE', 'Keep title', 'keep title',
+                       'LOCAL_CONFIRMED', '{\"tmdb\":\"99\"}')",
+        )
+        .bind(library.id.to_string())
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_local_nfo_default_repair
+         BEFORE UPDATE OF premiere_date ON media_items
+         WHEN OLD.id = 'nfo-state-defaults'
+         BEGIN SELECT RAISE(ABORT, 'injected defaults failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let fingerprint = [7_u8; 32];
+    let updates = [MediaMetadataUpdate {
+        item_id: "nfo-state-metadata",
+        title: "Updated title",
+        original_title: None,
+        overview: None,
+        production_year: None,
+        premiere_date: None,
+        rating: None,
+        rating_source: None,
+        provider_ids_json: None,
+        metadata_fingerprint: &fingerprint,
+        provenance_json: "{}",
+        locked_fields_json: "{}",
+    }];
+    let provider_ids = std::collections::BTreeMap::from([
+        ("tmdb".to_owned(), "42".to_owned()),
+        ("imdb".to_owned(), "tt123".to_owned()),
+    ]);
+    let repairs = [LocalNfoDefaultsRepair {
+        item_id: "nfo-state-defaults",
+        provider_ids: &provider_ids,
+        premiere_date: Some("2026-01-02"),
+    }];
+
+    assert!(
+        database
+            .commit_local_nfo_state_batch(&updates, &repairs)
+            .await
+            .is_err()
+    );
+    let unchanged: (String, Option<String>) = sqlx::query_as(
+        "SELECT metadata.title, defaults.premiere_date
+         FROM media_items metadata
+         CROSS JOIN media_items defaults
+         WHERE metadata.id = 'nfo-state-metadata'
+           AND defaults.id = 'nfo-state-defaults'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged, ("Old title".to_owned(), None));
+
+    sqlx::query("DROP TRIGGER reject_local_nfo_default_repair")
+        .execute(database.pool())
+        .await?;
+    database
+        .commit_local_nfo_state_batch(&updates, &repairs)
+        .await?;
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM media_items WHERE id = 'nfo-state-metadata'")
+            .fetch_one(database.pool())
+            .await?;
+    let repaired: (String, Option<String>) = sqlx::query_as(
+        "SELECT provider_ids_json, premiere_date FROM media_items
+         WHERE id = 'nfo-state-defaults'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(title, "Updated title");
+    assert_eq!(
+        repaired,
+        (
+            r#"{"imdb":"tt123","tmdb":"99"}"#.to_owned(),
+            Some("2026-01-02".to_owned())
+        )
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER reject_unchanged_local_nfo_default_repair
+         BEFORE UPDATE OF premiere_date ON media_items
+         WHEN OLD.id = 'nfo-state-defaults'
+         BEGIN SELECT RAISE(ABORT, 'unchanged defaults must not update'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    database.commit_local_nfo_state_batch(&[], &repairs).await?;
+    database.close().await;
     Ok(())
 }
 
