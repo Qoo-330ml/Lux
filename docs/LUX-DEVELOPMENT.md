@@ -8920,6 +8920,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：每页 NFO projection、人物 relation 旁车和本地图片发现最多 4 个 item 并行，所有结果收齐后按原输入顺序处理；策略/图片/context/attempts 查询仍为页级数据库调用。候选模块测试 23/23 通过。该回归只证明任务上界和顺序，不测文件访问总数、墙钟或 FNOS/NAS 性能。
 
+#### LUX-423：降低本地 metadata worker 的空闲 job 状态查询
+
+范围：本地 metadata worker 没有 pending target 时通过 Notify 等待，同时每秒 fallback 重新读取 scan job。只将该 job-state refresh fallback 改为 5 秒；Notify 和 stop watch 仍即时唤醒。worker 启动加载失败重试、image-stage waiter 的 fallback 保持 1 秒，completion waiter 保持 LUX-420 的 5 秒。跨进程 scan job 状态变化的观察窗口扩大至最多 5 秒。
+
+验收：
+
+- [x] job-state refresh fallback 为 5 秒且没有改动其他 idle/retry/image fallback。
+- [x] Notify 到达后仍无需等待 fallback，并保持现有单次通知 query 回归。
+- [x] scanner waiter 定向测试、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录仅报告配置间隔 1 秒→5 秒；不推断实际运行时查询量、CPU 或 FNOS 收益。
+
+预计文件：`src/application/scanner.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先锁定新 fallback 配置和即时 Notify 路径，再只替换 scan job 状态 refresh timer。
+
+结果（2026-10-08）：worker 空闲时的 scan job 状态 refresh 从 1 秒 fallback 改为 5 秒；通知和 stop watch 仍即时唤醒，worker 启动读取错误及 image-stage waiter 的 1 秒 fallback 未改变。`local_metadata_worker_` 定向测试 4/4、`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。只确认 fallback 配置和通知语义，未测总体 query/CPU 或 FNOS 收益；跨进程状态观察最迟延至 5 秒。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

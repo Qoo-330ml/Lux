@@ -1573,3 +1573,7 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 ### LUX-422 local metadata completeness planning concurrency
 
 本地 completeness 页中的 item image discovery、必要时的 NFO projection 和 actor relation file check 从逐项串行改为最多 4 个只读 task 并行；结果在进入 attempt-state 查询前按原 item 输入顺序汇总。固定 12-task helper fixture 证明最大并发为 4 并且输出顺序稳定。此项不减少旁车文件总读取数或数据库 query 数；没有采集文件系统墙钟，也不推断 PostgreSQL、NAS 或 FNOS 收益。
+
+### LUX-423 local metadata worker job-state fallback
+
+本地 metadata worker 在无 pending target 且没有 Notify 时，scan job 状态 reload fallback 从 1 秒调至 5 秒；Notify 和 stop watch 仍即时唤醒。worker 初始读取失败的 retry 与 image-stage waiter 保持 1 秒。通知回归断言仍为一次 query；5 秒配置回归锁定状态查询间隔。该配置变化会把跨进程状态观察延迟扩大到最多 5 秒，没有测量总体查询数、CPU 或 FNOS 收益。

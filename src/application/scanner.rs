@@ -88,6 +88,7 @@ use manifest::*;
 const MISSING_ENTRY_BATCH_SIZE: usize = 500;
 const LOCAL_METADATA_IDLE_FALLBACK: Duration = Duration::from_secs(1);
 const LOCAL_METADATA_COMPLETION_FALLBACK: Duration = Duration::from_secs(5);
+const LOCAL_METADATA_JOB_REFRESH_FALLBACK: Duration = Duration::from_secs(5);
 const LOCAL_METADATA_BATCH_SIZE: usize = 16;
 const LIBRARY_DELETION_SCAN_CANCEL_TIMEOUT: Duration = Duration::from_secs(30);
 const SQLITE_SCAN_LOCK_RETRY_DELAYS_MS: [u64; 3] = [250, 750, 1_500];
@@ -9645,7 +9646,7 @@ impl ScanJobService {
                         false
                     }
                     _ = notified => false,
-                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => true,
+                    _ = tokio::time::sleep(LOCAL_METADATA_JOB_REFRESH_FALLBACK) => true,
                 };
                 if !refresh_job {
                     continue;
@@ -12315,13 +12316,13 @@ mod tests {
     };
 
     use super::{
-        LibraryScanner, LocalMetadataCompletenessTrigger, MANIFEST_DISCOVERY_BATCH_SIZE,
-        MANIFEST_STREAMED_ENTRY_BATCH_SIZE, MANIFEST_STREAMED_INDEX_BATCH_SIZE,
-        MAX_STRM_TARGET_BYTES, ManifestDirectoryReader, ManifestFilenameInput,
-        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
-        MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
-        NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
-        ScanJobService, ScannerError, ScraperAvailabilityPreflight,
+        LOCAL_METADATA_JOB_REFRESH_FALLBACK, LibraryScanner, LocalMetadataCompletenessTrigger,
+        MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
+        MANIFEST_STREAMED_INDEX_BATCH_SIZE, MAX_STRM_TARGET_BYTES, ManifestDirectoryReader,
+        ManifestFilenameInput, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
+        MixedClassification, MixedClassificationCache, MixedManifestClassification,
+        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
+        PreparedManifestFilename, ScanJobService, ScannerError, ScraperAvailabilityPreflight,
         classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
         infer_sibling_movie_variant_suffix, infer_sibling_movie_variant_suffix_with_probe,
         is_lite_manifest_discovery, manifest_file_observation_matches,
@@ -13665,6 +13666,14 @@ mod tests {
         ScanJobService::stop_local_metadata_worker(&mut worker).await;
         assert_eq!(notification_queries, 1);
         Ok(())
+    }
+
+    #[test]
+    fn local_metadata_worker_job_state_fallback_is_five_seconds() {
+        assert_eq!(
+            LOCAL_METADATA_JOB_REFRESH_FALLBACK,
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[tokio::test]
