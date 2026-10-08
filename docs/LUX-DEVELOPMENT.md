@@ -9350,6 +9350,46 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：SQLite/PostgreSQL 均新增 nullable `relation_checksum`，旧 migration 未修改。SQLite `tests/storage.rs` 51/51 通过，覆盖从空库迁移和从 0165 升级时保留 source fingerprint、relation schema version 与时间戳，旧 checksum 为 NULL；静态双后端合同确认 PostgreSQL 使用相同 additive nullable DDL。schema-version 相关 `scanning_jobs` 81/81、`scanner` 17/17、`danmaku` 7/7、`admin_health` 1/1、`ready_version` 2/2 通过；PostgreSQL 数据库目标 16 项因本机无 PostgreSQL 实例而 ignored。`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本次 `cargo test --locked --all-targets` 的 796 个库测试通过、13 项忽略；集成测试在 `watch` 中遇到 SQLite `database is locked`。该目标独立复跑 5/5 通过，其后 5 个 Web/webhook 目标也通过，因此记录为并行测试时的偶发锁冲突，不归因于 migration。开发机 `arm64`；未部署 PostgreSQL/FNOS，也没有生产性能验证。应用层 checksum 写入与比较留给后续独立任务。
 
+#### LUX-452：在人物 credits 事务中保存关系快照 checksum
+
+范围：LUX-451 已增加 nullable `person_index_item_state.relation_checksum`，本任务补齐 storage 写入边界：credits 批量替换与 source fingerprint、关系 checksum 和 schema version 在同一事务写入。关系 checksum 由调用方对实际持久化的 `people.json` 字节计算并以 SHA-256 小写十六进制传入。fingerprint-only 兼容 API 写入时清空 checksum，避免保留已过期快照值。文件 checksum 读取与全部应用层调用方接入在后续独立任务完成。
+
+验收：
+
+- [x] 单项与批量 credits 写入均能原子保存 relation checksum；批次失败时 credits 和 checksum state 一起回滚。
+- [x] SQLite storage 回归覆盖 checksum 持久化、批次回滚与旧 API 清空 checksum；不改变 PostgreSQL/SQLite 通用 SQL 边界。
+- [x] 相关 storage 测试、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+
+预计文件：`src/storage/people.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先添加单项/批量写入与回滚回归，再增加 checksum-aware batch writer。此任务不修改应用层读写调用方。
+
+结果（2026-10-09）：storage 的单项和批量 credits replacement 均在同一 metadata transaction 写 source fingerprint、relation schema version 和 relation checksum；fingerprint-only 兼容入口明确清空 checksum，避免沿用旧值。SQLite 回归覆盖单项/批量保存、旧 API 行为，以及第二个 item 写 state 失败时整页 credits/state 回滚。`cargo test --locked --all-targets` 通过（库 797 passed、13 ignored，所有未忽略集成目标通过）；`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 `arm64`；PostgreSQL 16 项按需实例的测试在本机 ignored，未运行 PostgreSQL/FNOS 部署或生产性能验证。测试与 build 均使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
+#### LUX-453：从人物关系文件快照贯通 checksum 写入
+
+范围：在读取 `people.json` 时保留实际原始字节并计算 SHA-256 小写十六进制；所有关系文件更新路径在文件原子替换后，将同一份待写字节的 checksum 随 credits 一起交给 LUX-452 storage API。包含 NFO deferred credits 页批次和索引重建读取，避免从解析对象重新序列化计算或重复读取文件。文件系统与数据库不能共享原子事务；DB 写失败后关系文件仍可作为恢复来源，索引 current 检查必须由后续任务识别不一致。
+
+验收：
+
+- [ ] checksum 对实际写入或读取的原始文件字节计算，不重序列化关系对象，也不额外读取同一文件。
+- [ ] 人物关系持久化、person metadata 更新、NFO deferred credits 批次与索引重建均将正确 checksum 与 credits/fingerprint 一起提交。
+- [ ] relation 文件先提交而 credits 事务失败后，后续 current 判断有足够 checksum 状态检测不一致；不改变文件格式和 public API。
+- [ ] `tests/people_api.rs` 覆盖关系文件变化但 source fingerprint 不变时保存新 checksum；相关 storage/people tests、build、fmt、Clippy 与差异检查通过。
+
+预计文件：`src/application/people/helpers.rs`、`src/application/people/relations.rs`、`src/application/people/metadata.rs`、`src/application/people/rebuild.rs`、`docs/LUX-DEVELOPMENT.md`。先增加 raw snapshot checksum 读写回归，再贯通 immediate/deferred credits 路径。
+
+#### LUX-454：按人物关系快照 checksum 判定运行索引是否 current
+
+范围：将人物关系 skip/current 检查统一切换为 source fingerprint、原始 relation checksum 和 schema version 三者比较。checksum 缺失的旧行和文件变化但 source fingerprint 不变的记录必须判 stale，并进入现有批量重建流程；无数据库时保留当前文件内 source fingerprint 校验语义。
+
+验收：
+
+- [ ] `item_actor_relation_is_current`、`nfo_relation_snapshot_is_current` 与 index rebuild skip 路径都比较关系 checksum。
+- [ ] 旧行 checksum 为 NULL、文件 checksum 改变、source fingerprint 改变或 schema version 变化都会触发重建；全部匹配才跳过。
+- [ ] `tests/people_api.rs` 覆盖旧 NULL 行和相同 source fingerprint 下文件字节改变；storage 回归覆盖 checksum、source fingerprint 和 schema version 三维匹配。
+- [ ] 相关 people/storage tests、build、fmt、Clippy 与差异检查通过；PostgreSQL 未运行时如实记录。
+
+预计文件：`src/storage/library.rs`、`src/application/people/service.rs`、`src/application/people/rebuild.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。先锁定 checksum mismatch/legacy stale 回归，再替换 current 判定入口。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

@@ -14058,6 +14058,100 @@ async fn person_index_keyset_pages_and_fingerprints_are_conservative() {
 }
 
 #[tokio::test]
+async fn person_credit_writes_persist_relation_checksums_and_legacy_writes_clear_them() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("People checksum", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-checksum', ?, 'MOVIE', 'Checksum', 'checksum', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-checksum-batch', ?, 'MOVIE', 'Checksum batch', 'checksum batch', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("batch media item");
+
+    database
+        .replace_person_credits_with_relation_checksum(
+            "item-checksum",
+            &[],
+            Some("source-v1"),
+            Some("relation-v1"),
+        )
+        .await
+        .expect("store relation snapshot");
+    let stored_single_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT relation_checksum FROM person_index_item_state WHERE item_id = 'item-checksum'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("read single-item relation checksum");
+    assert_eq!(stored_single_checksum.as_deref(), Some("relation-v1"));
+
+    let no_credits = [];
+    database
+        .replace_person_credits_batch_with_relation_checksum(&[
+            (
+                "item-checksum",
+                &no_credits,
+                Some("source-v1"),
+                Some("relation-v2"),
+            ),
+            (
+                "item-checksum-batch",
+                &no_credits,
+                Some("source-batch"),
+                Some("relation-batch"),
+            ),
+        ])
+        .await
+        .expect("store relation checksums in a batch");
+    let stored_batch_checksum: Option<String> = sqlx::query_scalar(
+        "SELECT relation_checksum FROM person_index_item_state
+         WHERE item_id = 'item-checksum-batch'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("read batched relation checksum");
+    assert_eq!(stored_batch_checksum.as_deref(), Some("relation-batch"));
+
+    database
+        .replace_person_credits_with_fingerprint("item-checksum", &[], Some("source-v1"))
+        .await
+        .expect("legacy writer stores no relation checksum");
+    assert!(
+        database
+            .person_index_item_state_is_current("item-checksum", Some("source-v1"))
+            .await
+            .expect("legacy current check remains compatible")
+    );
+    let stored_checksum_after_legacy_write: Option<String> = sqlx::query_scalar(
+        "SELECT relation_checksum FROM person_index_item_state WHERE item_id = 'item-checksum'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("read legacy checksum");
+    assert_eq!(stored_checksum_after_legacy_write, None);
+}
+
+#[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -15937,8 +16031,18 @@ async fn person_credit_page_replacement_commits_all_items_atomically() {
     let credits_a = [credit("actor-a")];
     let credits_b = [credit("actor-b")];
     let replacements = [
-        ("credit-page-a", credits_a.as_slice(), Some("fingerprint-a")),
-        ("credit-page-b", credits_b.as_slice(), Some("fingerprint-b")),
+        (
+            "credit-page-a",
+            credits_a.as_slice(),
+            Some("fingerprint-a"),
+            Some("relation-a"),
+        ),
+        (
+            "credit-page-b",
+            credits_b.as_slice(),
+            Some("fingerprint-b"),
+            Some("relation-b"),
+        ),
     ];
 
     sqlx::query(
@@ -15952,7 +16056,7 @@ async fn person_credit_page_replacement_commits_all_items_atomically() {
     .expect("failure trigger");
     assert!(
         database
-            .replace_person_credits_batch_with_fingerprint(&replacements)
+            .replace_person_credits_batch_with_relation_checksum(&replacements)
             .await
             .is_err()
     );
@@ -15978,20 +16082,22 @@ async fn person_credit_page_replacement_commits_all_items_atomically() {
         .await
         .expect("drop failure trigger");
     database
-        .replace_person_credits_batch_with_fingerprint(&replacements)
+        .replace_person_credits_batch_with_relation_checksum(&replacements)
         .await
         .expect("replace whole page");
-    assert!(
-        database
-            .person_index_item_state_is_current("credit-page-a", Some("fingerprint-a"))
-            .await
-            .expect("first item fingerprint")
-    );
-    assert!(
-        database
-            .person_index_item_state_is_current("credit-page-b", Some("fingerprint-b"))
-            .await
-            .expect("second item fingerprint")
+    let persisted_checksums: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT item_id, relation_checksum FROM person_index_item_state
+         WHERE item_id IN ('credit-page-a', 'credit-page-b') ORDER BY item_id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("persisted page checksums");
+    assert_eq!(
+        persisted_checksums,
+        vec![
+            ("credit-page-a".to_owned(), Some("relation-a".to_owned())),
+            ("credit-page-b".to_owned(), Some("relation-b".to_owned())),
+        ]
     );
     let stored_credit_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM person_credits

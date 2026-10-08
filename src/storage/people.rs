@@ -376,11 +376,12 @@ impl Database {
         credits: &[NewPersonCredit],
         source_fingerprint: Option<&str>,
     ) -> Result<(), StorageError> {
-        self.replace_person_credits_batch_with_fingerprint(&[(
+        self.replace_person_credits_with_relation_checksum(
             item_id,
             credits,
             source_fingerprint,
-        )])
+            None,
+        )
         .await
     }
 
@@ -391,16 +392,51 @@ impl Database {
         if replacements.is_empty() {
             return Ok(());
         }
+        let replacements_with_checksum = replacements
+            .iter()
+            .map(|(item_id, credits, source_fingerprint)| {
+                (*item_id, *credits, *source_fingerprint, None)
+            })
+            .collect::<Vec<_>>();
+        self.replace_person_credits_batch_with_relation_checksum(&replacements_with_checksum)
+            .await
+    }
+
+    pub(crate) async fn replace_person_credits_with_relation_checksum(
+        &self,
+        item_id: &str,
+        credits: &[NewPersonCredit],
+        source_fingerprint: Option<&str>,
+        relation_checksum: Option<&str>,
+    ) -> Result<(), StorageError> {
+        self.replace_person_credits_batch_with_relation_checksum(&[(
+            item_id,
+            credits,
+            source_fingerprint,
+            relation_checksum,
+        )])
+        .await
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) async fn replace_person_credits_batch_with_relation_checksum(
+        &self,
+        replacements: &[(&str, &[NewPersonCredit], Option<&str>, Option<&str>)],
+    ) -> Result<(), StorageError> {
+        if replacements.is_empty() {
+            return Ok(());
+        }
         for replacement_chunk in replacements.chunks(PERSON_CREDIT_REPLACEMENT_BATCH_SIZE) {
             let _metadata_write_guard = self.acquire_metadata_write_lock().await;
             let _write_guard = self.person_credits_write_lock.lock().await;
             let mut transaction = self.begin_metadata_write_transaction().await?;
-            for (item_id, credits, source_fingerprint) in replacement_chunk {
+            for (item_id, credits, source_fingerprint, relation_checksum) in replacement_chunk {
                 self.replace_person_credits_in_transaction(
                     &mut transaction,
                     item_id,
                     credits,
                     *source_fingerprint,
+                    *relation_checksum,
                 )
                 .await?;
             }
@@ -421,6 +457,7 @@ impl Database {
         item_id: &str,
         credits: &[NewPersonCredit],
         source_fingerprint: Option<&str>,
+        relation_checksum: Option<&str>,
     ) -> Result<(), StorageError> {
         let mut seen_keys = HashSet::with_capacity(credits.len());
         let mut duplicates_skipped = 0;
@@ -588,15 +625,17 @@ impl Database {
         }
         self.query(
             "INSERT INTO person_index_item_state (
-                item_id, source_fingerprint, relation_schema_version, updated_at
-             ) VALUES (?, ?, 2, unixepoch())
+                item_id, source_fingerprint, relation_schema_version, relation_checksum, updated_at
+             ) VALUES (?, ?, 2, ?, unixepoch())
              ON CONFLICT(item_id) DO UPDATE SET
                 source_fingerprint = excluded.source_fingerprint,
                 relation_schema_version = excluded.relation_schema_version,
+                relation_checksum = excluded.relation_checksum,
                 updated_at = excluded.updated_at",
         )
         .bind(item_id)
         .bind(source_fingerprint)
+        .bind(relation_checksum)
         .execute(&mut **transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
