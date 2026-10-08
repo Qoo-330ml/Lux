@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     fmt,
     fmt::Write as _,
     io::Cursor,
@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     io::AsyncWriteExt,
-    sync::Mutex as AsyncMutex,
+    sync::{Mutex as AsyncMutex, OnceCell},
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -93,6 +93,27 @@ const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "taglines",
     "aliases",
 ];
+const MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES: usize = 4096;
+
+#[derive(Clone, Default)]
+pub(crate) struct LocalActorRelationPageCache {
+    relevant_item_ids: Arc<HashSet<String>>,
+    legacy_item_ids: Arc<OnceCell<Result<LegacyItemDirectorySnapshot, String>>>,
+}
+
+impl LocalActorRelationPageCache {
+    pub(crate) fn new(item_ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            relevant_item_ids: Arc::new(item_ids.into_iter().collect()),
+            legacy_item_ids: Arc::new(OnceCell::new()),
+        }
+    }
+}
+
+struct LegacyItemDirectorySnapshot {
+    item_ids: HashSet<String>,
+    complete: bool,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -652,6 +673,86 @@ impl PeopleService {
         Ok(read_relation(&legacy_path).await?.is_some())
     }
 
+    pub(crate) async fn item_actor_relation_exists_with_page_cache(
+        &self,
+        item_id: &str,
+        cache: &LocalActorRelationPageCache,
+    ) -> Result<(bool, bool), PeopleError> {
+        let new_path = library_item_directory(&self.config_dir, item_id)
+            .map_err(PeopleError::from)?
+            .join("people.json");
+        if read_relation(&new_path).await?.is_some() {
+            return Ok((true, false));
+        }
+
+        let mut loaded = false;
+        let legacy_item_ids = cache
+            .legacy_item_ids
+            .get_or_init(|| async {
+                loaded = true;
+                self.read_legacy_item_relation_ids(&cache.relevant_item_ids)
+                    .await
+            })
+            .await;
+        let legacy_path = self
+            .legacy_people_dir()
+            .join(LEGACY_ITEMS_DIR)
+            .join(format!("{item_id}.json"));
+        match legacy_item_ids {
+            Ok(snapshot) if snapshot.item_ids.contains(item_id) => {
+                Ok((read_relation(&legacy_path).await?.is_some(), loaded))
+            }
+            Ok(snapshot) if snapshot.complete => Ok((false, loaded)),
+            Ok(_) => Ok((read_relation(&legacy_path).await?.is_some(), loaded)),
+            Err(_directory_error) => Ok((read_relation(&legacy_path).await?.is_some(), loaded)),
+        }
+    }
+
+    async fn read_legacy_item_relation_ids(
+        &self,
+        relevant_item_ids: &HashSet<String>,
+    ) -> Result<LegacyItemDirectorySnapshot, String> {
+        let directory = self.legacy_people_dir().join(LEGACY_ITEMS_DIR);
+        let mut entries = match fs::read_dir(&directory).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(LegacyItemDirectorySnapshot {
+                    item_ids: HashSet::new(),
+                    complete: true,
+                });
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        let mut item_ids = HashSet::new();
+        let mut entry_count = 0;
+        let mut complete = true;
+        loop {
+            if entry_count >= MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES {
+                complete = false;
+                break;
+            }
+            let entry = match entries.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(error) => return Err(error.to_string()),
+            };
+            entry_count += 1;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if let Some(item_id) = name.strip_suffix(".json") {
+                if relevant_item_ids.contains(item_id) {
+                    item_ids.insert(item_id.to_owned());
+                    if item_ids.len() == relevant_item_ids.len() {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(LegacyItemDirectorySnapshot { item_ids, complete })
+    }
+
     pub async fn item_actor_relation_is_current(
         &self,
         item_id: &str,
@@ -896,13 +997,14 @@ fn detected_profile_image_format(bytes: &[u8]) -> Option<(&'static str, &'static
 #[cfg(all(test, unix))]
 mod tests {
     use std::{
-        collections::{BTreeMap, BTreeSet},
+        collections::{BTreeMap, BTreeSet, HashSet},
         sync::Arc,
     };
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::{
-        ActorCredit, DeferredNfoActorCredits, PENDING_PERSON_MANIFEST, PERSON_MANIFEST,
+        ActorCredit, DeferredNfoActorCredits, LocalActorRelationPageCache,
+        MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES, PENDING_PERSON_MANIFEST, PERSON_MANIFEST,
         PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService, PersonIdentity,
         PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions, PersonMetadata,
     };
@@ -933,6 +1035,105 @@ mod tests {
         assert!(coordinator.finish().await);
         assert!(!coordinator.finish().await);
         assert!(coordinator.begin().await);
+    }
+
+    #[tokio::test]
+    async fn local_actor_relation_page_cache_lists_legacy_items_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let legacy_items = directory.path().join("people/items");
+        tokio::fs::create_dir_all(&legacy_items).await?;
+        tokio::fs::write(legacy_items.join("episode-1.json"), b"[]").await?;
+        tokio::fs::write(legacy_items.join("episode-2.json"), b"[]").await?;
+
+        let service = PeopleService::new(directory.path().to_owned());
+        let cache = LocalActorRelationPageCache::new(
+            ["episode-1", "episode-2", "episode-3"]
+                .into_iter()
+                .map(str::to_owned),
+        );
+        let (first, second, missing) = tokio::join!(
+            service.item_actor_relation_exists_with_page_cache("episode-1", &cache),
+            service.item_actor_relation_exists_with_page_cache("episode-2", &cache),
+            service.item_actor_relation_exists_with_page_cache("episode-3", &cache),
+        );
+        let (first_exists, first_loaded) = first?;
+        let (second_exists, second_loaded) = second?;
+        let (missing_exists, missing_loaded) = missing?;
+
+        assert!(first_exists);
+        assert!(second_exists);
+        assert!(!missing_exists);
+        assert_eq!(
+            [first_loaded, second_loaded, missing_loaded]
+                .into_iter()
+                .filter(|loaded| *loaded)
+                .count(),
+            1,
+            "a page should enumerate its legacy relation directory only once"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_actor_relation_page_cache_falls_back_when_legacy_directory_cannot_be_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let legacy_people = directory.path().join("people");
+        tokio::fs::create_dir_all(&legacy_people).await?;
+        tokio::fs::write(legacy_people.join("items"), b"not a directory").await?;
+
+        let service = PeopleService::new(directory.path().to_owned());
+        let cache = LocalActorRelationPageCache::new(["episode-1".to_owned()]);
+        let result = service
+            .item_actor_relation_exists_with_page_cache("episode-1", &cache)
+            .await;
+
+        assert!(matches!(result, Err(PeopleError::Io { .. })));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_actor_relation_page_cache_falls_back_after_legacy_entry_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let legacy_items = directory.path().join("people/items");
+        tokio::fs::create_dir_all(&legacy_items).await?;
+        let entries_path = legacy_items.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            for index in 0..=MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES {
+                std::fs::write(entries_path.join(format!("unrelated-{index}.json")), b"[]")?;
+            }
+            Ok(())
+        })
+        .await??;
+
+        let service = PeopleService::new(directory.path().to_owned());
+        let relevant_item_ids = HashSet::from(["episode-target".to_owned()]);
+        let snapshot = service
+            .read_legacy_item_relation_ids(&relevant_item_ids)
+            .await?;
+        assert!(
+            !snapshot.complete,
+            "the directory scan must stop at its cap"
+        );
+        assert!(!snapshot.item_ids.contains("episode-target"));
+
+        tokio::fs::write(legacy_items.join("episode-target.json"), b"[]").await?;
+        let cache = LocalActorRelationPageCache::new(["episode-target".to_owned()]);
+        assert!(
+            cache.legacy_item_ids.set(Ok(snapshot)).is_ok(),
+            "the fixture snapshot should initialize the page cache"
+        );
+        let (exists, _) = service
+            .item_actor_relation_exists_with_page_cache("episode-target", &cache)
+            .await?;
+
+        assert!(
+            exists,
+            "an incomplete snapshot must fall back to the legacy path"
+        );
+        Ok(())
     }
 
     #[tokio::test]

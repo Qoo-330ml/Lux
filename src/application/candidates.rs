@@ -16,8 +16,11 @@ use crate::{
         images::{ImageWriteError, ImageWriteService, MAX_IMAGE_VARIANTS, image_no_candidate_key},
         media_matching::{MediaKind, parse_media_name, title_candidates},
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
-        nfo::{MovieNfoCredit, MovieNfoMetadata, NfoWriteError, NfoWriteService},
-        people::{ActorCredit, PeopleError},
+        nfo::{
+            LocalNfoProjectionCache, MovieNfoCredit, MovieNfoMetadata, NfoWriteError,
+            NfoWriteService,
+        },
+        people::{ActorCredit, LocalActorRelationPageCache, PeopleError},
         scraper::{
             ScraperError, ScraperGetRequest, ScraperImageRequest, ScraperItemType, ScraperMetadata,
             ScraperProvider, ScraperSearchResponse, ScraperSearchResult, provider_id_for_key,
@@ -54,6 +57,21 @@ const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
 const CAPABILITY_TRAILERS: &str = "TRAILERS";
 const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
 const COMPLETENESS_INPUT_VERSION: u64 = 1;
+
+#[derive(Clone)]
+struct LocalCompletenessPlanningCaches {
+    nfo_projection: LocalNfoProjectionCache,
+    actor_relation: LocalActorRelationPageCache,
+}
+
+impl LocalCompletenessPlanningCaches {
+    fn new(item_ids: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            nfo_projection: LocalNfoProjectionCache::default(),
+            actor_relation: LocalActorRelationPageCache::new(item_ids),
+        }
+    }
+}
 
 type CompletenessPlanTask<T> =
     std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
@@ -2378,6 +2396,11 @@ impl MetadataSelectionService {
 
         let mut actual_plans = Vec::with_capacity(supported_items.len());
         let mut attempt_item_ids = Vec::new();
+        let page_caches = LocalCompletenessPlanningCaches::new(
+            supported_items
+                .iter()
+                .map(|(item_id, _)| (*item_id).to_owned()),
+        );
         for (chunk_index, supported_chunk) in supported_items
             .chunks(COMPLETENESS_PLAN_ITEM_CONCURRENCY)
             .enumerate()
@@ -2402,6 +2425,7 @@ impl MetadataSelectionService {
                     .ok_or(MetadataSelectionError::ItemNotFound)?;
                 let item_id = item_id.to_owned();
                 let current = (*current).clone();
+                let page_caches = page_caches.clone();
                 let service = self.clone();
                 let task: CompletenessPlanTask<Result<_, MetadataSelectionError>> =
                     Box::pin(async move {
@@ -2424,6 +2448,7 @@ impl MetadataSelectionService {
                                 image_policy,
                                 actual_missing_image_mask,
                                 Some(&writeback_context),
+                                Some(page_caches),
                             )
                             .await?;
                         let should_read_attempt_state = capability_identity.is_some()
@@ -2497,12 +2522,24 @@ impl MetadataSelectionService {
         image_policy: ImageSelectionPolicy,
         actual_missing_image_mask: u16,
         writeback_context: Option<&crate::storage::StoredMediaWritebackContext>,
+        page_caches: Option<LocalCompletenessPlanningCaches>,
     ) -> Result<(MetadataRequestPlan, Option<(String, String)>), MetadataSelectionError> {
         let details = current.nfo_metadata_json.as_deref().and_then(|value| {
             serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
         });
         let details = if details.is_some() {
             details
+        } else if let (Some(page_caches), Some(context)) = (page_caches.as_ref(), writeback_context)
+        {
+            self.nfo
+                .read_item_projection_with_writeback_context_cached(
+                    current.season_number,
+                    context,
+                    &page_caches.nfo_projection,
+                )
+                .await?
+                .0
+                .map(|projection| projection.details)
         } else if let Some(context) = writeback_context {
             self.nfo
                 .read_item_projection_with_writeback_context(current.season_number, context)
@@ -2517,11 +2554,18 @@ impl MetadataSelectionService {
         let credits_missing = match current.item_type.as_str() {
             "MOVIE" | "SERIES" => {
                 if credits_need_actor_relation_check(details.as_ref()) {
-                    !self
-                        .people
-                        .item_actor_relation_exists(item_id)
-                        .await
-                        .map_err(MetadataSelectionError::People)?
+                    let exists = if let Some(page_caches) = page_caches.as_ref() {
+                        self.people
+                            .item_actor_relation_exists_with_page_cache(
+                                item_id,
+                                &page_caches.actor_relation,
+                            )
+                            .await?
+                            .0
+                    } else {
+                        self.people.item_actor_relation_exists(item_id).await?
+                    };
+                    !exists
                 } else {
                     true
                 }
@@ -2602,6 +2646,7 @@ impl MetadataSelectionService {
                 current,
                 image_policy,
                 actual_missing_image_mask,
+                None,
                 None,
             )
             .await?;
@@ -4241,6 +4286,7 @@ mod tests {
         parse_image_selection_policy, run_bounded_completeness_plan_tasks,
         selected_scraper_provider_id,
     };
+    use crate::application::images::ImageWriteService;
     use crate::application::scraper::{
         ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
         ScraperExternalIdsResponse, ScraperFuture, ScraperGetRequest, ScraperImage,
@@ -4249,7 +4295,7 @@ mod tests {
         ScraperTrailersResponse,
     };
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
-    use crate::storage::{StoredMediaMetadata, StoredMetadataCapabilityAttempt};
+    use crate::storage::{Database, StoredMediaMetadata, StoredMetadataCapabilityAttempt};
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::sync::{
@@ -4257,6 +4303,114 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::time::{Duration, sleep};
+
+    #[tokio::test]
+    async fn local_completeness_page_shares_movie_projection_and_relation_caches()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("movies");
+        tokio::fs::create_dir_all(&root).await?;
+        tokio::fs::write(root.join("First.mkv"), b"one").await?;
+        tokio::fs::write(root.join("Second.mkv"), b"two").await?;
+        tokio::fs::write(
+            root.join("movie.nfo"),
+            b"<movie><title>Shared movie</title><director>Director</director><writer>Writer</writer></movie>",
+        )
+        .await?;
+
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM media_items WHERE item_type = 'MOVIE' ORDER BY id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        let metadata_by_item = database
+            .list_active_media_item_metadata_with_libraries(&item_ids)
+            .await?;
+        let plan_inputs = item_ids
+            .iter()
+            .filter_map(|item_id| {
+                metadata_by_item
+                    .get(item_id)
+                    .map(|(_, current)| (item_id.as_str(), current))
+            })
+            .collect::<Vec<_>>();
+        let service = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir,
+        );
+
+        let plans = service
+            .local_metadata_completeness_plans(&plan_inputs)
+            .await?;
+        let first_item_id = item_ids.first().ok_or("movie fixture has no items")?;
+        let (_, stored_current) = metadata_by_item
+            .get(first_item_id)
+            .ok_or("movie metadata row missing")?;
+        let mut current_with_projection = stored_current.clone();
+        current_with_projection.nfo_metadata_json =
+            Some(json!({"directors": [], "writers": []}).to_string());
+        let mut contexts = database
+            .list_media_item_writeback_contexts_by_ids(&item_ids)
+            .await?;
+        let mut context = contexts
+            .remove(first_item_id)
+            .ok_or("movie writeback context missing")?;
+        context
+            .source
+            .as_mut()
+            .ok_or("movie source path missing")?
+            .root_path = root.join("missing-root").to_string_lossy().into_owned();
+        let (database_projection_plan, _) = service
+            .actual_request_plan_for_current(
+                first_item_id,
+                &current_with_projection,
+                super::ImageSelectionPolicy::default(),
+                0,
+                Some(&context),
+                Some(super::LocalCompletenessPlanningCaches::new([
+                    first_item_id.clone()
+                ])),
+            )
+            .await?;
+        assert!(
+            database_projection_plan.needs_credits,
+            "a parsed database projection should avoid the invalid sidecar source"
+        );
+
+        for item_id in item_ids {
+            let plan = plans
+                .get(&item_id)
+                .and_then(Option::as_ref)
+                .ok_or("movie completeness plan missing")?;
+            assert!(
+                plan.capabilities
+                    .iter()
+                    .any(|(name, missing)| { name == "CREDITS" && *missing })
+            );
+        }
+        Ok(())
+    }
 
     #[derive(Clone)]
     struct DelayedActorAdapter {

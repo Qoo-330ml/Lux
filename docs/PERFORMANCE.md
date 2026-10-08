@@ -1690,3 +1690,11 @@ SQLite 故障注入在 job row 已插入、job item 写入失败时确认 comple
 worker 现在一次 storage query 同时读取 pending 状态与 MOVIE、VIDEO、EPISODE 优先级下首个有界 source page；每个类型候选最多取请求页大小，再按 target ID 选首个可用类型，因此无 source 的早期 pending 项不会挡住后续可处理类型。固定 SQLite 回归覆盖每类 page 顺序、无 source pending 与无 pending，storage query-wrapper 次数各为 1。原处理循环最多执行 pending 检查 1 次和类型 page 查询 1–3 次；新循环为 1 次组合 page query。Manifest worker 校验也将 workflow/discovery 状态与全部 root identity/target cursor 信息由 2 次 storage query 合并为 1 次；仍会在有 pending 的批次逐个 stat 有正向记录的本地 roots，根身份变化时 worker 不解析或写回 NFO，并将 target 保留为失败可重试。
 
 固定 scanner 回归确认 root mismatch 会让 target 进入 `FAILED`、library root 标为不可用且媒体条目不被本地 NFO 改写；既有空闲 Notify 回归仍是一条 query-wrapper 调用。metadata 20/20、scanned metadata 16/16、scanning jobs 81/81 及 PostgreSQL progressive-scan storage contract 通过。本机 `arm64`；这些计数不代表 SQL 墙钟、PostgreSQL 生产负载或 FNOS/NAS CPU 收益，也未做部署测量。
+
+### LUX-444 completeness page 本地 projection 与 relation 检查缓存
+
+固定测试 fixture 中两个 episode 指向同一 canonical `episode.nfo` 时，共享的 page-scope `OnceCell` 仅允许一个并发调用初始化读取/解析，其余 item 复用解析结果；下一页建立新 cache，会观察 sidecar 内容更新。NFO path/read/parse error 在 cache 中保留对应的 `NfoWriteError` 类别，并由 LUX-422 的有序结果汇总选择首错误。数据库已提供可解析 NFO projection 的 item 不进入旁车缓存路径。
+
+actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallback 时，一页只枚举一次 `people/items`，最多读取 4096 个 directory entry；缓存完整目录内的缺失 ID 时跳过 legacy per-item stat，只为目录中命中的 ID 读取 relation JSON。超过上限或目录读取失败会对未确定 item 回退原路径检查，因此旧目录很大时不会无界遍历。固定回归确认共享 legacy listing 只初始化一次、命中的 relation 仍被解析，以及不可读目录触发逐路径 fallback。
+
+该项复用现有每页最多 4 个 item 的并发上限；路径 canonicalization、新式每 item relation 检查和图片 discovery 仍各自执行。未统计真实目录大小、旁车字节数、文件系统调用总量或耗时；性能描述只基于固定行为回归，不推断墙钟、PostgreSQL、FNOS/NAS 或 CPU 收益。

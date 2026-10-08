@@ -1,8 +1,9 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     io::Cursor,
     path::{Path, PathBuf},
+    sync::Arc,
     time::UNIX_EPOCH,
 };
 
@@ -18,6 +19,7 @@ use time::OffsetDateTime;
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
+    sync::{Mutex, OnceCell},
 };
 use uuid::Uuid;
 
@@ -29,7 +31,91 @@ use crate::application::metadata_paths::{library_item_directory, metadata_root};
 use crate::application::metadata_writeback::item_metadata_writeback_enabled;
 use crate::application::people::ActorCredit;
 use crate::application::probe::{MediaProbeResult, MediaStreamResult, StreamType};
-use crate::storage::{Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath};
+use crate::storage::{
+    Database, MediaMetadataUpdate, StorageError, StoredMediaSourcePath, StoredMediaWritebackContext,
+};
+
+#[derive(Clone, Default)]
+pub(crate) struct LocalNfoProjectionCache {
+    entries: Arc<Mutex<HashMap<PathBuf, Arc<OnceCell<CachedNfoProjectionResult>>>>>,
+}
+
+type CachedNfoProjectionResult = Result<Option<LocalNfoProjection>, CachedNfoProjectionError>;
+
+#[derive(Clone)]
+enum CachedNfoProjectionError {
+    Io {
+        path: PathBuf,
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+    Parse(CachedNfoParseError),
+    Other(String),
+}
+
+#[derive(Clone)]
+enum CachedNfoParseError {
+    TooLarge,
+    TooManyEvents,
+    FieldTooLarge,
+    DocTypeNotAllowed,
+    Unbalanced,
+    Xml(String),
+    Io {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+impl CachedNfoProjectionError {
+    fn from_write_error(error: NfoWriteError) -> Self {
+        match error {
+            NfoWriteError::Io { path, source } => Self::Io {
+                path,
+                kind: source.kind(),
+                message: source.to_string(),
+            },
+            NfoWriteError::Nfo(error) => Self::Parse(match error {
+                NfoError::TooLarge => CachedNfoParseError::TooLarge,
+                NfoError::TooManyEvents => CachedNfoParseError::TooManyEvents,
+                NfoError::FieldTooLarge => CachedNfoParseError::FieldTooLarge,
+                NfoError::DocTypeNotAllowed => CachedNfoParseError::DocTypeNotAllowed,
+                NfoError::Unbalanced => CachedNfoParseError::Unbalanced,
+                NfoError::Xml(message) => CachedNfoParseError::Xml(message),
+                NfoError::Io(source) => CachedNfoParseError::Io {
+                    kind: source.kind(),
+                    message: source.to_string(),
+                },
+            }),
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    fn into_write_error(self) -> NfoWriteError {
+        match self {
+            Self::Io {
+                path,
+                kind,
+                message,
+            } => NfoWriteError::Io {
+                path,
+                source: std::io::Error::new(kind, message),
+            },
+            Self::Parse(error) => NfoWriteError::Nfo(match error {
+                CachedNfoParseError::TooLarge => NfoError::TooLarge,
+                CachedNfoParseError::TooManyEvents => NfoError::TooManyEvents,
+                CachedNfoParseError::FieldTooLarge => NfoError::FieldTooLarge,
+                CachedNfoParseError::DocTypeNotAllowed => NfoError::DocTypeNotAllowed,
+                CachedNfoParseError::Unbalanced => NfoError::Unbalanced,
+                CachedNfoParseError::Xml(message) => NfoError::Xml(message),
+                CachedNfoParseError::Io { kind, message } => {
+                    NfoError::Io(std::io::Error::new(kind, message))
+                }
+            }),
+            Self::Other(message) => NfoWriteError::InvalidMetadata(message),
+        }
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct LocalNfoCredit {
@@ -2309,6 +2395,38 @@ impl NfoWriteService {
         self.read_item_projection_at_target(&target).await
     }
 
+    pub(crate) async fn read_item_projection_with_writeback_context_cached(
+        &self,
+        season_number: Option<i64>,
+        context: &StoredMediaWritebackContext,
+        cache: &LocalNfoProjectionCache,
+    ) -> Result<(Option<LocalNfoProjection>, bool), NfoWriteError> {
+        let source = context.source.as_ref().ok_or(NfoWriteError::ItemNotFound)?;
+        let target = self
+            .item_nfo_target_from_source(&context.item_type, season_number, source)
+            .await?;
+        let cell = {
+            let mut entries = cache.entries.lock().await;
+            entries
+                .entry(target.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let mut loaded = false;
+        let projection = cell
+            .get_or_init(|| async {
+                loaded = true;
+                self.read_item_projection_at_target(&target)
+                    .await
+                    .map_err(CachedNfoProjectionError::from_write_error)
+            })
+            .await;
+        let projection = projection
+            .clone()
+            .map_err(CachedNfoProjectionError::into_write_error)?;
+        Ok((projection, loaded))
+    }
+
     pub(crate) async fn read_item_projection_with_writeback_context(
         &self,
         season_number: Option<i64>,
@@ -3134,6 +3252,133 @@ mod tests {
         config::Config,
         library::LibraryKind,
     };
+
+    #[tokio::test]
+    async fn shared_episode_nfo_projection_is_cached_per_page_and_keeps_errors_typed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let root = directory.path().join("media");
+        let show = root.join("Show");
+        fs::create_dir_all(&show).await?;
+        fs::write(show.join("S01E01.mkv"), b"one").await?;
+        fs::write(show.join("S01E02.mkv"), b"two").await?;
+        fs::write(
+            show.join("episode.nfo"),
+            b"<episodedetails><title>Shared episode metadata</title></episodedetails>",
+        )
+        .await?;
+        let other_show = root.join("Other");
+        fs::create_dir_all(&other_show).await?;
+        fs::write(other_show.join("S01E01.mkv"), b"other").await?;
+        fs::write(
+            other_show.join("episode.nfo"),
+            b"<episodedetails><title>Independent episode metadata</title></episodedetails>",
+        )
+        .await?;
+        let database = Database::connect(&config).await?;
+        let service = NfoWriteService::new(database);
+        let root_path = root.to_string_lossy().into_owned();
+        let request = |item_id: &str, filename: &str| {
+            (
+                item_id.to_owned(),
+                Some(1),
+                StoredMediaWritebackContext {
+                    item_type: "EPISODE".to_owned(),
+                    source: Some(StoredMediaSourcePath {
+                        source_id: format!("source-{item_id}"),
+                        item_id: item_id.to_owned(),
+                        probe_status: "DONE".to_owned(),
+                        root_path: root_path.clone(),
+                        relative_path: format!("Show/{filename}"),
+                    }),
+                },
+            )
+        };
+
+        let (_, season_a, context_a) = request("episode-1", "S01E01.mkv");
+        let (_, season_b, context_b) = request("episode-2", "S01E02.mkv");
+        let cache = LocalNfoProjectionCache::default();
+        let (first, second) = tokio::join!(
+            service
+                .read_item_projection_with_writeback_context_cached(season_a, &context_a, &cache,),
+            service
+                .read_item_projection_with_writeback_context_cached(season_b, &context_b, &cache,),
+        );
+        let (projection_a, loaded_a) = first?;
+        let (projection_b, loaded_b) = second?;
+        let projection_a = projection_a.ok_or("shared episode sidecar was not found")?;
+        let projection_b = projection_b.ok_or("shared episode sidecar was not found")?;
+        assert_eq!(
+            projection_a.metadata.title.as_deref(),
+            Some("Shared episode metadata")
+        );
+        assert_eq!(
+            projection_b.metadata.title.as_deref(),
+            Some("Shared episode metadata")
+        );
+        assert_ne!(loaded_a, loaded_b, "shared sidecar should be loaded once");
+
+        let (_, _, context_other) = request("episode-other", "../Other/S01E01.mkv");
+        let (other_projection, loaded_other) = service
+            .read_item_projection_with_writeback_context_cached(Some(1), &context_other, &cache)
+            .await?;
+        assert!(
+            loaded_other,
+            "a different canonical sidecar gets its own initializer"
+        );
+        assert_eq!(
+            other_projection.and_then(|projection| projection.metadata.title),
+            Some("Independent episode metadata".to_owned())
+        );
+
+        fs::write(
+            show.join("episode.nfo"),
+            b"<episodedetails><title>Updated page metadata</title></episodedetails>",
+        )
+        .await?;
+        let next_page_cache = LocalNfoProjectionCache::default();
+        let (next_a, next_b) = tokio::join!(
+            service.read_item_projection_with_writeback_context_cached(
+                season_a,
+                &context_a,
+                &next_page_cache,
+            ),
+            service.read_item_projection_with_writeback_context_cached(
+                season_b,
+                &context_b,
+                &next_page_cache,
+            ),
+        );
+        for result in [next_a, next_b] {
+            let (projection, _) = result?;
+            assert_eq!(
+                projection.and_then(|projection| projection.metadata.title),
+                Some("Updated page metadata".to_owned())
+            );
+        }
+
+        fs::write(show.join("episode.nfo"), b"<episodedetails><title>Broken").await?;
+        let error_cache = LocalNfoProjectionCache::default();
+        let (error_a, error_b) = tokio::join!(
+            service.read_item_projection_with_writeback_context_cached(
+                season_a,
+                &context_a,
+                &error_cache,
+            ),
+            service.read_item_projection_with_writeback_context_cached(
+                season_b,
+                &context_b,
+                &error_cache,
+            ),
+        );
+        assert!(matches!(error_a, Err(NfoWriteError::Nfo(_))));
+        assert!(matches!(error_b, Err(NfoWriteError::Nfo(_))));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn no_op_nfo_write_reuses_the_file_stamp_fingerprint()

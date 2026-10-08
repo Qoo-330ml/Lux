@@ -9232,6 +9232,24 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：本地 metadata worker 一次读取 pending 状态与首个有界 source page，保持 MOVIE、VIDEO、EPISODE 优先级以及每类按 target ID 的稳定顺序；pending 条目无 source 时仍与无 pending 区分。manifest workflow/discovery 状态、全部 root identity 与 target cursor 信息合并为一次 storage query，仍在每个 pending 批次 stat 正向 roots；root identity 变化时目标被标记 FAILED、root 标为不可用，NFO 不会被应用。固定 SQLite query-wrapper 回归覆盖三类顺序和 source unavailable 状态，worker/manifest 回归覆盖 root mismatch。`metadata` 20/20、`scanned_metadata` 16/16、`scanning_jobs` 81/81、PostgreSQL `postgres_progressive_scan_metadata_storage_contract`、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。全量 all-targets 有三个失败目标（`emby_counts`、`metadata_selection`、`strm`），与父提交 `855d890a` 已记录的独立失败一致；相关集成测试文件未被本任务修改。开发机 `arm64`；未在 FNOS/NAS 上部署或测量运行性能，query-wrapper 计数不代表 SQL 墙钟。
 
+#### LUX-444：本地 completeness 页按路径复用 NFO projection 与人物关系检查
+
+范围：LUX-422 已把本地 completeness 的 item 检查限制为最多 4 路并发，metadata row 中可解析的 NFO projection 已直接复用；但多个 episode 共用 `episode.nfo` 时仍重复读取和解析 sidecar，legacy `people/items` fallback 也逐 item 查询目录。给一次 planning page 增加按 canonical NFO target path 键控的惰性缓存，让相同路径共用一次读取和解析；给 actor relation 检查增加惰性 page cache，在新式 per-item relation 不存在后只枚举一次 legacy relation 目录，并仅对命中 ID 读取旧文件。目录枚举最多读取 4096 个 entry；达到上限但目标 ID 尚未齐全，或目录枚举失败时，对未确定 item 保留原逐路径 fallback。缓存只活到本次 page planning 结束。每项仍独立做 root/source canonicalization 与目标安全检查。缓存错误按 item 传播，planning task 仍按原输入顺序选择首错误；数据库已有的 NFO projection 仍优先，LUX-413 的 crew 缺失短路不变。
+
+预计文件：`src/application/nfo.rs`、`src/application/people/service.rs`、`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。
+
+验收：
+
+- [x] 同目录多个 episode 共用 `episode.nfo` 时，并发 page lookup 只有一个调用执行 sidecar read/parse initializer，所有 item 得到相同 projection；互不相同的 target 不合并。
+- [x] 新 relation 缺失的多个 item 共用一次 legacy `people/items` 目录快照；命中旧 relation 仍解析文件，完整快照中的未命中 ID 不逐项 stat legacy 路径，4096-entry 上限或目录枚举失败时回退原路径检查。
+- [x] NFO path/read/parse error 保持原类型并按既有输入顺序汇总；数据库 projection 快路径不触发旁车读取；storage item/context/attempt 批量查询不变。
+- [x] page planning 总并发仍不超过 4；新增缓存回归、NFO/scanned metadata 定向目标、fmt、build、全目标全 feature Clippy 与差异检查完成。全量目标测试执行时命中已有且与本改动无关的集成测试失败，具体结果见下。
+- [x] 性能记录只陈述同路径重复解析被去重及并发上界，不推断实际文件系统时延、PostgreSQL 或 FNOS/NAS CPU 收益。
+
+短计划与文件：修改 `src/application/nfo.rs`、`src/application/people/service.rs`、`src/application/candidates.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先为同一 canonical sidecar 和 legacy directory snapshot 加并发回归，再将两个缓存限制在 planning page，并验证错误顺序、目录读失败 fallback、数据库 projection 快路径与既有并发上限。
+
+结果（2026-10-08）：固定测试确认同一 page 内共享 sidecar 只解析一次、不同 target 不共享、下一页读取变更后的内容，错误类型保持且 database projection 可避开失效 source；relation cache 一页只枚举一次，读取命中的旧 JSON，不可读目录和超过 4096 项后的未确定 ID 均走原路径 fallback。候选 page planning 回归、NFO projection 回归、relation cache 3 项回归、`nfo_writer` 26/26、`scanned_metadata` 16/16、build、fmt 和全目标全 feature Clippy 通过。全量测试的库单测为 789 通过、13 忽略；集成阶段在 `emby_counts` 失败并停止（未收藏计数期望 0、实际 1）。单独运行 `metadata_selection` 为 30/31（可选 actor enrichment 等待超时），`strm` 的认证请求返回 401 而期望 200；这些失败此前已在父提交记录，且对应集成测试不在本任务改动中。开发机 `arm64`；未测文件系统耗时、PostgreSQL、FNOS/NAS 或生产 CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
