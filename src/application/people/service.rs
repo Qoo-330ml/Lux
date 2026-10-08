@@ -1009,7 +1009,7 @@ mod tests {
         MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES, PENDING_PERSON_MANIFEST, PERSON_MANIFEST,
         PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService, PersonIdentity,
         PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions, PersonMetadata,
-        write_atomically_if_changed,
+        PersonMetadataUpdate, write_atomically_if_changed,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
@@ -2680,6 +2680,37 @@ mod tests {
 
         service
             .persist_nfo_item_actors("item-1", "tmdb", &actors, &source_fingerprint)
+            .await?;
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-1").await?;
+
+        let enriched_actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: Some(PersonMetadata {
+                biography: Some("在线补全的人物简介".to_owned()),
+                ..PersonMetadata::default()
+            }),
+        };
+        service
+            .update_item_actor_metadata("item-1", "tmdb", &[enriched_actor])
+            .await?;
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-1").await?;
+
+        service
+            .update_person_metadata(
+                &[library.id.to_string()],
+                "9",
+                PersonMetadataUpdate {
+                    name: "演员甲".to_owned(),
+                    biography: Some("人物资料更新后的简介".to_owned()),
+                    ..PersonMetadataUpdate::default()
+                },
+            )
             .await?;
         assert_relation_checksum_matches_file(&database, &config.config_dir, "item-1").await?;
 

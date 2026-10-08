@@ -370,6 +370,7 @@ impl Database {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn replace_person_credits_with_fingerprint(
         &self,
         item_id: &str,

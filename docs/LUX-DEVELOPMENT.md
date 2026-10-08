@@ -9384,11 +9384,13 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] actor metadata 与 person metadata 更新后，数据库保存的 relation checksum 等于实际 `people.json` 字节的 SHA-256。
-- [ ] relation 文件先写入、credits/checksum 事务失败时保留文件作为恢复来源；不重复读盘或重序列化计算 checksum。
-- [ ] service 回归覆盖两种 metadata 更新路径；相关 people tests、build、fmt、Clippy 与差异检查通过。
+- [x] actor metadata 与 person metadata 更新后，数据库保存的 relation checksum 等于实际 `people.json` 字节的 SHA-256。
+- [x] relation 文件先写入、credits/checksum 事务失败时保留文件作为恢复来源；不重复读盘或重序列化计算 checksum。
+- [x] service 回归覆盖两种 metadata 更新路径；相关 people tests、build、fmt、Clippy 与差异检查通过。
 
 预计文件：`src/application/people/metadata.rs`、`src/application/people/service.rs`、`src/storage/people.rs`、`docs/LUX-DEVELOPMENT.md`。先在现有 metadata 更新回归中加入实际文件 checksum 断言，再将 checksum 传入 credits transaction，并把已退出生产路径的 wrapper 限制为测试使用。
+
+结果（2026-10-09）：actor metadata 与 person metadata 两种改写都对即将写入的 JSON 字节计算 checksum，并与对应 credits/source fingerprint 在同一数据库事务持久化；写文件仍先于数据库事务，失败时保留可供后续重建读取的文件。旧 fingerprint-only 单项入口只供测试使用。回归先在旧实现下失败（数据库 checksum 为 NULL），再以 39/39 people service tests 通过；`cargo build --locked`、全目标全 feature Clippy、fmt 与 `git diff --check` 通过。全目标测试在合并实现状态下通过（797 passed、13 ignored；其中 16 个 PostgreSQL 专项因无本地 PostgreSQL 而 ignored）。本机 `arm64`，未做 FNOS/生产性能验证。
 
 #### LUX-455：按人物关系快照 checksum 判定运行索引是否 current
 
