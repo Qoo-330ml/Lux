@@ -1617,3 +1617,7 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 删除媒体库时，进程内 active scan run 的最后一个 guard 结束后通过 `Notify` 唤醒删除等待者；等待者在检查 registry 前先注册通知，因此 guard 即使恰好在注册与检查之间释放，也会被观察到。原 30 秒删除超时和阻止新 run 的 library fence 保持不变。扫描优先级与 manifest materialization 的数据库条件仍需跨进程轮询，间隔按 10、20、40、80、160、250ms 增长并封顶；相应的进程外状态变化观察窗口最多 250ms。拿到 scan semaphore 后仍复核数据库条件。
 
 单测覆盖退避边界，删除回归覆盖终态 job 对应的活跃 run 等待、释放后完成和 fence。没有采集总体 SQL 数、实际等待时长、CPU、FNOS 或 NAS 性能数据。
+
+### LUX-431 人物 manifest 跨进程锁退避
+
+争用中的人物 relation/manifest 文件锁等待改为 10、20、40、80、160、250ms 并封顶，使用 1 秒单调截止时间；未争用时仍立即取得 `create_new` 锁，超过 300 秒的 stale lock 继续清理。固定本地回归确认退避边界、未占用锁成功和持续占用锁返回 `TimedOut`。最大锁等待合同仍约 1 秒，理论轮询次数由 100 次降至约 8 次；没有测量真实文件系统耗时、并发冲突率或生产收益。

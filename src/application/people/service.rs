@@ -5,7 +5,7 @@ use std::{
     io::Cursor,
     path::{Component, Path, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};

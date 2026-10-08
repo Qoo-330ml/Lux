@@ -9043,6 +9043,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：active run 的最后一个 guard 移除 registry 项后通知等待者；删除等待先注册并启用通知，再复核活动项，避免通知早于 await 时丢失唤醒。原 30 秒超时和 deletion fence 保留。数据库条件等待采用 10、20、40、80、160、250ms 并封顶，拿到 scan semaphore 后仍重新读取优先级条件。退避边界单测、删除 active run/fence 单测、`tests/scanning_jobs.rs` 删除 worker 回归和 `tests/library_deletion.rs` 通过；build、fmt、Clippy 与 `git diff --check` 通过。本机架构 ARM64；记录的 250ms 是进程外数据库变化的退避观察窗口上限，不表示生产 CPU、FNOS 或 NAS 收益。
 
+#### LUX-431：降低人物 manifest 文件锁争用轮询
+
+范围：`acquire_exclusive_file_lock` 遇到已有锁时固定每 10ms 轮询，最多 100 次。改为单调时钟控制的 1 秒总等待期限，以及 10ms、20ms、40ms、80ms、160ms、250ms 后封顶的有界退避；stale lock 检查、跨进程 `create_new` 互斥语义、成功后的锁内容和错误类型保持不变。该文件锁允许其他进程持有，不能依赖进程内 Notify。
+
+验收：
+
+- [x] 自动化覆盖退避序列、封顶和仍被占用的锁在期限内返回 TimedOut；未占用锁仍可立即获取。
+- [x] 人物 relation/manifest 写入及管理 API 定向回归通过；不改变 stale-lock 清理阈值或跨进程锁格式。
+- [x] 性能记录仅报告最长等待与检查间隔，不外推文件系统墙钟、生产 CPU、FNOS 或 NAS 收益。
+
+预计文件：`src/application/people/helpers.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 backoff 序列回归，再替换固定 100 次循环并执行人物关系定向验证。
+
+结果（2026-10-08）：人物 relation/manifest 文件锁等待改用 1 秒单调截止时间及 10、20、40、80、160、250ms 后封顶的退避；未占用锁仍立即通过 `create_new` 获取，stale lock 仍按 300 秒阈值处理。helper 边界和锁超时/立即获取单测、`tests/people_api.rs` 10/10、person relation 持久化与 NFO fingerprint 单测通过；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机架构 ARM64；没有文件系统基准、FNOS/NAS 或生产 CPU 测量。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
