@@ -9158,6 +9158,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：本地 NFO page 记录固定 `local_nfo_page` 批次计数、输入条目累计数、最大 page 大小、成功/失败页数及最近 128 个耗时样本的 p95。失败页包含 item 级 NFO/credits 失败和批次级错误；计时覆盖 source 校验、NFO 读取/解析、人物处理及 deferred credits flush。ScanJobService 的 outbox、job worker、手动 refresh 与 scan 后处理都向 MetadataEnricher 传入同一个 ResourceMetrics。指标名称白名单阻止未知名字进入输出，不包含 item ID、路径或错误文本。metrics 单测、metadata 14/14、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；没有运行独立吞吐基准或 FNOS/NAS/PostgreSQL A/B，不据此声称 CPU、SQL 延迟或生产收益。
 
+#### LUX-439：清理本地 metadata storage 的过期 dead-code 抑制
+
+范围：早期本地 metadata storage API 曾先于 scanner 消费路径建立，代码仍保留“下一阶段 worker 使用”的 `#[allow(dead_code)]` 和过期注释。逐项核对 completeness、扫描 outbox/backfill、批量图片 storage 合同的生产调用点；已被消费的接口去掉无效抑制并更新注释。只在确认没有生产调用、且不是仍需维护的测试合同后，才删除无用接口；保留其他阶段的 manifest API、字幕 API 与无关 storage 范围。
+
+验收：
+
+- [x] 本地 metadata storage 中已接入的类型、字段和方法不再靠宽泛 `#[allow(dead_code)]` 隐藏编译器可发现的问题；注释反映当前消费者。
+- [x] 未使用接口只有在生产调用、测试用途和后续任务依赖均核实后才清理；队列状态、schema、公共行为和存储事务语义不变。
+- [x] storage 定向测试、build、fmt、Clippy 和差异检查通过；报告仍保留的非本地 metadata dead-code 抑制及原因。
+
+预计文件：`src/storage/jobs.rs`、`src/storage/metadata.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`docs/LUX-DEVELOPMENT.md`。先核对抑制范围内的类型/方法实际调用者与测试，再去掉过期抑制或将必要例外缩小到单个接口。
+
+结果（2026-10-08）：移除了扫描 completeness、outbox/backfill 与图片 batch 合同上 7 处“下一阶段消费者”类型抑制和两个实现块级宽泛抑制。正常 build 先暴露 8 组确实只供 storage 合同回归使用的入口/字段；核对调用点后，将例外缩小到具体方法、类型或测试专用常量，并为每项注明它覆盖的持久化行为。没有删仍由回归覆盖的单项状态转换，也未改变 schema、队列状态、事务边界或运行期入口。`cargo test --locked --lib storage::repository::repository_tests` 119 passed、8 ignored；build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本轮仍保留的其他范围 dead-code 抑制属于 scan-manifest LUX-266/267 边界、字幕/Emby migration 接口和测试夹具；本任务没有扩大清理范围。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

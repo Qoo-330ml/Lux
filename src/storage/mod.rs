@@ -13,7 +13,6 @@ impl MetadataAutoMatchPolicy {
     }
 }
 
-#[allow(dead_code)] // Scanner jobs build these values after evaluating local metadata.
 pub(crate) struct NewItemMetadataCompletenessResult<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) capability: &'a str,
@@ -37,7 +36,6 @@ pub(crate) struct MetadataFillMissingRequest {
     pub(crate) automatic_retry_count: i64,
 }
 
-#[allow(dead_code)] // Scanner jobs use the queued IDs to wake the existing worker.
 #[derive(Debug, Default)]
 pub(crate) struct ItemMetadataCompletenessCommit {
     pub(crate) updated_count: usize,

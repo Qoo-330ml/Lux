@@ -8,6 +8,7 @@ const MAX_SCAN_MANIFEST_APPLY_BATCH_SIZE: i64 = 500;
 const MAX_SCAN_LOCAL_METADATA_BATCH_SOURCES: usize = 256;
 // Six bound values per row keep each insert under SQLite's conservative bind limit.
 const MAX_SCAN_LOCAL_METADATA_BATCH_INSERT_ROWS: usize = 64;
+#[allow(dead_code)] // The test-only batch listing API enforces this storage contract bound.
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 const MAX_SCAN_LOCAL_METADATA_BATCH_ERROR_BYTES: usize = 4096;
 const MAX_SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE: usize = 16;
@@ -82,7 +83,6 @@ const METADATA_REIDENTIFY_PRIORITY_CASE: &str = "CASE
 END";
 
 #[derive(Debug)]
-#[allow(dead_code)] // The next phase worker consumes the bounded page payload.
 pub(crate) struct StoredScanLocalMetadataBackfillPage {
     pub(crate) library_root_id: String,
     pub(crate) cursor_entry_id: Option<String>,
@@ -171,7 +171,6 @@ impl Database {
         "LEGACY_SCAN_REQUIRES_NEW_MANIFEST";
 }
 
-#[allow(dead_code)] // Local metadata workers consume these durable queue operations.
 impl Database {
     pub(crate) async fn ensure_scan_local_metadata_backfill_roots(
         &self,
@@ -193,6 +192,7 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)] // Exercised by storage tests for backfill-root idempotency.
     pub(crate) async fn ensure_scan_local_metadata_backfill_root(
         &self,
         library_root_id: &str,
@@ -364,6 +364,7 @@ impl Database {
         }
     }
 
+    #[allow(dead_code)] // Exercised by storage tests for the default completion transition.
     pub(crate) async fn complete_scan_local_metadata_backfill_page(
         &self,
         page: &StoredScanLocalMetadataBackfillPage,
@@ -412,6 +413,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[allow(dead_code)] // Exercised by storage tests for the default failure transition.
     pub(crate) async fn fail_scan_local_metadata_backfill_page(
         &self,
         page: &StoredScanLocalMetadataBackfillPage,
@@ -508,6 +510,7 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    #[allow(dead_code)] // Storage contract tests cover idempotent single-batch enqueue.
     pub(crate) async fn enqueue_scan_local_metadata_batch(
         &self,
         batch: NewScanLocalMetadataBatch<'_>,
@@ -527,6 +530,7 @@ impl Database {
         Ok(inserted)
     }
 
+    #[allow(dead_code)] // Shared by the test-only single-batch enqueue contract.
     async fn enqueue_scan_local_metadata_batch_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -747,6 +751,7 @@ impl Database {
         Ok(())
     }
 
+    #[allow(dead_code)] // Storage tests inspect pagination and persisted batch state.
     pub(crate) async fn list_scan_local_metadata_batches(
         &self,
         after_created_at: Option<i64>,
@@ -1253,6 +1258,7 @@ impl Database {
         Ok(claimed.map(stored_scan_local_metadata_batch))
     }
 
+    #[allow(dead_code)] // Exercised by storage tests for the default completion transition.
     pub(crate) async fn complete_scan_local_metadata_batch(
         &self,
         batch_id: &str,
@@ -1392,6 +1398,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[allow(dead_code)] // Exercised by storage tests for cancellation state transitions.
     pub(crate) async fn cancel_scan_local_metadata_batches(
         &self,
         job_id: &str,

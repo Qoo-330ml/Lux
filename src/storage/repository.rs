@@ -1202,7 +1202,7 @@ pub(crate) struct StoredScanJob {
     pub(crate) scan_phase: String,
 }
 
-#[allow(dead_code)] // The local metadata worker consumes these batches in the next phase task.
+#[allow(dead_code)] // Storage tests exercise the single-batch enqueue contract.
 #[derive(Clone, Copy)]
 pub(crate) struct NewScanLocalMetadataBatch<'a> {
     pub(crate) id: &'a str,
@@ -1212,7 +1212,7 @@ pub(crate) struct NewScanLocalMetadataBatch<'a> {
     pub(crate) source_ids: &'a [String],
 }
 
-#[allow(dead_code)] // Fields are consumed by the later local metadata worker.
+#[allow(dead_code)] // The active worker reads a subset; tests inspect the complete stored row.
 #[derive(Debug)]
 pub(crate) struct StoredScanLocalMetadataBatch {
     pub(crate) id: String,
@@ -2039,7 +2039,7 @@ pub(crate) struct StoredMetadataCapabilityAttempt {
     pub(crate) next_retry_at: Option<i64>,
 }
 
-#[allow(dead_code)] // Consumed by local metadata scanning in the next phase task.
+#[allow(dead_code)] // Storage tests cover the legacy completeness read projection.
 #[derive(Debug)]
 pub(crate) struct StoredItemMetadataCompleteness {
     pub(crate) item_id: String,
@@ -2480,7 +2480,6 @@ pub(crate) struct ItemImageInsert {
     pub(crate) source_url: Option<String>,
 }
 
-#[allow(dead_code)] // LUX-306 consumes this storage contract from the local image worker.
 pub(crate) struct ItemImageBatchInsert {
     pub(crate) item_id: String,
     pub(crate) images: Vec<ItemImageInsert>,

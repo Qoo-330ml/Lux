@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 const MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH: usize = 64;
 const MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES: usize = 256;
 const MAX_ITEM_METADATA_COMPLETENESS_ERROR_BYTES: usize = 4096;
+#[allow(dead_code)] // The test-only confirmed-missing listing API enforces this bound.
 const MAX_ITEM_METADATA_COMPLETENESS_PAGE_SIZE: i64 = 100;
 const MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE: usize = 512;
 const ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE: usize = 100;
@@ -30,8 +31,8 @@ fn validate_item_metadata_completeness_key(
     Ok(())
 }
 
-#[allow(dead_code)] // The local scan worker consumes these transitions in the next phase task.
 impl Database {
+    #[allow(dead_code)] // Storage tests retain the legacy batch-claim contract.
     pub(crate) async fn prepare_and_claim_item_metadata_completeness_checks(
         &self,
         checks: &[NewItemMetadataCompletenessCheck<'_>],
@@ -252,6 +253,7 @@ impl Database {
         Ok((claimed_indices, due_fill_missing_retry_item_ids))
     }
 
+    #[allow(dead_code)] // Storage tests cover atomic completion and enqueue semantics.
     pub(crate) async fn complete_local_metadata_and_enqueue_fill_missing(
         &self,
         library_id: &str,
@@ -546,6 +548,7 @@ impl Database {
         Ok(requests)
     }
 
+    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
     pub(crate) async fn prepare_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -595,6 +598,7 @@ impl Database {
         Ok(changed.is_some())
     }
 
+    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
     pub(crate) async fn claim_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -632,6 +636,7 @@ impl Database {
         Ok(changed.is_some())
     }
 
+    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
     pub(crate) async fn finish_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -719,6 +724,7 @@ impl Database {
         Ok(changed.is_some())
     }
 
+    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
     pub(crate) async fn cancel_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -757,6 +763,7 @@ impl Database {
     }
 
     /// Call once during startup, before local metadata workers begin claiming checks.
+    #[allow(dead_code)] // Storage tests cover recovery of legacy single-item claims.
     pub(crate) async fn requeue_interrupted_item_metadata_completeness_checks(
         &self,
     ) -> Result<u64, StorageError> {
@@ -785,6 +792,7 @@ impl Database {
         Ok(result.rows_affected())
     }
 
+    #[allow(dead_code)] // Storage tests assert persisted legacy claim state through this projection.
     pub(crate) async fn find_item_metadata_completeness(
         &self,
         item_id: &str,
@@ -814,6 +822,7 @@ impl Database {
         })
     }
 
+    #[allow(dead_code)] // Storage tests cover pagination of confirmed missing items.
     pub(crate) async fn list_confirmed_missing_metadata(
         &self,
         capability: &str,
