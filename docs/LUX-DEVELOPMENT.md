@@ -9276,6 +9276,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：原失败重现为 1.15 秒，低于 mock 人物详情请求的 1.5 秒响应延迟，因此并非任务等待该响应；固定的 1 秒总时延限制误判了本机工作流耗时。新回归在 actor endpoint 收到请求后保持其未响应，确认 metadata job 已 `COMPLETED` 后才释放，并继续验证人物 NFO 得到补充。`cargo test --locked --test metadata_selection` 31/31 通过。
 
+#### LUX-447：区分共享管理 API key 与个人 PlaybackInfo 身份
+
+范围：STRM PlaybackInfo 集成用例只传共享管理 API key，却期待创建用户播放上下文成功。共享管理 key 代表服务器身份，不能替代个人会话；PlaybackInfo 需使用真实 Emby 用户 token。保留 key 单独请求应返回 401 的合同，并在提供真实用户 token 时验证 PlaybackInfo 成功且共享 key 不进入播放 URL。生产鉴权边界保持不变。
+
+验收：
+
+- [x] 只有共享管理 API key 的 PlaybackInfo 请求返回 401；用户会话 token 请求成功。
+- [x] 同时带用户 token 与共享 key query 时，成功响应的播放 URL 不包含共享 key；STRM 重定向、用户播放和本地路径播放行为回归通过。
+- [x] `cargo test --locked --test strm`、fmt 与 `git diff --check` 通过。
+
+预计文件：`tests/strm.rs`、`docs/LUX-DEVELOPMENT.md`。先复现共享 key 单独请求返回 401，再明确区分服务器与用户身份，运行完整 STRM 集成目标。
+
+结果（2026-10-08）：共享 key 单独请求稳定返回 401；带真实 `X-Emby-Token` 的 PlaybackInfo 返回 200，响应播放 URL 不含共享 key。完整 STRM 集成目标 1/1 通过，现有 Emby 302 handoff 与本地 path 播放断言保持。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
