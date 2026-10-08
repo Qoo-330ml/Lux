@@ -3745,6 +3745,7 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         is_missing: true,
         checked_at: 10,
     }];
+    database.reset_query_count();
     let incremental_enabled = database
         .complete_local_metadata_and_enqueue_fill_missing_with_policy(
             &library_id,
@@ -3755,6 +3756,11 @@ async fn progressive_scan_metadata_dispatch_is_atomic_and_deduplicated() {
         .await
         .expect("incremental job policy can enable auto-match for its sources");
     assert_eq!(incremental_enabled.scheduled_job_ids.len(), 1);
+    assert_eq!(
+        database.query_count(),
+        7,
+        "completeness confirmation and schedulable-item lookup should share one page query"
+    );
 
     let replay_fingerprint = b"replay-without-new-result";
     assert!(

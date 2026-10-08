@@ -8891,6 +8891,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：completion waiter pending-state 查询从每秒 fallback 降至每 5 秒一次；本进程 worker 的 `notify_waiters` 仍即时唤醒。新增 fixture 在 target 由 PENDING 变为 DONE 后触发 Notify，250ms 内返回；image waiter 原 250ms 通知回归也通过。`scanning_jobs` 81/81、全目标全 feature Clippy、fmt 和 `git diff --check` 通过。跨进程写入的检测延迟窗口扩大至最多 5 秒，性能记录不外推 CPU、PostgreSQL 或 FNOS 收益。
 
+#### LUX-421：合并 completeness 完成后的缺失项筛选
+
+范围：`complete_local_metadata_and_enqueue_fill_missing_with_policy` 在同一事务中完成 completeness 状态后，原先先查询 READY/missing 项，再查询仍有效的媒体项，最后将两组结果求交后交给请求构建器；请求构建器本身已按同样条件筛选 completeness 和媒体项。删除这两次冗余筛选，只把去重后的 eligible IDs 交给批量请求构建器。保留 completeness 更新、并发锁、事务提交、自动补全策略以及目标 eligibility 规则。
+
+验收：
+
+- [x] 固定 SQLite fixture 的应用 query-wrapper 调用从 9 次降为 7 次；对应回归精确断言候选路径调用数。
+- [x] 请求构建器仍限定当前 library、未软删除、有效媒体类型、READY 且 missing 的 capability，并按输入 fingerprint 生成请求。
+- [x] storage 定向测试、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；不把 query-wrapper 数量解释为 SQL 执行时长或生产收益。
+
+预计文件：`src/storage/metadata.rs`、`src/storage/repository_tests.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先测出旧路径 9 次查询，再去除重复读取并确认新路径为 7 次。
+
+结果（2026-10-08）：旧版隔离基线与候选版各自运行同一 storage fixture，query-wrapper 调用为 9→7。请求构建器的事务内查询继续复核有效媒体项和 READY/missing 状态；本机 `arm64`。只证明固定 SQLite fixture 的应用层调用数变化，不外推 SQL 时长、PostgreSQL、FNOS 或 NAS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

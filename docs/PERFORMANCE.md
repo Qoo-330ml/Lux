@@ -1565,3 +1565,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-420 local metadata completion waiter
 
 completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到通知时的 fallback 查询间隔由 1 秒增至 5 秒；当前同进程完成路径会发出通知。跨进程数据库状态变化可见窗口相应为最多 5 秒。通知 fixture 确认 target 完成后在 250ms 内唤醒。没有采集总体 SQL 或墙钟数据，不据此外推 CPU 收益。
+
+### LUX-421 completeness completion query reduction
+
+固定 SQLite fixture 中，补全策略启用时的 completeness completion 路径由外层 READY/missing 筛选、有效媒体项筛选和请求构建器读取组成，合计 9 次 query-wrapper 调用。请求构建器的查询已限定同一 library、未软删除的有效媒体类型，以及 READY 且 missing 的 completeness capability；因此移除外层两次重复筛选后为 7 次。输入 eligible IDs、fingerprint 匹配、事务内锁定和 enqueue 逻辑保持。该计数只说明 fixture 的应用 query-wrapper 调用，不代表 SQL 耗时、真实往返时间、PostgreSQL 或 FNOS 收益。

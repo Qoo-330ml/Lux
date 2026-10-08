@@ -344,7 +344,6 @@ impl Database {
             .await?;
 
         let mut commit = ItemMetadataCompletenessCommit::default();
-        let mut confirmed_missing = HashSet::new();
         for batch in results.chunks(ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE) {
             let values = std::iter::repeat_n("(?, ?, ?, ?, ?)", batch.len())
                 .collect::<Vec<_>>()
@@ -397,13 +396,7 @@ impl Database {
                     path: self.path.clone(),
                     source,
                 })?;
-            for row in rows {
-                let item_id = row.get::<String, _>("item_id");
-                commit.updated_count = commit.updated_count.saturating_add(1);
-                if row.get::<i64, _>("is_missing") != 0 {
-                    confirmed_missing.insert(item_id);
-                }
-            }
+            commit.updated_count = commit.updated_count.saturating_add(rows.len());
         }
 
         let auto_match_enabled = match auto_match_policy {
@@ -423,81 +416,12 @@ impl Database {
                 })? != 0
             }
         };
-        if auto_match_enabled {
-            for ids in eligible_ids.chunks(100) {
-                if ids.is_empty() {
-                    continue;
-                }
-                let placeholders = std::iter::repeat_n("?", ids.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let query = format!(
-                    "SELECT DISTINCT completeness.item_id
-                 FROM item_metadata_completeness completeness
-                 JOIN media_items item ON item.id = completeness.item_id
-                 WHERE item.library_id = ? AND item.removed_at IS NULL
-                   AND item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
-                   AND completeness.local_state = 'READY' AND completeness.is_missing = 1
-                   AND completeness.item_id IN ({placeholders})"
-                );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
-                for item_id in ids {
-                    statement = statement.bind(item_id);
-                }
-                confirmed_missing.extend(
-                    statement
-                        .fetch_all(&mut *transaction)
-                        .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?
-                        .into_iter()
-                        .map(|row| row.get::<String, _>("item_id")),
-                );
-            }
-        }
-        if auto_match_enabled && !eligible_ids.is_empty() && !confirmed_missing.is_empty() {
-            let candidate_ids = eligible_ids
-                .into_iter()
-                .filter(|item_id| confirmed_missing.contains(item_id))
-                .collect::<Vec<_>>();
-            let mut schedulable_ids = Vec::new();
-            for ids in candidate_ids.chunks(100) {
-                if ids.is_empty() {
-                    continue;
-                }
-                let placeholders = std::iter::repeat_n("?", ids.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                let query = format!(
-                    "SELECT id FROM media_items
-                     WHERE library_id = ? AND removed_at IS NULL
-                       AND item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE')
-                       AND id IN ({placeholders})
-                     ORDER BY id"
-                );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
-                for item_id in ids {
-                    statement = statement.bind(item_id);
-                }
-                schedulable_ids.extend(
-                    statement
-                        .fetch_all(&mut *transaction)
-                        .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?
-                        .into_iter()
-                        .map(|row| row.get::<String, _>("id")),
-                );
-            }
+        if auto_match_enabled && !eligible_ids.is_empty() {
             let requests = self
                 .build_metadata_fill_missing_requests(
                     &mut transaction,
                     library_id,
-                    &schedulable_ids,
+                    &eligible_ids,
                     results,
                 )
                 .await?;
