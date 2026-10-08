@@ -8905,6 +8905,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：旧版隔离基线与候选版各自运行同一 storage fixture，query-wrapper 调用为 9→7。请求构建器的事务内查询继续复核有效媒体项和 READY/missing 状态；本机 `arm64`。只证明固定 SQLite fixture 的应用层调用数变化，不外推 SQL 时长、PostgreSQL、FNOS 或 NAS 收益。
 
+#### LUX-422：有界并行规划本地 metadata completeness 页
+
+范围：完整性规划页已批量读取策略、图片索引、NFO writeback context 和 attempts，但每个 item 的本地图片发现、必要时的 NFO projection 与 actor relation 检查仍串行执行。对只读 item planning 使用最多 4 路并发，收齐后按输入顺序生成计划；保留 attempt state 批量读取、请求 eligibility、最先失败项语义和现有文件/数据库读取边界。不引入文件读取缓存、schema 或依赖。
+
+验收：
+
+- [x] 固定 12 个异步 planning task 的回归证明并发数大于 1 且不超过 4，返回结果按输入顺序稳定。
+- [x] image discovery、NFO projection 或 actor relation 检查错误仍导致该页规划失败，并按输入顺序选择首个错误；这些操作保持只读。
+- [x] 候选模块及相关扫描回归、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
+- [x] 性能记录只说明页内只读 task 并发上限；不声称减少文件读取次数或已验证墙钟/FNOS/NAS 收益。
+
+预计文件：`src/application/candidates.rs`、`src/storage/repository.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。先锁定有界 helper 的并发与稳定顺序，再将完整性页 per-item planning 移入 helper。
+
+结果（2026-10-08）：每页 NFO projection、人物 relation 旁车和本地图片发现最多 4 个 item 并行，所有结果收齐后按原输入顺序处理；策略/图片/context/attempts 查询仍为页级数据库调用。候选模块测试 23/23 通过。该回归只证明任务上界和顺序，不测文件访问总数、墙钟或 FNOS/NAS 性能。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

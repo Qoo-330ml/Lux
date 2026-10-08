@@ -38,6 +38,7 @@ const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const MAX_ACTOR_DETAIL_FETCHES: usize = 12;
 const ACTOR_METADATA_FETCH_CONCURRENCY: usize = 4;
 const IMAGE_ITEM_CONCURRENCY: usize = 4;
+const COMPLETENESS_PLAN_ITEM_CONCURRENCY: usize = 4;
 const SCRAPER_IMAGE_TYPES: [&str; 8] = [
     "POSTER",
     "FANART",
@@ -53,6 +54,32 @@ const CAPABILITY_EXTERNAL_IDS: &str = "EXTERNAL_IDS";
 const CAPABILITY_TRAILERS: &str = "TRAILERS";
 const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
 const COMPLETENESS_INPUT_VERSION: u64 = 1;
+
+type CompletenessPlanTask<T> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
+
+async fn run_bounded_completeness_plan_tasks<T: Send + 'static>(
+    tasks: Vec<(usize, CompletenessPlanTask<T>)>,
+) -> Result<Vec<(usize, T)>, tokio::task::JoinError> {
+    let mut queued = tasks.into_iter();
+    let mut pending = JoinSet::new();
+    let mut results = Vec::new();
+
+    while pending.len() < COMPLETENESS_PLAN_ITEM_CONCURRENCY {
+        let Some((index, task)) = queued.next() else {
+            break;
+        };
+        pending.spawn(async move { (index, task.await) });
+    }
+    while let Some(result) = pending.join_next().await {
+        results.push(result?);
+        if let Some((index, task)) = queued.next() {
+            pending.spawn(async move { (index, task.await) });
+        }
+    }
+    results.sort_unstable_by_key(|(index, _)| *index);
+    Ok(results)
+}
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct MetadataRequestPlan {
@@ -2351,56 +2378,84 @@ impl MetadataSelectionService {
 
         let mut actual_plans = Vec::with_capacity(supported_items.len());
         let mut attempt_item_ids = Vec::new();
-        for (item_id, current) in &supported_items {
-            let Some((library_strategy, global_strategy)) = strategies.get(*item_id) else {
-                return Err(MetadataSelectionError::ItemNotFound);
-            };
-            let image_policy = ImageSelectionPolicy::from_json(
-                library_strategy.as_deref(),
-                global_strategy.as_deref(),
-            );
-            let image_types = image_policy.enabled_types().collect::<Vec<_>>();
-            let indexed_images = indexed_images
-                .get(*item_id)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let writeback_context = writeback_contexts
-                .get(*item_id)
-                .ok_or(MetadataSelectionError::ItemNotFound)?;
-            let local_image_types = self
-                .images
-                .local_image_types_with_indexed_images_and_context(
-                    item_id,
-                    &image_types,
-                    image_policy.thumbnail_scraping_mode.prefers_screenshots(),
-                    indexed_images,
-                    writeback_context,
-                )
-                .await?;
-            let actual_missing_image_mask = missing_image_mask(&image_types, &local_image_types);
-            let (actual_plan, capability_identity) = self
-                .actual_request_plan_for_current(
-                    item_id,
-                    current,
-                    image_policy,
-                    actual_missing_image_mask,
-                    Some(writeback_context),
-                )
-                .await?;
-            let should_read_attempt_state =
-                capability_identity.is_some() && automatic_fill_missing_plan_has_work(actual_plan);
-            if should_read_attempt_state {
-                attempt_item_ids.push((*item_id).to_owned());
+        for (chunk_index, supported_chunk) in supported_items
+            .chunks(COMPLETENESS_PLAN_ITEM_CONCURRENCY)
+            .enumerate()
+        {
+            let chunk_start = chunk_index * COMPLETENESS_PLAN_ITEM_CONCURRENCY;
+            let mut planning_tasks = Vec::with_capacity(supported_chunk.len());
+            for (chunk_offset, supported_item) in supported_chunk.iter().enumerate() {
+                let index = chunk_start + chunk_offset;
+                let (item_id, current) = **supported_item;
+                let Some((library_strategy, global_strategy)) = strategies.get(item_id) else {
+                    return Err(MetadataSelectionError::ItemNotFound);
+                };
+                let image_policy = ImageSelectionPolicy::from_json(
+                    library_strategy.as_deref(),
+                    global_strategy.as_deref(),
+                );
+                let image_types = image_policy.enabled_types().collect::<Vec<_>>();
+                let indexed_item_images = indexed_images.get(item_id).cloned().unwrap_or_default();
+                let writeback_context = writeback_contexts
+                    .get(item_id)
+                    .cloned()
+                    .ok_or(MetadataSelectionError::ItemNotFound)?;
+                let item_id = item_id.to_owned();
+                let current = (*current).clone();
+                let service = self.clone();
+                let task: CompletenessPlanTask<Result<_, MetadataSelectionError>> =
+                    Box::pin(async move {
+                        let local_image_types = service
+                            .images
+                            .local_image_types_with_indexed_images_and_context(
+                                &item_id,
+                                &image_types,
+                                image_policy.thumbnail_scraping_mode.prefers_screenshots(),
+                                &indexed_item_images,
+                                &writeback_context,
+                            )
+                            .await?;
+                        let actual_missing_image_mask =
+                            missing_image_mask(&image_types, &local_image_types);
+                        let (actual_plan, capability_identity) = service
+                            .actual_request_plan_for_current(
+                                &item_id,
+                                &current,
+                                image_policy,
+                                actual_missing_image_mask,
+                                Some(&writeback_context),
+                            )
+                            .await?;
+                        let should_read_attempt_state = capability_identity.is_some()
+                            && automatic_fill_missing_plan_has_work(actual_plan);
+                        Ok((
+                            item_id,
+                            image_types,
+                            actual_plan,
+                            capability_identity,
+                            should_read_attempt_state,
+                        ))
+                    });
+                planning_tasks.push((index, task));
             }
-            actual_plans.push((
-                (*item_id).to_owned(),
-                current,
-                image_types,
-                actual_plan,
-                capability_identity,
-                should_read_attempt_state,
-            ));
+            let chunk_plans = run_bounded_completeness_plan_tasks(planning_tasks)
+                .await
+                .map_err(|_| {
+                    MetadataSelectionError::InvalidCandidate(
+                        "local completeness planning task failed".to_owned(),
+                    )
+                })?
+                .into_iter()
+                .map(|(index, result)| result.map(|plan| (index, plan)))
+                .collect::<Result<Vec<_>, _>>()?;
+            actual_plans.extend(chunk_plans);
         }
+        attempt_item_ids.extend(
+            actual_plans
+                .iter()
+                .filter(|(_, (_, _, _, _, should_read_attempt_state))| *should_read_attempt_state)
+                .map(|(_, (item_id, _, _, _, _))| item_id.clone()),
+        );
 
         let attempts = self
             .database
@@ -2408,14 +2463,13 @@ impl MetadataSelectionService {
             .await?;
         let mut plans = HashMap::with_capacity(items.len());
         for (
-            item_id,
-            current,
-            image_types,
-            actual_plan,
-            capability_identity,
-            should_read_attempt_state,
+            index,
+            (item_id, image_types, actual_plan, capability_identity, should_read_attempt_state),
         ) in actual_plans
         {
+            let (_, current) = **supported_items
+                .get(index)
+                .ok_or(MetadataSelectionError::ItemNotFound)?;
             let attempt_state = should_read_attempt_state
                 .then(|| attempts.get(&item_id))
                 .flatten();
@@ -4175,15 +4229,17 @@ fn candidate_production_year(candidate: &Value) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTOR_METADATA_FETCH_CONCURRENCY, FillMissingRequestPlan, ImageSelectionPolicy,
-        MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
-        MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors,
-        capability_needs_request, completeness_capabilities, credits_need_actor_relation_check,
+        ACTOR_METADATA_FETCH_CONCURRENCY, COMPLETENESS_PLAN_ITEM_CONCURRENCY,
+        FillMissingRequestPlan, ImageSelectionPolicy, MAX_ACTOR_DETAIL_FETCHES,
+        MetadataCandidateService, MetadataRequestPlan, MetadataSelectionService,
+        SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors, capability_needs_request,
+        completeness_capabilities, credits_need_actor_relation_check,
         default_image_selection_policy, enrich_actor_metadata, generic_candidate_actors,
         generic_candidate_images, image_attempt_identities, local_metadata_completeness_plan,
         merge_actor_values, merge_supplemental_movie_nfo, metadata_completeness_fingerprint,
         metadata_match_score, metadata_request_plan, metadata_request_plan_has_work,
-        parse_image_selection_policy, selected_scraper_provider_id,
+        parse_image_selection_policy, run_bounded_completeness_plan_tasks,
+        selected_scraper_provider_id,
     };
     use crate::application::scraper::{
         ScraperActorCredit, ScraperAdapter, ScraperCreditsResponse, ScraperError,
@@ -4306,6 +4362,70 @@ mod tests {
         assert!(actors.iter().all(|actor| actor.person.is_some()));
         assert!(maximum.load(Ordering::SeqCst) > 1);
         assert!(maximum.load(Ordering::SeqCst) <= ACTOR_METADATA_FETCH_CONCURRENCY);
+    }
+
+    #[tokio::test]
+    async fn completeness_plan_page_tasks_are_bounded_and_keep_input_order() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let tasks = (0..12)
+            .map(|index| {
+                let active = Arc::clone(&active);
+                let maximum = Arc::clone(&maximum);
+                (
+                    index,
+                    Box::pin(async move {
+                        let active_count = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(active_count, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        index
+                    }) as super::CompletenessPlanTask<usize>,
+                )
+            })
+            .collect();
+
+        let results = run_bounded_completeness_plan_tasks(tasks)
+            .await
+            .expect("bounded completeness planning tasks should join");
+
+        assert_eq!(
+            results.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+            (0..12).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            results.iter().map(|(_, value)| *value).collect::<Vec<_>>(),
+            (0..12).collect::<Vec<_>>()
+        );
+        assert!(maximum.load(Ordering::SeqCst) > 1);
+        assert!(maximum.load(Ordering::SeqCst) <= COMPLETENESS_PLAN_ITEM_CONCURRENCY);
+
+        let error_tasks = (0..3)
+            .map(|index| {
+                (
+                    index,
+                    Box::pin(async move {
+                        tokio::time::sleep(Duration::from_millis(if index == 0 { 20 } else { 1 }))
+                            .await;
+                        Err::<usize, _>(if index == 0 {
+                            "first input error"
+                        } else {
+                            "later error"
+                        })
+                    })
+                        as super::CompletenessPlanTask<Result<usize, &'static str>>,
+                )
+            })
+            .collect();
+        let error_results = run_bounded_completeness_plan_tasks(error_tasks)
+            .await
+            .expect("bounded error tasks should join");
+        let first_error = error_results
+            .into_iter()
+            .map(|(_, result)| result)
+            .collect::<Result<Vec<_>, _>>()
+            .expect_err("input-order error should be preserved");
+        assert_eq!(first_error, "first input error");
     }
 
     #[tokio::test]

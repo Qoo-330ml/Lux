@@ -1987,7 +1987,7 @@ pub(crate) struct NewCollection<'a> {
     pub(crate) member_provider_ids: &'a [(String, String, i64)],
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredMediaMetadata {
     pub(crate) library_id: String,
     pub(crate) item_type: String,
@@ -2497,7 +2497,7 @@ pub(crate) struct MetadataImageAttemptUpdate<'a> {
     pub(crate) now: i64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredItemImage {
     pub(crate) id: String,
     pub(crate) item_id: String,
@@ -2993,7 +2993,7 @@ pub(crate) enum CatalogSort {
     Rating,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredMediaSourcePath {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
@@ -3002,7 +3002,7 @@ pub(crate) struct StoredMediaSourcePath {
     pub(crate) relative_path: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredMediaWritebackContext {
     pub(crate) item_type: String,
     pub(crate) source: Option<StoredMediaSourcePath>,

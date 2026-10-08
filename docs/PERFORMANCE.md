@@ -1569,3 +1569,7 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 ### LUX-421 completeness completion query reduction
 
 固定 SQLite fixture 中，补全策略启用时的 completeness completion 路径由外层 READY/missing 筛选、有效媒体项筛选和请求构建器读取组成，合计 9 次 query-wrapper 调用。请求构建器的查询已限定同一 library、未软删除的有效媒体类型，以及 READY 且 missing 的 completeness capability；因此移除外层两次重复筛选后为 7 次。输入 eligible IDs、fingerprint 匹配、事务内锁定和 enqueue 逻辑保持。该计数只说明 fixture 的应用 query-wrapper 调用，不代表 SQL 耗时、真实往返时间、PostgreSQL 或 FNOS 收益。
+
+### LUX-422 local metadata completeness planning concurrency
+
+本地 completeness 页中的 item image discovery、必要时的 NFO projection 和 actor relation file check 从逐项串行改为最多 4 个只读 task 并行；结果在进入 attempt-state 查询前按原 item 输入顺序汇总。固定 12-task helper fixture 证明最大并发为 4 并且输出顺序稳定。此项不减少旁车文件总读取数或数据库 query 数；没有采集文件系统墙钟，也不推断 PostgreSQL、NAS 或 FNOS 收益。
