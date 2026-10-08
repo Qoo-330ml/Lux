@@ -1541,3 +1541,7 @@ provider 暂不可用会使 metadata job 进入 `DEFERRED`、相应 item 进入 
 ### LUX-414 图片阶段等待通知
 
 扫描 job 等待本地 metadata 图片阶段时，原路径每秒重查一次数据库。现在 outbox worker 在成功保存图片阶段完成状态后通知同 job 的等待者；该等待者会重新读取数据库，1 秒 fallback 保留用于跨进程变更和恢复。固定 SQLite scanner 测试确认 pending batch 转为 completed 并发出通知后，等待在 250ms 内结束。未统计查询数或时延，不外推文件处理墙钟、PostgreSQL、FNOS 或 NAS 收益。
+
+### LUX-415 idle metadata worker 查询
+
+本地 metadata worker 在没有 pending target 时收到 Notify，原先查询 pending 状态后还会重读 scan job；固定 SQLite idle fixture 的一次唤醒是 2 次 query-wrapper 调用。现在 Notify 后直接重查 pending target，scan job 行只在 1 秒 fallback 读取，单次唤醒变为 1 次。该计数不含 SQL 执行时长，不外推 PostgreSQL、墙钟或 FNOS 收益。

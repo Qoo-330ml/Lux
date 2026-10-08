@@ -9636,14 +9636,18 @@ impl ScanJobService {
                     continue;
                 }
                 let notified = notify.notified();
-                tokio::select! {
+                let refresh_job = tokio::select! {
                     changed = stop_receiver.changed() => {
                         if changed.is_err() || *stop_receiver.borrow() {
                             return;
                         }
+                        false
                     }
-                    _ = notified => {}
-                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
+                    _ = notified => false,
+                    _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => true,
+                };
+                if !refresh_job {
+                    continue;
                 }
                 job = match database.find_scan_job(&worker_job_id).await {
                     Ok(Some(job)) => job,
@@ -13556,6 +13560,51 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
             .await
             .expect("image waiter should wake before the fallback")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_worker_does_not_reload_scan_job_after_notification()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "local-metadata-idle-worker";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let mut worker = Some(jobs.start_local_metadata_worker(job_id));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        database.reset_query_count();
+        jobs.notify_local_metadata_worker(job_id);
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while database.query_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        })
+        .await?;
+        let notification_queries = database.query_count();
+        ScanJobService::stop_local_metadata_worker(&mut worker).await;
+        assert_eq!(notification_queries, 1);
         Ok(())
     }
 

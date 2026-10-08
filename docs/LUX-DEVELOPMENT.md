@@ -8804,6 +8804,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：outbox 图片阶段成功写入 `images_completed_at` 后通知对应 job；等待方收到通知后重新查询数据库，周期 fallback 仍为 1 秒。通知单测先保持 batch 为 pending，再完成它并要求 250ms 内唤醒（不含开始时的 50ms 等待）；定向回归、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。失败批次不发送完成通知，仍按原有延迟重试。本结果不测量 SQL 时延、扫描墙钟或 FNOS CPU。
 
+#### LUX-415：本地 metadata worker 仅在 fallback 时刷新 scan job
+
+范围：本地 metadata worker 每次收到 target 状态 Notify 后都会重新读取 scan job，即使 scan job 生命周期由同一个 worker 的 stop watch 控制，且 target 通知已由本地 scan service 发出。改为 Notify 后直接回到 pending-target 查询，仅 1 秒 fallback 重读 job 行，以发现外部状态变化或修复丢失通知；stop watch 仍立即退出。不改变 pending target claim、root 校验、批次大小、worker 状态机或数据库合同。
+
+验收：
+
+- [x] 固定 SQLite worker idle 回归确认一次 Notify 唤醒只执行 pending-target 查询，从原来的两次 query-wrapper 调用降为一次。
+- [x] scan job fallback 刷新和 stop watch 行为保持；本地 metadata worker 定向回归、fmt、Clippy 和 `git diff --check` 通过。
+- [x] 性能记录只说明 query-wrapper 调用数，不外推 PostgreSQL、墙钟或生产收益。
+
+短计划与文件：只改 `src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md` 和 `docs/PERFORMANCE.md`。先让 idle worker 在通知回归中记录 query-wrapper 调用并观察现有 2 次读取，再仅在 fallback 分支刷新 job，最后验证 worker 通知、取消退出与现有扫描回归。
+
+结果（2026-10-08）：idle worker 收到 target Notify 后不再查询 scan job；仍会回到 pending-target 查询，且只有 1 秒 fallback 会检查最新 scan job 状态。SQLite idle fixture 在一次 Notify 后的 query-wrapper 调用由 2 降为 1；stop watch、pending 状态及 scan job 持久化语义未变。候选 worker 与图片等待回归、fmt、全目标全 feature Clippy 和 `git diff --check` 通过；不推断 PostgreSQL、墙钟或 FNOS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
