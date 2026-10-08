@@ -8,7 +8,11 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
-use tokio::{fs, sync::Semaphore, task::JoinSet};
+use tokio::{
+    fs,
+    sync::{Mutex, Semaphore},
+    task::JoinSet,
+};
 
 use crate::{
     application::scanner::compute_file_fingerprint,
@@ -35,6 +39,7 @@ const MIN_SCAN_JOB_METADATA_BATCH_SIZE: usize = 8;
 const MAX_SCAN_JOB_METADATA_BATCH_SIZE: usize = 32;
 const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
 const LOCAL_IMAGE_ITEM_BATCH_SIZE: usize = 16;
+const LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY: usize = 4;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
@@ -764,6 +769,100 @@ struct ScanLocalMetadataNfoSnapshot {
     nfo_paths_by_item: HashMap<String, PathBuf>,
     nfo_errors_by_item: HashMap<String, MetadataError>,
     metadata_by_item: HashMap<String, StoredMediaMetadata>,
+    deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
+}
+
+#[derive(Clone, Default)]
+struct DeferredLocalNfoMetadataUpdates {
+    state: Arc<Mutex<DeferredLocalNfoMetadataState>>,
+}
+
+#[derive(Default)]
+struct DeferredLocalNfoMetadataState {
+    pending: Vec<DeferredLocalNfoMetadataUpdate>,
+    failed_updates: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct DeferredLocalNfoMetadataUpdate {
+    item_id: String,
+    title: String,
+    original_title: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i64>,
+    premiere_date: Option<String>,
+    rating: Option<f64>,
+    rating_source: Option<String>,
+    provider_ids_json: Option<String>,
+    metadata_fingerprint: Vec<u8>,
+    provenance_json: String,
+    locked_fields_json: String,
+}
+
+impl DeferredLocalNfoMetadataUpdate {
+    fn from_update(update: MediaMetadataUpdate<'_>) -> Self {
+        Self {
+            item_id: update.item_id.to_owned(),
+            title: update.title.to_owned(),
+            original_title: update.original_title.map(str::to_owned),
+            overview: update.overview.map(str::to_owned),
+            production_year: update.production_year,
+            premiere_date: update.premiere_date.map(str::to_owned),
+            rating: update.rating,
+            rating_source: update.rating_source.map(str::to_owned),
+            provider_ids_json: update.provider_ids_json.map(str::to_owned),
+            metadata_fingerprint: update.metadata_fingerprint.to_vec(),
+            provenance_json: update.provenance_json.to_owned(),
+            locked_fields_json: update.locked_fields_json.to_owned(),
+        }
+    }
+
+    fn as_update(&self) -> MediaMetadataUpdate<'_> {
+        MediaMetadataUpdate {
+            item_id: &self.item_id,
+            title: &self.title,
+            original_title: self.original_title.as_deref(),
+            overview: self.overview.as_deref(),
+            production_year: self.production_year,
+            premiere_date: self.premiere_date.as_deref(),
+            rating: self.rating,
+            rating_source: self.rating_source.as_deref(),
+            provider_ids_json: self.provider_ids_json.as_deref(),
+            metadata_fingerprint: &self.metadata_fingerprint,
+            provenance_json: &self.provenance_json,
+            locked_fields_json: &self.locked_fields_json,
+        }
+    }
+}
+
+impl DeferredLocalNfoMetadataUpdates {
+    async fn push(&self, update: MediaMetadataUpdate<'_>) {
+        self.state
+            .lock()
+            .await
+            .pending
+            .push(DeferredLocalNfoMetadataUpdate::from_update(update));
+    }
+
+    async fn take_pending(&self) -> Vec<DeferredLocalNfoMetadataUpdate> {
+        std::mem::take(&mut self.state.lock().await.pending)
+    }
+
+    async fn has_pending(&self) -> bool {
+        !self.state.lock().await.pending.is_empty()
+    }
+
+    async fn record_failure(&self, item_id: String, error: String) {
+        self.state
+            .lock()
+            .await
+            .failed_updates
+            .push((item_id, error));
+    }
+
+    async fn take_failures(&self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.state.lock().await.failed_updates)
+    }
 }
 
 struct SeriesNfoRequest {
@@ -771,11 +870,15 @@ struct SeriesNfoRequest {
     nfo_path: PathBuf,
     metadata: Option<StoredMediaMetadata>,
     on_demand: bool,
+    deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
 }
 
 enum NfoMetadataLookup<'a> {
     OnDemand,
-    Snapshot(&'a mut HashMap<String, StoredMediaMetadata>),
+    Snapshot {
+        metadata_by_item: &'a mut HashMap<String, StoredMediaMetadata>,
+        deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
+    },
 }
 
 async fn scan_local_metadata_nfo_paths(
@@ -1222,11 +1325,16 @@ impl MetadataEnricher {
         for source in movies {
             report.items_processed += 1;
             if let Some(nfo_path) = nfo_snapshot.nfo_paths_by_item.remove(&source.item_id) {
+                let deferred_metadata_updates =
+                    Some(nfo_snapshot.deferred_metadata_updates.clone());
                 self.enrich_nfo_item_best_effort_with_metadata(
                     &mut report,
                     &source.item_id,
                     &nfo_path,
-                    NfoMetadataLookup::Snapshot(&mut nfo_snapshot.metadata_by_item),
+                    NfoMetadataLookup::Snapshot {
+                        metadata_by_item: &mut nfo_snapshot.metadata_by_item,
+                        deferred_metadata_updates,
+                    },
                     deferred_actor_credits.clone(),
                 )
                 .await;
@@ -1249,6 +1357,15 @@ impl MetadataEnricher {
             deferred_actor_credits.clone(),
         )
         .await;
+        let deferred_metadata_updates = &nfo_snapshot.deferred_metadata_updates;
+        self.flush_deferred_local_nfo_metadata_updates(deferred_metadata_updates)
+            .await;
+        for (item_id, error) in deferred_metadata_updates.take_failures().await {
+            tracing::warn!(item_id, %error, "local NFO metadata update failed");
+            report.nfo_loaded = report.nfo_loaded.saturating_sub(1);
+            report.nfo_failed += 1;
+            report.mark_item_failed(&item_id);
+        }
         if let (Some(people), Some(deferred_actor_credits)) =
             (&self.people, deferred_actor_credits.as_ref())
         {
@@ -1273,6 +1390,47 @@ impl MetadataEnricher {
             report,
             source_identities,
         })
+    }
+
+    async fn flush_deferred_local_nfo_metadata_updates(
+        &self,
+        deferred_updates: &DeferredLocalNfoMetadataUpdates,
+    ) {
+        let updates = deferred_updates.take_pending().await;
+        for chunk in updates.chunks(LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE) {
+            let batch_updates = chunk
+                .iter()
+                .map(DeferredLocalNfoMetadataUpdate::as_update)
+                .collect::<Vec<_>>();
+            let result = self
+                .database
+                .update_media_item_metadata_batch(&batch_updates)
+                .await;
+            drop(batch_updates);
+            if let Err(batch_error) = result {
+                tracing::warn!(
+                    item_count = chunk.len(),
+                    %batch_error,
+                    "local NFO metadata page transaction failed; retrying items individually"
+                );
+                for update in chunk {
+                    if let Err(error) = self
+                        .database
+                        .update_media_item_metadata(update.as_update())
+                        .await
+                    {
+                        tracing::warn!(
+                            item_id = %update.item_id,
+                            %error,
+                            "local NFO metadata update failed"
+                        );
+                        deferred_updates
+                            .record_failure(update.item_id.clone(), error.to_string())
+                            .await;
+                    }
+                }
+            }
+        }
     }
 
     async fn enrich_scan_job_batch(
@@ -1629,11 +1787,15 @@ impl MetadataEnricher {
                 continue;
             }
             if let Some(nfo_path) = snapshot.nfo_paths_by_item.remove(&source.item_id) {
+                let deferred_metadata_updates = Some(snapshot.deferred_metadata_updates.clone());
                 self.enrich_nfo_item_best_effort_with_metadata(
                     report,
                     &source.item_id,
                     &nfo_path,
-                    NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item),
+                    NfoMetadataLookup::Snapshot {
+                        metadata_by_item: &mut snapshot.metadata_by_item,
+                        deferred_metadata_updates,
+                    },
                     deferred_actor_credits.clone(),
                 )
                 .await;
@@ -1750,11 +1912,15 @@ impl MetadataEnricher {
                     let metadata = nfo_snapshot
                         .as_deref_mut()
                         .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.series_id));
+                    let deferred_metadata_updates = nfo_snapshot
+                        .as_deref()
+                        .map(|snapshot| snapshot.deferred_metadata_updates.clone());
                     nfo_requests.push(SeriesNfoRequest {
                         item_id: source.series_id.clone(),
                         nfo_path,
                         metadata,
                         on_demand: nfo_snapshot.is_none(),
+                        deferred_metadata_updates,
                     });
                 }
                 if process_images && let Some(series_paths) = series_paths.as_ref() {
@@ -1817,11 +1983,15 @@ impl MetadataEnricher {
                     let metadata = nfo_snapshot
                         .as_deref_mut()
                         .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.season_id));
+                    let deferred_metadata_updates = nfo_snapshot
+                        .as_deref()
+                        .map(|snapshot| snapshot.deferred_metadata_updates.clone());
                     nfo_requests.push(SeriesNfoRequest {
                         item_id: source.season_id.clone(),
                         nfo_path,
                         metadata,
                         on_demand: nfo_snapshot.is_none(),
+                        deferred_metadata_updates,
                     });
                 }
                 if process_images {
@@ -1855,11 +2025,15 @@ impl MetadataEnricher {
                     let metadata = nfo_snapshot
                         .as_deref_mut()
                         .and_then(|snapshot| snapshot.metadata_by_item.remove(&source.episode_id));
+                    let deferred_metadata_updates = nfo_snapshot
+                        .as_deref()
+                        .map(|snapshot| snapshot.deferred_metadata_updates.clone());
                     nfo_requests.push(SeriesNfoRequest {
                         item_id: source.episode_id.clone(),
                         nfo_path,
                         metadata,
                         on_demand: nfo_snapshot.is_none(),
+                        deferred_metadata_updates,
                     });
                 }
                 if process_images {
@@ -1901,6 +2075,7 @@ impl MetadataEnricher {
                                     &request.nfo_path,
                                     request.metadata,
                                     deferred_actor_credits,
+                                    request.deferred_metadata_updates,
                                 )
                                 .await
                         };
@@ -1951,12 +2126,16 @@ impl MetadataEnricher {
                 )
                 .await
             }
-            NfoMetadataLookup::Snapshot(metadata_by_item) => {
+            NfoMetadataLookup::Snapshot {
+                metadata_by_item,
+                deferred_metadata_updates,
+            } => {
                 self.enrich_nfo_item_with_metadata(
                     item_id,
                     nfo_path,
                     metadata_by_item.remove(item_id),
                     deferred_actor_credits,
+                    deferred_metadata_updates,
                 )
                 .await
             }
@@ -2010,8 +2189,14 @@ impl MetadataEnricher {
         deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) -> Result<MetadataReport, MetadataError> {
         let metadata = self.database.find_media_item_metadata(item_id).await?;
-        self.enrich_nfo_item_with_metadata(item_id, nfo_path, metadata, deferred_actor_credits)
-            .await
+        self.enrich_nfo_item_with_metadata(
+            item_id,
+            nfo_path,
+            metadata,
+            deferred_actor_credits,
+            None,
+        )
+        .await
     }
 
     async fn enrich_nfo_item_with_metadata(
@@ -2020,6 +2205,7 @@ impl MetadataEnricher {
         nfo_path: &Path,
         metadata: Option<StoredMediaMetadata>,
         deferred_actor_credits: Option<DeferredNfoActorCredits>,
+        deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
@@ -2131,24 +2317,29 @@ impl MetadataEnricher {
                 state.metadata.production_year.map(i64::from) != current.production_year;
             if (title_changed || year_changed)
                 && let Some(production_year) = state.metadata.production_year
-                && let Some(conflicting_item_id) = self
-                    .database
-                    .movie_metadata_identity_conflict(
-                        item_id,
-                        &state
-                            .metadata
-                            .title
-                            .as_deref()
-                            .unwrap_or(&current.title)
-                            .to_lowercase(),
-                        i64::from(production_year),
-                    )
-                    .await?
             {
-                return Err(MetadataError::ConflictingMovieIdentity {
-                    item_id: item_id.to_owned(),
-                    conflicting_item_id,
-                });
+                if let Some(deferred_updates) = deferred_metadata_updates.as_ref()
+                    && deferred_updates.has_pending().await
+                {
+                    self.flush_deferred_local_nfo_metadata_updates(deferred_updates)
+                        .await;
+                }
+                let title = state
+                    .metadata
+                    .title
+                    .as_deref()
+                    .unwrap_or(&current.title)
+                    .to_lowercase();
+                if let Some(conflicting_item_id) = self
+                    .database
+                    .movie_metadata_identity_conflict(item_id, &title, i64::from(production_year))
+                    .await?
+                {
+                    return Err(MetadataError::ConflictingMovieIdentity {
+                        item_id: item_id.to_owned(),
+                        conflicting_item_id,
+                    });
+                }
             }
         }
         let local_rating = projection.details.rating;
@@ -2247,22 +2438,25 @@ impl MetadataEnricher {
             });
             let provenance_json = state.provenance_json();
             let locked_fields_json = state.locked_fields_json();
-            self.database
-                .update_media_item_metadata(MediaMetadataUpdate {
-                    item_id,
-                    title: state.metadata.title.as_deref().unwrap_or(&current.title),
-                    original_title: state.metadata.original_title.as_deref(),
-                    overview: state.metadata.overview.as_deref(),
-                    production_year: state.metadata.production_year.map(i64::from),
-                    premiere_date: local_nfo_premiere_date(&projection.details),
-                    rating: local_rating,
-                    rating_source: local_rating.map(|_| "NFO"),
-                    provider_ids_json: provider_ids_json.as_deref(),
-                    metadata_fingerprint: fingerprint,
-                    provenance_json: &provenance_json,
-                    locked_fields_json: &locked_fields_json,
-                })
-                .await?;
+            let update = MediaMetadataUpdate {
+                item_id,
+                title: state.metadata.title.as_deref().unwrap_or(&current.title),
+                original_title: state.metadata.original_title.as_deref(),
+                overview: state.metadata.overview.as_deref(),
+                production_year: state.metadata.production_year.map(i64::from),
+                premiere_date: local_nfo_premiere_date(&projection.details),
+                rating: local_rating,
+                rating_source: local_rating.map(|_| "NFO"),
+                provider_ids_json: provider_ids_json.as_deref(),
+                metadata_fingerprint: fingerprint,
+                provenance_json: &provenance_json,
+                locked_fields_json: &locked_fields_json,
+            };
+            if let Some(deferred_metadata_updates) = deferred_metadata_updates {
+                deferred_metadata_updates.push(update).await;
+            } else {
+                self.database.update_media_item_metadata(update).await?;
+            }
         }
         report.nfo_loaded = 1;
         Ok(report)
@@ -3449,6 +3643,88 @@ mod tests {
         .fetch_one(database.pool())
         .await?;
         assert_eq!(fallback, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_nfo_metadata_batch_falls_back_per_item_after_transaction_failure()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, title) in [
+            ("Movie One (2024)", "Movie.One.2024", "Updated One"),
+            ("Movie Two (2024)", "Movie.Two.2024", "Updated Two"),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(
+                movie_dir.join(format!("{stem}.nfo")),
+                format!("<movie><title>{title}</title><year>2024</year></movie>"),
+            )
+            .await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let entry_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM filesystem_entries
+             WHERE relative_path LIKE 'Movie % (2024)/%.mkv' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), 2);
+
+        let failed_item_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND title = 'Movie Two'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_second_local_nfo_metadata_update
+             BEFORE UPDATE OF title ON media_items
+             WHEN OLD.title = 'Movie Two'
+             BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let enricher = MetadataEnricher::new(database.clone());
+        let image_batch = enricher
+            .index_scan_local_metadata_batch_images(&entry_ids)
+            .await?;
+        let batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(image_batch.sources, &[])
+            .await?;
+
+        assert_eq!(batch.report.nfo_loaded, 1);
+        assert_eq!(batch.report.nfo_failed, 1);
+        assert_eq!(batch.report.failed_item_ids, [failed_item_id.as_str()]);
+        let titles: Vec<String> = sqlx::query_scalar(
+            "SELECT title FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY title",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(titles, ["Movie Two", "Updated One"]);
         Ok(())
     }
 

@@ -2,6 +2,7 @@ use super::*;
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
+const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
@@ -5689,9 +5690,47 @@ impl Database {
         &self,
         update: MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
-        let sort_title = update.title.to_lowercase();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.update_media_item_metadata_in_transaction(&mut transaction, &update)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn update_media_item_metadata_batch(
+        &self,
+        updates: &[MediaMetadataUpdate<'_>],
+    ) -> Result<(), StorageError> {
+        for update_chunk in updates.chunks(MEDIA_METADATA_UPDATE_BATCH_SIZE) {
+            let _write_guard = self.acquire_metadata_write_lock().await;
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            for update in update_chunk {
+                self.update_media_item_metadata_in_transaction(&mut transaction, update)
+                    .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    async fn update_media_item_metadata_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        update: &MediaMetadataUpdate<'_>,
+    ) -> Result<(), StorageError> {
+        let sort_title = update.title.to_lowercase();
         self.query(
             "UPDATE media_items
              SET title = ?,
@@ -5754,20 +5793,13 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
         })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        Ok(())
     }
 
     pub(crate) async fn media_item_nfo_metadata_json(

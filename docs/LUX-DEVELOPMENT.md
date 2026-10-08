@@ -9305,6 +9305,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：相同 profile 图片再次写入时，人物图片、provider index 和 legacy TMDb index 三个目标均保留原 inode；helper 回归确认缺失目标仍创建、不同内容走原子写、相同内容保持私有权限，符号链接和目录目标拒绝。旧实现回归先稳定观察到重复上传替换了人物图片 inode。People service 定向测试 39/39 通过；`cargo build --locked`、`cargo test --locked --all-targets --quiet`（791 library tests 通过、13 忽略，集成目标全部通过）、fmt、全 target/all features Clippy 与 `git diff --check` 通过。本机 `arm64`。固定测试只证明跳过相同内容的临时文件写入、`fsync` 和 `rename`，不测量总文件系统调用或墙钟，也不外推 FNOS/NAS/生产收益。
 
+#### LUX-449：按页合并本地 NFO metadata 写事务
+
+范围：本地 metadata worker 已在一次 item 更新中提交 NFO metadata、provider ID、premiere date 与 fingerprint，但一页中每个 item 仍独立获取 metadata 写锁并提交事务。将已成功解析的状态按最多 16 个 item 聚合，每个 chunk 只获取一次写锁并提交一个事务；标题或年份身份检查前先提交此前暂存项，保持同页 identity conflict 检查顺序。普通在线/单条 NFO 写回继续使用单条事务。若 chunk 事务失败，回退到逐 item 写入以保持既有错误隔离，并只将真正失败的 item 计为 NFO 失败。不改变字段优先级、provider ID 合并、NFO fingerprint 或失败重试语义。
+
+验收：
+
+- [x] 存储批量更新按最多 16 个 item 共用写锁和事务；注入后续 item 失败时，批次前面已执行的 UPDATE 也整体回滚。
+- [x] 本地 NFO page 在解析完成后批量提交；标题或年份变更前提交前序状态并检查同页身份冲突。批次失败后逐 item 回退，成功 item 保留更新，失败 item 单独标记。
+- [x] 定向 storage 与 metadata page 回归、build、fmt、Clippy、全目标测试和差异检查通过。
+- [x] 性能记录区分事务/锁次数与 SQL UPDATE 次数；不把事务合并表述成 SQL 调用减少或 FNOS/NAS 收益。
+
+预计文件：`src/application/metadata.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加跨 item 回滚回归，再实现 storage 批量提交和失败回退。
+
+结果（2026-10-09）：本地 NFO metadata/provider ID/premiere date/fingerprint 更新按最多 16 个 item 共用一次 metadata 写锁和事务；标题或年份改变前先提交已暂存状态，再检查同页身份冲突。注入批次中途 UPDATE 失败后，存储回归确认整个 chunk 回滚；应用层逐项回退，成功项保留、失败项单独标记。`cargo test --locked --all-targets` 的 793 项库测试与所有集成目标通过（13 项忽略）；`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 通过。本机 ARM64。SQL UPDATE 仍逐 item 执行；未测量事务墙钟或部署后 PostgreSQL/FNOS/NAS 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

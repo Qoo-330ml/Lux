@@ -1702,3 +1702,7 @@ actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallba
 ### LUX-448 相同人物图片与 provider index 的 no-op 写入
 
 重复上传同一 profile 图片的固定回归中，旧路径会替换人物图片及两个 TMDb index 文件；候选路径在 inode 保持不变时复用现有文件。不同字节与缺失文件仍经原子临时文件写入。相同内容路径仍会读取同长度目标并校正私有权限，因此这里记录的是跳过临时文件写入、`fsync` 与 `rename` 的行为，不代表文件系统总调用或墙钟下降；没有测量图片下载请求、FNOS/NAS、生产 I/O 或 CPU 收益。
+
+### LUX-449 本地 NFO metadata 状态写事务
+
+本地 NFO page 的 metadata/provider ID/premiere date/fingerprint 更新按最多 16 个 item 共用一次 metadata 写锁和事务；identity conflict 检查会在标题或年份变更前刷新此前暂存项，因此部分批次会早于 16 项提交。16 个 item 的 SQL `UPDATE` 语句仍分别执行。跨 item 故障回归证明批次事务在后续 UPDATE 失败时整体回滚；应用层随后逐 item 回退，以保留单条错误隔离。该记录说明事务和锁的合并边界，不声称 SQL 调用数减少、事务墙钟缩短或 PostgreSQL/FNOS/NAS CPU 改善。

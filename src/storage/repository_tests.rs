@@ -86,6 +86,88 @@ async fn scan_job_metadata_target_selection_uses_one_query_without_a_local_sourc
 }
 
 #[tokio::test]
+async fn local_nfo_metadata_batch_rolls_back_all_updates_on_a_batch_error()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    for item_id in ["nfo-batch-first", "nfo-batch-second"] {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', 'Old title', 'old title', 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+    }
+    sqlx::query(
+        "CREATE TRIGGER reject_second_local_nfo_update
+         BEFORE UPDATE OF title ON media_items
+         WHEN OLD.id = 'nfo-batch-second'
+         BEGIN SELECT RAISE(ABORT, 'injected metadata failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let first_fingerprint = [1_u8; 32];
+    let second_fingerprint = [2_u8; 32];
+    let updates = [
+        MediaMetadataUpdate {
+            item_id: "nfo-batch-first",
+            title: "First title",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: None,
+            rating_source: None,
+            provider_ids_json: None,
+            metadata_fingerprint: &first_fingerprint,
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        },
+        MediaMetadataUpdate {
+            item_id: "nfo-batch-second",
+            title: "Second title",
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating: None,
+            rating_source: None,
+            provider_ids_json: None,
+            metadata_fingerprint: &second_fingerprint,
+            provenance_json: "{}",
+            locked_fields_json: "{}",
+        },
+    ];
+
+    assert!(
+        database
+            .update_media_item_metadata_batch(&updates)
+            .await
+            .is_err()
+    );
+    let titles: Vec<String> = sqlx::query_scalar(
+        "SELECT title FROM media_items
+         WHERE id IN ('nfo-batch-first', 'nfo-batch-second') ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(titles, ["Old title", "Old title"]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn scan_job_metadata_page_preserves_kind_priority_and_item_order()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
