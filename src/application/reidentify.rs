@@ -40,6 +40,7 @@ pub const METADATA_MATCH_CONCURRENCY: usize = 16;
 const METADATA_GLOBAL_WORKER_LIMIT: usize = METADATA_MATCH_CONCURRENCY;
 const METADATA_FILL_MISSING_GLOBAL_WORKER_LIMIT: usize = 2;
 const METADATA_FILL_MISSING_DISPATCH_QUEUE_CAPACITY: usize = 32;
+const METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const SQLITE_METADATA_DEFAULT_CONCURRENCY: usize = 4;
 const POSTGRES_METADATA_DEFAULT_CONCURRENCY: usize = 8;
 const METADATA_JOB_ITEM_PAGE_SIZE: i64 = 100;
@@ -181,7 +182,11 @@ async fn run_fill_missing_dispatcher_loop<F, Fut, R, RFut>(
     R: FnMut(String) -> RFut + Send + 'static,
     RFut: Future<Output = ()> + Send + 'static,
 {
+    let mut wait_for_coalescing_window = true;
     while let Some(job_id) = receiver.recv().await {
+        if wait_for_coalescing_window {
+            tokio::time::sleep(METADATA_FILL_MISSING_DISPATCH_COALESCE_WINDOW).await;
+        }
         if let Err(error) = tokio::spawn(run_job(job_id.clone())).await {
             tracing::error!(
                 job_id,
@@ -197,6 +202,7 @@ async fn run_fill_missing_dispatcher_loop<F, Fut, R, RFut>(
         } else {
             None
         };
+        wait_for_coalescing_window = receiver.is_empty();
         if let Some(completion_sender) = completion_sender {
             let _ = completion_sender.send(());
         }
@@ -3293,8 +3299,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fill_missing_dispatcher_continues_after_a_job_runner_panics() {
-        let (sender, receiver) = mpsc::channel(2);
+    async fn fill_missing_dispatcher_recovers_panics_and_coalesces_only_when_idle() {
+        let (sender, receiver) = mpsc::channel(3);
         let pending_jobs = Arc::new(Mutex::new(MetadataFillMissingPendingJobs::default()));
         let mut completion_receivers = Vec::new();
         {
@@ -3307,23 +3313,35 @@ mod tests {
                     .insert(job_id.to_owned(), completion_sender);
                 completion_receivers.push(completion_receiver);
             }
+            let (completion_sender, completion_receiver) = oneshot::channel();
+            pending.job_ids.insert("fresh".to_owned());
+            pending
+                .completion_senders
+                .insert("fresh".to_owned(), completion_sender);
+            completion_receivers.push(completion_receiver);
         }
         sender.send("panics".to_owned()).await.expect("queue open");
         sender
             .send("continues".to_owned())
             .await
             .expect("queue open");
-        drop(sender);
 
         let (completed_tx, mut completed_rx) = mpsc::unbounded_channel();
         let run_completed = completed_tx.clone();
         let recovered = completed_tx;
-        run_fill_missing_dispatcher_loop(
+        let job_starts = Arc::new(Mutex::new(Vec::new()));
+        let run_job_starts = Arc::clone(&job_starts);
+        let worker = tokio::spawn(run_fill_missing_dispatcher_loop(
             receiver,
             Arc::clone(&pending_jobs),
             move |job_id| {
                 let completed = run_completed.clone();
+                let job_starts = Arc::clone(&run_job_starts);
                 async move {
+                    job_starts
+                        .lock()
+                        .expect("job start timestamps lock")
+                        .push((job_id.clone(), tokio::time::Instant::now()));
                     if job_id == "panics" {
                         panic!("injected dispatcher job panic");
                     }
@@ -3336,8 +3354,7 @@ mod tests {
                     let _ = recovered.send(format!("recovered:{job_id}"));
                 }
             },
-        )
-        .await;
+        ));
 
         let observed = [
             completed_rx.recv().await.expect("panic recovery recorded"),
@@ -3345,9 +3362,43 @@ mod tests {
         ];
         assert!(observed.contains(&"recovered:panics".to_owned()));
         assert!(observed.contains(&"ran:continues".to_owned()));
-        for completion in completion_receivers {
+        {
+            let job_starts = job_starts.lock().expect("job start timestamps lock");
+            assert_eq!(job_starts[0].0, "panics");
+            assert_eq!(job_starts[1].0, "continues");
+            assert!(
+                job_starts[1].1.duration_since(job_starts[0].1) < Duration::from_millis(900),
+                "a queued job should not incur another coalescing delay"
+            );
+        }
+        let first_completions = completion_receivers.drain(..2);
+        for completion in first_completions {
             completion.await.expect("dispatch completion signaled");
         }
+        let fresh_enqueued_at = tokio::time::Instant::now();
+        sender.send("fresh".to_owned()).await.expect("queue open");
+        completion_receivers
+            .pop()
+            .expect("fresh completion receiver")
+            .await
+            .expect("fresh job completion signaled");
+        assert_eq!(
+            completed_rx.recv().await.as_deref(),
+            Some("ran:fresh"),
+            "a new job after the queue became idle should run"
+        );
+        {
+            let job_starts = job_starts.lock().expect("job start timestamps lock");
+            assert_eq!(job_starts[2].0, "fresh");
+            assert!(
+                job_starts[2].1.duration_since(fresh_enqueued_at) >= Duration::from_millis(900),
+                "the first job after an idle period should receive a coalescing window"
+            );
+        }
+        drop(sender);
+        worker
+            .await
+            .expect("dispatcher exits after the queue closes");
         assert!(
             pending_jobs
                 .lock()

@@ -1607,3 +1607,7 @@ completion waiter 仍优先等待本地 worker 的进程内 `Notify`，未收到
 thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 enqueue 等 dispatcher completion；storage 把请求合并到已排队 job、dispatcher 未提供新 completion receiver 时，以 1 秒间隔读取 job 终态。只有终态后才检查 poster/thumb 并更新 retry attempt。enqueue 失败时释放 lease、保留尝试次数并安排内部错误恢复时间。
 
 固定测试 gate 住 provider search，确认 job 运行期间 retry 仍为 `RUNNING`、attempt count 不变；provider 放行并且 metadata job 终态后才推进 retry。关闭 dispatcher 回归确认 job 留在 `QUEUED`、retry 恢复为 `PENDING` 且次数不变。该测试不测量真实任务时延、请求吞吐或生产 CPU，不推断 FNOS/NAS 收益。
+
+### LUX-429 FILL_MISSING idle coalescing window
+
+按 library 的 dispatcher 空闲并收到首个 job 后等待 1 秒，再 claim；这段时间里后续条目请求仍可被 storage 合并进相同的 `QUEUED` job，dispatcher 对重复 job ID 不重复排队。dispatcher 有积压时，后续 job 按序立即执行；队列再次为空后收到的新 job 才重新等待 1 秒。`RUNNING` job 的输入不变。此策略使空闲后的首个补全 job 最多额外等待 1 秒；固定回归验证了 storage 合并和 runner 时序，但没有测量真实请求批次、SQL、吞吐、生产 CPU 或 FNOS/NAS 收益。

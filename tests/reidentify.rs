@@ -1449,6 +1449,115 @@ async fn fill_missing_dispatcher_serializes_jobs_for_one_library()
 }
 
 #[tokio::test]
+async fn idle_fill_missing_dispatcher_coalesces_requests_before_claim()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8101".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Coalesced fill missing", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Coalesced fill missing");
+    for item_index in 0..2 {
+        let title = format!("Coalesced Movie {item_index} (2024)");
+        let movie_dir = root.join(&title);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Coalesced.Movie.{item_index}.2024.mkv")),
+            b"fixture",
+        )
+        .await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL
+         ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 2);
+
+    let gate = BlockingRequestGate {
+        started: Arc::new(AtomicUsize::new(0)),
+        release: Arc::new(Semaphore::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(gated_empty_tmdb_stub))
+        .with_state(gate.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move { axum::serve(tmdb_listener, tmdb_app).await });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        proxy_url: None,
+        api_key: None,
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(5),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+    })?;
+    let metadata =
+        MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
+
+    let first_job = metadata
+        .create_fill_missing_job(vec![item_ids[0].clone()])
+        .await?;
+    let completion = metadata
+        .enqueue_fill_missing_job(&first_job)
+        .await?
+        .ok_or("first dispatcher submission should own the completion receiver")?;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let status_before_second_request: String =
+        sqlx::query_scalar("SELECT status FROM metadata_reidentify_jobs WHERE id = ?")
+            .bind(&first_job.id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        status_before_second_request, "QUEUED",
+        "an idle dispatcher must hold its first job through the coalescing window"
+    );
+
+    let merged_job = metadata
+        .create_fill_missing_job(vec![item_ids[1].clone()])
+        .await?;
+    assert_eq!(merged_job.id, first_job.id);
+    assert_eq!(merged_job.total_count, 2);
+    assert!(
+        metadata
+            .enqueue_fill_missing_job(&merged_job)
+            .await?
+            .is_none()
+    );
+    assert_eq!(gate.started.load(Ordering::SeqCst), 0);
+
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while gate.started.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await?;
+    gate.release.add_permits(16);
+    tokio::time::timeout(Duration::from_secs(5), completion).await??;
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelled_fill_missing_job_finishes_while_waiting_for_worker_permit()
 -> Result<(), Box<dyn std::error::Error>> {
     let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;

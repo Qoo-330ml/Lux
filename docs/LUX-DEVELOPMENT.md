@@ -9013,6 +9013,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：thumbnail retry 现经 library dispatcher 提交 FILL_MISSING；独占队列项等待 dispatcher 完成通知，合并项以 1 秒 fallback 读取 job 终态。关闭 dispatcher 时释放 retry lease、保留原 attempt count，job 保持可重试的 QUEUED。测试分别验证拒绝入队的恢复状态，以及 provider 被 gate 时不提前消费 attempt、job 完成后才继续图片缺失检查。旧实现的关闭回归曾观察到 3 秒后 retry 和 metadata job 仍 RUNNING。`tests/scheduled_tasks.rs` 8/8、`tests/reidentify.rs` 15/15、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。本机 ARM64；无生产吞吐或 FNOS/NAS 性能证据。
 
+#### LUX-429：合并空闲窗口内到达的 FILL_MISSING 请求
+
+范围：LUX-424 至 LUX-428 已将补全 job 接入按 library dispatcher，但每个 job 创建后立即被 runner claim，短时间内连续到达的小批次难以合并。dispatcher 从空闲状态收到首个 job 后增加 1 秒聚合窗口，让同库请求仍可并入 QUEUED job；已有积压时后续 job 立即按序执行，不逐项叠加窗口。RUNNING job 的输入保持不变，不改变 job 持久化合同、每库顺序或全局 item worker 上限。
+
+验收：
+
+- [x] dispatcher 空闲时首个 job 在 1 秒窗口中保持 QUEUED，同库后续请求能复用该 job，且不重复排入同一 job ID。
+- [x] dispatcher 已有积压时，首个 job 完成后立即执行下一个 queued job，不再等待额外聚合窗口；队列为空后新一轮请求才开启窗口。
+- [x] 自动化回归覆盖 storage 合并、claim 时序及积压执行；`tests/reidentify.rs`、build、fmt、Clippy 和 `git diff --check` 通过。
+- [x] 性能记录说明窗口只降低空闲后短批请求创建新 job 的机会；不推断真实任务批次、SQL、CPU 或 FNOS/NAS 收益。
+
+预计文件：`src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加实际 storage 合并回归，再实现 dispatcher 空闲窗口，并用定向 runner 测试确认积压 job 不逐项延迟。
+
+结果（2026-10-08）：library dispatcher 在空闲后 claim 首个 `FILL_MISSING` job 前等待 1 秒；期间新请求可并入同一个 QUEUED job，重复 ID 继续复用原 completion 通知。队列已积压时不逐 job 增加延迟，队列再次排空后新请求重新获得窗口。`tests/reidentify.rs` 16/16、对应 dispatcher library 单测通过；build、fmt、全目标全 feature Clippy 和差异检查通过。本机架构为 ARM64。`cargo test --locked --all-targets` 的 library 部分 766 passed、13 ignored，随后在既有 `tests/emby_counts.rs:159` 失败（实际 1、预期 0；此前 LUX-424 记录已在基线 `2b64ba65` 复现）。未部署 FNOS，也没有生产 job 聚合、吞吐、SQL 或 CPU 测量。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
