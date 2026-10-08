@@ -9099,6 +9099,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-08）：`mark_person_manifest_restore_pending` 的 UPSERT 仅当状态不是当前 schema 的 PENDING 时执行 conflict UPDATE。storage trigger 回归确认重复 pending 为 0 次 UPDATE，而 COMPLETED→PENDING 与 schema version 变化各执行一次更新。manifest checksum restore、legacy migration completion、`tests/people_api.rs` 10/10、build、fmt、全目标全 feature Clippy 和差异检查通过。本机 ARM64；确认的只是数据库 UPDATE 行数边界，不外推端到端 storage 调用数、墙钟或 FNOS/NAS 收益。
 
+#### LUX-435：本地 NFO 页批量写入 actor credits
+
+范围：本地 scan metadata NFO page 每个 item 完成 actor relation file 后，分别获取 credits lock 和 metadata transaction。增加仅供本地 NFO 页使用的 deferred credits 路径：保持每个 item 的 relation、person manifest、NFO 与 image 文件处理及错误隔离，收齐页内 actor credits 后按最多 16 个 item 一个事务批量提交。普通单 item API、在线刮削和 candidate refresh 保持即时持久化。批事务失败时记录失败 item IDs，relation fingerprint 与数据库 credits revision 不一致，使之后扫描可重试；不声称文件与数据库原子提交。
+
+验收：
+
+- [x] people service 回归验证 relation 文件在 credits flush 前已写入、DB revision 尚未 current，flush 后 revision current。
+- [x] scanner local NFO page regression 验证多项 actor 更新走 batch flush，单项错误仍隔离；storage 16-item rollback 语义不变。
+- [x] metadata/NFO、people API 定向回归、build、fmt、Clippy 与差异检查通过；记录每 16 item 至多一次 credits transaction，不推断生产数据库或 FNOS 收益。
+
+预计文件：`src/application/people/relations.rs`、`src/application/people/service.rs`、`src/application/metadata.rs`、相关 people/scanning tests、两份开发/性能记录。先加 deferred persistence contract 回归，再实现 service batch，最后只连接 local scan NFO batch path。
+
+结果（2026-10-08）：本地 scan NFO page 先完成每项 relation、manifest、NFO 和图片处理，再把 credits 按最多 16 项一组提交；每页 N 项至多执行 `ceil(N/16)` 次 credits replacement 事务。relation 文件早于 credits flush 写入；如果批事务失败，该 chunk 内 item 被报告为失败，数据库 revision 不 current，后续扫描可重试。普通人物 API、在线刮削及单条目 NFO enrichment 仍即时提交。deferred persistence、page flush/错误隔离、metadata NFO 单测、`tests/people_api.rs` 10/10、`tests/scanned_metadata.rs` 16/16、`tests/scanned_series_metadata.rs` 2/2、build、fmt、Clippy 和差异检查通过。本机 ARM64。全目标库测试 775 passed、13 ignored；集成目标中 `emby_counts`、`metadata`、`metadata_selection`、`strm` 四个失败已在父提交 `855d890a` 独立复现，`watch` 的 SQLite 锁冲突单独复跑通过。未据此推断生产 SQL 延迟、FNOS/NAS 或 CPU 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

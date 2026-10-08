@@ -1633,3 +1633,9 @@ thumbnail retry 创建的 `FILL_MISSING` job 进入 library dispatcher。首个 
 ### LUX-434 person manifest restore pending no-op
 
 重复将相同 schema 的 restore state 标记为 `PENDING` 时，UPSERT 不再更新数据库行和 `updated_at`；`COMPLETED` 状态或 schema 变化仍执行 UPDATE。trigger 固定回归确认 UPDATE 为 0 次或 1 次。这不跳过调用方的 storage 查询入口，也没有测量生产更新频率、事务耗时或数据库收益。
+
+### LUX-435 本地 NFO 页 actor credits 批次边界
+
+本地 scan metadata NFO page 原先在每个 item 的 relation 文件写完后分别获取 credits 写锁并提交事务。现在先完成页内 relation 文件处理，再每 16 个 item 调用一次批量 credits replacement；含 N 项待提交 actor relation 的页面最多执行 `ceil(N/16)` 次 credits replacement 事务。固定回归覆盖两个 relation 先于 flush 写入、flush 前数据库 revision 仍为 stale、flush 后恢复 current；注入 credits SQL 错误时同一 16-item chunk 的 credits/index state 整体回滚，扫描报告该 chunk item 失败，其他 NFO 文件解析错误仍按 item 隔离。
+
+该记录描述调用和事务边界，不是 SQL 执行次数或事务耗时测量。普通人物 API、在线刮削和单条目 enrichment 保持即时持久化；未测量 PostgreSQL 时延、锁等待、FNOS/NAS 或 CPU 收益。

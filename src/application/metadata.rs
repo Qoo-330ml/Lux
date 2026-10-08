@@ -17,7 +17,7 @@ use crate::{
             LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
             parse_local_nfo_projection,
         },
-        people::PeopleService,
+        people::{DeferredNfoActorCredits, PeopleService},
     },
     domain::ids::LibraryId,
     storage::{
@@ -901,6 +901,7 @@ impl MetadataEnricher {
             &mut series_context,
             SeriesEnrichmentMode::ImagesAndNfo,
             None,
+            None,
         )
         .await?;
         Ok(report)
@@ -1024,6 +1025,7 @@ impl MetadataEnricher {
                 &mut series_context,
                 SeriesEnrichmentMode::ImagesAndNfo,
                 None,
+                None,
             )
             .await;
             let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -1111,6 +1113,7 @@ impl MetadataEnricher {
             &mut series_context,
             SeriesEnrichmentMode::ImagesOnly,
             None,
+            None,
         )
         .await;
         Ok(ScanLocalMetadataImageBatch { report, sources })
@@ -1181,6 +1184,10 @@ impl MetadataEnricher {
             .collect();
         let (movies, home_videos, episodes) = split_scan_local_metadata_sources(&sources);
         let mut report = MetadataReport::default();
+        let deferred_actor_credits = self
+            .people
+            .as_ref()
+            .map(|_| DeferredNfoActorCredits::default());
         for source in movies {
             report.items_processed += 1;
             if let Some(nfo_path) = nfo_snapshot.nfo_paths_by_item.remove(&source.item_id) {
@@ -1189,12 +1196,18 @@ impl MetadataEnricher {
                     &source.item_id,
                     &nfo_path,
                     NfoMetadataLookup::Snapshot(&mut nfo_snapshot.metadata_by_item),
+                    deferred_actor_credits.clone(),
                 )
                 .await;
             }
         }
-        self.enrich_home_video_sources_with_snapshot(home_videos, &mut report, &mut nfo_snapshot)
-            .await;
+        self.enrich_home_video_sources_with_snapshot(
+            home_videos,
+            &mut report,
+            &mut nfo_snapshot,
+            deferred_actor_credits.clone(),
+        )
+        .await;
         let mut series_context = SeriesEnrichmentContext::tracking_hierarchy();
         self.enrich_series_scan_job_sources(
             episodes,
@@ -1202,8 +1215,26 @@ impl MetadataEnricher {
             &mut series_context,
             SeriesEnrichmentMode::NfoOnly,
             Some(&mut nfo_snapshot),
+            deferred_actor_credits.clone(),
         )
         .await;
+        if let (Some(people), Some(deferred_actor_credits)) =
+            (&self.people, deferred_actor_credits.as_ref())
+        {
+            for failure in people
+                .flush_deferred_nfo_actor_credits(deferred_actor_credits)
+                .await
+            {
+                tracing::warn!(
+                    item_ids = ?failure.item_ids,
+                    error = %failure.error,
+                    "local NFO actor credits batch could not be committed"
+                );
+                for item_id in failure.item_ids {
+                    report.mark_item_failed(&item_id);
+                }
+            }
+        }
         Ok(ScanLocalMetadataNfoBatch {
             report,
             source_identities,
@@ -1320,6 +1351,7 @@ impl MetadataEnricher {
             &mut series_context,
             SeriesEnrichmentMode::ImagesAndNfo,
             None,
+            None,
         )
         .await;
         let failed_item_ids = batch_report.failed_item_ids.clone();
@@ -1353,9 +1385,17 @@ impl MetadataEnricher {
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
         nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) {
         if let Err(error) = self
-            .enrich_series_sources(sources, report, context, mode, nfo_snapshot)
+            .enrich_series_sources(
+                sources,
+                report,
+                context,
+                mode,
+                nfo_snapshot,
+                deferred_actor_credits,
+            )
             .await
         {
             tracing::warn!(%error, "local series metadata batch failed");
@@ -1507,6 +1547,7 @@ impl MetadataEnricher {
                         &source.item_id,
                         &nfo_path,
                         NfoMetadataLookup::OnDemand,
+                        None,
                     )
                     .await;
                 }
@@ -1533,6 +1574,7 @@ impl MetadataEnricher {
         sources: Vec<StoredMediaSourcePath>,
         report: &mut MetadataReport,
         snapshot: &mut ScanLocalMetadataNfoSnapshot,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) {
         for source in sources {
             report.items_processed += 1;
@@ -1552,6 +1594,7 @@ impl MetadataEnricher {
                     &source.item_id,
                     &nfo_path,
                     NfoMetadataLookup::Snapshot(&mut snapshot.metadata_by_item),
+                    deferred_actor_credits.clone(),
                 )
                 .await;
             }
@@ -1602,6 +1645,7 @@ impl MetadataEnricher {
                 &mut series_context,
                 SeriesEnrichmentMode::ImagesAndNfo,
                 None,
+                None,
             )
             .await?;
             if last_page {
@@ -1619,6 +1663,7 @@ impl MetadataEnricher {
         context: &mut SeriesEnrichmentContext,
         mode: SeriesEnrichmentMode,
         mut nfo_snapshot: Option<&mut ScanLocalMetadataNfoSnapshot>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) -> Result<(), MetadataError> {
         let process_images = mode.process_images();
         let process_nfo = mode.process_nfo();
@@ -1795,13 +1840,19 @@ impl MetadataEnricher {
         let nfo_results =
             run_bounded_tasks_in_order(nfo_requests, LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY, {
                 let enricher = self.clone();
+                let deferred_actor_credits = deferred_actor_credits.clone();
                 move |request| {
                     let enricher = enricher.clone();
+                    let deferred_actor_credits = deferred_actor_credits.clone();
                     async move {
                         let item_id = request.item_id.clone();
                         let result = if request.on_demand {
                             enricher
-                                .enrich_nfo_item(&request.item_id, &request.nfo_path)
+                                .enrich_nfo_item_with_actor_credit_batch(
+                                    &request.item_id,
+                                    &request.nfo_path,
+                                    deferred_actor_credits,
+                                )
                                 .await
                         } else {
                             enricher
@@ -1809,6 +1860,7 @@ impl MetadataEnricher {
                                     &request.item_id,
                                     &request.nfo_path,
                                     request.metadata,
+                                    deferred_actor_credits,
                                 )
                                 .await
                         };
@@ -1848,14 +1900,23 @@ impl MetadataEnricher {
         item_id: &str,
         nfo_path: &Path,
         metadata: NfoMetadataLookup<'_>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) {
         let enriched = match metadata {
-            NfoMetadataLookup::OnDemand => self.enrich_nfo_item(item_id, nfo_path).await,
+            NfoMetadataLookup::OnDemand => {
+                self.enrich_nfo_item_with_actor_credit_batch(
+                    item_id,
+                    nfo_path,
+                    deferred_actor_credits,
+                )
+                .await
+            }
             NfoMetadataLookup::Snapshot(metadata_by_item) => {
                 self.enrich_nfo_item_with_metadata(
                     item_id,
                     nfo_path,
                     metadata_by_item.remove(item_id),
+                    deferred_actor_credits,
                 )
                 .await
             }
@@ -1898,8 +1959,18 @@ impl MetadataEnricher {
         item_id: &str,
         nfo_path: &Path,
     ) -> Result<MetadataReport, MetadataError> {
+        self.enrich_nfo_item_with_actor_credit_batch(item_id, nfo_path, None)
+            .await
+    }
+
+    async fn enrich_nfo_item_with_actor_credit_batch(
+        &self,
+        item_id: &str,
+        nfo_path: &Path,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
+    ) -> Result<MetadataReport, MetadataError> {
         let metadata = self.database.find_media_item_metadata(item_id).await?;
-        self.enrich_nfo_item_with_metadata(item_id, nfo_path, metadata)
+        self.enrich_nfo_item_with_metadata(item_id, nfo_path, metadata, deferred_actor_credits)
             .await
     }
 
@@ -1908,6 +1979,7 @@ impl MetadataEnricher {
         item_id: &str,
         nfo_path: &Path,
         metadata: Option<StoredMediaMetadata>,
+        deferred_actor_credits: Option<DeferredNfoActorCredits>,
     ) -> Result<MetadataReport, MetadataError> {
         let mut report = MetadataReport::default();
         let fingerprint = nfo_fingerprint(nfo_path).await.ok();
@@ -1927,7 +1999,7 @@ impl MetadataEnricher {
         };
         let rich_cache_missing = self.local_nfo.is_some() && cached_nfo.is_none();
         let actor_relation_missing = if let Some(people) = &self.people {
-            match people.nfo_relation_snapshot_exists(item_id).await {
+            match people.nfo_relation_snapshot_is_current(item_id).await {
                 Ok(exists) => !exists,
                 Err(error) => {
                     tracing::warn!(
@@ -2074,15 +2146,28 @@ impl MetadataEnricher {
                 }
             };
             if !relation_current {
-                match people
-                    .persist_nfo_item_actors(
-                        item_id,
-                        "tmdb",
-                        &projection.actors,
-                        &source_fingerprint,
-                    )
-                    .await
-                {
+                let persist_result =
+                    if let Some(deferred_actor_credits) = deferred_actor_credits.as_ref() {
+                        people
+                            .persist_nfo_item_actors_deferred(
+                                item_id,
+                                "tmdb",
+                                &projection.actors,
+                                &source_fingerprint,
+                                deferred_actor_credits,
+                            )
+                            .await
+                    } else {
+                        people
+                            .persist_nfo_item_actors(
+                                item_id,
+                                "tmdb",
+                                &projection.actors,
+                                &source_fingerprint,
+                            )
+                            .await
+                    };
+                match persist_result {
                     Ok(actor_report) => {
                         if !actor_report.pending_assets.is_empty() {
                             tracing::warn!(
@@ -3045,6 +3130,174 @@ mod tests {
             1,
             "stale preferred sources should be rejected by the same bounded validation"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        let entries = [
+            (
+                "Movie One (2024)",
+                "Movie.One.2024",
+                "<movie><title>broken nfo",
+            ),
+            (
+                "Movie Two (2024)",
+                "Movie.Two.2024",
+                "<movie><title>Movie Two</title><actor><name>演员甲</name><tmdbid>101</tmdbid><order>0</order></actor></movie>",
+            ),
+            (
+                "Movie Three (2024)",
+                "Movie.Three.2024",
+                "<movie><title>Movie Three</title><actor><name>演员乙</name><tmdbid>102</tmdbid><order>0</order></actor></movie>",
+            ),
+        ];
+        for (folder, stem, nfo) in entries {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.nfo")), nfo).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let entry_ids = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM filesystem_entries
+             WHERE relative_path LIKE 'Movie % (2024)/%.mkv' ORDER BY relative_path",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), entries.len());
+
+        let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let enricher = MetadataEnricher::new(database.clone()).with_people(people.clone());
+        let image_batch = enricher
+            .index_scan_local_metadata_batch_images(&entry_ids)
+            .await?;
+        let invalid_item_id: String = sqlx::query_scalar(
+            "SELECT id FROM media_items WHERE library_id = ? AND title = 'Movie One'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        sqlx::query(
+            "CREATE TRIGGER reject_nfo_person_credit BEFORE INSERT ON person_credits
+             BEGIN SELECT RAISE(ABORT, 'injected actor credit failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(image_batch.sources, &[])
+            .await?;
+
+        assert_eq!(batch.report.items_processed, 3);
+        assert_eq!(batch.report.nfo_loaded, 2);
+        assert_eq!(batch.report.nfo_failed, 1);
+        assert!(batch.report.failed_item_ids.contains(&invalid_item_id));
+        for title in ["Movie Two", "Movie Three"] {
+            let item_id: String =
+                sqlx::query_scalar("SELECT id FROM media_items WHERE library_id = ? AND title = ?")
+                    .bind(library.id.to_string())
+                    .bind(title)
+                    .fetch_one(database.pool())
+                    .await?;
+            assert!(batch.report.failed_item_ids.contains(&item_id));
+        }
+        let failed_chunk_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_index_item_state
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            failed_chunk_items, 0,
+            "the failed chunk should roll back atomically"
+        );
+        let failed_chunk_credits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_credits
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(failed_chunk_credits, 0);
+        sqlx::query("DROP TRIGGER reject_nfo_person_credit")
+            .execute(database.pool())
+            .await?;
+        let retry_sources = database
+            .list_scan_local_metadata_sources(&entry_ids)
+            .await?;
+        let retry_batch = enricher
+            .enrich_scan_local_metadata_batch_nfo(retry_sources, &[])
+            .await?;
+        assert_eq!(retry_batch.report.nfo_failed, 1);
+        assert_eq!(retry_batch.report.failed_item_ids, vec![invalid_item_id]);
+        let indexed_items: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_index_item_state
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            indexed_items, 2,
+            "valid item credits should flush as one page batch"
+        );
+        let credits: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_credits
+             WHERE item_id IN (
+                 SELECT id FROM media_items WHERE library_id = ? AND title IN ('Movie Two', 'Movie Three')
+             )",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(credits, 2);
+
+        for title in ["Movie Two", "Movie Three"] {
+            let item_id: String =
+                sqlx::query_scalar("SELECT id FROM media_items WHERE library_id = ? AND title = ?")
+                    .bind(library.id.to_string())
+                    .bind(title)
+                    .fetch_one(database.pool())
+                    .await?;
+            let nfo_path = media_root
+                .join(format!("{title} (2024)"))
+                .join(format!("{}.2024.nfo", title.replace(' ', ".")));
+            let fingerprint = nfo_content_fingerprint(&tokio::fs::read(nfo_path).await?);
+            assert!(
+                people
+                    .item_actor_relation_is_current(&item_id, &fingerprint)
+                    .await?
+            );
+        }
+
         Ok(())
     }
 

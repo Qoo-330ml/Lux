@@ -339,6 +339,22 @@ pub struct ActorPersistReport {
     pub pending_assets: Vec<String>,
 }
 
+#[derive(Clone, Default)]
+pub(crate) struct DeferredNfoActorCredits {
+    pending: Arc<AsyncMutex<Vec<PendingNfoActorCredits>>>,
+}
+
+struct PendingNfoActorCredits {
+    item_id: String,
+    credits: Vec<NewPersonCredit>,
+    source_fingerprint: Option<String>,
+}
+
+pub(crate) struct NfoActorCreditsFlushFailure {
+    pub item_ids: Vec<String>,
+    pub error: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PersonMatchCandidateView {
@@ -642,18 +658,31 @@ impl PeopleService {
         Ok(true)
     }
 
-    pub async fn nfo_relation_snapshot_exists(&self, item_id: &str) -> Result<bool, PeopleError> {
+    pub async fn nfo_relation_snapshot_is_current(
+        &self,
+        item_id: &str,
+    ) -> Result<bool, PeopleError> {
         let path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
             .join("people.json");
         let Some(relation) = read_relation(&path).await? else {
             return Ok(false);
         };
-        Ok(relation
+        let source_fingerprint = relation
             .source_fingerprint
             .as_deref()
             .and_then(decode_fingerprint)
-            .is_some_and(|fingerprint| fingerprint.len() == 32))
+            .filter(|fingerprint| fingerprint.len() == 32);
+        let Some(source_fingerprint) = source_fingerprint else {
+            return Ok(false);
+        };
+        if let Some(database) = &self.database {
+            return database
+                .person_index_item_state_is_current(item_id, relation.source_fingerprint.as_deref())
+                .await
+                .map_err(|error| PeopleError::Storage(error.to_string()));
+        }
+        Ok(source_fingerprint.len() == 32)
     }
 
     pub async fn list_item_actors(&self, item_id: &str) -> Result<Vec<ActorView>, PeopleError> {
@@ -851,9 +880,9 @@ mod tests {
     use tokio::sync::Mutex as AsyncMutex;
 
     use super::{
-        ActorCredit, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError,
-        PeopleService, PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest,
-        PersonMetadata,
+        ActorCredit, DeferredNfoActorCredits, PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION,
+        PERSON_NFO, PeopleError, PeopleService, PersonIdentity, PersonIndexRebuildCoordinator,
+        PersonManifest, PersonMetadata,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
@@ -2360,6 +2389,98 @@ mod tests {
         assert!(
             service
                 .item_actor_relation_is_current("item-1", &source_fingerprint)
+                .await?
+        );
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_nfo_actor_credits_become_current_after_batch_flush()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        for item_id in ["item-a", "item-b"] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(item_id)
+            .bind(library.id.to_string())
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let actors = [ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let fingerprint_a = [1_u8, 2, 3];
+        let fingerprint_b = [4_u8, 5, 6];
+        let deferred_credits = DeferredNfoActorCredits::default();
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-a",
+                "tmdb",
+                &actors,
+                &fingerprint_a,
+                &deferred_credits,
+            )
+            .await?;
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-b",
+                "tmdb",
+                &actors,
+                &fingerprint_b,
+                &deferred_credits,
+            )
+            .await?;
+
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-a", &fingerprint_a)
+                .await?
+        );
+        assert!(
+            library_item_directory(config.config_dir.as_path(), "item-a")?
+                .join("people.json")
+                .exists()
+        );
+
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty()
+        );
+
+        assert!(
+            service
+                .item_actor_relation_is_current("item-a", &fingerprint_a)
+                .await?
+        );
+        assert!(
+            service
+                .item_actor_relation_is_current("item-b", &fingerprint_b)
                 .await?
         );
         database.close().await;

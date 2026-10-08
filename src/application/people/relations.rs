@@ -158,7 +158,7 @@ impl PeopleService {
         provider: &str,
         actors: &[ActorCredit],
     ) -> Result<usize, PeopleError> {
-        self.persist_item_actors_with_source(item_id, provider, actors, None)
+        self.persist_item_actors_with_source(item_id, provider, actors, None, None)
             .await
             .map(|report| report.stored_count)
     }
@@ -170,8 +170,68 @@ impl PeopleService {
         actors: &[ActorCredit],
         source_fingerprint: &[u8],
     ) -> Result<ActorPersistReport, PeopleError> {
-        self.persist_item_actors_with_source(item_id, provider, actors, Some(source_fingerprint))
-            .await
+        self.persist_item_actors_with_source(
+            item_id,
+            provider,
+            actors,
+            Some(source_fingerprint),
+            None,
+        )
+        .await
+    }
+
+    pub(crate) async fn persist_nfo_item_actors_deferred(
+        &self,
+        item_id: &str,
+        provider: &str,
+        actors: &[ActorCredit],
+        source_fingerprint: &[u8],
+        deferred_credits: &DeferredNfoActorCredits,
+    ) -> Result<ActorPersistReport, PeopleError> {
+        self.persist_item_actors_with_source(
+            item_id,
+            provider,
+            actors,
+            Some(source_fingerprint),
+            Some(deferred_credits),
+        )
+        .await
+    }
+
+    pub(crate) async fn flush_deferred_nfo_actor_credits(
+        &self,
+        deferred_credits: &DeferredNfoActorCredits,
+    ) -> Vec<NfoActorCreditsFlushFailure> {
+        let pending = std::mem::take(&mut *deferred_credits.pending.lock().await);
+        let Some(database) = &self.database else {
+            return Vec::new();
+        };
+        let mut failures = Vec::new();
+        for chunk in pending.chunks(16) {
+            let replacements = chunk
+                .iter()
+                .map(|pending| {
+                    (
+                        pending.item_id.as_str(),
+                        pending.credits.as_slice(),
+                        pending.source_fingerprint.as_deref(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Err(error) = database
+                .replace_person_credits_batch_with_fingerprint(&replacements)
+                .await
+            {
+                failures.push(NfoActorCreditsFlushFailure {
+                    item_ids: chunk
+                        .iter()
+                        .map(|pending| pending.item_id.clone())
+                        .collect(),
+                    error: error.to_string(),
+                });
+            }
+        }
+        failures
     }
 
     pub(crate) async fn update_item_actor_metadata(
@@ -288,6 +348,7 @@ impl PeopleService {
         provider: &str,
         actors: &[ActorCredit],
         source_fingerprint: Option<&[u8]>,
+        deferred_credits: Option<&DeferredNfoActorCredits>,
     ) -> Result<ActorPersistReport, PeopleError> {
         let relation_path = library_item_directory(&self.config_dir, item_id)
             .map_err(PeopleError::from)?
@@ -307,6 +368,7 @@ impl PeopleService {
                 actors,
                 source_fingerprint,
                 &relation_path,
+                deferred_credits,
             )
             .await;
         let _ = fs::remove_file(&lock_path).await;
@@ -320,6 +382,7 @@ impl PeopleService {
         actors: &[ActorCredit],
         source_fingerprint: Option<&[u8]>,
         relation_path: &Path,
+        deferred_credits: Option<&DeferredNfoActorCredits>,
     ) -> Result<ActorPersistReport, PeopleError> {
         let previous_relation = read_relation(relation_path).await?;
         let source_locator = if let Some(database) = &self.database {
@@ -613,14 +676,26 @@ impl PeopleService {
                 .iter()
                 .map(person_credit_from_stored_actor)
                 .collect::<Vec<_>>();
-            database
-                .replace_person_credits_with_fingerprint(
-                    item_id,
-                    &credits,
-                    relation.source_fingerprint.as_deref(),
-                )
-                .await
-                .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            if let Some(deferred_credits) = deferred_credits {
+                deferred_credits
+                    .pending
+                    .lock()
+                    .await
+                    .push(PendingNfoActorCredits {
+                        item_id: item_id.to_owned(),
+                        credits,
+                        source_fingerprint: relation.source_fingerprint.clone(),
+                    });
+            } else {
+                database
+                    .replace_person_credits_with_fingerprint(
+                        item_id,
+                        &credits,
+                        relation.source_fingerprint.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?;
+            }
         }
         Ok(ActorPersistReport {
             stored_count: relation.actors.len(),
