@@ -9436,6 +9436,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：一次本地 scan NFO page 用惰性 `PathBuf` cache 复用 episode sidecar 的 `try_exists` 结果；三 episode 回归确认两项共享同一 `episode.nfo`，第三项仍优先同名 NFO，page 对四个唯一候选路径各检查一次。OnDemand 单 item 入口保留独立 cache，缓存不跨 page；文件系统错误仍被 `Option` 传播并停止该 item 的 fallback 查找。新增 metadata library regression 与 `series_metadata` 3/3 通过；第二轮全量 `cargo test --locked --all-targets` 通过，`cargo build --locked`、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。PostgreSQL 专项 16 项因本机无实例而 ignored。本机 ARM64，未测量 NAS/FNOS 文件系统墙钟或 CPU。
 
+#### LUX-458：有界并发扫描本地 metadata NFO 路径
+
+范围：LUX-419 已将 series/season/episode NFO enrichment 限制为最多 4 路并发，LUX-457 已按 page 复用重复 episode sidecar 检查，但 `scan_local_metadata_nfo_paths` 仍按 source 串行做路径发现。将一次 source page 的 NFO 路径发现改为最多 4 路并发，并按原 source 顺序归并路径与错误。多个任务检查同一 sidecar 路径时共用同一个异步结果，包括同目录 `episode.nfo`、重复 series/season 候选；缓存只活到该 page。保留每类原有候选优先级、hierarchy 仅由每个 series/season 的首个 source 决定、VIDEO 显式 I/O 错误、其他 NFO 查找错误通过 `Option` 终止 fallback 的行为。OnDemand 单项路径和后续 NFO enrichment/page metadata transaction 不变。
+
+验收：
+
+- [x] local scan NFO 路径发现的并发不超过 4，source-order 路径/error 结果稳定；测试能观察到并发大于 1。
+- [x] 多个 episode 并发检查共享 `episode.nfo` 时，该 page 只执行一次底层 existence probe；同名 NFO 优先级、hierarchy 首 source 选择和 path errors 保持。
+- [x] 不同 series/season ID 指向同一 hierarchy NFO 候选路径时，共享 page cache 只执行一次底层 existence probe。
+- [x] NFO path discovery、`series_metadata`、`scanned_series_metadata` 定向回归、fmt、build、全目标全 feature Clippy、全量 `cargo test --locked --all-targets` 与 `git diff --check` 通过。
+- [x] 性能记录只报告固定 page 的 probe 次数和并发上界，不外推 NAS/FNOS 墙钟、PostgreSQL 或 CPU 收益。
+
+短计划与文件：修改 `src/application/metadata.rs`，用现有有界 task runner 执行拥有型 path-discovery request，以异步 per-path cell 合并同页重叠 probe，并按输入顺序合并结果；修改 `docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`。先增加 concurrency/probe/order 回归并确认旧串行实现使其失败，再接入 bounded path discovery，最后运行剧集 NFO 定向目标。
+
+结果（2026-10-09）：新增 12-episode fixture 在旧串行实现下先失败（最大并发为 1）；有界执行后观察到并发大于 1 且不超过 4，12 个 item 共用的 `episode.nfo` 只检查一次，同名 NFO 优先级和 series/season 首个 source 选择保持。另一 fixture 先在旧实现下以 3 次 cache probe 对 5 次期望失败，随后确认两个 episode 以及重复 hierarchy ID 路径合计只检查 5 个唯一候选。路径发现单测 6/6、`series_metadata` 3/3、`scanned_series_metadata` 2/2 通过；全量 `cargo test --locked --all-targets` 通过，库测试 802 passed、13 ignored，PostgreSQL 专项 16 项因本机没有实例而 ignored。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；未测量 NAS/FNOS 文件系统墙钟或 CPU，也未据本地 SQLite 测试外推 PostgreSQL 收益。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

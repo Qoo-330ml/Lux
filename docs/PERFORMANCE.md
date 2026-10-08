@@ -1715,4 +1715,8 @@ actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallba
 
 ### LUX-457 本地 scan NFO sidecar 路径检查缓存
 
-本地 metadata page 按完整候选 `PathBuf` 缓存 episode NFO sidecar 的 `try_exists` 结果，仅覆盖当前 page。三 episode 固定回归中，两个 item 复用同目录 `episode.nfo`，第三个 item 仍选用优先级更高的同名 NFO；四个不同候选路径各检查一次，共用 sidecar 不重复检查。filesystem error 继续按原 `Option` 语义终止该 item 的 fallback。缓存不保留到下一页、不复用解析后的 XML，也未测量实际系统调用墙钟、NAS/FNOS 或 CPU 收益。
+本地 metadata page 按完整候选 `PathBuf` 缓存 episode NFO sidecar 的 `try_exists` 结果，仅覆盖当前 page。三 episode 固定回归中，两个 item 复用同目录 `episode.nfo`，第三个 item 仍选用优先级更高的同名 NFO；四个不同 episode sidecar 候选路径各检查一次，共用 sidecar 不重复检查。LUX-458 同时让 hierarchy NFO 候选使用该 page cache。filesystem error 继续按原 `Option` 语义终止该 item 的 fallback。缓存不保留到下一页、不复用解析后的 XML，也未测量实际系统调用墙钟、NAS/FNOS 或 CPU 收益。
+
+### LUX-458 本地 metadata NFO 路径发现有界并发
+
+scan-local NFO page 的路径发现从逐 source 串行改为最多 4 个并发任务，最终仍按 source 输入顺序写入 snapshot。每个 page 用异步单元格共享相同候选路径的 in-flight `try_exists` 结果，覆盖 episode、series 和 season NFO。固定 12-episode fixture 观测到并发大于 1 且不超过 4；12 个不同同名候选加 1 个共享 `episode.nfo` 共进行 13 次候选存在性检查，shared fallback 仅检查一次。另一个两 episode fixture 让不同 hierarchy ID 指向相同 tvshow/season NFO，共 5 个唯一候选只进行 5 次检查。NFO 内容读取/解析、series/season 选择、每 item 错误映射及后续 credits transaction 边界不变。该回归测量的是应用层候选检查次数和并发上界，不是物理磁盘 I/O 数、文件系统墙钟或 FNOS/NAS/PostgreSQL/CPU 收益。

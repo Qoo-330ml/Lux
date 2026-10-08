@@ -10,7 +10,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use tokio::{
     fs,
-    sync::{Mutex, Semaphore},
+    sync::{Mutex, OnceCell, Semaphore},
     task::JoinSet,
 };
 
@@ -42,6 +42,7 @@ const LOCAL_IMAGE_READ_CONCURRENCY: usize = 16;
 const LOCAL_IMAGE_ITEM_BATCH_SIZE: usize = 16;
 const LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY: usize = 4;
+const LOCAL_NFO_PATH_DISCOVERY_CONCURRENCY: usize = 4;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
 fn spawn_bounded_task<I, F, Fut, T>(
@@ -772,7 +773,9 @@ struct ScanLocalMetadataNfoSnapshot {
     metadata_by_item: HashMap<String, StoredMediaMetadata>,
     deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
     #[cfg(test)]
-    nfo_sidecar_probe_count: usize,
+    nfo_candidate_probe_count: usize,
+    #[cfg(test)]
+    nfo_candidate_max_concurrency: usize,
 }
 
 #[derive(Clone, Default)]
@@ -949,6 +952,29 @@ struct SeriesNfoRequest {
     deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
 }
 
+#[derive(Clone, Copy)]
+enum ScanNfoPathSourceKind {
+    Movie,
+    Video,
+    Episode,
+}
+
+struct ScanNfoPathDiscoveryRequest {
+    item_id: String,
+    media_path: PathBuf,
+    kind: ScanNfoPathSourceKind,
+    series_lookup: Option<(String, PathBuf)>,
+    season_lookup: Option<(String, PathBuf, PathBuf, i64)>,
+}
+
+struct ScanNfoPathDiscoveryResult {
+    item_id: String,
+    item_nfo_path: Option<PathBuf>,
+    item_error: Option<MetadataError>,
+    series_lookup: Option<(String, Option<PathBuf>)>,
+    season_lookup: Option<(String, Option<PathBuf>)>,
+}
+
 enum NfoMetadataLookup<'a> {
     OnDemand,
     Snapshot {
@@ -963,79 +989,155 @@ async fn scan_local_metadata_nfo_paths(
     let mut snapshot = ScanLocalMetadataNfoSnapshot::default();
     let mut seen_series = HashSet::<&str>::new();
     let mut seen_seasons = HashSet::<&str>::new();
-    let mut sidecar_existence = NfoSidecarExistenceCache::default();
+    let mut requests = Vec::with_capacity(sources.len());
     for source in sources {
         let root = Path::new(&source.root_path);
         let media_path = root.join(&source.relative_path);
-        match source.item_type.as_str() {
-            "MOVIE" => {
-                if let Some(path) = find_nfo_path(&media_path).await {
-                    snapshot
-                        .nfo_paths_by_item
-                        .insert(source.item_id.clone(), path);
-                }
+        let kind = match source.item_type.as_str() {
+            "MOVIE" => ScanNfoPathSourceKind::Movie,
+            "VIDEO" => ScanNfoPathSourceKind::Video,
+            "EPISODE" => ScanNfoPathSourceKind::Episode,
+            _ => continue,
+        };
+        let mut series_lookup = None;
+        let mut season_lookup = None;
+        if matches!(kind, ScanNfoPathSourceKind::Episode)
+            && let Some(series_dir) = series_directory(root, &source.relative_path)
+        {
+            if let Some(series_id) = source.series_id.as_deref()
+                && seen_series.insert(series_id)
+            {
+                series_lookup = Some((series_id.to_owned(), series_dir.clone()));
             }
-            "VIDEO" => {
-                let path = media_path.with_extension("nfo");
-                match fs::try_exists(&path).await {
-                    Ok(true) => {
-                        snapshot
-                            .nfo_paths_by_item
-                            .insert(source.item_id.clone(), path);
-                    }
-                    Ok(false) => {}
-                    Err(io_error) => {
-                        snapshot.nfo_errors_by_item.insert(
-                            source.item_id.clone(),
-                            MetadataError::Io {
-                                path,
-                                source: io_error,
-                            },
-                        );
-                    }
-                }
+            if let (Some(season_id), Some(season_number)) =
+                (source.season_id.as_deref(), source.season_number)
+                && seen_seasons.insert(season_id)
+            {
+                let season_dir = media_path.parent().unwrap_or(&series_dir).to_owned();
+                season_lookup = Some((season_id.to_owned(), series_dir, season_dir, season_number));
             }
-            "EPISODE" => {
-                if let Some(path) =
-                    find_episode_nfo_with_cache(&media_path, &mut sidecar_existence).await
-                {
-                    snapshot
-                        .nfo_paths_by_item
-                        .insert(source.item_id.clone(), path);
-                }
-                let Some(series_dir) = series_directory(root, &source.relative_path) else {
-                    continue;
-                };
-                if let Some(series_id) = source.series_id.as_deref()
-                    && seen_series.insert(series_id)
-                    && let Some(path) = find_tvshow_nfo(&series_dir).await
-                {
-                    snapshot
-                        .nfo_paths_by_item
-                        .insert(series_id.to_owned(), path);
-                }
-                if let (Some(season_id), Some(season_number)) =
-                    (source.season_id.as_deref(), source.season_number)
-                    && seen_seasons.insert(season_id)
-                {
-                    let season_dir = media_path.parent().unwrap_or(&series_dir);
-                    if let Some(path) =
-                        find_season_nfo(&series_dir, season_dir, season_number).await
-                    {
-                        snapshot
-                            .nfo_paths_by_item
-                            .insert(season_id.to_owned(), path);
-                    }
-                }
+        }
+        requests.push(ScanNfoPathDiscoveryRequest {
+            item_id: source.item_id.clone(),
+            media_path,
+            kind,
+            series_lookup,
+            season_lookup,
+        });
+    }
+
+    let sidecar_existence = Arc::new(NfoSidecarExistenceCache::default());
+    let item_ids = requests
+        .iter()
+        .map(|request| request.item_id.clone())
+        .collect::<Vec<_>>();
+    let media_paths = requests
+        .iter()
+        .map(|request| request.media_path.clone())
+        .collect::<Vec<_>>();
+    let results = run_bounded_tasks_in_order(requests, LOCAL_NFO_PATH_DISCOVERY_CONCURRENCY, {
+        let sidecar_existence = Arc::clone(&sidecar_existence);
+        move |request| {
+            let sidecar_existence = Arc::clone(&sidecar_existence);
+            async move { discover_scan_nfo_paths(request, sidecar_existence.as_ref()).await }
+        }
+    })
+    .await;
+    for ((item_id, media_path), result) in item_ids.into_iter().zip(media_paths).zip(results) {
+        let discovery = match result {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                snapshot.nfo_errors_by_item.insert(
+                    item_id,
+                    MetadataError::Io {
+                        path: media_path,
+                        source: std::io::Error::other(format!(
+                            "local metadata NFO path discovery task failed: {error}"
+                        )),
+                    },
+                );
+                continue;
             }
-            _ => {}
+        };
+        if let Some(path) = discovery.item_nfo_path {
+            snapshot
+                .nfo_paths_by_item
+                .insert(discovery.item_id.clone(), path);
+        }
+        if let Some(error) = discovery.item_error {
+            snapshot
+                .nfo_errors_by_item
+                .insert(discovery.item_id.clone(), error);
+        }
+        if let Some((series_id, Some(path))) = discovery.series_lookup {
+            snapshot.nfo_paths_by_item.insert(series_id, path);
+        }
+        if let Some((season_id, Some(path))) = discovery.season_lookup {
+            snapshot.nfo_paths_by_item.insert(season_id, path);
         }
     }
     #[cfg(test)]
     {
-        snapshot.nfo_sidecar_probe_count = sidecar_existence.probe_count;
+        snapshot.nfo_candidate_probe_count = sidecar_existence
+            .probe_stats
+            .probe_count
+            .load(std::sync::atomic::Ordering::SeqCst);
+        snapshot.nfo_candidate_max_concurrency = sidecar_existence
+            .probe_stats
+            .max_concurrency
+            .load(std::sync::atomic::Ordering::SeqCst);
     }
     snapshot
+}
+
+async fn discover_scan_nfo_paths(
+    request: ScanNfoPathDiscoveryRequest,
+    sidecar_existence: &NfoSidecarExistenceCache,
+) -> ScanNfoPathDiscoveryResult {
+    let mut result = ScanNfoPathDiscoveryResult {
+        item_id: request.item_id,
+        item_nfo_path: None,
+        item_error: None,
+        series_lookup: None,
+        season_lookup: None,
+    };
+    match request.kind {
+        ScanNfoPathSourceKind::Movie => {
+            result.item_nfo_path = find_nfo_path(&request.media_path).await;
+        }
+        ScanNfoPathSourceKind::Video => {
+            let path = request.media_path.with_extension("nfo");
+            match fs::try_exists(&path).await {
+                Ok(true) => result.item_nfo_path = Some(path),
+                Ok(false) => {}
+                Err(source) => result.item_error = Some(MetadataError::Io { path, source }),
+            }
+        }
+        ScanNfoPathSourceKind::Episode => {
+            result.item_nfo_path =
+                find_episode_nfo_with_cache(&request.media_path, sidecar_existence).await;
+            if let Some((series_id, series_dir)) = request.series_lookup {
+                result.series_lookup = Some((
+                    series_id,
+                    find_tvshow_nfo_with_cache(&series_dir, sidecar_existence).await,
+                ));
+            }
+            if let Some((season_id, series_dir, season_dir, season_number)) = request.season_lookup
+            {
+                result.season_lookup = Some((
+                    season_id,
+                    find_season_nfo_with_cache(
+                        &series_dir,
+                        &season_dir,
+                        season_number,
+                        sidecar_existence,
+                    )
+                    .await,
+                ));
+            }
+        }
+    }
+    result
 }
 
 impl MetadataEnricher {
@@ -3434,6 +3536,10 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let season_dir = directory.path().join("Series").join("Season 01");
         tokio::fs::create_dir_all(&season_dir).await?;
+        let series_nfo = directory.path().join("Series").join("tvshow.nfo");
+        tokio::fs::write(&series_nfo, "<tvshow />").await?;
+        let season_nfo = season_dir.join("season01.nfo");
+        tokio::fs::write(&season_nfo, "<season />").await?;
         let shared_nfo = season_dir.join("episode.nfo");
         tokio::fs::write(&shared_nfo, "<episodedetails />").await?;
         let named_nfo = season_dir.join("Episode 03.nfo");
@@ -3478,7 +3584,187 @@ mod tests {
             snapshot.nfo_paths_by_item.get("episode-3"),
             Some(&named_nfo)
         );
-        assert_eq!(snapshot.nfo_sidecar_probe_count, 4);
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-1"),
+            Some(&series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-1"),
+            Some(&season_nfo)
+        );
+        assert_eq!(snapshot.nfo_candidate_probe_count, 6);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_caches_repeated_hierarchy_candidate_checks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let season_dir = directory.path().join("Series").join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await?;
+        let series_nfo = directory.path().join("Series").join("tvshow.nfo");
+        tokio::fs::write(&series_nfo, "<tvshow />").await?;
+        let season_nfo = season_dir.join("season01.nfo");
+        tokio::fs::write(&season_nfo, "<season />").await?;
+        let shared_episode_nfo = season_dir.join("episode.nfo");
+        tokio::fs::write(&shared_episode_nfo, "<episodedetails />").await?;
+        let root_path = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF8 temporary path")?
+            .to_owned();
+        let sources = [
+            StoredScanLocalMetadataSource {
+                source_id: "source-first".to_owned(),
+                item_id: "episode-first".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-first".to_owned()),
+                season_id: Some("season-first".to_owned()),
+                season_number: Some(1),
+                root_path: root_path.clone(),
+                relative_path: "Series/Season 01/Episode 01.mkv".to_owned(),
+            },
+            StoredScanLocalMetadataSource {
+                source_id: "source-second".to_owned(),
+                item_id: "episode-second".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-second".to_owned()),
+                season_id: Some("season-second".to_owned()),
+                season_number: Some(1),
+                root_path,
+                relative_path: "Series/Season 01/Episode 02.mkv".to_owned(),
+            },
+        ];
+
+        let snapshot = scan_local_metadata_nfo_paths(&sources).await;
+
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-first"),
+            Some(&series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-second"),
+            Some(&series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-first"),
+            Some(&season_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-second"),
+            Some(&season_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("episode-first"),
+            Some(&shared_episode_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("episode-second"),
+            Some(&shared_episode_nfo)
+        );
+        assert_eq!(snapshot.nfo_candidate_probe_count, 5);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_path_discovery_has_bounded_concurrency()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let season_dir = directory.path().join("Series").join("Season 01");
+        tokio::fs::create_dir_all(&season_dir).await?;
+        let shared_nfo = season_dir.join("episode.nfo");
+        tokio::fs::write(&shared_nfo, "<episodedetails />").await?;
+        let root_path = directory
+            .path()
+            .to_str()
+            .ok_or("non-UTF8 temporary path")?
+            .to_owned();
+        let sources = (0..12)
+            .map(|index| StoredScanLocalMetadataSource {
+                source_id: format!("source-{index}"),
+                item_id: format!("episode-{index}"),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: None,
+                season_id: None,
+                season_number: None,
+                root_path: root_path.clone(),
+                relative_path: format!("Series/Season 01/Episode {index:02}.mkv"),
+            })
+            .collect::<Vec<_>>();
+
+        let snapshot = scan_local_metadata_nfo_paths(&sources).await;
+
+        assert_eq!(snapshot.nfo_candidate_probe_count, 13);
+        assert!(snapshot.nfo_candidate_max_concurrency > 1);
+        assert!(snapshot.nfo_candidate_max_concurrency <= 4);
+        for source in &sources {
+            assert_eq!(
+                snapshot.nfo_paths_by_item.get(&source.item_id),
+                Some(&shared_nfo)
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_metadata_nfo_hierarchy_keeps_first_source_selection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let first_root = directory.path().join("first");
+        let second_root = directory.path().join("second");
+        let first_season = first_root.join("Series").join("Season 01");
+        let second_season = second_root.join("Series").join("Season 01");
+        tokio::fs::create_dir_all(&first_season).await?;
+        tokio::fs::create_dir_all(&second_season).await?;
+        let first_series_nfo = first_root.join("Series").join("tvshow.nfo");
+        let second_series_nfo = second_root.join("Series").join("tvshow.nfo");
+        let first_season_nfo = first_season.join("season01.nfo");
+        let second_season_nfo = second_season.join("season01.nfo");
+        tokio::fs::write(&first_series_nfo, "<tvshow><title>First</title></tvshow>").await?;
+        tokio::fs::write(&second_series_nfo, "<tvshow><title>Second</title></tvshow>").await?;
+        tokio::fs::write(&first_season_nfo, "<season><title>First</title></season>").await?;
+        tokio::fs::write(&second_season_nfo, "<season><title>Second</title></season>").await?;
+        let sources = [
+            StoredScanLocalMetadataSource {
+                source_id: "source-first".to_owned(),
+                item_id: "episode-first".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-shared".to_owned()),
+                season_id: Some("season-shared".to_owned()),
+                season_number: Some(1),
+                root_path: first_root.to_str().ok_or("non-UTF8 first root")?.to_owned(),
+                relative_path: "Series/Season 01/Episode 01.mkv".to_owned(),
+            },
+            StoredScanLocalMetadataSource {
+                source_id: "source-second".to_owned(),
+                item_id: "episode-second".to_owned(),
+                item_type: "EPISODE".to_owned(),
+                probe_status: "READY".to_owned(),
+                series_id: Some("series-shared".to_owned()),
+                season_id: Some("season-shared".to_owned()),
+                season_number: Some(1),
+                root_path: second_root
+                    .to_str()
+                    .ok_or("non-UTF8 second root")?
+                    .to_owned(),
+                relative_path: "Series/Season 01/Episode 02.mkv".to_owned(),
+            },
+        ];
+
+        let snapshot = scan_local_metadata_nfo_paths(&sources).await;
+
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("series-shared"),
+            Some(&first_series_nfo)
+        );
+        assert_eq!(
+            snapshot.nfo_paths_by_item.get("season-shared"),
+            Some(&first_season_nfo)
+        );
         Ok(())
     }
 
@@ -4342,25 +4628,59 @@ pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
     find_directory_nfo(directory).await
 }
 
-#[derive(Default)]
+type NfoSidecarProbeCell = Arc<OnceCell<Option<bool>>>;
+type NfoSidecarProbeCache = Arc<Mutex<HashMap<PathBuf, NfoSidecarProbeCell>>>;
+
+#[derive(Clone, Default)]
 struct NfoSidecarExistenceCache {
-    entries: HashMap<PathBuf, Option<bool>>,
+    entries: NfoSidecarProbeCache,
     #[cfg(test)]
-    probe_count: usize,
+    probe_stats: Arc<NfoSidecarProbeStats>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct NfoSidecarProbeStats {
+    probe_count: std::sync::atomic::AtomicUsize,
+    active: std::sync::atomic::AtomicUsize,
+    max_concurrency: std::sync::atomic::AtomicUsize,
 }
 
 impl NfoSidecarExistenceCache {
-    async fn try_exists(&mut self, path: &Path) -> Option<bool> {
-        if let Some(result) = self.entries.get(path) {
-            return *result;
-        }
-        #[cfg(test)]
-        {
-            self.probe_count = self.probe_count.saturating_add(1);
-        }
-        let result = fs::try_exists(path).await.ok();
-        self.entries.insert(path.to_owned(), result);
-        result
+    async fn try_exists(&self, path: &Path) -> Option<bool> {
+        let result = {
+            let mut entries = self.entries.lock().await;
+            Arc::clone(
+                entries
+                    .entry(path.to_owned())
+                    .or_insert_with(|| Arc::new(OnceCell::new())),
+            )
+        };
+        *result
+            .get_or_init(|| async {
+                #[cfg(test)]
+                {
+                    self.probe_stats
+                        .probe_count
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let active = self
+                        .probe_stats
+                        .active
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        + 1;
+                    self.probe_stats
+                        .max_concurrency
+                        .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                let result = fs::try_exists(path).await.ok();
+                #[cfg(test)]
+                self.probe_stats
+                    .active
+                    .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                result
+            })
+            .await
     }
 }
 
@@ -4468,14 +4788,36 @@ fn is_season_directory(value: &str) -> bool {
 }
 
 async fn find_tvshow_nfo(series_dir: &Path) -> Option<PathBuf> {
+    find_tvshow_nfo_with_cache(series_dir, &NfoSidecarExistenceCache::default()).await
+}
+
+async fn find_tvshow_nfo_with_cache(
+    series_dir: &Path,
+    sidecar_existence: &NfoSidecarExistenceCache,
+) -> Option<PathBuf> {
     let path = series_dir.join("tvshow.nfo");
-    fs::try_exists(&path).await.ok()?.then_some(path)
+    sidecar_existence.try_exists(&path).await?.then_some(path)
 }
 
 async fn find_season_nfo(
     series_dir: &Path,
     season_dir: &Path,
     season_number: i64,
+) -> Option<PathBuf> {
+    find_season_nfo_with_cache(
+        series_dir,
+        season_dir,
+        season_number,
+        &NfoSidecarExistenceCache::default(),
+    )
+    .await
+}
+
+async fn find_season_nfo_with_cache(
+    series_dir: &Path,
+    season_dir: &Path,
+    season_number: i64,
+    sidecar_existence: &NfoSidecarExistenceCache,
 ) -> Option<PathBuf> {
     let names = if season_number == 0 {
         vec!["season00.nfo".to_owned(), "specials.nfo".to_owned()]
@@ -4492,7 +4834,7 @@ async fn find_season_nfo(
     }
     candidates.push(season_dir.join("season.nfo"));
     for candidate in candidates {
-        if fs::try_exists(&candidate).await.ok()? {
+        if sidecar_existence.try_exists(&candidate).await? {
             return Some(candidate);
         }
     }
@@ -4500,12 +4842,12 @@ async fn find_season_nfo(
 }
 
 async fn find_episode_nfo(media_path: &Path) -> Option<PathBuf> {
-    find_episode_nfo_with_cache(media_path, &mut NfoSidecarExistenceCache::default()).await
+    find_episode_nfo_with_cache(media_path, &NfoSidecarExistenceCache::default()).await
 }
 
 async fn find_episode_nfo_with_cache(
     media_path: &Path,
-    sidecar_existence: &mut NfoSidecarExistenceCache,
+    sidecar_existence: &NfoSidecarExistenceCache,
 ) -> Option<PathBuf> {
     let same_name = media_path.with_extension("nfo");
     if sidecar_existence.try_exists(&same_name).await? {
