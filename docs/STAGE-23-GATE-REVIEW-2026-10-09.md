@@ -1,44 +1,45 @@
-# 阶段 23 阶段门证据复核（2026-10-09）
+# 阶段 23 阶段门证据复核（2026-10-09，更新至候选 21c8dfc7）
 
 ## 结论与复核范围
 
-**阶段门保持开放，不能关闭。** 本次以 gate worktree 的候选 `e6a7ef8a14122a7affda50a78042e7c6c4e89b2f` 为代码基线，只核对阶段 23 总体验收、相关测试和当前 A/B 证据；没有运行 Cargo，也没有修改业务代码。故障覆盖候选 `9ec104608ac229f57f2951adc2bf09724645283d` 目前在独立 worktree，未包含在本次候选 SHA 中。
+**阶段 23 仍开放，不能关闭。** 本次按已推送候选 `21c8dfc7781e0ce4a0e698fe59e6abed2dba7265` 复核；该 SHA 在复核时是 `origin/test` 与 `codex/lux-audit-optimization-round` 的 HEAD。只更新本阶段门报告，没有运行 Cargo 或性能采样。候选已包含 LUX-469 故障修复及 #10/#13/#16/#17 相关提交；先前报告将 `e6a7ef8a` 当作当前候选并声称 LUX-469 尚未集成，已过时。
 
-`docs/LUX-DEVELOPMENT.md` 的阶段门规定阶段末必须运行阶段检查、更新兼容性或性能记录，并由项目所有者确认。以下六项仍未满足全部关闭条件；本复核不勾选原清单，也不代替项目所有者确认。
+最终性能矩阵尚无结果。A/B agent 已收到 `21c8dfc7` 并开始准备最终矩阵；本次复核收到的性能文件仍只有针对中间候选 `e6a7ef8a` 的 1k A/B 数据。候选 SHA、对应测试状态和历史性能样本必须分别陈述，不能相互替代。
+
+阶段末需要完成指定检查、更新兼容性或性能记录并取得项目所有者确认。以下审查不替代该确认。
 
 ## 六项验收证据矩阵
 
-| # | 验收项 | 已有证据 | 缺口与关闭判定 |
+| # | 验收项 | 当前证据 | 判定与剩余缺口 |
 |---|---|---|---|
-| 1 | 1k/10k fixture 中，首批索引与本地海报在扫描结束前可查，且本地 worker 与后续索引并行 | 当前候选有 `tests/scanned_metadata.rs::manifest_scan_indexes_poster_while_local_nfo_is_blocked`，覆盖 NFO 阻塞期间 poster 可见。较早的 LUX-462 单轮记录报告 10k 首项/首张 poster 均在 88 ms 可见、scan job 在 1,470 ms 完成、本地图片队列在 4,380 ms 排空（`docs/PERFORMANCE.md`，基准候选为 `e487076b`）。 | 单轮记录不是当前候选 A/B，也没有证明真实 Web UI 已显示首批条目。10k 同 fixture 的当前候选对照、poster-worker 矩阵尚未完成。**部分覆盖，不能关闭。** |
-| 2 | 首项图片/后段海报、慢 NFO、权限错误、不可用根、取消重试、全量/增量竞态及扫描期间本地补图都有自动化覆盖 | 当前候选已有慢 NFO、图片写事务失败、增量扫描和定向本地补图测试；`tests/scanning_jobs.rs` 有 Manifest 与 incremental 文件变更竞争回归。独立提交 `9ec10460` 增加首次 poster 阻塞、RUNNING local image claim 中取消、movie/series poster `PermissionDenied` 重试及 media root 不可用用例；故障 agent 报告权限/取消用例先红后绿，首次 poster 阻塞与不可用根用例定向各通过 1/1。 | `9ec10460` 未集成进 `e6a7ef8a`。故障 agent 正在运行 `scanned_metadata`、`scanned_series_metadata` 与 `scanning_jobs` 三个完整 target；截至本记录更新时，完整 target、build、Clippy 尚无结果（fmt 已报告通过）。全量/增量已有回归主要验证索引状态，不足以替代全部 local image worker 竞态验收。**部分覆盖，待集成及完整验证。** |
-| 3 | 缺失分类、自动补缺策略、任务去重、provider 无候选/失败冷却、执行前复查及保护本地/锁定数据均有回归 | 已有较广的底层测试：`tests/reidentify.rs` 覆盖完整条目跳过刮削、同库 dispatcher 合并与活动任务约束；`tests/metadata_selection.rs` 覆盖缺字段选择、锁定 NFO 保留、图片 backoff 和显式空结果；`tests/scanned_metadata.rs` 覆盖 completeness 与 NFO 冲突重试。 | 现有记录未给出一份把清单中的每个 provider 状态、冷却期限、执行前再次检查和 workflow 3 自动调度接线逐一映射到测试的证据表；不能仅凭底层用例名称推定整条新流程完整。**部分覆盖，逐项映射/缺项回归仍需完成。** |
-| 4 | SQLite/PostgreSQL 同 fixture A/B 分别报告索引、首批/首 poster、local/online queue、前台 p95、事务/队列规模和内存；超过 5% 回退先调度/并发并复测 | 2026-10-09 当前 1k LUX-270 A/B 为 baseline `6424ab122a556e2214f9948580b8c7bf42407aa3` 对 candidate `e6a7ef8a14122a7affda50a78042e7c6c4e89b2f`，SQLite/PostgreSQL 各三轮。索引中位数 SQLite `64→54 ms`、PostgreSQL `146→149 ms`。但 `foregroundP95` 为 SQLite `547→791 ms`（+44.6%）、PostgreSQL `557→792 ms`（+42.2%）；热目录页 p95 分别 `529→772 ms` 与 `543→770 ms`，均超过 5% 门槛。 | 这是当前候选**性能门未通过**的证据。10k LUX-270 与 1k/10k poster-worker A/B 尚未运行；online queue 和所需事务/队列规模、内存字段也未形成完整双后端矩阵。回退根因仍未分离；SQL 窗口含后台语句、elapsed 不含 pool acquire，当前还缺每请求 pool acquire、storage await、映射/JSON 与 CPU 拆分。**未通过，必须先定位并修复/重测，不能关闭。** |
-| 5 | 扫描索引耗时与本地/在线处理耗时分开报告，不把剩余后台工作混入索引耗时 | 既有 LUX-304 记录分别列 scan job 与 local poster queue；LUX-462 增加 image-pending 与严格 drain 窗口。A/B harness 分别输出 index、目录请求和热页字段。 | 当前 `unchangedRescanMs` 是从 rescan 开始到结束的复合窗口，其中包含前后两组各 50 个并发 HTTP 请求，不能解释为纯扫描耗时。在线 queue 缺少当前双后端实测；最终矩阵尚未完成。**部分覆盖，当前 A/B 仍需按阶段拆分并补齐。** |
-| 6 | 相关 Rust/Web 全量质量门、兼容性/性能记录和架构记录完成，并由项目所有者确认 | `docs/LUX-DEVELOPMENT.md` 的 LUX-463 记录在 `e6a7ef8a` 说明 all-target Rust 测试、build、fmt、Clippy 和差异检查通过（library 808 passed、13 ignored）；性能资料记录了 ARM64 与 PostgreSQL 16.15 边界。 | LUX-469 故障覆盖尚未进入该 SHA，完整 targets 与质量检查待补；本阶段没有当前最终候选的 Web test/build 记录。`docs/COMPATIBILITY.md` 的 LUX-288 段仍写明 workflow 3/增量事件/在线补缺未由该记录证明，阶段 23 兼容性结论待追加。**项目所有者确认尚未取得；此项不得由 agent 自动关闭。** |
+| 1 | 1k/10k fixture 证明首批索引和本地 poster 在扫描完成前可见，worker 与后续索引并行 | 候选含 `tests/scanned_metadata.rs::manifest_scan_indexes_poster_while_local_nfo_is_blocked`、`blocked_first_local_poster_does_not_block_manifest_scan` 和 `workflow3_running_discovery_indexes_poster_added_to_unvisited_directory`。最后一项在最终整理版精确测试通过，并在串行目标中通过。LUX-462 有单轮 SQLite/PostgreSQL 观测；旧 LUX-306 有 1k/10k poster-worker A/B。 | **部分完成。** 新回归证明 SQLite fixture 中扫描与本地 worker 并行；仍缺当前候选同 fixture 1k/10k、SQLite/PostgreSQL 的 LUX-270 与 poster-worker A/B。现有记录未单独证明 Web 在该阶段实际呈现首批条目。依据 `docs/LUX-DEVELOPMENT.md` 阶段 23 第 1 项。 |
+| 2 | 首项图片、后段图片、慢 NFO、权限、根不可用、取消/重试、全量/增量竞态及扫描期间新 poster 的故障覆盖 | 候选文档映射到 `manifest_scan_indexes_poster_while_local_nfo_is_blocked`、`blocked_first_local_poster_does_not_block_manifest_scan`、`failed_local_poster_insert_does_not_mark_image_stage_complete`、两项 `unreadable_*_poster_*`、`unavailable_media_root_keeps_local_image_batch_retryable`、`cancelling_scan_during_running_local_image_claim_cancels_before_completeness`、Manifest/incremental CAS 用例及新增 poster 用例。最终三个 target 串行结果为 `scanned_metadata` 21/21、`scanned_series_metadata` 3/3、`scanning_jobs` 81/81；新增 poster 精确回归 1/1。 | **故障覆盖已完成。** 结果是本机 SQLite 自动化 fixture，不证明 PostgreSQL、FNOS 或 NAS 运行行为。此前报告中“LUX-469 未进入候选、target/build/Clippy 尚无结果”的表述已过时。证据见 `docs/LUX-DEVELOPMENT.md` LUX-469 进度记录。 |
+| 3 | 缺失分类、自动补缺策略、队列去重、无候选/失败冷却、执行前复查和保护本地/锁定字段 | 候选包含 `fill_missing_request_plan_only_keeps_missing_capabilities`、`fill_missing_skips_complete_local_items_before_resolving_scrapers`、`scraper_preflight_failure_enters_bounded_fill_missing_retry`、`incremental_scan_only_queues_metadata_when_library_switch_is_enabled`、`idle_fill_missing_dispatcher_coalesces_requests_before_claim`、`full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images` 等回归。LUX-402 记录同一 fingerprint/capability 退避、到期重试及失败次数继承；LUX-407 区分预检错误、明确无 scraper 和无可请求 capability。 | **大体有覆盖，但仍需把证据逐条对齐验收。** 代码中有返回空候选的 stub 和 dispatcher 用例；现有记录未清楚指出哪条断言专门证明“provider 无候选”后的结果及重试/冷却边界。建议最终覆盖表明确对应测试/断言；若没有直接断言，补定向回归。依据 `tests/reidentify.rs`、`tests/metadata_selection.rs`、`src/application/candidates.rs`、`src/application/scanner.rs` 及 `docs/LUX-DEVELOPMENT.md` 的 LUX-402/LUX-407。 |
+| 4 | SQLite/PostgreSQL 同 fixture 性能 A/B：索引、首批可见、poster、本地/在线队列、前台 p95、事务/队列规模、内存；超过 5% 回退后调整并复测 | 当前性能记录中的阶段 23 1k LUX-270 A/B 是 baseline `6424ab12` 对 candidate `e6a7ef8a`，各后端三轮。其前台 p95 SQLite `547→791 ms`（+44.6%）、PostgreSQL `557→792 ms`（+42.2%），热目录 p95 同样明显回退；索引中位数 SQLite `64→54 ms`、PostgreSQL `146→149 ms`。 | **未通过，且不是候选 21c8dfc7 的最终结论。** 旧数据保留为历史性能风险；候选 21c8dfc7 的完整矩阵尚未运行/记录，尚无证据证明回退已消失。还缺 LUX-270 的 1k/10k、LUX-304 poster-worker 的 1k/10k 双后端多轮对照及在线队列、事务/队列规模和内存数据。不得降低 5% 门槛。依据 `docs/PERFORMANCE.md` 的阶段 23 / LUX-270 初步 A/B。 |
+| 5 | 分开报告索引、本地处理和在线处理耗时 | LUX-462 harness 已分别记录 index、scan job、image-pending/drain 及请求窗口；LUX-304 历史结果也分别呈现 scan job 与 poster queue。 | **部分完成。** 阶段 23 旧 1k `unchangedRescanMs` 包含 rescan 与两组并发 HTTP 请求，是复合窗口而非纯扫描耗时；完整最终候选 A/B 和 online queue 分段数据仍待采集。最终报告需分开索引、本地队列、在线队列与前台负载。依据 `docs/PERFORMANCE.md` 中 1k A/B 的窗口定义及 LUX-462 记录。 |
+| 6 | 最终 Rust/Web 质量门、兼容性/性能记录、架构记录及项目所有者确认 | 当前 SHA 的串行 Rust all-targets 结果为 819 passed、1 failed、13 ignored；唯一失败 `application::danmaku::tests::configured_jobs_reuse_plugin_settings_across_libraries`，断言期望 19、实得 20；该测试在同一 SHA 隔离重跑 1/1 通过。LUX-469 三个 target 通过。Web 冻结安装通过；完整 Web 重跑为 132 个 Node 测试及 Vitest 76 个文件/561 项通过；首次并发运行出现 5 个首页用例波动，隔离文件 17/17 通过；Web build 通过。 | **阶段门未通过。** Rust 全量测试的原始阶段结果仍有 1 个失败，即使隔离重跑通过也不能将 all-targets 标为全绿；需稳定复跑全量门并调查波动来源。Web 门通过。LUX-288 `docs/COMPATIBILITY.md` 第 243 行仍写 workflow 3/增量事件/在线补缺运行合同和 A/B 未证明，应在阶段证据完成后更新。项目所有者尚未确认；这是技术验收全过后的最后停点，agent 不得代为关闭。 |
 
-## 1k A/B 回退样本说明
+## 旧 1k A/B：保留为风险证据，不代表当前候选
 
-三轮中位数如下，p95 字段为 A/B harness 中的 50 并发目录请求观测：
+以下是中间候选 `e6a7ef8a14122a7affda50a78042e7c6c4e89b2f` 的三轮中位数，单位 ms。它早于当前 `21c8dfc7`，所以既不能证明当前候选的回退，也不能证明回退已修复。
 
-| 后端 | 指标 | Baseline → candidate | 变化 |
+| 后端 | 指标 | Baseline → `e6a7ef8a` | 变化 |
 |---|---|---:|---:|
-| SQLite | index | 64 → 54 ms | -15.6% |
-| SQLite | foreground p95 | 547 → 791 ms | +44.6% |
-| SQLite | catalog p95 | 566 → 771 ms | +36.2% |
-| SQLite | warm catalog p95 | 529 → 772 ms | +45.9% |
-| SQLite | no-change composite window | 1,146 → 1,611 ms | +40.6% |
-| PostgreSQL | index | 146 → 149 ms | +2.1% |
-| PostgreSQL | foreground p95 | 557 → 792 ms | +42.2% |
-| PostgreSQL | catalog p95 | 541 → 765 ms | +41.4% |
-| PostgreSQL | warm catalog p95 | 543 → 770 ms | +41.8% |
-| PostgreSQL | no-change composite window | 1,142 → 1,575 ms | +37.9% |
+| SQLite | index | 64 → 54 | −15.6% |
+| SQLite | foreground p95 | 547 → 791 | +44.6% |
+| SQLite | catalog p95 | 566 → 771 | +36.2% |
+| SQLite | warm catalog p95 | 529 → 772 | +45.9% |
+| PostgreSQL | index | 146 → 149 | +2.1% |
+| PostgreSQL | foreground p95 | 557 → 792 | +42.2% |
+| PostgreSQL | catalog p95 | 541 → 765 | +41.4% |
+| PostgreSQL | warm catalog p95 | 543 → 770 | +41.8% |
 
-`no-change composite window` 包含两组并发 HTTP burst，不可用作纯 scan wall-time。现有样本未观察到能稳定解释回退的 pool 饱和或 PostgreSQL lock 等待；PostgreSQL 热页 SQL elapsed 中位数从约 383.5 ms 增至 657.6 ms/50 请求，SQLite 从约 23.54 ms 增至 25.74 ms/50 请求。但 SQL phase window 可能混入后台查询，elapsed 不包含获取连接的等待，因此这些数字只能说明需继续拆分，不能确定代码根因或据此宣称已完成修复。
+旧 `unchangedRescanMs` 包含并发 HTTP 请求测量，不作为纯 scan wall time。该基准的 SQL elapsed 采样可能混入后台 SQL，且不含连接池 acquire 时间，不能单独归因代码根因。A/B 证据限定为本机 ARM64 和本地 PostgreSQL 16.15；不能外推 FNOS/NAS/x86_64。
 
-## 仍需完成的关闭步骤
+## 最短剩余清单
 
-1. 把 LUX-469 `9ec10460` 的测试修复与实现集成到最终候选；完成两项扫描 integration target、build、fmt、Clippy，并复核已有/新增测试覆盖矩阵。
-2. 完成 10k LUX-270 及 1k/10k poster-worker SQLite/PostgreSQL A/B；将索引、local queue、online queue、前台请求、资源/事务规模分开记录。对目前超过 5% 的前台 p95 回退，先取得可归因的分段证据，再决定候选是否需调整并复测。
-3. 在兼容性事实来源中补充 workflow 3 的真实合同与自动化证据；更新性能记录并明确本机 ARM64 结论不外推为 FNOS/NAS/x86_64 性能。
-4. 对集成后的最终 SHA 执行阶段要求的 Rust/Web 质量门。全部技术验收通过后，**停在阶段门等待项目所有者确认**；收到明确确认之前，阶段 23 仍保持开放。
+1. 对候选 `21c8dfc7781e0ce4a0e698fe59e6abed2dba7265` 完成 LUX-270 的 1k/10k × SQLite/PostgreSQL 与 LUX-304 poster-worker 的 1k/10k × SQLite/PostgreSQL A/B；每种配置 baseline/candidate 各三轮，明确记录首项/首 poster、索引、本地与在线队列、前台 p95、资源/事务/队列规模、内存及独立阶段计时。对超过 5% 的回退，先分段定位、调整和复测。
+2. 完成第 3 项的逐项“行为—测试—断言—运行结果”映射；补齐 provider 无候选的直接断言（若现有测试没有覆盖）。
+3. 在最终候选上重跑全 Rust completion gate；完整 all-targets 必须有可解释且通过的结果，不能用单个隔离重跑代替。保留已经通过的 Web 冻结安装、完整测试和 build 证据；将初次波动和隔离复跑结果写入记录。
+4. 更新 `docs/PERFORMANCE.md` 和 `docs/COMPATIBILITY.md`，写明精确候选 SHA、采样与测试证据和 ARM64 边界；不要把本机结果外推为 FNOS/NAS 性能或已部署运行证明。
+5. 所有技术项通过后停在阶段门，等待项目所有者明确确认。确认前阶段 23 保持开放。
