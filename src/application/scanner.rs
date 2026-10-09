@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::{
     application::{
-        admin_events::{AdminEventHub, AdminEventScope, UserEventHub},
+        admin_events::{AdminEventHub, UserEventHub},
         candidates::MetadataSelectionService,
         home::HomeService,
         library_covers::{AutoLibraryCoverResult, LibraryCoverService},
@@ -4123,7 +4123,7 @@ impl ScanJobService {
         self.database
             .update_scan_job_activity(job_id, current_item.as_deref(), scan_phase)
             .await?;
-        self.admin_events.publish(AdminEventScope::Jobs);
+        self.admin_events.publish_jobs_progress();
         Ok(())
     }
 
@@ -10898,7 +10898,11 @@ impl ScanJobService {
                 "failed to persist scan job log event"
             );
         }
-        self.admin_events.publish(AdminEventScope::Jobs);
+        if event_code == "DISCOVERY_PROGRESS" {
+            self.admin_events.publish_jobs_progress();
+        } else {
+            self.admin_events.publish_jobs_now();
+        }
     }
 }
 

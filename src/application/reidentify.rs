@@ -1419,7 +1419,7 @@ impl MetadataReidentifyService {
 
     fn publish_job_progress(&self, job_id: &str) {
         if self.progress_events.should_publish(job_id) {
-            self.admin_events.publish(AdminEventScope::Jobs);
+            self.admin_events.publish_jobs_progress();
         }
     }
 
