@@ -9652,6 +9652,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 预计文件：`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加单 query 与状态语义回归，再合并 storage 查询并在 DB read 前注册通知 future。
 
 结果（2026-10-09）：旧实现红灯回归观测到每次状态检查 3 次 query-wrapper 调用；合并后 storage 状态查询为 1 次。SQLite 回归覆盖 pending、complete、cancel requested 与 missing job；completion/cancellation waiter 通知 250ms 回归及固定 5 秒 fallback 测试通过。`cargo test --locked --lib local_metadata_completion`、`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；只验证 query-wrapper 计数和本地通知边界，没有 PostgreSQL/FNOS/NAS 时延或 CPU 收益证据。跨进程状态继续由最多 5 秒 fallback 发现。
+#### LUX-469：补齐渐进扫描故障与竞态回归
+
+范围：阶段 23 的故障清单需要区分已覆盖路径与真正未覆盖路径。为扫描本地图片 worker 增加首个 poster 读取阻塞、电影/剧集 poster 权限拒绝、outbox 发布后媒体根暂时不可用的 fixture；并检查已 claim 的 outbox 在 scan job 取消时是否会越过 READY/completeness 提交。I/O 读取错误或根不可用只能使图片批次可重试，不能将 image stage 标为完成或写入 `POSTER` 完整性结论；恢复后同一批次应成功。扫描索引应在本地图片读取阻塞时继续运行。复用现有慢 NFO、页后段图片事务失败、不可用根、取消/重试、全量/增量 CAS 与增量扫描图片回归，不重复造等价覆盖。fixture 只使用临时目录，不读取外部媒体库或 FNOS 数据。
+
+验收：
+
+- [ ] 首个 poster FIFO 读取被阻塞时，workflow 3 仍完成扫描索引；释放 FIFO 后本地图片批次完成且两项 poster 可查。
+- [x] 电影和剧集 poster 权限拒绝都使本地 outbox image stage 失败且可重试；恢复权限后同一批次完成，故障期间不写入 `POSTER` completeness 结论。
+- [ ] outbox 已发布后暂时移走 fixture 根路径会使图片批次失败且不确认缺失；恢复根路径后可重试成功。
+- [x] 图片 FIFO read 已打开且 batch 为 RUNNING 时取消 scan job，会先取消该 job 的未完成 outbox；释放读闸门后不能提交 image READY/completeness。
+- [ ] 结果记录把慢 NFO、后段海报写事务失败、扫描取消/重试、不可用根恢复、全量/增量 CAS 与扫描期间增量补图映射到现有测试；未覆盖的竞态明确保留为开放项。
+- [ ] 运行 `cargo test --locked --test scanned_metadata --test scanned_series_metadata --test scanning_jobs`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings` 与 `git diff --check`。
+
+预计文件：`src/application/metadata.rs`、`src/application/scanner.rs`、`tests/scanned_metadata.rs`、`tests/scanned_series_metadata.rs`、`docs/LUX-DEVELOPMENT.md`。先分别写电影/剧集权限拒绝、首项图片阻塞、取消 outbox 与根离线回归，确认旧行为，再修复只记录日志却将 image stage 当成功的路径及生产取消未终结其 local outbox 的路径；最后完成定向验证。
+
+进度记录（2026-10-09）：电影 `unreadable_local_poster_keeps_image_check_retryable` 与剧集 `unreadable_series_poster_keeps_local_image_batch_retryable` 先复现旧行为：chmod 000 的 poster 被跳过，outbox 错误地完成图片阶段；修复后两项定向回归通过，并确认故障时无 POSTER completeness、恢复权限后同一批次成功。`cancelling_scan_during_running_local_image_claim_cancels_before_completeness` 在确定 outbox 已发布且 worker 阻塞在 FIFO 后复现批次仍为 RUNNING；取消流程现在先取消该 job 的未完成 outbox，修复后定向回归通过，释放 FIFO 后不会完成图片阶段或写 completeness。新增首 poster FIFO 并行扫描及根离线/恢复 fixture 已编写，尚未执行。已有覆盖映射：慢 NFO=`manifest_scan_indexes_poster_while_local_nfo_is_blocked`；图片登记事务失败=`failed_local_poster_insert_does_not_mark_image_stage_complete`；扫描根不可用/恢复=`scan_job_marks_inaccessible_root_unavailable_and_recovers_after_restore`；Manifest 取消/恢复=`manifest_cancellation_preserves_committed_frontier_and_observations`、`cancelled_manifest_apply_resumes_pending_deltas_without_rediscovery`；全量/增量 CAS=`manifest_apply_does_not_overwrite_a_newer_incremental_filesystem_entry`、`manifest_add_conflicts_with_incremental_entry_claimed_after_diff`、`streamed_manifest_change_cas_does_not_overwrite_a_newer_incremental_entry`；增量图片=`incremental_movie_scan_indexes_local_images`、`incremental_sidecar_change_replaces_local_image`。按主 agent 安排，共享 Cargo target 已释放给 LUX-10 专项，LUX-469 的两个新增 fixture 与三个要求的集成目标、build、Clippy 尚待验证；阶段 23 故障验收仍开放。
 
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

@@ -4077,6 +4077,9 @@ impl ScanJobService {
             });
         };
         self.database
+            .cancel_scan_local_metadata_batches(job_id)
+            .await?;
+        self.database
             .finish_scan_manifest(job_id, "CANCELLED")
             .await?;
         if let Some(manifest) = self.database.get_scan_manifest_by_job(job_id).await? {
