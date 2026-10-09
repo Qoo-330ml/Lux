@@ -9452,6 +9452,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：新增 12-episode fixture 在旧串行实现下先失败（最大并发为 1）；有界执行后观察到并发大于 1 且不超过 4，12 个 item 共用的 `episode.nfo` 只检查一次，同名 NFO 优先级和 series/season 首个 source 选择保持。另一 fixture 先在旧实现下以 3 次 cache probe 对 5 次期望失败，随后确认两个 episode 以及重复 hierarchy ID 路径合计只检查 5 个唯一候选。路径发现单测 6/6、`series_metadata` 3/3、`scanned_series_metadata` 2/2 通过；全量 `cargo test --locked --all-targets` 通过，库测试 802 passed、13 ignored，PostgreSQL 专项 16 项因本机没有实例而 ignored。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；未测量 NAS/FNOS 文件系统墙钟或 CPU，也未据本地 SQLite 测试外推 PostgreSQL 收益。
 
+#### LUX-460：扫描本地 metadata page 普通电影 NFO 有界并发
+
+范围：scan-local metadata NFO page 当前逐个 await 普通电影的 NFO enrichment。复用现有有界有序 task runner 和电影 NFO 并发上限（最多 4 路），让一个 page 内独立电影并发处理，并按原 source 顺序归并结果。单个 NFO 失败或 task 异常仍只影响对应 item。page 级延迟 metadata 更新继续在所有电影、home video 与剧集处理后统一 flush；actor credits 继续使用共享 deferred collector 并在 page 末统一 flush。只修改 scan-local page 的 MOVIE 路径；库级 `enrich_movie_sources`、home-video、series/season/episode 和 OnDemand 路径不扩大范围。
+
+验收：
+
+- [ ] 回归证明 scan-local 普通电影 NFO enrichment 的最大并发大于 1 且不超过 4，结果合并顺序与输入 source 顺序一致。
+- [ ] 一个电影 NFO 无效或 task 失败时，其余电影仍完成；单 item 错误隔离语义保持。
+- [ ] page deferred metadata 更新及 actor credits 仍只在 page 末统一 flush；metadata batch transaction 失败后的逐 item fallback 回归通过。
+- [ ] 只改变 scan-local page 的 MOVIE 路径；series、home-video、OnDemand 和库级电影 enrichment 行为不变。
+- [ ] 相关 metadata 定向回归、格式、build、Clippy、全量 Rust 完成门及 `git diff --check` 通过。
+- [ ] 性能记录仅报告固定 task runner 的并发上界和行为边界，不推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+
+短计划与文件：先在 `src/application/metadata.rs` 为 scan-local movie page 增加有界并发、顺序和错误隔离回归，再将该路径接入现有有界有序 runner，同时保留 page flush 边界；更新 `docs/PERFORMANCE.md` 记录验证范围。预计修改 `src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`，最多 3 个文件。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
