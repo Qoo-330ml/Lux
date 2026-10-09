@@ -274,6 +274,14 @@ async fn metadata_reidentify_deduplicates_repeated_item_ids()
 
     assert_eq!(job.total_count, 3);
     assert_eq!(job.items.len(), 3);
+    assert_eq!(
+        job.items
+            .iter()
+            .map(|item| item.item_id.clone())
+            .collect::<Vec<_>>(),
+        item_ids,
+        "the returned job items should retain the established item-id ordering"
+    );
     let (item_count, unique_item_count): (i64, i64) = sqlx::query_as(
         "SELECT COUNT(*), COUNT(DISTINCT item_id)
          FROM metadata_reidentify_job_items WHERE job_id = ?",
