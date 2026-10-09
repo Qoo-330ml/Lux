@@ -9541,6 +9541,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### 阶段 23 总体验收与阶段门
 
+#### LUX-462：补全阶段 23 基准的 SQL 延迟、连接池与后台队列观测
+
+范围：LUX-270 当前记录 SQL 调用数和 manifest 内部阶段，但没有 SQLx 执行时间分布、测量期间的连接池压力或目录 API 冷/热页面对照，无法把用户请求 p95 回退定位到 cache miss、数据库执行或连接池等待。LUX-304 的“本地海报队列完成”只依据 poster 行数；改为同时确认该 scan job 的全部本地图片阶段已有完成标记，并单独呈现扫描结束后但图片仍在排队的目录 API p95。只改性能测试 harness 与性能记录，不增加生产指标、不改变扫描或 API 行为。所有 SQL 汇总仅使用规范化 statement summary，不采集 bind 值或完整 SQL。
+
+验收：
+
+- [ ] LUX-270 结果包含按规范化 statement summary 分组的 SQLx 调用数、累计时间、p50/p95/max；时间为空时明确报告不可用，不伪造零耗时。
+- [ ] 前台管理请求与目录请求各自测量期间记录连接池 `size/idle/in-use/saturated` 峰值或采样计数；目录请求增加预热缓存后的对照，以区分 cache miss 等待与热页 hydration/query 负载。
+- [ ] LUX-304 区分 scan-active、scan-finished/image-pending 和所有 scan job image batch 完成后的目录列表 p95；队列完成条件同时核验本地 poster 数与 `images_completed_at`，失败或残留批次不得被误记为 drain 完成。
+- [ ] 固定统计 helper 单测、LUX-270/LUX-304 小 fixture SQLite 定向运行、fmt、build、全目标 Clippy 和差异检查通过。
+- [ ] 性能文档记录观测边界、原 1k 回退仍待修复/复测，所有结果限定为本机 ARM64 和临时 PostgreSQL；不外推 FNOS/NAS。
+
+预计文件：`tests/performance.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先为 SQL 延迟摘要统计添加确定性单测，再采集 query/连接池样本，接着为 LUX-304 增加严格 image-stage drain 和中间阶段测量；使用 1k SQLite 先确认输出完整后再决定是否运行双后端全矩阵。
+
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
 - [ ] 人为阻塞首项图片、后段海报、慢 NFO、权限错误、不可用根、取消/重试、全量/增量竞态和扫描期间本地补图均有自动化覆盖。
 - [ ] 缺失分类、自动补缺策略、队列去重、provider 无候选/失败冷却、执行前重新检查和禁止覆盖本地/锁定数据均有回归覆盖。
