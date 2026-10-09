@@ -170,7 +170,7 @@ async fn unreadable_series_poster_keeps_local_image_batch_retryable()
     .write_to(&mut poster_png, image::ImageFormat::Png)?;
     tokio::fs::write(&poster_path, poster_png.get_ref()).await?;
     let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
-    permissions.set_mode(0);
+    permissions.set_mode(0o000);
     tokio::fs::set_permissions(&poster_path, permissions).await?;
     assert_eq!(
         tokio::fs::read(&poster_path)

@@ -560,12 +560,7 @@ async fn local_metadata_backfill_retry_keeps_conflicted_item_excluded()
 #[tokio::test]
 async fn manifest_scan_indexes_poster_while_local_nfo_is_blocked()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::{
-        ffi::CString,
-        io::Write,
-        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
-        time::Duration,
-    };
+    use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Duration};
 
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -809,10 +804,10 @@ async fn blocked_first_local_poster_does_not_block_manifest_scan()
         None
     };
     let worker_blocked = fifo_writer.is_some();
-    let scan_finished_while_poster_blocked =
-        tokio::time::timeout(Duration::from_secs(30), &mut scan)
-            .await
-            .is_ok();
+    let completed_scan = tokio::time::timeout(Duration::from_secs(30), &mut scan)
+        .await
+        .ok();
+    let scan_finished_while_poster_blocked = completed_scan.is_some();
 
     // Always release the FIFO so a failed assertion cannot leave the worker stuck.
     if let Some(writer) = fifo_writer.as_mut() {
@@ -821,7 +816,11 @@ async fn blocked_first_local_poster_does_not_block_manifest_scan()
     } else {
         tokio::fs::remove_file(&blocked_poster).await?;
     }
-    scan.await??;
+    if let Some(result) = completed_scan {
+        result??;
+    } else {
+        scan.await??;
+    }
     wait_for_local_metadata_batches(&database, &job.id).await?;
 
     let indexed: (i64, i64) = sqlx::query_as(
@@ -1035,7 +1034,7 @@ async fn unreadable_local_poster_keeps_image_check_retryable()
     .write_to(&mut poster_png, image::ImageFormat::Png)?;
     tokio::fs::write(&poster_path, poster_png.get_ref()).await?;
     let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
-    permissions.set_mode(0);
+    permissions.set_mode(0o000);
     tokio::fs::set_permissions(&poster_path, permissions).await?;
     assert_eq!(
         tokio::fs::read(&poster_path)
