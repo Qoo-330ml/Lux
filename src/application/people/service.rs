@@ -401,6 +401,7 @@ impl Default for DeferredNfoActorCredits {
     fn default() -> Self {
         Self {
             pending: Arc::default(),
+            flush_lock: Arc::new(AsyncMutex::new(())),
             manifest_restore_pending: Arc::default(),
             person_asset_results: Arc::default(),
             person_asset_permits: Arc::new(Semaphore::new(
