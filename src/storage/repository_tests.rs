@@ -311,6 +311,11 @@ async fn scan_job_metadata_page_preserves_kind_priority_and_item_order()
     let job = ScanJobService::new(database.clone())
         .create_movie_scan_job(library.id)
         .await?;
+    database
+        .query("UPDATE scan_jobs SET auto_metadata_match = 1 WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
 
     for (item_id, item_type, parent_id, series_id, season_number) in [
         ("movie-z", "MOVIE", None, None, None),
@@ -391,6 +396,9 @@ async fn scan_job_metadata_page_preserves_kind_priority_and_item_order()
     database.reset_query_count();
     let page = database.load_scan_job_metadata_page(&job.id, 1).await?;
     assert!(page.has_pending);
+    assert_eq!(page.job_type.as_deref(), Some(job.job_type.as_str()));
+    assert_eq!(page.job_status.as_deref(), Some(job.status.as_str()));
+    assert!(page.auto_metadata_match);
     let StoredScanJobMetadataSources::Movies(movies) = page.sources else {
         return Err("movie targets should have priority over other media types".into());
     };
@@ -479,6 +487,55 @@ async fn scan_job_metadata_page_preserves_kind_priority_and_item_order()
     let page = database.load_scan_job_metadata_page(&job.id, 8).await?;
     assert!(!page.has_pending);
     assert!(matches!(page.sources, StoredScanJobMetadataSources::None));
+    assert_eq!(database.query_count(), 1);
+
+    database
+        .query("UPDATE scan_jobs SET status = 'FAILED' WHERE id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES ('metadata-page-empty-job', ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+    database.reset_query_count();
+    let empty_job_page = database
+        .load_scan_job_metadata_page("metadata-page-empty-job", 8)
+        .await?;
+    assert_eq!(
+        empty_job_page.job_type.as_deref(),
+        Some("RECONCILE_LIBRARY")
+    );
+    assert_eq!(empty_job_page.job_status.as_deref(), Some("RUNNING"));
+    assert!(!empty_job_page.auto_metadata_match);
+    assert!(!empty_job_page.has_pending);
+    assert!(matches!(
+        empty_job_page.sources,
+        StoredScanJobMetadataSources::None
+    ));
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    let failed_job_page = database.load_scan_job_metadata_page(&job.id, 8).await?;
+    assert_eq!(
+        failed_job_page.job_type.as_deref(),
+        Some(job.job_type.as_str())
+    );
+    assert_eq!(failed_job_page.job_status.as_deref(), Some("FAILED"));
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    let missing_job_page = database
+        .load_scan_job_metadata_page("metadata-page-job-does-not-exist", 8)
+        .await?;
+    assert_eq!(missing_job_page.job_type, None);
+    assert_eq!(missing_job_page.job_status, None);
+    assert!(!missing_job_page.auto_metadata_match);
+    assert!(!missing_job_page.has_pending);
     assert_eq!(database.query_count(), 1);
     Ok(())
 }

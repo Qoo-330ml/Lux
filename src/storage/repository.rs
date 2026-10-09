@@ -3213,6 +3213,9 @@ pub(crate) struct StoredSeriesMetadataSource {
 
 #[derive(Debug)]
 pub(crate) struct StoredScanJobMetadataPage {
+    pub(crate) job_type: Option<String>,
+    pub(crate) job_status: Option<String>,
+    pub(crate) auto_metadata_match: bool,
     pub(crate) has_pending: bool,
     pub(crate) sources: StoredScanJobMetadataSources,
 }

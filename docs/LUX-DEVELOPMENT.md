@@ -9607,6 +9607,22 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 进度记录（2026-10-09）：基准 harness 已接入规范化 SQLx 延迟摘要、5 ms 连接池采样、管理/目录请求各自的 pool 观测、目录页首次与热页对照，以及 LUX-304 scan 完成后 image-pending 采样和严格 image batch drain。SQL 延迟对象显式标注 phase window 和后台 SQL 可能混入；单次首次目录请求只记录单次延迟。image-pending 只接受请求窗口首尾都存在有效 pending/running batch 的样本；失败/取消不计作 pending，已完成但缺少 `images_completed_at` 会使 drain 立即失败。pool 无样本报告保持 unavailable，所有未观测数值为 null。helper 测试 10/10 通过。LUX-270 与 LUX-304 的 1k SQLite fixture 通过；另有 10k SQLite LUX-304 fixture，扫描中、image-pending、strict drain 后三个窗口均记录目录 p95，完整输出见 `docs/PERFORMANCE.md`。这些是单轮 ARM64 SQLite fixture 检查，不是 A/B 或性能收益结论；原 1k 回退和阶段 23 双后端 A/B 仍待修复/复测。`cargo build --locked`、fmt、全目标全 feature Clippy 和全量 Rust 测试完成门通过；本机无 PostgreSQL 实例的专项测试保持 ignored。上述数据不外推 FNOS/NAS。
 
+#### LUX-463：将 scan-job lifecycle 状态并入本地 metadata page 读取
+
+范围：LUX-443 已把 pending target 与有界 source page 合并读取，但本地 metadata worker 启动时仍单独读取一次 scan job；空闲 fallback 到期时又单独刷新 scan job，之后回到 page 查询。扩展现有 `load_scan_job_metadata_page` 单次查询，同时返回 job 是否存在、job type、job status、`auto_metadata_match`、pending 状态和首个有界 source page。worker 使用该 page lifecycle 判定不存在、FAILED、CANCELLED 的退出路径，并读取 `INCREMENTAL_SCAN` 类型及 completeness policy；删除独立的初始 `find_scan_job`、fallback refresh 和增量 completeness policy 的重复 job 查询。保留没有 page snapshot 的其他调用点原有策略解析、`Notify`、stop watch、5 秒跨进程状态 fallback、page 顺序、source unavailable 失败语义，以及每个 pending page 的 manifest root 身份复核。
+
+验收：
+
+- [x] page storage query 一次返回 lifecycle、`auto_metadata_match` 与既有 pending/source page；job 不存在可与空 job 区分，job status/type/auto-match 不引入第二次 query。
+- [x] worker 启动和每次 Notify/fallback 后只通过 page 查询读取最新 lifecycle；missing、FAILED、CANCELLED 的退出行为与原实现一致，INCREMENTAL_SCAN completeness 从同一 page snapshot 取策略，不重复读取 job。
+- [x] query-wrapper 回归证明 worker 启动与 Notify 分别只产生一次 lifecycle/page 查询，completeness policy 使用 page snapshot 时不增加查询；storage 回归覆盖 auto-match 开关、存在、终态和不存在 job，同时保留 target 优先级与无 source pending 行为。
+- [x] root identity 校验、stop watch、Notify 即时唤醒与 5 秒跨进程 fallback 语义保持；相关 scanner/storage 测试、fmt、build、Clippy 和 `git diff --check` 通过。
+- [x] 不把 query-wrapper 调用数变化描述成 SQL 墙钟、FNOS/NAS CPU 或 PostgreSQL 生产收益。
+
+短计划与文件：先扩展 `StoredScanJobMetadataPage` 并在原有单条 page query 返回 job lifecycle 与 `auto_metadata_match`，添加 storage 回归；再将 scanner worker 的启动/刷新状态判断及增量 completeness policy 切到 page snapshot，并扩展 idle worker query-count 回归。预计修改 `src/storage/repository.rs`、`src/storage/jobs.rs`、`src/application/scanner.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`，共 5 个文件。
+
+进度记录（2026-10-09）：page lifecycle 合并 query 额外返回 `auto_metadata_match`，增量 metadata completeness 复用 page snapshot 解析策略，不再第二次读取 scan job；没有 page snapshot 的调用点保留既有策略读取路径。query counter 回归先复现了 1 次冗余 query，修复后策略解析增加 0 次 query；storage 覆盖 enabled flag、空 page、终态和不存在 job。相关定向测试、`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 和 `cargo test --locked --all-targets` 通过；library 为 808 passed、13 ignored，需本地 PostgreSQL 的集成测试与手动性能基准仍按其条件 ignored。以上是调用次数与本机测试证据，不推断 SQL 墙钟、FNOS/NAS CPU 或 PostgreSQL 生产收益。
+
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
 - [ ] 人为阻塞首项图片、后段海报、慢 NFO、权限错误、不可用根、取消/重试、全量/增量竞态和扫描期间本地补图均有自动化覆盖。

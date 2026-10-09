@@ -8037,11 +8037,16 @@ impl Database {
     ) -> Result<StoredScanJobMetadataPage, StorageError> {
         let rows = self
             .query(
-                "WITH pending_targets AS (
-                     SELECT target_id, item_id
-                     FROM scan_job_targets
-                     WHERE job_id = ? AND target_type = 'ITEM'
-                       AND metadata_state = 'PENDING'
+                "WITH job_lifecycle AS (
+                     SELECT id, job_type, status, auto_metadata_match
+                     FROM scan_jobs
+                     WHERE id = ?
+                 ), pending_targets AS (
+                     SELECT t.target_id, t.item_id
+                     FROM scan_job_targets t
+                     JOIN job_lifecycle job ON job.id = t.job_id
+                     WHERE t.target_type = 'ITEM'
+                       AND t.metadata_state = 'PENDING'
                  ), source_candidates AS (
                      SELECT * FROM (
                      SELECT 0 AS source_order, t.target_id, 'MOVIE' AS target_kind,
@@ -8127,7 +8132,10 @@ impl Database {
                      ORDER BY target_id
                      LIMIT ?
                  )
-                 SELECT CASE WHEN EXISTS(SELECT 1 FROM pending_targets) THEN 1 ELSE 0 END
+                 SELECT job.job_type AS job_type,
+                        job.status AS job_status,
+                        job.auto_metadata_match AS auto_metadata_match,
+                        CASE WHEN EXISTS(SELECT 1 FROM pending_targets) THEN 1 ELSE 0 END
                             AS has_pending,
                         COALESCE(selected.target_kind, '') AS target_kind,
                         COALESCE(selected.source_id, '') AS source_id,
@@ -8139,6 +8147,7 @@ impl Database {
                         COALESCE(selected.season_id, '') AS season_id,
                         selected.season_number
                  FROM (SELECT 1 AS singleton) singleton
+                 LEFT JOIN job_lifecycle job ON TRUE
                  LEFT JOIN selected_sources selected ON TRUE
                  ORDER BY selected.target_id",
             )
@@ -8154,12 +8163,23 @@ impl Database {
                 source,
             })?;
 
-        let mut has_pending = false;
+        let (job_type, job_status, auto_metadata_match, has_pending) = rows
+            .first()
+            .map(|row| {
+                (
+                    row.get("job_type"),
+                    row.get("job_status"),
+                    row.get::<Option<i64>, _>("auto_metadata_match")
+                        .unwrap_or_default()
+                        != 0,
+                    row.get::<i64, _>("has_pending") != 0,
+                )
+            })
+            .unwrap_or((None, None, false, false));
         let mut movies = Vec::new();
         let mut home_videos = Vec::new();
         let mut episodes = Vec::new();
         for row in rows {
-            has_pending = row.get::<i64, _>("has_pending") != 0;
             let target_kind: String = row.get("target_kind");
             if target_kind.is_empty() {
                 continue;
@@ -8204,6 +8224,9 @@ impl Database {
             StoredScanJobMetadataSources::None
         };
         Ok(StoredScanJobMetadataPage {
+            job_type,
+            job_status,
+            auto_metadata_match,
             has_pending,
             sources,
         })

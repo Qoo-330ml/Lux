@@ -2914,6 +2914,8 @@ struct LocalMetadataWorkerHandle {
     task: JoinHandle<()>,
     job_id: String,
     notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    #[cfg(test)]
+    idle_page_receiver: tokio::sync::mpsc::UnboundedReceiver<()>,
 }
 
 fn notify_local_metadata_images_waiter(
@@ -3378,13 +3380,24 @@ async fn fail_scan_local_metadata_backfill_page(
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LocalMetadataCompletenessTrigger<'a> {
     ScanJob(&'a str),
+    ScanJobPolicy(MetadataAutoMatchPolicy),
     LibrarySetting,
 }
 
 fn metadata_auto_match_policy_for_scan_job(job: Option<&StoredScanJob>) -> MetadataAutoMatchPolicy {
-    match job {
-        Some(job) if job.job_type == "INCREMENTAL_SCAN" => {
-            if job.auto_metadata_match {
+    metadata_auto_match_policy_for_scan_job_snapshot(
+        job.map(|job| job.job_type.as_str()),
+        job.is_some_and(|job| job.auto_metadata_match),
+    )
+}
+
+fn metadata_auto_match_policy_for_scan_job_snapshot(
+    job_type: Option<&str>,
+    auto_metadata_match: bool,
+) -> MetadataAutoMatchPolicy {
+    match job_type {
+        Some("INCREMENTAL_SCAN") => {
+            if auto_metadata_match {
                 MetadataAutoMatchPolicy::Enabled
             } else {
                 MetadataAutoMatchPolicy::Disabled
@@ -3403,6 +3416,7 @@ async fn resolve_local_metadata_auto_match_policy(
         LocalMetadataCompletenessTrigger::LibrarySetting => {
             Ok(MetadataAutoMatchPolicy::UseLibrarySetting)
         }
+        LocalMetadataCompletenessTrigger::ScanJobPolicy(policy) => Ok(policy),
         LocalMetadataCompletenessTrigger::ScanJob(scan_job_id) => {
             let job = database
                 .find_scan_job(scan_job_id)
@@ -9421,6 +9435,8 @@ impl ScanJobService {
 
     fn start_local_metadata_worker(&self, scan_job_id: &str) -> LocalMetadataWorkerHandle {
         let (stop, mut stop_receiver) = watch::channel(false);
+        #[cfg(test)]
+        let (idle_page_sender, idle_page_receiver) = tokio::sync::mpsc::unbounded_channel();
         let database = self.database.clone();
         let people = self.people.clone();
         let local_nfo = self.local_nfo.clone();
@@ -9448,32 +9464,9 @@ impl ScanJobService {
                 None => enricher,
             };
 
-            let mut job = loop {
-                match database.find_scan_job(&worker_job_id).await {
-                    Ok(Some(job)) => break job,
-                    Ok(None) => return,
-                    Err(error) => {
-                        tracing::warn!(
-                            scan_job_id = %worker_job_id,
-                            %error,
-                            "local metadata worker could not load scan job; retrying"
-                        );
-                        tokio::select! {
-                            changed = stop_receiver.changed() => {
-                                if changed.is_err() || *stop_receiver.borrow() {
-                                    return;
-                                }
-                            }
-                            _ = tokio::time::sleep(LOCAL_METADATA_IDLE_FALLBACK) => {}
-                        }
-                    }
-                }
-            };
+            let mut loaded_lifecycle = false;
             loop {
                 if *stop_receiver.borrow() {
-                    return;
-                }
-                if matches!(job.status.as_str(), "FAILED" | "CANCELLED") {
                     return;
                 }
                 let page = match database
@@ -9483,17 +9476,45 @@ impl ScanJobService {
                     )
                     .await
                 {
-                    Ok(page) => Some(page),
+                    Ok(page) => {
+                        loaded_lifecycle = true;
+                        page
+                    }
                     Err(error) => {
                         tracing::warn!(
                             scan_job_id = %worker_job_id,
                             %error,
-                            "local metadata worker could not load pending target page"
+                            "local metadata worker could not load job lifecycle and target page"
                         );
-                        None
+                        let fallback = if loaded_lifecycle {
+                            LOCAL_METADATA_JOB_REFRESH_FALLBACK
+                        } else {
+                            LOCAL_METADATA_IDLE_FALLBACK
+                        };
+                        tokio::select! {
+                            changed = stop_receiver.changed() => {
+                                if changed.is_err() || *stop_receiver.borrow() {
+                                    return;
+                                }
+                            }
+                            _ = notify.notified() => {}
+                            _ = tokio::time::sleep(fallback) => {}
+                        }
+                        continue;
                     }
                 };
-                if let Some(page) = page.filter(|page| page.has_pending) {
+                let Some(job_status) = page.job_status.as_deref() else {
+                    return;
+                };
+                if matches!(job_status, "FAILED" | "CANCELLED") {
+                    return;
+                }
+                let is_incremental_scan = page.job_type.as_deref() == Some("INCREMENTAL_SCAN");
+                let completeness_policy = metadata_auto_match_policy_for_scan_job_snapshot(
+                    page.job_type.as_deref(),
+                    page.auto_metadata_match,
+                );
+                if page.has_pending {
                     if let Err(error) = target_root_validator
                         .verify_manifest_postprocessing_target_roots(&worker_job_id)
                         .await
@@ -9524,14 +9545,16 @@ impl ScanJobService {
                         .await
                     {
                         Ok(report) if report.items_processed > 0 => {
-                            if job.job_type == "INCREMENTAL_SCAN"
+                            if is_incremental_scan
                                 && !report.locally_enriched_item_ids.is_empty()
                                 && let Err(error) =
                                     complete_local_metadata_completeness_for_item_ids(
                                         &database,
                                         metadata_selection.as_ref(),
                                         metadata_reidentify.as_ref(),
-                                        LocalMetadataCompletenessTrigger::ScanJob(&worker_job_id),
+                                        LocalMetadataCompletenessTrigger::ScanJobPolicy(
+                                            completeness_policy,
+                                        ),
                                         &report.locally_enriched_item_ids,
                                         &user_events,
                                     )
@@ -9593,32 +9616,18 @@ impl ScanJobService {
                     }
                     continue;
                 }
+                #[cfg(test)]
+                let _ = idle_page_sender.send(());
                 let notified = notify.notified();
-                let refresh_job = tokio::select! {
+                tokio::select! {
                     changed = stop_receiver.changed() => {
                         if changed.is_err() || *stop_receiver.borrow() {
                             return;
                         }
-                        false
                     }
-                    _ = notified => false,
-                    _ = tokio::time::sleep(LOCAL_METADATA_JOB_REFRESH_FALLBACK) => true,
-                };
-                if !refresh_job {
-                    continue;
+                    _ = notified => {}
+                    _ = tokio::time::sleep(LOCAL_METADATA_JOB_REFRESH_FALLBACK) => {}
                 }
-                job = match database.find_scan_job(&worker_job_id).await {
-                    Ok(Some(job)) => job,
-                    Ok(None) => return,
-                    Err(error) => {
-                        tracing::warn!(
-                            scan_job_id = %worker_job_id,
-                            %error,
-                            "local metadata worker could not refresh scan job; retrying"
-                        );
-                        continue;
-                    }
-                };
             }
         });
         LocalMetadataWorkerHandle {
@@ -9626,6 +9635,8 @@ impl ScanJobService {
             task,
             job_id: scan_job_id,
             notifications,
+            #[cfg(test)]
+            idle_page_receiver,
         }
     }
 
@@ -12312,10 +12323,10 @@ mod tests {
         infer_sibling_movie_variant_suffix, infer_sibling_movie_variant_suffix_with_probe,
         is_lite_manifest_discovery, manifest_file_observation_matches,
         manifest_root_identity_matches, media_source_folder, merge_movie_provider_ids,
-        metadata_auto_match_policy_for_scan_job, normalize_incremental_path,
-        notify_local_metadata_images_waiter, parse_episode_filename, parse_movie_filename,
-        prepare_manifest_filename, read_manifest_strm_target, read_strm_target,
-        resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
+        metadata_auto_match_policy_for_scan_job, metadata_auto_match_policy_for_scan_job_snapshot,
+        normalize_incremental_path, notify_local_metadata_images_waiter, parse_episode_filename,
+        parse_movie_filename, prepare_manifest_filename, read_manifest_strm_target,
+        read_strm_target, resolve_local_metadata_auto_match_policy, safe_scan_activity_label,
         scan_lock_database_wait_backoff, stat_manifest_directory_file_batch_sync,
         stat_manifest_relative_file_sync, stat_manifest_root_sync,
     };
@@ -12494,6 +12505,60 @@ mod tests {
         .await?;
 
         assert_eq!(policy, MetadataAutoMatchPolicy::UseLibrarySetting);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn incremental_scan_completeness_policy_does_not_reload_its_metadata_page_job()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "incremental-completeness-page-policy";
+        sqlx::query(
+            "INSERT INTO scan_jobs (
+                 id, library_id, job_type, status, generation, auto_metadata_match
+             ) VALUES (?, ?, 'INCREMENTAL_SCAN', 'RUNNING', 'generation', 1)",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        let page = database.load_scan_job_metadata_page(job_id, 8).await?;
+        assert_eq!(database.query_count(), 1);
+        assert!(page.auto_metadata_match);
+        database.reset_query_count();
+
+        let policy = resolve_local_metadata_auto_match_policy(
+            &database,
+            LocalMetadataCompletenessTrigger::ScanJobPolicy(
+                metadata_auto_match_policy_for_scan_job_snapshot(
+                    page.job_type.as_deref(),
+                    page.auto_metadata_match,
+                ),
+            ),
+        )
+        .await?;
+
+        assert_eq!(policy, MetadataAutoMatchPolicy::Enabled);
+        assert_eq!(
+            database.query_count(),
+            0,
+            "completeness policy should reuse scan-job values returned with its metadata page"
+        );
         Ok(())
     }
 
@@ -13484,20 +13549,104 @@ mod tests {
         .await?;
 
         let jobs = ScanJobService::new(database.clone());
+        database.reset_query_count();
         let mut worker = Some(jobs.start_local_metadata_worker(job_id));
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            worker
+                .as_mut()
+                .expect("worker handle should be available")
+                .idle_page_receiver
+                .recv(),
+        )
+        .await?
+        .expect("worker should finish its startup page before waiting");
+        assert_eq!(
+            database.query_count(),
+            1,
+            "worker startup should load job lifecycle with its first metadata page"
+        );
         database.reset_query_count();
         jobs.notify_local_metadata_worker(job_id);
-        tokio::time::timeout(std::time::Duration::from_millis(250), async {
-            while database.query_count() == 0 {
-                tokio::task::yield_now().await;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        })
-        .await?;
+        tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            worker
+                .as_mut()
+                .expect("worker handle should be available")
+                .idle_page_receiver
+                .recv(),
+        )
+        .await?
+        .expect("notification should trigger one lifecycle page read");
         let notification_queries = database.query_count();
         ScanJobService::stop_local_metadata_worker(&mut worker).await;
         assert_eq!(notification_queries, 1);
+        sqlx::query("UPDATE scan_jobs SET status = 'FAILED' WHERE id = ?")
+            .bind(job_id)
+            .execute(database.pool())
+            .await?;
+
+        for (terminal_job_id, terminal_status) in [
+            ("local-metadata-failed-worker", "FAILED"),
+            ("local-metadata-cancelled-worker", "CANCELLED"),
+        ] {
+            sqlx::query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+                 VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+            )
+            .bind(terminal_job_id)
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+
+            database.reset_query_count();
+            let mut terminal_worker = Some(jobs.start_local_metadata_worker(terminal_job_id));
+            tokio::time::timeout(
+                std::time::Duration::from_millis(250),
+                terminal_worker
+                    .as_mut()
+                    .expect("worker handle should be available")
+                    .idle_page_receiver
+                    .recv(),
+            )
+            .await?
+            .expect("worker should finish its startup page before waiting");
+            assert_eq!(database.query_count(), 1);
+
+            sqlx::query("UPDATE scan_jobs SET status = ? WHERE id = ?")
+                .bind(terminal_status)
+                .bind(terminal_job_id)
+                .execute(database.pool())
+                .await?;
+            database.reset_query_count();
+            jobs.notify_local_metadata_worker(terminal_job_id);
+            tokio::time::timeout(std::time::Duration::from_millis(250), async {
+                while !terminal_worker
+                    .as_ref()
+                    .is_some_and(|worker| worker.task.is_finished())
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await?;
+            assert_eq!(database.query_count(), 1);
+            ScanJobService::stop_local_metadata_worker(&mut terminal_worker).await;
+        }
+
+        database.reset_query_count();
+        let mut missing_worker =
+            Some(jobs.start_local_metadata_worker("local-metadata-missing-worker"));
+        tokio::time::timeout(std::time::Duration::from_millis(250), async {
+            while !missing_worker
+                .as_ref()
+                .is_some_and(|worker| worker.task.is_finished())
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        assert_eq!(database.query_count(), 1);
+        ScanJobService::stop_local_metadata_worker(&mut missing_worker).await;
         Ok(())
     }
 
