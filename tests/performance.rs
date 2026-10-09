@@ -3482,6 +3482,28 @@ async fn measure_get_requests(
     Ok(durations)
 }
 
+#[tokio::test]
+async fn completed_scan_probe_signal_is_not_polled_twice() {
+    let (local_poster_sender, local_poster_receiver) = tokio::sync::oneshot::channel();
+    let (scan_completed_sender, scan_completed_receiver) = tokio::sync::oneshot::channel();
+    assert!(local_poster_sender.send(()).is_ok());
+    assert!(scan_completed_sender.send(()).is_ok());
+
+    let error = probe_catalog_poster_until_scan_completes(
+        reqwest::Client::new(),
+        "http://127.0.0.1:1/catalog".to_owned(),
+        "http://127.0.0.1:1".to_owned(),
+        String::new(),
+        Instant::now(),
+        local_poster_receiver,
+        scan_completed_receiver,
+    )
+    .await
+    .expect_err("a completed scan without a poster response should return a probe error");
+
+    assert!(error.contains("did not return a valid image before scan completion"));
+}
+
 async fn probe_catalog_poster_until_scan_completes(
     client: reqwest::Client,
     catalog_url: String,
@@ -3501,6 +3523,7 @@ async fn probe_catalog_poster_until_scan_completes(
         local_poster_index_observed: true,
         ..CatalogPosterApiProbe::default()
     };
+    let mut scan_completed_observed = false;
     let deadline = Instant::now() + POSTER_API_PROBE_MAX_DURATION;
     for attempt in 0..POSTER_API_PROBE_MAX_REQUESTS {
         if Instant::now() >= deadline {
@@ -3509,7 +3532,10 @@ async fn probe_catalog_poster_until_scan_completes(
         if attempt > 0 {
             tokio::select! {
                 biased;
-                _ = &mut scan_completed => break,
+                _ = &mut scan_completed => {
+                    scan_completed_observed = true;
+                    break;
+                },
                 _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => break,
                 _ = tokio::time::sleep(POSTER_API_PROBE_INTERVAL) => {},
             }
@@ -3518,7 +3544,10 @@ async fn probe_catalog_poster_until_scan_completes(
         probe.catalog_list_request_count += 1;
         let catalog_response = tokio::select! {
             biased;
-            _ = &mut scan_completed => break,
+            _ = &mut scan_completed => {
+                scan_completed_observed = true;
+                break;
+            },
             response = client
                 .get(&catalog_url)
                 .header(COOKIE, &cookies)
@@ -3538,7 +3567,10 @@ async fn probe_catalog_poster_until_scan_completes(
         };
         let catalog_body = tokio::select! {
             biased;
-            _ = &mut scan_completed => break,
+            _ = &mut scan_completed => {
+                scan_completed_observed = true;
+                break;
+            },
             body = response.json::<serde_json::Value>() => body,
         };
         let body = match catalog_body {
@@ -3565,7 +3597,10 @@ async fn probe_catalog_poster_until_scan_completes(
         let endpoint_started = Instant::now();
         let poster_response = tokio::select! {
             biased;
-            _ = &mut scan_completed => break,
+            _ = &mut scan_completed => {
+                scan_completed_observed = true;
+                break;
+            },
             response = client
                 .get(poster_url)
                 .header(COOKIE, &cookies)
@@ -3611,7 +3646,10 @@ async fn probe_catalog_poster_until_scan_completes(
         }
         let image_body = tokio::select! {
             biased;
-            _ = &mut scan_completed => break,
+            _ = &mut scan_completed => {
+                scan_completed_observed = true;
+                break;
+            },
             body = response.bytes() => body,
         };
         let image_bytes = match image_body {
@@ -3636,7 +3674,9 @@ async fn probe_catalog_poster_until_scan_completes(
         return Ok(probe);
     }
 
-    let _ = scan_completed.await;
+    if !scan_completed_observed {
+        let _ = scan_completed.await;
+    }
     Err(format!(
         "LUX-304 public poster API did not return a valid image before scan completion; probe={probe:?}"
     ))
