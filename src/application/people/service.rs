@@ -1086,7 +1086,8 @@ mod tests {
         MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES, PENDING_PERSON_INDEX, PENDING_PERSON_MANIFEST,
         PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService,
         PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions,
-        PersonMetadata, PersonMetadataUpdate, write_atomically_if_changed,
+        PersonMetadata, PersonMetadataUpdate, relation_snapshot_checksum,
+        write_atomically_if_changed,
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, metadata_root,
@@ -3499,6 +3500,129 @@ mod tests {
         assert_relation_checksum_matches_file(&database, &config.config_dir, "item-retry").await?;
 
         database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_relation_credit_failure_recovers_from_snapshot_after_restart()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-restart-recovery', ?, 'MOVIE', 'Restart', 'Restart', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let actors = [ActorCredit {
+            id: "actor-restart".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: vec![PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "actor-restart".to_owned(),
+            }],
+            name: "演员乙".to_owned(),
+            character: Some("角色乙".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let source_fingerprint = [17_u8; 32];
+        let deferred_credits = DeferredNfoActorCredits::default();
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-restart-recovery",
+                "tmdb",
+                &actors,
+                &source_fingerprint,
+                &deferred_credits,
+            )
+            .await?;
+
+        sqlx::query(
+            "CREATE TRIGGER reject_restart_relation_credit_state
+             BEFORE INSERT ON person_index_item_state
+             WHEN NEW.item_id = 'item-restart-recovery'
+             BEGIN SELECT RAISE(ABORT, 'injected relation state failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let failures = service
+            .flush_deferred_nfo_actor_credits(&deferred_credits)
+            .await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].item_ids, ["item-restart-recovery"]);
+
+        let relation_path = library_item_directory(&config.config_dir, "item-restart-recovery")?
+            .join("people.json");
+        let relation_bytes = tokio::fs::read(&relation_path).await?;
+        let relation_checksum = relation_snapshot_checksum(&relation_bytes);
+        assert!(
+            !service
+                .nfo_relation_snapshot_is_current("item-restart-recovery")
+                .await?,
+            "the durable relation snapshot must remain stale until its credit/index transaction commits"
+        );
+
+        // Lose the page-local retry queue and all service state as a process restart would.
+        drop(deferred_credits);
+        drop(service);
+        database.close().await;
+
+        let restarted_database = Database::connect(&config).await?;
+        sqlx::query("DROP TRIGGER reject_restart_relation_credit_state")
+            .execute(restarted_database.pool())
+            .await?;
+        let restarted_relation_bytes = tokio::fs::read(&relation_path).await?;
+        assert_eq!(
+            relation_snapshot_checksum(&restarted_relation_bytes),
+            relation_checksum,
+            "the recovery snapshot must survive the service and database restart"
+        );
+        let restarted_service =
+            PeopleService::new(config.config_dir.clone()).with_database(restarted_database.clone());
+        assert!(
+            !restarted_service
+                .nfo_relation_snapshot_is_current("item-restart-recovery")
+                .await?,
+            "a new service instance must detect the persisted snapshot/index mismatch"
+        );
+
+        assert_eq!(restarted_service.rebuild_person_credit_index().await?, 1);
+        assert!(
+            restarted_service
+                .nfo_relation_snapshot_is_current("item-restart-recovery")
+                .await?,
+            "the existing person index rebuild must reconcile the durable snapshot"
+        );
+        let stored_checksum: String = sqlx::query_scalar(
+            "SELECT relation_checksum FROM person_index_item_state
+             WHERE item_id = 'item-restart-recovery'",
+        )
+        .fetch_one(restarted_database.pool())
+        .await?;
+        assert_eq!(stored_checksum, relation_checksum);
+        let credit_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-restart-recovery'",
+        )
+        .fetch_one(restarted_database.pool())
+        .await?;
+        assert_eq!(credit_count, 1);
+
+        restarted_database.close().await;
         Ok(())
     }
 
