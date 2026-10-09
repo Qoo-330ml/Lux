@@ -242,11 +242,13 @@ impl PeopleService {
         deferred_credits: &DeferredNfoActorCredits,
         resources: &ResourceMetrics,
     ) -> Vec<NfoActorCreditsFlushFailure> {
-        let pending = std::mem::take(&mut *deferred_credits.pending.lock().await);
         let Some(database) = &self.database else {
             return Vec::new();
         };
+        let _flush_guard = deferred_credits.flush_lock.lock().await;
+        let pending = std::mem::take(&mut *deferred_credits.pending.lock().await);
         let mut failures = Vec::new();
+        let mut retry_pending = Vec::new();
         for chunk in pending.chunks(16) {
             let replacements = chunk
                 .iter()
@@ -274,6 +276,7 @@ impl PeopleService {
                 result.is_ok(),
             );
             if let Err(error) = result {
+                retry_pending.extend(chunk.iter().cloned());
                 failures.push(NfoActorCreditsFlushFailure {
                     item_ids: chunk
                         .iter()
@@ -282,6 +285,13 @@ impl PeopleService {
                     error: error.to_string(),
                 });
             }
+        }
+        if !retry_pending.is_empty() {
+            deferred_credits
+                .pending
+                .lock()
+                .await
+                .splice(0..0, retry_pending);
         }
         failures
     }

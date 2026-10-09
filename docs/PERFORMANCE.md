@@ -1766,3 +1766,9 @@ scan-local movie metadata page 复用有序 task runner，最多同时执行 4 �
 同一个 scan-local NFO page context 对序列化后相同的人物 NFO、身份与 metadata 输入使用一个共享 `OnceCell` 结果；不同人物资产处理由共享 semaphore 限制为最多 4 路并发，重复人物不占第二个并发槽。该结果覆盖 `person.nfo`、person manifest、profile image、provider identity index 和 canonical person index 写入；`people.json` 关系快照仍逐 item 写入，credits 继续按既有最多 16-item storage chunk 提交。相同 person manifest checksum 继续跳过 manifest 文件替换，profile image 继续使用 LUX-448 的 unchanged-write；本任务将 person NFO 与 provider/canonical index 接入 byte-identical 检查，相同字节保留 inode，变化输入仍写入新文件。固定并发回归用测试闸门阻塞真实的 4 个 page permits，再确认同页没有可用的第 5 个 permit，8 个不同人物请求最终全部完成。provider-index symlink 故障 fixture 从另一 provider 读取有效 profile，再触发目标 provider index 写入失败；断言失败人物仅增加 `personIndex` pending，其他人物 NFO 与全部 relation 仍保存。
 
 这些回归证明页内合并范围、4 路并发上限、错误隔离和相同目标字节不执行原子文件替换；没有测量磁盘系统调用墙钟、数据库时延、PostgreSQL/NAS/FNOS CPU 或生产收益，也不表示 person files 与 credits 数据库可以跨持久化边界原子提交。`cargo build --locked` 和全目标全 feature Clippy 等待阶段 23 A/B 采样结束后运行。
+
+### LUX-467 deferred relation credits 失败恢复
+
+deferred NFO credits flush 现在串行化同一 page collector 的 flush；某个最多 16-item storage chunk 事务失败时，只把该失败 chunk 保留到 collector，已提交的其他 chunk 不会重复入队。故障解除后再次 flush 可重试同一份 credits、source fingerprint 和 relation checksum；storage UPSERT 与 item index state transaction 保持幂等，成功后重复 flush 不再写入。固定 service 回归注入 index-state insert 错误，确认 SQL chunk 回滚、relation 文件仍存在且 current 检查为 stale，随后移除故障并对同一 collector 重试，确认 current 恢复、文件 checksum 匹配且只留下一个 credit。
+
+这只证明同一进程内 collector 的显式重试和单库 SQLite correctness。文件系统与数据库不能组成跨系统 ACID 事务；崩溃恢复依赖 durable relation snapshot、checksum stale 判定和既有 index rebuild reconciliation。Home cache invalidation 与 coalesced event 在 scan metadata batch 的完成边界发出，不是 DB outbox，也不能与文件/数据库提交原子化。未测量 PostgreSQL/FNOS/NAS 性能或事件送达耐久性。

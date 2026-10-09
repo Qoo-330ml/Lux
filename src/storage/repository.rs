@@ -1799,7 +1799,7 @@ struct PrefetchedMovieItem {
     removed_at: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct NewPersonCredit {
     pub(crate) person_id: String,
     pub(crate) lux_person_id: Option<String>,

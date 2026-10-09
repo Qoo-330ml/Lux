@@ -10101,6 +10101,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 明确不做：多图/轮播、任意 URL/路径、插件读宿主文件、图片服务端代理/CDN/转码、媒体库写入、许可同意自动迁移、远程卸载已装插件或重写 Git 历史。
 
+#### LUX-467：让 deferred relation credits 失败后可重试
+
+范围：本地 NFO page 先原子写入 `people.json`，再按最多 16 项提交 credits、source fingerprint 和 relation checksum。文件写入和数据库事务不共享 ACID 边界；数据库写入失败时保留 relation 文件作为恢复快照，并确保 index state/checksum mismatch 让该 revision 保持 stale。deferred credits flush 失败时将失败 chunk 保留在同一个 page collector 中，允许存储故障清除后重试；credits replacement 和 checksum state 继续在单个数据库事务内提交。扫描 batch 在 metadata 处理后统一失效 Home cache 并发送合并后的 Home event。文件、数据库和进程内事件不能组成一个跨系统事务；进程重启后的关系恢复依赖文件快照及既有 person index rebuild reconciliation。
+
+验收：
+
+- [x] 注入 credits/index-state 数据库失败后，relation 文件保留且 current 检查返回 stale；同一 deferred collector 在故障解除后可重试，并保存与文件字节匹配的 checksum。
+- [x] 重试后 credits 只有一份；成功 flush 消费 pending 项，重复 flush 为 no-op；flush 串行化以避免同一 collector 的并发重复提交。
+- [x] 现有扫描 page/job 边界仍统一失效 Home cache 并 coalesce Home event；文档不将它与文件或数据库提交描述为原子事务。
+- [x] people service、metadata/scanner relation-retry 定向测试、build、fmt、Clippy 与 `git diff --check` 通过；验证边界如实记录。
+
+预计文件：`src/application/people/relations.rs`、`src/application/people/service.rs`、`src/storage/repository.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加 database failure / retry / idempotency regression，再保留失败 chunk 并串行化 flush。文件系统与数据库之间没有共同事务；durable relation snapshot 和 stale revision 检测用于恢复，Home invalidation/event 在 scan batch 完成边界合并。
+
+结果（2026-10-09）：旧实现下新回归先失败，证明 DB index-state 写入失败后 relation 文件虽仍在且判 stale，同一个 deferred collector 已丢弃 pending，解除 SQL 故障后无法 flush。修复将 flush 串行化，失败 chunk 按原顺序放回队列头部，避免并发追加的较新快照被失败旧项覆盖；数据库缺失时不消费队列。SQLite trigger 回归确认 failure 后 stale、同 collector retry 后 checksum/current 恢复、重复 flush 无副作用且仅一条 credit。people service library tests 45/45、scanner Home-event worker regression 1/1、`tests/metadata.rs` 21/21 通过；`cargo build --locked`、`cargo fmt --all -- --check`、全目标全 feature Clippy 与 `git diff --check` 通过。使用 Toshiba 的共享 Cargo target，本机 `arm64`。没有运行 PostgreSQL、FNOS 或生产性能测量；relation file、DB transaction 与进程内 Home event 仍是分开的持久化/缓存边界，不声称跨系统 ACID。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

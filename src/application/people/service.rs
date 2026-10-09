@@ -367,6 +367,7 @@ pub struct ActorPersistReport {
 #[derive(Clone)]
 pub(crate) struct DeferredNfoActorCredits {
     pending: Arc<AsyncMutex<Vec<PendingNfoActorCredits>>>,
+    flush_lock: Arc<AsyncMutex<()>>,
     manifest_restore_pending: Arc<AsyncMutex<bool>>,
     person_asset_results: Arc<AsyncMutex<HashMap<String, Arc<OnceCell<PersonAssetResult>>>>>,
     person_asset_permits: Arc<Semaphore>,
@@ -416,6 +417,7 @@ pub(super) struct PersonManifestWriteOptions<'a> {
     pub deferred_restore_pending: Option<&'a DeferredNfoActorCredits>,
 }
 
+#[derive(Clone)]
 struct PendingNfoActorCredits {
     item_id: String,
     credits: Vec<NewPersonCredit>,
@@ -3352,6 +3354,150 @@ mod tests {
         for item_id in ["item-a", "item-b"] {
             assert_relation_checksum_matches_file(&database, &config.config_dir, item_id).await?;
         }
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn deferred_relation_credit_failure_preserves_snapshot_for_retry()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{config::Config, storage::Database};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-retry', ?, 'MOVIE', 'Retry', 'Retry', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let actors = [ActorCredit {
+            id: "actor-9".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: vec![PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "actor-9".to_owned(),
+            }],
+            name: "演员甲".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        }];
+        let source_fingerprint = [7_u8, 8, 9];
+        let deferred_credits = DeferredNfoActorCredits::default();
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-retry",
+                "tmdb",
+                &actors,
+                &source_fingerprint,
+                &deferred_credits,
+            )
+            .await?;
+
+        sqlx::query(
+            "CREATE TRIGGER reject_relation_credit_state
+             BEFORE INSERT ON person_index_item_state
+             WHEN NEW.item_id = 'item-retry'
+             BEGIN SELECT RAISE(ABORT, 'injected relation state failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+        let failures = service
+            .flush_deferred_nfo_actor_credits(&deferred_credits)
+            .await;
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].item_ids, ["item-retry"]);
+        let failed_credit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-retry'")
+                .fetch_one(database.pool())
+                .await?;
+        let failed_state_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM person_index_item_state WHERE item_id = 'item-retry'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            failed_credit_count, 0,
+            "the failed DB chunk must roll back credits"
+        );
+        assert_eq!(
+            failed_state_count, 0,
+            "the failed DB chunk must roll back relation revision state"
+        );
+
+        let relation_path =
+            library_item_directory(&config.config_dir, "item-retry")?.join("people.json");
+        assert!(
+            relation_path.exists(),
+            "the relation snapshot survives DB failure"
+        );
+        assert!(
+            !service
+                .item_actor_relation_is_current("item-retry", &source_fingerprint)
+                .await?,
+            "the checksum mismatch must make the partially persisted revision stale"
+        );
+
+        sqlx::query("DROP TRIGGER reject_relation_credit_state")
+            .execute(database.pool())
+            .await?;
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty(),
+            "the same deferred snapshot should be retryable after the storage fault clears"
+        );
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty(),
+            "a repeated flush after success should be an idempotent no-op"
+        );
+        assert!(
+            service
+                .item_actor_relation_is_current("item-retry", &source_fingerprint)
+                .await?
+        );
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-retry").await?;
+
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-retry",
+                "tmdb",
+                &actors,
+                &source_fingerprint,
+                &deferred_credits,
+            )
+            .await?;
+        assert!(
+            service
+                .flush_deferred_nfo_actor_credits(&deferred_credits)
+                .await
+                .is_empty(),
+            "replaying the same relation update should remain idempotent"
+        );
+        let credit_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM person_credits WHERE item_id = 'item-retry'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(credit_count, 1);
+        assert_relation_checksum_matches_file(&database, &config.config_dir, "item-retry").await?;
+
         database.close().await;
         Ok(())
     }
