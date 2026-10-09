@@ -8,6 +8,9 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use quick_xml::{
     escape::{escape, unescape},
@@ -367,6 +370,30 @@ pub(crate) struct DeferredNfoActorCredits {
     manifest_restore_pending: Arc<AsyncMutex<bool>>,
     person_asset_results: Arc<AsyncMutex<HashMap<String, Arc<OnceCell<PersonAssetResult>>>>>,
     person_asset_permits: Arc<Semaphore>,
+    #[cfg(test)]
+    person_asset_test_probe: Option<LocalNfoPersonAssetConcurrencyProbe>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct LocalNfoPersonAssetConcurrencyProbe {
+    started: tokio::sync::mpsc::UnboundedSender<()>,
+    release: Arc<Semaphore>,
+    active: Arc<AtomicUsize>,
+    max_active: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl LocalNfoPersonAssetConcurrencyProbe {
+    async fn hold_after_permit(&self) {
+        let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max_active.fetch_max(active, Ordering::SeqCst);
+        let _ = self.started.send(());
+        if let Ok(permit) = self.release.acquire().await {
+            drop(permit);
+        }
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl Default for DeferredNfoActorCredits {
@@ -378,6 +405,8 @@ impl Default for DeferredNfoActorCredits {
             person_asset_permits: Arc::new(Semaphore::new(
                 LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY,
             )),
+            #[cfg(test)]
+            person_asset_test_probe: None,
         }
     }
 }
@@ -1045,19 +1074,21 @@ mod tests {
         collections::{BTreeMap, BTreeSet, HashSet},
         path::Path,
         sync::Arc,
+        sync::atomic::{AtomicUsize, Ordering},
     };
-    use tokio::sync::Mutex as AsyncMutex;
+    use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 
     use super::{
-        ActorCredit, DeferredNfoActorCredits, LocalActorRelationPageCache,
-        MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES, PENDING_PERSON_MANIFEST, PERSON_MANIFEST,
-        PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService, PersonIdentity,
-        PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions, PersonMetadata,
-        PersonMetadataUpdate, write_atomically_if_changed,
+        ActorCredit, DeferredNfoActorCredits, LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY,
+        LocalActorRelationPageCache, LocalNfoPersonAssetConcurrencyProbe,
+        MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES, PENDING_PERSON_INDEX, PENDING_PERSON_MANIFEST,
+        PERSON_MANIFEST, PERSON_MANIFEST_SCHEMA_VERSION, PERSON_NFO, PeopleError, PeopleService,
+        PersonIdentity, PersonIndexRebuildCoordinator, PersonManifest, PersonManifestWriteOptions,
+        PersonMetadata, PersonMetadataUpdate, write_atomically_if_changed,
     };
     use crate::application::metadata_paths::{
-        canonical_person_directory, library_item_directory, lux_person_directory, people_directory,
-        people_index_path_for_provider,
+        canonical_person_directory, library_item_directory, lux_person_directory, metadata_root,
+        people_directory, people_index_path_for_provider,
     };
     use crate::{
         application::libraries::LibraryService, config::Config, library::LibraryKind,
@@ -3005,8 +3036,31 @@ mod tests {
         let profiles = config.path().join("people/profiles");
         tokio::fs::create_dir_all(&profiles).await?;
         tokio::fs::write(profiles.join("9.png"), PNG_1X1).await?;
-        tokio::fs::write(profiles.join("10.png"), PNG_1X1).await?;
         tokio::fs::write(profiles.join("11.png"), PNG_1X1).await?;
+
+        let indexed_profile = Path::new("people/assets/provider-seed.png");
+        let indexed_profile_path = metadata_root(config.path()).join(indexed_profile);
+        tokio::fs::create_dir_all(
+            indexed_profile_path
+                .parent()
+                .ok_or("indexed profile path has no parent")?,
+        )
+        .await?;
+        tokio::fs::write(&indexed_profile_path, PNG_1X1).await?;
+        let readable_provider_index = people_index_path_for_provider(config.path(), "aaa", "10")?;
+        tokio::fs::create_dir_all(
+            readable_provider_index
+                .parent()
+                .ok_or("readable provider index path has no parent")?,
+        )
+        .await?;
+        tokio::fs::write(
+            &readable_provider_index,
+            serde_json::to_vec(&serde_json::json!({
+                "imagePath": indexed_profile.to_string_lossy(),
+            }))?,
+        )
+        .await?;
         let broken_index = people_index_path_for_provider(config.path(), "tmdb", "10")?;
         tokio::fs::create_dir_all(
             broken_index
@@ -3022,7 +3076,20 @@ mod tests {
             [("9", "演员甲"), ("10", "演员乙"), ("11", "演员丙")].map(|(id, name)| ActorCredit {
                 id: id.to_owned(),
                 provider: None,
-                identities: Vec::new(),
+                identities: if id == "10" {
+                    vec![
+                        PersonIdentity {
+                            provider: "aaa".to_owned(),
+                            id: id.to_owned(),
+                        },
+                        PersonIdentity {
+                            provider: "tmdb".to_owned(),
+                            id: id.to_owned(),
+                        },
+                    ]
+                } else {
+                    Vec::new()
+                },
                 name: name.to_owned(),
                 character: None,
                 order: None,
@@ -3063,6 +3130,77 @@ mod tests {
                 .as_array()
                 .is_some_and(|pending| pending.iter().any(|asset| asset == PENDING_PERSON_INDEX))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_person_assets_keep_page_concurrency_at_four()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PERSON_COUNT: usize = 8;
+        const EXPECTED_CONCURRENCY: usize = LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let mut deferred = DeferredNfoActorCredits::default();
+        let (started, mut started_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(Semaphore::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        deferred.person_asset_test_probe = Some(LocalNfoPersonAssetConcurrencyProbe {
+            started,
+            release: Arc::clone(&release),
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+        });
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for index in 0..PERSON_COUNT {
+            let service = service.clone();
+            let deferred = deferred.clone();
+            let item_id = format!("item-concurrency-{index}");
+            let actor = ActorCredit {
+                id: (index + 1).to_string(),
+                provider: None,
+                identities: Vec::new(),
+                name: format!("演员{index}"),
+                character: None,
+                order: None,
+                profile_url: None,
+                person: None,
+            };
+            tasks.spawn(async move {
+                service
+                    .persist_nfo_item_actors_deferred(
+                        &item_id,
+                        "tmdb",
+                        &[actor],
+                        &[index as u8],
+                        &deferred,
+                    )
+                    .await
+            });
+        }
+
+        for _ in 0..EXPECTED_CONCURRENCY {
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), started_receiver.recv(),)
+                    .await?,
+                Some(()),
+                "expected each available page permit to admit one person asset task"
+            );
+        }
+        assert_eq!(active.load(Ordering::SeqCst), EXPECTED_CONCURRENCY);
+        assert!(
+            deferred.person_asset_permits.try_acquire().is_err(),
+            "all page permits should remain held while the admitted tasks are blocked"
+        );
+
+        release.add_permits(PERSON_COUNT);
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result??.stored_count, 1);
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(max_active.load(Ordering::SeqCst), EXPECTED_CONCURRENCY);
         Ok(())
     }
 
