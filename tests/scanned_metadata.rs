@@ -560,7 +560,12 @@ async fn local_metadata_backfill_retry_keeps_conflicted_item_excluded()
 #[tokio::test]
 async fn manifest_scan_indexes_poster_while_local_nfo_is_blocked()
 -> Result<(), Box<dyn std::error::Error>> {
-    use std::{ffi::CString, os::unix::ffi::OsStrExt, time::Duration};
+    use std::{
+        ffi::CString,
+        io::Write,
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        time::Duration,
+    };
 
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -707,6 +712,568 @@ async fn manifest_scan_indexes_poster_while_local_nfo_is_blocked()
         scan_finished_before_nfo_unblocked,
         "scan completion should not wait for local NFO processing; scan={scan_state:?}, queue={queue_state:?}"
     );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn blocked_first_local_poster_does_not_block_manifest_scan()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{
+        ffi::CString,
+        io::Write,
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        time::Duration,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let first_movie_dir = media_root.join("00 Blocked Poster (2024)");
+    let second_movie_dir = media_root.join("01 Later Poster (2024)");
+    tokio::fs::create_dir_all(&first_movie_dir).await?;
+    tokio::fs::create_dir_all(&second_movie_dir).await?;
+    tokio::fs::write(first_movie_dir.join("00.Blocked.Poster.2024.mkv"), b"movie").await?;
+    tokio::fs::write(second_movie_dir.join("01.Later.Poster.2024.mkv"), b"movie").await?;
+    let blocked_poster = first_movie_dir.join("poster.png");
+    let blocked_poster_c = CString::new(blocked_poster.as_os_str().as_bytes())?;
+    // SAFETY: the path is a valid NUL-terminated fixture path and mode is restrictive.
+    let mkfifo_result = unsafe { libc::mkfifo(blocked_poster_c.as_ptr(), 0o600) };
+    assert_eq!(mkfifo_result, 0, "failed to create blocked poster fixture");
+
+    let mut poster_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([12, 34, 56, 255]),
+    ))
+    .write_to(&mut poster_png, image::ImageFormat::Png)?;
+    tokio::fs::write(second_movie_dir.join("poster.png"), poster_png.get_ref()).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let job_id = job.id.clone();
+    let scan_jobs = jobs.clone();
+    let mut scan = tokio::spawn(async move { scan_jobs.run_to_completion(&job_id, 1, None).await });
+
+    let worker_claimed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_optional(database.pool())
+            .await?;
+            if status.as_deref() == Some("RUNNING") {
+                return Ok::<_, sqlx::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(Ok(false))?;
+    let mut fifo_writer = if worker_claimed {
+        Some(
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&blocked_poster)
+                    {
+                        Ok(writer) => return Ok::<_, std::io::Error>(writer),
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
+            .await??,
+        )
+    } else {
+        None
+    };
+    let worker_blocked = fifo_writer.is_some();
+    let scan_finished_while_poster_blocked =
+        tokio::time::timeout(Duration::from_secs(30), &mut scan)
+            .await
+            .is_ok();
+
+    // Always release the FIFO so a failed assertion cannot leave the worker stuck.
+    if let Some(writer) = fifo_writer.as_mut() {
+        writer.write_all(poster_png.get_ref())?;
+        drop(fifo_writer.take());
+    } else {
+        tokio::fs::remove_file(&blocked_poster).await?;
+    }
+    scan.await??;
+    wait_for_local_metadata_batches(&database, &job.id).await?;
+
+    let indexed: (i64, i64) = sqlx::query_as(
+        "SELECT
+             (SELECT COUNT(*) FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'),
+             (SELECT COUNT(*) FROM item_images image
+              JOIN media_items item ON item.id = image.item_id
+              WHERE item.library_id = ? AND image.image_type = 'POSTER')",
+    )
+    .bind(library.id.to_string())
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        worker_blocked,
+        "the local poster worker never reached the FIFO"
+    );
+    assert!(
+        scan_finished_while_poster_blocked,
+        "manifest scan must finish while the first local poster read is blocked"
+    );
+    assert_eq!(
+        indexed,
+        (2, 2),
+        "both posters should appear after FIFO release"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_scan_during_running_local_image_claim_cancels_before_completeness()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{
+        ffi::CString,
+        io::Write,
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt},
+        time::Duration,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Cancelled Image (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Cancelled.Image.2024.mkv"), b"movie").await?;
+    let poster_path = movie_dir.join("poster.png");
+    let poster_path_c = CString::new(poster_path.as_os_str().as_bytes())?;
+    // SAFETY: the path is a valid NUL-terminated fixture path and mode is restrictive.
+    let mkfifo_result = unsafe { libc::mkfifo(poster_path_c.as_ptr(), 0o600) };
+    assert_eq!(mkfifo_result, 0, "failed to create blocked poster fixture");
+
+    let mut poster_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([76, 54, 32, 255]),
+    ))
+    .write_to(&mut poster_png, image::ImageFormat::Png)?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-UTF8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let mut queued = false;
+    for _ in 0..20 {
+        let report = jobs.run_batch(&job.id, 1).await?;
+        let batch_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+        if batch_count > 0 {
+            assert!(
+                !report.completed,
+                "fixture scan finished before cancellation"
+            );
+            queued = true;
+            break;
+        }
+        assert!(
+            !report.completed,
+            "scan ended without publishing local image work"
+        );
+    }
+    assert!(queued, "scan did not publish the local image batch");
+    jobs.start_local_metadata_outbox_worker().await?;
+    let claimed = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let status: Option<String> = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_optional(database.pool())
+            .await?;
+            if status.as_deref() == Some("RUNNING") {
+                return Ok::<_, sqlx::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(Ok(false))?;
+    let mut fifo_writer = if claimed {
+        Some(
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&poster_path)
+                    {
+                        Ok(writer) => return Ok::<_, std::io::Error>(writer),
+                        Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                            tokio::time::sleep(Duration::from_millis(20)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            })
+            .await??,
+        )
+    } else {
+        None
+    };
+    if claimed {
+        jobs.cancel(&job.id).await?;
+    }
+    let cancelled = if claimed {
+        jobs.run_batch(&job.id, 1).await?.status == "CANCELLED"
+    } else {
+        false
+    };
+
+    // Release the blocked image read even if cancellation did not reach the terminal state.
+    if let Some(writer) = fifo_writer.as_mut() {
+        writer.write_all(poster_png.get_ref())?;
+        drop(fifo_writer.take());
+    } else {
+        tokio::fs::remove_file(&poster_path).await?;
+    }
+    let batch: (String, Option<i64>) = sqlx::query_as(
+        "SELECT status, images_completed_at FROM scan_local_metadata_batches
+         WHERE job_id = ? LIMIT 1",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let poster_completeness: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_metadata_completeness
+         WHERE item_id = ? AND capability = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+
+    assert!(claimed, "local metadata batch never entered RUNNING");
+    assert!(cancelled, "scan job did not acknowledge cancellation");
+    assert_eq!(
+        batch.0, "CANCELLED",
+        "claimed local work must be cancelled with its scan"
+    );
+    assert_eq!(
+        batch.1, None,
+        "cancelled image stage must not be marked complete"
+    );
+    assert_eq!(
+        poster_completeness, 0,
+        "cancellation must precede READY/missing commit"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_local_poster_keeps_image_check_retryable()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::{os::unix::fs::PermissionsExt, time::Duration};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Unreadable Poster (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Unreadable.Poster.2024.mkv"), b"movie").await?;
+    let poster_path = movie_dir.join("poster.png");
+    let mut poster_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([56, 34, 12, 255]),
+    ))
+    .write_to(&mut poster_png, image::ImageFormat::Png)?;
+    tokio::fs::write(&poster_path, poster_png.get_ref()).await?;
+    let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
+    permissions.set_mode(0);
+    tokio::fs::set_permissions(&poster_path, permissions).await?;
+    assert_eq!(
+        tokio::fs::read(&poster_path)
+            .await
+            .expect_err("poster should be unreadable")
+            .kind(),
+        std::io::ErrorKind::PermissionDenied,
+        "fixture must inject a real permission error"
+    );
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(
+            library.id,
+            media_root.to_str().ok_or("non-UTF8 media root")?,
+        )
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let batch: (String, Option<i64>, Option<String>) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+                    "SELECT status, images_completed_at, error
+                     FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+                )
+                .bind(&job.id)
+                .fetch_optional(database.pool())
+                .await?;
+                if let Some(row) = row
+                    && matches!(row.0.as_str(), "FAILED" | "COMPLETED")
+                {
+                    return Ok::<_, sqlx::Error>(row);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await??;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE'",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let completeness: Option<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT local_state, is_missing FROM item_metadata_completeness
+         WHERE item_id = ? AND capability = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_optional(database.pool())
+    .await?;
+
+    assert_eq!(
+        batch.0, "FAILED",
+        "permission failure must keep the image batch retryable"
+    );
+    assert_eq!(
+        batch.1, None,
+        "failed image reads must not complete image stage"
+    );
+    assert_eq!(
+        completeness, None,
+        "failed image reads must not confirm poster missing"
+    );
+
+    let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
+    permissions.set_mode(0o644);
+    tokio::fs::set_permissions(&poster_path, permissions).await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_batches SET next_attempt_at = 0
+         WHERE job_id = ? AND status = 'FAILED'",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    let retried = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+            let poster: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+            )
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" && poster == 1 {
+                return Ok::<_, sqlx::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(Ok(false))?;
+    assert!(
+        retried,
+        "restoring poster permissions should let the batch retry"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unavailable_media_root_keeps_local_image_batch_retryable()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::time::Duration;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("Unavailable Root (2024)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Unavailable.Root.2024.mkv"), b"movie").await?;
+    let mut poster_png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+        1,
+        1,
+        image::Rgba([89, 67, 45, 255]),
+    ))
+    .write_to(&mut poster_png, image::ImageFormat::Png)?;
+    tokio::fs::write(movie_dir.join("poster.png"), poster_png.get_ref()).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-UTF8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let mut queued = false;
+    for _ in 0..20 {
+        let report = jobs.run_batch(&job.id, 100).await?;
+        let batch_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM scan_local_metadata_batches WHERE job_id = ?")
+                .bind(&job.id)
+                .fetch_one(database.pool())
+                .await?;
+        if batch_count > 0 {
+            queued = true;
+            break;
+        }
+        assert!(
+            !report.completed,
+            "scan ended without publishing local image work"
+        );
+    }
+    assert!(queued, "scan did not publish the local image batch");
+
+    let offline_root = temp_dir.path().join("Movies.offline");
+    tokio::fs::rename(&media_root, &offline_root).await?;
+    jobs.start_local_metadata_outbox_worker().await?;
+    let batch: (String, Option<i64>) = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let row: Option<(String, Option<i64>)> = sqlx::query_as(
+                "SELECT status, images_completed_at FROM scan_local_metadata_batches
+                 WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_optional(database.pool())
+            .await?;
+            if let Some(row) = row
+                && matches!(row.0.as_str(), "FAILED" | "COMPLETED")
+            {
+                return Ok::<_, sqlx::Error>(row);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        batch.0, "FAILED",
+        "a missing root must leave the batch retryable"
+    );
+    assert_eq!(
+        batch.1, None,
+        "an unavailable root cannot complete image checks"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM item_metadata_completeness completeness
+             JOIN media_items item ON item.id = completeness.item_id
+             WHERE item.library_id = ? AND completeness.capability = 'POSTER'",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?,
+        0,
+        "an unavailable root cannot confirm poster availability or absence"
+    );
+
+    tokio::fs::rename(&offline_root, &media_root).await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_batches SET next_attempt_at = 0
+         WHERE job_id = ? AND status = 'FAILED'",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
+    let retried = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let status: String = sqlx::query_scalar(
+                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ? LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_one(database.pool())
+            .await?;
+            let posters: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM item_images image
+                 JOIN media_items item ON item.id = image.item_id
+                 WHERE item.library_id = ? AND image.image_type = 'POSTER'",
+            )
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            if status == "COMPLETED" && posters == 1 {
+                return Ok::<_, sqlx::Error>(true);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or(Ok(false))?;
+    assert!(retried, "restoring the root should let the batch retry");
+    jobs.run_to_completion(&job.id, 100, None).await?;
     Ok(())
 }
 

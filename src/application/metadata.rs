@@ -3111,10 +3111,23 @@ impl MetadataEnricher {
                     .get(item_id)
                     .map(Vec::as_slice)
                     .unwrap_or_default();
-                inserts
-                    .push(prepare_local_image_batch_item(item_id, images.clone(), indexed).await);
+                match prepare_local_image_batch_item(item_id, images.clone(), indexed).await {
+                    Ok(insert) => inserts.push(insert),
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id,
+                            path = %error.path.display(),
+                            error = %error.error,
+                            "local series image could not be read"
+                        );
+                        report.mark_item_failed(item_id);
+                    }
+                }
             }
 
+            if inserts.is_empty() {
+                continue;
+            }
             match self
                 .database
                 .insert_item_images_batch_at_indices(&inserts)
@@ -3139,7 +3152,7 @@ impl MetadataEnricher {
         report: &mut MetadataReport,
     ) {
         for (item_id, images) in candidates {
-            match self.index_images(item_id, images.clone()).await {
+            match self.index_images(item_id, images.clone(), report).await {
                 Ok(images_found) => report.images_found += images_found,
                 Err(error) => {
                     tracing::warn!(
@@ -3157,9 +3170,19 @@ impl MetadataEnricher {
         &self,
         item_id: &str,
         images: Vec<LocalImage>,
+        report: &mut MetadataReport,
     ) -> Result<usize, MetadataError> {
         let indexed_images = self.database.list_item_images(item_id).await?;
-        let insert = prepare_local_image_batch_item(item_id, images, &indexed_images).await;
+        let insert = match prepare_local_image_batch_item(item_id, images, &indexed_images).await {
+            Ok(insert) => insert,
+            Err(error) => {
+                report.mark_item_failed(item_id);
+                return Err(MetadataError::Io {
+                    path: error.path,
+                    source: error.error,
+                });
+            }
+        };
         self.database
             .insert_item_images_batch_at_indices(&[insert])
             .await
@@ -3171,7 +3194,7 @@ async fn prepare_local_image_batch_item(
     item_id: &str,
     images: Vec<LocalImage>,
     indexed_images: &[StoredItemImage],
-) -> ItemImageBatchInsert {
+) -> Result<ItemImageBatchInsert, LocalImageReadError> {
     let images = images
         .into_iter()
         .filter(|image| {
@@ -3188,6 +3211,7 @@ async fn prepare_local_image_batch_item(
     let prepared = prepare_local_images(images).await;
     let mut image_indexes = BTreeMap::<&'static str, i64>::new();
     let mut records = Vec::new();
+    let mut first_error = None;
     for result in prepared {
         let prepared = match result {
             Ok(prepared) => prepared,
@@ -3196,8 +3220,9 @@ async fn prepare_local_image_batch_item(
                     item_id,
                     path = %error.path.display(),
                     error = %error.error,
-                    "local series image could not be read; skipping image"
+                    "local series image could not be read; failing item"
                 );
+                first_error.get_or_insert(error);
                 continue;
             }
         };
@@ -3214,11 +3239,14 @@ async fn prepare_local_image_batch_item(
             source_url: None,
         });
     }
-    ItemImageBatchInsert {
+    if let Some(error) = first_error {
+        return Err(error);
+    }
+    Ok(ItemImageBatchInsert {
         item_id: item_id.to_owned(),
         images: records,
         clear_poster_fallback,
-    }
+    })
 }
 
 async fn prepare_scan_local_movie_image_batch_item(
@@ -3249,6 +3277,7 @@ async fn prepare_scan_local_movie_image_batch_item(
     let prepared = prepare_local_images(images).await;
     let mut image_indexes = BTreeMap::<&'static str, i64>::new();
     let mut records = Vec::new();
+    let mut first_error = None;
     for result in prepared {
         let prepared = match result {
             Ok(prepared) => prepared,
@@ -3257,8 +3286,9 @@ async fn prepare_scan_local_movie_image_batch_item(
                     item_id = %source.item_id,
                     path = %error.path.display(),
                     error = %error.error,
-                    "local movie image could not be read; skipping image"
+                    "local movie image could not be read; failing item"
                 );
+                first_error.get_or_insert(error);
                 continue;
             }
         };
@@ -3274,6 +3304,11 @@ async fn prepare_scan_local_movie_image_batch_item(
             source: "LOCAL".to_owned(),
             source_url: None,
         });
+    }
+    if let Some(error) = first_error {
+        tracing::warn!(item_id = %source.item_id, %error.error, "local movie image batch item failed");
+        report.mark_item_failed(&source.item_id);
+        return None;
     }
     Some(ItemImageBatchInsert {
         item_id: source.item_id.clone(),
@@ -4666,8 +4701,16 @@ mod tests {
         .execute(database.pool())
         .await?;
         let poster = directory.path().join("poster.jpg");
-        tokio::fs::write(&poster, b"local image fixture").await?;
+        let mut poster_png = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            1,
+            1,
+            image::Rgba([21, 43, 65, 255]),
+        ))
+        .write_to(&mut poster_png, image::ImageFormat::Png)?;
+        tokio::fs::write(&poster, poster_png.get_ref()).await?;
         let enricher = MetadataEnricher::new(database.clone());
+        let mut report = MetadataReport::default();
         assert!(
             enricher
                 .index_images(
@@ -4675,7 +4718,8 @@ mod tests {
                     vec![LocalImage {
                         image_type: ImageType::Poster,
                         path: poster.clone(),
-                    }]
+                    }],
+                    &mut report,
                 )
                 .await
                 .is_err()
@@ -4691,7 +4735,8 @@ mod tests {
                     vec![LocalImage {
                         image_type: ImageType::Poster,
                         path: poster,
-                    }]
+                    }],
+                    &mut report,
                 )
                 .await?,
             1
