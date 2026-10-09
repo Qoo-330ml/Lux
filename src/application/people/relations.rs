@@ -885,6 +885,10 @@ impl PeopleService {
             let Ok(_permit) = permit else {
                 return PersonAssetResult::failed();
             };
+            #[cfg(test)]
+            if let Some(probe) = deferred_assets.person_asset_test_probe.as_ref() {
+                probe.hold_after_permit().await;
+            }
             self.persist_person_assets_with_deferred_manifest(
                 &actor.actor,
                 &actor.actor_provider,
