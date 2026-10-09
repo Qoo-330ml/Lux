@@ -1720,3 +1720,9 @@ actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallba
 ### LUX-458 本地 metadata NFO 路径发现有界并发
 
 scan-local NFO page 的路径发现从逐 source 串行改为最多 4 个并发任务，最终仍按 source 输入顺序写入 snapshot。每个 page 用异步单元格共享相同候选路径的 in-flight `try_exists` 结果，覆盖 episode、series 和 season NFO。固定 12-episode fixture 观测到并发大于 1 且不超过 4；12 个不同同名候选加 1 个共享 `episode.nfo` 共进行 13 次候选存在性检查，shared fallback 仅检查一次。另一个两 episode fixture 让不同 hierarchy ID 指向相同 tvshow/season NFO，共 5 个唯一候选只进行 5 次检查。NFO 内容读取/解析、series/season 选择、每 item 错误映射及后续 credits transaction 边界不变。该回归测量的是应用层候选检查次数和并发上界，不是物理磁盘 I/O 数、文件系统墙钟或 FNOS/NAS/PostgreSQL/CPU 收益。
+
+### LUX-459 NFO 完整语义 fingerprint
+
+NFO cache 保留原始字节 SHA-256 快路径。只有配置了 local NFO cache 的 enrichment 才收集 semantic tokens；没有 cache 的普通路径继续使用既有 projection parser，不额外分配 token vector 或计算摘要。文件内容字节变化后，后台 enrichment 仍读取文件并在一次受大小与事件数限制的 XML pass 中提取 projection、人物和完整语义 fingerprint；XML 声明、注释、属性顺序、CDATA/文本表示、空元素写法及 element-only 格式空白不改变 fingerprint。所有元素名、属性和值、混合内容文本和未知 XML 子树仍参与摘要。文本与属性值都按 XML 1.0 的换行语义规范化；属性字面 TAB/换行折叠为空格，而 TAB/换行字符引用保留其字符值。合法的预定义/数字引用会参与 cache-enabled metadata projection 和摘要，避免投影与语义摘要对等价文本的判断不一致。`xml:space="preserve"` 下的空白会进入摘要，混合内容中的空白也会保留。仅当完整摘要匹配、rich cache 与其基于旧 source revision 的 actor relation snapshot 均有效且默认字段无需修复时，才持久化新的 raw content/stat revision 并跳过 metadata/credits 写入。旧版 details-only cache 在 raw 内容改变后完整处理并升级；相同原始字节继续走现有免解析路径。
+
+回归覆盖 lexical equivalence、未知 XML、旧 cache 升级、stat/raw cache revision 更新、DTD/格式错误和未声明实体拒绝，以及文本和属性空白边界。实现与回归已写入，但截至 2026-10-09 尚未运行 Cargo 测试、Clippy 或性能测量；此处没有可报告的运行时收益数据。后续通过的正确性回归只证明解析后的重复写入可跳过，不证明文件读取或 XML 解析减少，也不把本机时间推断为 PostgreSQL、NAS/x86_64 或生产 CPU 收益。

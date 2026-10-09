@@ -5,7 +5,7 @@ use luxd::{
             ImageType, LocalImage, MetadataCandidate, MetadataEnricher, MetadataField,
             MetadataSource, MetadataState, NfoMetadata, find_local_images, parse_nfo,
         },
-        metadata_paths::people_directory,
+        metadata_paths::{library_item_directory, people_directory},
         nfo::LocalNfoMetadataStore,
         people::PeopleService,
         scanner::{LibraryScanner, ScanJobService},
@@ -770,6 +770,167 @@ async fn unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_chang
     .fetch_one(database.pool())
     .await?;
     assert_eq!(after, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn semantically_unchanged_nfo_revision_skips_metadata_and_relation_rewrites()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Semantic Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Semantic.Movie.2026.mkv"), b"movie").await?;
+    let nfo_path = movie_dir.join("movie.nfo");
+    let original = r#"<movie><title>语义电影</title><actor sortorder="0" tmdbid="9"><name>演员甲</name><role>角色甲</role></actor><custom key="x">保留</custom></movie>"#;
+    tokio::fs::write(&nfo_path, original).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let people = PeopleService::new(config.config_dir.clone());
+    let enricher = MetadataEnricher::new(database.clone())
+        .with_people(people)
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+    let first = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(first.nfo_loaded, 1);
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let relation_path = library_item_directory(&config.config_dir, &item_id)?.join("people.json");
+
+    // Simulate a cache written by a previous release. It has the same raw
+    // source revision, but no semantic fingerprint, so it must be parsed and
+    // upgraded once before the exact-revision fast path can resume.
+    let versioned_cache: String =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let legacy_details = serde_json::from_str::<serde_json::Value>(&versioned_cache)?
+        .get("details")
+        .cloned()
+        .ok_or("versioned NFO cache has no details")?;
+    sqlx::query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
+        .bind(legacy_details.to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let legacy_upgrade = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(legacy_upgrade.nfo_loaded, 1);
+    assert_eq!(legacy_upgrade.nfo_skipped, 0);
+    let upgraded_cache: String =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&upgraded_cache)?["schemaVersion"],
+        1
+    );
+    let upgraded_fast_path = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(upgraded_fast_path.nfo_loaded, 0);
+    assert_eq!(upgraded_fast_path.nfo_skipped, 1);
+
+    let relation_before = tokio::fs::read(&relation_path).await?;
+    let cache_before: Option<String> =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let revision_before: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let cache_source_revision_before: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(cache_source_revision_before.is_some());
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let equivalent = "<?xml version=\"1.0\"?>\n<movie>\n<!--editor note--><title><![CDATA[语义电影]]></title>\n<actor tmdbid='9' sortorder='0'><name>演员甲</name><role>角色甲</role></actor>\n<custom key='x'>保留</custom>\n</movie>";
+    tokio::fs::write(&nfo_path, equivalent).await?;
+    let second = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(second.nfo_loaded, 0);
+    assert_eq!(second.nfo_skipped, 1);
+    assert_eq!(tokio::fs::read(&nfo_path).await?, equivalent.as_bytes());
+    assert_eq!(tokio::fs::read(&relation_path).await?, relation_before);
+    let cache_after: Option<String> =
+        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cache_after, cache_before);
+    let revision_after: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_ne!(revision_after, revision_before);
+    let cache_source_revision_after: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(cache_source_revision_after.is_some());
+    assert_ne!(cache_source_revision_after, cache_source_revision_before);
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_unknown = equivalent.replace("key='x'", "key='y'");
+    tokio::fs::write(&nfo_path, &changed_unknown).await?;
+    let third = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(third.nfo_loaded, 1);
+    assert_eq!(
+        tokio::fs::read(&nfo_path).await?,
+        changed_unknown.as_bytes()
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_unknown_text = changed_unknown.replace("保留", "未知文本已变化");
+    tokio::fs::write(&nfo_path, &changed_unknown_text).await?;
+    let fourth = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(fourth.nfo_loaded, 1);
+    assert_eq!(
+        tokio::fs::read(&nfo_path).await?,
+        changed_unknown_text.as_bytes()
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_unknown_node = changed_unknown_text.replace(
+        "</custom>",
+        "<extension-child>未知节点</extension-child></custom>",
+    );
+    tokio::fs::write(&nfo_path, &changed_unknown_node).await?;
+    let fifth = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(fifth.nfo_loaded, 1);
+    assert_eq!(
+        tokio::fs::read(&nfo_path).await?,
+        changed_unknown_node.as_bytes()
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_known = changed_unknown_node.replace("语义电影", "更新后的电影");
+    tokio::fs::write(&nfo_path, &changed_known).await?;
+    let sixth = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(sixth.nfo_loaded, 1);
+    assert_eq!(tokio::fs::read(&nfo_path).await?, changed_known.as_bytes());
     Ok(())
 }
 

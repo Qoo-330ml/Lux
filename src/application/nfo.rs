@@ -8,7 +8,7 @@ use std::{
 };
 
 use quick_xml::{
-    Writer,
+    Decoder, Writer,
     escape::{escape, unescape},
     events::{BytesEnd, BytesStart, BytesText, Event},
     reader::Reader,
@@ -195,6 +195,7 @@ pub struct MovieNfoMetadata {
 
 const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
+const LOCAL_NFO_CACHE_SCHEMA_VERSION: u8 = 1;
 const MAX_MOVIE_NFO_ACTORS: usize = 100;
 const MAX_MOVIE_NFO_STREAMS: usize = 128;
 const MAX_MOVIE_ACTOR_FIELD_BYTES: usize = 256 * 1024;
@@ -208,12 +209,28 @@ const MAX_MOVIE_NFO_DETAILS_ID_BYTES: usize = 256;
 /// Background enrichment uses this entry point so base metadata, rich detail
 /// fields, and actor relations always come from the same source revision.
 pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, NfoError> {
+    parse_local_nfo_projection_inner(bytes, false).map(|(projection, _)| projection)
+}
+
+pub(crate) fn parse_local_nfo_projection_with_semantic_fingerprint(
+    bytes: &[u8],
+) -> Result<(LocalNfoProjection, Vec<u8>), NfoError> {
+    parse_local_nfo_projection_inner(bytes, true)
+}
+
+fn parse_local_nfo_projection_inner(
+    bytes: &[u8],
+    include_semantic_fingerprint: bool,
+) -> Result<(LocalNfoProjection, Vec<u8>), NfoError> {
     if bytes.len() > MAX_LOCAL_NFO_BYTES {
         return Err(NfoError::TooLarge);
     }
 
     let mut reader = Reader::from_reader(Cursor::new(bytes));
-    reader.config_mut().trim_text(true);
+    // Keep the established projection trimming behavior for callers that do
+    // not need a semantic fingerprint. The semantic path reads full text and
+    // applies the old trimming only to the metadata projection below.
+    reader.config_mut().trim_text(!include_semantic_fingerprint);
     let mut buffer = Vec::new();
     let mut projection = LocalNfoProjection::default();
     let mut active_direct = None;
@@ -222,6 +239,7 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
     let mut current_actor = None;
     let mut depth = 0_usize;
     let mut event_count = 0_usize;
+    let mut semantic_tokens = include_semantic_fingerprint.then(Vec::new);
 
     loop {
         event_count = event_count.saturating_add(1);
@@ -236,6 +254,9 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 break;
             }
             Ok(Event::Start(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    tokens.push(NfoSemanticToken::start(&event, reader.decoder())?);
+                }
                 depth = depth.saturating_add(1);
                 if depth == 2 && event.name().as_ref() == b"actor" {
                     actor_depth = Some(depth);
@@ -257,6 +278,16 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                     .map_err(|error| NfoError::Xml(error.to_string()))?;
                 let value =
                     unescape(decoded.as_ref()).map_err(|error| NfoError::Xml(error.to_string()))?;
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let content = event
+                        .xml10_content()
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    let semantic_value = unescape(content.as_ref())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    if depth != 0 || !is_xml_whitespace(&semantic_value) {
+                        push_nfo_semantic_text(tokens, semantic_value.as_ref());
+                    }
+                }
                 append_projection_text(
                     depth,
                     actor_depth,
@@ -269,6 +300,12 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 let value = event
                     .decode()
                     .map_err(|error| NfoError::Xml(error.to_string()))?;
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let content = event
+                        .xml10_content()
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    push_nfo_semantic_text(tokens, content.as_ref());
+                }
                 append_projection_text(
                     depth,
                     actor_depth,
@@ -278,6 +315,15 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 )?;
             }
             Ok(Event::End(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let name = reader
+                        .decoder()
+                        .decode(event.name().as_ref())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .into_owned()
+                        .into_bytes();
+                    tokens.push(NfoSemanticToken::End(name));
+                }
                 if actor_depth == Some(depth) && event.name().as_ref() == b"actor" {
                     if let Some(actor) = current_actor.take() {
                         push_parsed_actor(&mut projection.actors, actor);
@@ -305,15 +351,294 @@ pub fn parse_local_nfo_projection(bytes: &[u8]) -> Result<LocalNfoProjection, Nf
                 }
                 depth -= 1;
             }
-            Ok(Event::Empty(_)) => {}
+            Ok(Event::Empty(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let decoder = reader.decoder();
+                    tokens.push(NfoSemanticToken::start(&event, decoder)?);
+                    let name = decoder
+                        .decode(event.name().as_ref())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .into_owned()
+                        .into_bytes();
+                    tokens.push(NfoSemanticToken::End(name));
+                }
+            }
+            Ok(Event::PI(event)) => {
+                if let Some(tokens) = semantic_tokens.as_mut() {
+                    let decoder = reader.decoder();
+                    let target = decoder
+                        .decode(event.target())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?
+                        .into_owned()
+                        .into_bytes();
+                    let content = decoder
+                        .decode(event.content())
+                        .map_err(|error| NfoError::Xml(error.to_string()))?;
+                    let content = normalize_xml_10_line_endings(content.as_ref()).into_bytes();
+                    tokens.push(NfoSemanticToken::ProcessingInstruction { target, content });
+                }
+            }
             Ok(Event::DocType(_)) => return Err(NfoError::DocTypeNotAllowed),
+            Ok(Event::GeneralRef(event)) => {
+                let value = match event
+                    .resolve_char_ref()
+                    .map_err(|error| NfoError::Xml(error.to_string()))?
+                {
+                    Some(character) => include_semantic_fingerprint.then(|| character.to_string()),
+                    None => {
+                        let name = event
+                            .decode()
+                            .map_err(|error| NfoError::Xml(error.to_string()))?;
+                        let value = match name.as_ref() {
+                            "amp" => "&",
+                            "lt" => "<",
+                            "gt" => ">",
+                            "apos" => "'",
+                            "quot" => "\"",
+                            _ => {
+                                return Err(NfoError::Xml(format!(
+                                    "undeclared entity reference: &{name};"
+                                )));
+                            }
+                        };
+                        include_semantic_fingerprint.then(|| value.to_owned())
+                    }
+                };
+                if let Some(value) = value {
+                    if let Some(tokens) = semantic_tokens.as_mut() {
+                        push_nfo_semantic_text(tokens, &value);
+                    }
+                    append_projection_text(
+                        depth,
+                        actor_depth,
+                        active_direct.as_mut(),
+                        active_actor.as_mut(),
+                        &value,
+                    )?;
+                }
+            }
             Ok(_) => {}
             Err(error) => return Err(NfoError::Xml(error.to_string())),
         }
         buffer.clear();
     }
 
-    Ok(projection)
+    let semantic_fingerprint = semantic_tokens
+        .as_deref()
+        .map(nfo_semantic_fingerprint_from_tokens)
+        .unwrap_or_default();
+    Ok((projection, semantic_fingerprint))
+}
+
+#[derive(Clone, Debug)]
+enum NfoSemanticToken {
+    Start {
+        name: Vec<u8>,
+        attributes: Vec<(Vec<u8>, String)>,
+        preserve_whitespace: Option<bool>,
+    },
+    End(Vec<u8>),
+    Text(String),
+    ProcessingInstruction {
+        target: Vec<u8>,
+        content: Vec<u8>,
+    },
+}
+
+impl NfoSemanticToken {
+    fn start(event: &BytesStart<'_>, decoder: Decoder) -> Result<Self, NfoError> {
+        let mut attributes = event
+            .attributes()
+            .with_checks(true)
+            .map(|attribute| {
+                let attribute = attribute.map_err(|error| NfoError::Xml(error.to_string()))?;
+                // XML 1.0 normalizes literal attribute whitespace before
+                // resolving references. Doing this after unescaping would
+                // incorrectly equate a literal newline (normalized to a
+                // space) with `&#xA;` (which remains a newline).
+                let raw_value = decoder
+                    .decode(&attribute.value)
+                    .map_err(|error| NfoError::Xml(error.to_string()))?;
+                let normalized_value = normalize_xml_attribute_whitespace(raw_value.as_ref());
+                let value = unescape(&normalized_value)
+                    .map_err(|error| NfoError::Xml(error.to_string()))?
+                    .into_owned();
+                let name = decoder
+                    .decode(attribute.key.as_ref())
+                    .map_err(|error| NfoError::Xml(error.to_string()))?
+                    .into_owned()
+                    .into_bytes();
+                Ok((name, value))
+            })
+            .collect::<Result<Vec<_>, NfoError>>()?;
+        attributes.sort_by(|left, right| left.0.cmp(&right.0));
+        let preserve_whitespace = attributes
+            .iter()
+            .find(|(name, _)| name.as_slice() == b"xml:space")
+            .and_then(|(_, value)| match value.as_str() {
+                "preserve" => Some(true),
+                "default" => Some(false),
+                _ => None,
+            });
+        let name = decoder
+            .decode(event.name().as_ref())
+            .map_err(|error| NfoError::Xml(error.to_string()))?
+            .into_owned()
+            .into_bytes();
+        Ok(Self::Start {
+            name,
+            attributes,
+            preserve_whitespace,
+        })
+    }
+}
+
+fn normalize_xml_attribute_whitespace(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        match character {
+            '\r' => {
+                if characters.peek() == Some(&'\n') {
+                    characters.next();
+                }
+                normalized.push(' ');
+            }
+            '\n' | '\t' => normalized.push(' '),
+            character => normalized.push(character),
+        }
+    }
+    normalized
+}
+
+fn normalize_xml_10_line_endings(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    let mut characters = value.chars().peekable();
+    while let Some(character) = characters.next() {
+        if character == '\r' {
+            if characters.peek() == Some(&'\n') {
+                characters.next();
+            }
+            normalized.push('\n');
+        } else {
+            normalized.push(character);
+        }
+    }
+    normalized
+}
+
+fn push_nfo_semantic_text(tokens: &mut Vec<NfoSemanticToken>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if let Some(NfoSemanticToken::Text(previous)) = tokens.last_mut() {
+        previous.push_str(text);
+    } else {
+        tokens.push(NfoSemanticToken::Text(text.to_owned()));
+    }
+}
+
+#[derive(Default)]
+struct NfoSemanticElementState {
+    token_index: usize,
+    has_child_element: bool,
+    has_non_whitespace_text: bool,
+    preserve_whitespace: bool,
+}
+
+fn nfo_semantic_fingerprint_from_tokens(tokens: &[NfoSemanticToken]) -> Vec<u8> {
+    let mut element_only_whitespace = vec![false; tokens.len()];
+    let mut stack = Vec::<NfoSemanticElementState>::new();
+    let mut inherited_preserve_whitespace = Vec::<bool>::new();
+    for (token_index, token) in tokens.iter().enumerate() {
+        match token {
+            NfoSemanticToken::Start {
+                preserve_whitespace,
+                ..
+            } => {
+                if let Some(parent) = stack.last_mut() {
+                    parent.has_child_element = true;
+                }
+                let inherited = inherited_preserve_whitespace
+                    .last()
+                    .copied()
+                    .unwrap_or(false);
+                let preserve_whitespace = preserve_whitespace.unwrap_or(inherited);
+                stack.push(NfoSemanticElementState {
+                    token_index,
+                    preserve_whitespace,
+                    ..NfoSemanticElementState::default()
+                });
+                inherited_preserve_whitespace.push(preserve_whitespace);
+            }
+            NfoSemanticToken::Text(text) => {
+                if let Some(element) = stack.last_mut() {
+                    element.has_non_whitespace_text |= !is_xml_whitespace(text);
+                }
+            }
+            NfoSemanticToken::ProcessingInstruction { .. } => {}
+            NfoSemanticToken::End(_) => {
+                if let Some(element) = stack.pop() {
+                    inherited_preserve_whitespace.pop();
+                    element_only_whitespace[element.token_index] = element.has_child_element
+                        && !element.has_non_whitespace_text
+                        && !element.preserve_whitespace;
+                }
+            }
+        }
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"LUX-NFO-SEMANTIC-2\0");
+    let mut skip_whitespace_stack = Vec::<bool>::new();
+    for (token_index, token) in tokens.iter().enumerate() {
+        match token {
+            NfoSemanticToken::Start {
+                name, attributes, ..
+            } => {
+                hasher.update([b'S']);
+                hash_nfo_semantic_bytes(&mut hasher, name);
+                hasher.update((attributes.len() as u64).to_be_bytes());
+                for (name, value) in attributes {
+                    hash_nfo_semantic_bytes(&mut hasher, name);
+                    hash_nfo_semantic_bytes(&mut hasher, value.as_bytes());
+                }
+                skip_whitespace_stack.push(element_only_whitespace[token_index]);
+            }
+            NfoSemanticToken::End(name) => {
+                hasher.update([b'E']);
+                hash_nfo_semantic_bytes(&mut hasher, name);
+                skip_whitespace_stack.pop();
+            }
+            NfoSemanticToken::Text(text) => {
+                if skip_whitespace_stack.last().copied().unwrap_or(false) && is_xml_whitespace(text)
+                {
+                    continue;
+                }
+                hasher.update([b'T']);
+                hash_nfo_semantic_bytes(&mut hasher, text.as_bytes());
+            }
+            NfoSemanticToken::ProcessingInstruction { target, content } => {
+                hasher.update([b'P']);
+                hash_nfo_semantic_bytes(&mut hasher, target);
+                hash_nfo_semantic_bytes(&mut hasher, content);
+            }
+        }
+    }
+    hasher.finalize().to_vec()
+}
+
+fn hash_nfo_semantic_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+}
+
+fn is_xml_whitespace(value: &str) -> bool {
+    value.chars().all(is_xml_whitespace_character)
+}
+
+fn is_xml_whitespace_character(character: char) -> bool {
+    matches!(character, ' ' | '\t' | '\r' | '\n')
 }
 
 /// Reads the direct `<actor>` nodes used by Emby/Kodi local NFO files.
@@ -750,6 +1075,53 @@ pub struct LocalNfoMetadataStore {
     database: Database,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalNfoCacheEnvelope {
+    schema_version: u8,
+    semantic_fingerprint: Option<Vec<u8>>,
+    relation_fingerprint: Option<Vec<u8>>,
+    details: LocalNfoDetails,
+}
+
+fn decode_local_nfo_cache(
+    json: &str,
+) -> Result<(LocalNfoDetails, Option<Vec<u8>>, Option<Vec<u8>>), String> {
+    let value =
+        serde_json::from_str::<serde_json::Value>(json).map_err(|error| error.to_string())?;
+    if value.get("schemaVersion").is_some() {
+        let envelope = serde_json::from_value::<LocalNfoCacheEnvelope>(value)
+            .map_err(|error| error.to_string())?;
+        if envelope.schema_version != LOCAL_NFO_CACHE_SCHEMA_VERSION {
+            return Err("unsupported local NFO cache schema version".to_owned());
+        }
+        let semantic_fingerprint = envelope
+            .semantic_fingerprint
+            .filter(|fingerprint| valid_nfo_content_fingerprint(fingerprint));
+        let relation_fingerprint = envelope
+            .relation_fingerprint
+            .filter(|fingerprint| valid_nfo_content_fingerprint(fingerprint));
+        return Ok((envelope.details, semantic_fingerprint, relation_fingerprint));
+    }
+    serde_json::from_value(value)
+        .map(|details| (details, None, None))
+        .map_err(|error| error.to_string())
+}
+
+fn encode_local_nfo_cache(
+    details: &LocalNfoDetails,
+    semantic_fingerprint: Option<&[u8]>,
+    relation_fingerprint: Option<&[u8]>,
+) -> Result<String, LocalNfoMetadataStoreError> {
+    serde_json::to_string(&LocalNfoCacheEnvelope {
+        schema_version: LOCAL_NFO_CACHE_SCHEMA_VERSION,
+        semantic_fingerprint: semantic_fingerprint.map(<[u8]>::to_vec),
+        relation_fingerprint: relation_fingerprint.map(<[u8]>::to_vec),
+        details: details.clone(),
+    })
+    .map_err(|error| LocalNfoMetadataStoreError::Serialization(error.to_string()))
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalNfoMetadataState {
     pub has_snapshot: bool,
@@ -769,6 +1141,24 @@ impl LocalNfoMetadataStore {
     ) -> Result<(), LocalNfoMetadataStoreError> {
         let json = serde_json::to_string(details)
             .map_err(|error| LocalNfoMetadataStoreError::Serialization(error.to_string()))?;
+        if json.len() > MAX_LOCAL_NFO_BYTES {
+            return Err(LocalNfoMetadataStoreError::TooLarge);
+        }
+        self.database
+            .update_media_item_nfo_metadata(item_id, Some(&json), Some(source_fingerprint))
+            .await
+            .map_err(LocalNfoMetadataStoreError::Storage)
+    }
+
+    pub(crate) async fn write_item_with_semantic_fingerprint(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+        semantic_fingerprint: Option<&[u8]>,
+        relation_fingerprint: Option<&[u8]>,
+        details: &LocalNfoDetails,
+    ) -> Result<(), LocalNfoMetadataStoreError> {
+        let json = encode_local_nfo_cache(details, semantic_fingerprint, relation_fingerprint)?;
         if json.len() > MAX_LOCAL_NFO_BYTES {
             return Err(LocalNfoMetadataStoreError::TooLarge);
         }
@@ -801,8 +1191,8 @@ impl LocalNfoMetadataStore {
                 .map_err(LocalNfoMetadataStoreError::Storage)?;
             return Ok(None);
         }
-        match serde_json::from_str(&json) {
-            Ok(details) => Ok(Some(details)),
+        match decode_local_nfo_cache(&json) {
+            Ok((details, _, _)) => Ok(Some(details)),
             Err(error) => {
                 tracing::warn!(
                     item_id,
@@ -868,7 +1258,10 @@ impl LocalNfoMetadataStore {
     pub(crate) async fn read_item_if_usable_with_fingerprint(
         &self,
         item_id: &str,
-    ) -> Result<Option<(LocalNfoDetails, Vec<u8>)>, LocalNfoMetadataStoreError> {
+    ) -> Result<
+        Option<(LocalNfoDetails, Vec<u8>, Option<Vec<u8>>, Option<Vec<u8>>)>,
+        LocalNfoMetadataStoreError,
+    > {
         let Some((json, source_fingerprint)) = self
             .database
             .media_item_nfo_metadata_snapshot(item_id)
@@ -893,8 +1286,13 @@ impl LocalNfoMetadataStore {
         else {
             return Ok(None);
         };
-        match serde_json::from_str(&json) {
-            Ok(details) => Ok(Some((details, source_fingerprint))),
+        match decode_local_nfo_cache(&json) {
+            Ok((details, semantic_fingerprint, relation_fingerprint)) => Ok(Some((
+                details,
+                source_fingerprint,
+                semantic_fingerprint,
+                relation_fingerprint,
+            ))),
             Err(error) => {
                 tracing::warn!(
                     item_id,
@@ -1416,14 +1814,15 @@ fn rewrite_rich_nfo(
     }
     let rewritten = writer.into_inner();
     if !original.is_empty()
-        && nfo_semantic_fingerprint(original)? == nfo_semantic_fingerprint(&rewritten)?
+        && nfo_writeback_projection_fingerprint(original)?
+            == nfo_writeback_projection_fingerprint(&rewritten)?
     {
         return Ok(original.to_vec());
     }
     Ok(rewritten)
 }
 
-fn nfo_semantic_fingerprint(bytes: &[u8]) -> Result<Vec<u8>, NfoWriteError> {
+fn nfo_writeback_projection_fingerprint(bytes: &[u8]) -> Result<Vec<u8>, NfoWriteError> {
     let projection = parse_local_nfo_projection(bytes)
         .map_err(|error| NfoWriteError::InvalidXml(error.to_string()))?;
     let root = nfo_root_tag(bytes)?;
@@ -3252,6 +3651,271 @@ mod tests {
         config::Config,
         library::LibraryKind,
     };
+
+    #[test]
+    fn local_nfo_cache_decodes_legacy_details_and_versioned_semantic_state() {
+        let details = LocalNfoDetails::default();
+        let legacy = serde_json::to_string(&details).expect("legacy cache json");
+        let (legacy_details, legacy_semantic, legacy_relation) =
+            decode_local_nfo_cache(&legacy).expect("legacy cache");
+        assert_eq!(legacy_details, details);
+        assert_eq!(legacy_semantic, None);
+        assert_eq!(legacy_relation, None);
+
+        let fingerprint = [7_u8; 32];
+        let versioned = encode_local_nfo_cache(&details, Some(&fingerprint), Some(&fingerprint))
+            .expect("versioned cache json");
+        let (versioned_details, semantic, relation) =
+            decode_local_nfo_cache(&versioned).expect("versioned cache");
+        assert_eq!(versioned_details, details);
+        assert_eq!(semantic.as_deref(), Some(fingerprint.as_slice()));
+        assert_eq!(relation.as_deref(), Some(fingerprint.as_slice()));
+    }
+
+    #[test]
+    fn local_nfo_semantic_fingerprint_ignores_lexical_changes_and_keeps_unknown_xml() {
+        let original = br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">preserved</extension><empty/></movie>"#;
+        let equivalent = br#"<?xml version="1.0"?>
+<movie>
+  <!-- ignored editor comment -->
+  <title><![CDATA[Title & text]]></title>
+  <actor tmdbid='9' sortorder='0'><name>Actor</name></actor>
+  <extension key='x'>preserved</extension><empty></empty>
+</movie>"#;
+        let (original_projection, original_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(original).expect("original NFO");
+        let (equivalent_projection, equivalent_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(equivalent)
+                .expect("equivalent NFO");
+        assert_eq!(original_fingerprint, equivalent_fingerprint);
+        assert_eq!(original_projection, equivalent_projection);
+        let (_, ordinary_fingerprint) =
+            parse_local_nfo_projection_inner(original, false).expect("ordinary projection mode");
+        assert!(ordinary_fingerprint.is_empty());
+
+        let bare_root = b"<movie><extension/></movie>";
+        let root_with_misc_whitespace = b" \n<movie><extension/></movie>\r\n ";
+        let (_, bare_root_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(bare_root).expect("bare root");
+        let (_, root_whitespace_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(root_with_misc_whitespace)
+                .expect("root surrounding whitespace");
+        assert_eq!(bare_root_fingerprint, root_whitespace_fingerprint);
+
+        let pi_crlf = b"<movie><?app data='first\r\nsecond'?></movie>";
+        let pi_lf = b"<movie><?app data='first\nsecond'?></movie>";
+        let pi_other_target = b"<movie><?other data='first\nsecond'?></movie>";
+        let (_, pi_crlf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(pi_crlf)
+                .expect("CRLF processing instruction");
+        let (_, pi_lf_fingerprint) = parse_local_nfo_projection_with_semantic_fingerprint(pi_lf)
+            .expect("LF processing instruction");
+        let (_, pi_other_target_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(pi_other_target)
+                .expect("different processing-instruction target");
+        assert_eq!(pi_crlf_fingerprint, pi_lf_fingerprint);
+        assert_ne!(pi_lf_fingerprint, pi_other_target_fingerprint);
+
+        let lf_content = b"<movie><extension>first\nsecond</extension></movie>";
+        let crlf_content = b"<movie><extension>first\r\nsecond</extension></movie>";
+        let (_, lf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(lf_content).expect("LF content");
+        let (_, crlf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(crlf_content)
+                .expect("CRLF content");
+        assert_eq!(lf_fingerprint, crlf_fingerprint);
+        let referenced_lf_content = b"<movie><extension>first&#xA;second</extension></movie>";
+        let (_, referenced_lf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(referenced_lf_content)
+                .expect("character-reference LF content");
+        assert_eq!(lf_fingerprint, referenced_lf_fingerprint);
+
+        let mixed_one_space = b"<movie><extension>left <child/> right</extension></movie>";
+        let mixed_two_spaces = b"<movie><extension>left  <child/> right</extension></movie>";
+        let (_, mixed_one_space_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(mixed_one_space)
+                .expect("one mixed-content space");
+        let (_, mixed_two_spaces_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(mixed_two_spaces)
+                .expect("two mixed-content spaces");
+        assert_ne!(mixed_one_space_fingerprint, mixed_two_spaces_fingerprint);
+
+        let whitespace_cdata = b"<movie><extension><![CDATA[ \n  ]]><child/></extension></movie>";
+        let whitespace_text = b"<movie><extension> \n  <child/></extension></movie>";
+        let (_, whitespace_cdata_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(whitespace_cdata)
+                .expect("CDATA formatting whitespace");
+        let (_, whitespace_text_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(whitespace_text)
+                .expect("text formatting whitespace");
+        assert_eq!(whitespace_cdata_fingerprint, whitespace_text_fingerprint);
+
+        let preserved_cdata =
+            b"<movie xml:space=\"preserve\"><extension><![CDATA[ \n  ]]><child/></extension></movie>";
+        let preserved_text =
+            b"<movie xml:space=\"preserve\"><extension> \n  <child/></extension></movie>";
+        let (_, preserved_cdata_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_cdata)
+                .expect("preserved CDATA whitespace");
+        let (_, preserved_text_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_text)
+                .expect("preserved text whitespace");
+        assert_eq!(preserved_cdata_fingerprint, preserved_text_fingerprint);
+
+        let preserved_one_space =
+            b"<movie xml:space=\"preserve\"><extension> <child/></extension></movie>";
+        let preserved_two_spaces =
+            b"<movie xml:space=\"preserve\"><extension>  <child/></extension></movie>";
+        let (_, preserved_one_space_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_one_space)
+                .expect("one preserved space");
+        let (_, preserved_two_spaces_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(preserved_two_spaces)
+                .expect("two preserved spaces");
+        assert_ne!(
+            preserved_one_space_fingerprint,
+            preserved_two_spaces_fingerprint
+        );
+
+        let default_one_space = b"<movie><extension> <child/></extension></movie>";
+        let default_two_spaces = b"<movie><extension>  <child/></extension></movie>";
+        let (_, default_one_space_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(default_one_space)
+                .expect("one element-only formatting space");
+        let (_, default_two_spaces_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(default_two_spaces)
+                .expect("two element-only formatting spaces");
+        assert_eq!(
+            default_one_space_fingerprint,
+            default_two_spaces_fingerprint
+        );
+        let reset_preserve = b"<movie xml:space=\"preserve\"><extension xml:space=\"default\"> <child/></extension></movie>";
+        let reset_default = b"<movie xml:space=\"preserve\"><extension xml:space=\"default\">  <child/></extension></movie>";
+        let (_, reset_preserve_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(reset_preserve)
+                .expect("nested xml:space default");
+        let (_, reset_default_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(reset_default)
+                .expect("nested xml:space default formatting");
+        assert_eq!(reset_preserve_fingerprint, reset_default_fingerprint);
+
+        let attribute_lf = b"<movie><extension value=\"line\nbreak\"/></movie>";
+        let attribute_crlf = b"<movie><extension value=\"line\r\nbreak\"/></movie>";
+        let attribute_char_ref = b"<movie><extension value=\"line&#xA;break\"/></movie>";
+        let (_, attribute_lf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_lf)
+                .expect("literal LF attribute");
+        let (_, attribute_crlf_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_crlf)
+                .expect("literal CRLF attribute");
+        let (_, attribute_char_ref_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_char_ref)
+                .expect("character-reference LF attribute");
+        assert_eq!(attribute_lf_fingerprint, attribute_crlf_fingerprint);
+        assert_ne!(attribute_lf_fingerprint, attribute_char_ref_fingerprint);
+
+        let attribute_literal_tab = b"<movie><extension value=\"left\tright\"/></movie>";
+        let attribute_char_ref_tab = b"<movie><extension value=\"left&#x9;right\"/></movie>";
+        let (_, attribute_literal_tab_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_literal_tab)
+                .expect("literal TAB attribute");
+        let (_, attribute_char_ref_tab_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(attribute_char_ref_tab)
+                .expect("character-reference TAB attribute");
+        assert_ne!(
+            attribute_literal_tab_fingerprint,
+            attribute_char_ref_tab_fingerprint
+        );
+
+        let equivalent_attribute_refs = b"<movie><extension value=\"A&amp;B&#10;C\"/></movie>";
+        let equivalent_numeric_attribute_refs =
+            b"<movie><extension value=\"A&#38;B&#xA;C\"/></movie>";
+        let (_, equivalent_attribute_ref_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(equivalent_attribute_refs)
+                .expect("named attribute references");
+        let (_, equivalent_numeric_attribute_ref_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(equivalent_numeric_attribute_refs)
+                .expect("numeric attribute references");
+        assert_eq!(
+            equivalent_attribute_ref_fingerprint,
+            equivalent_numeric_attribute_ref_fingerprint
+        );
+
+        let duplicate_attribute = b"<movie><extension key=\"x\" key=\"y\"/></movie>";
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(duplicate_attribute),
+            Err(NfoError::Xml(_))
+        ));
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(
+                b"<!DOCTYPE movie [<!ENTITY secret 'value'>]><movie><extension>&secret;</extension></movie>"
+            ),
+            Err(NfoError::DocTypeNotAllowed)
+        ));
+        let escaped_unknown_name = b"<movie><extension>&amp;missing;</extension></movie>";
+        let cdata_unknown_name = b"<movie><extension><![CDATA[&missing;]]></extension></movie>";
+        let (_, escaped_unknown_name_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(escaped_unknown_name)
+                .expect("escaped literal entity-like text");
+        let (_, cdata_unknown_name_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(cdata_unknown_name)
+                .expect("CDATA literal entity-like text");
+        assert_eq!(
+            escaped_unknown_name_fingerprint,
+            cdata_unknown_name_fingerprint
+        );
+        let undeclared_entity = b"<movie><extension>&missing;</extension></movie>";
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(undeclared_entity),
+            Err(NfoError::Xml(_))
+        ));
+        assert!(matches!(
+            parse_local_nfo_projection(undeclared_entity),
+            Err(NfoError::Xml(_))
+        ));
+        assert!(matches!(
+            parse_local_nfo_projection_with_semantic_fingerprint(b"<movie><extension></movie>"),
+            Err(NfoError::Xml(_))
+        ));
+
+        let projection_source = b"<movie><title>  Lead <emphasis>ignored</emphasis> tail  </title><plot>  Intro <b>omitted</b> outro  </plot></movie>";
+        let established_projection =
+            parse_local_nfo_projection(projection_source).expect("established projection");
+        let (semantic_projection, _) =
+            parse_local_nfo_projection_with_semantic_fingerprint(projection_source)
+                .expect("semantic projection");
+        // The cache-enabled path keeps untrimmed XML text events so character
+        // references and CDATA map to the same field value. The projection-only
+        // path retains its historical per-event trimming behavior.
+        assert_eq!(
+            established_projection.metadata.title.as_deref(),
+            Some("Leadtail")
+        );
+        assert_eq!(
+            semantic_projection.metadata.title.as_deref(),
+            Some("Lead  tail")
+        );
+        assert_eq!(
+            established_projection.metadata.overview.as_deref(),
+            Some("Introoutro")
+        );
+        assert_eq!(
+            semantic_projection.metadata.overview.as_deref(),
+            Some("Intro  outro")
+        );
+
+        for changed in [
+            br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="y">preserved</extension><empty/></movie>"#.as_slice(),
+            br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">changed</extension><empty/></movie>"#.as_slice(),
+            br#"<movie><title>Title &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">preserved<child/></extension><empty/></movie>"#.as_slice(),
+            br#"<movie><title>Changed &amp; text</title><actor sortorder="0" tmdbid="9"><name>Actor</name></actor><extension key="x">preserved</extension><empty/></movie>"#.as_slice(),
+        ] {
+            let (_, changed_fingerprint) =
+                parse_local_nfo_projection_with_semantic_fingerprint(changed)
+                    .expect("changed NFO");
+            assert_ne!(original_fingerprint, changed_fingerprint);
+        }
+    }
 
     #[tokio::test]
     async fn shared_episode_nfo_projection_is_cached_per_page_and_keeps_errors_typed()
