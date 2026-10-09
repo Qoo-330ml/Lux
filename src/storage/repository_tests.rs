@@ -16792,3 +16792,120 @@ async fn person_credit_refresh_preserves_unchanged_rows() {
     .expect("remaining credits");
     assert_eq!(remaining_people, ["person-1", "person-3"]);
 }
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_metadata_update_persists_and_skips_unchanged_ratings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Rating", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status,
+                    has_available_source
+                 ) VALUES ('rating-item', ?, 'MOVIE', 'Old', 'old', 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let update = |title: &'static str, rating: Option<f64>| MediaMetadataUpdate {
+            item_id: "rating-item",
+            title,
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating,
+            rating_source: Some("nfo"),
+            provider_ids_json: None,
+            metadata_fingerprint: b"fingerprint",
+            provenance_json: "{}",
+            locked_fields_json: "[]",
+        };
+        let rating = || async {
+            sqlx::query_scalar::<_, Option<f64>>("SELECT rating FROM media_items WHERE id = $1")
+                .bind("rating-item")
+                .fetch_one(database.pool())
+                .await
+        };
+
+        // Only the rating differs from the stored row: the unchanged-write guard must still see it.
+        database
+            .update_media_item_metadata(update("Old", None))
+            .await?;
+        assert_eq!(rating().await?, None);
+        database
+            .update_media_item_metadata(update("Old", Some(8.2)))
+            .await?;
+        assert_eq!(rating().await?, Some(8.2));
+        // Same values again, then a missing rating must not erase the stored one.
+        database
+            .update_media_item_metadata(update("Old", Some(8.2)))
+            .await?;
+        database
+            .update_media_item_metadata(update("Old", None))
+            .await?;
+        assert_eq!(rating().await?, Some(8.2));
+        database
+            .update_media_item_metadata(update("Old", Some(9.1)))
+            .await?;
+        assert_eq!(rating().await?, Some(9.1));
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}

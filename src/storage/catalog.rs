@@ -5792,6 +5792,10 @@ impl Database {
         transaction: &mut sqlx::Transaction<'_, Any>,
         update: &MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
+        // The rating comparison binds the presence flag and a plain f64 (like the SET clause)
+        // instead of an `Option<f64>`: PostgreSQL rejects the optional float in the repeated
+        // `? IS NOT NULL` position ("incorrect binary data format in bind parameter 23"),
+        // which failed every update of an item whose NFO carries a rating.
         let sort_title = update.title.to_lowercase();
         self.query(
             "UPDATE media_items
@@ -5816,7 +5820,7 @@ impl Database {
                    OR overview IS DISTINCT FROM ?
                    OR production_year IS DISTINCT FROM ?
                    OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
-                   OR (? IS NOT NULL AND rating IS DISTINCT FROM ?)
+                   OR (? = 1 AND rating IS DISTINCT FROM ?)
                    OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
                    OR (? IS NOT NULL AND provider_ids_json IS DISTINCT FROM ?)
                    OR metadata_fingerprint IS DISTINCT FROM ?
@@ -5846,8 +5850,8 @@ impl Database {
         .bind(update.production_year)
         .bind(update.premiere_date)
         .bind(update.premiere_date)
-        .bind(update.rating)
-        .bind(update.rating)
+        .bind(database_flag(update.rating.is_some()))
+        .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
