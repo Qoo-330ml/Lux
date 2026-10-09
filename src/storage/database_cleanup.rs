@@ -825,3 +825,102 @@ impl Database {
         Ok(result.rows_affected())
     }
 }
+
+const REMOVED_ITEM_RETENTION_ENV: &str = "LUX_REMOVED_ITEM_RETENTION_DAYS";
+const DEFAULT_REMOVED_ITEM_RETENTION_DAYS: i64 = 30;
+const REMOVED_ITEM_PURGE_BATCH_SIZE: i64 = 200;
+const REMOVED_ITEM_PURGE_MAX_BATCHES: u32 = 500;
+const REMOVED_ITEM_PURGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
+const SECONDS_PER_DAY: i64 = 86_400;
+
+static REMOVED_ITEM_PURGE_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Retention window for soft-deleted media items, in days. `0` disables the purge.
+pub fn removed_item_retention_days() -> i64 {
+    std::env::var(REMOVED_ITEM_RETENTION_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days >= 0)
+        .unwrap_or(DEFAULT_REMOVED_ITEM_RETENTION_DAYS)
+}
+
+impl Database {
+    /// Runs one bounded purge pass in the background unless one is already running.
+    pub fn spawn_removed_media_item_purge(&self) {
+        let retention_days = removed_item_retention_days();
+        if retention_days == 0 {
+            return;
+        }
+        if REMOVED_ITEM_PURGE_RUNNING.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let database = self.clone();
+        tokio::spawn(async move {
+            let result = database
+                .purge_expired_removed_media_items(
+                    retention_days.saturating_mul(SECONDS_PER_DAY),
+                    REMOVED_ITEM_PURGE_BATCH_SIZE,
+                    REMOVED_ITEM_PURGE_MAX_BATCHES,
+                    REMOVED_ITEM_PURGE_PAUSE,
+                )
+                .await;
+            REMOVED_ITEM_PURGE_RUNNING.store(false, std::sync::atomic::Ordering::Release);
+            match result {
+                Ok(0) => {}
+                Ok(purged) => tracing::info!(purged, "expired soft-deleted media items purged"),
+                Err(error) => tracing::warn!(%error, "soft-deleted media item purge failed"),
+            }
+        });
+    }
+
+    /// Hard-deletes soft-deleted media items older than `retention_seconds` in small
+    /// batches, letting `ON DELETE CASCADE` remove images, credits and search rows.
+    /// Items that still carry user state, playback history or are a merge target are kept.
+    pub async fn purge_expired_removed_media_items(
+        &self,
+        retention_seconds: i64,
+        batch_size: i64,
+        max_batches: u32,
+        pause: std::time::Duration,
+    ) -> Result<u64, StorageError> {
+        let mut purged = 0_u64;
+        for _ in 0..max_batches {
+            let count = self
+                .query(
+                    "DELETE FROM media_items
+                     WHERE id IN (
+                         SELECT mi.id FROM media_items mi
+                         WHERE mi.removed_at IS NOT NULL
+                           AND mi.removed_at < unixepoch() - ?
+                           AND mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO', 'UNRESOLVED')
+                           AND NOT EXISTS (
+                               SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
+                           AND NOT EXISTS (
+                               SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
+                           AND NOT EXISTS (
+                               SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
+                         ORDER BY mi.removed_at
+                         LIMIT ?
+                     )",
+                )
+                .bind(retention_seconds)
+                .bind(batch_size)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            purged = purged.saturating_add(count);
+            if !pause.is_zero() {
+                tokio::time::sleep(pause).await;
+            }
+        }
+        Ok(purged)
+    }
+}

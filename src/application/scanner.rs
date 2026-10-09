@@ -10108,6 +10108,7 @@ impl ScanJobService {
                 {
                     tracing::warn!(job_id, %error, "completed scan manifest payload cleanup failed");
                 }
+                self.database.spawn_removed_media_item_purge();
                 if completed_job.auto_metadata_match && !uses_local_metadata_outbox {
                     if let Some(metadata) = metadata {
                         self.schedule_online_metadata_after_scan(job_id, metadata)
