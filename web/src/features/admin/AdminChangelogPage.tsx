@@ -15,6 +15,22 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.20",
+    date: "2026-10-09",
+    sections: [
+      { kind: "changed", items: [
+        "本地 NFO 与图片处理按页复用媒体源和图片快照，采用有界并发、批量登记与语义 fingerprint，跳过等价内容的重复读取和写入。",
+        "自动元数据补全按媒体库进入有界 dispatcher；空闲窗口合并短批次，同库任务顺序运行并保留排队背压。",
+        "增加本地 NFO 页与 deferred credits transaction 的低基数耗时和批次指标，并在 PostgreSQL 可用时提供 pg_stat_statements 摘要。",
+      ] },
+      { kind: "fixed", items: [
+        "本地海报权限错误、扫描根暂时不可用和扫描取消会保留可重试状态，避免错误确认图片阶段或完整度。",
+        "人物关系索引使用内容 checksum 检测过期快照，credits 批次失败可重试并可在重启后恢复。",
+        "指定条目重识别对重复 ID 保留首次出现顺序；合并高频管理任务进度失效通知。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.19",
     date: "2026-10-06",
     sections: [
