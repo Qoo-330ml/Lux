@@ -9597,15 +9597,16 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] LUX-270 结果包含按规范化 statement summary 分组的 SQLx 调用数、累计时间、p50/p95/max；时间为空时明确报告不可用，不伪造零耗时。
-- [ ] 前台管理请求与目录请求各自测量期间记录连接池 `size/idle/in-use/saturated` 峰值或采样计数；目录请求增加预热缓存后的对照，以区分 cache miss 等待与热页 hydration/query 负载。
-- [ ] LUX-304 区分 scan-active、scan-finished/image-pending 和所有 scan job image batch 完成后的目录列表 p95；队列完成条件同时核验本地 poster 数与 `images_completed_at`，失败或残留批次不得被误记为 drain 完成。
-- [ ] 固定统计 helper 单测、LUX-270/LUX-304 小 fixture SQLite 定向运行、fmt、build、全目标 Clippy 和差异检查通过。
-- [ ] 性能文档记录观测边界、原 1k 回退仍待修复/复测，所有结果限定为本机 ARM64 和临时 PostgreSQL；不外推 FNOS/NAS。
+- [x] LUX-270 结果包含按规范化 statement summary 分组的 SQLx 调用数、累计时间、p50/p95/max；时间为空时明确报告不可用，不伪造零耗时。
+- [x] 前台管理请求与目录请求各自测量期间记录连接池 `size/idle/in-use/saturated` 峰值或采样计数；目录请求增加预热缓存后的对照，以区分 cache miss 等待与热页 hydration/query 负载。
+- [x] LUX-304 区分 scan-active、scan-finished/image-pending 和所有 scan job image batch 完成后的目录列表 p95；队列完成条件同时核验本地 poster 数与 `images_completed_at`，失败或残留批次不得被误记为 drain 完成。
+- [x] 固定统计 helper 单测、LUX-270/LUX-304 小 fixture SQLite 定向运行、fmt、build、全目标 Clippy 和差异检查通过。
+- [x] 性能文档明确记录 ARM64 SQLite 单轮观测、临时 PostgreSQL 历史样本及观测边界；当前 LUX-304 1k/10k 非 A/B 结果不用于关闭既有回退或性能阶段门，也不外推 FNOS/NAS。
 
 预计文件：`tests/performance.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先为 SQL 延迟摘要统计添加确定性单测，再采集 query/连接池样本，接着为 LUX-304 增加严格 image-stage drain 和中间阶段测量；使用 1k SQLite 先确认输出完整后再决定是否运行双后端全矩阵。
 
-进度记录（2026-10-09）：基准 harness 已接入规范化 SQLx 延迟摘要、5 ms 连接池采样、管理/目录请求各自的 pool 观测、目录页首次与热页对照，以及 LUX-304 scan 完成后 image-pending 采样和严格 image batch drain。SQL 延迟对象显式标注 phase window 和后台 SQL 可能混入；单次首次目录请求只记录单次延迟。image-pending 只接受请求窗口首尾都存在有效 pending/running batch 的样本；失败/取消不计作 pending，已完成但缺少 `images_completed_at` 会使 drain 立即失败。pool 无样本报告保持 unavailable，所有未观测数值为 null。helper 测试 10/10 通过。LUX-270 与 LUX-304 的 1k SQLite fixture 通过；另外运行了 10k SQLite LUX-304 fixture，在扫描中、image-pending、strict drain 后三个窗口均记录到目录 p95，完整输出见 `docs/PERFORMANCE.md`。这几次是单次 ARM64 fixture 检查，不是 A/B 或性能收益结论；原有双后端 A/B、Rust build/Clippy、格式及全量测试仍待最终门禁。
+进度记录（2026-10-09）：基准 harness 已接入规范化 SQLx 延迟摘要、5 ms 连接池采样、管理/目录请求各自的 pool 观测、目录页首次与热页对照，以及 LUX-304 scan 完成后 image-pending 采样和严格 image batch drain。SQL 延迟对象显式标注 phase window 和后台 SQL 可能混入；单次首次目录请求只记录单次延迟。image-pending 只接受请求窗口首尾都存在有效 pending/running batch 的样本；失败/取消不计作 pending，已完成但缺少 `images_completed_at` 会使 drain 立即失败。pool 无样本报告保持 unavailable，所有未观测数值为 null。helper 测试 10/10 通过。LUX-270 与 LUX-304 的 1k SQLite fixture 通过；另有 10k SQLite LUX-304 fixture，扫描中、image-pending、strict drain 后三个窗口均记录目录 p95，完整输出见 `docs/PERFORMANCE.md`。这些是单轮 ARM64 SQLite fixture 检查，不是 A/B 或性能收益结论；原 1k 回退和阶段 23 双后端 A/B 仍待修复/复测。`cargo build --locked`、fmt、全目标全 feature Clippy 和全量 Rust 测试完成门通过；本机无 PostgreSQL 实例的专项测试保持 ignored。上述数据不外推 FNOS/NAS。
+
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
 - [ ] 人为阻塞首项图片、后段海报、慢 NFO、权限错误、不可用根、取消/重试、全量/增量竞态和扫描期间本地补图均有自动化覆盖。

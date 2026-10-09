@@ -1000,7 +1000,7 @@ fn pool_pressure_report(
         "maxIdle": has_samples.then_some(max_idle),
         "maxInUse": has_samples.then_some(max_in_use),
         "saturatedSamples": has_samples.then_some(saturated_samples),
-        "observedSaturated": has_samples.then(|| saturated_samples > 0),
+        "observedSaturated": has_samples.then_some(saturated_samples > 0),
     })
 }
 
@@ -2033,8 +2033,10 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         .map(|(count, _)| count)
         .sum::<usize>();
     let positive_commit_batch_count = statement_counts.manifest_positive_commit_batch_count();
+    // Lite Manifest discovery submits at most 80 directories per work unit;
+    // include those commits alongside the 8,000-file bound.
     let max_positive_commit_batch_count =
-        file_count.div_ceil(8_000) + directory_count.div_ceil(200) + 5;
+        file_count.div_ceil(8_000) + directory_count.div_ceil(80) + 5;
     assert!(
         positive_commit_batch_count <= max_positive_commit_batch_count,
         "streamed positive indexes should checkpoint no more than 8,000 files per transaction; transactions={positive_commit_batch_count}, upper_bound={max_positive_commit_batch_count}"

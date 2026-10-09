@@ -1067,7 +1067,18 @@ LUX-304 的本地图片队列只在 scan job 的每个 `scan_local_metadata_batc
 
 验证（2026-10-09）：本机 `uname -m=arm64`，基准候选 revision `e487076b`，SQLite fixture 单轮运行。LUX-270 的 1k/100-directory fixture 通过并输出所有 SQL 延迟窗口与 pool 采样：Manifest DML 34 次、5 个批次；首个目录页请求 18 ms，同页 50 并发热请求 p50/p95 为 367/679 ms，并发前台请求 p95 为 692 ms。pool 采样均未观察到饱和；热页窗口最大 in-use 为 7/8。LUX-304 的 1k fixture scan p95 为 756 ms、drain 后 p95 为 726 ms；该轮 50 个 image-pending 请求开始时有 9 个 pending batch，结束时队列已 drain，因此该窗口正确报告 unavailable。10k/1,000-directory fixture 的 scan p95 为 780 ms、image-pending p95 为 755 ms、drain 后 p95 为 827 ms；pending 窗口首尾分别有 74 和 55 个待处理 batch，最终 88/88 个 batch 带 `images_completed_at` 完成且 10,000 张 poster 已登记。10k 首个条目可见 88 ms、首张 poster 可见 88 ms、scan job 完成 1,470 ms、本地图片队列完成 4,380 ms。
 
-这些是单轮观测值，用于确认字段、SQL/pool 样本及严格 drain 条件工作；不是 A/B 或性能收益结论。全量 Rust build/Clippy/测试门禁仍待通过，LUX-304 历史 A/B 仍使用此前口径；当前结果只代表本机 ARM64 与 SQLite，不外推 FNOS、NAS/x86_64 或 PostgreSQL。
+补充 PostgreSQL 16.15 Docker fixture 单轮（同候选 `2da9efe5`，ARM64；1k/100 directories 与 10k/1,000 directories 各运行一次）：
+
+| 基准 / fixture | 索引或首项可见 ms | target 或 scan job ms | 无变化重扫 / local poster 队列 ms | 前台 / scan-active 目录 p95 ms | 热页 / image-pending / drain 后目录 p95 ms | DML / 正向提交数 | 峰值 RSS |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| LUX-270 / 1k | 166 | 29 | 1,484 | 698 | 724 / 746 / — | 34 / 2 | 315 MiB |
+| LUX-270 / 10k | 1,363 | 249 | 2,701 | 798 | 819 / 748 / — | 122 / 13 | 269 MiB |
+| LUX-304 / 1k | 首项 395、poster 396 | scan job 659 | 1,613 | 794 | — / unavailable / 785 | — | 222 MiB |
+| LUX-304 / 10k | 首项 438、poster 461 | scan job 3,285 | 11,345 | 806 | — / 797 / 767 | — | 280 MiB |
+
+LUX-304/1k 的 image-pending 窗口开始采样时已没有 pending batch，因此按 harness 规则标为 unavailable；10k 窗口有效，开始/结束分别有 51/46 个 pending batch，最终 88/88 个 batch 均完成且 10,000 张 poster 已登记。LUX-270/10k 首轮暴露性能测试上界错误地按 200 个目录估算发现批次；scanner 每个 discovery work unit 最多处理 80 个目录。上界已按 80 修正，复跑通过，实际 positive commit 为 13 次。这些 PostgreSQL 数值是单轮 harness 验证，不是 A/B 或收益结论；SQLite/PostgreSQL 同 fixture 多轮对照、既有回退复测和阶段 23 性能门仍未完成。
+
+这些单轮观测值用于确认字段、SQL/pool 样本及严格 drain 条件；不能证明性能收益。ARM64 全量 Rust 门禁已通过：library 807 passed、13 ignored，所有 integration targets 通过，build、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。要求本机 PostgreSQL 实例的专项测试仍为 ignored。LUX-304 10k PostgreSQL 队列完成后目录 p95 的 59→63 ms（+6.8%）仍需按相同配置复测；SQLite/PostgreSQL 多轮 A/B 和阶段 23 性能门仍未完成。本节结果不能外推 FNOS 或 NAS/x86_64。
 
 ### LUX-306 批量本地图片写入 A/B：1k/10k SQLite/PostgreSQL
 
