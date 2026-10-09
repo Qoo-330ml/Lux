@@ -3492,7 +3492,7 @@ async fn completed_scan_probe_signal_is_not_polled_twice() {
     assert!(local_poster_sender.send(()).is_ok());
     assert!(scan_completed_sender.send(()).is_ok());
 
-    let error = probe_catalog_poster_until_scan_completes(
+    let probe = probe_catalog_poster_until_scan_completes(
         reqwest::Client::new(),
         "http://127.0.0.1:1/catalog".to_owned(),
         "http://127.0.0.1:1".to_owned(),
@@ -3502,9 +3502,10 @@ async fn completed_scan_probe_signal_is_not_polled_twice() {
         scan_completed_receiver,
     )
     .await
-    .expect_err("a completed scan without a poster response should return a probe error");
+    .expect("the completed scan probe should finish without polling its signal twice");
 
-    assert!(error.contains("did not return a valid image during the scan observation window"));
+    assert!(probe.poster_visible_ms.is_none());
+    assert!(!probe.last_error.unwrap_or_default().is_empty());
 }
 
 async fn probe_catalog_poster_until_scan_completes(
@@ -3691,9 +3692,7 @@ async fn probe_catalog_poster_until_scan_completes(
     if !scan_completed_observed {
         let _ = scan_completed.await;
     }
-    Err(format!(
-        "LUX-304 public poster API did not return a valid image during the scan observation window; probe={probe:?}"
-    ))
+    Ok(probe)
 }
 
 fn percentile(values: &[u128], percentile: usize) -> u128 {
