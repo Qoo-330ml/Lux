@@ -1760,3 +1760,5 @@ scan-local movie metadata page 复用有序 task runner，最多同时执行 4 �
 deferred NFO credits flush 现在串行化同一 page collector 的 flush；某个最多 16-item storage chunk 事务失败时，只把该失败 chunk 保留到 collector，已提交的其他 chunk 不会重复入队。故障解除后再次 flush 可重试同一份 credits、source fingerprint 和 relation checksum；storage UPSERT 与 item index state transaction 保持幂等，成功后重复 flush 不再写入。固定 service 回归注入 index-state insert 错误，确认 SQL chunk 回滚、relation 文件仍存在且 current 检查为 stale，随后移除故障并对同一 collector 重试，确认 current 恢复、文件 checksum 匹配且只留下一个 credit。
 
 这只证明同一进程内 collector 的显式重试和单库 SQLite correctness。文件系统与数据库不能组成跨系统 ACID 事务；崩溃恢复依赖 durable relation snapshot、checksum stale 判定和既有 index rebuild reconciliation。Home cache invalidation 与 coalesced event 在 scan metadata batch 的完成边界发出，不是 DB outbox，也不能与文件/数据库提交原子化。未测量 PostgreSQL/FNOS/NAS 性能或事件送达耐久性。
+
+新增固定回归 `deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 已通过：credits/index-state 失败后丢弃 collector 并重开 SQLite/PeopleService，确认 durable relation snapshot 的 checksum 不变且 index revision 保持 stale，再由既有 index rebuild 对账恢复 credits/checksum。该测试只模拟服务状态丢失和 SQLite 重连；不证明断电/文件系统崩溃一致性、PostgreSQL/FNOS 行为或生产性能收益。
