@@ -1754,3 +1754,9 @@ NFO cache 保留原始字节 SHA-256 快路径。只有配置了 local NFO cache
 scan-local movie metadata page 复用有序 task runner，最多同时执行 4 个普通电影 NFO enrichment；结果按 source 顺序归并，单 item 的解析或 task 错误继续隔离。page deferred metadata 与 actor credits 仍由原 page 末 flush 边界提交。title/year 发生变化的电影在共享 guard 下检查数据库现存身份及尚未 flush 的同页 pending identity reservations，再写入 NFO cache/actor relation 并排入 metadata update collector；入队后释放 guard。pending reservation 候选由 storage 按当前 parent、可用 source 和 active 状态复核，身份冲突检查不提前 flush page collector。同步 gate 固定回归检查冲突检查期间没有 metadata transaction，以及普通 metadata update 与唯一成功身份更新在 page 末共用一次事务。
 
 这里记录的是应用层并发上限和身份检查/入队顺序；没有墙钟、吞吐、FNOS CPU、PostgreSQL 或 NAS 测量。Cargo 验证尚待统一测试窗口，当前记录不代表验收通过。
+
+### LUX-467 deferred relation credits 失败恢复
+
+deferred NFO credits flush 现在串行化同一 page collector 的 flush；某个最多 16-item storage chunk 事务失败时，只把该失败 chunk 保留到 collector，已提交的其他 chunk 不会重复入队。故障解除后再次 flush 可重试同一份 credits、source fingerprint 和 relation checksum；storage UPSERT 与 item index state transaction 保持幂等，成功后重复 flush 不再写入。固定 service 回归注入 index-state insert 错误，确认 SQL chunk 回滚、relation 文件仍存在且 current 检查为 stale，随后移除故障并对同一 collector 重试，确认 current 恢复、文件 checksum 匹配且只留下一个 credit。
+
+这只证明同一进程内 collector 的显式重试和单库 SQLite correctness。文件系统与数据库不能组成跨系统 ACID 事务；崩溃恢复依赖 durable relation snapshot、checksum stale 判定和既有 index rebuild reconciliation。Home cache invalidation 与 coalesced event 在 scan metadata batch 的完成边界发出，不是 DB outbox，也不能与文件/数据库提交原子化。未测量 PostgreSQL/FNOS/NAS 性能或事件送达耐久性。
