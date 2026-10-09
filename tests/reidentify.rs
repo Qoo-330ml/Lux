@@ -1227,8 +1227,8 @@ async fn fill_missing_jobs_share_a_process_global_worker_limit()
 
     assert!(maximum_running_items > 0);
     assert!(
-        maximum_running_items <= 2,
-        "automatic FILL_MISSING jobs must claim at most two running items process-wide; observed {maximum_running_items}"
+        maximum_running_items <= 4,
+        "automatic FILL_MISSING jobs must claim at most four running items process-wide; observed {maximum_running_items}"
     );
     tmdb_server.abort();
     Ok(())
@@ -1671,7 +1671,7 @@ async fn cancelled_fill_missing_job_finishes_while_waiting_for_worker_permit()
     let metadata =
         MetadataReidentifyService::new(database.clone(), ScraperProvider::from_adapter(tmdb));
     let mut job_ids = Vec::new();
-    for (library_index, item_count) in [(0, 3), (1, 1)] {
+    for (library_index, item_count) in [(0, 4), (1, 1)] {
         let library = libraries
             .create_library(
                 &format!("Cancel Movies {library_index}"),
@@ -1717,12 +1717,12 @@ async fn cancelled_fill_missing_job_finishes_while_waiting_for_worker_permit()
     let first_job_id = job_ids[0].clone();
     let first_run = tokio::spawn(async move { first_service.run(&first_job_id).await });
     for _ in 0..200 {
-        if gate.started.load(Ordering::SeqCst) >= 2 {
+        if gate.started.load(Ordering::SeqCst) >= 4 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert_eq!(gate.started.load(Ordering::SeqCst), 2);
+    assert_eq!(gate.started.load(Ordering::SeqCst), 4);
 
     let waiting_service = metadata.clone();
     let waiting_job_id = job_ids[1].clone();
