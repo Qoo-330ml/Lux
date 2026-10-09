@@ -72,6 +72,7 @@ pub struct StrmProbeService {
     database: Database,
     plugins: PluginService,
     operations: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
+    incremental_creation_lock: Arc<Mutex<()>>,
     resources: ResourceMetrics,
 }
 
@@ -81,6 +82,7 @@ impl StrmProbeService {
             database,
             plugins,
             operations: Arc::new(Mutex::new(HashMap::new())),
+            incremental_creation_lock: Arc::new(Mutex::new(())),
             resources: ResourceMetrics::new(),
         }
     }
@@ -95,6 +97,7 @@ impl StrmProbeService {
         library_ids: &[LibraryId],
         options: StrmProbeOptions,
     ) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
+        let _creation_guard = self.incremental_creation_lock.lock().await;
         if library_ids.is_empty() || library_ids.len() > MAX_LIBRARY_COUNT {
             return Err(StrmProbeError::InvalidLibraryCount);
         }
@@ -175,15 +178,16 @@ impl StrmProbeService {
         if !library.is_enabled {
             return Ok(None);
         }
+        let _creation_guard = self.incremental_creation_lock.lock().await;
+        if self.database.has_active_strm_probe_jobs().await? {
+            return Err(StrmProbeError::AlreadyActive);
+        }
         let total_count = self
             .database
             .count_strm_media_sources_for_incremental_scan(scan_job_id)
             .await?;
         if total_count == 0 {
             return Ok(None);
-        }
-        if self.database.has_active_strm_probe_jobs().await? {
-            return Err(StrmProbeError::AlreadyActive);
         }
         let operation_id = Uuid::now_v7().to_string();
         let job = self

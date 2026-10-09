@@ -4003,6 +4003,48 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<i64, StorageError> {
+        let has_directory_scope: i64 = self
+            .query_scalar(
+                "SELECT EXISTS (
+                    SELECT 1
+                    FROM scan_job_paths sjp
+                    LEFT JOIN filesystem_entries path_entry
+                      ON path_entry.library_root_id = sjp.library_root_id
+                     AND path_entry.relative_path = sjp.relative_path
+                    WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                      AND (sjp.relative_path = '.' OR path_entry.entry_kind = 'DIRECTORY')
+                )",
+            )
+            .bind(scan_job_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if has_directory_scope == 0 {
+            return self
+                .query_scalar(
+                    "SELECT COUNT(*)
+                     FROM scan_job_paths sjp
+                     JOIN filesystem_entries fe
+                       ON fe.library_root_id = sjp.library_root_id
+                      AND fe.relative_path = sjp.relative_path
+                     JOIN media_sources ms ON ms.filesystem_entry_id = fe.id
+                     JOIN media_items mi ON mi.id = ms.item_id
+                     WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                       AND ms.source_kind = 'STRM_URL'
+                       AND fe.is_missing = 0 AND mi.removed_at IS NULL",
+                )
+                .bind(scan_job_id)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+        }
+
         self.query_scalar(
             "SELECT COUNT(DISTINCT ms.id)
              FROM media_sources ms

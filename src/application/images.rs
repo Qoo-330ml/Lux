@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     fmt,
+    io::Cursor,
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, OnceLock, Weak},
@@ -219,17 +220,18 @@ pub(crate) async fn read_image_dimensions(path: &Path) -> Option<(i32, i32)> {
 
 pub(crate) async fn read_image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i32, i32)> {
     let bytes = bytes.to_owned();
-    tokio::task::spawn_blocking(move || {
-        image::load_from_memory(&bytes).ok().and_then(|image| {
-            Some((
-                i32::try_from(image.width()).ok()?,
-                i32::try_from(image.height()).ok()?,
-            ))
-        })
-    })
-    .await
-    .ok()
-    .flatten()
+    tokio::task::spawn_blocking(move || image_dimensions_from_bytes(&bytes))
+        .await
+        .ok()
+        .flatten()
+}
+
+fn image_dimensions_from_bytes(bytes: &[u8]) -> Option<(i32, i32)> {
+    let reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
+    let (width, height) = reader.into_dimensions().ok()?;
+    Some((i32::try_from(width).ok()?, i32::try_from(height).ok()?))
 }
 
 pub(crate) async fn image_content_tag_and_dimensions_from_bytes(
@@ -237,12 +239,7 @@ pub(crate) async fn image_content_tag_and_dimensions_from_bytes(
 ) -> Result<(String, Option<(i32, i32)>), std::io::Error> {
     tokio::task::spawn_blocking(move || {
         let content_tag = format!("{:x}", Sha256::digest(&bytes));
-        let dimensions = image::load_from_memory(&bytes).ok().and_then(|image| {
-            Some((
-                i32::try_from(image.width()).ok()?,
-                i32::try_from(image.height()).ok()?,
-            ))
-        });
+        let dimensions = image_dimensions_from_bytes(&bytes);
         Ok((content_tag, dimensions))
     })
     .await
@@ -2850,6 +2847,24 @@ mod tests {
             .expect("metadata worker");
         assert_eq!(content_tag.len(), 64);
         assert_eq!(dimensions, Some((3, 2)));
+    }
+
+    #[tokio::test]
+    async fn combined_local_image_metadata_reads_dimensions_from_header() {
+        // The header describes a large image, while the deliberately invalid
+        // IDAT payload prevents a full pixel decode. A metadata-only reader
+        // can still read the dimensions without decoding.
+        let bytes = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x27, 0x10, 0x00, 0x00, 0x1f, 0x40, 0x08, 0x02, 0x00, 0x00,
+            0x00, 0xa2, 0x2e, 0x16, 0xb2, 0x00, 0x00, 0x00, 0x03, 0x49, 0x44, 0x41, 0x54, 0x62,
+            0x61, 0x64, 0x84, 0xa0, 0xae, 0x4b, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44,
+            0xae, 0x42, 0x60, 0x82,
+        ];
+        let (_, dimensions) = image_content_tag_and_dimensions_from_bytes(bytes)
+            .await
+            .expect("metadata worker");
+        assert_eq!(dimensions, Some((10_000, 8_000)));
     }
 
     #[tokio::test]

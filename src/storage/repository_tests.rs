@@ -13,11 +13,333 @@ use crate::{
     library::LibraryKind,
     storage::{
         ItemImageBatchInsert, ItemImageInsert, LocalNfoDefaultsRepair, MetadataAutoMatchPolicy,
-        MetadataCapabilityResult, MetadataImageUnavailable, NewItemMetadataCompletenessCheck,
-        NewItemMetadataCompletenessResult, NewMediaChapterMarker, NewMetadataCandidate,
-        NewNotificationDestination, NewNotificationEvent,
+        MetadataCapabilityResult, MetadataImageUnavailable, NewFilesystemEntry,
+        NewItemMetadataCompletenessCheck, NewItemMetadataCompletenessResult, NewMediaChapterMarker,
+        NewMetadataCandidate, NewNotificationDestination, NewNotificationEvent,
     },
 };
+
+#[tokio::test]
+async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    for item_id in ["fts-first", "fts-second"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title,
+                    identification_status, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    let original_rowid: i64 =
+        sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("initial FTS row");
+    let mapped_rowid: i64 =
+        sqlx::query_scalar("SELECT fts_rowid FROM media_search_map WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("indexed FTS row mapping");
+    assert_eq!(mapped_rowid, original_rowid);
+    let unique_index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_index_list('media_search_map') WHERE \"unique\" = 1",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("mapping uniqueness index");
+    assert!(unique_index_count > 0);
+
+    sqlx::query("UPDATE media_items SET overview = 'new overview' WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("non-search metadata update");
+    sqlx::query("UPDATE media_items SET title = 'renamed media' WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("search metadata update");
+    let renamed_rowid: i64 =
+        sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("renamed FTS row");
+    assert_eq!(renamed_rowid, original_rowid);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND title MATCH 'renamed'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("updated FTS content"),
+        1
+    );
+
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('fts-alias', 'fts-first', 'first alias', 'first alias')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("insert alias");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("inserted alias search"),
+        1
+    );
+    sqlx::query(
+        "UPDATE item_aliases SET alias = 'second alias', alias_normalized = 'second alias'
+         WHERE id = 'fts-alias'",
+    )
+    .execute(database.pool())
+    .await
+    .expect("update alias");
+    sqlx::query("UPDATE item_aliases SET item_id = 'fts-second' WHERE id = 'fts-alias'")
+        .execute(database.pool())
+        .await
+        .expect("move alias to another item");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("old item's alias search"),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-second' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("new item's alias search"),
+        1
+    );
+    sqlx::query("DELETE FROM item_aliases WHERE id = 'fts-alias'")
+        .execute(database.pool())
+        .await
+        .expect("delete alias");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM media_search WHERE item_id = 'fts-second' AND aliases MATCH 'alias'",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("deleted alias search"),
+        0
+    );
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'fts-first'")
+        .execute(database.pool())
+        .await
+        .expect("delete media item");
+    let remaining_mappings: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search_map WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted row mapping");
+    let remaining_search_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'fts-first'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted FTS row");
+    assert_eq!(remaining_mappings, 0);
+    assert_eq!(remaining_search_rows, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn incremental_strm_count_uses_exact_file_paths_and_preserves_directory_scopes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("STRM count", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let media_root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&media_root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(
+            library.id,
+            media_root_path.to_str().expect("UTF-8 media root"),
+        )
+        .await
+        .expect("library root")
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+
+    for (entry_id, path) in [
+        ("strm-count-nfo-entry", "Movie/Movie.nfo"),
+        ("strm-count-video-entry", "Movie/Movie.strm"),
+    ] {
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: entry_id,
+                library_root_id: &root_id,
+                relative_path: path,
+                entry_kind: "FILE",
+                size: 1,
+                modified_at: 1,
+                inode: None,
+                fingerprint: b"fingerprint",
+                last_seen_generation: "strm-count-generation",
+            })
+            .await
+            .expect("filesystem entry");
+    }
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('strm-count-item', ?, 'MOVIE', 'STRM Movie', 'strm-movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await
+    .expect("media item");
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id)
+         VALUES ('strm-count-source', 'strm-count-item', 'STRM_URL', 'strm-count-video-entry')",
+    )
+    .execute(database.pool())
+    .await
+    .expect("STRM media source");
+
+    database
+        .create_scan_job(
+            "strm-count-nfo",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "nfo",
+            0,
+            false,
+        )
+        .await
+        .expect("NFO scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-nfo", &root_id, "Movie/Movie.nfo", "MODIFY")
+        .await
+        .expect("enqueue NFO scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-nfo'")
+        .execute(database.pool())
+        .await
+        .expect("mark NFO scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-nfo")
+            .await
+            .expect("count NFO scan STRM sources"),
+        0
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "file-only scans use the narrow path"
+    );
+    sqlx::query("UPDATE scan_jobs SET status = 'COMPLETED' WHERE id = 'strm-count-nfo'")
+        .execute(database.pool())
+        .await
+        .expect("complete NFO scan job");
+
+    database
+        .create_scan_job(
+            "strm-count-strm",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "strm",
+            0,
+            false,
+        )
+        .await
+        .expect("STRM scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-strm", &root_id, "Movie/Movie.strm", "MODIFY")
+        .await
+        .expect("enqueue STRM scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-strm'")
+        .execute(database.pool())
+        .await
+        .expect("mark STRM scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-strm")
+            .await
+            .expect("count STRM scan sources"),
+        1
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "STRM file scans use the narrow path"
+    );
+    sqlx::query("UPDATE scan_jobs SET status = 'COMPLETED' WHERE id = 'strm-count-strm'")
+        .execute(database.pool())
+        .await
+        .expect("complete STRM scan job");
+
+    database
+        .create_scan_job(
+            "strm-count-directory",
+            &library_id,
+            "INCREMENTAL_SCAN",
+            "directory",
+            0,
+            false,
+        )
+        .await
+        .expect("directory scan job");
+    database
+        .enqueue_incremental_scan_path("strm-count-directory", &root_id, ".", "MODIFY")
+        .await
+        .expect("enqueue directory scan path");
+    sqlx::query("UPDATE scan_job_paths SET processed_at = 1 WHERE job_id = 'strm-count-directory'")
+        .execute(database.pool())
+        .await
+        .expect("mark directory scan path processed");
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .count_strm_media_sources_for_incremental_scan("strm-count-directory")
+            .await
+            .expect("count directory STRM sources"),
+        1
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "directory scans retain recursive counting"
+    );
+
+    database.close().await;
+}
 
 async fn refresh_recommendation_stats(database: &Database) {
     sqlx::query(
@@ -2030,6 +2352,12 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(retryable.id, "retry-batch");
     assert!(
         database
+            .mark_scan_local_metadata_images_complete(&retryable.id)
+            .await
+            .expect("mark image stage complete before NFO work")
+    );
+    assert!(
+        database
             .fail_scan_local_metadata_batch(&retryable.id, "temporary failure", Some(i64::MAX))
             .await
             .expect("fail with delayed retry")
@@ -2055,16 +2383,14 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(retried.id, retryable.id);
     assert_eq!(retried.attempts, 2);
     assert!(
-        database
-            .has_pending_scan_local_metadata_images("retry-job")
-            .await
-            .expect("claim resets the image stage")
+        retried.images_completed_at.is_some(),
+        "a retry retains its completed image stage"
     );
     assert!(
-        database
-            .mark_scan_local_metadata_images_complete(&retried.id)
+        !database
+            .has_pending_scan_local_metadata_images("retry-job")
             .await
-            .expect("mark retried images complete")
+            .expect("completed image stage stays out of the pending queue")
     );
     assert!(
         database
@@ -2124,10 +2450,14 @@ async fn progressive_scan_metadata_batches_are_bounded_idempotent_and_recoverabl
     assert_eq!(recovered.id, "batch-e");
     assert_eq!(recovered.attempts, 2);
     assert!(
-        database
+        recovered.images_completed_at.is_some(),
+        "interrupted work retains its completed image stage"
+    );
+    assert!(
+        !database
             .has_pending_scan_local_metadata_images("interrupted-job")
             .await
-            .expect("reclaimed batch reruns the image stage")
+            .expect("recovered batch does not repeat the image stage")
     );
 
     database.close().await;

@@ -1776,3 +1776,11 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 新增固定回归 `deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 已通过：credits/index-state 失败后丢弃 collector 并重开 SQLite/PeopleService，确认 durable relation snapshot 的 checksum 不变且 index revision 保持 stale，再由既有 index rebuild 对账恢复 credits/checksum。该测试只模拟服务状态丢失和 SQLite 重连；不证明断电/文件系统崩溃一致性、PostgreSQL/FNOS 行为或生产性能收益。
 
 补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes` 通过 `lux-*` 人物路径覆盖 canonical index unchanged write；相同字节保留 inode，metadata 变化仍更新 NFO。`local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets` 覆盖改名目录和同一 canonical person 新增 identity；分别遗漏两个指纹字段时测试均能复现错误复用，恢复后通过。回归只验证写入结果，不提供系统调用耗时或生产性能数据。
+
+### LUX-CPU NAS 部署复测
+
+2026-10-08 在飞牛 NAS（Intel Core i9-12900H，16 CPU，`uname -m=x86_64`）部署提交 `5a542b36`。数据集为现有 PostgreSQL 媒体库（约 890,000 条 filesystem entry、367,000 条 media source；来自修复前 `EXPLAIN` 估算）。部署前 `docker stats --no-stream` 两次采样间隔 12 秒，PostgreSQL 分别占用 1439% 和 1469% CPU；`pg_stat_activity` 同时观察到 21 条相同的 `COUNT(DISTINCT media_sources...)` 全库计数查询，最长运行约 96 秒。
+
+新 amd64 镜像在 NAS 使用 `docker buildx bake --load --set app.platform=linux/amd64 ... app` 构建，revision 标签为 `5a542b36`；以 `docker compose up -d --no-deps lux` 替换 Lux，PostgreSQL 未重建。容器内 `/health/live`、`/health/ready`，主机映射端口 readiness 和公网 readiness 均成功；ready 报告 `databaseWritable=true`、`schemaVersion=157`。重启后首个 12 秒窗口 PostgreSQL CPU 从 424% 降到 10.06%；再观察 45 秒后降至 1.32%，Lux 为 20.64%。此时活跃查询列表中不再有全库计数，最近 60 秒没有 metadata refresh 调度或 `.nfo`/`.tmp` 日志。
+
+这是目标 NAS 生产库上的短时前后观测，不是固定负载下的 A/B 或长期 p95 基准。重启后的首分钟仍有本地 metadata backfill 与缺少 `org.lux.tmdb` 插件的告警，因此 Lux CPU 数字包含启动后工作；没有据此声称所有扫描/刮削负载下 CPU 恒定。观察窗口内，原先持续占满 PostgreSQL 的重复全库计数停止，修复达到本次线上复测目标。

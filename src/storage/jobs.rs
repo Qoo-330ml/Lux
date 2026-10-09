@@ -1236,7 +1236,7 @@ impl Database {
             .query(
                 "UPDATE scan_local_metadata_batches
                  SET status = 'RUNNING', attempts = attempts + 1, next_attempt_at = NULL,
-                     error = NULL, images_completed_at = NULL, updated_at = unixepoch()
+                     error = NULL, updated_at = unixepoch()
                  WHERE id = ? AND status IN ('PENDING', 'FAILED')
                    AND (next_attempt_at IS NULL OR next_attempt_at <= unixepoch())
                  RETURNING *",

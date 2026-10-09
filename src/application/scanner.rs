@@ -3059,23 +3059,30 @@ async fn process_scan_local_metadata_batch(
             }
         };
 
-    let result = match enricher
-        .index_scan_local_metadata_batch_images(&source_ids)
-        .await
-    {
-        Ok(batch) if !batch.report.failed_item_ids.is_empty() => Err(format!(
-            "{} local image item(s) failed",
-            batch.report.failed_item_ids.len()
-        )),
-        Ok(batch) => match database
-            .mark_scan_local_metadata_images_complete(&batch_id)
+    let result = if batch.images_completed_at.is_some() {
+        database
+            .list_scan_local_metadata_sources(&source_ids)
+            .await
+            .map_err(|error| error.to_string())
+    } else {
+        match enricher
+            .index_scan_local_metadata_batch_images(&source_ids)
             .await
         {
-            Ok(true) => Ok(batch.sources),
-            Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
+            Ok(batch) if !batch.report.failed_item_ids.is_empty() => Err(format!(
+                "{} local image item(s) failed",
+                batch.report.failed_item_ids.len()
+            )),
+            Ok(batch) => match database
+                .mark_scan_local_metadata_images_complete(&batch_id)
+                .await
+            {
+                Ok(true) => Ok(batch.sources),
+                Ok(false) => Err("local metadata batch stopped before image completion".to_owned()),
+                Err(error) => Err(error.to_string()),
+            },
             Err(error) => Err(error.to_string()),
-        },
-        Err(error) => Err(error.to_string()),
+        }
     };
     if let Some(home) = home {
         home.invalidate();

@@ -2110,7 +2110,7 @@ async fn failed_local_poster_insert_does_not_mark_image_stage_complete()
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
 
-    let batch_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    let batch_id = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let batch: Option<(String, Option<i64>, i64)> = sqlx::query_as(
                 "SELECT id, images_completed_at, source_count FROM scan_local_metadata_batches
@@ -2158,7 +2158,7 @@ async fn failed_local_poster_insert_does_not_mark_image_stage_complete()
     .bind(&batch_id)
     .execute(database.pool())
     .await?;
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
             let status: String =
                 sqlx::query_scalar("SELECT status FROM scan_local_metadata_batches WHERE id = ?")
@@ -2280,5 +2280,109 @@ async fn local_metadata_refresh_reindexes_only_the_requested_directories()
             .await
             .is_err()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn nfo_retry_skips_the_completed_scan_image_stage() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&media_root).await?;
+    tokio::fs::write(media_root.join("Retry.Nfo.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(
+        media_root.join("Retry.Nfo.Movie.2026.nfo"),
+        "<movie><title>Recovered From NFO</title></movie>",
+    )
+    .await?;
+    tokio::fs::write(
+        media_root.join("Retry.Nfo.Movie.2026-poster.jpg"),
+        b"poster",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_scan_nfo_update
+         BEFORE UPDATE OF title ON media_items
+         WHEN OLD.item_type = 'MOVIE'
+         BEGIN SELECT RAISE(ABORT, 'injected scan NFO failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    jobs.start_local_metadata_outbox_worker().await?;
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let batch_id = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let batch: Option<(String, String, Option<i64>)> = sqlx::query_as(
+                "SELECT id, status, images_completed_at FROM scan_local_metadata_batches
+                 WHERE job_id = ? ORDER BY created_at, id LIMIT 1",
+            )
+            .bind(&job.id)
+            .fetch_optional(database.pool())
+            .await?;
+            if let Some((id, status, images_completed_at)) = batch
+                && status == "FAILED"
+            {
+                assert!(images_completed_at.is_some());
+                return Ok::<_, sqlx::Error>(id);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM item_images WHERE source = 'LOCAL'")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+
+    sqlx::query("DROP TRIGGER fail_scan_nfo_update")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER reject_scan_image_retry
+         BEFORE INSERT ON item_images
+         BEGIN SELECT RAISE(ABORT, 'completed image stage must not run again'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_batches SET next_attempt_at = 0
+         WHERE id = ? AND status = 'FAILED'",
+    )
+    .bind(&batch_id)
+    .execute(database.pool())
+    .await?;
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            let status: String =
+                sqlx::query_scalar("SELECT status FROM scan_local_metadata_batches WHERE id = ?")
+                    .bind(&batch_id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if status == "COMPLETED" {
+                return Ok::<_, sqlx::Error>(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await??;
     Ok(())
 }

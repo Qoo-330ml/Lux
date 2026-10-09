@@ -4376,6 +4376,36 @@ mod tests {
         assert!(content.contains("external"));
     }
 
+    #[tokio::test]
+    async fn atomic_nfo_write_is_marked_for_watcher_suppression() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("movie.nfo");
+        write_movie_nfo_atomically(
+            &target,
+            &MovieNfoMetadata {
+                base: NfoMetadata {
+                    title: Some("movie".to_owned()),
+                    ..NfoMetadata::default()
+                },
+                ..MovieNfoMetadata::default()
+            },
+        )
+        .await
+        .expect("write nfo");
+
+        assert!(
+            crate::application::images::should_suppress_internal_image_write(&target).await,
+            "the watcher should recognize Lux-owned NFO writes"
+        );
+        tokio::fs::write(&target, b"<movie><title>external edit</title></movie>")
+            .await
+            .expect("external edit");
+        assert!(
+            !crate::application::images::should_suppress_internal_image_write(&target).await,
+            "an external edit should invalidate the internal-write marker"
+        );
+    }
+
     #[test]
     fn oversized_metadata_text_is_rejected_instead_of_being_dropped() {
         let value = Some("x".repeat(513));
