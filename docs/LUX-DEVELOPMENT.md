@@ -9605,6 +9605,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`tests/performance.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先为 SQL 延迟摘要统计添加确定性单测，再采集 query/连接池样本，接着为 LUX-304 增加严格 image-stage drain 和中间阶段测量；使用 1k SQLite 先确认输出完整后再决定是否运行双后端全矩阵。
 
+进度记录（2026-10-09）：基准 harness 已接入规范化 SQLx 延迟摘要、5 ms 连接池采样、管理/目录请求各自的 pool 观测、目录页首次与热页对照，以及 LUX-304 scan 完成后 image-pending 采样和严格 image batch drain。SQL 延迟对象显式标注 phase window 和后台 SQL 可能混入；单次首次目录请求只记录单次延迟。image-pending 只接受请求窗口首尾都存在有效 pending/running batch 的样本；失败/取消不计作 pending，已完成但缺少 `images_completed_at` 会使 drain 立即失败。pool 无样本报告保持 unavailable，所有未观测数值为 null。helper 测试 10/10 通过。LUX-270 与 LUX-304 的 1k SQLite fixture 通过；另外运行了 10k SQLite LUX-304 fixture，在扫描中、image-pending、strict drain 后三个窗口均记录到目录 p95，完整输出见 `docs/PERFORMANCE.md`。这几次是单次 ARM64 fixture 检查，不是 A/B 或性能收益结论；原有双后端 A/B、Rust build/Clippy、格式及全量测试仍待最终门禁。
+
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
 - [ ] 人为阻塞首项图片、后段海报、慢 NFO、权限错误、不可用根、取消/重试、全量/增量竞态和扫描期间本地补图均有自动化覆盖。
 - [ ] 缺失分类、自动补缺策略、队列去重、provider 无候选/失败冷却、执行前重新检查和禁止覆盖本地/锁定数据均有回归覆盖。
