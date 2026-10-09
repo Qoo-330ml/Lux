@@ -9466,6 +9466,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`tests/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 lexical/unknown XML/metadata-state 回归，再实现有界、保留未知结构的 semantic fingerprint 与 cache 兼容，最后运行定向 NFO 与 metadata 验证。
 
 进度（2026-10-09）：核心实现及 lexical、未知 XML、metadata state、旧 cache、`xml:space` 和属性规范化回归已补。定向验证通过：`cargo test --locked --lib application::nfo::tests` 为 8/8，`cargo test --locked --test metadata` 为 21/21。测试发现并修正了 cache-enabled projection 按 Text event 裁剪空格的问题；该路径现保留字段内部空白，projection-only 路径仍保持既有行为。属性规范化区分字面 TAB/换行（XML 1.0 将其规范化为空格）与字符引用（保留引用字符），并将 CRLF 与 LF 字面换行按相同值处理；只有启用 local NFO cache 时才收集 semantic tokens。cache-enabled 解析让合法预定义/数字引用进入 metadata projection，并拒绝未声明的 general entity；回归检查 lexical rewrite 后 stat revision 与 raw cache source revision 均更新。全局 build、Clippy、全量 Rust 测试与集成工作树验收尚待完成，故任务验收仍开放。
+#### LUX-460：扫描本地 metadata page 普通电影 NFO 有界并发
+
+范围：scan-local metadata NFO page 当前逐个 await 普通电影的 NFO enrichment。复用现有有界有序 task runner 和电影 NFO 并发上限（最多 4 路），让一个 page 内独立电影并发处理，并按原 source 顺序归并结果。单个 NFO 失败或 task 异常仍只影响对应 item。page 级延迟 metadata 更新继续在所有电影、home video 与剧集处理后统一 flush；actor credits 继续使用共享 deferred collector 并在 page 末统一 flush。只修改 scan-local page 的 MOVIE 路径；库级 `enrich_movie_sources`、home-video、series/season/episode 和 OnDemand 路径不扩大范围。
+
+验收：
+
+- [ ] 回归证明 scan-local 普通电影 NFO enrichment 的最大并发大于 1 且不超过 4，结果合并顺序与输入 source 顺序一致。
+- [ ] 一个电影 NFO 无效或 task 失败时，其余电影仍完成；单 item 错误隔离语义保持。
+- [ ] page deferred metadata 更新及 actor credits 仍只在 page 末统一 flush；metadata batch transaction 失败后的逐 item fallback 回归通过。
+- [ ] 只改变 scan-local page 的 MOVIE 路径；series、home-video、OnDemand 和库级电影 enrichment 行为不变。
+- [ ] 相关 metadata 定向回归、格式、build、Clippy、全量 Rust 完成门及 `git diff --check` 通过。
+- [ ] 性能记录仅报告固定 task runner 的并发上界和行为边界，不推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
+
+短计划与文件：先在 `src/application/metadata.rs` 为 scan-local movie page 增加有界并发、顺序和错误隔离回归，再将该路径接入现有有界有序 runner，同时保留 page flush 边界；更新 `docs/PERFORMANCE.md` 记录验证范围。预计修改 `src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`，最多 3 个文件。
 
 #### 本轮代码质量与性能优化收口
 
