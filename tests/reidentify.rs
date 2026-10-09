@@ -225,6 +225,76 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
 }
 
 #[tokio::test]
+async fn metadata_reidentify_deduplicates_repeated_item_ids()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    for (title, filename) in [
+        ("Alpha Movie (2020)", "Alpha.Movie.2020.mkv"),
+        ("Middle Movie (2021)", "Middle.Movie.2021.mkv"),
+        ("Zulu Movie (2022)", "Zulu.Movie.2022.mkv"),
+    ] {
+        let movie_dir = root.join(title);
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join(filename), b"fixture").await?;
+    }
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY id",
+    )
+    .bind(library.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(item_ids.len(), 3);
+
+    let requested_ids = vec![
+        item_ids[2].clone(),
+        item_ids[0].clone(),
+        item_ids[1].clone(),
+        item_ids[2].clone(),
+        item_ids[0].clone(),
+    ];
+    let service = MetadataReidentifyService::new(database.clone(), unreachable_tmdb_provider()?);
+    let job = service.create_job(requested_ids).await?;
+
+    assert_eq!(job.total_count, 3);
+    assert_eq!(job.items.len(), 3);
+    let (item_count, unique_item_count): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*), COUNT(DISTINCT item_id)
+         FROM metadata_reidentify_job_items WHERE job_id = ?",
+    )
+    .bind(&job.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(item_count, 3);
+    assert_eq!(unique_item_count, 3);
+
+    let persisted_item_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM metadata_reidentify_job_items WHERE job_id = ? ORDER BY item_id",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(persisted_item_ids, item_ids);
+    Ok(())
+}
+
+#[tokio::test]
 async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn std::error::Error>> {
     let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
     let temp_dir = tempfile::tempdir()?;

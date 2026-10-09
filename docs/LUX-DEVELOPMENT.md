@@ -2150,6 +2150,7 @@ services:
 | LUX-321 | src/application/nfo.rs、src/storage/media.rs、tests/nfo_writer.rs、docs/COMPATIBILITY.md、docs/；为电影 NFO 写入数据库时间/排序值并提供原子 probe-info 写回服务 |
 | LUX-322 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后调用 NFO 技术信息写回 |
 | LUX-461 | src/application/admin_events.rs、src/application/scanner.rs、src/application/reidentify.rs、docs/LUX-DEVELOPMENT.md；合并高频 Admin Jobs 进度失效通知并保留关键事件即时刷新 |
+| LUX-464 | src/application/reidentify.rs、tests/reidentify.rs、docs/LUX-DEVELOPMENT.md；为指定条目重识别的重复 ID 去重和首次出现顺序补充回归 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；兼容持久 frontier 与新 Lite 目录发现 |
@@ -9622,6 +9623,20 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 短计划与文件：先扩展 `StoredScanJobMetadataPage` 并在原有单条 page query 返回 job lifecycle 与 `auto_metadata_match`，添加 storage 回归；再将 scanner worker 的启动/刷新状态判断及增量 completeness policy 切到 page snapshot，并扩展 idle worker query-count 回归。预计修改 `src/storage/repository.rs`、`src/storage/jobs.rs`、`src/application/scanner.rs`、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`，共 5 个文件。
 
 进度记录（2026-10-09）：page lifecycle 合并 query 额外返回 `auto_metadata_match`，增量 metadata completeness 复用 page snapshot 解析策略，不再第二次读取 scan job；没有 page snapshot 的调用点保留既有策略读取路径。query counter 回归先复现了 1 次冗余 query，修复后策略解析增加 0 次 query；storage 覆盖 enabled flag、空 page、终态和不存在 job。相关定向测试、`cargo build --locked`、fmt、全目标全 feature Clippy、`git diff --check` 和 `cargo test --locked --all-targets` 通过；library 为 808 passed、13 ignored，需本地 PostgreSQL 的集成测试与手动性能基准仍按其条件 ignored。以上是调用次数与本机测试证据，不推断 SQL 墙钟、FNOS/NAS CPU 或 PostgreSQL 生产收益。
+
+#### LUX-464：指定条目重识别的稳定去重回归
+
+范围：为原性能审计清单第 13 项补齐回归保护。指定条目重识别收到重复 item ID 时，只保留每个 ID 的首次出现，稳定保留其余首次出现的输入顺序，并按唯一条目数创建任务。不得改变请求合同、数据库模型或 job item 的对外排序。
+
+验收：
+
+- [x] 单元回归证明去重后保留首次出现顺序，例如 `[b, a, b, c, a]` 得到 `[b, a, c]`。
+- [x] 集成回归提交含重复 ID 的任务，确认任务总数等于唯一 ID 数，且持久化 job item 中每个唯一 ID 恰好出现一次。
+- [x] `cargo test --locked --lib reidentify::tests::metadata_reidentify_deduplication_keeps_first_occurrence_order`、`cargo test --locked --test reidentify`、build、fmt、Clippy 和 `git diff --check` 通过。
+
+短计划与文件：将现有保序 HashSet 逻辑抽成私有纯函数并先添加单元回归；再在 `tests/reidentify.rs` 通过真实 SQLite 数据库创建含重复 ID 的重识别任务，检查计数和持久化条目；最后记录测试结果。预计修改 `src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`，共 3 个文件。
+
+结果（2026-10-09）：保序去重 helper 的单元回归 1/1 通过；SQLite 集成用例确认 5 个输入 ID 去重为 3 个 job item、`total_count` 为 3，持久化 ID 与 3 个唯一 ID 一致；`tests/reidentify.rs` 17/17、`cargo build --locked`、全目标全 feature Clippy、fmt 与 `git diff --check` 通过。一次并行全量测试中 `libraries_api` 的库更新用例返回 `DATABASE_UNAVAILABLE`；随后隔离重跑该用例和 `tests/libraries_api.rs` 全目标（13/13）通过。该全量测试的串行重跑尚待最终阶段门执行。
 
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。

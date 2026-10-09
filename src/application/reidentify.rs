@@ -831,13 +831,7 @@ impl MetadataReidentifyService {
         item_ids: Vec<String>,
         mode: MetadataRefreshMode,
     ) -> Result<MetadataReidentifyJob, MetadataReidentifyError> {
-        let mut unique_ids = Vec::with_capacity(item_ids.len());
-        let mut seen_ids = HashSet::with_capacity(item_ids.len());
-        for item_id in item_ids {
-            if seen_ids.insert(item_id.clone()) {
-                unique_ids.push(item_id);
-            }
-        }
+        let unique_ids = deduplicate_item_ids_preserving_first_occurrence(item_ids);
         if unique_ids.is_empty() || unique_ids.len() > 100 {
             return Err(MetadataReidentifyError::InvalidItemCount);
         }
@@ -2164,6 +2158,17 @@ fn has_any_provider_id(item: &crate::storage::StoredMediaMetadata) -> bool {
         .any(|value| value.as_str().is_some_and(|id| !id.trim().is_empty()))
 }
 
+fn deduplicate_item_ids_preserving_first_occurrence(item_ids: Vec<String>) -> Vec<String> {
+    let mut unique_ids = Vec::with_capacity(item_ids.len());
+    let mut seen_ids = HashSet::with_capacity(item_ids.len());
+    for item_id in item_ids {
+        if seen_ids.insert(item_id.clone()) {
+            unique_ids.push(item_id);
+        }
+    }
+    unique_ids
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -2182,8 +2187,9 @@ mod tests {
         METADATA_GLOBAL_WORKER_LIMIT, MetadataCandidatePage, MetadataCandidateView,
         MetadataFillMissingPendingJobs, MetadataJobOwners, MetadataRefreshMode,
         MetadataRequestPlan, acquire_metadata_worker_permit_or_cancel, best_automatic_candidate,
-        candidate_count_for_page, dispatch_panic_outcome, metadata_fill_missing_global_permits,
-        metadata_global_permits, metadata_request_plan_is_complete, metadata_worker_concurrency,
+        candidate_count_for_page, deduplicate_item_ids_preserving_first_occurrence,
+        dispatch_panic_outcome, metadata_fill_missing_global_permits, metadata_global_permits,
+        metadata_request_plan_is_complete, metadata_worker_concurrency,
         metadata_worker_configured_concurrency, metadata_worker_default_concurrency,
         reserve_fill_missing_queue_capacity, run_fill_missing_dispatcher_loop,
     };
@@ -3443,5 +3449,17 @@ mod tests {
             dispatch_panic_outcome(false),
             ("FAILED", Some("WORKER_PANICKED"))
         );
+    }
+
+    #[test]
+    fn metadata_reidentify_deduplication_keeps_first_occurrence_order() {
+        let unique_ids = deduplicate_item_ids_preserving_first_occurrence(
+            ["b", "a", "b", "c", "a"]
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
+        );
+
+        assert_eq!(unique_ids, ["b", "a", "c"]);
     }
 }
