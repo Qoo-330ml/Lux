@@ -9640,18 +9640,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### LUX-465：合并本地 metadata 完成 waiter 状态查询
 
-范围：完成等待器每次被通知或 5 秒 fallback 唤醒时，先查询是否还有 PENDING metadata target；有待处理 target 时又分别读取 scan job 是否存在和 cancel 状态。将三次读取合并为一个 SQLite/PostgreSQL 共用的 storage 查询，返回 pending、取消或缺失 job 状态。等待器在读取状态前启用 `Notify` future，避免 `notify_waiters` 恰好发生于状态读取期间而丢失；保留同进程通知即时唤醒、内存取消标记、5 秒跨进程 fallback 和既有 stop 行为。
+范围：完成等待器每次被通知或 5 秒 fallback 唤醒时，先查询是否还有 PENDING metadata target；有待处理 target 时又分别读取 scan job 是否存在和 cancel 状态。将三次读取合并为一个 SQLite/PostgreSQL 共用的 storage 查询，返回 pending、取消或缺失 job 状态。等待器在读取状态前启用 `Notify` future，避免 `notify_waiters` 恰好发生于状态读取期间而丢失；同进程完成和取消通知都即时唤醒，内存取消标记、5 秒跨进程 fallback 和既有 stop 行为保持不变。
 
 验收：
 
 - [x] 固定 SQLite storage fixture 将 pending 状态及 job 取消检查从 3 次 query-wrapper 调用收敛到 1 次；无 pending、已取消和不存在的 job 仍退出等待。
-- [x] `Notify` 在状态查询前完成注册；同进程完成通知仍在 250ms 内唤醒，跨进程 fallback 仍为 5 秒。
+- [x] `Notify` 在状态查询前完成注册；同进程完成及取消通知都在 250ms 内唤醒，跨进程 fallback 仍为 5 秒。
 - [x] 相关定向测试、build、fmt、全目标全 feature Clippy 和 `git diff --check` 通过。
 - [x] 性能记录只描述固定 fixture 的 query-wrapper 数量，不外推 PostgreSQL 时延、FNOS/NAS 或生产 CPU 收益。
 
 预计文件：`src/storage/jobs.rs`、`src/storage/repository_tests.rs`、`src/application/scanner.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先添加单 query 与状态语义回归，再合并 storage 查询并在 DB read 前注册通知 future。
 
-结果（2026-10-09）：旧实现红灯回归观测到每次状态检查 3 次 query-wrapper 调用；合并后 storage 状态查询为 1 次。SQLite 回归覆盖 pending、complete、cancel requested 与 missing job；completion waiter 通知 250ms 回归及固定 5 秒 fallback 测试通过。`cargo test --locked --lib local_metadata_completion` 3/3、`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；只验证 query-wrapper 计数和本地通知边界，没有 PostgreSQL/FNOS/NAS 时延或 CPU 收益证据。跨进程状态继续由最多 5 秒 fallback 发现。
+结果（2026-10-09）：旧实现红灯回归观测到每次状态检查 3 次 query-wrapper 调用；合并后 storage 状态查询为 1 次。SQLite 回归覆盖 pending、complete、cancel requested 与 missing job；completion/cancellation waiter 通知 250ms 回归及固定 5 秒 fallback 测试通过。`cargo test --locked --lib local_metadata_completion`、`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；只验证 query-wrapper 计数和本地通知边界，没有 PostgreSQL/FNOS/NAS 时延或 CPU 收益证据。跨进程状态继续由最多 5 秒 fallback 发现。
 
 
 - [ ] 1,000 与 10,000 项 fixture 证明首批已索引条目和本地海报在扫描结束前可查询/显示，且本地 worker 与后续索引并行。
