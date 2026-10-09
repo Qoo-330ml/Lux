@@ -30,8 +30,9 @@
    显式重置状态。
 6. 图片失败不回滚基础元数据。NFO、图片和人物资源继续分别原子写入，任务结果记录图片问题但保留
    已成功的字段和关系。
-7. 元数据条目 worker 使用独立的网络 I/O 并发策略：SQLite 默认有效并发 4，PostgreSQL 默认有效并发 8，
-   进程全局硬上限为 16；前台 p95、Lux cgroup CPU、内存压力升高时按比例降档。领取查询的最近 128 个样本
+7. 元数据条目 worker 使用独立的网络 I/O 并发策略：SQLite 和 PostgreSQL 默认 worker 并发均为 4，
+   `FILL_MISSING` 另有 4 路进程级上限，所有元数据 worker 的进程全局硬上限为 16；前台 p95、Lux cgroup CPU、
+   内存压力升高时按比例降档。领取查询的最近 128 个样本
    中，p95 达到 250ms 时 worker 并发减半，达到 1s 时降至四分之一。这为独立 PostgreSQL 容器提供查询延迟
    反馈；Lux 不直接读取 PostgreSQL 容器 CPU。图片下载和写入继续使用独立全局配额，按相同资源压力动态降档，
    各自硬上限为 16。该上限不改变 TMDb 插件自身最多 16 路并发和每秒最多 32 次请求的限制。实际 NAS
@@ -40,6 +41,11 @@
    读到写升级触发 `SQLITE_BUSY_SNAPSHOT`；PostgreSQL 继续使用普通 `BEGIN`。
 9. 下载图片的 SHA-256 计算在有界图片写入配额内交给 Tokio blocking pool，避免在 Tokio 核心 worker 上运行
    大图哈希。
+
+## 更新记录
+
+- 2026-10-09：按项目所有者要求，将 SQLite、PostgreSQL 及 `FILL_MISSING` 的 worker 默认并发统一为 4；
+  保留资源压力降档和进程全局上限 16。
 
 ## 未采用的方案
 
