@@ -9696,7 +9696,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 进度记录（2026-10-09）：同页共享缓存以人物 NFO/身份/metadata 写入输入的 SHA-256 标识一次资产结果，使用共享 semaphore 将跨 item 的不同人物资产任务限制为最多 4 路；person NFO 与 provider/canonical index 在目标字节未变时跳过临时文件、fsync 和 rename。person manifest 继续用其内容 checksum 避免无变化写入，profile image 沿用 LUX-448 的 unchanged-write，relation credits 沿用最多 16 item 的批量提交。覆盖的文件类型包括 `person.nfo`、人物 manifest、profile image、provider identity index 与 canonical person index；`people.json` relation 仍逐 item 持久化，credits 仍按现有 chunk 事务提交。测试专用闸门令 8 个不同人物请求竞争同一页 semaphore，确认 4 个 permit 全部占用且最大活动数为 4；symlink provider-index 故障 fixture 通过另一 provider 的可读 profile index 到达目标写回，确认只有失败人物标记 `personIndex` pending、其他人物 NFO 和全部 relation 仍保存。`cargo test --locked --lib local_nfo_person_assets_keep_page_concurrency_at_four`（1/1）、`local_nfo_person_asset_batch_isolates_failures_between_people`（1/1）、`local_nfo_person_`（3/3）、同页重复人物资产（1/1）、scan-local relation/credits（1/1）和 `cargo fmt --all -- --check` 通过，`git diff --check` 通过。`cargo build --locked` 和全目标全 feature Clippy 暂缓至阶段 23 A/B 采样结束。本机 `arm64`；测试没有测量系统调用墙钟、PostgreSQL/NAS 延迟、FNOS CPU 或生产收益，也不声称跨文件/数据库原子性。
 
-补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes`（1/1）直接覆盖 `lux-*` canonical index 写入路径；相同 index 字节保留 inode，metadata 改变仍更新 person NFO，且不替换未变化的 canonical index。该项已按阶段 23 A/B 窗口约束只运行定向单测，build 与全目标 Clippy 仍待阶段门统一执行。
+补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes`（1/1）直接覆盖 `lux-*` canonical index 写入路径；相同 index 字节保留 inode，metadata 改变仍更新 person NFO，且不替换未变化的 canonical index。`local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets`（1/1）覆盖同一 canonical person 的改名目录和新增 identity；分别临时移除 name、identity 指纹字段时测试均按预期失败，恢复实现后通过。上述项目只运行定向单测，build 与全目标 Clippy 仍待阶段门统一执行。
 
 ### 资源详情入库时间
 
