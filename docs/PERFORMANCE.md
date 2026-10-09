@@ -1754,3 +1754,9 @@ NFO cache 保留原始字节 SHA-256 快路径。只有配置了 local NFO cache
 scan-local movie metadata page 复用有序 task runner，最多同时执行 4 个普通电影 NFO enrichment；结果按 source 顺序归并，单 item 的解析或 task 错误继续隔离。page deferred metadata 与 actor credits 仍由原 page 末 flush 边界提交。title/year 发生变化的电影在共享 guard 下检查数据库现存身份及尚未 flush 的同页 pending identity reservations，再写入 NFO cache/actor relation 并排入 metadata update collector；入队后释放 guard。pending reservation 候选由 storage 按当前 parent、可用 source 和 active 状态复核，身份冲突检查不提前 flush page collector。同步 gate 固定回归检查冲突检查期间没有 metadata transaction，以及普通 metadata update 与唯一成功身份更新在 page 末共用一次事务。
 
 这里记录的是应用层并发上限和身份检查/入队顺序；没有墙钟、吞吐、FNOS CPU、PostgreSQL 或 NAS 测量。Cargo 验证尚待统一测试窗口，当前记录不代表验收通过。
+
+### LUX-465 本地 metadata completion waiter 状态查询
+
+固定 SQLite waiter-state fixture 中，旧路径对有 pending target 的每次检查依次执行 pending、scan-job existence 和 cancel-state 三个 query-wrapper 调用；合并后一次查询返回相同的 pending/取消状态，调用数为 3→1。等待器在查询前启用 `Notify` future；同进程通知仍立即触发状态复查。跨进程没有共享 `Notify`，仍依赖 5 秒 fallback，因此跨进程状态发现窗口未扩大。
+
+这是固定 SQLite fixture 的应用层 query-wrapper 计数，不是 SQL 执行时长、数据库往返墙钟或持续负载指标；没有 PostgreSQL/FNOS/NAS 运行数据，也不据此声称 CPU 收益。

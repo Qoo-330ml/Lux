@@ -8391,25 +8391,39 @@ impl Database {
         })
     }
 
-    pub(crate) async fn has_pending_scan_job_metadata_targets(
+    pub(crate) async fn local_metadata_completion_wait_state(
         &self,
         job_id: &str,
-    ) -> Result<bool, StorageError> {
-        self.query_scalar(
-            "SELECT CASE WHEN EXISTS(
-                 SELECT 1 FROM scan_job_targets
-                 WHERE job_id = ? AND target_type = 'ITEM'
-                   AND metadata_state = 'PENDING'
-             ) THEN 1 ELSE 0 END",
-        )
-        .bind(job_id)
-        .fetch_one(&self.pool)
-        .await
-        .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+    ) -> Result<(bool, bool), StorageError> {
+        // Return (has_pending_targets, job_missing_or_cancelled) from one read.
+        let row = self
+            .query(
+                "WITH completion_state AS (
+                    SELECT CASE WHEN EXISTS (
+                        SELECT 1 FROM scan_job_targets
+                        WHERE job_id = ? AND target_type = 'ITEM'
+                          AND metadata_state = 'PENDING'
+                    ) THEN 1 ELSE 0 END AS has_pending_targets
+                 )
+                 SELECT has_pending_targets,
+                    CASE WHEN has_pending_targets = 1 AND NOT EXISTS (
+                        SELECT 1 FROM scan_jobs
+                        WHERE id = ? AND cancel_requested = 0
+                    ) THEN 1 ELSE 0 END AS job_missing_or_cancelled
+                 FROM completion_state",
+            )
+            .bind(job_id)
+            .bind(job_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((
+            row.get::<i64, _>("has_pending_targets") != 0,
+            row.get::<i64, _>("job_missing_or_cancelled") != 0,
+        ))
     }
 
     pub(crate) async fn mark_pending_scan_job_metadata_targets_failed(

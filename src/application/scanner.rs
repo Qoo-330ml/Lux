@@ -9654,20 +9654,30 @@ impl ScanJobService {
             .lock()
             .ok()
             .and_then(|registry| registry.get(scan_job_id).cloned());
-        while self
-            .database
-            .has_pending_scan_job_metadata_targets(scan_job_id)
-            .await?
-        {
-            let cancellation = self.cancellation_flag(scan_job_id);
-            if self
-                .cancellation_requested(scan_job_id, false, &cancellation)
-                .await?
-            {
+        loop {
+            let notified = notify.as_ref().map(|notify| notify.notified());
+            tokio::pin!(notified);
+            if let Some(notified) = notified.as_mut().as_pin_mut() {
+                notified.enable();
+            }
+
+            let (has_pending_targets, job_missing_or_cancelled) = self
+                .database
+                .local_metadata_completion_wait_state(scan_job_id)
+                .await?;
+            if !has_pending_targets {
                 break;
             }
-            if let Some(notify) = &notify {
-                let notified = notify.notified();
+            let cancellation = self.cancellation_flag(scan_job_id);
+            if job_missing_or_cancelled {
+                cancellation.store(true, Ordering::Release);
+                break;
+            }
+            if cancellation.load(Ordering::Acquire) {
+                break;
+            }
+
+            if let Some(notified) = notified.as_mut().as_pin_mut() {
                 tokio::select! {
                     _ = notified => {}
                     _ = tokio::time::sleep(LOCAL_METADATA_COMPLETION_FALLBACK) => {}
@@ -12312,13 +12322,14 @@ mod tests {
     };
 
     use super::{
-        LOCAL_METADATA_JOB_REFRESH_FALLBACK, LibraryScanner, LocalMetadataCompletenessTrigger,
-        MANIFEST_DISCOVERY_BATCH_SIZE, MANIFEST_STREAMED_ENTRY_BATCH_SIZE,
-        MANIFEST_STREAMED_INDEX_BATCH_SIZE, MAX_STRM_TARGET_BYTES, ManifestDirectoryReader,
-        ManifestFilenameInput, ManifestRemovalOutcome, ManifestRootDiscoveryContext,
-        MixedClassification, MixedClassificationCache, MixedManifestClassification,
-        NewScanManifestDiscoveryChunk, NewScanManifestEntry, PendingManifestDirectoryChunk,
-        PreparedManifestFilename, ScanJobService, ScannerError, ScraperAvailabilityPreflight,
+        LOCAL_METADATA_COMPLETION_FALLBACK, LOCAL_METADATA_JOB_REFRESH_FALLBACK, LibraryScanner,
+        LocalMetadataCompletenessTrigger, MANIFEST_DISCOVERY_BATCH_SIZE,
+        MANIFEST_STREAMED_ENTRY_BATCH_SIZE, MANIFEST_STREAMED_INDEX_BATCH_SIZE,
+        MAX_STRM_TARGET_BYTES, ManifestDirectoryReader, ManifestFilenameInput,
+        ManifestRemovalOutcome, ManifestRootDiscoveryContext, MixedClassification,
+        MixedClassificationCache, MixedManifestClassification, NewScanManifestDiscoveryChunk,
+        NewScanManifestEntry, PendingManifestDirectoryChunk, PreparedManifestFilename,
+        ScanJobService, ScannerError, ScraperAvailabilityPreflight,
         classify_manifest_removal_outcomes, classify_mixed_file, configured_scan_concurrency,
         infer_sibling_movie_variant_suffix, infer_sibling_movie_variant_suffix_with_probe,
         is_lite_manifest_discovery, manifest_file_observation_matches,
@@ -13519,6 +13530,14 @@ mod tests {
             .await
             .expect("completion notification should beat the fallback")??;
         Ok(())
+    }
+
+    #[test]
+    fn local_metadata_completion_waiter_keeps_five_second_fallback() {
+        assert_eq!(
+            LOCAL_METADATA_COMPLETION_FALLBACK,
+            std::time::Duration::from_secs(5)
+        );
     }
 
     #[tokio::test]
