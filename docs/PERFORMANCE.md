@@ -1057,6 +1057,18 @@ poster-worker A/B 使用每个 movie 一张有效 1×1 PNG。候选父目录快�
 
 候选 scan job 可先返回，poster worker 留在后台；10k fixture 首张 poster 提前约 0.7–1.1 s，完整本地 poster 队列比基线快约 30–38%。父目录缓存单独 A/B 将候选 10k poster queue 从 7.15→5.58 s（SQLite）、51.65→37.35 s（PostgreSQL）。扫描期间 50 并发目录 p95 为 0.295–0.326 s，poster 队列完成后的 p95 为 0.036–0.058 s；扫描期间 p95 相对旧流程增加约 40–65 ms。每 16 项让出 2/10 ms 的限速实验没有稳定改善 p95，且延长队列，未保留。当前 p95 仍低于 0.4 s，但 LUX-275/LUX-304 的 5% 回退门尚未满足；LUX-305/306 随后按有界 item image write 批次减少写事务并复测，结果见下文。结果只代表本机 ARM64 与 PostgreSQL 16.15，不能外推到 NAS/x86_64；阶段 23 尚未通过性能门。
 
+### LUX-462 性能基准观测补全（2026-10-09）
+
+基准 harness 增加 SQLx statement 延迟报告和连接池采样。LUX-270 分别输出 Manifest 首扫、postprocessing target 物化、目录页首次请求、热页请求，以及无变化重扫与并发前台请求的 SQL 汇总；每个规范化 SQLx statement summary 报告调用数、累计耗时、p50/p95/max。每个 SQL 延迟对象都带有 `phaseWindow`、`backgroundSqlMayBeIncluded` 和 `phaseWindowNote`，用于标明样本边界及并发后台 SQL 的归属。采集器使用进程级 SQLx listener，phase window 表示事件采集的时间区间，并不保证把每条语句归因到该请求；因此报告会将后台 SQL 可能混入显式标为 true。summary 仅使用 SQLx 提供的前四个 SQL token，折叠空白并统一大小写，不采集 bind 值或完整 SQL。SQLx `elapsed_secs` 不包含获取连接的等待；若某阶段没有延迟事件，结果标为 `unavailable`，不填零。PostgreSQL 锁监控 SELECT 从 SQL 延迟样本中排除；SQLite 锁监控语句若被 SQLx 记录，可能仍在样本内。无变化重扫的 SQL 样本与并发管理及目录请求重叠，报告会明确这一边界。
+
+连接池在首扫、target 物化、管理 API、目录 API 首次请求和热页请求期间分别采样 `size`、`idle`、`in-use` 与饱和观察次数。采样间隔为 5 ms，读取 SQLx pool 的内存计数器；采样 task 会增加少量调度和计数读取开销，短于采样间隔的饱和也可能漏过，因此这不是 pool-acquire wait 的直接测量。目录页增加首次请求和同页 50 并发热页对照，并分别报告请求延迟、pool 压力和 SQLx 延迟摘要，便于观察首次缓存准备和后续 hydration/query 负载。单次首次目录请求只记录 `catalogListFirstRequestMs`，不从单个观察值计算请求 p50/p95；百分位数只对有多次请求的热页批次报告。
+
+LUX-304 的本地图片队列只在 scan job 的每个 `scan_local_metadata_batches` 均为 `COMPLETED`、全部存在 `images_completed_at`、没有 pending/running/failed/cancelled 批次，且本地 poster 数达到 fixture 文件数时才算排空。结果分别记录 scan-active、scan 完成但 image batch 未排空期间，以及严格排空后的目录列表 p95。中间阶段只有在请求批次开始和结束时都仍有 pending/running batch，且没有 failed/cancelled batch 或已完成但缺少 `images_completed_at` 的 batch 时才报告数值；否则写为 unavailable 并说明状态原因。失败 batch 不会被称作 pending，可继续等待 worker 重试；已完成但缺少完成标记属于不一致状态，drain 轮询会立即报错。失败、取消或仍残留的 batch 不会被统计成完成。
+
+验证（2026-10-09）：本机 `uname -m=arm64`，基准候选 revision `e487076b`，SQLite fixture 单轮运行。LUX-270 的 1k/100-directory fixture 通过并输出所有 SQL 延迟窗口与 pool 采样：Manifest DML 34 次、5 个批次；首个目录页请求 18 ms，同页 50 并发热请求 p50/p95 为 367/679 ms，并发前台请求 p95 为 692 ms。pool 采样均未观察到饱和；热页窗口最大 in-use 为 7/8。LUX-304 的 1k fixture scan p95 为 756 ms、drain 后 p95 为 726 ms；该轮 50 个 image-pending 请求开始时有 9 个 pending batch，结束时队列已 drain，因此该窗口正确报告 unavailable。10k/1,000-directory fixture 的 scan p95 为 780 ms、image-pending p95 为 755 ms、drain 后 p95 为 827 ms；pending 窗口首尾分别有 74 和 55 个待处理 batch，最终 88/88 个 batch 带 `images_completed_at` 完成且 10,000 张 poster 已登记。10k 首个条目可见 88 ms、首张 poster 可见 88 ms、scan job 完成 1,470 ms、本地图片队列完成 4,380 ms。
+
+这些是单轮观测值，用于确认字段、SQL/pool 样本及严格 drain 条件工作；不是 A/B 或性能收益结论。全量 Rust build/Clippy/测试门禁仍待通过，LUX-304 历史 A/B 仍使用此前口径；当前结果只代表本机 ARM64 与 SQLite，不外推 FNOS、NAS/x86_64 或 PostgreSQL。
+
 ### LUX-306 批量本地图片写入 A/B：1k/10k SQLite/PostgreSQL
 
 2026-09-29 在 Mac16,10 / 16 GiB / ARM64（`uname -m=arm64`），以 LUX-305 提交 `245d2f83` 为基线、LUX-306 worker 提交 `1bedd2e1` 为候选，对同一 1k/10k poster-worker fixture 在 SQLite 与 Docker PostgreSQL 16.15 上各交错运行三轮。每个 movie 有一张有效 1×1 PNG；每轮扫描期间及队列完成后各测 50 个并发 `GET /api/v1/libraries/{id}/items` 请求的 p95。表中为三轮中位数，单位 ms；首 poster 与 scan job 时间由 20 ms 轮询观察。候选每页最多准备并原子写入 16 个 movie，首个 movie 仍走单项快速路径。
