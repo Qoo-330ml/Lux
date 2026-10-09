@@ -9638,7 +9638,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 短计划与文件：将现有保序 HashSet 逻辑抽成私有纯函数并先添加单元回归；再在 `tests/reidentify.rs` 通过真实 SQLite 数据库创建含重复 ID 的重识别任务，检查计数和持久化条目；最后记录测试结果。预计修改 `src/application/reidentify.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`，共 3 个文件。
 
-结果（2026-10-09）：保序去重 helper 的单元回归 1/1 通过；SQLite 集成用例确认 5 个输入 ID 去重为 3 个 job item、`total_count` 为 3，持久化 ID 与 3 个唯一 ID 一致；`tests/reidentify.rs` 17/17、`cargo build --locked`、全目标全 feature Clippy、fmt 与 `git diff --check` 通过。一次并行全量测试中 `libraries_api` 的库更新用例返回 `DATABASE_UNAVAILABLE`；随后隔离重跑该用例和 `tests/libraries_api.rs` 全目标（13/13）通过。该全量测试的串行重跑尚待最终阶段门执行。
+结果（2026-10-09）：保序去重 helper 的单元回归 1/1 通过；SQLite 集成用例确认 5 个输入 ID 去重为 3 个 job item、`total_count` 为 3，持久化 ID 与 3 个唯一 ID 一致；service 返回的 `job.items` 仍按既有 `item_id` 顺序排序。`tests/reidentify.rs` 17/17、`cargo build --locked`、全目标全 feature Clippy、fmt 与 `git diff --check` 通过。一次并行全量测试中 `libraries_api` 的库更新用例返回 `DATABASE_UNAVAILABLE`；随后隔离重跑该用例和 `tests/libraries_api.rs` 全目标（13/13）通过。该全量测试的串行重跑尚待最终阶段门执行。
 
 #### LUX-465：合并本地 metadata 完成 waiter 状态查询
 
