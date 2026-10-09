@@ -1774,3 +1774,5 @@ deferred NFO credits flush 现在串行化同一 page collector 的 flush；某�
 这只证明同一进程内 collector 的显式重试和单库 SQLite correctness。文件系统与数据库不能组成跨系统 ACID 事务；崩溃恢复依赖 durable relation snapshot、checksum stale 判定和既有 index rebuild reconciliation。Home cache invalidation 与 coalesced event 在 scan metadata batch 的完成边界发出，不是 DB outbox，也不能与文件/数据库提交原子化。未测量 PostgreSQL/FNOS/NAS 性能或事件送达耐久性。
 
 新增固定回归 `deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 已通过：credits/index-state 失败后丢弃 collector 并重开 SQLite/PeopleService，确认 durable relation snapshot 的 checksum 不变且 index revision 保持 stale，再由既有 index rebuild 对账恢复 credits/checksum。该测试只模拟服务状态丢失和 SQLite 重连；不证明断电/文件系统崩溃一致性、PostgreSQL/FNOS 行为或生产性能收益。
+
+补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes` 通过 `lux-*` 人物路径覆盖 canonical index unchanged write；相同字节保留 inode，metadata 变化仍更新 NFO。该回归只验证写入结果，不提供系统调用耗时或生产性能数据。
