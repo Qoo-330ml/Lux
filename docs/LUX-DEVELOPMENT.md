@@ -9452,6 +9452,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 结果（2026-10-09）：新增 12-episode fixture 在旧串行实现下先失败（最大并发为 1）；有界执行后观察到并发大于 1 且不超过 4，12 个 item 共用的 `episode.nfo` 只检查一次，同名 NFO 优先级和 series/season 首个 source 选择保持。另一 fixture 先在旧实现下以 3 次 cache probe 对 5 次期望失败，随后确认两个 episode 以及重复 hierarchy ID 路径合计只检查 5 个唯一候选。路径发现单测 6/6、`series_metadata` 3/3、`scanned_series_metadata` 2/2 通过；全量 `cargo test --locked --all-targets` 通过，库测试 802 passed、13 ignored，PostgreSQL 专项 16 项因本机没有实例而 ignored。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。本机 ARM64；未测量 NAS/FNOS 文件系统墙钟或 CPU，也未据本地 SQLite 测试外推 PostgreSQL 收益。
 
+#### LUX-459：用完整 NFO 语义 fingerprint 跳过等价内容重处理
+
+范围：现有 NFO cache 用原始字节 fingerprint 做无变化快路径；字节因 XML 注释、属性顺序或格式化空白变化时，仍会重新解析，并可能重复写 rich metadata 与人物关系。增加完整 XML 文档的语义 fingerprint，在保留原始字节快路径的同时，识别仅词法变化且 XML 语义未变的 NFO。语义 fingerprint 必须覆盖未知节点、未知属性与文本，不能复用仅比较已知 projection 的 NFO writer fingerprint；忽略 XML 声明、注释、属性顺序、空元素写法差异和纯 element-only 格式空白，将 CDATA 与相同文本按相同内容处理。继续遵守 NFO 字节数、事件数和禁止 DTD 的解析限制。旧 cache 中没有 semantic fingerprint 时安全地完整处理一次并写入新格式。只有 cache、默认字段和基于旧 raw fingerprint 的人物关系快照均可复用时，才更新当前 raw/stat fingerprint 并跳过 metadata 与 relation 写入；语义内容变化或快照过期仍走原 enrichment。
+
+验收：
+
+- [ ] 相同 XML 内容在注释、属性顺序、CDATA/文本表示、空元素写法或纯格式化空白变化后得到相同 semantic fingerprint；metadata enrichment 跳过重复 metadata/person relation 写入并更新当前 revision state。
+- [ ] 已知字段变化、未知节点/属性/文本变化都会产生不同 fingerprint 并执行正常 enrichment；NFO 原始字节不被重写或规范化。
+- [ ] 原始字节完全相同的 fingerprint 快路径保持；没有 semantic fingerprint 的旧 cache 安全回退一次并可生成新 cache；资源限制和非法 XML 行为保持。
+- [ ] NFO fingerprint 单元回归与 `cargo test --locked --test metadata`、fmt、Clippy 和差异检查通过。性能记录明确区分文件读取、XML 解析和后续数据库/关系写入，不把本机正确性测试描述成 FNOS/NAS 性能收益。
+
+预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`tests/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 lexical/unknown XML/metadata-state 回归，再实现有界、保留未知结构的 semantic fingerprint 与 cache 兼容，最后运行定向 NFO 与 metadata 验证。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。
