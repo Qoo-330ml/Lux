@@ -2934,6 +2934,52 @@ impl Database {
         })
     }
 
+    pub(crate) async fn movie_metadata_pending_identity_conflict(
+        &self,
+        item_id: &str,
+        pending_item_ids: &[String],
+    ) -> Result<Option<String>, StorageError> {
+        if pending_item_ids.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = std::iter::repeat_n("?", pending_item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT conflicting_item.id
+             FROM media_items current_item
+             JOIN media_items conflicting_item
+               ON conflicting_item.library_id = current_item.library_id
+              AND conflicting_item.id <> current_item.id
+              AND conflicting_item.id IN ({placeholders})
+              AND conflicting_item.item_type = 'MOVIE'
+              AND conflicting_item.removed_at IS NULL
+              AND conflicting_item.has_available_source = 1
+              AND (
+                  current_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS NULL
+                  OR conflicting_item.parent_id IS DISTINCT FROM current_item.parent_id
+              )
+             WHERE current_item.id = ?
+               AND current_item.item_type = 'MOVIE'
+               AND current_item.removed_at IS NULL
+             ORDER BY conflicting_item.id
+             LIMIT 1"
+        );
+        let mut statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(query));
+        for pending_item_id in pending_item_ids {
+            statement = statement.bind(pending_item_id);
+        }
+        statement
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn find_media_item_by_identity(
         &self,
         identity_key: &str,

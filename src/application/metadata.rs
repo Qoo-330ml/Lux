@@ -45,6 +45,114 @@ const LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY: usize = 4;
 const LOCAL_NFO_PATH_DISCOVERY_CONCURRENCY: usize = 4;
 static LOCAL_IMAGE_READ_PERMITS: OnceLock<Arc<Semaphore>> = OnceLock::new();
 
+#[cfg(test)]
+#[derive(Clone)]
+struct ScanLocalMovieNfoConcurrencyProbe {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    peak: Arc<std::sync::atomic::AtomicUsize>,
+    identity_conflict_gate: Option<Arc<ScanLocalMovieIdentityConflictGate>>,
+}
+
+#[cfg(test)]
+struct ScanLocalMovieIdentityConflictGate {
+    contenders: tokio::sync::Barrier,
+    ready_contenders: tokio::sync::Semaphore,
+    release_contenders: tokio::sync::Semaphore,
+    conflict_checks_passed: tokio::sync::Semaphore,
+    release_first_check: tokio::sync::Semaphore,
+    hold_first_check: std::sync::atomic::AtomicBool,
+    identity_guard_held_after_first_check: std::sync::atomic::AtomicBool,
+    metadata_updates_pushed: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+impl ScanLocalMovieIdentityConflictGate {
+    fn new(contenders: usize) -> Self {
+        Self {
+            contenders: tokio::sync::Barrier::new(contenders),
+            ready_contenders: tokio::sync::Semaphore::new(0),
+            release_contenders: tokio::sync::Semaphore::new(0),
+            conflict_checks_passed: tokio::sync::Semaphore::new(0),
+            release_first_check: tokio::sync::Semaphore::new(0),
+            hold_first_check: std::sync::atomic::AtomicBool::new(true),
+            identity_guard_held_after_first_check: std::sync::atomic::AtomicBool::new(false),
+            metadata_updates_pushed: tokio::sync::Semaphore::new(0),
+        }
+    }
+
+    async fn meet_contenders_before_guard(&self) {
+        self.contenders.wait().await;
+        self.ready_contenders.add_permits(1);
+        if let Ok(release) = self.release_contenders.acquire().await {
+            release.forget();
+        }
+    }
+
+    async fn hold_first_successful_conflict_check(
+        &self,
+        identity_update_guard: Option<&Arc<Mutex<()>>>,
+    ) {
+        self.identity_guard_held_after_first_check.store(
+            identity_update_guard.is_some_and(|guard| guard.try_lock().is_err()),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+        self.conflict_checks_passed.add_permits(1);
+        if self
+            .hold_first_check
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            if let Ok(release) = self.release_first_check.acquire().await {
+                release.forget();
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+struct ScanLocalMovieNfoConcurrencyGuard {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(test)]
+impl ScanLocalMovieNfoConcurrencyProbe {
+    fn new() -> Self {
+        Self {
+            active: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            peak: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            identity_conflict_gate: None,
+        }
+    }
+
+    fn with_identity_conflict_gate(mut self, contenders: usize) -> Self {
+        self.identity_conflict_gate = Some(Arc::new(ScanLocalMovieIdentityConflictGate::new(
+            contenders,
+        )));
+        self
+    }
+
+    async fn enter(&self) -> ScanLocalMovieNfoConcurrencyGuard {
+        let active = self
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.peak
+            .fetch_max(active, std::sync::atomic::Ordering::SeqCst);
+        let guard = ScanLocalMovieNfoConcurrencyGuard {
+            active: Arc::clone(&self.active),
+        };
+        tokio::task::yield_now().await;
+        guard
+    }
+}
+
+#[cfg(test)]
+impl Drop for ScanLocalMovieNfoConcurrencyGuard {
+    fn drop(&mut self) {
+        self.active
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 fn spawn_bounded_task<I, F, Fut, T>(
     pending: &mut JoinSet<(usize, T)>,
     task_indices: &mut HashMap<tokio::task::Id, usize>,
@@ -677,6 +785,8 @@ pub struct MetadataEnricher {
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     resources: ResourceMetrics,
+    #[cfg(test)]
+    scan_local_movie_nfo_concurrency_probe: Option<ScanLocalMovieNfoConcurrencyProbe>,
 }
 
 #[derive(Default)]
@@ -781,6 +891,9 @@ struct ScanLocalMetadataNfoSnapshot {
 #[derive(Clone, Default)]
 struct DeferredLocalNfoMetadataUpdates {
     state: Arc<Mutex<DeferredLocalNfoMetadataState>>,
+    identity_update_guard: Arc<Mutex<()>>,
+    #[cfg(test)]
+    identity_conflict_gate: Option<Arc<ScanLocalMovieIdentityConflictGate>>,
 }
 
 #[derive(Default)]
@@ -890,6 +1003,30 @@ impl DeferredLocalNfoMetadataUpdates {
             .await
             .pending
             .push(DeferredLocalNfoMetadataUpdate::from_update(update));
+        #[cfg(test)]
+        if let Some(gate) = self.identity_conflict_gate.as_ref() {
+            gate.metadata_updates_pushed.add_permits(1);
+        }
+    }
+
+    async fn pending_identity_item_ids(
+        &self,
+        item_id: &str,
+        sort_title: &str,
+        production_year: i64,
+    ) -> Vec<String> {
+        self.state
+            .lock()
+            .await
+            .pending
+            .iter()
+            .filter(|update| {
+                update.item_id != item_id
+                    && update.title.to_lowercase() == sort_title
+                    && update.production_year == Some(production_year)
+            })
+            .map(|update| update.item_id.clone())
+            .collect()
     }
 
     async fn take_pending(&self) -> Vec<DeferredLocalNfoMetadataUpdate> {
@@ -915,11 +1052,6 @@ impl DeferredLocalNfoMetadataUpdates {
 
     async fn take_default_repairs(&self) -> Vec<DeferredLocalNfoDefaultsRepair> {
         std::mem::take(&mut self.state.lock().await.pending_default_repairs)
-    }
-
-    async fn has_pending(&self) -> bool {
-        let state = self.state.lock().await;
-        !state.pending.is_empty() || !state.pending_default_repairs.is_empty()
     }
 
     async fn record_failure(
@@ -952,6 +1084,13 @@ struct SeriesNfoRequest {
     deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
 }
 
+struct ScanLocalMovieNfoRequest {
+    item_id: String,
+    nfo_path: PathBuf,
+    metadata: Option<StoredMediaMetadata>,
+    deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
+}
+
 #[derive(Clone, Copy)]
 enum ScanNfoPathSourceKind {
     Movie,
@@ -980,6 +1119,10 @@ enum NfoMetadataLookup<'a> {
     Snapshot {
         metadata_by_item: &'a mut HashMap<String, StoredMediaMetadata>,
         deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
+    },
+    OwnedSnapshot {
+        metadata: Option<StoredMediaMetadata>,
+        deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
     },
 }
 
@@ -1147,6 +1290,8 @@ impl MetadataEnricher {
             people: None,
             local_nfo: None,
             resources: ResourceMetrics::new(),
+            #[cfg(test)]
+            scan_local_movie_nfo_concurrency_probe: None,
         }
     }
 
@@ -1487,6 +1632,16 @@ impl MetadataEnricher {
             .collect::<HashSet<_>>();
         sources.retain(|source| current_item_ids.contains(&source.item_id));
         let mut nfo_snapshot = scan_local_metadata_nfo_paths(&sources).await;
+        #[cfg(test)]
+        if let Some(gate) = self
+            .scan_local_movie_nfo_concurrency_probe
+            .as_ref()
+            .and_then(|probe| probe.identity_conflict_gate.as_ref())
+        {
+            nfo_snapshot
+                .deferred_metadata_updates
+                .identity_conflict_gate = Some(Arc::clone(gate));
+        }
         let mut metadata_item_ids = nfo_snapshot
             .nfo_paths_by_item
             .keys()
@@ -1507,22 +1662,66 @@ impl MetadataEnricher {
             .people
             .as_ref()
             .map(|_| DeferredNfoActorCredits::default());
+        let mut movie_nfo_requests = Vec::with_capacity(movies.len());
         for source in movies {
             report.items_processed += 1;
             if let Some(nfo_path) = nfo_snapshot.nfo_paths_by_item.remove(&source.item_id) {
-                let deferred_metadata_updates =
-                    Some(nfo_snapshot.deferred_metadata_updates.clone());
-                self.enrich_nfo_item_best_effort_with_metadata(
-                    &mut report,
-                    &source.item_id,
-                    &nfo_path,
-                    NfoMetadataLookup::Snapshot {
-                        metadata_by_item: &mut nfo_snapshot.metadata_by_item,
-                        deferred_metadata_updates,
-                    },
-                    deferred_actor_credits.clone(),
-                )
-                .await;
+                movie_nfo_requests.push(ScanLocalMovieNfoRequest {
+                    item_id: source.item_id.clone(),
+                    nfo_path,
+                    metadata: nfo_snapshot.metadata_by_item.remove(&source.item_id),
+                    deferred_metadata_updates: nfo_snapshot.deferred_metadata_updates.clone(),
+                });
+            }
+        }
+        let movie_nfo_item_ids = movie_nfo_requests
+            .iter()
+            .map(|request| request.item_id.clone())
+            .collect::<Vec<_>>();
+        let movie_nfo_results =
+            run_bounded_tasks_in_order(movie_nfo_requests, LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY, {
+                let enricher = self.clone();
+                let deferred_actor_credits = deferred_actor_credits.clone();
+                move |request| {
+                    let enricher = enricher.clone();
+                    let deferred_actor_credits = deferred_actor_credits.clone();
+                    async move {
+                        #[cfg(test)]
+                        let _concurrency_guard =
+                            match &enricher.scan_local_movie_nfo_concurrency_probe {
+                                Some(probe) => Some(probe.enter().await),
+                                None => None,
+                            };
+                        let mut item_report = MetadataReport::default();
+                        enricher
+                            .enrich_nfo_item_best_effort_with_metadata(
+                                &mut item_report,
+                                &request.item_id,
+                                &request.nfo_path,
+                                NfoMetadataLookup::OwnedSnapshot {
+                                    metadata: request.metadata,
+                                    deferred_metadata_updates: request.deferred_metadata_updates,
+                                },
+                                deferred_actor_credits,
+                            )
+                            .await;
+                        item_report
+                    }
+                }
+            })
+            .await;
+        for (result, item_id) in movie_nfo_results.into_iter().zip(movie_nfo_item_ids) {
+            match result {
+                Ok(item_report) => report.merge(item_report),
+                Err(error) => {
+                    tracing::error!(
+                        item_id = %item_id,
+                        %error,
+                        "local movie NFO task failed unexpectedly; continuing with remaining items"
+                    );
+                    report.nfo_failed += 1;
+                    report.mark_item_failed(&item_id);
+                }
             }
         }
         self.enrich_home_video_sources_with_snapshot(
@@ -2402,6 +2601,19 @@ impl MetadataEnricher {
                 )
                 .await
             }
+            NfoMetadataLookup::OwnedSnapshot {
+                metadata,
+                deferred_metadata_updates,
+            } => {
+                self.enrich_nfo_item_with_metadata(
+                    item_id,
+                    nfo_path,
+                    metadata,
+                    deferred_actor_credits,
+                    Some(deferred_metadata_updates),
+                )
+                .await
+            }
         };
         match enriched {
             Ok(nfo_report) => {
@@ -2568,6 +2780,9 @@ impl MetadataEnricher {
             }
         };
         let current = metadata;
+        let mut identity_update_guard = None;
+        #[cfg(test)]
+        let mut identity_conflict_gate = None;
         if let Some(current) = current.as_ref() {
             let mut state = MetadataState::from_persisted(
                 NfoMetadata {
@@ -2588,15 +2803,27 @@ impl MetadataEnricher {
             let title_changed = state.metadata.title.as_deref() != Some(current.title.as_str());
             let year_changed =
                 state.metadata.production_year.map(i64::from) != current.production_year;
+            if title_changed || year_changed {
+                #[cfg(test)]
+                if let Some(gate) = self
+                    .scan_local_movie_nfo_concurrency_probe
+                    .as_ref()
+                    .and_then(|probe| probe.identity_conflict_gate.as_ref())
+                {
+                    gate.meet_contenders_before_guard().await;
+                    identity_conflict_gate = Some(Arc::clone(gate));
+                }
+                if let Some(deferred_updates) = deferred_metadata_updates.as_ref() {
+                    identity_update_guard = Some(
+                        Arc::clone(&deferred_updates.identity_update_guard)
+                            .lock_owned()
+                            .await,
+                    );
+                }
+            }
             if (title_changed || year_changed)
                 && let Some(production_year) = state.metadata.production_year
             {
-                if let Some(deferred_updates) = deferred_metadata_updates.as_ref()
-                    && deferred_updates.has_pending().await
-                {
-                    self.flush_deferred_local_nfo_metadata_updates(deferred_updates)
-                        .await;
-                }
                 let title = state
                     .metadata
                     .title
@@ -2613,7 +2840,35 @@ impl MetadataEnricher {
                         conflicting_item_id,
                     });
                 }
+                if let Some(deferred_updates) = deferred_metadata_updates.as_ref() {
+                    let pending_identity_item_ids = deferred_updates
+                        .pending_identity_item_ids(item_id, &title, i64::from(production_year))
+                        .await;
+                    if !pending_identity_item_ids.is_empty()
+                        && let Some(conflicting_item_id) = self
+                            .database
+                            .movie_metadata_pending_identity_conflict(
+                                item_id,
+                                &pending_identity_item_ids,
+                            )
+                            .await?
+                    {
+                        return Err(MetadataError::ConflictingMovieIdentity {
+                            item_id: item_id.to_owned(),
+                            conflicting_item_id,
+                        });
+                    }
+                }
             }
+        }
+        #[cfg(test)]
+        if let Some(gate) = identity_conflict_gate {
+            gate.hold_first_successful_conflict_check(
+                deferred_metadata_updates
+                    .as_ref()
+                    .map(|deferred_updates| &deferred_updates.identity_update_guard),
+            )
+            .await;
         }
         let local_rating = projection.details.rating;
         if let Some(local_nfo) = &self.local_nfo {
@@ -2727,8 +2982,10 @@ impl MetadataEnricher {
             };
             if let Some(deferred_metadata_updates) = deferred_metadata_updates {
                 deferred_metadata_updates.push(update).await;
+                drop(identity_update_guard.take());
             } else {
                 self.database.update_media_item_metadata(update).await?;
+                drop(identity_update_guard.take());
             }
         }
         report.nfo_loaded = 1;
@@ -3935,9 +4192,11 @@ mod tests {
 
         let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
         let resources = ResourceMetrics::new();
-        let enricher = MetadataEnricher::new(database.clone())
+        let concurrency_probe = ScanLocalMovieNfoConcurrencyProbe::new();
+        let mut enricher = MetadataEnricher::new(database.clone())
             .with_people(people.clone())
             .with_resource_metrics(resources.clone());
+        enricher.scan_local_movie_nfo_concurrency_probe = Some(concurrency_probe.clone());
         let image_batch = enricher
             .index_scan_local_metadata_batch_images(&entry_ids)
             .await?;
@@ -3960,6 +4219,13 @@ mod tests {
         assert_eq!(batch.report.items_processed, 3);
         assert_eq!(batch.report.nfo_loaded, 2);
         assert_eq!(batch.report.nfo_failed, 1);
+        let max_nfo_concurrency = concurrency_probe
+            .peak
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            (2..=LOCAL_MOVIE_NFO_ENRICH_CONCURRENCY).contains(&max_nfo_concurrency),
+            "scan-local movie NFO enrichment should overlap while staying within the configured limit; observed {max_nfo_concurrency}"
+        );
         assert!(batch.report.failed_item_ids.contains(&invalid_item_id));
         for title in ["Movie Two", "Movie Three"] {
             let item_id: String =
@@ -4088,6 +4354,194 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_local_movie_page_serializes_conflicting_identity_updates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let media_root = directory.path().join("Movies");
+        for (folder, stem, nfo) in [
+            (
+                "Identity Alpha (1985)",
+                "Identity.Alpha.1985",
+                "<movie><title>Shared Page Identity</title><year>1999</year></movie>",
+            ),
+            (
+                "Identity Beta (1986)",
+                "Identity.Beta.1986",
+                "<movie><title>Shared Page Identity</title><year>1999</year></movie>",
+            ),
+            (
+                "Identity Regular (2000)",
+                "Identity.Regular.2000",
+                "<movie><title>Identity Regular</title><year>2000</year><plot>Ordinary NFO overview</plot></movie>",
+            ),
+        ] {
+            let movie_dir = media_root.join(folder);
+            tokio::fs::create_dir_all(&movie_dir).await?;
+            tokio::fs::write(movie_dir.join(format!("{stem}.mkv")), b"media").await?;
+            tokio::fs::write(movie_dir.join("movie.nfo"), nfo).await?;
+        }
+
+        let database = Database::connect(&config).await?;
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(
+                library.id,
+                media_root.to_str().ok_or("non-UTF8 media root")?,
+            )
+            .await?;
+        crate::application::scanner::LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+
+        let original_items: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT id, title, production_year FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE' ORDER BY production_year",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(original_items.len(), 3);
+        let conflict_items = original_items
+            .iter()
+            .filter(|(_, _, year)| matches!(year, 1985 | 1986))
+            .map(|(item_id, _, _)| item_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(conflict_items.len(), 2);
+        let regular_item_id = original_items
+            .iter()
+            .find(|(_, _, year)| *year == 2000)
+            .ok_or("regular movie")?
+            .0
+            .clone();
+        let entry_ids = sqlx::query_scalar::<_, String>(
+            "SELECT source.filesystem_entry_id FROM media_sources source
+             JOIN media_items item ON item.id = source.item_id
+             WHERE item.library_id = ? AND source.filesystem_entry_id IS NOT NULL
+             ORDER BY item.production_year",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(entry_ids.len(), 3);
+        let sources = database
+            .list_scan_local_metadata_sources(&entry_ids)
+            .await?;
+        assert_eq!(sources.len(), 3);
+
+        let concurrency_probe =
+            ScanLocalMovieNfoConcurrencyProbe::new().with_identity_conflict_gate(2);
+        let identity_gate = Arc::clone(
+            concurrency_probe
+                .identity_conflict_gate
+                .as_ref()
+                .ok_or("identity conflict gate")?,
+        );
+        let resources = ResourceMetrics::new();
+        let mut enricher =
+            MetadataEnricher::new(database.clone()).with_resource_metrics(resources.clone());
+        enricher.scan_local_movie_nfo_concurrency_probe = Some(concurrency_probe);
+        let batch_task = tokio::spawn(async move {
+            enricher
+                .enrich_scan_local_metadata_batch_nfo(sources, &[])
+                .await
+        });
+
+        // The changed-identity tasks wait at the test gate. The ordinary movie can
+        // therefore enqueue its update first, making an early page flush observable.
+        let ordinary_update = identity_gate.metadata_updates_pushed.acquire().await?;
+        ordinary_update.forget();
+        for _ in 0..2 {
+            let ready = identity_gate.ready_contenders.acquire().await?;
+            ready.forget();
+        }
+        identity_gate.release_contenders.add_permits(2);
+        let first_check = identity_gate.conflict_checks_passed.acquire().await?;
+        first_check.forget();
+        let identity_guard_held_during_check = identity_gate
+            .identity_guard_held_after_first_check
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let transactions_while_check_is_held = resources.snapshot().await;
+        identity_gate.release_first_check.add_permits(1);
+        assert!(
+            identity_guard_held_during_check,
+            "the page identity guard must remain held after the database check"
+        );
+        assert_eq!(
+            transactions_while_check_is_held
+                .metadata
+                .counters
+                .get("batch.local_nfo_state_tx.count")
+                .copied()
+                .unwrap_or_default(),
+            0,
+            "identity conflict checks must not flush pending page metadata updates"
+        );
+
+        let batch = batch_task.await??;
+        assert_eq!(batch.report.items_processed, 3);
+        assert_eq!(batch.report.nfo_loaded, 2);
+        assert_eq!(batch.report.nfo_failed, 1);
+        assert_eq!(batch.report.non_retryable_failed_item_ids.len(), 1);
+        let failed_conflict_id = &batch.report.non_retryable_failed_item_ids[0];
+        assert!(conflict_items.contains(failed_conflict_id));
+        assert!(!batch.report.failed_item_ids.contains(&regular_item_id));
+
+        let shared_identity_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE library_id = ? AND item_type = 'MOVIE'
+               AND title = 'Shared Page Identity' AND production_year = 1999",
+        )
+        .bind(library.id.to_string())
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(shared_identity_count, 1);
+        let unchanged_conflict_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_items
+             WHERE id IN (?, ?) AND title <> 'Shared Page Identity'",
+        )
+        .bind(&conflict_items[0])
+        .bind(&conflict_items[1])
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(unchanged_conflict_count, 1);
+        let regular_metadata: (String, Option<String>) =
+            sqlx::query_as("SELECT title, overview FROM media_items WHERE id = ?")
+                .bind(&regular_item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(regular_metadata.0, "Identity Regular");
+        assert_eq!(regular_metadata.1.as_deref(), Some("Ordinary NFO overview"));
+        let final_metrics = resources.snapshot().await;
+        assert_eq!(
+            final_metrics
+                .metadata
+                .counters
+                .get("batch.local_nfo_state_tx.count")
+                .copied()
+                .unwrap_or_default(),
+            1,
+            "ordinary and accepted identity metadata updates should share the page-end flush"
+        );
+        assert_eq!(
+            final_metrics
+                .metadata
+                .counters
+                .get("batch.local_nfo_state_tx.metadata_updates")
+                .copied()
+                .unwrap_or_default(),
+            2
+        );
         Ok(())
     }
 
@@ -4233,15 +4687,16 @@ mod tests {
         let metrics = resources.snapshot().await;
         assert_eq!(
             metrics.metadata.counters["batch.local_nfo_state_tx.count"], 3,
-            "page transaction and fallback writes must all be recorded"
+            "page transaction and fallback writes must all be recorded: {:?}",
+            metrics.metadata.counters
         );
         assert_eq!(
-            metrics.metadata.counters["batch.local_nfo_state_tx.items"],
-            3
+            metrics.metadata.counters["batch.local_nfo_state_tx.items"], 4,
+            "the failed page batch contains both items, then each item is retried"
         );
         assert_eq!(
             metrics.metadata.counters["batch.local_nfo_state_tx.metadata_updates"],
-            3
+            4
         );
         assert_eq!(
             metrics.metadata.counters["batch.local_nfo_state_tx.default_repairs"],

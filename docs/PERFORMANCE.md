@@ -1720,3 +1720,9 @@ actor relation 检查仍先逐 item 检查新式 relation。需要 legacy fallba
 ### LUX-458 本地 metadata NFO 路径发现有界并发
 
 scan-local NFO page 的路径发现从逐 source 串行改为最多 4 个并发任务，最终仍按 source 输入顺序写入 snapshot。每个 page 用异步单元格共享相同候选路径的 in-flight `try_exists` 结果，覆盖 episode、series 和 season NFO。固定 12-episode fixture 观测到并发大于 1 且不超过 4；12 个不同同名候选加 1 个共享 `episode.nfo` 共进行 13 次候选存在性检查，shared fallback 仅检查一次。另一个两 episode fixture 让不同 hierarchy ID 指向相同 tvshow/season NFO，共 5 个唯一候选只进行 5 次检查。NFO 内容读取/解析、series/season 选择、每 item 错误映射及后续 credits transaction 边界不变。该回归测量的是应用层候选检查次数和并发上界，不是物理磁盘 I/O 数、文件系统墙钟或 FNOS/NAS/PostgreSQL/CPU 收益。
+
+### LUX-460 scan-local 普通电影 NFO 有界并发
+
+scan-local movie metadata page 复用有序 task runner，最多同时执行 4 个普通电影 NFO enrichment；结果按 source 顺序归并，单 item 的解析或 task 错误继续隔离。page deferred metadata 与 actor credits 仍由原 page 末 flush 边界提交。title/year 发生变化的电影在共享 guard 下检查数据库现存身份及尚未 flush 的同页 pending identity reservations，再写入 NFO cache/actor relation 并排入 metadata update collector；入队后释放 guard。pending reservation 候选由 storage 按当前 parent、可用 source 和 active 状态复核，身份冲突检查不提前 flush page collector。同步 gate 固定回归检查冲突检查期间没有 metadata transaction，以及普通 metadata update 与唯一成功身份更新在 page 末共用一次事务。
+
+这里记录的是应用层并发上限和身份检查/入队顺序；没有墙钟、吞吐、FNOS CPU、PostgreSQL 或 NAS 测量。Cargo 验证尚待统一测试窗口，当前记录不代表验收通过。
