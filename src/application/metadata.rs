@@ -1121,7 +1121,7 @@ enum NfoMetadataLookup<'a> {
         deferred_metadata_updates: Option<DeferredLocalNfoMetadataUpdates>,
     },
     OwnedSnapshot {
-        metadata: Option<StoredMediaMetadata>,
+        metadata: Option<Box<StoredMediaMetadata>>,
         deferred_metadata_updates: DeferredLocalNfoMetadataUpdates,
     },
 }
@@ -1699,7 +1699,7 @@ impl MetadataEnricher {
                                 &request.item_id,
                                 &request.nfo_path,
                                 NfoMetadataLookup::OwnedSnapshot {
-                                    metadata: request.metadata,
+                                    metadata: request.metadata.map(Box::new),
                                     deferred_metadata_updates: request.deferred_metadata_updates,
                                 },
                                 deferred_actor_credits,
@@ -2608,7 +2608,7 @@ impl MetadataEnricher {
                 self.enrich_nfo_item_with_metadata(
                     item_id,
                     nfo_path,
-                    metadata,
+                    metadata.map(|metadata| *metadata),
                     deferred_actor_credits,
                     Some(deferred_metadata_updates),
                 )
@@ -4324,7 +4324,11 @@ mod tests {
                     .bind(title)
                     .fetch_one(database.pool())
                     .await?;
-            assert!(batch.report.failed_item_ids.contains(&item_id));
+            assert!(
+                batch.report.failed_item_ids.contains(&item_id),
+                "expected item {item_id} ({title}) to fail as part of the actor-credit batch; failed IDs: {:?}",
+                batch.report.failed_item_ids,
+            );
         }
         let failed_chunk_items: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM person_index_item_state
@@ -4862,8 +4866,17 @@ mod tests {
             ..LocalNfoDetails::default()
         };
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
+        let (_, semantic_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(nfo_bytes)?;
+        let raw_content_fingerprint = nfo_content_fingerprint(nfo_bytes);
         local_nfo
-            .write_item(item_id, &nfo_content_fingerprint(nfo_bytes), &details)
+            .write_item_with_semantic_fingerprint(
+                item_id,
+                &raw_content_fingerprint,
+                Some(&semantic_fingerprint),
+                Some(&raw_content_fingerprint),
+                &details,
+            )
             .await?;
         let metadata = database
             .find_media_item_metadata(item_id)
@@ -4998,8 +5011,17 @@ mod tests {
             provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
             ..LocalNfoDetails::default()
         };
+        let (_, semantic_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(nfo_bytes)?;
+        let raw_content_fingerprint = nfo_content_fingerprint(nfo_bytes);
         LocalNfoMetadataStore::new(database.clone())
-            .write_item(item_id, &nfo_content_fingerprint(nfo_bytes), &details)
+            .write_item_with_semantic_fingerprint(
+                item_id,
+                &raw_content_fingerprint,
+                Some(&semantic_fingerprint),
+                Some(&raw_content_fingerprint),
+                &details,
+            )
             .await?;
 
         let enricher = MetadataEnricher::new(database.clone())
@@ -5068,8 +5090,17 @@ mod tests {
             provider_ids: BTreeMap::from([("tmdb".to_owned(), "42".to_owned())]),
             ..LocalNfoDetails::default()
         };
+        let (_, semantic_fingerprint) =
+            parse_local_nfo_projection_with_semantic_fingerprint(nfo_bytes)?;
+        let raw_content_fingerprint = nfo_content_fingerprint(nfo_bytes);
         LocalNfoMetadataStore::new(database.clone())
-            .write_item(item_id, &nfo_content_fingerprint(nfo_bytes), &details)
+            .write_item_with_semantic_fingerprint(
+                item_id,
+                &raw_content_fingerprint,
+                Some(&semantic_fingerprint),
+                Some(&raw_content_fingerprint),
+                &details,
+            )
             .await?;
 
         let enricher = MetadataEnricher::new(database.clone())

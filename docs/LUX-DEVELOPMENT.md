@@ -9459,14 +9459,14 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 验收：
 
-- [ ] 相同 XML 内容在注释、属性顺序、CDATA/文本表示、空元素写法或纯格式化空白变化后得到相同 semantic fingerprint；metadata enrichment 跳过重复 metadata/person relation 写入并更新当前 revision state。
-- [ ] 已知字段变化、未知节点/属性/文本变化都会产生不同 fingerprint 并执行正常 enrichment；NFO 原始字节不被重写或规范化。
-- [ ] 原始字节完全相同的 fingerprint 快路径保持；没有 semantic fingerprint 的旧 cache 安全回退一次并可生成新 cache；资源限制和非法 XML 行为保持。
-- [ ] NFO fingerprint 单元回归与 `cargo test --locked --test metadata`、fmt、Clippy 和差异检查通过。性能记录明确区分文件读取、XML 解析和后续数据库/关系写入，不把本机正确性测试描述成 FNOS/NAS 性能收益。
+- [x] 相同 XML 内容在注释、属性顺序、CDATA/文本表示、空元素写法或纯格式化空白变化后得到相同 semantic fingerprint；metadata enrichment 跳过重复 metadata/person relation 写入并更新当前 revision state。
+- [x] 已知字段变化、未知节点/属性/文本变化都会产生不同 fingerprint 并执行正常 enrichment；NFO 原始字节不被重写或规范化。
+- [x] 原始字节完全相同的 fingerprint 快路径保持；没有 semantic fingerprint 的旧 cache 安全回退一次并可生成新 cache；资源限制和非法 XML 行为保持。
+- [x] NFO fingerprint 单元回归与 `cargo test --locked --test metadata`、fmt、Clippy 和差异检查通过。性能记录明确区分文件读取、XML 解析和后续数据库/关系写入，不把本机正确性测试描述成 FNOS/NAS 性能收益。
 
-预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`tests/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 lexical/unknown XML/metadata-state 回归，再实现有界、保留未知结构的 semantic fingerprint 与 cache 兼容，最后运行定向 NFO 与 metadata 验证。
+预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`src/application/candidates.rs`、`tests/metadata.rs`、`tests/reidentify.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 lexical/unknown XML/metadata-state 回归，再实现有界、保留未知结构的 semantic fingerprint 与 cache 兼容，最后运行定向 NFO 与 metadata 验证。
 
-进度（2026-10-09）：核心实现及 lexical、未知 XML、metadata state、旧 cache、`xml:space` 和属性规范化回归已补。定向验证通过：`cargo test --locked --lib application::nfo::tests` 为 8/8，`cargo test --locked --test metadata` 为 21/21。测试发现并修正了 cache-enabled projection 按 Text event 裁剪空格的问题；该路径现保留字段内部空白，projection-only 路径仍保持既有行为。属性规范化区分字面 TAB/换行（XML 1.0 将其规范化为空格）与字符引用（保留引用字符），并将 CRLF 与 LF 字面换行按相同值处理；只有启用 local NFO cache 时才收集 semantic tokens。cache-enabled 解析让合法预定义/数字引用进入 metadata projection，并拒绝未声明的 general entity；回归检查 lexical rewrite 后 stat revision 与 raw cache source revision 均更新。全局 build、Clippy、全量 Rust 测试与集成工作树验收尚待完成，故任务验收仍开放。
+进度（2026-10-09）：核心实现及 lexical、未知 XML、metadata state、旧 cache、`xml:space` 和属性规范化回归已补。cache-enabled projection 保留字段内部空白，projection-only 路径仍保持既有行为；属性规范化区分字面 TAB/换行与字符引用，并将 CRLF 与 LF 字面换行按相同值处理。cache-enabled 解析接受合法预定义/数字引用进入 metadata projection，并拒绝未声明 general entity。首次全量测试发现完整性规划仍按旧 JSON 结构解码 rich cache，导致完整本地 NFO 被误判缺少 credits/trailers 并发起候选搜索；现改为复用版本化 cache decoder，`fill_missing_skips_complete_movie_without_scraper_request` 回归通过，旧格式兼容不变。NFO 单测 8/8、metadata 单测 21/21、`tests/metadata.rs` 21/21 与 `tests/reidentify.rs` 16/16 通过。最终复跑 `cargo test --locked --all-targets` 成功：library 807 passed、13 ignored；所有 integration targets 通过。`cargo build --locked`、fmt、全目标全 feature Clippy 与 `git diff --check` 通过；PostgreSQL 专项因本机无默认实例而 ignored。
 #### LUX-460：扫描本地 metadata page 普通电影 NFO 有界并发
 
 范围：scan-local metadata NFO page 当前逐个 await 普通电影的 NFO enrichment。复用现有有界有序 task runner 和电影 NFO 并发上限（最多 4 路），让一个 page 内独立电影并发处理，并按原 source 顺序归并结果。单个 NFO 失败或 task 异常仍只影响对应 item。page 级延迟 metadata 更新继续在所有电影、home video 与剧集处理后统一 flush；actor credits 继续使用共享 deferred collector 并在 page 末统一 flush。只修改 scan-local page 的 MOVIE 路径；库级 `enrich_movie_sources`、home-video、series/season/episode 和 OnDemand 路径不扩大范围。

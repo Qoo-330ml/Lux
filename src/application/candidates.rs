@@ -18,7 +18,7 @@ use crate::{
         metadata::{MetadataCandidate, MetadataField, MetadataSource, MetadataState, NfoMetadata},
         nfo::{
             LocalNfoProjectionCache, MovieNfoCredit, MovieNfoMetadata, NfoWriteError,
-            NfoWriteService,
+            NfoWriteService, local_nfo_details_from_cache_json,
         },
         people::{ActorCredit, LocalActorRelationPageCache, PeopleError},
         scraper::{
@@ -2524,9 +2524,10 @@ impl MetadataSelectionService {
         writeback_context: Option<&crate::storage::StoredMediaWritebackContext>,
         page_caches: Option<LocalCompletenessPlanningCaches>,
     ) -> Result<(MetadataRequestPlan, Option<(String, String)>), MetadataSelectionError> {
-        let details = current.nfo_metadata_json.as_deref().and_then(|value| {
-            serde_json::from_str::<crate::application::nfo::LocalNfoDetails>(value).ok()
-        });
+        let details = current
+            .nfo_metadata_json
+            .as_deref()
+            .and_then(local_nfo_details_from_cache_json);
         let details = if details.is_some() {
             details
         } else if let (Some(page_caches), Some(context)) = (page_caches.as_ref(), writeback_context)

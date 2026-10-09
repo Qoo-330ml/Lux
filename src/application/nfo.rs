@@ -596,7 +596,7 @@ fn nfo_semantic_fingerprint_from_tokens(tokens: &[NfoSemanticToken]) -> Vec<u8> 
             NfoSemanticToken::Start {
                 name, attributes, ..
             } => {
-                hasher.update([b'S']);
+                hasher.update(*b"S");
                 hash_nfo_semantic_bytes(&mut hasher, name);
                 hasher.update((attributes.len() as u64).to_be_bytes());
                 for (name, value) in attributes {
@@ -606,7 +606,7 @@ fn nfo_semantic_fingerprint_from_tokens(tokens: &[NfoSemanticToken]) -> Vec<u8> 
                 skip_whitespace_stack.push(element_only_whitespace[token_index]);
             }
             NfoSemanticToken::End(name) => {
-                hasher.update([b'E']);
+                hasher.update(*b"E");
                 hash_nfo_semantic_bytes(&mut hasher, name);
                 skip_whitespace_stack.pop();
             }
@@ -615,11 +615,11 @@ fn nfo_semantic_fingerprint_from_tokens(tokens: &[NfoSemanticToken]) -> Vec<u8> 
                 {
                     continue;
                 }
-                hasher.update([b'T']);
+                hasher.update(*b"T");
                 hash_nfo_semantic_bytes(&mut hasher, text.as_bytes());
             }
             NfoSemanticToken::ProcessingInstruction { target, content } => {
-                hasher.update([b'P']);
+                hasher.update(*b"P");
                 hash_nfo_semantic_bytes(&mut hasher, target);
                 hash_nfo_semantic_bytes(&mut hasher, content);
             }
@@ -1084,9 +1084,13 @@ struct LocalNfoCacheEnvelope {
     details: LocalNfoDetails,
 }
 
-fn decode_local_nfo_cache(
-    json: &str,
-) -> Result<(LocalNfoDetails, Option<Vec<u8>>, Option<Vec<u8>>), String> {
+struct DecodedLocalNfoCache {
+    details: LocalNfoDetails,
+    semantic_fingerprint: Option<Vec<u8>>,
+    relation_fingerprint: Option<Vec<u8>>,
+}
+
+fn decode_local_nfo_cache(json: &str) -> Result<DecodedLocalNfoCache, String> {
     let value =
         serde_json::from_str::<serde_json::Value>(json).map_err(|error| error.to_string())?;
     if value.get("schemaVersion").is_some() {
@@ -1101,11 +1105,25 @@ fn decode_local_nfo_cache(
         let relation_fingerprint = envelope
             .relation_fingerprint
             .filter(|fingerprint| valid_nfo_content_fingerprint(fingerprint));
-        return Ok((envelope.details, semantic_fingerprint, relation_fingerprint));
+        return Ok(DecodedLocalNfoCache {
+            details: envelope.details,
+            semantic_fingerprint,
+            relation_fingerprint,
+        });
     }
     serde_json::from_value(value)
-        .map(|details| (details, None, None))
+        .map(|details| DecodedLocalNfoCache {
+            details,
+            semantic_fingerprint: None,
+            relation_fingerprint: None,
+        })
         .map_err(|error| error.to_string())
+}
+
+pub(crate) fn local_nfo_details_from_cache_json(json: &str) -> Option<LocalNfoDetails> {
+    decode_local_nfo_cache(json)
+        .ok()
+        .map(|decoded| decoded.details)
 }
 
 fn encode_local_nfo_cache(
@@ -1192,7 +1210,7 @@ impl LocalNfoMetadataStore {
             return Ok(None);
         }
         match decode_local_nfo_cache(&json) {
-            Ok((details, _, _)) => Ok(Some(details)),
+            Ok(decoded) => Ok(Some(decoded.details)),
             Err(error) => {
                 tracing::warn!(
                     item_id,
@@ -1287,11 +1305,11 @@ impl LocalNfoMetadataStore {
             return Ok(None);
         };
         match decode_local_nfo_cache(&json) {
-            Ok((details, semantic_fingerprint, relation_fingerprint)) => Ok(Some((
-                details,
+            Ok(decoded) => Ok(Some((
+                decoded.details,
                 source_fingerprint,
-                semantic_fingerprint,
-                relation_fingerprint,
+                decoded.semantic_fingerprint,
+                decoded.relation_fingerprint,
             ))),
             Err(error) => {
                 tracing::warn!(
@@ -3656,20 +3674,24 @@ mod tests {
     fn local_nfo_cache_decodes_legacy_details_and_versioned_semantic_state() {
         let details = LocalNfoDetails::default();
         let legacy = serde_json::to_string(&details).expect("legacy cache json");
-        let (legacy_details, legacy_semantic, legacy_relation) =
-            decode_local_nfo_cache(&legacy).expect("legacy cache");
-        assert_eq!(legacy_details, details);
-        assert_eq!(legacy_semantic, None);
-        assert_eq!(legacy_relation, None);
+        let legacy_cache = decode_local_nfo_cache(&legacy).expect("legacy cache");
+        assert_eq!(legacy_cache.details, details);
+        assert_eq!(legacy_cache.semantic_fingerprint, None);
+        assert_eq!(legacy_cache.relation_fingerprint, None);
 
         let fingerprint = [7_u8; 32];
         let versioned = encode_local_nfo_cache(&details, Some(&fingerprint), Some(&fingerprint))
             .expect("versioned cache json");
-        let (versioned_details, semantic, relation) =
-            decode_local_nfo_cache(&versioned).expect("versioned cache");
-        assert_eq!(versioned_details, details);
-        assert_eq!(semantic.as_deref(), Some(fingerprint.as_slice()));
-        assert_eq!(relation.as_deref(), Some(fingerprint.as_slice()));
+        let versioned_cache = decode_local_nfo_cache(&versioned).expect("versioned cache");
+        assert_eq!(versioned_cache.details, details);
+        assert_eq!(
+            versioned_cache.semantic_fingerprint.as_deref(),
+            Some(fingerprint.as_slice())
+        );
+        assert_eq!(
+            versioned_cache.relation_fingerprint.as_deref(),
+            Some(fingerprint.as_slice())
+        );
     }
 
     #[test]
