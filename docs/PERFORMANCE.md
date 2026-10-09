@@ -1754,3 +1754,9 @@ NFO cache 保留原始字节 SHA-256 快路径。只有配置了 local NFO cache
 scan-local movie metadata page 复用有序 task runner，最多同时执行 4 个普通电影 NFO enrichment；结果按 source 顺序归并，单 item 的解析或 task 错误继续隔离。page deferred metadata 与 actor credits 仍由原 page 末 flush 边界提交。title/year 发生变化的电影在共享 guard 下检查数据库现存身份及尚未 flush 的同页 pending identity reservations，再写入 NFO cache/actor relation 并排入 metadata update collector；入队后释放 guard。pending reservation 候选由 storage 按当前 parent、可用 source 和 active 状态复核，身份冲突检查不提前 flush page collector。同步 gate 固定回归检查冲突检查期间没有 metadata transaction，以及普通 metadata update 与唯一成功身份更新在 page 末共用一次事务。
 
 这里记录的是应用层并发上限和身份检查/入队顺序；没有墙钟、吞吐、FNOS CPU、PostgreSQL 或 NAS 测量。Cargo 验证尚待统一测试窗口，当前记录不代表验收通过。
+
+### LUX-466 本地 NFO 页人物资产去重与 unchanged write
+
+同一个 scan-local NFO page context 对序列化后相同的人物 NFO、身份与 metadata 输入使用一个共享 `OnceCell` 结果；不同人物资产处理由共享 semaphore 限制为最多 4 路并发，重复人物不占第二个并发槽。该结果覆盖 `person.nfo`、person manifest、profile image、provider identity index 和 canonical person index 写入；`people.json` 关系快照仍逐 item 写入，credits 继续按既有最多 16-item storage chunk 提交。相同 person manifest checksum 继续跳过 manifest 文件替换，profile image 继续使用 LUX-448 的 unchanged-write；本任务将 person NFO 与 provider/canonical index 接入 byte-identical 检查，相同字节保留 inode，变化输入仍写入新文件。单人 provider-index symlink 故障 fixture 断言只将该人物资产标记 pending、其他人物 NFO 与全部 relation 仍保存；该加强版 fixture 尚待重跑。
+
+这些回归证明页内合并范围、4 路并发上限、错误隔离和相同目标字节不执行原子文件替换；没有测量磁盘系统调用墙钟、数据库时延、PostgreSQL/NAS/FNOS CPU 或生产收益，也不表示 person files 与 credits 数据库可以跨持久化边界原子提交。

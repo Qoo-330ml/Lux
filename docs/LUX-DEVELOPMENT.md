@@ -9631,6 +9631,23 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [ ] 扫描索引耗时与本地/在线处理耗时分别呈现；不以任务仍有后台工作为由把索引时间混入扫描性能结论。
 - [ ] 完成相关 Rust/Web 全量质量门、兼容性和性能记录、本机架构记录，并由项目所有者确认后结束阶段。
 
+#### LUX-466：合并本地 NFO 页重复人物资产并跳过相同人物文件写入
+
+范围：本地 NFO 页跨媒体条目重复引用同一人物时，使用该页共享的 deferred context 对人物资产请求做内容指纹去重；不同人物资产最多 4 路并发，单个人物失败不得阻断其他人物和 relation 保存。对人物 NFO、provider/canonical index 的写入仅在目标字节变化时原子替换。复用既有 person manifest checksum no-op、profile-image unchanged 写入和 person credits 页批处理；不把文件系统与数据库伪装为一个原子事务，不改变 identity、人物关系或 credits 数据模型。
+
+验收：
+
+- [x] 同一 page context 下重复引用的相同人物资产输入共用一个持久化结果；人物名、metadata 或 identity 输入变化时不错误复用旧结果。
+- [ ] 多人物处理保持每页最多 4 个不同人物资产并发；一人 provider index 写入失败时，该人物保留 pending 状态，其他人物资产与全部 relation 仍保存（已补齐 profile fixture 与 personIndex 错误断言，待定向重跑）。
+- [x] 相同人物 NFO、provider/canonical index 字节不替换文件；变化后的人物 metadata 仍写入新内容。
+- [x] 当前已运行的定向人物资产、同页重复人物、scan-local NFO relation/credits 回归与 `git diff --check` 通过。
+- [ ] `cargo build --locked`、`cargo fmt --all -- --check` 和全目标全 feature Clippy 待阶段 23 A/B 采样结束后运行，避免干扰同机测量。
+- [x] 性能记录区分同页请求去重与 byte-identical write 的边界，不将调用上界推断为 FNOS/NAS CPU 或生产收益。
+
+短计划与文件：先检查同页 actor relation/credits 生命周期和人物资产写入边界，再以 `src/application/people/relations.rs`、`src/application/people/service.rs` 补充有界去重与回归，最后更新本文件和 `docs/PERFORMANCE.md`。本任务不新增 storage schema 或依赖。
+
+进度记录（2026-10-09）：同页共享缓存以人物 NFO/身份/metadata 写入输入的 SHA-256 标识一次资产结果，使用共享 semaphore 将跨 item 的不同人物资产任务限制为最多 4 路；person NFO 与 provider/canonical index 在目标字节未变时跳过临时文件、fsync 和 rename。person manifest 继续用其内容 checksum 避免无变化写入，profile image 沿用 LUX-448 的 unchanged-write，relation credits 沿用最多 16 item 的批量提交。覆盖的文件类型包括 `person.nfo`、人物 manifest、profile image、provider identity index 与 canonical person index；`people.json` relation 仍逐 item 持久化，credits 仍按现有 chunk 事务提交。`cargo test --locked --lib local_nfo_person_`（2/2）、同页重复人物资产定向测试（1/1）和 scan-local relation/credits exact 测试（1/1）通过；随后将错误 fixture 从缺图 pending 调整为显式 provider-index symlink failure 与 `personIndex` pending 断言，该加强版定向回归尚未重跑。`git diff --check` 通过。build、fmt 与 Clippy 暂缓至阶段 23 A/B 采样结束。本机 `arm64`；测试没有测量系统调用墙钟、PostgreSQL/NAS 延迟、FNOS CPU 或生产收益，也不声称跨文件/数据库原子性。
+
 ### 资源详情入库时间
 
 #### LUX-307：Lux 媒体条目响应公开入库时间

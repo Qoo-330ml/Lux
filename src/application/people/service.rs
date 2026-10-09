@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use tokio::{
     fs,
     io::AsyncWriteExt,
-    sync::{Mutex as AsyncMutex, OnceCell},
+    sync::{Mutex as AsyncMutex, OnceCell, Semaphore},
     time::{Duration, sleep},
 };
 use uuid::Uuid;
@@ -94,6 +94,7 @@ const PERSON_LOCKABLE_FIELDS: [&str; 14] = [
     "aliases",
 ];
 const MAX_LOCAL_LEGACY_RELATION_DIRECTORY_ENTRIES: usize = 4096;
+const LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY: usize = 4;
 
 #[derive(Clone, Default)]
 pub(crate) struct LocalActorRelationPageCache {
@@ -360,10 +361,25 @@ pub struct ActorPersistReport {
     pub pending_assets: Vec<String>,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct DeferredNfoActorCredits {
     pending: Arc<AsyncMutex<Vec<PendingNfoActorCredits>>>,
     manifest_restore_pending: Arc<AsyncMutex<bool>>,
+    person_asset_results: Arc<AsyncMutex<HashMap<String, Arc<OnceCell<PersonAssetResult>>>>>,
+    person_asset_permits: Arc<Semaphore>,
+}
+
+impl Default for DeferredNfoActorCredits {
+    fn default() -> Self {
+        Self {
+            pending: Arc::default(),
+            manifest_restore_pending: Arc::default(),
+            person_asset_results: Arc::default(),
+            person_asset_permits: Arc::new(Semaphore::new(
+                LOCAL_NFO_PERSON_ASSET_BATCH_CONCURRENCY,
+            )),
+        }
+    }
 }
 
 pub(super) struct PersonManifestWriteOptions<'a> {
@@ -448,9 +464,25 @@ struct PersonDecisionOperation {
     checksum: String,
 }
 
+#[derive(Clone, Default)]
 struct PersonAssetResult {
     image_file: Option<String>,
     pending_assets: Vec<String>,
+}
+
+impl PersonAssetResult {
+    fn failed() -> Self {
+        Self {
+            image_file: None,
+            pending_assets: vec![
+                PENDING_PERSON_DIRECTORY.to_owned(),
+                PENDING_PERSON_NFO.to_owned(),
+                PENDING_PERSON_MANIFEST.to_owned(),
+                PENDING_PROFILE_IMAGE.to_owned(),
+                PENDING_PERSON_INDEX.to_owned(),
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2866,6 +2898,228 @@ mod tests {
         assert_relation_checksum_matches_file(&database, &config.config_dir, "item-rebuild")
             .await?;
         database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_page_coalesces_duplicate_person_asset_persistence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let deferred = DeferredNfoActorCredits::default();
+        let actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: Some("角色甲".to_owned()),
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+
+        assert_eq!(
+            service
+                .persist_nfo_item_actors_deferred(
+                    "item-a",
+                    "tmdb",
+                    std::slice::from_ref(&actor),
+                    &[1, 2, 3],
+                    &deferred,
+                )
+                .await?
+                .stored_count,
+            1
+        );
+
+        let first_relation: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(library_item_directory(config.path(), "item-a")?.join("people.json"))
+                .await?,
+        )?;
+        let person_key = first_relation["actors"][0]["personKey"]
+            .as_str()
+            .ok_or("missing resolved person key")?;
+        let person_nfo = canonical_person_directory(config.path(), person_key)?.join("person.nfo");
+        let first_inode = tokio::fs::metadata(&person_nfo).await?.ino();
+
+        assert_eq!(
+            service
+                .persist_nfo_item_actors_deferred(
+                    "item-b",
+                    "tmdb",
+                    std::slice::from_ref(&actor),
+                    &[4, 5, 6],
+                    &deferred,
+                )
+                .await?
+                .stored_count,
+            1
+        );
+        assert_eq!(
+            tokio::fs::metadata(&person_nfo).await?.ino(),
+            first_inode,
+            "the same page should persist duplicate person assets only once"
+        );
+
+        for item_id in ["item-a", "item-b"] {
+            let relation_path = library_item_directory(config.path(), item_id)?.join("people.json");
+            let relation: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+            assert_eq!(relation["actors"].as_array().map(Vec::len), Some(1));
+        }
+
+        let changed_actor = ActorCredit {
+            person: Some(PersonMetadata {
+                biography: Some("新增人物简介".to_owned()),
+                ..PersonMetadata::default()
+            }),
+            ..actor
+        };
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-c",
+                "tmdb",
+                &[changed_actor],
+                &[7, 8, 9],
+                &deferred,
+            )
+            .await?;
+        let updated_metadata = tokio::fs::metadata(&person_nfo).await?;
+        assert_ne!(updated_metadata.ino(), first_inode);
+        assert!(
+            tokio::fs::read_to_string(person_nfo)
+                .await?
+                .contains("<biography>新增人物简介</biography>")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_person_asset_batch_isolates_failures_between_people()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let deferred = DeferredNfoActorCredits::default();
+        let profiles = config.path().join("people/profiles");
+        tokio::fs::create_dir_all(&profiles).await?;
+        tokio::fs::write(profiles.join("9.png"), PNG_1X1).await?;
+        tokio::fs::write(profiles.join("10.png"), PNG_1X1).await?;
+        tokio::fs::write(profiles.join("11.png"), PNG_1X1).await?;
+        let broken_index = people_index_path_for_provider(config.path(), "tmdb", "10")?;
+        tokio::fs::create_dir_all(
+            broken_index
+                .parent()
+                .ok_or("provider index path has no parent")?,
+        )
+        .await?;
+        let index_target = config.path().join("index-target.json");
+        tokio::fs::write(&index_target, b"{}").await?;
+        tokio::fs::symlink(index_target, &broken_index).await?;
+
+        let actors =
+            [("9", "演员甲"), ("10", "演员乙"), ("11", "演员丙")].map(|(id, name)| ActorCredit {
+                id: id.to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: name.to_owned(),
+                character: None,
+                order: None,
+                profile_url: None,
+                person: None,
+            });
+
+        let report = service
+            .persist_nfo_item_actors_deferred("item-assets", "tmdb", &actors, &[1, 2, 3], &deferred)
+            .await?;
+        assert_eq!(report.stored_count, 3);
+        assert!(report.pending_assets.iter().any(|item_id| item_id == "10"));
+
+        let relation_path =
+            library_item_directory(config.path(), "item-assets")?.join("people.json");
+        let relation: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(relation_path).await?)?;
+        let stored_actors = relation["actors"].as_array().ok_or("missing actors")?;
+        assert_eq!(stored_actors.len(), 3);
+        for name in ["演员甲", "演员丙"] {
+            let actor = stored_actors
+                .iter()
+                .find(|actor| actor["name"] == name)
+                .ok_or("missing successfully persisted actor")?;
+            let person_key = actor["personKey"].as_str().ok_or("missing person key")?;
+            assert!(
+                canonical_person_directory(config.path(), person_key)?
+                    .join("person.nfo")
+                    .exists()
+            );
+        }
+        let failed_actor = stored_actors
+            .iter()
+            .find(|actor| actor["name"] == "演员乙")
+            .ok_or("missing isolated failed actor")?;
+        assert!(
+            failed_actor["pendingAssets"]
+                .as_array()
+                .is_some_and(|pending| pending.iter().any(|asset| asset == PENDING_PERSON_INDEX))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_person_nfo_and_provider_index_skip_unchanged_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: None,
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: None,
+            profile_url: None,
+            person: None,
+        };
+
+        service
+            .persist_nfo_item_actors("item-first", "tmdb", std::slice::from_ref(&actor), &[1])
+            .await?;
+        let first_relation: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(
+                library_item_directory(config.path(), "item-first")?.join("people.json"),
+            )
+            .await?,
+        )?;
+        let person_key = first_relation["actors"][0]["personKey"]
+            .as_str()
+            .ok_or("missing resolved person key")?;
+        let person_dir = canonical_person_directory(config.path(), person_key)?;
+        let person_nfo = person_dir.join("person.nfo");
+        let first_nfo_inode = tokio::fs::metadata(&person_nfo).await?.ino();
+        tokio::fs::write(person_dir.join("folder.png"), PNG_1X1).await?;
+
+        service
+            .persist_nfo_item_actors("item-second", "tmdb", std::slice::from_ref(&actor), &[2])
+            .await?;
+        assert_eq!(
+            tokio::fs::metadata(&person_nfo).await?.ino(),
+            first_nfo_inode,
+            "an unchanged person NFO must not be atomically replaced"
+        );
+
+        let provider_index = people_index_path_for_provider(config.path(), "tmdb", "9")?;
+        let first_index_inode = tokio::fs::metadata(&provider_index).await?.ino();
+        service
+            .persist_nfo_item_actors("item-third", "tmdb", &[actor], &[3])
+            .await?;
+        assert_eq!(
+            tokio::fs::metadata(provider_index).await?.ino(),
+            first_index_inode,
+            "an unchanged provider index must not be atomically replaced"
+        );
         Ok(())
     }
 
