@@ -86,6 +86,76 @@ async fn scan_job_metadata_target_selection_uses_one_query_without_a_local_sourc
 }
 
 #[tokio::test]
+async fn local_metadata_completion_wait_state_uses_one_query_and_stops_for_cancelled_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database
+        .query(
+            "INSERT INTO scan_job_targets (
+                 job_id, target_type, target_id, item_id, change_kind, metadata_state
+             ) VALUES (?, 'ITEM', 'completion-wait-target', 'completion-wait-target',
+                       'NEW', 'PENDING')",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state(&job.id)
+            .await?,
+        (true, false)
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "pending state and job cancellation must be observed by one storage query"
+    );
+
+    database.request_scan_job_cancel(&job.id).await?;
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state(&job.id)
+            .await?,
+        (true, true)
+    );
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state("missing-completion-wait-job")
+            .await?,
+        (false, false)
+    );
+
+    database
+        .query(
+            "UPDATE scan_job_targets SET metadata_state = 'DONE'
+             WHERE job_id = ? AND target_id = 'completion-wait-target'",
+        )
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .local_metadata_completion_wait_state(&job.id)
+            .await?,
+        (false, false)
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_nfo_metadata_batch_rolls_back_all_updates_on_a_batch_error()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
