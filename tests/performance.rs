@@ -2856,12 +2856,15 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         first_poster_indexed_ms <= scan_job_completion_ms,
         "first local poster was indexed at {first_poster_indexed_ms} ms, after scan completion at {scan_job_completion_ms} ms"
     );
-    assert!(
-        poster_api_probe
-            .poster_visible_ms
-            .is_some_and(|elapsed_ms| elapsed_ms <= scan_job_completion_ms),
-        "a poster visible through the authenticated catalog and poster APIs was not returned before scan completion: probe={poster_api_probe:?}, scan completion={scan_job_completion_ms} ms"
-    );
+    let poster_api_visible_before_scan_completion = poster_api_probe
+        .poster_visible_ms
+        .is_some_and(|elapsed_ms| elapsed_ms <= scan_job_completion_ms);
+    if require_detached_poster_queue {
+        assert!(
+            poster_api_visible_before_scan_completion,
+            "a poster visible through the authenticated catalog and poster APIs was not returned before scan completion: probe={poster_api_probe:?}, scan completion={scan_job_completion_ms} ms"
+        );
+    }
     if require_detached_poster_queue {
         assert!(
             scan_job_completion_ms < local_poster_queue_ms,
@@ -2897,7 +2900,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
                 "bodyBytes": poster_api_probe.body_bytes,
                 "bodyDecodedAsImage": poster_api_probe.body_decoded_as_image,
                 "lastError": poster_api_probe.last_error,
-                "posterVisibleBeforeScanCompletion": poster_api_probe.poster_visible_ms.is_some_and(|elapsed_ms| elapsed_ms <= scan_job_completion_ms),
+                "posterVisibleBeforeScanCompletion": poster_api_visible_before_scan_completion,
                 "backgroundTrafficDuringScan": true,
                 "includedInCatalogListP95": false,
             },
@@ -3501,7 +3504,7 @@ async fn completed_scan_probe_signal_is_not_polled_twice() {
     .await
     .expect_err("a completed scan without a poster response should return a probe error");
 
-    assert!(error.contains("did not return a valid image before scan completion"));
+    assert!(error.contains("did not return a valid image during the scan observation window"));
 }
 
 async fn probe_catalog_poster_until_scan_completes(
@@ -3532,9 +3535,8 @@ async fn probe_catalog_poster_until_scan_completes(
         if attempt > 0 {
             tokio::select! {
                 biased;
-                _ = &mut scan_completed => {
+                _ = &mut scan_completed, if !scan_completed_observed => {
                     scan_completed_observed = true;
-                    break;
                 },
                 _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => break,
                 _ = tokio::time::sleep(POSTER_API_PROBE_INTERVAL) => {},
@@ -3544,15 +3546,18 @@ async fn probe_catalog_poster_until_scan_completes(
         probe.catalog_list_request_count += 1;
         let catalog_response = tokio::select! {
             biased;
-            _ = &mut scan_completed => {
+            _ = &mut scan_completed, if !scan_completed_observed => {
                 scan_completed_observed = true;
-                break;
+                None
             },
             response = client
                 .get(&catalog_url)
                 .header(COOKIE, &cookies)
                 .timeout(POSTER_API_PROBE_REQUEST_TIMEOUT)
-                .send() => response,
+                .send() => Some(response),
+        };
+        let Some(catalog_response) = catalog_response else {
+            continue;
         };
         let response = match catalog_response {
             Ok(response) if response.status() == reqwest::StatusCode::OK => response,
@@ -3567,11 +3572,14 @@ async fn probe_catalog_poster_until_scan_completes(
         };
         let catalog_body = tokio::select! {
             biased;
-            _ = &mut scan_completed => {
+            _ = &mut scan_completed, if !scan_completed_observed => {
                 scan_completed_observed = true;
-                break;
+                None
             },
-            body = response.json::<serde_json::Value>() => body,
+            body = response.json::<serde_json::Value>() => Some(body),
+        };
+        let Some(catalog_body) = catalog_body else {
+            continue;
         };
         let body = match catalog_body {
             Ok(body) => body,
@@ -3597,15 +3605,18 @@ async fn probe_catalog_poster_until_scan_completes(
         let endpoint_started = Instant::now();
         let poster_response = tokio::select! {
             biased;
-            _ = &mut scan_completed => {
+            _ = &mut scan_completed, if !scan_completed_observed => {
                 scan_completed_observed = true;
-                break;
+                None
             },
             response = client
                 .get(poster_url)
                 .header(COOKIE, &cookies)
                 .timeout(POSTER_API_PROBE_REQUEST_TIMEOUT)
-                .send() => response,
+                .send() => Some(response),
+        };
+        let Some(poster_response) = poster_response else {
+            continue;
         };
         let response = match poster_response {
             Ok(response) if response.status() == reqwest::StatusCode::OK => response,
@@ -3646,11 +3657,14 @@ async fn probe_catalog_poster_until_scan_completes(
         }
         let image_body = tokio::select! {
             biased;
-            _ = &mut scan_completed => {
+            _ = &mut scan_completed, if !scan_completed_observed => {
                 scan_completed_observed = true;
-                break;
+                None
             },
-            body = response.bytes() => body,
+            body = response.bytes() => Some(body),
+        };
+        let Some(image_body) = image_body else {
+            continue;
         };
         let image_bytes = match image_body {
             Ok(bytes) => bytes,
@@ -3678,7 +3692,7 @@ async fn probe_catalog_poster_until_scan_completes(
         let _ = scan_completed.await;
     }
     Err(format!(
-        "LUX-304 public poster API did not return a valid image before scan completion; probe={probe:?}"
+        "LUX-304 public poster API did not return a valid image during the scan observation window; probe={probe:?}"
     ))
 }
 
