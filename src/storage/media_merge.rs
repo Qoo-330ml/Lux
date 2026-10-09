@@ -106,10 +106,12 @@ impl Database {
         if primary.item_type == "MOVIE" {
             let primary_has_default =
                 self.query_scalar::<i64>(
-                    "SELECT EXISTS (
+                    // PostgreSQL returns BOOLEAN for a bare `SELECT EXISTS`, which does not decode
+                    // as i64 (SQLite returns an integer); the CASE keeps one portable 0/1 value.
+                    "SELECT CAST(CASE WHEN EXISTS (
                          SELECT 1 FROM media_sources
                          WHERE item_id = ? AND is_default = 1
-                     )",
+                     ) THEN 1 ELSE 0 END AS BIGINT)",
                 )
                 .bind(primary_item_id)
                 .fetch_one(&mut *transaction)
