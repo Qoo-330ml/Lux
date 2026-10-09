@@ -3006,7 +3006,7 @@ mod tests {
                 biography: Some("新增人物简介".to_owned()),
                 ..PersonMetadata::default()
             }),
-            ..actor
+            ..actor.clone()
         };
         service
             .persist_nfo_item_actors_deferred(
@@ -3020,10 +3020,132 @@ mod tests {
         let updated_metadata = tokio::fs::metadata(&person_nfo).await?;
         assert_ne!(updated_metadata.ino(), first_inode);
         assert!(
-            tokio::fs::read_to_string(person_nfo)
+            tokio::fs::read_to_string(&person_nfo)
                 .await?
                 .contains("<biography>新增人物简介</biography>")
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let canonical_person = database
+            .resolve_or_create_canonical_person(
+                "演员甲",
+                "aaa",
+                "10",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"method":"test"}"#,
+            )
+            .await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let deferred = DeferredNfoActorCredits::default();
+        let actor = ActorCredit {
+            id: "10".to_owned(),
+            provider: Some("aaa".to_owned()),
+            identities: vec![PersonIdentity {
+                provider: "tmdb".to_owned(),
+                id: "9".to_owned(),
+            }],
+            name: "演员甲".to_owned(),
+            character: None,
+            order: Some(0),
+            profile_url: None,
+            person: None,
+        };
+
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-identity-first",
+                "tmdb",
+                std::slice::from_ref(&actor),
+                &[1],
+                &deferred,
+            )
+            .await?;
+        let renamed_actor = ActorCredit {
+            name: "演员甲更名".to_owned(),
+            ..actor.clone()
+        };
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-name-changed",
+                "tmdb",
+                std::slice::from_ref(&renamed_actor),
+                &[2],
+                &deferred,
+            )
+            .await?;
+        let renamed_person_dir = lux_person_directory(
+            &config.config_dir,
+            &renamed_actor.name,
+            &canonical_person.id,
+        )?;
+        let person_nfo = renamed_person_dir.join(PERSON_NFO);
+        assert!(
+            tokio::fs::read_to_string(&person_nfo)
+                .await?
+                .contains("<name>演员甲更名</name>"),
+            "a changed person name must persist assets in the renamed person directory"
+        );
+        let first_nfo_inode = tokio::fs::metadata(&person_nfo).await?.ino();
+
+        let actor_with_new_identity = ActorCredit {
+            identities: vec![
+                PersonIdentity {
+                    provider: "tmdb".to_owned(),
+                    id: "9".to_owned(),
+                },
+                PersonIdentity {
+                    provider: "zeta".to_owned(),
+                    id: "99".to_owned(),
+                },
+            ],
+            ..renamed_actor
+        };
+        service
+            .persist_nfo_item_actors_deferred(
+                "item-identity-second",
+                "tmdb",
+                &[actor_with_new_identity],
+                &[2],
+                &deferred,
+            )
+            .await?;
+
+        let relation: serde_json::Value = serde_json::from_slice(
+            &tokio::fs::read(
+                library_item_directory(&config.config_dir, "item-identity-second")?
+                    .join("people.json"),
+            )
+            .await?,
+        )?;
+        assert_eq!(
+            relation["actors"][0]["personKey"], canonical_person.id,
+            "the additional identity must resolve to the same canonical person"
+        );
+        assert_ne!(
+            tokio::fs::metadata(&person_nfo).await?.ino(),
+            first_nfo_inode
+        );
+        assert!(
+            tokio::fs::read_to_string(person_nfo)
+                .await?
+                .contains("<uniqueid type=\"zeta\">99</uniqueid>"),
+            "a changed identity set must not reuse the prior page asset result"
+        );
+        database.close().await;
         Ok(())
     }
 

@@ -1761,4 +1761,4 @@ scan-local movie metadata page 复用有序 task runner，最多同时执行 4 �
 
 这些回归证明页内合并范围、4 路并发上限、错误隔离和相同目标字节不执行原子文件替换；没有测量磁盘系统调用墙钟、数据库时延、PostgreSQL/NAS/FNOS CPU 或生产收益，也不表示 person files 与 credits 数据库可以跨持久化边界原子提交。`cargo build --locked` 和全目标全 feature Clippy 等待阶段 23 A/B 采样结束后运行。
 
-补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes` 通过 `lux-*` 人物路径覆盖 canonical index unchanged write；相同字节保留 inode，metadata 变化仍更新 NFO。该回归只验证写入结果，不提供系统调用耗时或生产性能数据。
+补充回归（2026-10-09）：`local_nfo_lux_person_canonical_index_skips_unchanged_bytes` 通过 `lux-*` 人物路径覆盖 canonical index unchanged write；相同字节保留 inode，metadata 变化仍更新 NFO。`local_nfo_page_name_and_identity_changes_do_not_reuse_cached_person_assets` 覆盖改名目录和同一 canonical person 新增 identity；分别遗漏两个指纹字段时测试均能复现错误复用，恢复后通过。回归只验证写入结果，不提供系统调用耗时或生产性能数据。
