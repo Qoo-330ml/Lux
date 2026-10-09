@@ -9496,11 +9496,11 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] 即时 Jobs 状态事件在调用时发送并撤销已排队的进度尾随事件，最终完成状态不会被合并丢失或延迟。
 - [x] 只合并扫描活动项、`DISCOVERY_PROGRESS` 与 reidentify progress；JOB_CREATED、取消、失败、阶段完成和任务完成仍即时发送。
 - [x] AdminEventHub 单测覆盖 burst、尾随刷新和即时刷新。
-- [ ] 相关应用路径编译/测试、全量完成门尚待 root 释放共享 Cargo target 后运行；`git diff --check` 与三个 Rust 文件 `rustfmt --check` 已通过。
+- [x] 相关应用路径编译/测试、全量完成门通过；`git diff --check` 与 rustfmt 检查通过。
 
 短计划与文件：先在 `src/application/admin_events.rs` 添加通知时序回归，再增加仅用于 Jobs 进度的 1 秒有界 coalescing 和可取消尾随刷新；在 `src/application/scanner.rs` 接入扫描活动项与发现进度，在 `src/application/reidentify.rs` 接入已节流的重识别进度。更新本文件记录边界和结果。预计修改文件共 4 个。
 
-结果（2026-10-09）：Jobs 进度现在首个即时广播，窗口内后续变更置脏，由每秒一次的尾随广播合并刷新；连续压力最多每秒广播一次。任意即时 Jobs 发布会使旧窗口失效并清空待发尾随刷新。扫描活动项、`DISCOVERY_PROGRESS` 与 reidentify 进度接入该路径；其他扫描事件和任务创建/取消/完成继续即时刷新。旧实现上的新 coalescing 用例先因方法缺失而 RED；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::admin_events::tests` 通过，6 passed、0 failed，并编译了整个 library 应用路径。三个 Rust 文件的 rustfmt 检查与 `git diff --check` 通过。全量 Rust 完成门、最终集成工作树验收及 FNOS/生产负载验证仍待完成。
+结果（2026-10-09）：Jobs 进度现在首个即时广播，窗口内后续变更置脏，由每秒一次的尾随广播合并刷新；连续压力最多每秒广播一次。任意即时 Jobs 发布会使旧窗口失效并清空待发尾随刷新。扫描活动项、`DISCOVERY_PROGRESS` 与 reidentify 进度接入该路径；其他扫描事件和任务创建/取消/完成继续即时刷新。AdminEventHub 单测 6/6、集成目标 `admin_events` 3/3 通过；build、全量 Rust 测试、fmt、全目标全 feature Clippy 与 `git diff --check` 通过。未在 FNOS 或生产负载上验证效果。
 
 #### 本轮代码质量与性能优化收口
 
