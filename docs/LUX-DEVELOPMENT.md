@@ -9465,6 +9465,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 预计文件：`src/application/nfo.rs`、`src/application/metadata.rs`、`tests/metadata.rs`、`docs/LUX-DEVELOPMENT.md`、`docs/PERFORMANCE.md`。先增加 lexical/unknown XML/metadata-state 回归，再实现有界、保留未知结构的 semantic fingerprint 与 cache 兼容，最后运行定向 NFO 与 metadata 验证。
 
+进度（2026-10-09）：核心实现及 lexical、未知 XML、metadata state、旧 cache、`xml:space` 和属性规范化回归已补。定向验证通过：`cargo test --locked --lib application::nfo::tests` 为 8/8，`cargo test --locked --test metadata` 为 21/21。测试发现并修正了 cache-enabled projection 按 Text event 裁剪空格的问题；该路径现保留字段内部空白，projection-only 路径仍保持既有行为。属性规范化区分字面 TAB/换行（XML 1.0 将其规范化为空格）与字符引用（保留引用字符），并将 CRLF 与 LF 字面换行按相同值处理；只有启用 local NFO cache 时才收集 semantic tokens。cache-enabled 解析让合法预定义/数字引用进入 metadata projection，并拒绝未声明的 general entity；回归检查 lexical rewrite 后 stat revision 与 raw cache source revision 均更新。全局 build、Clippy、全量 Rust 测试与集成工作树验收尚待完成，故任务验收仍开放。
+
 #### 本轮代码质量与性能优化收口
 
 本轮修复范围截至已登记的 LUX-389；修复期间继续发现的候选不自动追加到本轮。后续优化应先记录调用频率、数据规模、预期收益与风险，再建立下一轮固定清单；剩余任务数和进度按各轮清单分别报告。

@@ -20,7 +20,7 @@ use crate::{
         images::image_content_tag_and_dimensions_from_bytes,
         nfo::{
             LocalNfoMetadataStore, LocalNfoMetadataStoreError, nfo_content_fingerprint,
-            parse_local_nfo_projection,
+            parse_local_nfo_projection, parse_local_nfo_projection_with_semantic_fingerprint,
         },
         people::{DeferredNfoActorCredits, PeopleService},
     },
@@ -2487,6 +2487,10 @@ impl MetadataEnricher {
             None
         };
         let rich_cache_missing = self.local_nfo.is_some() && cached_nfo.is_none();
+        let semantic_cache_missing = self.local_nfo.is_some()
+            && cached_nfo
+                .as_ref()
+                .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_none());
         let actor_relation_missing = if let Some(people) = &self.people {
             match people.nfo_relation_snapshot_is_current(item_id).await {
                 Ok(exists) => !exists,
@@ -2502,8 +2506,13 @@ impl MetadataEnricher {
         } else {
             false
         };
-        if already_checked && !rich_cache_missing && !actor_relation_missing {
-            if let (Some(metadata), Some((details, _))) = (metadata.as_ref(), cached_nfo.as_ref())
+        if already_checked
+            && !rich_cache_missing
+            && !semantic_cache_missing
+            && !actor_relation_missing
+        {
+            if let (Some(metadata), Some((details, _, _, _))) =
+                (metadata.as_ref(), cached_nfo.as_ref())
                 && local_nfo_defaults_missing(metadata, details)
             {
                 if let Some(deferred_updates) = deferred_metadata_updates.as_ref() {
@@ -2536,9 +2545,12 @@ impl MetadataEnricher {
         };
         let source_fingerprint = nfo_content_fingerprint(&bytes);
         if !actor_relation_missing
-            && let (Some(metadata), Some((details, cached_fingerprint))) =
+            && let (Some(metadata), Some((details, cached_fingerprint, _, _))) =
                 (metadata.as_ref(), cached_nfo.as_ref())
             && cached_fingerprint == &source_fingerprint
+            && cached_nfo
+                .as_ref()
+                .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_some())
             && !local_nfo_defaults_missing(metadata, details)
         {
             if let Some(fingerprint) = fingerprint.as_deref() {
@@ -2549,8 +2561,13 @@ impl MetadataEnricher {
             report.nfo_skipped = 1;
             return Ok(report);
         }
-        let projection = match parse_local_nfo_projection(&bytes) {
-            Ok(projection) => projection,
+        let parsed_projection = if self.local_nfo.is_some() {
+            parse_local_nfo_projection_with_semantic_fingerprint(&bytes)
+        } else {
+            parse_local_nfo_projection(&bytes).map(|projection| (projection, Vec::new()))
+        };
+        let (projection, semantic_fingerprint) = match parsed_projection {
+            Ok(parsed) => parsed,
             Err(_) => {
                 if let Some(local_nfo) = &self.local_nfo {
                     local_nfo
@@ -2567,6 +2584,70 @@ impl MetadataEnricher {
                 return Ok(report);
             }
         };
+        let semantically_unchanged = cached_nfo.as_ref().is_some_and(
+            |(_, cached_fingerprint, cached_semantic_fingerprint, _)| {
+                cached_semantic_fingerprint.as_deref() == Some(semantic_fingerprint.as_slice())
+                    && cached_fingerprint.len() == 32
+            },
+        );
+        let relation_current_for_cached_revision = if semantically_unchanged {
+            if let (Some(people), Some((_, cached_fingerprint, _, cached_relation_fingerprint))) =
+                (self.people.as_ref(), cached_nfo.as_ref())
+            {
+                let relation_fingerprint = cached_relation_fingerprint
+                    .as_deref()
+                    .unwrap_or(cached_fingerprint);
+                match people
+                    .item_actor_relation_is_current(item_id, relation_fingerprint)
+                    .await
+                {
+                    Ok(current) => current,
+                    Err(error) => {
+                        tracing::warn!(
+                            item_id,
+                            %error,
+                            "local actor relation could not be checked against cached NFO revision"
+                        );
+                        false
+                    }
+                }
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+        if semantically_unchanged
+            && relation_current_for_cached_revision
+            && !actor_relation_missing
+            && let Some(metadata) = metadata.as_ref()
+            && !local_nfo_defaults_missing(metadata, &projection.details)
+        {
+            if let (Some(local_nfo), Some((details, _, Some(_), relation_fingerprint))) =
+                (self.local_nfo.as_ref(), cached_nfo.as_ref())
+            {
+                let relation_fingerprint = relation_fingerprint
+                    .as_deref()
+                    .or_else(|| cached_nfo.as_ref().map(|(_, raw, _, _)| raw.as_slice()));
+                local_nfo
+                    .write_item_with_semantic_fingerprint(
+                        item_id,
+                        &source_fingerprint,
+                        Some(&semantic_fingerprint),
+                        relation_fingerprint,
+                        details,
+                    )
+                    .await
+                    .map_err(MetadataError::NfoCache)?;
+            }
+            if let Some(fingerprint) = fingerprint.as_deref() {
+                self.database
+                    .mark_media_item_metadata_checked(item_id, fingerprint)
+                    .await?;
+            }
+            report.nfo_skipped = 1;
+            return Ok(report);
+        }
         let current = metadata;
         if let Some(current) = current.as_ref() {
             let mut state = MetadataState::from_persisted(
@@ -2621,9 +2702,18 @@ impl MetadataEnricher {
                 .is_current(item_id, &source_fingerprint)
                 .await
                 .map_err(MetadataError::NfoCache)?;
-            if !current {
+            let cache_has_semantic_fingerprint = cached_nfo
+                .as_ref()
+                .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_some());
+            if !current || !cache_has_semantic_fingerprint {
                 local_nfo
-                    .write_item(item_id, &source_fingerprint, &projection.details)
+                    .write_item_with_semantic_fingerprint(
+                        item_id,
+                        &source_fingerprint,
+                        Some(&semantic_fingerprint),
+                        Some(&source_fingerprint),
+                        &projection.details,
+                    )
                     .await
                     .map_err(MetadataError::NfoCache)?;
             }
