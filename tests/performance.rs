@@ -60,6 +60,54 @@ const FOREGROUND_REQUESTS: usize = 50;
 const INCREMENTAL_FILES: usize = 100;
 const METADATA_BENCHMARK_ITEMS: usize = 32;
 const POOL_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
+const POSTER_API_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const POSTER_API_PROBE_MAX_REQUESTS: usize = 20;
+const POSTER_API_PROBE_MAX_DURATION: Duration = Duration::from_secs(5);
+const POSTER_API_PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn first_catalog_item_with_poster(body: &serde_json::Value) -> Option<(String, String)> {
+    body.get("items")?.as_array()?.iter().find_map(|item| {
+        let item_id = item.get("id")?.as_str()?;
+        let poster_tag = item.get("imageTags")?.get("poster")?.as_str()?;
+        if item_id.trim().is_empty() || poster_tag.trim().is_empty() {
+            return None;
+        }
+        Some((item_id.to_owned(), poster_tag.to_owned()))
+    })
+}
+
+#[test]
+fn catalog_poster_probe_selects_an_item_with_a_poster_tag() {
+    let body = json!({
+        "items": [
+            {"id": "no-poster", "imageTags": {"poster": null}},
+            {"id": "", "imageTags": {"poster": "ignored-empty-item"}},
+            {"id": "movie-1", "imageTags": {"poster": "poster-tag-1"}},
+            {"id": "movie-2", "imageTags": {"poster": "poster-tag-2"}}
+        ]
+    });
+    assert_eq!(
+        first_catalog_item_with_poster(&body),
+        Some(("movie-1".to_owned(), "poster-tag-1".to_owned()))
+    );
+    assert!(first_catalog_item_with_poster(&json!({"items": []})).is_none());
+}
+
+#[derive(Debug, Default)]
+struct CatalogPosterApiProbe {
+    local_poster_index_observed: bool,
+    catalog_list_request_count: usize,
+    poster_endpoint_request_count: usize,
+    item_id: Option<String>,
+    poster_tag: Option<String>,
+    poster_tag_visible_ms: Option<u128>,
+    poster_visible_ms: Option<u128>,
+    poster_endpoint_latency_ms: Option<u128>,
+    content_type: Option<String>,
+    body_bytes: Option<usize>,
+    body_decoded_as_image: bool,
+    last_error: Option<String>,
+}
 
 #[test]
 fn process_peak_rss_is_reported_in_bytes() {
@@ -2590,9 +2638,12 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     let observation_database = database.clone();
     let observation_library_id = library.id.to_string();
     let observation_started = scan_started;
+    let (local_poster_indexed_sender, local_poster_indexed_receiver) =
+        tokio::sync::oneshot::channel();
     let first_visibility_handle = tokio::spawn(async move {
         let mut first_item_visible_ms = None;
         let mut first_poster_indexed_ms = None;
+        let mut local_poster_indexed_sender = Some(local_poster_indexed_sender);
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
             if first_item_visible_ms.is_none()
@@ -2620,6 +2671,9 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
                 .is_some()
             {
                 first_poster_indexed_ms = Some(observation_started.elapsed().as_millis());
+                if let Some(sender) = local_poster_indexed_sender.take() {
+                    let _ = sender.send(());
+                }
             }
             if let (Some(first_item_visible_ms), Some(first_poster_indexed_ms)) =
                 (first_item_visible_ms, first_poster_indexed_ms)
@@ -2647,6 +2701,23 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     );
     let api_url = catalog_list_url.clone();
     let api_cookies = cookies.clone();
+    let (scan_completed_sender, scan_completed_receiver) = tokio::sync::oneshot::channel();
+    let poster_probe_client = client.clone();
+    let poster_probe_catalog_url = catalog_list_url.clone();
+    let poster_probe_base_url = base_url.clone();
+    let poster_probe_cookies = cookies.clone();
+    let poster_api_probe_handle = tokio::spawn(async move {
+        probe_catalog_poster_until_scan_completes(
+            poster_probe_client,
+            poster_probe_catalog_url,
+            poster_probe_base_url,
+            poster_probe_cookies,
+            scan_started,
+            local_poster_indexed_receiver,
+            scan_completed_receiver,
+        )
+        .await
+    });
     let catalog_list_handle = tokio::spawn(async move {
         measure_get_requests(
             &api_client,
@@ -2661,6 +2732,11 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
     let scan_job_completion_ms = scan_started.elapsed().as_millis();
+    let _ = scan_completed_sender.send(());
+    let poster_api_probe = poster_api_probe_handle
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(std::io::Error::other)?;
     let scan_finished_queue_snapshot = load_local_poster_queue_snapshot(
         database.pool(),
         &scan_job.id,
@@ -2780,6 +2856,12 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         first_poster_indexed_ms <= scan_job_completion_ms,
         "first local poster was indexed at {first_poster_indexed_ms} ms, after scan completion at {scan_job_completion_ms} ms"
     );
+    assert!(
+        poster_api_probe
+            .poster_visible_ms
+            .is_some_and(|elapsed_ms| elapsed_ms <= scan_job_completion_ms),
+        "a poster visible through the authenticated catalog and poster APIs was not returned before scan completion: probe={poster_api_probe:?}, scan completion={scan_job_completion_ms} ms"
+    );
     if require_detached_poster_queue {
         assert!(
             scan_job_completion_ms < local_poster_queue_ms,
@@ -2794,9 +2876,31 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "databaseBackend": backend,
             "fileCount": file_count,
             "directoryCount": directory_count,
+            "posterQueueMode": "detached_batches",
             "scanJobCompletionMs": scan_job_completion_ms,
             "firstItemVisibleMs": first_item_visible_ms,
             "firstPosterIndexedMs": first_poster_indexed_ms,
+            "catalogPosterApiProbe": {
+                "probeIntervalMs": POSTER_API_PROBE_INTERVAL.as_millis(),
+                "maxCatalogListRequests": POSTER_API_PROBE_MAX_REQUESTS,
+                "maxProbeDurationMs": POSTER_API_PROBE_MAX_DURATION.as_millis(),
+                "requestTimeoutMs": POSTER_API_PROBE_REQUEST_TIMEOUT.as_millis(),
+                "localPosterIndexObserved": poster_api_probe.local_poster_index_observed,
+                "catalogListRequestCount": poster_api_probe.catalog_list_request_count,
+                "posterEndpointRequestCount": poster_api_probe.poster_endpoint_request_count,
+                "itemId": poster_api_probe.item_id,
+                "posterTag": poster_api_probe.poster_tag,
+                "posterTagVisibleMs": poster_api_probe.poster_tag_visible_ms,
+                "posterVisibleMs": poster_api_probe.poster_visible_ms,
+                "posterEndpointLatencyMs": poster_api_probe.poster_endpoint_latency_ms,
+                "contentType": poster_api_probe.content_type,
+                "bodyBytes": poster_api_probe.body_bytes,
+                "bodyDecodedAsImage": poster_api_probe.body_decoded_as_image,
+                "lastError": poster_api_probe.last_error,
+                "posterVisibleBeforeScanCompletion": poster_api_probe.poster_visible_ms.is_some_and(|elapsed_ms| elapsed_ms <= scan_job_completion_ms),
+                "backgroundTrafficDuringScan": true,
+                "includedInCatalogListP95": false,
+            },
             "catalogListP95DuringScanMs": catalog_list_p95_ms,
             "catalogListRequestCount": catalog_list_ms.len(),
             "catalogListP95ScanFinishedImagePendingMs": scan_finished_image_pending_p95_ms,
@@ -3376,6 +3480,166 @@ async fn measure_get_requests(
         durations.push(result.map_err(std::io::Error::other)?);
     }
     Ok(durations)
+}
+
+async fn probe_catalog_poster_until_scan_completes(
+    client: reqwest::Client,
+    catalog_url: String,
+    base_url: String,
+    cookies: String,
+    scan_started: Instant,
+    mut local_poster_indexed: tokio::sync::oneshot::Receiver<()>,
+    mut scan_completed: tokio::sync::oneshot::Receiver<()>,
+) -> Result<CatalogPosterApiProbe, String> {
+    tokio::select! {
+        biased;
+        ready = &mut local_poster_indexed => ready.map_err(|_| "LUX-304 poster API probe was not notified about local poster indexing".to_owned())?,
+        _ = &mut scan_completed => return Err("LUX-304 scan completed before a local poster row became available to probe".to_owned()),
+    }
+
+    let mut probe = CatalogPosterApiProbe {
+        local_poster_index_observed: true,
+        ..CatalogPosterApiProbe::default()
+    };
+    let deadline = Instant::now() + POSTER_API_PROBE_MAX_DURATION;
+    for attempt in 0..POSTER_API_PROBE_MAX_REQUESTS {
+        if Instant::now() >= deadline {
+            break;
+        }
+        if attempt > 0 {
+            tokio::select! {
+                biased;
+                _ = &mut scan_completed => break,
+                _ = tokio::time::sleep(deadline.saturating_duration_since(Instant::now())) => break,
+                _ = tokio::time::sleep(POSTER_API_PROBE_INTERVAL) => {},
+            }
+        }
+
+        probe.catalog_list_request_count += 1;
+        let catalog_response = tokio::select! {
+            biased;
+            _ = &mut scan_completed => break,
+            response = client
+                .get(&catalog_url)
+                .header(COOKIE, &cookies)
+                .timeout(POSTER_API_PROBE_REQUEST_TIMEOUT)
+                .send() => response,
+        };
+        let response = match catalog_response {
+            Ok(response) if response.status() == reqwest::StatusCode::OK => response,
+            Ok(response) => {
+                probe.last_error = Some(format!("catalog endpoint returned {}", response.status()));
+                continue;
+            }
+            Err(error) => {
+                probe.last_error = Some(format!("catalog request failed: {error}"));
+                continue;
+            }
+        };
+        let catalog_body = tokio::select! {
+            biased;
+            _ = &mut scan_completed => break,
+            body = response.json::<serde_json::Value>() => body,
+        };
+        let body = match catalog_body {
+            Ok(body) => body,
+            Err(error) => {
+                probe.last_error = Some(format!("catalog response JSON was invalid: {error}"));
+                continue;
+            }
+        };
+        let Some((item_id, poster_tag)) = first_catalog_item_with_poster(&body) else {
+            probe.last_error = Some(
+                "catalog projection does not include an item with imageTags.poster yet".to_owned(),
+            );
+            continue;
+        };
+
+        probe.item_id = Some(item_id.clone());
+        probe.poster_tag = Some(poster_tag);
+        if probe.poster_tag_visible_ms.is_none() {
+            probe.poster_tag_visible_ms = Some(scan_started.elapsed().as_millis());
+        }
+        probe.poster_endpoint_request_count += 1;
+        let poster_url = format!("{base_url}/api/v1/items/{item_id}/images/poster");
+        let endpoint_started = Instant::now();
+        let poster_response = tokio::select! {
+            biased;
+            _ = &mut scan_completed => break,
+            response = client
+                .get(poster_url)
+                .header(COOKIE, &cookies)
+                .timeout(POSTER_API_PROBE_REQUEST_TIMEOUT)
+                .send() => response,
+        };
+        let response = match poster_response {
+            Ok(response) if response.status() == reqwest::StatusCode::OK => response,
+            Ok(response) => {
+                probe.last_error = Some(format!(
+                    "poster endpoint for item {item_id} returned {}",
+                    response.status()
+                ));
+                continue;
+            }
+            Err(error) => {
+                probe.last_error =
+                    Some(format!("poster request for item {item_id} failed: {error}"));
+                continue;
+            }
+        };
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let Some(content_type) = content_type else {
+            probe.last_error = Some(format!(
+                "poster endpoint for item {item_id} omitted content-type"
+            ));
+            continue;
+        };
+        if !content_type
+            .split(';')
+            .next()
+            .map(str::trim)
+            .is_some_and(|value| value.starts_with("image/"))
+        {
+            probe.last_error = Some(format!(
+                "poster endpoint for item {item_id} returned non-image content-type {content_type}"
+            ));
+            continue;
+        }
+        let image_body = tokio::select! {
+            biased;
+            _ = &mut scan_completed => break,
+            body = response.bytes() => body,
+        };
+        let image_bytes = match image_body {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                probe.last_error = Some(format!("poster response body read failed: {error}"));
+                continue;
+            }
+        };
+        if image_bytes.is_empty() || image::load_from_memory(&image_bytes).is_err() {
+            probe.last_error = Some(format!(
+                "poster endpoint for item {item_id} returned an empty or invalid image body"
+            ));
+            continue;
+        }
+        probe.poster_endpoint_latency_ms = Some(endpoint_started.elapsed().as_millis());
+        probe.content_type = Some(content_type);
+        probe.body_bytes = Some(image_bytes.len());
+        probe.body_decoded_as_image = true;
+        probe.poster_visible_ms = Some(scan_started.elapsed().as_millis());
+        probe.last_error = None;
+        return Ok(probe);
+    }
+
+    let _ = scan_completed.await;
+    Err(format!(
+        "LUX-304 public poster API did not return a valid image before scan completion; probe={probe:?}"
+    ))
 }
 
 fn percentile(values: &[u128], percentile: usize) -> u128 {
