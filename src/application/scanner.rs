@@ -10805,6 +10805,7 @@ impl ScanJobService {
             return Ok(());
         }
         self.database.request_scan_job_cancel(job_id).await?;
+        self.notify_local_metadata_worker(job_id);
         self.record_event(job_id, "INFO", "CANCEL_REQUESTED", "已请求取消任务", "{}")
             .await;
         Ok(())
@@ -13529,6 +13530,73 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(250), waiter)
             .await
             .expect("completion notification should beat the fallback")??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_metadata_completion_waiter_wakes_when_scan_is_cancelled()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::libraries::LibraryService, config::Config, library::LibraryKind,
+            storage::Database,
+        };
+
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let job_id = "local-metadata-cancelled-waiter";
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', 'RUNNING', 'generation', 'POSTPROCESSING')",
+        )
+        .bind(job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scan_job_targets
+             (job_id, target_type, target_id, item_id, change_kind, metadata_state)
+             VALUES (?, 'ITEM', 'item-1', 'item-1', 'NEW', 'PENDING')",
+        )
+        .bind(job_id)
+        .execute(database.pool())
+        .await?;
+
+        let jobs = ScanJobService::new(database.clone());
+        let notify = Arc::new(Notify::new());
+        jobs.metadata_notifications
+            .lock()
+            .map_err(|_| "metadata notification registry poisoned")?
+            .insert(job_id.to_owned(), Arc::clone(&notify));
+        let waiter_jobs = jobs.clone();
+        let waiter_job_id = job_id.to_owned();
+        let (completed_sender, completed_receiver) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            let result = waiter_jobs.wait_for_local_metadata(&waiter_job_id).await;
+            let _ = completed_sender.send(());
+            result
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        jobs.cancel(job_id).await?;
+        let woke_before_fallback =
+            tokio::time::timeout(std::time::Duration::from_millis(250), completed_receiver)
+                .await
+                .is_ok();
+        if !woke_before_fallback {
+            notify.notify_waiters();
+        }
+        waiter.await??;
+        assert!(
+            woke_before_fallback,
+            "same-process cancellation should wake the waiter without the 5-second fallback"
+        );
         Ok(())
     }
 
