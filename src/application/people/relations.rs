@@ -681,7 +681,7 @@ impl PeopleService {
                 .filter(|person_key| person_key.starts_with("lux-"))
                 .map(str::to_owned);
             stored.push(StoredActor {
-                id: has_stable_identity.then(|| resolved.actor_id),
+                id: has_stable_identity.then_some(resolved.actor_id),
                 name: resolved.actor.name.trim().to_owned(),
                 provider: if has_stable_identity {
                     resolved.actor_provider
