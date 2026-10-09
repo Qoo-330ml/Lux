@@ -9470,16 +9470,21 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 范围：scan-local metadata NFO page 当前逐个 await 普通电影的 NFO enrichment。复用现有有界有序 task runner 和电影 NFO 并发上限（最多 4 路），让一个 page 内独立电影并发处理，并按原 source 顺序归并结果。单个 NFO 失败或 task 异常仍只影响对应 item。page 级延迟 metadata 更新继续在所有电影、home video 与剧集处理后统一 flush；actor credits 继续使用共享 deferred collector 并在 page 末统一 flush。只修改 scan-local page 的 MOVIE 路径；库级 `enrich_movie_sources`、home-video、series/season/episode 和 OnDemand 路径不扩大范围。
 
+身份变更的电影在同一 page 共享的异步 guard 下检查数据库现存身份及 deferred collector 中尚未 flush 的同页身份 reservation，然后完成 NFO cache/actor relation 写入和 metadata update 入队；入队后释放 guard。pending reservation 的冲突候选仍由数据库按当前 parent、可用 source 和 active 状态条件复核。冲突检查不触发 page metadata flush；只有电影 title/year 变化的 item 等待该 guard。这样并发 item 使用旧 page snapshot 时，仍可保留 page-end batching 并避免同页重复身份入队。
+
 验收：
 
 - [ ] 回归证明 scan-local 普通电影 NFO enrichment 的最大并发大于 1 且不超过 4，结果合并顺序与输入 source 顺序一致。
 - [ ] 一个电影 NFO 无效或 task 失败时，其余电影仍完成；单 item 错误隔离语义保持。
-- [ ] page deferred metadata 更新及 actor credits 仍只在 page 末统一 flush；metadata batch transaction 失败后的逐 item fallback 回归通过。
+- [ ] 两个并发电影将改为相同 title/year 时只允许一个身份更新入队，另一个作为不可重试冲突单独失败；同页普通电影仍成功，且冲突检查顺序由回归同步控制。
+- [ ] 冲突检查期间已有的普通 metadata update 不提前 flush；普通更新与唯一成功身份更新在 page 末同一事务 flush，actor credits 仍只在 page 末统一 flush；metadata batch transaction 失败后的逐 item fallback 回归通过。
 - [ ] 只改变 scan-local page 的 MOVIE 路径；series、home-video、OnDemand 和库级电影 enrichment 行为不变。
 - [ ] 相关 metadata 定向回归、格式、build、Clippy、全量 Rust 完成门及 `git diff --check` 通过。
 - [ ] 性能记录仅报告固定 task runner 的并发上界和行为边界，不推断墙钟、FNOS CPU、PostgreSQL 或 NAS 收益。
 
-短计划与文件：先在 `src/application/metadata.rs` 为 scan-local movie page 增加有界并发、顺序和错误隔离回归，再将该路径接入现有有界有序 runner，同时保留 page flush 边界；更新 `docs/PERFORMANCE.md` 记录验证范围。预计修改 `src/application/metadata.rs`、`docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`，最多 3 个文件。
+短计划与文件：先在 `src/application/metadata.rs` 为 scan-local movie page 增加有界并发、顺序、错误隔离、身份冲突串行化及 page-end flush 回归，再将该路径接入现有有界有序 runner，同时保留 page flush 边界；在 `src/storage/media.rs` 按既有 movie identity eligibility 复核同页 pending reservation；更新两份任务和性能记录。预计修改 `src/application/metadata.rs`、`src/storage/media.rs`、`docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`，共 4 个文件。
+
+实现进度（2026-10-09）：scan-local MOVIE NFO 已接入最多 4 路有序 runner；并发、错误隔离、同页 identity reservation 与 page-end flush 回归均覆盖。身份 guard 跨越数据库与 page pending reservation 检查、cache/relation 写入和 metadata update 入队，并在入队后释放；storage 按 parent、available source 和 active 条件复核待检查 reservation。定向 `cargo test --locked --lib application::metadata::tests` 通过 21/21。fallback 用例确认同页两项先参加一次失败 page batch、再逐项回退，故指标中的事务数为 3、item/update 尝试数为 4；与旧提前 flush 路径相比，page metadata 不会在 identity 检查中提前提交。全局 build、Clippy、全量 Rust 测试与集成工作树验收尚待完成，故任务验收仍开放。
 
 #### 本轮代码质量与性能优化收口
 

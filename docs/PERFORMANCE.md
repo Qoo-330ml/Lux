@@ -1726,3 +1726,8 @@ scan-local NFO page 的路径发现从逐 source 串行改为最多 4 个并发�
 NFO cache 保留原始字节 SHA-256 快路径。只有配置了 local NFO cache 的 enrichment 才收集 semantic tokens；没有 cache 的普通路径继续使用既有 projection parser，不额外分配 token vector 或计算摘要。文件内容字节变化后，后台 enrichment 仍读取文件并在一次受大小与事件数限制的 XML pass 中提取 projection、人物和完整语义 fingerprint；XML 声明、注释、属性顺序、CDATA/文本表示、空元素写法及 element-only 格式空白不改变 fingerprint。所有元素名、属性和值、混合内容文本和未知 XML 子树仍参与摘要。文本与属性值都按 XML 1.0 的换行语义规范化；属性字面 TAB/换行折叠为空格，而 TAB/换行字符引用保留其字符值。合法的预定义/数字引用会参与 cache-enabled metadata projection 和摘要，避免投影与语义摘要对等价文本的判断不一致。`xml:space="preserve"` 下的空白会进入摘要，混合内容中的空白也会保留。仅当完整摘要匹配、rich cache 与其基于旧 source revision 的 actor relation snapshot 均有效且默认字段无需修复时，才持久化新的 raw content/stat revision 并跳过 metadata/credits 写入。旧版 details-only cache 在 raw 内容改变后完整处理并升级；相同原始字节继续走现有免解析路径。
 
 回归覆盖 lexical equivalence、未知 XML、旧 cache 升级、stat/raw cache revision 更新、DTD/格式错误和未声明实体拒绝，以及文本和属性空白边界。实现与回归已写入，但截至 2026-10-09 尚未运行 Cargo 测试、Clippy 或性能测量；此处没有可报告的运行时收益数据。后续通过的正确性回归只证明解析后的重复写入可跳过，不证明文件读取或 XML 解析减少，也不把本机时间推断为 PostgreSQL、NAS/x86_64 或生产 CPU 收益。
+### LUX-460 scan-local 普通电影 NFO 有界并发
+
+scan-local movie metadata page 复用有序 task runner，最多同时执行 4 个普通电影 NFO enrichment；结果按 source 顺序归并，单 item 的解析或 task 错误继续隔离。page deferred metadata 与 actor credits 仍由原 page 末 flush 边界提交。title/year 发生变化的电影在共享 guard 下检查数据库现存身份及尚未 flush 的同页 pending identity reservations，再写入 NFO cache/actor relation 并排入 metadata update collector；入队后释放 guard。pending reservation 候选由 storage 按当前 parent、可用 source 和 active 状态复核，身份冲突检查不提前 flush page collector。同步 gate 固定回归检查冲突检查期间没有 metadata transaction，以及普通 metadata update 与唯一成功身份更新在 page 末共用一次事务。
+
+这里记录的是应用层并发上限和身份检查/入队顺序；没有墙钟、吞吐、FNOS CPU、PostgreSQL 或 NAS 测量。Cargo 验证尚待统一测试窗口，当前记录不代表验收通过。
