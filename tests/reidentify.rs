@@ -80,6 +80,16 @@ async fn complete_movie_tmdb_stub(AxumState(tracker): AxumState<RequestTracker>)
     }))
 }
 
+async fn empty_tmdb_stub(AxumState(tracker): AxumState<RequestTracker>) -> Json<Value> {
+    tracker.requests.fetch_add(1, Ordering::SeqCst);
+    Json(json!({
+        "page": 1,
+        "total_pages": 1,
+        "total_results": 0,
+        "results": []
+    }))
+}
+
 #[derive(Clone)]
 struct ConcurrencyTracker {
     active: Arc<AtomicUsize>,
@@ -209,6 +219,35 @@ fn unreachable_tmdb_provider() -> Result<ScraperProvider, Box<dyn std::error::Er
         ..TestScraperConfig::default()
     })?;
     Ok(ScraperProvider::from_adapter(tmdb))
+}
+
+async fn empty_search_tmdb_provider() -> Result<
+    (ScraperProvider, RequestTracker, tokio::task::JoinHandle<()>),
+    Box<dyn std::error::Error>,
+> {
+    let tracker = RequestTracker {
+        requests: Arc::new(AtomicUsize::new(0)),
+    };
+    let tmdb_app = Router::new()
+        .fallback(any(empty_tmdb_stub))
+        .with_state(tracker.clone());
+    let tmdb_listener = TcpListener::bind("127.0.0.1:0").await?;
+    let tmdb_address = tmdb_listener.local_addr()?;
+    let tmdb_server = tokio::spawn(async move {
+        let _ = axum::serve(tmdb_listener, tmdb_app).await;
+    });
+    let tmdb = TestScraper::new(TestScraperConfig {
+        base_url: format!("http://{tmdb_address}"),
+        read_access_token: Some("stub-token".to_owned()),
+        timeout: Duration::from_secs(1),
+        max_retries: 0,
+        initial_backoff: Duration::ZERO,
+        max_backoff: Duration::ZERO,
+        retry_jitter: Duration::ZERO,
+        requests_per_second: 0,
+        ..TestScraperConfig::default()
+    })?;
+    Ok((ScraperProvider::from_adapter(tmdb), tracker, tmdb_server))
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -1047,6 +1086,132 @@ async fn fill_missing_skips_complete_movie_without_scraper_request()
             .as_str()
             .is_some_and(|content| content.contains("模式：补全缺失"))
     );
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_empty_provider_search_is_low_confidence_not_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let (_temp_dir, database, _library_id, _folder_id) =
+        setup_movie_library_with_parent_folder().await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND removed_at IS NULL LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let before: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+
+    let (tmdb, tracker, tmdb_server) = empty_search_tmdb_provider().await?;
+    let selection =
+        MetadataSelectionService::new(database.clone(), ImageWriteService::new(database.clone())?);
+    let metadata =
+        MetadataReidentifyService::with_selection(database.clone(), tmdb, Some(selection));
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert!(tracker.requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.items.len(), 1);
+    assert_eq!(completed.items[0].status, "COMPLETED");
+    assert_eq!(completed.items[0].candidate_count, 0);
+    assert_eq!(completed.items[0].error.as_deref(), Some("LOW_CONFIDENCE"));
+
+    let candidates: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let after: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(candidates, 0);
+    assert_eq!(after, before);
+
+    tmdb_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn fill_missing_episode_without_series_candidates_is_not_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _fill_missing_test_guard = FILL_MISSING_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let season = root.join("No Match Show (2024)").join("Season 01");
+    tokio::fs::create_dir_all(&season).await?;
+    tokio::fs::write(season.join("No.Match.Show.S01E01.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_series_library(library.id)
+        .await?;
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'EPISODE' AND removed_at IS NULL LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let before: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+
+    let (tmdb, tracker, tmdb_server) = empty_search_tmdb_provider().await?;
+    let selection =
+        MetadataSelectionService::new(database.clone(), ImageWriteService::new(database.clone())?);
+    let metadata =
+        MetadataReidentifyService::with_selection(database.clone(), tmdb, Some(selection));
+    let job = metadata
+        .create_item_refresh_job(&item_id, MetadataRefreshMode::FillMissing)
+        .await?;
+
+    metadata.run(&job.id).await;
+
+    let completed = metadata.get_job(&job.id).await?;
+    assert!(tracker.requests.load(Ordering::SeqCst) > 0);
+    assert_eq!(completed.status, "COMPLETED");
+    assert_eq!(completed.items.len(), 1);
+    assert_eq!(completed.items[0].status, "COMPLETED");
+    assert_eq!(completed.items[0].candidate_count, 0);
+    assert_eq!(completed.items[0].error.as_deref(), Some("LOW_CONFIDENCE"));
+
+    let candidates: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let after: (String, Option<String>) =
+        sqlx::query_as("SELECT title, provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(candidates, 0);
+    assert_eq!(after, before);
 
     tmdb_server.abort();
     Ok(())

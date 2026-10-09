@@ -1396,9 +1396,12 @@ impl MetadataCandidateService {
             .parent_providers(current, scraper, series_query, series_year)
             .await?;
         if parents.is_empty() {
-            return Err(MetadataCandidateError::Scraper(ScraperError::Provider(
-                "series scraper returned no candidates".to_owned(),
-            )));
+            return Ok(MetadataCandidatePage {
+                items: Vec::new(),
+                total: 0,
+                offset: 0,
+                limit: 50,
+            });
         }
         let expires_at = candidate_expiry();
         let mut stored_candidates = Vec::with_capacity(parents.len());
@@ -1804,9 +1807,7 @@ async fn search_generic(
             }
         }
     }
-    Err(crate::application::scraper::ScraperError::Provider(
-        "scraper returned no candidates".to_owned(),
-    ))
+    Ok(crate::application::scraper::ScraperSearchResponse { items: Vec::new() })
 }
 
 fn candidate_expiry() -> Option<i64> {
