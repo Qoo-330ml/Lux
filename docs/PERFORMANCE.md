@@ -1760,3 +1760,9 @@ scan-local movie metadata page 复用有序 task runner，最多同时执行 4 �
 固定 SQLite waiter-state fixture 中，旧路径对有 pending target 的每次检查依次执行 pending、scan-job existence 和 cancel-state 三个 query-wrapper 调用；合并后一次查询返回相同的 pending/取消状态，调用数为 3→1。等待器在查询前启用 `Notify` future；同进程完成和成功写入的取消请求都会立即触发状态复查。跨进程没有共享 `Notify`，仍依赖 5 秒 fallback，因此跨进程状态发现窗口未扩大。
 
 这是固定 SQLite fixture 的应用层 query-wrapper 计数，不是 SQL 执行时长、数据库往返墙钟或持续负载指标；没有 PostgreSQL/FNOS/NAS 运行数据，也不据此声称 CPU 收益。
+
+### LUX-466 本地 NFO 页人物资产去重与 unchanged write
+
+同一个 scan-local NFO page context 对序列化后相同的人物 NFO、身份与 metadata 输入使用一个共享 `OnceCell` 结果；不同人物资产处理由共享 semaphore 限制为最多 4 路并发，重复人物不占第二个并发槽。该结果覆盖 `person.nfo`、person manifest、profile image、provider identity index 和 canonical person index 写入；`people.json` 关系快照仍逐 item 写入，credits 继续按既有最多 16-item storage chunk 提交。相同 person manifest checksum 继续跳过 manifest 文件替换，profile image 继续使用 LUX-448 的 unchanged-write；本任务将 person NFO 与 provider/canonical index 接入 byte-identical 检查，相同字节保留 inode，变化输入仍写入新文件。单人 provider-index symlink 故障 fixture 断言只将该人物资产标记 pending、其他人物 NFO 与全部 relation 仍保存；该加强版 fixture 尚待重跑。
+
+这些回归证明页内合并范围、4 路并发上限、错误隔离和相同目标字节不执行原子文件替换；没有测量磁盘系统调用墙钟、数据库时延、PostgreSQL/NAS/FNOS CPU 或生产收益，也不表示 person files 与 credits 数据库可以跨持久化边界原子提交。
