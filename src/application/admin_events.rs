@@ -1,9 +1,13 @@
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{Arc, Mutex as StdMutex},
+    time::Duration,
+};
 
 use tokio::sync::{Mutex, broadcast};
 
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const HOME_EVENT_COALESCE_WINDOW: Duration = Duration::from_secs(1);
+const ADMIN_JOBS_EVENT_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdminEventScope {
@@ -48,6 +52,7 @@ impl AdminEventScope {
 #[derive(Clone)]
 pub struct AdminEventHub {
     sender: broadcast::Sender<AdminEventScope>,
+    jobs_event_state: Arc<StdMutex<AdminJobsEventState>>,
 }
 
 #[derive(Clone)]
@@ -63,10 +68,20 @@ struct HomeEventState {
     epoch: u64,
 }
 
+#[derive(Default)]
+struct AdminJobsEventState {
+    scheduled: bool,
+    dirty: bool,
+    epoch: u64,
+}
+
 impl AdminEventHub {
     pub fn new() -> Self {
         let (sender, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        Self { sender }
+        Self {
+            sender,
+            jobs_event_state: Arc::new(StdMutex::new(AdminJobsEventState::default())),
+        }
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<AdminEventScope> {
@@ -74,7 +89,58 @@ impl AdminEventHub {
     }
 
     pub fn publish(&self, scope: AdminEventScope) {
+        if scope == AdminEventScope::Jobs {
+            self.publish_jobs_now();
+            return;
+        }
         let _ = self.sender.send(scope);
+    }
+
+    pub fn publish_jobs_progress(&self) {
+        let Ok(mut state) = self.jobs_event_state.lock() else {
+            let _ = self.sender.send(AdminEventScope::Jobs);
+            return;
+        };
+        if state.scheduled {
+            state.dirty = true;
+            return;
+        }
+
+        state.scheduled = true;
+        state.dirty = false;
+        state.epoch = state.epoch.wrapping_add(1);
+        let epoch = state.epoch;
+        let _ = self.sender.send(AdminEventScope::Jobs);
+
+        let sender = self.sender.clone();
+        let event_state = Arc::clone(&self.jobs_event_state);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ADMIN_JOBS_EVENT_COALESCE_WINDOW).await;
+                let Ok(mut state) = event_state.lock() else {
+                    return;
+                };
+                if state.epoch != epoch || !state.scheduled {
+                    return;
+                }
+                if state.dirty {
+                    state.dirty = false;
+                    let _ = sender.send(AdminEventScope::Jobs);
+                    continue;
+                }
+                state.scheduled = false;
+                return;
+            }
+        });
+    }
+
+    pub fn publish_jobs_now(&self) {
+        if let Ok(mut state) = self.jobs_event_state.lock() {
+            state.scheduled = false;
+            state.dirty = false;
+            state.epoch = state.epoch.wrapping_add(1);
+        }
+        let _ = self.sender.send(AdminEventScope::Jobs);
     }
 }
 
@@ -175,6 +241,57 @@ mod tests {
 
         assert_eq!(first.recv().await, Ok(AdminEventScope::Jobs));
         assert_eq!(second.recv().await, Ok(AdminEventScope::Jobs));
+    }
+
+    #[tokio::test]
+    async fn coalesces_jobs_progress_and_sends_one_trailing_refresh() {
+        let hub = AdminEventHub::new();
+        let mut receiver = hub.subscribe();
+
+        hub.publish_jobs_progress();
+        assert_eq!(
+            timeout(Duration::from_secs(2), receiver.recv()).await,
+            Ok(Ok(AdminEventScope::Jobs))
+        );
+
+        hub.publish_jobs_progress();
+        hub.publish_jobs_progress();
+        assert!(
+            timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err()
+        );
+
+        assert_eq!(
+            timeout(Duration::from_secs(2), receiver.recv()).await,
+            Ok(Ok(AdminEventScope::Jobs))
+        );
+        assert!(
+            timeout(Duration::from_millis(25), receiver.recv())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_jobs_refresh_cancels_pending_progress_trailing_event() {
+        let hub = AdminEventHub::new();
+        let mut receiver = hub.subscribe();
+
+        hub.publish_jobs_progress();
+        assert_eq!(receiver.recv().await, Ok(AdminEventScope::Jobs));
+        hub.publish_jobs_progress();
+        hub.publish(AdminEventScope::Jobs);
+        assert_eq!(receiver.recv().await, Ok(AdminEventScope::Jobs));
+
+        assert!(
+            timeout(
+                Duration::from_secs(1) + Duration::from_millis(25),
+                receiver.recv()
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[test]
