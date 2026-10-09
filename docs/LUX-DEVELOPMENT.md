@@ -2149,6 +2149,7 @@ services:
 | LUX-320 | src/application/nfo.rs、src/application/probe.rs、tests/nfo_writer.rs、docs/；从本地探测结果生成 Emby/Kodi `fileinfo/streamdetails` |
 | LUX-321 | src/application/nfo.rs、src/storage/media.rs、tests/nfo_writer.rs、docs/COMPATIBILITY.md、docs/；为电影 NFO 写入数据库时间/排序值并提供原子 probe-info 写回服务 |
 | LUX-322 | src/application/probe.rs、src/api/legacy.rs、tests/probe.rs、docs/COMPATIBILITY.md、docs/；本地探测完成后调用 NFO 技术信息写回 |
+| LUX-461 | src/application/admin_events.rs、src/application/scanner.rs、src/application/reidentify.rs、docs/LUX-DEVELOPMENT.md；合并高频 Admin Jobs 进度失效通知并保留关键事件即时刷新 |
 | LUX-264 | docs/LUX-DEVELOPMENT.md、docs/decisions/043-full-scan-manifest.md；Manifest 与完成语义规格 |
 | LUX-265 | migrations/0128_full_scan_manifest.sql、migrations-postgres/0128_full_scan_manifest.sql、src/storage/repository.rs、src/storage/mod.rs、src/storage/jobs.rs、tests/storage.rs、tests/postgres_database.rs；跨数据库 Manifest 存储合同 |
 | LUX-266 | src/application/scanner.rs、src/storage/jobs.rs、src/storage/repository.rs、tests/scanning_jobs.rs、docs/PERFORMANCE.md；兼容持久 frontier 与新 Lite 目录发现 |
@@ -9485,6 +9486,18 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 短计划与文件：先在 `src/application/metadata.rs` 为 scan-local movie page 增加有界并发、顺序、错误隔离、身份冲突串行化及 page-end flush 回归，再将该路径接入现有有界有序 runner，同时保留 page flush 边界；在 `src/storage/media.rs` 按既有 movie identity eligibility 复核同页 pending reservation；更新两份任务和性能记录。预计修改 `src/application/metadata.rs`、`src/storage/media.rs`、`docs/LUX-DEVELOPMENT.md` 与 `docs/PERFORMANCE.md`，共 4 个文件。
 
 实现进度（2026-10-09）：scan-local MOVIE NFO 已接入最多 4 路有序 runner；并发、错误隔离、同页 identity reservation 与 page-end flush 回归均覆盖。身份 guard 跨越数据库与 page pending reservation 检查、cache/relation 写入和 metadata update 入队，并在入队后释放；storage 按 parent、available source 和 active 条件复核待检查 reservation。定向 `cargo test --locked --lib application::metadata::tests` 通过 21/21。fallback 用例确认同页两项先参加一次失败 page batch、再逐项回退，故指标中的事务数为 3、item/update 尝试数为 4；与旧提前 flush 路径相比，page metadata 不会在 identity 检查中提前提交。全局 build、Clippy、全量 Rust 测试与集成工作树验收尚待完成，故任务验收仍开放。
+#### LUX-461：合并高频 Admin Jobs 进度失效通知
+
+范围：扫描活动项更新、Manifest `DISCOVERY_PROGRESS` 和 metadata reidentify 进度会反复使 Admin Jobs SSE 失效。为这些进度通知增加有界合并：首个通知立即发送，持续更新最多每秒补发一次尾随失效。任务创建、取消、错误和完成等关键状态变化继续立即发送；即时发送要取消旧进度窗口的待发尾随通知，确保结束状态刷新及时。事件 payload、SSE 协议和任务持久状态不变。
+
+验收：
+
+- [ ] burst 内首个 Jobs 进度失效立即发送，后续事件合并；有持续更新时每个窗口最多发送一次尾随失效。
+- [ ] 即时 Jobs 状态事件在调用时发送并撤销已排队的进度尾随事件，最终完成状态不会被合并丢失或延迟。
+- [ ] 只合并扫描活动项、`DISCOVERY_PROGRESS` 与 reidentify progress；JOB_CREATED、取消、失败、阶段完成和任务完成仍即时发送。
+- [ ] AdminEventHub 单测覆盖 burst、尾随刷新和即时刷新；格式、相关 Rust 测试、全量完成门与差异检查通过。
+
+短计划与文件：先在 `src/application/admin_events.rs` 添加通知时序回归，再增加仅用于 Jobs 进度的 1 秒有界 coalescing 和可取消尾随刷新；在 `src/application/scanner.rs` 接入扫描活动项与发现进度，在 `src/application/reidentify.rs` 接入已节流的重识别进度。更新本文件记录边界和结果。预计修改文件共 4 个。
 
 #### 本轮代码质量与性能优化收口
 
