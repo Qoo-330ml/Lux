@@ -1088,7 +1088,7 @@ mod tests {
     };
     use crate::application::metadata_paths::{
         canonical_person_directory, library_item_directory, lux_person_directory, metadata_root,
-        people_directory, people_index_path_for_provider,
+        people_directory, people_index_path, people_index_path_for_provider,
     };
     use crate::{
         application::libraries::LibraryService, config::Config, library::LibraryKind,
@@ -3257,6 +3257,73 @@ mod tests {
             tokio::fs::metadata(provider_index).await?.ino(),
             first_index_inode,
             "an unchanged provider index must not be atomically replaced"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn local_nfo_lux_person_canonical_index_skips_unchanged_bytes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::os::unix::fs::MetadataExt;
+
+        let config = tempfile::tempdir()?;
+        let service = PeopleService::new(config.path().to_owned());
+        let person_key = "lux-000001";
+        let person_dir = lux_person_directory(config.path(), "演员甲", person_key)?;
+        tokio::fs::create_dir_all(&person_dir).await?;
+        tokio::fs::write(person_dir.join("folder.png"), PNG_1X1).await?;
+
+        let actor = ActorCredit {
+            id: "9".to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: Vec::new(),
+            name: "演员甲".to_owned(),
+            character: None,
+            order: None,
+            profile_url: None,
+            person: None,
+        };
+        let identities = [PersonIdentity {
+            provider: "tmdb".to_owned(),
+            id: "9".to_owned(),
+        }];
+        let index_path = people_index_path(config.path(), person_key)?;
+
+        service
+            .persist_person_assets(&actor, "tmdb", "9", Some(person_key), &identities)
+            .await;
+        let first_index_inode = tokio::fs::metadata(&index_path).await?.ino();
+        service
+            .persist_person_assets(&actor, "tmdb", "9", Some(person_key), &identities)
+            .await;
+        assert_eq!(
+            tokio::fs::metadata(&index_path).await?.ino(),
+            first_index_inode,
+            "an unchanged canonical person index must not be atomically replaced"
+        );
+
+        let nfo_path = person_dir.join(PERSON_NFO);
+        let first_nfo_inode = tokio::fs::metadata(&nfo_path).await?.ino();
+        let updated_actor = ActorCredit {
+            person: Some(PersonMetadata {
+                biography: Some("新增人物简介".to_owned()),
+                ..PersonMetadata::default()
+            }),
+            ..actor
+        };
+        service
+            .persist_person_assets(&updated_actor, "tmdb", "9", Some(person_key), &identities)
+            .await;
+        assert_ne!(tokio::fs::metadata(&nfo_path).await?.ino(), first_nfo_inode);
+        assert!(
+            tokio::fs::read_to_string(nfo_path)
+                .await?
+                .contains("<biography>新增人物简介</biography>")
+        );
+        assert_eq!(
+            tokio::fs::metadata(index_path).await?.ino(),
+            first_index_inode,
+            "metadata-only changes must leave unchanged canonical index bytes in place"
         );
         Ok(())
     }
