@@ -1,45 +1,44 @@
-# 阶段 23 阶段门证据复核（2026-10-09，更新至候选 21c8dfc7）
+# 阶段 23 阶段门证据复核（2026-10-09，更新 2026-10-10）
 
-## 结论与复核范围
+## 结论与 revision
 
-**阶段 23 仍开放，不能关闭。** 本次按已推送候选 `21c8dfc7781e0ce4a0e698fe59e6abed2dba7265` 复核；该 SHA 在复核时是 `origin/test` 与 `codex/lux-audit-optimization-round` 的 HEAD。只更新本阶段门报告，没有运行 Cargo 或性能采样。候选已包含 LUX-469 故障修复及 #10/#13/#16/#17 相关提交；先前报告将 `e6a7ef8a` 当作当前候选并声称 LUX-469 尚未集成，已过时。
+**阶段 23 未完成，性能门不能判通过。** 本次冻结测量/常规 Rust 质量门对应 `32c158ecbe1196db7a53a39e7f6ba8149c93095b`，基线为 `6424ab122a556e2214f9948580b8c7bf42407aa3` 加相同测量补丁；旧 `e6a7ef8a` 的不公平 1k 样本不作为回退或达标证据。完整的计时合同、数据表、失败与归档位置见 [PERFORMANCE.md](PERFORMANCE.md) 的“阶段 23 公平计时复核与未关闭门”。
 
-最终性能矩阵尚无结果。A/B agent 已收到 `21c8dfc7` 并开始准备最终矩阵；本次复核收到的性能文件仍只有针对中间候选 `e6a7ef8a` 的 1k A/B 数据。候选 SHA、对应测试状态和历史性能样本必须分别陈述，不能相互替代。
+另一会话已将冻结提交链集成并推送到 `test`；本轮观察到 `test/origin/test=0980dd36`。该版本还有扫描默认并发 4、metadata worker 配置和其他后续修改。本记录分开列出旧冻结运行与新 Web 测试，不把旧性能或 Rust 门覆盖到新版本。本轮没有推送记录增量或部署。
 
-阶段末需要完成指定检查、更新兼容性或性能记录并取得项目所有者确认。以下审查不替代该确认。
+最终远端只读刷新又观察到 `origin/test=b4635ee3946d497bb1d122ea6597ff2df0a4bc9f`（PR #43 的 PostgreSQL movie merge 修复）；`origin/main=4ee1ea5f`。记录工作树仍基于 `0980dd36`，测量仍为 `32c158ec`；后续源码也没有在本轮 Rust/性能证据的覆盖范围内。
 
 ## 六项验收证据矩阵
 
-| # | 验收项 | 当前证据 | 判定与剩余缺口 |
+| # | 验收项 | 已运行证据 | 判定与剩余缺口 |
 |---|---|---|---|
-| 1 | 1k/10k fixture 证明首批索引和本地 poster 在扫描完成前可见，worker 与后续索引并行 | 候选含 `tests/scanned_metadata.rs::manifest_scan_indexes_poster_while_local_nfo_is_blocked`、`blocked_first_local_poster_does_not_block_manifest_scan` 和 `workflow3_running_discovery_indexes_poster_added_to_unvisited_directory`。最后一项在最终整理版精确测试通过，并在串行目标中通过。LUX-462 有单轮 SQLite/PostgreSQL 观测；旧 LUX-306 有 1k/10k poster-worker A/B。 | **部分完成。** 新回归证明 SQLite fixture 中扫描与本地 worker 并行；仍缺当前候选同 fixture 1k/10k、SQLite/PostgreSQL 的 LUX-270 与 poster-worker A/B。现有记录未单独证明 Web 在该阶段实际呈现首批条目。依据 `docs/LUX-DEVELOPMENT.md` 阶段 23 第 1 项。 |
-| 2 | 首项图片、后段图片、慢 NFO、权限、根不可用、取消/重试、全量/增量竞态及扫描期间新 poster 的故障覆盖 | 候选文档映射到 `manifest_scan_indexes_poster_while_local_nfo_is_blocked`、`blocked_first_local_poster_does_not_block_manifest_scan`、`failed_local_poster_insert_does_not_mark_image_stage_complete`、两项 `unreadable_*_poster_*`、`unavailable_media_root_keeps_local_image_batch_retryable`、`cancelling_scan_during_running_local_image_claim_cancels_before_completeness`、Manifest/incremental CAS 用例及新增 poster 用例。最终三个 target 串行结果为 `scanned_metadata` 21/21、`scanned_series_metadata` 3/3、`scanning_jobs` 81/81；新增 poster 精确回归 1/1。 | **故障覆盖已完成。** 结果是本机 SQLite 自动化 fixture，不证明 PostgreSQL、FNOS 或 NAS 运行行为。此前报告中“LUX-469 未进入候选、target/build/Clippy 尚无结果”的表述已过时。证据见 `docs/LUX-DEVELOPMENT.md` LUX-469 进度记录。 |
-| 3 | 缺失分类、自动补缺策略、队列去重、无候选/失败冷却、执行前复查和保护本地/锁定字段 | 候选包含 `fill_missing_request_plan_only_keeps_missing_capabilities`、`fill_missing_skips_complete_local_items_before_resolving_scrapers`、`scraper_preflight_failure_enters_bounded_fill_missing_retry`、`incremental_scan_only_queues_metadata_when_library_switch_is_enabled`、`idle_fill_missing_dispatcher_coalesces_requests_before_claim`、`full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images` 等回归。LUX-402 记录同一 fingerprint/capability 退避、到期重试及失败次数继承；LUX-407 区分预检错误、明确无 scraper 和无可请求 capability。 | **大体有覆盖，但仍需把证据逐条对齐验收。** 代码中有返回空候选的 stub 和 dispatcher 用例；现有记录未清楚指出哪条断言专门证明“provider 无候选”后的结果及重试/冷却边界。建议最终覆盖表明确对应测试/断言；若没有直接断言，补定向回归。依据 `tests/reidentify.rs`、`tests/metadata_selection.rs`、`src/application/candidates.rs`、`src/application/scanner.rs` 及 `docs/LUX-DEVELOPMENT.md` 的 LUX-402/LUX-407。 |
-| 4 | SQLite/PostgreSQL 同 fixture 性能 A/B：索引、首批可见、poster、本地/在线队列、前台 p95、事务/队列规模、内存；超过 5% 回退后调整并复测 | 当前性能记录中的阶段 23 1k LUX-270 A/B 是 baseline `6424ab12` 对 candidate `e6a7ef8a`，各后端三轮。其前台 p95 SQLite `547→791 ms`（+44.6%）、PostgreSQL `557→792 ms`（+42.2%），热目录 p95 同样明显回退；索引中位数 SQLite `64→54 ms`、PostgreSQL `146→149 ms`。 | **未通过，且不是候选 21c8dfc7 的最终结论。** 旧数据保留为历史性能风险；候选 21c8dfc7 的完整矩阵尚未运行/记录，尚无证据证明回退已消失。还缺 LUX-270 的 1k/10k、LUX-304 poster-worker 的 1k/10k 双后端多轮对照及在线队列、事务/队列规模和内存数据。不得降低 5% 门槛。依据 `docs/PERFORMANCE.md` 的阶段 23 / LUX-270 初步 A/B。 |
-| 5 | 分开报告索引、本地处理和在线处理耗时 | LUX-462 harness 已分别记录 index、scan job、image-pending/drain 及请求窗口；LUX-304 历史结果也分别呈现 scan job 与 poster queue。 | **部分完成。** 阶段 23 旧 1k `unchangedRescanMs` 包含 rescan 与两组并发 HTTP 请求，是复合窗口而非纯扫描耗时；完整最终候选 A/B 和 online queue 分段数据仍待采集。最终报告需分开索引、本地队列、在线队列与前台负载。依据 `docs/PERFORMANCE.md` 中 1k A/B 的窗口定义及 LUX-462 记录。 |
-| 6 | 最终 Rust/Web 质量门、兼容性/性能记录、架构记录及项目所有者确认 | 当前 SHA 的串行 Rust all-targets 结果为 819 passed、1 failed、13 ignored；唯一失败 `application::danmaku::tests::configured_jobs_reuse_plugin_settings_across_libraries`，断言期望 19、实得 20；该测试在同一 SHA 隔离重跑 1/1 通过。LUX-469 三个 target 通过。Web 冻结安装通过；完整 Web 重跑为 132 个 Node 测试及 Vitest 76 个文件/561 项通过；首次并发运行出现 5 个首页用例波动，隔离文件 17/17 通过；Web build 通过。 | **阶段门未通过。** Rust 全量测试的原始阶段结果仍有 1 个失败，即使隔离重跑通过也不能将 all-targets 标为全绿；需稳定复跑全量门并调查波动来源。Web 门通过。LUX-288 `docs/COMPATIBILITY.md` 第 243 行仍写 workflow 3/增量事件/在线补缺运行合同和 A/B 未证明，应在阶段证据完成后更新。项目所有者尚未确认；这是技术验收全过后的最后停点，agent 不得代为关闭。 |
+| 1 | 首批索引、local poster 早于 scan 完成；worker 与后续索引并行，Web 刷新 | `32c158ec` 的 1k/10k 双后端 poster 运行均有先后断言；LUX-469 FIFO/慢 NFO/新 poster 回归；`18b88888` 的组件回归验证 mock 空首页→home 通知→条目和 poster URL；未建模 scan lifecycle 或加载图片。 | **部分完成。** SQLite poster 各缺一轮；DOM 是静态组件 mock，不证明扫描 lifecycle、图片实际加载或浏览器/真实扫描端到端行为。 |
+| 2 | 首项/后段图片、慢 NFO、权限、不可用根、取消/重试、全量/增量竞态、扫描期间补图 | 最终 `scanned_metadata` 22/22、`scanned_series_metadata` 3/3、`scanning_jobs` 81/81；LUX-469 测试映射保留于规格。 | **故障覆盖通过于冻结 SHA。** 这是本机 SQLite 自动化 fixture；后续修改需对应重验。 |
+| 3 | 缺失分类、策略、去重、无候选/失败冷却、执行前复查、保护本地/锁定数据 | `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 释放空 provider 后专门检查 item `COMPLETED/LOW_CONFIDENCE`、retry=0、retry_after=NULL；1k 双后端 online fixture 全部 1000 项也满足相同断言；metadata_selection 31/31、reidentify 集成 17/17、reidentify 模块 28/28。 | **小 fixture 回归通过，规模边界失败。** 10k 自动调度受容量 32 channel 背压阻塞 local worker，需先解决 LUX-424/LUX-303 冲突。 |
+| 4 | 双后端同 fixture、至少三轮；索引/首项/poster/local/online/p95/事务与队列/RSS；回退 ≤5% | 原始 48 行，3 对发现 Cargo 干扰并剔除；仅 LUX-270/10k SQLite 成对补跑成功，现有 44 行诊断数据。逐请求与窗口完整保存。 | **未通过。** SQLite poster 两组各只有两轮；基线默认并发 16、候选 2，未跑相同并发对照；最新 test 默认 4。索引及部分 PG p95 超过 5%，尚未归因；PG poster queue 后 p95 约 +19%/+22%。不能降低门槛或用默认配置差异归因代码。 |
+| 5 | 索引、本地、在线分开计时 | 独立 scan task 与 poster observer 修正；1k online 真实触发 10 jobs/1000 items，分别报告 gate hold 与释放后 drain（SQLite 668ms、PG 2494ms）。 | **部分完成。** 10k SQLite provider 未放行时 local queue 超时；10k PG 未运行。失败/未触发保持 unavailable，不能记零。 |
+| 6 | 最终 Rust/Web 门、兼容/性能/架构记录、ARM 记录及所有者确认 | `32c158ec` build/fmt/Clippy/Rust 1514 passed、0 failed、36 ignored（110 目标）；原候选 Web Node132/Vitest561/build 通过。`0980dd36` 加 DOM 测试的 Web Node134/Vitest570/build 通过（Vitest 最终完整单 worker 重跑）。 | **阶段门未通过。** 新 revision 的 Rust/完整性能矩阵仍需最终重验；技术项未齐，不进入所有者关闭确认。仅 Mac ARM64，不外推部署、FNOS/NAS 或第三方客户端。 |
 
-## 旧 1k A/B：保留为风险证据，不代表当前候选
+Web 复核保留一次默认并行全量的 5 个首页轮播失败；新增 DOM 文件与首页文件分别隔离 17/17 通过，最终完整 Node134/Vitest570 在 `--maxWorkers=1 --minWorkers=1` 下通过，build 通过。并行波动原因未证实，不能把隔离通过当全量通过或直接归因主机负载。
 
-以下是中间候选 `e6a7ef8a14122a7affda50a78042e7c6c4e89b2f` 的三轮中位数，单位 ms。它早于当前 `21c8dfc7`，所以既不能证明当前候选的回退，也不能证明回退已修复。
+## 10k 阻塞与必须先解决的规格冲突
 
-| 后端 | 指标 | Baseline → `e6a7ef8a` | 变化 |
-|---|---|---:|---:|
-| SQLite | index | 64 → 54 | −15.6% |
-| SQLite | foreground p95 | 547 → 791 | +44.6% |
-| SQLite | catalog p95 | 566 → 771 | +36.2% |
-| SQLite | warm catalog p95 | 529 → 772 | +45.9% |
-| PostgreSQL | index | 146 → 149 | +2.1% |
-| PostgreSQL | foreground p95 | 557 → 792 | +42.2% |
-| PostgreSQL | catalog p95 | 541 → 765 | +41.4% |
-| PostgreSQL | warm catalog p95 | 543 → 770 | +41.8% |
+10k SQLite ignored benchmark 用合成空 provider gate 检验在线工作独立性。scan 已 `COMPLETED/IDLE`、10000 项；本地 15 批 COMPLETED、31 PENDING、4 RUNNING，在线 39 QUEUED+1 RUNNING、3970 项。600 秒等待后报告 `local queue timed out while provider was blocked`；总测试 602.59 秒失败。不是 provider 网络慢的产品测量。
 
-旧 `unchangedRescanMs` 包含并发 HTTP 请求测量，不作为纯 scan wall time。该基准的 SQL elapsed 采样可能混入后台 SQL，且不含连接池 acquire 时间，不能单独归因代码根因。A/B 证据限定为本机 ARM64 和本地 PostgreSQL 16.15；不能外推 FNOS/NAS/x86_64。
+来源链：本地 completeness 已原子持久化缺失结果与 job，随后同步调用 `enqueue_fill_missing_job_id`；dispatcher 的 `sender.reserve().await` 等待容量 32 队列，provider 不释放就不消费后续队列，背压传回本地 worker。1k 仅 10 个 job，未达到这一容量边界。
+
+正式规格 LUX-424 明确要求满队列对扫描提交方背压；阶段 23/LUX-303 又要求独立在线任务不阻塞本地 worker。这两项在 10k fixture 上不能同时成立。按 **AGENTS.md / Source of truth**，在改变公共调度/存储边界前已报告并请求项目所有者选择。建议修订自动入口：QUEUED 数据库记录作为真实队列、每库 dispatcher 通过有界通知和分页异步领取，管理员/计划入口的背压与完成等待继续保留；不使用无界内存或逐 job spawn。该修订与实现尚未发生。
 
 ## 最短剩余清单
 
-1. 对候选 `21c8dfc7781e0ce4a0e698fe59e6abed2dba7265` 完成 LUX-270 的 1k/10k × SQLite/PostgreSQL 与 LUX-304 poster-worker 的 1k/10k × SQLite/PostgreSQL A/B；每种配置 baseline/candidate 各三轮，明确记录首项/首 poster、索引、本地与在线队列、前台 p95、资源/事务/队列规模、内存及独立阶段计时。对超过 5% 的回退，先分段定位、调整和复测。
-2. 完成第 3 项的逐项“行为—测试—断言—运行结果”映射；补齐 provider 无候选的直接断言（若现有测试没有覆盖）。
-3. 在最终候选上重跑全 Rust completion gate；完整 all-targets 必须有可解释且通过的结果，不能用单个隔离重跑代替。保留已经通过的 Web 冻结安装、完整测试和 build 证据；将初次波动和隔离复跑结果写入记录。
-4. 更新 `docs/PERFORMANCE.md` 和 `docs/COMPATIBILITY.md`，写明精确候选 SHA、采样与测试证据和 ARM64 边界；不要把本机结果外推为 FNOS/NAS 性能或已部署运行证明。
-5. 所有技术项通过后停在阶段门，等待项目所有者明确确认。确认前阶段 23 保持开放。
+1. 项目所有者选择上述冲突的合同；若采用建议，先补 >32-job、阻塞 provider 下 local drain 的失败回归，再最小修复；保留 dedupe、每库串行、shutdown、取消和完成通知语义。
+2. 在可用的采样窗口，以最终 revision、相同 scan/pool 配置完成 1k/10k × 两后端 × LUX-270/LUX-304 三轮配对，记录默认配置差异另作对照；拒绝受外部 Cargo 干扰的整个配对。补齐 10k online 矩阵。
+3. 对有效复测中仍超过 5% 的稳定回退做 phase/pool-acquire/HTTP/SQL 定位、调整和完整复测；不删跨终点慢请求，不把 null 当零。
+4. 最终源码重跑相关 Rust/Web 全门，更新精确 SHA、结果和兼容性记录；按全局完成标准补需要的真实用户流程验证。
+5. 技术项全部满足后，按 AGENTS.md Stage gates 等待项目所有者明确确认；当前不请求关闭、不进入下一阶段。
+
+## 持久证据与保留状态
+
+`/Volumes/Toshiba/mywork/Lux-stage23-evidence-20261010-32c158ec` 保存 raw/repair/accepted-diagnostic JSONL、manifest/二进制与源码 hash、逐请求时刻、配对日志、质量门、online 失败与 SQLite 阻塞快照。源码测量补丁里的合成数据库密码已脱敏；hash 清单区分原始与归档字节。
+
+主工作区原有 AGENTS.md 修改及未跟踪内容、旧脏基线未动；测量候选保持 `32c158ec` 干净。新增 DOM/记录位于基于 `0980dd36` 的独立 worktree。重复编译干扰后，停止的仅是本会话等待中的采样 driver，没有终止其他会话的编译/测试；相同并发诊断未运行。旧不公平样本与每次失败仍保留，不能宣称性能阶段达标。

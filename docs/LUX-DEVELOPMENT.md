@@ -9592,7 +9592,15 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 #### 阶段 23 总体验收与阶段门
 
-2026-10-09 阶段门复核仍为开放，六项验收的证据、缺口与关闭条件见[阶段 23 证据复核](STAGE-23-GATE-REVIEW-2026-10-09.md)。当前 1k A/B 前台 p95 超过 5% 回退门；新增故障覆盖与更大 fixture 的双后端 A/B 尚未纳入最终候选。项目所有者确认仍是阶段关闭的必要条件。
+2026-10-10 复核：阶段 23 仍开放，六项证据、失败和关闭条件见[阶段 23 证据复核](STAGE-23-GATE-REVIEW-2026-10-09.md)。冻结 `32c158ec` 已完成公平请求计时修复、provider 空候选专项和常规 Rust 全门（1514 passed、0 failed、36 ignored）；LUX-469 的最终三个目标分别 22/22、3/3、81/81。原不公平 1k A/B 不作产品回退证据。
+
+原始三轮矩阵有 3 对发现 Cargo 干扰；只补齐 LUX-270/10k SQLite，现存 44 行诊断样本，两组 SQLite poster 各少一轮。基线默认 scan 并发 16、冻结候选 2，最新 `test=0980dd36` 已改为 4；相同配置最终 A/B 未运行，不能判定实现回退或性能达标。逐请求 cohort、完整扫描窗口 null、本地/在线独立时段及 SQL/pool/RSS 数据见 `PERFORMANCE.md`，5% 门槛保留。
+
+在线补缺 1k 两后端均真实处理 10 jobs/1000 items，在 provider gate 关闭时 scan/local 完成；10k SQLite 却被容量 32 dispatcher 背压卡住本地 worker，600 秒后超时。LUX-424 的提交方背压与本阶段/LUX-303 的不阻塞本地 worker 存在冲突；已按 AGENTS.md Source of truth 报告，在选择修订合同前不改变公共调度/存储边界。10k PostgreSQL 尚未运行。
+
+另一会话已集成冻结提交链并推送到 `test=0980dd36`；本轮运行证据不覆盖其后续修改。基于该 revision 的 `18b88888` 的首页组件回归验证 mock 空列表→home 通知→电影标题/poster URL；Web Node134/Vitest570/build 通过。该测试未建模 scan lifecycle、未请求或解码 poster，不证明浏览器与真实 scan 的端到端行为，新的最终源码还须重跑 Rust/性能门。所有技术验收通过后才按 AGENTS.md Stage gates 请求项目所有者确认；当前不关闭、不进入后续阶段。
+
+最终远端刷新又观察到 `origin/test=b4635ee3`（PR #43 的 PostgreSQL movie merge 修复），同样不在本轮 Rust/性能证据的覆盖范围内；记录工作树保持基于 `0980dd36`。
 
 #### LUX-462：补全阶段 23 基准的 SQL 延迟、连接池与后台队列观测
 
