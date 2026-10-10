@@ -12204,6 +12204,12 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        // The moved source may now be a second default of the target item, and the old
+        // item may have lost its only default.
+        self.normalize_default_source_in_transaction(&mut transaction, new_item_id)
+            .await?;
+        self.normalize_default_source_in_transaction(&mut transaction, &old_item_id)
+            .await?;
 
         for item_id in [Some(old_item_id), parent_id, series_id]
             .into_iter()
@@ -13534,6 +13540,85 @@ mod tests {
                 .await?
                 .is_some()
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reassigned_media_source_does_not_add_a_second_default_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('lib', 'Library', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('root', 'lib', '/media', '/media', 1, 0)",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES
+                    ('item-a', 'lib', 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED'),
+                    ('item-b', 'lib', 'MOVIE', 'Movie B', 'movie b', 'LOCAL_CONFIRMED')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES
+                    ('entry-1', 'root', 'Movie/a.mkv', 'FILE', 10, 1, 'generation'),
+                    ('entry-2', 'root', 'Movie/b.mkv', 'FILE', 10, 1, 'generation'),
+                    ('entry-3', 'root', 'Movie/c.mkv', 'FILE', 10, 1, 'generation')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+                 ) VALUES
+                    ('source-1', 'item-a', 'LOCAL_FILE', 'entry-1', 1, 'READY'),
+                    ('source-2', 'item-b', 'LOCAL_FILE', 'entry-2', 1, 'READY'),
+                    ('source-3', 'item-b', 'LOCAL_FILE', 'entry-3', 0, 'READY')",
+            )
+            .execute(database.pool())
+            .await?;
+
+        // Moving a default source onto an item that already has one keeps a single default.
+        assert!(
+            database
+                .reassign_media_source_item("entry-2", "item-a")
+                .await?
+        );
+        let a_defaults: Vec<String> = database
+            .query_scalar(
+                "SELECT id FROM media_sources WHERE item_id = 'item-a' AND is_default = 1",
+            )
+            .fetch_all(database.pool())
+            .await?;
+        assert_eq!(a_defaults, ["source-1"]);
+        // The item that lost its default source still has exactly one.
+        let b_defaults: Vec<String> = database
+            .query_scalar(
+                "SELECT id FROM media_sources WHERE item_id = 'item-b' AND is_default = 1",
+            )
+            .fetch_all(database.pool())
+            .await?;
+        assert_eq!(b_defaults, ["source-3"]);
         Ok(())
     }
 }

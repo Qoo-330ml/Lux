@@ -260,7 +260,7 @@ impl Database {
             })
     }
 
-    async fn normalize_default_source_in_transaction(
+    pub(super) async fn normalize_default_source_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         item_id: &str,

@@ -1177,16 +1177,20 @@ impl Database {
             "INSERT INTO media_sources (
                  id, item_id, source_kind, filesystem_entry_id, container, size,
                  external_url, strm_target_kind, is_default, probe_status
-             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'PENDING')",
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?,
+                 CASE WHEN EXISTS (
+                     SELECT 1 FROM media_sources WHERE item_id = ? AND is_default = 1
+                 ) THEN 0 ELSE 1 END, 'PENDING')",
         )
         .bind(&file.source_id)
-        .bind(item_id)
+        .bind(&item_id)
         .bind(&file.source_kind)
         .bind(&file.filesystem_entry_id)
         .bind(&file.container)
         .bind(file.size)
         .bind(file.external_url.as_deref())
         .bind(file.strm_target_kind.as_deref())
+        .bind(&item_id)
         .execute(&mut **transaction)
         .await
         .map(|_| ())
