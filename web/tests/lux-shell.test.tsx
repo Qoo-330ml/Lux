@@ -375,7 +375,7 @@ describe("LuxShell user control", () => {
     ]);
   });
 
-  it("renders the first indexed movie and local poster before a scan completes", async () => {
+  it("renders the first catalog batch and poster URL after invalidating an empty home page", async () => {
     FakeEventSource.instances = [];
     sessionStorage.clear();
     vi.stubGlobal("EventSource", FakeEventSource);
@@ -388,7 +388,7 @@ describe("LuxShell user control", () => {
       id: "movie-1", title: "首批本地电影", itemType: "MOVIE",
       imageTags: { poster: "local-poster-v1" }, localMetadataPending: true,
     }];
-    const fixture = { indexed: false, scanCompleted: false };
+    const fixture = { indexed: false };
     const latest = vi.spyOn(api, "homeLibrariesLatest").mockImplementation(async () => ({
       libraries: [{ libraryId: "library-1", items: fixture.indexed ? firstBatch : [] }],
     }));
@@ -414,7 +414,7 @@ describe("LuxShell user control", () => {
     await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(1));
     expect(container.querySelector(".lux-media-card")).toBeNull();
 
-    // The API fixture publishes a committed batch while its scan remains running.
+    // Supply the first mock batch through the home invalidation used by scans.
     fixture.indexed = true;
     act(() => FakeEventSource.instances[0]?.emit("invalidate", JSON.stringify({ scope: "home" })));
     await vi.waitFor(() => expect(latest).toHaveBeenCalledTimes(2));
@@ -422,7 +422,6 @@ describe("LuxShell user control", () => {
       '[aria-label="最新电影库"] .lux-media-card img',
     )?.src).toContain("tag=local-poster-v1"));
     expect(container.textContent).toContain("首批本地电影");
-    expect(fixture.scanCompleted).toBe(false);
   });
 
   it("refreshes the library poster tags after a scraper home event", async () => {
