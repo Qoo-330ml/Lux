@@ -1728,31 +1728,59 @@ impl CatalogSource {
     }
 
     fn split_part(&self) -> (String, Option<u32>) {
-        let (key, part) = crate::application::media_matching::split_part_marker(
-            self.edition_name.as_deref().unwrap_or_default(),
-        );
+        use crate::application::media_matching::split_part_marker;
+        let (label, part) = split_part_marker(self.edition_name.as_deref().unwrap_or_default());
+        let quality = self
+            .quality_label
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        let label = label.to_lowercase();
         if part.is_some() {
-            return (key.to_lowercase(), part);
+            return (format!("{label}|{quality}"), part);
         }
-        // Plain `Movie cd1.mkv` files carry the marker only in the file name.
+        // Plain `Movie.1080p.cd1.mkv` files carry the marker only in the file name. The rest
+        // of the file name tells their versions apart (`Movie.4K.cd1.mkv` is another one).
         let stem = self
             .file_name
             .as_deref()
             .map(|name| name.rsplit_once('.').map_or(name, |(stem, _)| stem))
             .unwrap_or_default();
-        let (_, part) = crate::application::media_matching::split_part_marker(stem);
-        (key.to_lowercase(), part)
+        match split_part_marker(stem) {
+            (stem_key, Some(part)) => (
+                format!("{label}|{quality}|{}", stem_key.to_lowercase()),
+                Some(part),
+            ),
+            (_, None) => (format!("{label}|{quality}"), None),
+        }
     }
 }
 
 /// Number of parts that make up the version `source` belongs to (1 for a single file).
 pub fn catalog_source_part_count(sources: &[CatalogSource], source: &CatalogSource) -> usize {
+    if source.part_index().is_none() {
+        return 1;
+    }
     let key = source.version_key();
     sources
         .iter()
-        .filter(|candidate| candidate.version_key() == key && candidate.part_index().is_some())
+        .filter(|candidate| candidate.part_index().is_some() && candidate.version_key() == key)
         .count()
         .max(1)
+}
+
+/// Whether `source` belongs to the version of the default source: the default itself or,
+/// for a multi-part default, one of its other parts.
+pub fn belongs_to_default_version(sources: &[CatalogSource], source: &CatalogSource) -> bool {
+    if source.is_default {
+        return true;
+    }
+    let Some(default) = sources.iter().find(|candidate| candidate.is_default) else {
+        return false;
+    };
+    default.part_index().is_some()
+        && source.part_index().is_some()
+        && default.version_key() == source.version_key()
 }
 
 /// Keeps the parts of one version together, in part order, and makes sure only the
@@ -2012,8 +2040,9 @@ mod tests {
 
     use super::{
         CatalogItem, CatalogSource, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle,
-        SearchFlightKey, SearchFlightRegistry, arrange_source_parts, catalog_source_file_name,
-        catalog_source_part_count, reorder_catalog_items, take_recent_entries,
+        SearchFlightKey, SearchFlightRegistry, arrange_source_parts, belongs_to_default_version,
+        catalog_source_file_name, catalog_source_part_count, reorder_catalog_items,
+        take_recent_entries,
     };
 
     fn catalog_source(id: &str, edition: Option<&str>, is_default: bool) -> CatalogSource {
@@ -2033,6 +2062,81 @@ mod tests {
             streams: Vec::new(),
             chapters: Vec::new(),
         }
+    }
+
+    fn file_source(
+        id: &str,
+        file_name: &str,
+        quality: Option<&str>,
+        is_default: bool,
+    ) -> CatalogSource {
+        CatalogSource {
+            file_name: Some(file_name.to_owned()),
+            quality_label: quality.map(str::to_owned),
+            ..catalog_source(id, None, is_default)
+        }
+    }
+
+    #[test]
+    fn two_multi_part_versions_named_only_by_file_name_stay_apart() {
+        // The filename parser leaves edition_name empty here; the resolution is the only
+        // difference and must keep the two versions apart.
+        let mut sources = vec![
+            file_source("hd-cd1", "Movie.1080p.cd1.mkv", Some("1080p"), false),
+            file_source("uhd-cd1", "Movie.4K.cd1.mkv", Some("4K"), false),
+            file_source("hd-cd2", "Movie.1080p.cd2.mkv", Some("1080p"), false),
+            file_source("uhd-cd2", "Movie.4K.cd2.mkv", Some("4K"), true),
+        ];
+        arrange_source_parts(&mut sources);
+        let ids = sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["hd-cd1", "hd-cd2", "uhd-cd1", "uhd-cd2"]);
+        let defaults = sources
+            .iter()
+            .filter(|source| source.is_default)
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, ["uhd-cd1"], "the default stays in the 4K version");
+        assert_eq!(catalog_source_part_count(&sources, &sources[0]), 2);
+        assert_eq!(catalog_source_part_count(&sources, &sources[2]), 2);
+
+        // Without a quality label the rest of the file name still tells them apart.
+        let mut sources = vec![
+            file_source("a-cd1", "Movie Theatrical cd1.mkv", None, true),
+            file_source("b-cd1", "Movie Extended cd1.mkv", None, false),
+            file_source("a-cd2", "Movie Theatrical cd2.mkv", None, false),
+            file_source("b-cd2", "Movie Extended cd2.mkv", None, false),
+        ];
+        arrange_source_parts(&mut sources);
+        let ids = sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["a-cd1", "a-cd2", "b-cd1", "b-cd2"]);
+    }
+
+    #[test]
+    fn a_complete_single_file_reports_one_part_next_to_a_multi_part_version() {
+        let mut sources = vec![
+            file_source("whole", "Movie.mkv", None, true),
+            file_source("part-1", "Movie.cd1.mkv", None, false),
+            file_source("part-2", "Movie.cd2.mkv", None, false),
+        ];
+        arrange_source_parts(&mut sources);
+        let whole = sources
+            .iter()
+            .find(|source| source.id == "whole")
+            .expect("whole file");
+        assert_eq!(catalog_source_part_count(&sources, whole), 1);
+        let part = sources
+            .iter()
+            .find(|source| source.id == "part-1")
+            .expect("first part");
+        assert_eq!(catalog_source_part_count(&sources, part), 2);
+        assert!(belongs_to_default_version(&sources, whole));
+        assert!(!belongs_to_default_version(&sources, part));
     }
 
     #[test]

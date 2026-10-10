@@ -42,14 +42,22 @@ pub(super) async fn emby_playback_info(
             return StatusCode::NOT_FOUND.into_response();
         }
     };
-    let mut sources = item.media_sources.iter().collect::<Vec<_>>();
+    let sources = item.media_sources.iter().collect::<Vec<_>>();
     let query_media_source_requested = query.media_source_id.is_some();
-    sources.sort_by(|left, right| {
-        right
-            .is_default
-            .cmp(&left.is_default)
-            .then_with(|| left.id.cmp(&right.id))
-    });
+    // The catalog already grouped the parts of each version and ordered the versions; only
+    // move the default version (with all of its parts) to the front and keep the rest.
+    let default_version = sources
+        .iter()
+        .map(|source| {
+            crate::application::catalog::belongs_to_default_version(&item.media_sources, source)
+        })
+        .collect::<Vec<_>>();
+    let mut ranked = sources.into_iter().zip(default_version).collect::<Vec<_>>();
+    ranked.sort_by_key(|(_, in_default_version)| !*in_default_version);
+    let mut sources = ranked
+        .into_iter()
+        .map(|(source, _)| source)
+        .collect::<Vec<_>>();
     if let Some(source_id) = query.media_source_id {
         let Some(index) = sources.iter().position(|source| source.id == source_id) else {
             return StatusCode::NOT_FOUND.into_response();
