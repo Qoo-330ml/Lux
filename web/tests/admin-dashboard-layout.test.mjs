@@ -4,6 +4,25 @@ import test from "node:test";
 
 const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
 
+function extractBlock(source, marker) {
+  const markerIndex = source.indexOf(marker);
+  if (markerIndex < 0) return "";
+
+  const openingBrace = source.indexOf("{", markerIndex);
+  if (openingBrace < 0) return "";
+
+  let depth = 0;
+  for (let index = openingBrace; index < source.length; index += 1) {
+    if (source[index] === "{") depth += 1;
+    if (source[index] === "}") {
+      depth -= 1;
+      if (depth === 0) return source.slice(openingBrace + 1, index);
+    }
+  }
+
+  return "";
+}
+
 test("admin console uses the account settings page rhythm", () => {
   const layoutRule = stylesheet.match(/\.lux-admin-layout\s*\{([^}]*)\}/)?.[1] ?? "";
   const sidebarRule = stylesheet.match(/\.lux-admin-sidebar\s*\{([^}]*)\}/)?.[1] ?? "";
@@ -16,6 +35,21 @@ test("admin console uses the account settings page rhythm", () => {
   assert.match(sidebarRule, /border-right:\s*0/);
   assert.match(contentRule, /padding:\s*0\s+0\s+90px\s+clamp\(28px,\s*5vw,\s*84px\)/);
   assert.match(headingRule, /margin-bottom:\s*28px/);
+});
+
+test("phone admin content uses the available width with safe-area-aware gutters", () => {
+  const phoneStyles = extractBlock(stylesheet, "@media (max-width: 560px)");
+  const adminLayoutRule = extractBlock(phoneStyles, ".lux-admin-layout");
+  const adminContentRule = extractBlock(phoneStyles, ".lux-admin-content");
+  const tabletStyles = extractBlock(stylesheet, "@media (max-width: 900px)");
+  const tabletAdminLayoutRule = extractBlock(tabletStyles, ".lux-admin-layout");
+
+  assert.match(adminLayoutRule, /width:\s*100%/);
+  assert.match(
+    adminContentRule,
+    /padding:\s*24px\s+max\(12px,\s*env\(safe-area-inset-right\)\)\s+64px\s+max\(12px,\s*env\(safe-area-inset-left\)\)/,
+  );
+  assert.doesNotMatch(tabletAdminLayoutRule, /width:\s*100%/);
 });
 
 test("dashboard omits redundant status and quick-link panel styles", () => {

@@ -1853,6 +1853,8 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
 
 @media (max-width: 560px) {
   .lux-header { padding-top: max(14px, env(safe-area-inset-top)); padding-right: max(15px, env(safe-area-inset-right)); padding-bottom: 14px; padding-left: max(15px, env(safe-area-inset-left)); }
+  .lux-admin-layout { width: 100%; }
+  .lux-admin-content { padding: 24px max(12px, env(safe-area-inset-right)) 64px max(12px, env(safe-area-inset-left)); }
 .lux-media-editor-backdrop { place-items: center; padding: max(12px, env(safe-area-inset-top)) max(12px, env(safe-area-inset-right)) max(12px, env(safe-area-inset-bottom)) max(12px, env(safe-area-inset-left)); }
 .lux-media-editor { width: calc(100vw - 24px); width: calc(100dvw - 24px); max-height: calc(100vh - 24px); max-height: calc(100dvh - env(safe-area-inset-top) - env(safe-area-inset-bottom) - 24px); }
 .lux-media-editor-header { min-width: 0; gap: 12px; padding: 16px; }
