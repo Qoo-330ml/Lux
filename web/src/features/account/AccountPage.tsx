@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Check,
   ChevronDown,
   ChevronUp,
   GripVertical,
@@ -342,6 +343,7 @@ export function AccountPage({ user }: { user: LuxUser }) {
                 <p>用于按钮、进度和选中状态的界面色彩。</p>
               </div>
               <div className="lux-accent-options" role="group" aria-label="界面强调色">
+                <AccentOption color="silver" label="银灰" selected={settings.accentColor === "silver"} onSelect={() => updateSettings({ accentColor: "silver" })} />
                 <AccentOption color="berry" label="莓果" selected={settings.accentColor === "berry"} onSelect={() => updateSettings({ accentColor: "berry" })} />
                 <AccentOption color="ocean" label="海蓝" selected={settings.accentColor === "ocean"} onSelect={() => updateSettings({ accentColor: "ocean" })} />
                 <AccentOption color="amber" label="琥珀" selected={settings.accentColor === "amber"} onSelect={() => updateSettings({ accentColor: "amber" })} />
@@ -593,6 +595,7 @@ function AccentOption({ color, label, selected, onSelect }: { color: string; lab
     <button className={`lux-accent-option is-${color}${selected ? " is-selected" : ""}`} type="button" aria-label={`选择强调色 ${label}`} aria-pressed={selected} onClick={onSelect}>
       <span className="lux-accent-swatch" aria-hidden="true" />
       <span>{label}</span>
+      {selected ? <Check size={12} aria-hidden="true" /> : null}
     </button>
   );
 }

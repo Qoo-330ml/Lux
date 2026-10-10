@@ -10122,6 +10122,19 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 
 补充重启恢复回归（2026-10-09）：`deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 注入 credits/index-state 写入失败后丢弃 page-local collector、关闭并重新打开 SQLite 与 PeopleService；确认 `people.json` 的字节 checksum 保持不变、重启后的 current 检查仍判 stale，再由既有 person index rebuild 从文件快照恢复 credits/checksum 并转为 current。定向命令 `cargo test --locked --lib deferred_relation_credit_failure_recovers_from_snapshot_after_restart` 通过（1/1），使用 Toshiba 共享 Cargo target。本用例模拟持久化边界上的服务状态丢失，不等同于断电/文件系统崩溃测试，也不证明 PostgreSQL 或 FNOS 行为。
 
+#### LUX-470：Logo 银灰默认强调色
+
+范围：个人设置新增「银灰」强调色，并作为未保存颜色偏好时的默认值。沿用 Logo 的中性灰色：深色模式使用 `#CBD5E1`，浅色模式使用 `#3A3F4B`。强调色实心控件使用独立前景色，深色模式为 `#181B22`、浅色模式为白色；选中状态保持既有勾选和开关位置反馈。已保存的莓果、海蓝、琥珀、薄荷偏好继续有效。
+
+验收：
+
+- [ ] 无本地偏好或无效强调色时默认银灰；已保存的五种颜色可读取、切换并按账户持久化。
+- [ ] 个人设置显示银灰选项，使用 `aria-pressed` 标记选择；切换主题保持所选色系并调整银灰明度。
+- [ ] 银灰文字、实心按钮文字、勾选和启用开关在深浅模式均清晰，相关文字对比度至少 4.5:1。
+- [ ] Web 全量测试与构建、定向浏览器检查、Rust 格式与静态检查通过；记录本机 ARM 验证边界。
+
+实施切片：A 修改 `web/src/features/account/account-settings.ts`、`web/src/features/account/AccountPage.tsx`、`web/src/react.css`、`web/tests/account-settings.test.tsx` 和本文档；先用账户偏好回归验证默认值、旧颜色兼容和银灰切换。B 修改 `web/src/features/admin/plugin-library.css` 的启用开关前景色，并进行深浅模式控件对比度与 Web 全量验收。只调整 Web 外观和本地偏好，不修改服务端设置或数据库。
+
 ## 28. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

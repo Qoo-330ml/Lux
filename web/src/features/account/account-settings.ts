@@ -1,5 +1,5 @@
 export type LuxTheme = "light" | "dark";
-export type LuxAccentColor = "berry" | "ocean" | "amber" | "mint";
+export type LuxAccentColor = "silver" | "berry" | "ocean" | "amber" | "mint";
 export type LibraryMoveDirection = "up" | "down";
 
 export type AccountSettings = {
@@ -17,7 +17,7 @@ export const ACCOUNT_SETTINGS_STORAGE_KEY = "lux.account.settings";
 
 export const DEFAULT_ACCOUNT_SETTINGS: AccountSettings = {
   theme: "dark",
-  accentColor: "berry",
+  accentColor: "silver",
   libraryOrder: [],
   showMediaLibraries: true,
   showContinueWatching: true,
@@ -101,7 +101,7 @@ export function applyAccountAccent(accentColor: LuxAccentColor): void {
 }
 
 function isAccentColor(value: unknown): value is LuxAccentColor {
-  return value === "berry" || value === "ocean" || value === "amber" || value === "mint";
+  return value === "silver" || value === "berry" || value === "ocean" || value === "amber" || value === "mint";
 }
 
 function getStorage(): Storage | null {
