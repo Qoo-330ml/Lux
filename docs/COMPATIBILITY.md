@@ -218,6 +218,28 @@ Lux 兼容 `GET /ScheduledTasks` 和 `/emby/ScheduledTasks`，返回标准的 `R
 这些测试证明 Lux 服务端的请求路径、权限、状态码、响应字段和资源清理，不替代 Qmby 在 FNOS 部署实例上的完整
 登录、首页、详情、播放、进度和停止请求序列复测。
 
+## LUX-057 多版本重扫保持元数据身份
+
+电影文件名的通用连字符后缀仍要求同目录存在唯一匹配的基础视频。重新扫描已入库版本时，
+以基础视频当前关联的电影条目 ID 确定归属，包含其管理员合并后的主条目；NFO 或在线元数据
+修改标题、年份不会使版本脱离原条目。稳定全量扫描保留媒体源 ID 和 READY 探测状态；
+视频内容变化或目录重扫仍更新文件索引，已拆分的旧版本可在重扫时归回基础视频的条目。
+
+自动化覆盖：`tests/scanned_metadata.rs::movie_variant_rescan_preserves_nfo_identity_and_filename_poster`
+使用 `ABS-123.mp4`、`ABS-123-C.mp4`、本地 NFO 和 `ABS-123-poster.jpg`，
+验证元数据改写后的连续全量扫描、文件变化、目录重扫和旧拆分修复；
+`tests/scanner.rs::movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases`
+覆盖通用多段后缀、不同扩展名、旧拆分修复和稳定重扫。验证环境为本机 ARM64/SQLite，
+不代表已部署实例或第三方客户端验证。
+
+验证记录（2026-10-10）：相关 `scanner`、`scanning_jobs`、`scanned_metadata` 和 `item_merge`
+目标共 122 项通过；build、fmt、Clippy 全目标/全特性零警告、Web 561 项测试和构建、
+5 项 Python 工具测试及 `git diff --check` 通过。`check-all.sh` 的库测试阶段出现两项失败：
+NFO 人物关系故障注入断言和插件迁移查询计数；插件计数失败在修复前的 `21782159` 定向复现，
+NFO 测试在该基线定向和整组运行通过。基线整组另出现弹幕查询计数失败。
+后续完整集成运行受其他 Cargo 任务覆盖共享 target 二进制影响，出现新增回归缺失，不能作为本次完整门禁证据；
+相关目标重新编译后复制测试二进制、确认包含新增回归再运行。完整 Rust 门禁未全绿。
+
 ## LUX-266 全量扫描 Manifest 存储兼容
 
 新建全量扫描时，job、Manifest、root 状态和目录 frontier 同事务创建；扫描发现将文件/目录 stat 与 fingerprint 作为追加式 observation 持久化，目录 frontier 不再写入 `reconciliation_scan_entries`。Unix 扫描逐段从 root directory handle 打开路径组件并拒绝符号链接，再通过已打开目录 handle 枚举，避免目录在校验与打开之间被替换后越出 library root；发现 chunk 与收尾事务都检查取消标记，取消任务不能进入 `READY_TO_DIFF`。已发现的文件索引工作暂由旧表的 FILE 行承接，直到 LUX-267 将差异应用切换到 Manifest。此内部存储变化不改变 Lux、Webhook 或 Emby 公共合同。
