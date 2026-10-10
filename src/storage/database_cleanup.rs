@@ -8,6 +8,8 @@ const DATABASE_CLEANUP_COMPLETED: &str = "COMPLETED";
 const SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER: &str = "scan_job_events_config_log_migration_v1";
 const AUDIT_EVENTS_LOG_MIGRATION_MARKER: &str = "audit_events_config_log_migration_v1";
 const CLEANUP_BATCH_SIZE: i64 = 1_000;
+/// Grace period so a batch is never removed while its worker is still finishing it.
+const LOCAL_METADATA_BATCH_RETENTION_SECONDS: i64 = 3_600;
 const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGMENT_BYTES / 2;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -17,6 +19,7 @@ pub struct DatabaseLifecycleCleanupReport {
     pub scan_manifest_deltas_deleted: u64,
     pub scan_manifest_entries_deleted: u64,
     pub scan_manifest_directories_deleted: u64,
+    pub scan_local_metadata_batches_deleted: u64,
     pub scan_job_targets_deleted: u64,
     pub scan_jobs_summarized: u64,
 }
@@ -435,6 +438,7 @@ impl Database {
             return if report.scan_manifest_deltas_deleted > 0
                 || report.scan_manifest_entries_deleted > 0
                 || report.scan_manifest_directories_deleted > 0
+                || report.scan_local_metadata_batches_deleted > 0
             {
                 Ok(Some(report))
             } else {
@@ -541,6 +545,8 @@ impl Database {
             scan_manifest_deltas_deleted: manifest_payload.scan_manifest_deltas_deleted,
             scan_manifest_entries_deleted: manifest_payload.scan_manifest_entries_deleted,
             scan_manifest_directories_deleted: manifest_payload.scan_manifest_directories_deleted,
+            scan_local_metadata_batches_deleted: manifest_payload
+                .scan_local_metadata_batches_deleted,
             scan_job_targets_deleted: self.delete_non_retryable_scan_job_targets().await?,
             scan_jobs_summarized: self.summarize_terminal_scan_jobs().await?,
         })
@@ -569,12 +575,58 @@ impl Database {
         })?;
         let scan_manifest_directories_deleted =
             self.delete_completed_scan_manifest_directories().await?;
+        let scan_local_metadata_batches_deleted =
+            self.delete_terminal_scan_local_metadata_batches().await?;
         Ok(DatabaseLifecycleCleanupReport {
             scan_manifest_deltas_deleted,
             scan_manifest_entries_deleted,
             scan_manifest_directories_deleted,
+            scan_local_metadata_batches_deleted,
             ..DatabaseLifecycleCleanupReport::default()
         })
+    }
+
+    /// Local-metadata batches carry the full source id list of up to 256 sources. Once
+    /// a batch is COMPLETED (or CANCELLED) and its scan job is no longer running nothing
+    /// reads it again: the batch id is only consulted while a job is still enqueueing.
+    async fn delete_terminal_scan_local_metadata_batches(&self) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        loop {
+            let count = self
+                .query(
+                    "DELETE FROM scan_local_metadata_batches
+                     WHERE id IN (
+                         SELECT batch.id
+                         FROM scan_local_metadata_batches batch
+                         WHERE batch.status IN ('COMPLETED', 'CANCELLED')
+                           AND batch.updated_at < unixepoch() - ?
+                           AND NOT EXISTS (
+                               SELECT 1 FROM scan_jobs sj
+                               WHERE sj.id = batch.job_id
+                                 AND NOT (
+                                     (sj.status IN ('COMPLETED', 'FAILED')
+                                      AND sj.scan_phase = 'IDLE')
+                                     OR sj.status = 'CANCELLED'
+                                 )
+                           )
+                         LIMIT ?
+                     )",
+                )
+                .bind(LOCAL_METADATA_BATCH_RETENTION_SECONDS)
+                .bind(CLEANUP_BATCH_SIZE)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if count == 0 {
+                break;
+            }
+            deleted = deleted.saturating_add(count);
+        }
+        Ok(deleted)
     }
 
     async fn delete_completed_scan_manifest_deltas(&self) -> Result<u64, StorageError> {

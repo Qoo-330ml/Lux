@@ -4894,12 +4894,56 @@ impl Database {
         Ok(baselines)
     }
 
+    pub(crate) async fn find_movie_item_for_filesystem_paths(
+        &self,
+        library_root_id: &str,
+        relative_paths: &[String],
+    ) -> Result<Option<String>, StorageError> {
+        if relative_paths.is_empty() {
+            return Ok(None);
+        }
+        let placeholders = std::iter::repeat_n("?", relative_paths.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let query = format!(
+            "SELECT DISTINCT current_item.id
+             FROM filesystem_entries entry
+             JOIN media_sources source ON source.filesystem_entry_id = entry.id
+             JOIN media_items item ON item.id = source.item_id
+             JOIN media_items current_item
+               ON current_item.id = COALESCE(item.merged_into_item_id, item.id)
+             JOIN library_roots root ON root.id = entry.library_root_id
+             WHERE entry.library_root_id = ? AND entry.relative_path IN ({placeholders})
+               AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+               AND current_item.library_id = root.library_id
+               AND current_item.item_type = 'MOVIE' AND current_item.removed_at IS NULL
+               AND current_item.merged_into_item_id IS NULL
+             LIMIT 2"
+        );
+        let mut statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(query));
+        statement = statement.bind(library_root_id);
+        for relative_path in relative_paths {
+            statement = statement.bind(relative_path);
+        }
+        let item_ids =
+            statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        Ok(match item_ids.as_slice() {
+            [item_id] => Some(item_id.clone()),
+            _ => None,
+        })
+    }
+
     pub(crate) async fn scan_manifest_movie_variant_identity_is_current(
         &self,
         library_root_id: &str,
         relative_path: &str,
-        sort_title: &str,
-        production_year: Option<i64>,
+        base_item_id: &str,
         edition_name: Option<&str>,
     ) -> Result<bool, StorageError> {
         self.query_scalar::<i64>(
@@ -4909,15 +4953,14 @@ impl Database {
              JOIN media_items item ON item.id = source.item_id
              WHERE entry.library_root_id = ? AND entry.relative_path = ?
                AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
-               AND item.removed_at IS NULL AND item.sort_title = ?
-               AND COALESCE(item.production_year, -1) = COALESCE(?, -1)
+               AND item.removed_at IS NULL
+               AND COALESCE(item.merged_into_item_id, item.id) = ?
                AND COALESCE(source.edition_name, '') = COALESCE(?, '')
              LIMIT 1",
         )
         .bind(library_root_id)
         .bind(relative_path)
-        .bind(sort_title)
-        .bind(production_year)
+        .bind(base_item_id)
         .bind(edition_name)
         .fetch_optional(&self.pool)
         .await

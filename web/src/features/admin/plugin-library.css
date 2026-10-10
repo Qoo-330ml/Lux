@@ -271,6 +271,7 @@
 }
 
 .lux-admin-plugin-enable-switch.is-enabled .lux-admin-plugin-enable-switch-track span {
+  background: var(--lux-accent-foreground);
   transform: translateX(13px);
 }
 

@@ -2748,17 +2748,30 @@ impl LibraryScanner {
             return Ok(report);
         }
 
-        let existing_item = self
-            .database
-            .find_media_item(
-                library_id_text,
-                &parsed_name.sort_title,
-                parsed_name.production_year.map(i64::from),
-            )
-            .await?;
-        let (item_id, created_item) = if let Some(item) = existing_item {
-            self.database.restore_media_item(&item.id).await?;
-            (item.id, false)
+        // NFO or online metadata can replace the parsed title and year. The exact
+        // sibling base's indexed item remains the identity anchor for this version.
+        let base_item_id = match inferred_suffix {
+            Some(suffix) => {
+                self.find_inferred_movie_variant_base_item(&root.id, root_path, path, suffix)
+                    .await?
+            }
+            None => None,
+        };
+        let existing_item_id = match base_item_id {
+            Some(item_id) => Some(item_id),
+            None => self
+                .database
+                .find_media_item(
+                    library_id_text,
+                    &parsed_name.sort_title,
+                    parsed_name.production_year.map(i64::from),
+                )
+                .await?
+                .map(|item| item.id),
+        };
+        let (item_id, created_item) = if let Some(item_id) = existing_item_id {
+            self.database.restore_media_item(&item_id).await?;
+            (item_id, false)
         } else {
             let item_id = ItemId::new().to_string();
             self.database
@@ -2877,6 +2890,40 @@ impl LibraryScanner {
         report.created_sources = 1;
         report.created_items = if created_item { 1 } else { 0 };
         Ok(report)
+    }
+
+    async fn find_inferred_movie_variant_base_item(
+        &self,
+        library_root_id: &str,
+        root_path: &Path,
+        path: &Path,
+        suffix: &str,
+    ) -> Result<Option<String>, ScannerError> {
+        let Some(stem) = path.file_stem().and_then(|value| value.to_str()) else {
+            return Ok(None);
+        };
+        let Some(base) = stem.strip_suffix(&format!("-{suffix}")) else {
+            return Ok(None);
+        };
+        let Some(directory) = path.parent() else {
+            return Ok(None);
+        };
+        let relative_paths = movie_variant_extensions(path)
+            .into_iter()
+            .map(|extension| {
+                let sibling = directory.join(format!("{base}.{extension}"));
+                sibling
+                    .strip_prefix(root_path)
+                    .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                    .to_str()
+                    .map(str::to_owned)
+                    .ok_or(ScannerError::NonUtf8Path)
+            })
+            .collect::<Result<Vec<_>, ScannerError>>()?;
+        Ok(self
+            .database
+            .find_movie_item_for_filesystem_paths(library_root_id, &relative_paths)
+            .await?)
     }
 }
 
@@ -5169,27 +5216,29 @@ impl ScanJobService {
                     } else {
                         None
                     };
-                    let variant_identity_is_current =
-                        match inferred_suffix.as_deref().and_then(|suffix| {
-                            path.file_name()
-                                .and_then(|name| name.to_str())
-                                .and_then(|name| {
-                                    parse_movie_filename_with_variant_suffix(name, suffix)
-                                })
-                        }) {
-                            Some(parsed) => {
+                    let variant_identity_is_current = match inferred_suffix.as_deref() {
+                        Some(suffix) => {
+                            let base_item_id = self
+                                .scanner
+                                .find_inferred_movie_variant_base_item(
+                                    &root.id, &root_path, &path, suffix,
+                                )
+                                .await?;
+                            if let Some(base_item_id) = base_item_id {
                                 self.database
                                     .scan_manifest_movie_variant_identity_is_current(
                                         &root.id,
                                         &observation.relative_path,
-                                        &parsed.sort_title,
-                                        parsed.production_year.map(i64::from),
-                                        parsed.edition_name.as_deref(),
+                                        &base_item_id,
+                                        Some(suffix),
                                     )
                                     .await?
+                            } else {
+                                false
                             }
-                            None => false,
-                        };
+                        }
+                        None => false,
+                    };
                     if inferred_suffix.is_none() || variant_identity_is_current {
                         seen_filesystem_entries.push(NewScanManifestSeenFilesystemEntry {
                             filesystem_entry_id: baseline.id.clone(),
@@ -12108,15 +12157,7 @@ where
     let filename = path.file_name()?.to_str()?;
     let candidates = trailing_hyphen_variant_candidates(filename)?;
     let directory = path.parent()?;
-    let mut extensions = Vec::with_capacity(7);
-    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
-        extensions.push(extension.to_owned());
-    }
-    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
-        if !extensions.iter().any(|existing| existing == extension) {
-            extensions.push(extension.to_owned());
-        }
-    }
+    let extensions = movie_variant_extensions(path);
     let mut matched_suffixes = HashSet::new();
     for (base, suffix) in candidates.iter().rev() {
         for extension in &extensions {
@@ -12135,6 +12176,19 @@ where
     } else {
         None
     }
+}
+
+fn movie_variant_extensions(path: &Path) -> Vec<String> {
+    let mut extensions = Vec::with_capacity(7);
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        extensions.push(extension.to_owned());
+    }
+    for extension in ["mkv", "MKV", "mp4", "MP4", "strm", "STRM"] {
+        if !extensions.iter().any(|existing| existing == extension) {
+            extensions.push(extension.to_owned());
+        }
+    }
+    extensions
 }
 
 fn is_supported_movie_file(path: &Path) -> bool {
@@ -14119,6 +14173,175 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "stage 23 synthetic automatic online queue measurement; requires LUX_PERF_MEDIA_ROOT"]
+    async fn stage23_online_fill_missing_benchmark() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{
+                candidates::MetadataSelectionService, images::ImageWriteService,
+                libraries::LibraryService, nfo::LocalNfoMetadataStore,
+                reidentify::MetadataReidentifyService,
+            },
+            config::{Config, DatabaseConfiguration, PostgresConnection},
+            library::LibraryKind,
+            storage::Database,
+        };
+        use std::time::{Duration, Instant};
+        let count: usize = std::env::var("LUX_PERF_FILE_COUNT")?.parse()?;
+        let root = std::path::PathBuf::from(std::env::var("LUX_PERF_MEDIA_ROOT")?);
+        let backend = std::env::var("LUX_PERF_BACKEND").unwrap_or_else(|_| "sqlite".into());
+        let configuration = match backend.as_str() {
+            "sqlite" => DatabaseConfiguration::Sqlite,
+            "postgres" => {
+                let name = std::env::var("POSTGRES_TEST_DATABASE")?;
+                if !name.starts_with("s23_") {
+                    return Err("benchmark requires an s23_ disposable database".into());
+                }
+                DatabaseConfiguration::Postgres(PostgresConnection {
+                    host: "127.0.0.1".into(),
+                    port: std::env::var("POSTGRES_TEST_PORT")?.parse()?,
+                    database: name,
+                    username: std::env::var("POSTGRES_TEST_USER")?,
+                    password: std::env::var("POSTGRES_TEST_PASSWORD")?,
+                    ssl_mode: "disable".into(),
+                })
+            }
+            _ => return Err("unsupported benchmark database backend".into()),
+        };
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:0".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let database = Database::connect_with_configuration(&config, &configuration).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Online fixture", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 fixture")?)
+            .await?;
+        let provider = GateSearchScraper {
+            search_started: Arc::new(Notify::new()),
+            release_search: Arc::new(Semaphore::new(0)),
+        };
+        let selection = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir.clone(),
+        );
+        let metadata = MetadataReidentifyService::with_selection(
+            database.clone(),
+            ScraperProvider::from_adapter(provider.clone()),
+            Some(selection.clone()),
+        );
+        let jobs = ScanJobService::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+            .with_metadata_selection(selection)
+            .with_metadata_reidentify(metadata);
+        jobs.start_local_metadata_outbox_worker().await?;
+        let job = jobs.create_movie_scan_job(library.id).await?;
+        let started = Instant::now();
+        let scan_jobs = jobs.clone();
+        let job_id = job.id.clone();
+        let scan = tokio::spawn(async move {
+            scan_jobs.run_to_completion(&job_id, 500, None).await?;
+            Ok::<_, super::ScanJobError>(started.elapsed().as_nanos())
+        });
+        tokio::time::timeout(Duration::from_secs(600), provider.search_started.notified()).await?;
+        let first_provider_request_ns = started.elapsed().as_nanos();
+        let scan_complete_ns = tokio::time::timeout(Duration::from_secs(600), scan).await???;
+        let bind = if backend == "postgres" { "$1" } else { "?" };
+        let local_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status <> 'COMPLETED' OR images_completed_at IS NULL THEN 1 ELSE 0 END), 0) FROM scan_local_metadata_batches WHERE job_id = {bind}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let local_complete_ns = loop {
+            let (batches, unfinished): (i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(local_query.clone()))
+                    .bind(&job.id)
+                    .fetch_one(database.pool())
+                    .await?;
+            if batches > 0 && unfinished == 0 {
+                break started.elapsed().as_nanos();
+            }
+            if Instant::now() > deadline {
+                return Err("local queue timed out while provider was blocked".into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let queue_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN status IN ('QUEUED', 'RUNNING') THEN 1 ELSE 0 END), 0), COALESCE(MAX(total_count), 0) FROM metadata_reidentify_jobs WHERE library_id = {bind} AND mode = 'FILL_MISSING'"
+        );
+        let (jobs_before_release, active_before_release, max_items_before_release): (
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(sqlx::AssertSqlSafe(queue_query.clone()))
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+        assert!(
+            jobs_before_release > 0 && active_before_release > 0,
+            "the provider gate must leave real online jobs active"
+        );
+        let release_ns = started.elapsed().as_nanos();
+        // Title fallback may issue several searches per item. After the gate
+        // opens, keep every synthetic search unblocked until the queue drains.
+        provider
+            .release_search
+            .add_permits(Semaphore::MAX_PERMITS / 2);
+        let item_query = format!(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN item.status = 'COMPLETED' AND item.error = 'LOW_CONFIDENCE' AND item.automatic_retry_count = 0 AND item.automatic_retry_after IS NULL THEN 1 ELSE 0 END), 0) FROM metadata_reidentify_job_items item JOIN metadata_reidentify_jobs job ON job.id = item.job_id WHERE job.library_id = {bind} AND job.mode = 'FILL_MISSING'"
+        );
+        let mut peak_jobs = active_before_release;
+        let (online_complete_ns, job_count, item_count) = loop {
+            let (job_count, active, max_items): (i64, i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(queue_query.clone()))
+                    .bind(library.id.to_string())
+                    .fetch_one(database.pool())
+                    .await?;
+            let (items, successful): (i64, i64) =
+                sqlx::query_as(sqlx::AssertSqlSafe(item_query.clone()))
+                    .bind(library.id.to_string())
+                    .fetch_one(database.pool())
+                    .await?;
+            peak_jobs = peak_jobs.max(active);
+            assert!(max_items <= 100 && max_items_before_release <= 100);
+            assert!(
+                items <= count as i64,
+                "duplicate automatic work in synthetic fixture"
+            );
+            if items == count as i64 && successful == items && active == 0 {
+                break (started.elapsed().as_nanos(), job_count, items);
+            }
+            if Instant::now() > deadline {
+                return Err(format!("online drain timed out: jobs={job_count}, active={active}, items={items}, lowConfidence={successful}").into());
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(scan_complete_ns < release_ns && local_complete_ns < release_ns);
+        println!(
+            "STAGE23 ONLINE RESULT {}",
+            serde_json::json!({
+                "commit": crate::COMMIT, "architecture": std::env::consts::ARCH,
+                "databaseBackend": backend, "fileCount": count,
+                "firstProviderRequestMs": first_provider_request_ns / 1_000_000,
+                "scanJobCompletionMs": scan_complete_ns / 1_000_000,
+                "localQueueCompleteMs": local_complete_ns / 1_000_000,
+                "providerGateReleasedMs": release_ns / 1_000_000,
+                "onlineQueueCompleteMs": online_complete_ns / 1_000_000,
+                "onlineDrainAfterProviderReleaseMs": (online_complete_ns - release_ns) / 1_000_000,
+                "onlineFillMissingJobCount": job_count, "onlineItemCount": item_count,
+                "maxObservedActiveJobs": peak_jobs, "maxItemsPerJobBound": 100,
+                "scanAndLocalQueueCompletedWhileProviderBlocked": true,
+                "providerMode": "synthetic empty search; held until scan and local queue complete",
+                "timingNote": "providerGateReleasedMs includes intentional gate hold; onlineDrainAfterProviderReleaseMs measures scheduling/storage drain with an immediate empty provider, not real network latency",
+            })
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn local_metadata_worker_dispatches_fill_missing_without_blocking_scan()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -14240,6 +14463,31 @@ mod tests {
             }
         })
         .await??;
+        let fill_item: (String, Option<String>, i64, Option<i64>) = sqlx::query_as(
+            "SELECT status, error, automatic_retry_count, automatic_retry_after
+             FROM metadata_reidentify_job_items
+             WHERE job_id = ?",
+        )
+        .bind(&fill_job.0)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            fill_item.0, "COMPLETED",
+            "fill-missing result: {fill_item:?}"
+        );
+        assert_eq!(
+            fill_item.1.as_deref(),
+            Some("LOW_CONFIDENCE"),
+            "an empty provider search is a no-candidate result, not provider unavailability"
+        );
+        assert_eq!(
+            fill_item.2, 0,
+            "no-candidate results do not consume retry budget"
+        );
+        assert_eq!(
+            fill_item.3, None,
+            "no-candidate results do not enter cooldown"
+        );
         let home_event = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             user_events_receiver.recv(),

@@ -61,9 +61,178 @@ const INCREMENTAL_FILES: usize = 100;
 const METADATA_BENCHMARK_ITEMS: usize = 32;
 const POOL_PRESSURE_SAMPLE_INTERVAL: Duration = Duration::from_millis(5);
 
+#[derive(Clone, Copy)]
+struct CatalogPageExpectation {
+    fixture_file_count: usize,
+    require_complete_fixture: bool,
+    require_posters: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestTiming {
+    start_offset_ns: u128,
+    elapsed_ns: u128,
+}
+
 #[test]
 fn process_peak_rss_is_reported_in_bytes() {
     assert!(process_peak_rss_bytes().is_some_and(|bytes| bytes > 0));
+}
+
+#[test]
+fn performance_catalog_samples_reject_empty_and_foreign_fixture_pages() {
+    let expectation = CatalogPageExpectation {
+        fixture_file_count: 2,
+        require_complete_fixture: false,
+        require_posters: false,
+    };
+
+    assert!(validate_fixture_catalog_page(&json!({"items": [], "total": 0}), expectation).is_err());
+    assert!(
+        validate_fixture_catalog_page(
+            &json!({
+                "items": [{"itemType": "MOVIE", "title": "Unrelated Movie"}],
+                "total": 1
+            }),
+            expectation
+        )
+        .is_err()
+    );
+    assert!(
+        validate_fixture_catalog_page(
+            &json!({
+                "items": [{"itemType": "MOVIE", "title": "Fixture Movie 000000"}],
+                "total": 3
+            }),
+            expectation
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn performance_catalog_drain_page_matches_fixture_and_has_posters() {
+    let drained_page = json!({
+        "items": [
+            {"itemType": "MOVIE", "title": "Fixture Movie 000000", "imageTags": {"poster": "poster-0"}},
+            {"itemType": "MOVIE", "title": "Fixture Movie 000001", "imageTags": {"poster": "poster-1"}}
+        ],
+        "total": 2
+    });
+    let expectation = CatalogPageExpectation {
+        fixture_file_count: 2,
+        require_complete_fixture: true,
+        require_posters: true,
+    };
+
+    assert!(validate_fixture_catalog_page(&drained_page, expectation).is_ok());
+    let missing_poster = json!({
+        "items": [
+            {"itemType": "MOVIE", "title": "Fixture Movie 000000", "imageTags": {"poster": "poster-0"}},
+            {"itemType": "MOVIE", "title": "Fixture Movie 000001", "imageTags": {"poster": null}}
+        ],
+        "total": 2
+    });
+    assert!(validate_fixture_catalog_page(&missing_poster, expectation).is_err());
+    let missing_fixture_item = json!({
+        "items": [{"itemType": "MOVIE", "title": "Fixture Movie 000000", "imageTags": {"poster": "poster-0"}}],
+        "total": 1
+    });
+    assert!(validate_fixture_catalog_page(&missing_fixture_item, expectation).is_err());
+}
+
+#[test]
+fn scan_active_request_samples_must_fit_entirely_inside_the_window() {
+    let requests = [
+        RequestTiming {
+            start_offset_ns: 99,
+            elapsed_ns: 1,
+        },
+        RequestTiming {
+            start_offset_ns: 100,
+            elapsed_ns: 100,
+        },
+        RequestTiming {
+            start_offset_ns: 150,
+            elapsed_ns: 151,
+        },
+        RequestTiming {
+            start_offset_ns: 200,
+            elapsed_ns: 100,
+        },
+        RequestTiming {
+            start_offset_ns: 250,
+            elapsed_ns: 51,
+        },
+    ];
+
+    assert_eq!(
+        select_scan_active_requests(&requests, 100, 300),
+        [requests[1], requests[3]]
+    );
+}
+
+#[test]
+fn scan_active_request_samples_are_unavailable_when_no_request_fits() {
+    let requests = [RequestTiming {
+        start_offset_ns: 50,
+        elapsed_ns: 51,
+    }];
+
+    assert!(select_scan_active_requests(&requests, 100, 300).is_empty());
+    assert_eq!(optional_percentile_ms(&[]), None);
+}
+
+#[test]
+fn request_timing_report_keeps_slow_requests_started_during_scan() {
+    let mut requests = vec![
+        RequestTiming {
+            start_offset_ns: 150_000_000,
+            elapsed_ns: 10_000_000
+        };
+        FOREGROUND_REQUESTS
+    ];
+    for request in &mut requests[..3] {
+        *request = RequestTiming {
+            start_offset_ns: 100_000_000,
+            elapsed_ns: 300_000_000,
+        };
+    }
+    let report = request_timing_report(&requests, 100_000_000, 200_000_000);
+    assert_eq!(report["startedDuringScanRequestCount"], 50);
+    assert_eq!(report["crossingScanEndRequestCount"], 3);
+    assert_eq!(report["startedDuringScanP95Ms"], 300);
+    assert_eq!(report["scanActiveP95Ms"], serde_json::Value::Null);
+    let incomplete = request_timing_report(&requests[..49], 100_000_000, 200_000_000);
+    assert_eq!(
+        incomplete["startedDuringScanP95Ms"],
+        serde_json::Value::Null
+    );
+    requests[49].start_offset_ns = 200_000_000;
+    let late = request_timing_report(&requests, 100_000_000, 200_000_000);
+    assert_eq!(late["startedDuringScanP95Ms"], serde_json::Value::Null);
+}
+
+fn select_scan_active_requests(
+    requests: &[RequestTiming],
+    scan_start_ns: u128,
+    scan_end_ns: u128,
+) -> Vec<RequestTiming> {
+    requests
+        .iter()
+        .copied()
+        .filter(|request| {
+            request.start_offset_ns >= scan_start_ns
+                && request
+                    .start_offset_ns
+                    .checked_add(request.elapsed_ns)
+                    .is_some_and(|end| end <= scan_end_ns)
+        })
+        .collect()
+}
+
+fn optional_percentile_ms(values: &[u128]) -> Option<u128> {
+    (!values.is_empty()).then(|| percentile(values, 95))
 }
 
 fn process_peak_rss_bytes() -> Option<u64> {
@@ -87,6 +256,36 @@ fn process_peak_rss_bytes() -> Option<u64> {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
+    }
+}
+
+async fn wait_for_fixture_catalog_page(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<(u128, serde_json::Value), Box<dyn std::error::Error>> {
+    let deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let started = Instant::now();
+        let response = client.get(url).header(COOKIE, cookies).send().await?;
+        let status = response.status();
+        let body = response.bytes().await?;
+        if status != reqwest::StatusCode::OK {
+            return Err(format!("{label} request returned {status}").into());
+        }
+        let page: serde_json::Value = serde_json::from_slice(&body)?;
+        let total = page["total"].as_u64().unwrap_or_default();
+        let items_empty = page["items"].as_array().is_none_or(Vec::is_empty);
+        if total > 0 && !items_empty {
+            validate_fixture_catalog_page(&page, expectation).map_err(std::io::Error::other)?;
+            return Ok((started.elapsed().as_millis(), page));
+        }
+        if Instant::now() >= deadline {
+            return Err(format!("{label} never returned a visible fixture item").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 
@@ -1090,6 +1289,184 @@ impl LocalPosterQueueSnapshot {
     }
 }
 
+// The baseline processes local metadata inline; the candidate drains an outbox.
+// Keep their completion evidence explicit while sharing all HTTP sampling code.
+enum BenchmarkPosterSnapshot {
+    Detached(LocalPosterQueueSnapshot),
+    Inline {
+        total: i64,
+        status: String,
+        posters: i64,
+    },
+}
+
+impl BenchmarkPosterSnapshot {
+    fn is_drained(&self, required: usize) -> bool {
+        match self {
+            Self::Detached(snapshot) => snapshot.is_drained(required),
+            Self::Inline {
+                total,
+                status,
+                posters,
+            } => status == "COMPLETED" && *total >= required as i64 && *posters >= required as i64,
+        }
+    }
+    fn has_completed_batch_missing_image_marker(&self) -> bool {
+        matches!(self, Self::Detached(snapshot) if snapshot.has_completed_batch_missing_image_marker())
+    }
+    fn is_pending_measurement_window(&self) -> bool {
+        matches!(self, Self::Detached(snapshot) if snapshot.is_pending_measurement_window())
+    }
+    fn cancelled_batch_count(&self) -> i64 {
+        match self {
+            Self::Detached(snapshot) => snapshot.cancelled_batch_count,
+            Self::Inline { status, .. } => i64::from(status == "CANCELLED" || status == "FAILED"),
+        }
+    }
+    fn poster_item_count(&self) -> i64 {
+        match self {
+            Self::Detached(snapshot) => snapshot.poster_item_count,
+            Self::Inline { posters, .. } => *posters,
+        }
+    }
+    fn pending_measurement_unavailable_reason(&self) -> &'static str {
+        match self {
+            Self::Detached(snapshot) => snapshot.pending_measurement_unavailable_reason(),
+            Self::Inline { .. } => "inline baseline has no detached image queue",
+        }
+    }
+    fn report(&self, required: usize) -> serde_json::Value {
+        match self {
+            Self::Detached(snapshot) => snapshot.report(required),
+            Self::Inline {
+                total,
+                status,
+                posters,
+            } => json!({
+                "completionModel": "inline_metadata_baseline",
+                "scanTotalCount": total, "scanStatus": status,
+                "posterItemCount": posters, "requiredPosterItemCount": required,
+                "drained": self.is_drained(required),
+            }),
+        }
+    }
+}
+
+#[test]
+fn inline_poster_drain_requires_scan_completion_and_all_fixture_posters() {
+    assert!(
+        BenchmarkPosterSnapshot::Inline {
+            total: 100,
+            status: "COMPLETED".into(),
+            posters: 100
+        }
+        .is_drained(100)
+    );
+    for (status, posters) in [("RUNNING", 100), ("FAILED", 100), ("COMPLETED", 99)] {
+        assert!(
+            !BenchmarkPosterSnapshot::Inline {
+                total: 100,
+                status: status.into(),
+                posters
+            }
+            .is_drained(100)
+        );
+    }
+}
+
+async fn load_benchmark_poster_snapshot(
+    pool: &sqlx::AnyPool,
+    job_id: &str,
+    library_id: &str,
+    job_placeholder: &str,
+    library_placeholder: &str,
+) -> Result<BenchmarkPosterSnapshot, sqlx::Error> {
+    match env::var("LUX_PERF_POSTER_QUEUE_MODE").as_deref() {
+        Err(_) | Ok("detached_batches") => Ok(BenchmarkPosterSnapshot::Detached(
+            load_local_poster_queue_snapshot(
+                pool,
+                job_id,
+                library_id,
+                job_placeholder,
+                library_placeholder,
+            )
+            .await?,
+        )),
+        Ok("inline_metadata_baseline") => {
+            let library_placeholder = if job_placeholder == "$1" { "$2" } else { "?" };
+            let query = format!("SELECT job.total_count, job.status,
+                (SELECT COUNT(DISTINCT image.item_id) FROM item_images image
+                 JOIN media_items item ON item.id = image.item_id
+                 WHERE item.library_id = {library_placeholder} AND image.image_type = 'POSTER' AND image.source = 'LOCAL')
+                FROM scan_jobs job WHERE job.id = {job_placeholder}");
+            // SQLite binds the subquery before the WHERE clause; PostgreSQL
+            // parameter numbering is independent of textual occurrence order.
+            let (first, second) = if job_placeholder == "$1" {
+                (job_id, library_id)
+            } else {
+                (library_id, job_id)
+            };
+            let (total, status, posters) = sqlx::query_as(sqlx::AssertSqlSafe(query))
+                .bind(first)
+                .bind(second)
+                .fetch_one(pool)
+                .await?;
+            Ok(BenchmarkPosterSnapshot::Inline {
+                total,
+                status,
+                posters,
+            })
+        }
+        Ok(_) => Err(sqlx::Error::Protocol(
+            "unsupported poster queue mode".into(),
+        )),
+    }
+}
+
+async fn observe_benchmark_poster_completion(
+    pool: sqlx::AnyPool,
+    job_id: String,
+    library_id: String,
+    job_placeholder: &'static str,
+    library_placeholder: &'static str,
+    file_count: usize,
+    epoch: Instant,
+) -> Result<(u128, BenchmarkPosterSnapshot), sqlx::Error> {
+    let poster_queue_deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let snapshot = load_benchmark_poster_snapshot(
+            &pool,
+            &job_id,
+            &library_id,
+            job_placeholder,
+            library_placeholder,
+        )
+        .await?;
+        if snapshot.has_completed_batch_missing_image_marker() {
+            return Err(sqlx::Error::Protocol(format!(
+                "LUX-304 completed image batch is missing images_completed_at and cannot be considered drained: {}",
+                snapshot.report(file_count)
+            )));
+        }
+        if snapshot.cancelled_batch_count() > 0 {
+            return Err(sqlx::Error::Protocol(format!(
+                "LUX-304 image queue contains cancelled batches and cannot be considered drained: {}",
+                snapshot.report(file_count)
+            )));
+        }
+        if snapshot.is_drained(file_count) {
+            return Ok((epoch.elapsed().as_nanos(), snapshot));
+        }
+        if Instant::now() >= poster_queue_deadline {
+            return Err(sqlx::Error::Protocol(format!(
+                "LUX-304 strict local image queue drain timed out: {}",
+                snapshot.report(file_count)
+            )));
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn load_local_poster_queue_snapshot(
     pool: &sqlx::AnyPool,
     job_id: &str,
@@ -1212,44 +1589,62 @@ impl PoolPressureMonitor {
     }
 }
 
-async fn measure_get_requests_with_pool_pressure(
+async fn measure_catalog_get_requests_with_pool_pressure(
     client: &reqwest::Client,
     pool: sqlx::AnyPool,
     url: &str,
     cookies: &str,
     label: &str,
+    expectation: CatalogPageExpectation,
 ) -> Result<(Vec<u128>, serde_json::Value), Box<dyn std::error::Error>> {
     let monitor = start_pool_pressure_monitor(pool);
-    let request_result = measure_get_requests(client, url, cookies, label).await;
+    let request_result =
+        measure_catalog_get_requests(client, url, cookies, label, expectation).await;
     let pressure = monitor.stop().await;
     Ok((request_result?, pressure))
 }
 
-async fn measure_get_request(
+async fn measure_get_request_checked(
     client: &reqwest::Client,
     url: &str,
     cookies: &str,
     label: &str,
+    expectation: CatalogPageExpectation,
 ) -> Result<u128, Box<dyn std::error::Error>> {
     let started = Instant::now();
     let response = client.get(url).header(COOKIE, cookies).send().await?;
     let status = response.status();
-    let _ = response.bytes().await?;
+    let body = response.bytes().await?;
     if status != reqwest::StatusCode::OK {
         return Err(format!("{label} request returned {status}").into());
     }
-    Ok(started.elapsed().as_millis())
+    let elapsed_ms = started.elapsed().as_millis();
+    let page: serde_json::Value = serde_json::from_slice(&body)?;
+    validate_fixture_catalog_page(&page, expectation).map_err(std::io::Error::other)?;
+    Ok(elapsed_ms)
 }
 
-async fn measure_get_request_with_pool_pressure(
+async fn measure_catalog_get_request(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<u128, Box<dyn std::error::Error>> {
+    measure_get_request_checked(client, url, cookies, label, expectation).await
+}
+
+async fn measure_catalog_get_request_with_pool_pressure(
     client: &reqwest::Client,
     pool: sqlx::AnyPool,
     url: &str,
     cookies: &str,
     label: &str,
+    expectation: CatalogPageExpectation,
 ) -> Result<(u128, serde_json::Value), Box<dyn std::error::Error>> {
     let monitor = start_pool_pressure_monitor(pool);
-    let request_result = measure_get_request(client, url, cookies, label).await;
+    let request_result =
+        measure_catalog_get_request(client, url, cookies, label, expectation).await;
     let pressure = monitor.stop().await;
     Ok((request_result?, pressure))
 }
@@ -1422,7 +1817,13 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
@@ -1842,7 +2243,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
@@ -2207,13 +2614,19 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
         library.id
     );
+    let catalog_page_expectation = CatalogPageExpectation {
+        fixture_file_count: file_count,
+        require_complete_fixture: false,
+        require_posters: false,
+    };
     let (catalog_list_first_request_ms, catalog_list_first_request_pool_pressure) =
-        measure_get_request_with_pool_pressure(
+        measure_catalog_get_request_with_pool_pressure(
             &client,
             database.pool().clone(),
             &catalog_page_url,
             &cookies,
             "Manifest first catalog page",
+            catalog_page_expectation,
         )
         .await?;
     let catalog_list_first_request_sql_latency_window = statement_counts.take_query_latency_values(
@@ -2222,12 +2635,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         "SQLx events observed during the single first catalog-page request; global instrumentation may include concurrent background SQL.",
     );
     let (catalog_list_warm_page_ms, catalog_list_warm_pool_pressure) =
-        measure_get_requests_with_pool_pressure(
+        measure_catalog_get_requests_with_pool_pressure(
             &client,
             database.pool().clone(),
             &catalog_page_url,
             &cookies,
             "Manifest warmed catalog page",
+            catalog_page_expectation,
         )
         .await?;
     let catalog_list_warm_sql_latency_window = statement_counts.take_query_latency_values(
@@ -2258,33 +2672,53 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             rescan_batch_durations.push(batch_started.elapsed().as_millis());
             processed += report.processed;
             if report.completed {
-                return Ok((processed, rescan_batch_durations));
+                return Ok((
+                    processed,
+                    rescan_batch_durations,
+                    rescan_started.elapsed().as_nanos(),
+                ));
             }
         }
     });
     tokio::task::yield_now().await;
     let scan_running_before_api = !rescan_handle.is_finished();
-    let (foreground_ms, foreground_pool_pressure) = measure_get_requests_with_pool_pressure(
-        &client,
-        database.pool().clone(),
-        &format!("{base_url}/api/v1/admin/libraries"),
-        &cookies,
-        "Manifest foreground",
-    )
-    .await?;
-    let (catalog_list_ms, catalog_list_pool_pressure) = measure_get_requests_with_pool_pressure(
-        &client,
-        database.pool().clone(),
-        &catalog_page_url,
-        &cookies,
-        "Manifest catalog list",
-    )
-    .await?;
-    let (rescan_processed, rescan_batch_durations) = rescan_handle
+    let foreground_monitor = start_pool_pressure_monitor(database.pool().clone());
+    let catalog_monitor = start_pool_pressure_monitor(database.pool().clone());
+    let admin_url = format!("{base_url}/api/v1/admin/libraries");
+    let (foreground_timings, catalog_timings) = tokio::try_join!(
+        measure_timed_get_requests(
+            &client,
+            &admin_url,
+            &cookies,
+            "Manifest foreground",
+            None,
+            rescan_started
+        ),
+        measure_timed_get_requests(
+            &client,
+            &catalog_page_url,
+            &cookies,
+            "Manifest catalog list",
+            Some(catalog_page_expectation),
+            rescan_started
+        ),
+    )?;
+    let foreground_pool_pressure = foreground_monitor.stop().await;
+    let catalog_list_pool_pressure = catalog_monitor.stop().await;
+    let foreground_ms: Vec<_> = foreground_timings
+        .iter()
+        .map(|sample| sample.elapsed_ns / 1_000_000)
+        .collect();
+    let catalog_list_ms: Vec<_> = catalog_timings
+        .iter()
+        .map(|sample| sample.elapsed_ns / 1_000_000)
+        .collect();
+    let (rescan_processed, rescan_batch_durations, rescan_end_ns) = rescan_handle
         .await
-        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(std::io::Error::other)?
         .map_err(std::io::Error::other)?;
-    let rescan_ms = rescan_started.elapsed().as_millis();
+    let rescan_ms = rescan_end_ns / 1_000_000;
+    let rescan_and_request_window_ms = rescan_started.elapsed().as_millis();
     let unchanged_rescan_stage_timings = statement_counts.scan_stage_values();
     let unchanged_rescan_and_foreground_sql_latency_window =
         statement_counts.take_query_latency_values(
@@ -2423,6 +2857,9 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         }),
         json!({
             "foregroundDuringScan": scan_running_before_api,
+            "foregroundRequestTiming": request_timing_report(&foreground_timings, 0, rescan_end_ns),
+            "catalogListRequestTiming": request_timing_report(&catalog_timings, 0, rescan_end_ns),
+            "rescanAndRequestWindowMs": rescan_and_request_window_ms,
             "foregroundRequestCount": FOREGROUND_REQUESTS,
             "foregroundP95Ms": foreground_p95_ms,
             "foregroundPoolPressure": foreground_pool_pressure,
@@ -2565,7 +3002,13 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
@@ -2587,81 +3030,142 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
     let scan_job = jobs.create_movie_scan_job(library.id).await?;
     let scan_started = Instant::now();
-    let observation_database = database.clone();
-    let observation_library_id = library.id.to_string();
-    let observation_started = scan_started;
-    let first_visibility_handle = tokio::spawn(async move {
-        let mut first_item_visible_ms = None;
-        let mut first_poster_indexed_ms = None;
+    let scan_worker = jobs.clone();
+    let scan_job_id = scan_job.id.clone();
+    let scan_handle = tokio::spawn(async move {
+        scan_worker
+            .run_to_completion(&scan_job_id, 500, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>(scan_started.elapsed().as_nanos())
+    });
+    let local_poster_completion_handle = tokio::spawn(observe_benchmark_poster_completion(
+        database.pool().clone(),
+        scan_job.id.clone(),
+        library.id.to_string(),
+        job_id_placeholder,
+        queue_library_id_placeholder,
+        file_count,
+        scan_started,
+    ));
+    tokio::task::yield_now().await;
+    // The direct worker does not invalidate AppState's catalog cache. Wait for
+    // a committed fixture item before the first request so an empty page is
+    // never cached for the scan-active sample.
+    let catalog_list_url = format!(
+        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
+        library.id
+    );
+    // Catalog cache keys include the page limit, so each phase gets a fresh
+    // cache entry while sampling the same library and first page.
+    let image_pending_catalog_list_url = format!(
+        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=51",
+        library.id
+    );
+    let drained_catalog_list_url = format!(
+        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=52",
+        library.id
+    );
+    let catalog_page_expectation = CatalogPageExpectation {
+        fixture_file_count: file_count,
+        require_complete_fixture: false,
+        require_posters: false,
+    };
+    let first_poster_observer_database = database.clone();
+    let first_poster_observer_library_id = library.id.to_string();
+    let first_poster_observer_started = scan_started;
+    let first_poster_indexed_handle = tokio::spawn(async move {
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
-            if first_item_visible_ms.is_none()
-                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
-                    "SELECT id FROM media_items
-                     WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE' LIMIT 1"
-                )))
-                .bind(&observation_library_id)
-                .fetch_optional(observation_database.pool())
-                .await?
-                .is_some()
+            if sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+                "SELECT image.item_id FROM item_images image
+                 JOIN media_items item ON item.id = image.item_id
+                 WHERE item.library_id = {library_id_placeholder} AND image.image_type = 'POSTER'
+                   AND image.source = 'LOCAL' LIMIT 1"
+            )))
+            .bind(&first_poster_observer_library_id)
+            .fetch_optional(first_poster_observer_database.pool())
+            .await?
+            .is_some()
             {
-                first_item_visible_ms = Some(observation_started.elapsed().as_millis());
-            }
-            if first_poster_indexed_ms.is_none()
-                && sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
-                    "SELECT image.item_id FROM item_images image
-                     JOIN media_items item ON item.id = image.item_id
-                     WHERE item.library_id = {library_id_placeholder} AND image.image_type = 'POSTER'
-                       AND image.source = 'LOCAL' LIMIT 1"
-                )))
-                .bind(&observation_library_id)
-                .fetch_optional(observation_database.pool())
-                .await?
-                .is_some()
-            {
-                first_poster_indexed_ms = Some(observation_started.elapsed().as_millis());
-            }
-            if let (Some(first_item_visible_ms), Some(first_poster_indexed_ms)) =
-                (first_item_visible_ms, first_poster_indexed_ms)
-            {
-                return Ok::<_, sqlx::Error>((first_item_visible_ms, first_poster_indexed_ms));
+                return Ok::<_, sqlx::Error>(first_poster_observer_started.elapsed().as_millis());
             }
             if Instant::now() >= deadline {
                 return Err(sqlx::Error::Protocol(
-                    "LUX-304 first item/poster visibility timed out".to_owned(),
+                    "LUX-304 first poster visibility timed out".to_owned(),
                 ));
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     });
-    let scan_worker = jobs.clone();
-    let scan_job_id = scan_job.id.clone();
-    let scan_handle =
-        tokio::spawn(async move { scan_worker.run_to_completion(&scan_job_id, 500, None).await });
-    tokio::task::yield_now().await;
+    let first_item_deadline = Instant::now() + Duration::from_secs(600);
+    let first_item_visible_ms = loop {
+        if sqlx::query_scalar::<_, String>(sqlx::AssertSqlSafe(format!(
+            "SELECT id FROM media_items
+             WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE' LIMIT 1"
+        )))
+        .bind(library.id.to_string())
+        .fetch_optional(database.pool())
+        .await?
+        .is_some()
+        {
+            break scan_started.elapsed().as_millis();
+        }
+        if Instant::now() >= first_item_deadline {
+            return Err("LUX-304 first item visibility timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let page_ready_deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM media_items WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE'"
+        ))).bind(library.id.to_string()).fetch_one(database.pool()).await?;
+        if count >= 50 {
+            break;
+        }
+        if Instant::now() >= page_ready_deadline {
+            return Err("catalog page readiness timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let scan_running_at_api_start = !scan_handle.is_finished();
-    let api_client = client.clone();
-    let catalog_list_url = format!(
-        "{base_url}/api/v1/libraries/{}/items?page=1&pageSize=50",
-        library.id
+    if !scan_running_at_api_start {
+        return Err("LUX-304 scan completed before the scan-active catalog sample began".into());
+    }
+    let (first_catalog_request_ms, first_catalog_page) = wait_for_fixture_catalog_page(
+        &client,
+        &catalog_list_url,
+        &cookies,
+        "LUX-304 first visible catalog page",
+        catalog_page_expectation,
+    )
+    .await?;
+    let first_catalog_visible_total = first_catalog_page["total"].as_u64().unwrap_or_default();
+    assert_eq!(
+        first_catalog_page["items"].as_array().map(Vec::len),
+        Some(50)
     );
-    let api_url = catalog_list_url.clone();
-    let api_cookies = cookies.clone();
-    let catalog_list_handle = tokio::spawn(async move {
-        measure_get_requests(
-            &api_client,
-            &api_url,
-            &api_cookies,
-            "LUX-304 progressive catalog list",
-        )
+    let catalog_timings = measure_timed_get_requests(
+        &client,
+        &catalog_list_url,
+        &cookies,
+        "LUX-304 progressive catalog list",
+        Some(catalog_page_expectation),
+        scan_started,
+    )
+    .await?;
+    let catalog_list_ms: Vec<_> = catalog_timings
+        .iter()
+        .map(|sample| sample.elapsed_ns / 1_000_000)
+        .collect();
+    let scan_end_ns = scan_handle
         .await
-        .map_err(|error| error.to_string())
-    });
-    scan_handle
-        .await
-        .map_err(|error| std::io::Error::other(error.to_string()))??;
-    let scan_job_completion_ms = scan_started.elapsed().as_millis();
-    let scan_finished_queue_snapshot = load_local_poster_queue_snapshot(
+        .map_err(std::io::Error::other)?
+        .map_err(std::io::Error::other)?;
+    let scan_job_completion_ms = scan_end_ns / 1_000_000;
+    let catalog_timing_report = request_timing_report(&catalog_timings, 0, scan_end_ns);
+    let scan_finished_queue_snapshot = load_benchmark_poster_snapshot(
         database.pool(),
         &scan_job.id,
         &library.id.to_string(),
@@ -2669,14 +3173,10 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         queue_library_id_placeholder,
     )
     .await?;
-    let (first_item_visible_ms, first_poster_indexed_ms) = first_visibility_handle
+    let first_poster_indexed_ms = first_poster_indexed_handle
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
-    let catalog_list_ms = catalog_list_handle
-        .await
-        .map_err(|error| std::io::Error::other(error.to_string()))?
-        .map_err(std::io::Error::other)?;
-    let catalog_list_p95_ms = percentile(&catalog_list_ms, 95);
+    let catalog_list_p95_ms = catalog_timing_report["scanActiveP95Ms"].as_u64();
 
     let require_detached_poster_queue = env::var("LUX_PERF_REQUIRE_DETACHED_POSTER_QUEUE")
         .map(|value| value != "0")
@@ -2684,18 +3184,19 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     let scan_finished_image_pending = scan_finished_queue_snapshot.is_pending_measurement_window();
     let catalog_list_after_scan_image_pending_ms = if scan_finished_image_pending {
         Some(
-            measure_get_requests(
+            measure_catalog_get_requests(
                 &client,
-                &catalog_list_url,
+                &image_pending_catalog_list_url,
                 &cookies,
                 "LUX-304 catalog list after scan while images are pending",
+                catalog_page_expectation,
             )
             .await?,
         )
     } else {
         None
     };
-    let scan_finished_queue_after_api_snapshot = load_local_poster_queue_snapshot(
+    let scan_finished_queue_after_api_snapshot = load_benchmark_poster_snapshot(
         database.pool(),
         &scan_job.id,
         &library.id.to_string(),
@@ -2722,47 +3223,30 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             }
         });
 
-    let poster_queue_deadline = Instant::now() + Duration::from_secs(600);
-    let (local_poster_queue_ms, local_poster_queue_final_snapshot) = loop {
-        let snapshot = load_local_poster_queue_snapshot(
-            database.pool(),
-            &scan_job.id,
-            &library.id.to_string(),
-            job_id_placeholder,
-            queue_library_id_placeholder,
-        )
-        .await?;
-        if snapshot.has_completed_batch_missing_image_marker() {
-            return Err(format!(
-                "LUX-304 completed image batch is missing images_completed_at and cannot be considered drained: {}",
-                snapshot.report(file_count)
-            )
-            .into());
-        }
-        if snapshot.cancelled_batch_count > 0 {
-            return Err(format!(
-                "LUX-304 image queue contains cancelled batches and cannot be considered drained: {}",
-                snapshot.report(file_count)
-            )
-            .into());
-        }
-        if snapshot.is_drained(file_count) {
-            break (scan_started.elapsed().as_millis(), snapshot);
-        }
-        if Instant::now() >= poster_queue_deadline {
-            return Err(format!(
-                "LUX-304 strict local image queue drain timed out: {}",
-                snapshot.report(file_count)
-            )
-            .into());
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    let (local_poster_queue_observed_ns, local_poster_queue_final_snapshot) =
+        local_poster_completion_handle
+            .await
+            .map_err(std::io::Error::other)??;
+    let inline_baseline =
+        env::var("LUX_PERF_POSTER_QUEUE_MODE").as_deref() == Ok("inline_metadata_baseline");
+    let local_poster_queue_ms = if inline_baseline {
+        // Inline scan completion already includes the entire local stage;
+        // polling verifies the final posters but must not add API wait time.
+        scan_job_completion_ms
+    } else {
+        local_poster_queue_observed_ns / 1_000_000
     };
-    let catalog_list_after_queue_ms = measure_get_requests(
+    let drained_catalog_expectation = CatalogPageExpectation {
+        fixture_file_count: file_count,
+        require_complete_fixture: true,
+        require_posters: true,
+    };
+    let catalog_list_after_queue_ms = measure_catalog_get_requests(
         &client,
-        &catalog_list_url,
+        &drained_catalog_list_url,
         &cookies,
         "LUX-304 catalog list after local posters",
+        drained_catalog_expectation,
     )
     .await?;
     let catalog_list_after_queue_p95_ms = percentile(&catalog_list_after_queue_ms, 95);
@@ -2776,6 +3260,12 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     assert_eq!(online_fill_missing_job_count, 0);
     assert!(scan_running_at_api_start);
     assert!(first_item_visible_ms <= scan_job_completion_ms);
+    assert_eq!(
+        local_poster_queue_final_snapshot.poster_item_count(),
+        i64::try_from(file_count).unwrap_or(i64::MAX),
+        "the drained poster count must exactly match the synthetic fixture"
+    );
+    assert!(first_catalog_visible_total > 0);
     assert!(
         first_poster_indexed_ms <= scan_job_completion_ms,
         "first local poster was indexed at {first_poster_indexed_ms} ms, after scan completion at {scan_job_completion_ms} ms"
@@ -2790,14 +3280,21 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         "LUX-304 POSTER RESULT {}",
         serde_json::to_string(&json!({
             "commit": luxd::COMMIT,
+            "posterQueueMode": env::var("LUX_PERF_POSTER_QUEUE_MODE").unwrap_or_else(|_| "detached_batches".into()),
             "architecture": std::env::consts::ARCH,
             "databaseBackend": backend,
             "fileCount": file_count,
             "directoryCount": directory_count,
             "scanJobCompletionMs": scan_job_completion_ms,
             "firstItemVisibleMs": first_item_visible_ms,
+            "firstCatalogRequestMs": first_catalog_request_ms,
+            "firstCatalogVisibleTotal": first_catalog_visible_total,
             "firstPosterIndexedMs": first_poster_indexed_ms,
             "catalogListP95DuringScanMs": catalog_list_p95_ms,
+            "catalogListP95RequestsStartedDuringScanMs": catalog_timing_report["startedDuringScanP95Ms"],
+            "catalogListRequestTiming": catalog_timing_report,
+            "catalogPageReadinessRule": "at least 50 committed movies before first HTTP page; pageSize=50 on both revisions",
+            "firstCatalogVisibleItemCount": first_catalog_page["items"].as_array().map(Vec::len),
             "catalogListRequestCount": catalog_list_ms.len(),
             "catalogListP95ScanFinishedImagePendingMs": scan_finished_image_pending_p95_ms,
             "catalogListScanFinishedImagePendingSampleStatus":
@@ -2821,9 +3318,12 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "catalogListAfterPosterQueueRequestCount": catalog_list_after_queue_ms.len(),
             "scanRunningAtApiStart": scan_running_at_api_start,
             "localPosterQueueCompleteMs": local_poster_queue_ms,
+            "localPosterQueueFirstObservedCompleteMs": local_poster_queue_observed_ns / 1_000_000,
+            "localPosterQueueObservationIntervalMs": 100,
+            "localPosterQueueTimingNote": "inline baseline uses scan worker completion timestamp with strict poster validation; detached completion is first observed drain from a concurrent observer started with scan, independent of HTTP joins; polling is an upper bound with 100ms nominal resolution",
             "localPosterQueueFinalSnapshot":
                 local_poster_queue_final_snapshot.report(file_count),
-            "localPosterQueueDrainCondition": "all scan job local metadata batches are COMPLETED, every batch has images_completed_at, there are no pending/running/failed/cancelled batches, and the library has at least fileCount distinct LOCAL POSTER items",
+            "localPosterQueueDrainCondition": "detached: every batch COMPLETED with images_completed_at and full poster count; inline baseline: scan COMPLETED and full poster count",
             "onlineFillMissingJobCount": online_fill_missing_job_count,
             "processPeakRssBytes": process_peak_rss_bytes(),
         }))?
@@ -3346,12 +3846,48 @@ async fn measure_get_requests(
     cookies: &str,
     label: &str,
 ) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    measure_get_requests_checked(client, url, cookies, label, None).await
+}
+
+async fn measure_catalog_get_requests(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: CatalogPageExpectation,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    measure_get_requests_checked(client, url, cookies, label, Some(expectation)).await
+}
+
+async fn measure_get_requests_checked(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: Option<CatalogPageExpectation>,
+) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    Ok(
+        measure_timed_get_requests(client, url, cookies, label, expectation, Instant::now())
+            .await?
+            .iter()
+            .map(|request| request.elapsed_ns / 1_000_000)
+            .collect(),
+    )
+}
+
+async fn measure_timed_get_requests(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: Option<CatalogPageExpectation>,
+    epoch: Instant,
+) -> Result<Vec<RequestTiming>, Box<dyn std::error::Error>> {
     let mut requests = Vec::with_capacity(FOREGROUND_REQUESTS);
     for _ in 0..FOREGROUND_REQUESTS {
         let client = client.clone();
         let url = url.to_owned();
         let cookies = cookies.to_owned();
-        let label = label.to_owned();
         requests.push(tokio::spawn(async move {
             let started = Instant::now();
             let response = client
@@ -3361,21 +3897,147 @@ async fn measure_get_requests(
                 .await
                 .map_err(|error| error.to_string())?;
             let status = response.status();
-            let _ = response.bytes().await.map_err(|error| error.to_string())?;
+            let body = response.bytes().await.map_err(|error| error.to_string())?;
+            let timing = RequestTiming {
+                start_offset_ns: started.duration_since(epoch).as_nanos(),
+                elapsed_ns: started.elapsed().as_nanos(),
+            };
+            Ok::<_, String>((timing, status, body))
+        }));
+    }
+    let mut responses = Vec::with_capacity(FOREGROUND_REQUESTS);
+    for request in requests {
+        responses.push(
+            request
+                .await
+                .map_err(std::io::Error::other)?
+                .map_err(std::io::Error::other)?,
+        );
+    }
+    let label = label.to_owned();
+    // All timed requests have finished before parsing any response. JSON work
+    // also stays off the Tokio workers shared with the service under test.
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut timings = Vec::with_capacity(responses.len());
+        for (timing, status, body) in responses {
             if status != reqwest::StatusCode::OK {
                 return Err(format!("{label} request returned {status}"));
             }
-            Ok::<u128, String>(started.elapsed().as_millis())
-        }));
+            if let Some(expectation) = expectation {
+                let page = serde_json::from_slice(&body)
+                    .map_err(|error| format!("{label} returned invalid JSON: {error}"))?;
+                validate_fixture_catalog_page(&page, expectation)?;
+            }
+            timings.push(timing);
+        }
+        Ok::<_, String>(timings)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+    .map_err(std::io::Error::other)?)
+}
+
+fn request_timing_report(
+    requests: &[RequestTiming],
+    scan_start_ns: u128,
+    scan_end_ns: u128,
+) -> serde_json::Value {
+    let active = select_scan_active_requests(requests, scan_start_ns, scan_end_ns);
+    let started: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.start_offset_ns >= scan_start_ns && request.start_offset_ns < scan_end_ns
+        })
+        .collect();
+    let crossing = started
+        .iter()
+        .filter(|request| {
+            request
+                .start_offset_ns
+                .checked_add(request.elapsed_ns)
+                .is_none_or(|end| end > scan_end_ns)
+        })
+        .count();
+    let durations: Vec<_> = started
+        .iter()
+        .map(|request| request.elapsed_ns / 1_000_000)
+        .collect();
+    let complete_start_cohort =
+        requests.len() == FOREGROUND_REQUESTS && started.len() == FOREGROUND_REQUESTS;
+    let complete_overlap = complete_start_cohort && active.len() == FOREGROUND_REQUESTS;
+    json!({
+        "scanStartOffsetNs": scan_start_ns,
+        "scanEndOffsetNs": scan_end_ns,
+        "expectedRequestCount": FOREGROUND_REQUESTS,
+        "requestCount": requests.len(),
+        "startedDuringScanRequestCount": started.len(),
+        "crossingScanEndRequestCount": crossing,
+        "scanActiveRequestCount": active.len(),
+        "startedDuringScanP95Ms": complete_start_cohort.then(|| percentile(&durations, 95)),
+        "scanActiveP95Ms": complete_overlap.then(|| percentile(&durations, 95)),
+        "sampleStatus": if complete_start_cohort { "available" } else { "unavailable" },
+        "wholeWindowSampleStatus": if complete_overlap { "available" } else { "unavailable" },
+        "selectionRule": "all 50 predeclared requests start in [scanStart, scanEnd); full body-receipt latency includes crossings; no response-duration selection",
+        "wholeWindowRule": "all 50 requests start and finish inside scan window; otherwise p95 is unavailable",
+        "requests": requests.iter().enumerate().map(|(index, request)| json!({
+            "index": index,
+            "startOffsetNs": request.start_offset_ns,
+            "elapsedNs": request.elapsed_ns,
+            "endOffsetNs": request.start_offset_ns + request.elapsed_ns,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn validate_fixture_catalog_page(
+    page: &serde_json::Value,
+    expectation: CatalogPageExpectation,
+) -> Result<(), String> {
+    let total = page["total"]
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "catalog total is missing or invalid".to_owned())?;
+    if total == 0 {
+        return Err("catalog total is zero".to_owned());
     }
-    let mut durations = Vec::with_capacity(FOREGROUND_REQUESTS);
-    for request in requests {
-        let result = request
-            .await
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        durations.push(result.map_err(std::io::Error::other)?);
+    if total > expectation.fixture_file_count {
+        return Err(format!(
+            "catalog total {total} exceeds fixture size {}",
+            expectation.fixture_file_count
+        ));
     }
-    Ok(durations)
+    if expectation.require_complete_fixture && total != expectation.fixture_file_count {
+        return Err(format!(
+            "drained catalog total {total} does not match fixture size {}",
+            expectation.fixture_file_count
+        ));
+    }
+    let items = page["items"]
+        .as_array()
+        .filter(|items| !items.is_empty())
+        .ok_or_else(|| "catalog items page is empty or missing".to_owned())?;
+    if items.len() > total {
+        return Err(format!(
+            "catalog page has {} items but total is {total}",
+            items.len()
+        ));
+    }
+    for item in items {
+        if item["itemType"] != "MOVIE"
+            || !item["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("Fixture Movie "))
+        {
+            return Err("catalog page contains an item outside the movie fixture".to_owned());
+        }
+        if expectation.require_posters
+            && !item["imageTags"]["poster"]
+                .as_str()
+                .is_some_and(|tag| !tag.is_empty())
+        {
+            return Err("drained catalog page contains a movie without a poster tag".to_owned());
+        }
+    }
+    Ok(())
 }
 
 fn percentile(values: &[u128], percentile: usize) -> u128 {

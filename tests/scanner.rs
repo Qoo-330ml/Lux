@@ -358,7 +358,7 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
     }
     let alternate_dir = media_root.join("ADN-725");
     tokio::fs::create_dir_all(&alternate_dir).await?;
-    tokio::fs::write(alternate_dir.join("ADN-725.mp4"), b"base").await?;
+    tokio::fs::write(alternate_dir.join("ADN-725.MKV"), b"base").await?;
     tokio::fs::write(
         alternate_dir.join("ADN-725-Alternate-Cut.mp4"),
         b"alternate version",
@@ -424,7 +424,7 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
                 "ADN-725/ADN-725-Alternate-Cut.mp4".to_owned(),
                 Some("Alternate-Cut".to_owned()),
             ),
-            ("ADN-725/ADN-725.mp4".to_owned(), None),
+            ("ADN-725/ADN-725.MKV".to_owned(), None),
             ("Unpaired/ADN-999-Alternate.mp4".to_owned(), None),
         ]
     );
@@ -471,6 +471,18 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
     .await?;
     assert_eq!(removed_legacy_items, 2);
 
+    let alternate_item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE item_type = 'MOVIE' AND title = 'ADN 725'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET title = 'Metadata Title', sort_title = 'metadata title',
+               production_year = 2024 WHERE id = ?",
+    )
+    .bind(&alternate_item_id)
+    .execute(database.pool())
+    .await?;
     sqlx::query("UPDATE media_sources SET probe_status = 'READY'")
         .execute(database.pool())
         .await?;
@@ -481,6 +493,15 @@ async fn movie_full_scan_groups_generic_trailing_suffixes_with_sibling_bases()
             .fetch_all(database.pool())
             .await?;
     assert_eq!(probe_statuses, vec!["READY".to_owned(); 7]);
+    let alternate_sources: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = ?")
+            .bind(&alternate_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        alternate_sources, 2,
+        "generic suffix with a different base extension"
+    );
     Ok(())
 }
 

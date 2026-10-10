@@ -6,7 +6,7 @@ const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "u
 function lightThemeRule(selector: string) {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const rules = [...stylesheet.matchAll(
-    new RegExp(`html\\[data-lux-theme="light"\\] ${escapedSelector}\\s*\\{([^}]*)\\}`, "g"),
+    new RegExp(`html\\[data-lux-theme="light"\\] ${escapedSelector}(?:\\s*,[^{}]+)?\\s*\\{([^}]*)\\}`, "g"),
   )];
   return rules.at(-1)?.[1] ?? "";
 }
@@ -52,6 +52,27 @@ describe("light theme contrast", () => {
   it("keeps light-theme header controls on a light surface", () => {
     expect(lightThemeRule(".lux-icon-button")).toContain("background: rgba(255,255,255");
     expect(lightThemeRule(".lux-icon-button:hover")).toContain("background: rgba(28,28,34");
+  });
+
+  it("keeps portaled media action menus readable in light mode", () => {
+    expect(lightThemeRule(".lux-media-action-menu")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-media-action-menu")).toContain("border-color: var(--lux-line)");
+    expect(lightThemeRule(".lux-media-action-menu-heading strong")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-media-action-menu-heading > span")).toContain("background: rgba(28,28,34");
+    expect(lightThemeRule(".lux-media-action svg")).toContain("color: var(--lux-muted)");
+    expect(lightThemeRule(".lux-media-action:hover")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-media-action:focus-visible")).toContain("background: rgba(28,28,34");
+  });
+
+  it("uses a pale mobile detail header mask with dark controls", () => {
+    const mask = lightThemeRule(".lux-detail-mobile-header::before");
+    expect(mask).toContain("rgba(244,243,241");
+    expect(mask).not.toContain("rgba(5,5,6");
+    expect(lightThemeRule(".lux-detail-mobile-brand")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-detail-mobile-back")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-detail-mobile-back")).toContain("background: rgba(255,255,255");
+    expect(lightThemeRule(".lux-detail-mobile-header .lux-media-actions-trigger")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-detail-mobile-header .lux-media-actions-trigger")).toContain("background: rgba(255,255,255");
   });
 
   it("keeps the plugin configuration dialog readable in light mode", () => {
