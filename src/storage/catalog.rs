@@ -2870,7 +2870,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -2881,21 +2881,10 @@ impl Database {
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
                AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
-             ORDER BY ms.item_id, fe.relative_path",
-        )
+               AND {SCOPE}
+             ORDER BY ms.item_id, fe.relative_path"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
@@ -2920,7 +2909,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -2931,21 +2920,10 @@ impl Database {
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
                AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
-             ORDER BY ms.item_id, fe.relative_path",
-        )
+               AND {SCOPE}
+             ORDER BY ms.item_id, fe.relative_path"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
@@ -3608,7 +3586,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
@@ -3619,22 +3597,11 @@ impl Database {
              WHERE ms.source_kind = 'LOCAL_FILE'
                AND fe.is_missing = 0
                AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
+               AND {SCOPE}
              ORDER BY ms.item_id, ms.is_default DESC, ms.id
-             LIMIT ? OFFSET ?",
-        )
+             LIMIT ? OFFSET ?"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .bind(offset.max(0))
@@ -3869,7 +3836,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
         let rows = if let Some(after_source_id) = after_source_id {
-            self.query(
+            self.query(sqlx::AssertSqlSafe(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -3903,28 +3870,18 @@ impl Database {
                   AND ii.image_index = 0
                  WHERE ms.source_kind = 'STRM_URL'
                    AND fe.is_missing = 0 AND mi.removed_at IS NULL
-                   AND ms.id > ? AND EXISTS (
-                       SELECT 1 FROM scan_job_paths sjp
-                       WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-                         AND sjp.library_root_id = fe.library_root_id
-                         AND (
-                               sjp.relative_path = '.'
-                               OR
-                               fe.relative_path = sjp.relative_path
-                               OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                                  = sjp.relative_path || '/'
-                             )
-                   )
+                   AND ms.id > ? AND {SCOPE}
                  ORDER BY ms.id, fe.relative_path
-                 LIMIT ?",
-            )
+                 LIMIT ?"
+                    .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+            ))
             .bind(after_source_id)
             .bind(scan_job_id)
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .fetch_all(&self.pool)
             .await
         } else {
-            self.query(
+            self.query(sqlx::AssertSqlSafe(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -3958,21 +3915,11 @@ impl Database {
                   AND ii.image_index = 0
                  WHERE ms.source_kind = 'STRM_URL'
                    AND fe.is_missing = 0 AND mi.removed_at IS NULL
-                   AND EXISTS (
-                       SELECT 1 FROM scan_job_paths sjp
-                       WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-                         AND sjp.library_root_id = fe.library_root_id
-                         AND (
-                               sjp.relative_path = '.'
-                               OR
-                               fe.relative_path = sjp.relative_path
-                               OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                                  = sjp.relative_path || '/'
-                             )
-                   )
+                   AND {SCOPE}
                  ORDER BY ms.id, fe.relative_path
-                 LIMIT ?",
-            )
+                 LIMIT ?"
+                    .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+            ))
             .bind(scan_job_id)
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .fetch_all(&self.pool)
@@ -4005,7 +3952,8 @@ impl Database {
     ) -> Result<i64, StorageError> {
         let has_directory_scope: i64 = self
             .query_scalar(
-                "SELECT EXISTS (
+                // CASE keeps a portable 0/1 integer: PostgreSQL returns BOOLEAN for a bare EXISTS.
+                "SELECT CAST(CASE WHEN EXISTS (
                     SELECT 1
                     FROM scan_job_paths sjp
                     LEFT JOIN filesystem_entries path_entry
@@ -4013,7 +3961,7 @@ impl Database {
                      AND path_entry.relative_path = sjp.relative_path
                     WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
                       AND (sjp.relative_path = '.' OR path_entry.entry_kind = 'DIRECTORY')
-                )",
+                ) THEN 1 ELSE 0 END AS BIGINT)",
             )
             .bind(scan_job_id)
             .fetch_one(&self.pool)
@@ -4045,26 +3993,16 @@ impl Database {
                 });
         }
 
-        self.query_scalar(
+        self.query_scalar(sqlx::AssertSqlSafe(
             "SELECT COUNT(DISTINCT ms.id)
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
              WHERE ms.source_kind = 'STRM_URL'
                AND fe.is_missing = 0 AND mi.removed_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                         )
-               )",
-        )
+               AND {SCOPE}"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_one(&self.pool)
         .await
@@ -4740,7 +4678,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
-        self.query(
+        self.query(sqlx::AssertSqlSafe(
             "SELECT series.id AS series_id, season.id AS season_id,
                     episode.id AS episode_id, season.season_number,
                     lr.canonical_path AS root_path, fe.relative_path
@@ -4756,21 +4694,10 @@ impl Database {
                AND episode.removed_at IS NULL
                AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
                AND fe.is_missing = 0
-               AND EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ?
-                     AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR
-                           fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                     )
-               )
-             ORDER BY series.id, season.season_number, episode.id, fe.relative_path",
-        )
+               AND {SCOPE}
+             ORDER BY series.id, season.season_number, episode.id, fe.relative_path"
+                .replace("{SCOPE}", incremental_scan_scope_sql(self.backend)),
+        ))
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
@@ -5792,6 +5719,10 @@ impl Database {
         transaction: &mut sqlx::Transaction<'_, Any>,
         update: &MediaMetadataUpdate<'_>,
     ) -> Result<(), StorageError> {
+        // The rating comparison binds the presence flag and a plain f64 (like the SET clause)
+        // instead of an `Option<f64>`: PostgreSQL rejects the optional float in the repeated
+        // `? IS NOT NULL` position ("incorrect binary data format in bind parameter 23"),
+        // which failed every update of an item whose NFO carries a rating.
         let sort_title = update.title.to_lowercase();
         self.query(
             "UPDATE media_items
@@ -5816,7 +5747,7 @@ impl Database {
                    OR overview IS DISTINCT FROM ?
                    OR production_year IS DISTINCT FROM ?
                    OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
-                   OR (? IS NOT NULL AND rating IS DISTINCT FROM ?)
+                   OR (? = 1 AND rating IS DISTINCT FROM ?)
                    OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
                    OR (? IS NOT NULL AND provider_ids_json IS DISTINCT FROM ?)
                    OR metadata_fingerprint IS DISTINCT FROM ?
@@ -5846,8 +5777,8 @@ impl Database {
         .bind(update.production_year)
         .bind(update.premiere_date)
         .bind(update.premiere_date)
-        .bind(update.rating)
-        .bind(update.rating)
+        .bind(database_flag(update.rating.is_some()))
+        .bind(update.rating.unwrap_or_default())
         .bind(update.rating_source)
         .bind(update.rating_source)
         .bind(update.provider_ids_json)
@@ -7147,6 +7078,53 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+}
+
+/// Restricts a query over `filesystem_entries fe` to the entries touched by the paths of one
+/// incremental scan job (one `?` placeholder: the job id).
+///
+/// SQLite keeps the correlated `EXISTS`. PostgreSQL cannot use an index for the
+/// `substr(...) = path || '/'` form and evaluated it for every candidate entry (the STRM probe
+/// target count averaged about a minute on a library of several hundred thousand files), so there
+/// the matching entries are collected per scanned path with byte-order range operators served by
+/// `idx_filesystem_entries_dir_prefix` (same approach as the sidecar target lookup).
+fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
+    if backend == DatabaseBackend::Postgres {
+        "fe.id IN (
+                   SELECT matched.id
+                   FROM scan_job_paths sjp
+                   CROSS JOIN LATERAL (
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE sjp.relative_path = '.'
+                         AND entry.library_root_id = sjp.library_root_id
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                       UNION ALL
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE entry.library_root_id = sjp.library_root_id
+                         AND entry.relative_path = sjp.relative_path
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                       UNION ALL
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE entry.library_root_id = sjp.library_root_id
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                         AND entry.relative_path ~>=~ (sjp.relative_path || '/')
+                         AND entry.relative_path ~<~ (sjp.relative_path || '0')
+                   ) matched
+                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+               )"
+    } else {
+        "EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           sjp.relative_path = '.'
+                           OR fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                         )
+               )"
     }
 }
 

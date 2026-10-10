@@ -1716,6 +1716,112 @@ pub struct CatalogStream {
     pub details: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
+impl CatalogSource {
+    /// Version label without the part marker; parts of one file set share it.
+    pub fn version_key(&self) -> String {
+        self.split_part().0
+    }
+
+    /// Part number (`cd1` -> 1) when this source is one part of a multi-part version.
+    pub fn part_index(&self) -> Option<u32> {
+        self.split_part().1
+    }
+
+    fn split_part(&self) -> (String, Option<u32>) {
+        use crate::application::media_matching::split_part_marker;
+        let (label, part) = split_part_marker(self.edition_name.as_deref().unwrap_or_default());
+        let quality = self
+            .quality_label
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase();
+        let label = label.to_lowercase();
+        if part.is_some() {
+            return (format!("{label}|{quality}"), part);
+        }
+        // Plain `Movie.1080p.cd1.mkv` files carry the marker only in the file name. The rest
+        // of the file name tells their versions apart (`Movie.4K.cd1.mkv` is another one).
+        let stem = self
+            .file_name
+            .as_deref()
+            .map(|name| name.rsplit_once('.').map_or(name, |(stem, _)| stem))
+            .unwrap_or_default();
+        match split_part_marker(stem) {
+            (stem_key, Some(part)) => (
+                format!("{label}|{quality}|{}", stem_key.to_lowercase()),
+                Some(part),
+            ),
+            (_, None) => (format!("{label}|{quality}"), None),
+        }
+    }
+}
+
+/// Number of parts that make up the version `source` belongs to (1 for a single file).
+pub fn catalog_source_part_count(sources: &[CatalogSource], source: &CatalogSource) -> usize {
+    if source.part_index().is_none() {
+        return 1;
+    }
+    let key = source.version_key();
+    sources
+        .iter()
+        .filter(|candidate| candidate.part_index().is_some() && candidate.version_key() == key)
+        .count()
+        .max(1)
+}
+
+/// Whether `source` belongs to the version of the default source: the default itself or,
+/// for a multi-part default, one of its other parts.
+pub fn belongs_to_default_version(sources: &[CatalogSource], source: &CatalogSource) -> bool {
+    if source.is_default {
+        return true;
+    }
+    let Some(default) = sources.iter().find(|candidate| candidate.is_default) else {
+        return false;
+    };
+    default.part_index().is_some()
+        && source.part_index().is_some()
+        && default.version_key() == source.version_key()
+}
+
+/// Keeps the parts of one version together, in part order, and makes sure only the
+/// first part of a version can be the default source.
+fn arrange_source_parts(sources: &mut Vec<CatalogSource>) {
+    if sources.len() < 2 {
+        return;
+    }
+    let mut groups: Vec<(String, Vec<CatalogSource>)> = Vec::new();
+    for source in sources.drain(..) {
+        let key = source.version_key();
+        match groups.iter_mut().find(|(group_key, members)| {
+            *group_key == key
+                && members.iter().any(|member| member.part_index().is_some())
+                && source.part_index().is_some()
+        }) {
+            Some((_, members)) => members.push(source),
+            None => groups.push((key, vec![source])),
+        }
+    }
+    for (_, members) in &mut groups {
+        members.sort_by_key(|member| member.part_index().unwrap_or(0));
+    }
+    let default_group = groups
+        .iter()
+        .position(|(_, members)| members.iter().any(|member| member.is_default));
+    for (_, members) in &mut groups {
+        for member in members.iter_mut() {
+            member.is_default = false;
+        }
+    }
+    let default_group = default_group.unwrap_or(0);
+    if let Some(first) = groups
+        .get_mut(default_group)
+        .and_then(|(_, members)| members.first_mut())
+    {
+        first.is_default = true;
+    }
+    sources.extend(groups.into_iter().flat_map(|(_, members)| members));
+}
+
 fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
     let mut items = Vec::new();
     for row in rows {
@@ -1827,6 +1933,9 @@ fn assemble_items(rows: Vec<StoredCatalogRow>) -> Vec<CatalogItem> {
         });
         let _ = stream_id;
     }
+    for item in &mut items {
+        arrange_source_parts(&mut item.media_sources);
+    }
     items
 }
 
@@ -1930,9 +2039,169 @@ mod tests {
     use crate::application::recommendations::daily_recommendation_items;
 
     use super::{
-        CatalogItem, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle, SearchFlightKey,
-        SearchFlightRegistry, catalog_source_file_name, reorder_catalog_items, take_recent_entries,
+        CatalogItem, CatalogSource, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle,
+        SearchFlightKey, SearchFlightRegistry, arrange_source_parts, belongs_to_default_version,
+        catalog_source_file_name, catalog_source_part_count, reorder_catalog_items,
+        take_recent_entries,
     };
+
+    fn catalog_source(id: &str, edition: Option<&str>, is_default: bool) -> CatalogSource {
+        CatalogSource {
+            id: id.to_owned(),
+            source_kind: "LOCAL_FILE".to_owned(),
+            file_name: Some(format!("{id}.mkv")),
+            container: None,
+            size: None,
+            external_url: None,
+            edition_name: edition.map(str::to_owned),
+            quality_label: None,
+            bitrate: None,
+            duration_ticks: None,
+            is_default,
+            probe_status: "READY".to_owned(),
+            streams: Vec::new(),
+            chapters: Vec::new(),
+        }
+    }
+
+    fn file_source(
+        id: &str,
+        file_name: &str,
+        quality: Option<&str>,
+        is_default: bool,
+    ) -> CatalogSource {
+        CatalogSource {
+            file_name: Some(file_name.to_owned()),
+            quality_label: quality.map(str::to_owned),
+            ..catalog_source(id, None, is_default)
+        }
+    }
+
+    #[test]
+    fn two_multi_part_versions_named_only_by_file_name_stay_apart() {
+        // The filename parser leaves edition_name empty here; the resolution is the only
+        // difference and must keep the two versions apart.
+        let mut sources = vec![
+            file_source("hd-cd1", "Movie.1080p.cd1.mkv", Some("1080p"), false),
+            file_source("uhd-cd1", "Movie.4K.cd1.mkv", Some("4K"), false),
+            file_source("hd-cd2", "Movie.1080p.cd2.mkv", Some("1080p"), false),
+            file_source("uhd-cd2", "Movie.4K.cd2.mkv", Some("4K"), true),
+        ];
+        arrange_source_parts(&mut sources);
+        let ids = sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["hd-cd1", "hd-cd2", "uhd-cd1", "uhd-cd2"]);
+        let defaults = sources
+            .iter()
+            .filter(|source| source.is_default)
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, ["uhd-cd1"], "the default stays in the 4K version");
+        assert_eq!(catalog_source_part_count(&sources, &sources[0]), 2);
+        assert_eq!(catalog_source_part_count(&sources, &sources[2]), 2);
+
+        // Without a quality label the rest of the file name still tells them apart.
+        let mut sources = vec![
+            file_source("a-cd1", "Movie Theatrical cd1.mkv", None, true),
+            file_source("b-cd1", "Movie Extended cd1.mkv", None, false),
+            file_source("a-cd2", "Movie Theatrical cd2.mkv", None, false),
+            file_source("b-cd2", "Movie Extended cd2.mkv", None, false),
+        ];
+        arrange_source_parts(&mut sources);
+        let ids = sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["a-cd1", "a-cd2", "b-cd1", "b-cd2"]);
+    }
+
+    #[test]
+    fn a_complete_single_file_reports_one_part_next_to_a_multi_part_version() {
+        let mut sources = vec![
+            file_source("whole", "Movie.mkv", None, true),
+            file_source("part-1", "Movie.cd1.mkv", None, false),
+            file_source("part-2", "Movie.cd2.mkv", None, false),
+        ];
+        arrange_source_parts(&mut sources);
+        let whole = sources
+            .iter()
+            .find(|source| source.id == "whole")
+            .expect("whole file");
+        assert_eq!(catalog_source_part_count(&sources, whole), 1);
+        let part = sources
+            .iter()
+            .find(|source| source.id == "part-1")
+            .expect("first part");
+        assert_eq!(catalog_source_part_count(&sources, part), 2);
+        assert!(belongs_to_default_version(&sources, whole));
+        assert!(!belongs_to_default_version(&sources, part));
+    }
+
+    #[test]
+    fn parts_of_one_version_stay_together_and_only_the_first_can_be_default() {
+        let mut sources = vec![
+            catalog_source("a-cd2", Some("A 4K cd2"), false),
+            catalog_source("b", Some("B"), false),
+            catalog_source("a-cd1", Some("A 4K cd1"), true),
+            catalog_source("a-cd3", Some("A 4K cd3"), false),
+            catalog_source("plain-cd2", None, false),
+        ];
+        // Mirror the file-name fallback: the plain file's stem carries the marker.
+        sources[4].file_name = Some("Movie cd2.mkv".to_owned());
+        arrange_source_parts(&mut sources);
+        let ids = sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["a-cd1", "a-cd2", "a-cd3", "b", "plain-cd2"]);
+        let defaults = sources
+            .iter()
+            .filter(|source| source.is_default)
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, ["a-cd1"]);
+        assert_eq!(catalog_source_part_count(&sources, &sources[0]), 3);
+        assert_eq!(catalog_source_part_count(&sources, &sources[3]), 1);
+    }
+
+    #[test]
+    fn a_later_part_marked_default_moves_the_default_to_the_first_part() {
+        let mut sources = vec![
+            catalog_source("x-cd1", Some("X cd1"), false),
+            catalog_source("x-cd2", Some("X cd2"), true),
+            catalog_source("y", Some("Y"), false),
+        ];
+        arrange_source_parts(&mut sources);
+        let defaults = sources
+            .iter()
+            .filter(|source| source.is_default)
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, ["x-cd1"]);
+    }
+
+    #[test]
+    fn items_without_parts_keep_their_order_and_single_default() {
+        let mut sources = vec![
+            catalog_source("one", Some("Directors Cut"), false),
+            catalog_source("two", None, true),
+            catalog_source("three", Some("4K"), true),
+        ];
+        arrange_source_parts(&mut sources);
+        let ids = sources
+            .iter()
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["one", "two", "three"]);
+        let defaults = sources
+            .iter()
+            .filter(|source| source.is_default)
+            .map(|source| source.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(defaults, ["two"]);
+    }
 
     fn catalog_item(id: &str) -> CatalogItem {
         CatalogItem {

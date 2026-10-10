@@ -137,6 +137,9 @@ export type MediaSource = {
   externalUrl?: string | null;
   probeStatus?: string | null;
   isDefault?: boolean;
+  /** Parts of one version (cd1, cd2 ...) share a key; absent in older responses. */
+  versionKey?: string;
+  partIndex?: number | null;
   streams?: MediaStream[];
   /** Chapters belong to this media source; absent in older cached responses. */
   chapters?: MediaChapter[];
