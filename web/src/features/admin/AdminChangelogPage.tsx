@@ -15,6 +15,23 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.5.22",
+    date: "2026-10-10",
+    sections: [
+      { kind: "changed", items: [
+        "PostgreSQL 增量扫描的媒体源、缩略图和 STRM 探测查询复用目录前缀索引，减少逐条路径匹配的查询开销。",
+        "增加软删除媒体条目的保留期清理，并回收已结束扫描的终态本地元数据批次，控制数据库历史记录增长。",
+        "感谢 @anlostyle 持续贡献近期数据库相关修复与优化 PR，改善 PostgreSQL 兼容性、扫描查询效率和数据清理。",
+      ] },
+      { kind: "fixed", items: [
+        "修复 PostgreSQL 合并电影条目时 EXISTS 布尔值解码及评分元数据更新参数绑定错误，恢复相关数据库操作。",
+        "修复媒体源新增或归属调整后默认源重复、缺失的问题，并在启动时批量修复既有默认源状态。",
+        "多段影片不再把 cd1/cd2 等分段列成独立版本；Web 每个版本只展示首个分段，Emby PlaybackInfo 保持同版本分段连续排列。",
+        "版本选择器与音轨、字幕选择器统一紧凑布局；补齐浅色主题编辑弹窗、任务状态、移动端返回按钮及键盘焦点的对比度。",
+      ] },
+    ],
+  },
+  {
     version: "0.5.21",
     date: "2026-10-10",
     sections: [
