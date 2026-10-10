@@ -10,7 +10,7 @@ pub use database::{
 
 const DEFAULT_HTTP_ADDR: &str = "127.0.0.1:8097";
 const DEFAULT_CONFIG_DIR: &str = "./config";
-pub const DEFAULT_SCAN_CONCURRENCY: i64 = 2;
+pub const DEFAULT_SCAN_CONCURRENCY: i64 = 4;
 pub const MAX_SCAN_CONCURRENCY: i64 = 1024;
 const SCAN_CONCURRENCY_ENV: &str = "LUX_SCAN_CONCURRENCY";
 pub const MAX_PROBE_CONCURRENCY: i64 = 512;
@@ -175,9 +175,9 @@ mod tests {
     };
 
     #[test]
-    fn scan_concurrency_defaults_to_two() {
-        assert_eq!(parse_scan_concurrency(None).unwrap(), 2);
-        assert_eq!(DEFAULT_SCAN_CONCURRENCY, 2);
+    fn scan_concurrency_defaults_to_four() {
+        assert_eq!(parse_scan_concurrency(None).unwrap(), 4);
+        assert_eq!(DEFAULT_SCAN_CONCURRENCY, 4);
     }
 
     #[test]

@@ -145,6 +145,21 @@ test("touch media cards expose their action controls", () => {
   assert.match(touchStyles, /\.lux-library-card-menu-trigger\s*\{[^}]*opacity:\s*1/s);
 });
 
+test("touch text controls keep a 16px floor above page-specific font sizes", () => {
+  const touchStyles = stylesheet.match(/@media \(pointer: coarse\)\s*\{([\s\S]*?)\n\}/)?.[1] ?? "";
+
+  assert.match(touchStyles, /textarea, select\)\s*\{[^}]*font-size:\s*max\(16px,\s*var\(--lux-input-font-size,\s*1em\)\)\s*!important/);
+  for (const type of ["checkbox", "radio", "file", "hidden", "range", "color", "button", "submit", "reset", "image"]) {
+    assert.ok(touchStyles.includes(`:not([type="${type}"])`), `${type} is not a text control`);
+  }
+});
+
+test("touch text sizing preserves large editable titles and manual page zoom", () => {
+  assert.match(rule(".lux-person-title-input"), /--lux-input-font-size:\s*clamp\(1\.6rem,\s*4vw,\s*2\.8rem\)/);
+  assert.match(rule(".lux-person-title-input"), /font-size:\s*var\(--lux-input-font-size\)/);
+  assert.doesNotMatch(indexHtml, /user-scalable\s*=\s*(?:no|0)|maximum-scale\s*=/i);
+});
+
 test("mobile library batch actions wrap instead of overflowing", () => {
   const mobileStyles = stylesheet.slice(stylesheet.indexOf("@media (max-width: 560px)"));
   const selectionRule = mobileStyles.match(/\.lux-library-selection-toolbar\s*\{([^}]*)\}/)?.[1] ?? "";

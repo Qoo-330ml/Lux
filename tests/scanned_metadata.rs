@@ -41,6 +41,143 @@ async fn wait_for_local_metadata_batches(
 }
 
 #[tokio::test]
+async fn movie_variant_rescan_preserves_nfo_identity_and_filename_poster()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let media_root = temp_dir.path().join("Movies");
+    let movie_dir = media_root.join("ABS-123");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("ABS-123.mp4"), b"base").await?;
+    tokio::fs::write(
+        movie_dir.join("ABS-123.nfo"),
+        "<movie><title>Synthetic NFO Title</title><year>2024</year></movie>",
+    )
+    .await?;
+    tokio::fs::write(movie_dir.join("ABS-123-poster.jpg"), b"poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-UTF8 root")?)
+        .await?;
+    let scanner = LibraryScanner::new(database.clone());
+    scanner.scan_movie_library(library.id).await?;
+    tokio::fs::write(movie_dir.join("ABS-123-C.mp4"), b"variant").await?;
+    scanner.scan_movie_library(library.id).await?;
+    let jobs = ScanJobService::new(database.clone());
+    let initial = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&initial.id, 1, None).await?;
+    wait_for_local_metadata_batches(&database, &initial.id).await?;
+
+    let item_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items
+         WHERE library_id = ? AND item_type = 'MOVIE' AND removed_at IS NULL",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    let expected = vec![(
+        item_id.clone(),
+        "Synthetic NFO Title".to_owned(),
+        Some(2024_i64),
+        2_i64,
+        1_i64,
+    )];
+    let read_movies = || async {
+        sqlx::query_as::<_, (String, String, Option<i64>, i64, i64)>(
+            "SELECT item.id, item.title, item.production_year,
+                    (SELECT COUNT(*) FROM media_sources WHERE item_id = item.id),
+                    (SELECT COUNT(*) FROM item_images WHERE item_id = item.id
+                     AND image_type = 'POSTER' AND local_path LIKE '%/ABS-123-poster.jpg')
+             FROM media_items item
+             WHERE item.library_id = ? AND item.item_type = 'MOVIE'
+               AND item.removed_at IS NULL AND item.merged_into_item_id IS NULL
+             ORDER BY item.id",
+        )
+        .bind(library.id.to_string())
+        .fetch_all(database.pool())
+        .await
+    };
+    assert_eq!(read_movies().await?, expected, "initial NFO/image import");
+    let source_ids: Vec<String> = sqlx::query_scalar("SELECT id FROM media_sources ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_sources SET probe_status = 'READY'")
+        .execute(database.pool())
+        .await?;
+
+    for _ in 0..2 {
+        let rescan = jobs.create_movie_scan_job(library.id).await?;
+        jobs.run_to_completion(&rescan.id, 1, None).await?;
+        wait_for_local_metadata_batches(&database, &rescan.id).await?;
+        assert_eq!(read_movies().await?, expected, "unchanged full rescan");
+    }
+    let probe_statuses: Vec<String> = sqlx::query_scalar("SELECT probe_status FROM media_sources")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(probe_statuses, vec!["READY".to_owned(); 2]);
+
+    tokio::fs::write(movie_dir.join("ABS-123-C.mp4"), b"changed variant").await?;
+    let changed = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&changed.id, 1, None).await?;
+    wait_for_local_metadata_batches(&database, &changed.id).await?;
+    assert_eq!(read_movies().await?, expected, "changed full rescan");
+
+    LibraryScanner::new(database.clone())
+        .scan_movie_directory(library.id, &movie_dir)
+        .await?;
+    assert_eq!(read_movies().await?, expected, "directory rescan");
+    let rescanned_source_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM media_sources ORDER BY id")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(rescanned_source_ids, source_ids);
+
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, original_title,
+             identification_status, has_available_source
+         ) VALUES ('legacy-split-variant', ?, 'MOVIE', 'ABS 123 C', 'abs 123 c',
+                   'ABS 123 C', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_sources SET item_id = 'legacy-split-variant', edition_name = NULL
+         WHERE filesystem_entry_id = (
+             SELECT id FROM filesystem_entries WHERE relative_path = 'ABS-123/ABS-123-C.mp4'
+         )",
+    )
+    .execute(database.pool())
+    .await?;
+    let repair = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&repair.id, 1, None).await?;
+    wait_for_local_metadata_batches(&database, &repair.id).await?;
+    assert_eq!(
+        read_movies().await?,
+        expected,
+        "repair an already split version"
+    );
+    let repaired_edition: Option<String> = sqlx::query_scalar(
+        "SELECT edition_name FROM media_sources WHERE filesystem_entry_id = (
+             SELECT id FROM filesystem_entries WHERE relative_path = 'ABS-123/ABS-123-C.mp4'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(repaired_edition.as_deref(), Some("C"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn local_metadata_worker_backfills_posters_for_unchanged_indexed_items()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

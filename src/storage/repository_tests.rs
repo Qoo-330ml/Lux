@@ -16793,6 +16793,629 @@ async fn person_credit_refresh_preserves_unchanged_rows() {
     assert_eq!(remaining_people, ["person-1", "person-3"]);
 }
 
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_merges_movie_items_and_moves_every_source_to_the_primary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Merge", LibraryKind::Movie, false)
+            .await?;
+        for (item_id, title, source_id, is_default) in [
+            ("merge-primary", "Movie", "merge-source-1", 1),
+            ("merge-secondary", "Movie Part 2", "merge-source-2", 1),
+        ] {
+            database
+                .query(
+                    "INSERT INTO media_items (
+                        id, library_id, item_type, title, sort_title, identification_status,
+                        has_available_source
+                     ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+                )
+                .bind(item_id)
+                .bind(library.id.to_string())
+                .bind(title)
+                .bind(title.to_lowercase())
+                .execute(database.pool())
+                .await?;
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, ?, 'LOCAL_FILE', ?, 'PENDING')",
+                )
+                .bind(source_id)
+                .bind(item_id)
+                .bind(is_default)
+                .execute(database.pool())
+                .await?;
+        }
+        let item_ids = vec!["merge-primary".to_owned(), "merge-secondary".to_owned()];
+        let merged = database
+            .merge_media_items("merge-primary", &item_ids)
+            .await?;
+        assert_eq!(merged.merged_item_ids, vec!["merge-secondary".to_owned()]);
+        let sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = $1")
+                .bind("merge-primary")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(sources, 2);
+        let defaults: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_sources WHERE item_id = $1 AND is_default = 1",
+        )
+        .bind("merge-primary")
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(defaults, 1, "exactly one default source after the merge");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_metadata_update_persists_and_skips_unchanged_ratings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Rating", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status,
+                    has_available_source
+                 ) VALUES ('rating-item', ?, 'MOVIE', 'Old', 'old', 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        let update = |title: &'static str, rating: Option<f64>| MediaMetadataUpdate {
+            item_id: "rating-item",
+            title,
+            original_title: None,
+            overview: None,
+            production_year: None,
+            premiere_date: None,
+            rating,
+            rating_source: Some("nfo"),
+            provider_ids_json: None,
+            metadata_fingerprint: b"fingerprint",
+            provenance_json: "{}",
+            locked_fields_json: "[]",
+        };
+        let rating = || async {
+            sqlx::query_scalar::<_, Option<f64>>("SELECT rating FROM media_items WHERE id = $1")
+                .bind("rating-item")
+                .fetch_one(database.pool())
+                .await
+        };
+
+        // Only the rating differs from the stored row: the unchanged-write guard must still see it.
+        database
+            .update_media_item_metadata(update("Old", None))
+            .await?;
+        assert_eq!(rating().await?, None);
+        database
+            .update_media_item_metadata(update("Old", Some(8.2)))
+            .await?;
+        assert_eq!(rating().await?, Some(8.2));
+        // Same values again, then a missing rating must not erase the stored one.
+        database
+            .update_media_item_metadata(update("Old", Some(8.2)))
+            .await?;
+        database
+            .update_media_item_metadata(update("Old", None))
+            .await?;
+        assert_eq!(rating().await?, Some(8.2));
+        database
+            .update_media_item_metadata(update("Old", Some(9.1)))
+            .await?;
+        assert_eq!(rating().await?, Some(9.1));
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
+
+fn strm_file(index: i64, relative_path: &str) -> NewMovieFile {
+    NewMovieFile {
+        filesystem_entry_id: format!("scope-entry-{index}"),
+        source_id: format!("scope-source-{index}"),
+        relative_path: relative_path.to_owned(),
+        size: 1,
+        modified_at: index,
+        fingerprint: vec![index as u8],
+        title: format!("Scope {index}"),
+        sort_title: format!("scope {index}"),
+        original_title: format!("Scope {index}"),
+        production_year: Some(2024),
+        provider_ids_json: None,
+        source_kind: "STRM_URL".to_owned(),
+        strm_target_kind: Some("PATH".to_owned()),
+        edition_name: None,
+        quality_label: None,
+        container: "strm".to_owned(),
+        external_url: Some(format!("/cloud/scope-{index}.mp4")),
+    }
+}
+
+/// STRM sources selected for an incremental scan job must be exactly those under the scanned
+/// paths: a directory (not a sibling that merely shares its prefix), an exact file, or the root.
+async fn assert_incremental_scan_scope(database: &Database, temp_dir: &std::path::Path) {
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Scope", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    let root_path = temp_dir.join("media");
+    tokio::fs::create_dir_all(&root_path)
+        .await
+        .expect("media root");
+    let root = libraries
+        .add_root(library.id, root_path.to_str().expect("utf-8 media root"))
+        .await
+        .expect("library root")
+        .root;
+    database
+        .insert_movie_files_batch(
+            &library.id.to_string(),
+            &root.id.to_string(),
+            "generation",
+            &[
+                strm_file(1, "A/Movie.One/Movie.One.strm"),
+                strm_file(2, "A/Movie.One/extras/Movie.One.Extra.strm"),
+                strm_file(3, "A/Movie.One.2/Movie.One.2.strm"),
+                strm_file(4, "B/Movie.Two/Movie.Two.strm"),
+                strm_file(5, "Movie.Root.strm"),
+            ],
+        )
+        .await
+        .expect("insert");
+    // Real scans also record the scanned directories; the count query uses them to tell a
+    // directory scope from a plain file scope.
+    for (index, directory) in ["A/Movie.One", "B/Movie.Two"].into_iter().enumerate() {
+        database
+            .query(
+                "INSERT INTO filesystem_entries (
+                    id, library_root_id, relative_path, entry_kind, size, modified_at,
+                    fingerprint, last_seen_generation, is_missing
+                 ) VALUES (?, ?, ?, 'DIRECTORY', 0, 0, ?, 'generation', 0)",
+            )
+            .bind(format!("scope-directory-{index}"))
+            .bind(root.id.to_string())
+            .bind(directory)
+            .bind(vec![0_u8])
+            .execute(database.pool())
+            .await
+            .expect("directory entry");
+    }
+    let now = 1_700_000_000_i64;
+    let jobs = [
+        ("scope-dir", vec!["A/Movie.One"]),
+        ("scope-file", vec!["B/Movie.Two/Movie.Two.strm"]),
+        ("scope-root", vec!["."]),
+        ("scope-two", vec!["A/Movie.One", "B/Movie.Two"]),
+        ("scope-none", vec!["C/Missing"]),
+    ];
+    for (job_id, paths) in &jobs {
+        database
+            .query(
+                "INSERT INTO scan_jobs (
+                id, library_id, job_type, status, generation, scan_phase, created_at, updated_at
+             ) VALUES (?, ?, 'INCREMENTAL_SCAN', 'COMPLETED', ?, 'IDLE', ?, ?)",
+            )
+            .bind(*job_id)
+            .bind(library.id.to_string())
+            .bind(format!("generation-{job_id}"))
+            .bind(now)
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .expect("scan job");
+        for path in paths {
+            database
+                .query(
+                "INSERT INTO scan_job_paths (job_id, library_root_id, relative_path, change_kind, processed_at)
+                 VALUES (?, ?, ?, 'MODIFY', ?)",
+            )
+            .bind(*job_id)
+            .bind(root.id.to_string())
+            .bind(*path)
+            .bind(now)
+            .execute(database.pool())
+            .await
+            .expect("scan path");
+        }
+    }
+    for (job_id, expected) in [
+        ("scope-dir", vec!["scope-source-1", "scope-source-2"]),
+        ("scope-file", vec!["scope-source-4"]),
+        (
+            "scope-root",
+            vec![
+                "scope-source-1",
+                "scope-source-2",
+                "scope-source-3",
+                "scope-source-4",
+                "scope-source-5",
+            ],
+        ),
+        (
+            "scope-two",
+            vec!["scope-source-1", "scope-source-2", "scope-source-4"],
+        ),
+        ("scope-none", vec![]),
+    ] {
+        let listed = database
+            .list_strm_media_sources_for_incremental_scan_page(job_id, None, 100)
+            .await
+            .expect("list");
+        let mut listed = listed
+            .into_iter()
+            .map(|source| source.source_id)
+            .collect::<Vec<_>>();
+        listed.sort();
+        assert_eq!(listed, expected, "listed sources for {job_id}");
+        let counted = database
+            .count_strm_media_sources_for_incremental_scan(job_id)
+            .await
+            .expect("count");
+        assert_eq!(
+            counted,
+            i64::try_from(expected.len()).expect("small"),
+            "counted sources for {job_id}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn incremental_scan_scope_selects_only_sources_under_the_scanned_paths() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_incremental_scan_scope(&database, temp_dir.path()).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_incremental_scan_scope_selects_only_sources_under_the_scanned_paths()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        let path = temp_dir.path().to_path_buf();
+        async move { assert_incremental_scan_scope(&database, &path).await }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome?;
+    drop_database?;
+    Ok(())
+}
+
+async fn assert_terminal_local_metadata_batches_are_cleaned(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Batches", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = libraries
+        .add_root(library.id, root_path.to_str().ok_or("root path")?)
+        .await?
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+    for (job_id, status, phase) in [
+        ("done-job", "COMPLETED", "IDLE"),
+        ("cancelled-job", "CANCELLED", "IDLE"),
+        ("running-job", "RUNNING", "FINALIZING"),
+    ] {
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+                 VALUES (?, ?, 'RECONCILE_LIBRARY', ?, 'generation', ?)",
+            )
+            .bind(job_id)
+            .bind(&library_id)
+            .bind(status)
+            .bind(phase)
+            .execute(database.pool())
+            .await?;
+    }
+    // (id, job, status)
+    let batches = [
+        ("done-completed", "done-job", "COMPLETED"),
+        ("done-failed", "done-job", "FAILED"),
+        ("done-pending", "done-job", "PENDING"),
+        ("cancelled-cancelled", "cancelled-job", "CANCELLED"),
+        ("orphan-completed", "missing-job", "COMPLETED"),
+        ("running-completed", "running-job", "COMPLETED"),
+        ("running-pending", "running-job", "PENDING"),
+    ];
+    for (sequence, (id, job_id, status)) in batches.into_iter().enumerate() {
+        database
+            .query(
+                "INSERT INTO scan_local_metadata_batches
+                 (id, job_id, library_root_id, batch_sequence, source_refs_json, source_count,
+                  status)
+                 VALUES (?, ?, ?, ?, '[\"source\"]', 1, ?)",
+            )
+            .bind(id)
+            .bind(job_id)
+            .bind(&root_id)
+            .bind(i64::try_from(sequence)?)
+            .bind(status)
+            .execute(database.pool())
+            .await?;
+    }
+
+    // A batch that just finished is kept for a grace period; backdate all but one.
+    database
+        .query(
+            "UPDATE scan_local_metadata_batches SET updated_at = unixepoch() - 7200
+             WHERE id <> 'cancelled-cancelled'",
+        )
+        .execute(database.pool())
+        .await?;
+    let report = database.cleanup_completed_scan_manifest_payloads().await?;
+    assert_eq!(report.scan_local_metadata_batches_deleted, 2);
+    let remaining: Vec<String> = database
+        .query_scalar("SELECT id FROM scan_local_metadata_batches ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        remaining,
+        [
+            "cancelled-cancelled",
+            "done-failed",
+            "done-pending",
+            "running-completed",
+            "running-pending"
+        ]
+    );
+    database
+        .query("UPDATE scan_local_metadata_batches SET updated_at = unixepoch() - 7200")
+        .execute(database.pool())
+        .await?;
+    let report = database.cleanup_completed_scan_manifest_payloads().await?;
+    assert_eq!(report.scan_local_metadata_batches_deleted, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_local_metadata_batches_are_cleaned_after_the_scan_finishes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_terminal_local_metadata_batches_are_cleaned(&database)
+        .await
+        .expect("batch cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_finishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_terminal_local_metadata_batches_are_cleaned(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
+}
+
 async fn assert_removed_media_item_purge(
     database: &Database,
 ) -> Result<(), Box<dyn std::error::Error>> {
