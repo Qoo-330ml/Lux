@@ -183,6 +183,36 @@ fn scan_active_request_samples_are_unavailable_when_no_request_fits() {
     assert_eq!(optional_percentile_ms(&[]), None);
 }
 
+#[test]
+fn request_timing_report_keeps_slow_requests_started_during_scan() {
+    let mut requests = vec![
+        RequestTiming {
+            start_offset_ns: 150_000_000,
+            elapsed_ns: 10_000_000
+        };
+        FOREGROUND_REQUESTS
+    ];
+    for request in &mut requests[..3] {
+        *request = RequestTiming {
+            start_offset_ns: 100_000_000,
+            elapsed_ns: 300_000_000,
+        };
+    }
+    let report = request_timing_report(&requests, 100_000_000, 200_000_000);
+    assert_eq!(report["startedDuringScanRequestCount"], 50);
+    assert_eq!(report["crossingScanEndRequestCount"], 3);
+    assert_eq!(report["startedDuringScanP95Ms"], 300);
+    assert_eq!(report["scanActiveP95Ms"], serde_json::Value::Null);
+    let incomplete = request_timing_report(&requests[..49], 100_000_000, 200_000_000);
+    assert_eq!(
+        incomplete["startedDuringScanP95Ms"],
+        serde_json::Value::Null
+    );
+    requests[49].start_offset_ns = 200_000_000;
+    let late = request_timing_report(&requests, 100_000_000, 200_000_000);
+    assert_eq!(late["startedDuringScanP95Ms"], serde_json::Value::Null);
+}
+
 fn select_scan_active_requests(
     requests: &[RequestTiming],
     scan_start_ns: u128,
@@ -3063,10 +3093,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         .map_err(std::io::Error::other)?
         .map_err(std::io::Error::other)?;
     let scan_job_completion_ms = scan_end_ns / 1_000_000;
-    let active_catalog_ms: Vec<_> = select_scan_active_requests(&catalog_timings, 0, scan_end_ns)
-        .iter()
-        .map(|sample| sample.elapsed_ns / 1_000_000)
-        .collect();
+    let catalog_timing_report = request_timing_report(&catalog_timings, 0, scan_end_ns);
     let scan_finished_queue_snapshot = load_benchmark_poster_snapshot(
         database.pool(),
         &scan_job.id,
@@ -3078,7 +3105,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     let first_poster_indexed_ms = first_poster_indexed_handle
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
-    let catalog_list_p95_ms = optional_percentile_ms(&active_catalog_ms);
+    let catalog_list_p95_ms = catalog_timing_report["scanActiveP95Ms"].as_u64();
 
     let require_detached_poster_queue = env::var("LUX_PERF_REQUIRE_DETACHED_POSTER_QUEUE")
         .map(|value| value != "0")
@@ -3216,7 +3243,8 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "firstCatalogVisibleTotal": first_catalog_visible_total,
             "firstPosterIndexedMs": first_poster_indexed_ms,
             "catalogListP95DuringScanMs": catalog_list_p95_ms,
-            "catalogListRequestTiming": request_timing_report(&catalog_timings, 0, scan_end_ns),
+            "catalogListP95RequestsStartedDuringScanMs": catalog_timing_report["startedDuringScanP95Ms"],
+            "catalogListRequestTiming": catalog_timing_report,
             "catalogPageReadinessRule": "at least 50 committed movies before first HTTP page; pageSize=50 on both revisions",
             "firstCatalogVisibleItemCount": first_catalog_page["items"].as_array().map(Vec::len),
             "catalogListRequestCount": catalog_list_ms.len(),
@@ -3864,18 +3892,42 @@ fn request_timing_report(
     scan_end_ns: u128,
 ) -> serde_json::Value {
     let active = select_scan_active_requests(requests, scan_start_ns, scan_end_ns);
-    let durations: Vec<_> = active
+    let started: Vec<_> = requests
+        .iter()
+        .filter(|request| {
+            request.start_offset_ns >= scan_start_ns && request.start_offset_ns < scan_end_ns
+        })
+        .collect();
+    let crossing = started
+        .iter()
+        .filter(|request| {
+            request
+                .start_offset_ns
+                .checked_add(request.elapsed_ns)
+                .is_none_or(|end| end > scan_end_ns)
+        })
+        .count();
+    let durations: Vec<_> = started
         .iter()
         .map(|request| request.elapsed_ns / 1_000_000)
         .collect();
+    let complete_start_cohort =
+        requests.len() == FOREGROUND_REQUESTS && started.len() == FOREGROUND_REQUESTS;
+    let complete_overlap = complete_start_cohort && active.len() == FOREGROUND_REQUESTS;
     json!({
         "scanStartOffsetNs": scan_start_ns,
         "scanEndOffsetNs": scan_end_ns,
+        "expectedRequestCount": FOREGROUND_REQUESTS,
         "requestCount": requests.len(),
+        "startedDuringScanRequestCount": started.len(),
+        "crossingScanEndRequestCount": crossing,
         "scanActiveRequestCount": active.len(),
-        "scanActiveP95Ms": optional_percentile_ms(&durations),
-        "sampleStatus": if active.is_empty() { "unavailable" } else { "available" },
-        "selectionRule": "start >= scanStart and bodyReceived <= scanEnd; no partial overlap",
+        "startedDuringScanP95Ms": complete_start_cohort.then(|| percentile(&durations, 95)),
+        "scanActiveP95Ms": complete_overlap.then(|| percentile(&durations, 95)),
+        "sampleStatus": if complete_start_cohort { "available" } else { "unavailable" },
+        "wholeWindowSampleStatus": if complete_overlap { "available" } else { "unavailable" },
+        "selectionRule": "all 50 predeclared requests start in [scanStart, scanEnd); full body-receipt latency includes crossings; no response-duration selection",
+        "wholeWindowRule": "all 50 requests start and finish inside scan window; otherwise p95 is unavailable",
         "requests": requests.iter().enumerate().map(|(index, request)| json!({
             "index": index,
             "startOffsetNs": request.start_offset_ns,
