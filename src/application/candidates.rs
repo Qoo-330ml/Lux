@@ -776,12 +776,15 @@ impl MetadataCandidateService {
             )
         } else {
             (
-                search_generic(scraper, item_type, query, year)
+                search_generic(scraper, item_type, query, year, automatic_match)
                     .await
                     .map_err(MetadataCandidateError::Scraper)?,
                 None,
             )
         };
+        if automatic_match && response.items.is_empty() {
+            return Ok(empty_candidate_page());
+        }
         let expires_at = candidate_expiry();
         let automatic_search = matches!(
             mode,
@@ -1393,9 +1396,12 @@ impl MetadataCandidateService {
         }
 
         let parents = self
-            .parent_providers(current, scraper, series_query, series_year)
+            .parent_providers(current, scraper, series_query, series_year, automatic_match)
             .await?;
         if parents.is_empty() {
+            if automatic_match {
+                return Ok(empty_candidate_page());
+            }
             return Err(MetadataCandidateError::Scraper(ScraperError::Provider(
                 "series scraper returned no candidates".to_owned(),
             )));
@@ -1530,6 +1536,7 @@ impl MetadataCandidateService {
         scraper: &ScraperProvider,
         series_query: &str,
         series_year: Option<i32>,
+        allow_empty_result: bool,
     ) -> Result<Vec<ParentProvider>, MetadataCandidateError> {
         if let (Some(provider), Some(provider_id)) = (
             current.series_provider_name.as_deref(),
@@ -1558,9 +1565,15 @@ impl MetadataCandidateService {
                 }]);
             }
         }
-        let response = search_generic(scraper, ScraperItemType::Series, series_query, series_year)
-            .await
-            .map_err(MetadataCandidateError::Scraper)?;
+        let response = search_generic(
+            scraper,
+            ScraperItemType::Series,
+            series_query,
+            series_year,
+            allow_empty_result,
+        )
+        .await
+        .map_err(MetadataCandidateError::Scraper)?;
         let best = response
             .items
             .into_iter()
@@ -1780,6 +1793,7 @@ async fn search_generic(
     item_type: crate::application::scraper::ScraperItemType,
     query: &str,
     year: Option<i32>,
+    allow_empty_result: bool,
 ) -> Result<
     crate::application::scraper::ScraperSearchResponse,
     crate::application::scraper::ScraperError,
@@ -1789,6 +1803,7 @@ async fn search_generic(
         Some(year) => vec![Some(year), None],
         None => vec![None],
     };
+    let mut last_empty_response = None;
     for search_year in years {
         for term in &terms {
             let response = scraper
@@ -1802,11 +1817,24 @@ async fn search_generic(
             if !response.items.is_empty() {
                 return Ok(response);
             }
+            last_empty_response = Some(response);
         }
+    }
+    if allow_empty_result {
+        return Ok(last_empty_response.unwrap_or_default());
     }
     Err(crate::application::scraper::ScraperError::Provider(
         "scraper returned no candidates".to_owned(),
     ))
+}
+
+fn empty_candidate_page() -> MetadataCandidatePage {
+    MetadataCandidatePage {
+        items: Vec::new(),
+        total: 0,
+        offset: 0,
+        limit: 50,
+    }
 }
 
 fn candidate_expiry() -> Option<i64> {

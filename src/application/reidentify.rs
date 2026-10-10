@@ -1708,9 +1708,11 @@ impl MetadataReidentifyService {
                 .map_err(MetadataReidentifyError::Candidate)?
         };
         if matches!(mode, MetadataRefreshMode::Reidentify) {
-            return Ok(RefreshItemOutcome::Confirmed(candidate_count_for_page(
-                &page,
-            )));
+            let candidate_count = candidate_count_for_page(&page);
+            if candidate_count == 0 {
+                return Err(MetadataReidentifyError::LowConfidence);
+            }
+            return Ok(RefreshItemOutcome::Confirmed(candidate_count));
         }
         let Some(selection) = self.selection.as_ref() else {
             return Err(MetadataReidentifyError::SelectionUnavailable);
