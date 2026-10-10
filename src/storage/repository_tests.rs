@@ -16792,3 +16792,114 @@ async fn person_credit_refresh_preserves_unchanged_rows() {
     .expect("remaining credits");
     assert_eq!(remaining_people, ["person-1", "person-3"]);
 }
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_merges_movie_items_and_moves_every_source_to_the_primary()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+
+    let assertions = async {
+        let library = LibraryService::new(database.clone())
+            .create_library("Merge", LibraryKind::Movie, false)
+            .await?;
+        for (item_id, title, source_id, is_default) in [
+            ("merge-primary", "Movie", "merge-source-1", 1),
+            ("merge-secondary", "Movie Part 2", "merge-source-2", 1),
+        ] {
+            database
+                .query(
+                    "INSERT INTO media_items (
+                        id, library_id, item_type, title, sort_title, identification_status,
+                        has_available_source
+                     ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+                )
+                .bind(item_id)
+                .bind(library.id.to_string())
+                .bind(title)
+                .bind(title.to_lowercase())
+                .execute(database.pool())
+                .await?;
+            database
+                .query(
+                    "INSERT INTO media_sources (id, item_id, source_kind, is_default, probe_status)
+                     VALUES (?, ?, 'LOCAL_FILE', ?, 'PENDING')",
+                )
+                .bind(source_id)
+                .bind(item_id)
+                .bind(is_default)
+                .execute(database.pool())
+                .await?;
+        }
+        let item_ids = vec!["merge-primary".to_owned(), "merge-secondary".to_owned()];
+        let merged = database
+            .merge_media_items("merge-primary", &item_ids)
+            .await?;
+        assert_eq!(merged.merged_item_ids, vec!["merge-secondary".to_owned()]);
+        let sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = $1")
+                .bind("merge-primary")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(sources, 2);
+        let defaults: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_sources WHERE item_id = $1 AND is_default = 1",
+        )
+        .bind("merge-primary")
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(defaults, 1, "exactly one default source after the merge");
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
