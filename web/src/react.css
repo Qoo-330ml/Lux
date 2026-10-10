@@ -18,6 +18,7 @@
   --lux-silver-foreground: #181b22;
   --lux-accent: var(--lux-silver-accent);
   --lux-accent-foreground: var(--lux-silver-foreground);
+  --lux-focus-ring: #fff;
   --lux-ease: cubic-bezier(0.16, 1, 0.3, 1);
   --lux-header-height: 102px;
   --lux-page-top: 126px;
@@ -43,7 +44,7 @@ button, [role="button"] { touch-action: manipulation; user-select: none; -webkit
 a { color: inherit; text-decoration: none; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: 0.55; }
-:focus-visible { outline: 2px solid #fff; outline-offset: 3px; }
+:focus-visible { outline: 2px solid var(--lux-focus-ring); outline-offset: 3px; }
 
 :where(input:not([type="checkbox"]):not([type="radio"]):not([type="file"]):not([type="hidden"]), textarea) {
   width: 100%;
@@ -2504,7 +2505,7 @@ html[data-lux-theme="light"] .lux-admin-job-details { background: rgba(28,28,34,
   .lux-account-avatar-cropper { grid-template-columns: minmax(0, 1fr); justify-items: center; }
   .lux-avatar-crop-controls { width: 100%; }
 }
-html[data-lux-theme="light"] { color-scheme: light; --lux-bg: #f4f3f1; --lux-surface: rgba(255,255,255,.9); --lux-surface-strong: #fff; --lux-line: rgba(28,28,34,.22); --lux-line-soft: rgba(28,28,34,.13); --lux-text: #25252a; --lux-muted: #55565e; --lux-subtle: #6c6d75; --lux-silver-accent: #3a3f4b; --lux-silver-foreground: #fff; }
+html[data-lux-theme="light"] { color-scheme: light; --lux-bg: #f4f3f1; --lux-surface: rgba(255,255,255,.9); --lux-surface-strong: #fff; --lux-line: rgba(28,28,34,.22); --lux-line-soft: rgba(28,28,34,.13); --lux-text: #25252a; --lux-muted: #55565e; --lux-subtle: #6c6d75; --lux-silver-accent: #3a3f4b; --lux-silver-foreground: #fff; --lux-focus-ring: #25252a; --lux-status-danger: #a13d53; --lux-status-success: #247b4b; --lux-status-warning: #895708; --lux-status-active: #5b458f; }
 html[data-lux-theme="light"] .lux-select-trigger { border-color: var(--lux-line-soft); color: var(--lux-text); background: rgba(28,28,34,.035); }
 html[data-lux-theme="light"] .lux-select-trigger:hover:not(:disabled) { border-color: var(--lux-line); background: rgba(28,28,34,.07); }
 html[data-lux-theme="light"] .lux-select-trigger[aria-expanded="true"], html[data-lux-theme="light"] .lux-select-trigger:focus-visible { border-color: color-mix(in srgb, var(--lux-accent) 55%, var(--lux-line)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--lux-accent) 12%, transparent); }
@@ -2529,6 +2530,80 @@ html[data-lux-accent="mint"] { --lux-accent: #54c59b; --lux-accent-foreground: #
 html[data-lux-accent="silver"] .lux-player-page { --lux-accent: #cbd5e1; --lux-accent-foreground: #181b22; }
 html[data-lux-theme="light"] body, html[data-lux-theme="light"] .lux-app { color: var(--lux-text); background: var(--lux-bg); }
 html[data-lux-theme="light"] .lux-header::before { background: linear-gradient(180deg, rgba(244,243,241,.98) 0%, rgba(244,243,241,.84) 30%, rgba(244,243,241,.52) 52%, rgba(244,243,241,.28) 72%, rgba(244,243,241,0) 100%); }
+
+html[data-lux-theme="light"] .lux-media-editor { color: var(--lux-text); background: var(--lux-surface-strong); box-shadow: 0 28px 80px rgba(30,30,38,.18); }
+html[data-lux-theme="light"] .lux-media-editor-header h2 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-media-editor-close:hover { color: var(--lux-text); background: rgba(28,28,34,.07); }
+html[data-lux-theme="light"] .lux-metadata-field input:not([type="checkbox"]):not([type="radio"]),
+html[data-lux-theme="light"] .lux-metadata-field textarea { color: var(--lux-text); background: rgba(28,28,34,.04); }
+html[data-lux-theme="light"] .lux-image-type-tabs button:hover,
+html[data-lux-theme="light"] .lux-image-type-tabs button.is-active { color: var(--lux-text); background: rgba(28,28,34,.06); }
+html[data-lux-theme="light"] .lux-image-result:hover { color: var(--lux-text); background: rgba(28,28,34,.035); }
+
+@media (max-width: 720px) {
+  html[data-lux-theme="light"] .lux-detail-copy > .lux-hero-actions > .lux-detail-action-control,
+  html[data-lux-theme="light"] .lux-detail-copy > .lux-hero-actions > .lux-detail-watched-status,
+  html[data-lux-theme="light"] .lux-detail-inline-menu .lux-media-actions-trigger { color: var(--lux-muted); background: transparent; box-shadow: none; }
+  html[data-lux-theme="light"] .lux-detail-copy > .lux-hero-actions > .lux-detail-action-control:hover,
+  html[data-lux-theme="light"] .lux-detail-copy > .lux-hero-actions > .lux-detail-watched-status:hover,
+  html[data-lux-theme="light"] .lux-detail-inline-menu .lux-media-actions-trigger:hover,
+  html[data-lux-theme="light"] .lux-detail-inline-menu .lux-media-actions-trigger[aria-expanded="true"] { color: var(--lux-text); background: transparent; }
+  html[data-lux-theme="light"] .lux-detail-action-icon,
+  html[data-lux-theme="light"] .lux-detail-inline-menu .lux-media-actions-trigger-icon { border-color: var(--lux-line-soft); color: currentColor; background: rgba(28,28,34,.04); }
+  html[data-lux-theme="light"] .lux-detail-copy > .lux-hero-actions > .lux-detail-watched-status.is-played { color: var(--lux-status-success); background: transparent; box-shadow: none; }
+  html[data-lux-theme="light"] .lux-detail-copy > .lux-hero-actions > .lux-detail-watched-status.is-played .lux-detail-action-icon { border-color: rgba(36,123,75,.34); background: rgba(36,123,75,.1); box-shadow: inset 0 0 0 1px rgba(36,123,75,.08), 0 5px 14px rgba(36,123,75,.08); }
+}
+
+html[data-lux-theme="light"] .lux-state-screen h1,
+html[data-lux-theme="light"] .lux-page-state h1 { color: var(--lux-text); }
+html[data-lux-theme="light"] .lux-error-copy,
+html[data-lux-theme="light"] .lux-editor-error,
+html[data-lux-theme="light"] .lux-library-card-action-feedback.is-error,
+html[data-lux-theme="light"] .lux-admin-library-page .lux-error-copy,
+html[data-lux-theme="light"] .lux-login-background-status.is-error,
+html[data-lux-theme="light"] .lux-operations-log-row.is-error .lux-operations-log-level,
+html[data-lux-theme="light"] .status-failed { color: var(--lux-status-danger); }
+html[data-lux-theme="light"] .lux-success-copy,
+html[data-lux-theme="light"] .lux-log-export-success,
+html[data-lux-theme="light"] .lux-notification-result,
+html[data-lux-theme="light"] .lux-operations-log-level,
+html[data-lux-theme="light"] .lux-registered-task-status.is-enabled,
+html[data-lux-theme="light"] .lux-admin-server-status,
+html[data-lux-theme="light"] .lux-admin-plugin-status.is-ok,
+html[data-lux-theme="light"] .status-completed { color: var(--lux-status-success); }
+html[data-lux-theme="light"] .lux-account-notice,
+html[data-lux-theme="light"] .lux-login-background-warning,
+html[data-lux-theme="light"] .lux-admin-job-attention,
+html[data-lux-theme="light"] .lux-media-copy .lux-metadata-attention-badge,
+html[data-lux-theme="light"] .lux-operations-log-row.is-warn .lux-operations-log-level,
+html[data-lux-theme="light"] .lux-registered-task-status.is-disabled,
+html[data-lux-theme="light"] .lux-admin-plugin-status.is-warn,
+html[data-lux-theme="light"] .status-completed-with-issues,
+html[data-lux-theme="light"] .lux-admin-overview-status.is-alert { --lux-overview-accent: var(--lux-status-warning); --lux-overview-status-bg: rgba(137,87,8,.09); color: var(--lux-status-warning); }
+html[data-lux-theme="light"] .lux-admin-job-attention:hover { color: var(--lux-status-warning); }
+html[data-lux-theme="light"] .lux-admin-job-error { color: var(--lux-status-danger); }
+html[data-lux-theme="light"] .lux-job-icon.is-active { color: var(--lux-status-active); }
+html[data-lux-theme="light"] .lux-user-badge.is-ok { color: var(--lux-status-success); background: rgba(36,123,75,.08); }
+html[data-lux-theme="light"] .lux-user-badge.is-warn { color: var(--lux-status-warning); background: rgba(137,87,8,.08); }
+html[data-lux-theme="light"] .status-running,
+html[data-lux-theme="light"] .status-pending,
+html[data-lux-theme="light"] .status-postprocessing,
+html[data-lux-theme="light"] .status-deferred { color: var(--lux-status-active); background: rgba(91,69,143,.09); }
+html[data-lux-theme="light"] .status-completed { color: var(--lux-status-success); background: rgba(36,123,75,.09); }
+html[data-lux-theme="light"] .status-completed-with-issues { color: var(--lux-status-warning); background: rgba(137,87,8,.09); }
+html[data-lux-theme="light"] .status-failed { color: var(--lux-status-danger); background: rgba(161,61,83,.08); }
+html[data-lux-theme="light"] .lux-registered-task-status.is-enabled { background: rgba(36,123,75,.08); }
+html[data-lux-theme="light"] .lux-registered-task-status.is-disabled { background: rgba(137,87,8,.08); }
+
+html[data-lux-theme="light"] .lux-skeleton-block,
+html[data-lux-theme="light"] .lux-skeleton-row,
+html[data-lux-theme="light"] .lux-skeleton-line,
+html[data-lux-theme="light"] .lux-library-page-skeleton-card { background: linear-gradient(100deg, rgba(28,28,34,.045) 25%, rgba(28,28,34,.09) 50%, rgba(28,28,34,.045) 75%); }
+html[data-lux-theme="light"] .lux-media-placeholder { color: var(--lux-muted); background: radial-gradient(circle at 50% 22%, rgba(28,28,34,.07), transparent 44%), linear-gradient(145deg, #f1f0ee, #e5e4e2); }
+html[data-lux-theme="light"] .lux-admin-library-cover-placeholder { color: var(--lux-subtle); background: radial-gradient(circle at 50% 20%, rgba(28,28,34,.07), transparent 44%), linear-gradient(145deg, #f1f0ee, #e5e4e2); }
+
+html[data-lux-theme="light"] .lux-library-strategy-toggle input:focus-visible + span + i,
+html[data-lux-theme="light"] .lux-thumbnail-scraping-mode input:focus-visible + span { outline: 2px solid var(--lux-focus-ring); outline-offset: 3px; }
 html[data-lux-theme="light"] .lux-brand-name, html[data-lux-theme="light"] .lux-nav-link, html[data-lux-theme="light"] .lux-icon-button, html[data-lux-theme="light"] .lux-user-button { color: var(--lux-text); }
 html[data-lux-theme="light"] .lux-nav-link { color: var(--lux-muted); }
 html[data-lux-theme="light"] .lux-nav-link:hover, html[data-lux-theme="light"] .lux-nav-link.is-active { color: var(--lux-text); }
