@@ -17244,3 +17244,174 @@ async fn postgres_incremental_scan_scope_selects_only_sources_under_the_scanned_
     drop_database?;
     Ok(())
 }
+
+async fn assert_terminal_local_metadata_batches_are_cleaned(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Batches", LibraryKind::Movie, false)
+        .await?;
+    let root_path = temp_dir.path().join("media");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root = libraries
+        .add_root(library.id, root_path.to_str().ok_or("root path")?)
+        .await?
+        .root;
+    let library_id = library.id.to_string();
+    let root_id = root.id.to_string();
+    for (job_id, status, phase) in [
+        ("done-job", "COMPLETED", "IDLE"),
+        ("cancelled-job", "CANCELLED", "IDLE"),
+        ("running-job", "RUNNING", "FINALIZING"),
+    ] {
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+                 VALUES (?, ?, 'RECONCILE_LIBRARY', ?, 'generation', ?)",
+            )
+            .bind(job_id)
+            .bind(&library_id)
+            .bind(status)
+            .bind(phase)
+            .execute(database.pool())
+            .await?;
+    }
+    // (id, job, status)
+    let batches = [
+        ("done-completed", "done-job", "COMPLETED"),
+        ("done-failed", "done-job", "FAILED"),
+        ("done-pending", "done-job", "PENDING"),
+        ("cancelled-cancelled", "cancelled-job", "CANCELLED"),
+        ("orphan-completed", "missing-job", "COMPLETED"),
+        ("running-completed", "running-job", "COMPLETED"),
+        ("running-pending", "running-job", "PENDING"),
+    ];
+    for (sequence, (id, job_id, status)) in batches.into_iter().enumerate() {
+        database
+            .query(
+                "INSERT INTO scan_local_metadata_batches
+                 (id, job_id, library_root_id, batch_sequence, source_refs_json, source_count,
+                  status)
+                 VALUES (?, ?, ?, ?, '[\"source\"]', 1, ?)",
+            )
+            .bind(id)
+            .bind(job_id)
+            .bind(&root_id)
+            .bind(i64::try_from(sequence)?)
+            .bind(status)
+            .execute(database.pool())
+            .await?;
+    }
+
+    // A batch that just finished is kept for a grace period; backdate all but one.
+    database
+        .query(
+            "UPDATE scan_local_metadata_batches SET updated_at = unixepoch() - 7200
+             WHERE id <> 'cancelled-cancelled'",
+        )
+        .execute(database.pool())
+        .await?;
+    let report = database.cleanup_completed_scan_manifest_payloads().await?;
+    assert_eq!(report.scan_local_metadata_batches_deleted, 2);
+    let remaining: Vec<String> = database
+        .query_scalar("SELECT id FROM scan_local_metadata_batches ORDER BY id")
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(
+        remaining,
+        [
+            "cancelled-cancelled",
+            "done-failed",
+            "done-pending",
+            "running-completed",
+            "running-pending"
+        ]
+    );
+    database
+        .query("UPDATE scan_local_metadata_batches SET updated_at = unixepoch() - 7200")
+        .execute(database.pool())
+        .await?;
+    let report = database.cleanup_completed_scan_manifest_payloads().await?;
+    assert_eq!(report.scan_local_metadata_batches_deleted, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn terminal_local_metadata_batches_are_cleaned_after_the_scan_finishes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    assert_terminal_local_metadata_batches_are_cleaned(&database)
+        .await
+        .expect("batch cleanup");
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_finishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration =
+        crate::config::DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = tokio::spawn({
+        let database = database.clone();
+        async move {
+            assert_terminal_local_metadata_batches_are_cleaned(&database)
+                .await
+                .map_err(|error| error.to_string())
+        }
+    })
+    .await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome??;
+    drop_database?;
+    Ok(())
+}
