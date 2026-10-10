@@ -2465,35 +2465,53 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
             rescan_batch_durations.push(batch_started.elapsed().as_millis());
             processed += report.processed;
             if report.completed {
-                return Ok((processed, rescan_batch_durations));
+                return Ok((
+                    processed,
+                    rescan_batch_durations,
+                    rescan_started.elapsed().as_nanos(),
+                ));
             }
         }
     });
     tokio::task::yield_now().await;
     let scan_running_before_api = !rescan_handle.is_finished();
-    let (foreground_ms, foreground_pool_pressure) = measure_get_requests_with_pool_pressure(
-        &client,
-        database.pool().clone(),
-        &format!("{base_url}/api/v1/admin/libraries"),
-        &cookies,
-        "Manifest foreground",
-    )
-    .await?;
-    let (catalog_list_ms, catalog_list_pool_pressure) =
-        measure_catalog_get_requests_with_pool_pressure(
+    let foreground_monitor = start_pool_pressure_monitor(database.pool().clone());
+    let catalog_monitor = start_pool_pressure_monitor(database.pool().clone());
+    let admin_url = format!("{base_url}/api/v1/admin/libraries");
+    let (foreground_timings, catalog_timings) = tokio::try_join!(
+        measure_timed_get_requests(
             &client,
-            database.pool().clone(),
+            &admin_url,
+            &cookies,
+            "Manifest foreground",
+            None,
+            rescan_started
+        ),
+        measure_timed_get_requests(
+            &client,
             &catalog_page_url,
             &cookies,
             "Manifest catalog list",
-            catalog_page_expectation,
-        )
-        .await?;
-    let (rescan_processed, rescan_batch_durations) = rescan_handle
+            Some(catalog_page_expectation),
+            rescan_started
+        ),
+    )?;
+    let foreground_pool_pressure = foreground_monitor.stop().await;
+    let catalog_list_pool_pressure = catalog_monitor.stop().await;
+    let foreground_ms: Vec<_> = foreground_timings
+        .iter()
+        .map(|sample| sample.elapsed_ns / 1_000_000)
+        .collect();
+    let catalog_list_ms: Vec<_> = catalog_timings
+        .iter()
+        .map(|sample| sample.elapsed_ns / 1_000_000)
+        .collect();
+    let (rescan_processed, rescan_batch_durations, rescan_end_ns) = rescan_handle
         .await
-        .map_err(|error| std::io::Error::other(error.to_string()))?
+        .map_err(std::io::Error::other)?
         .map_err(std::io::Error::other)?;
-    let rescan_ms = rescan_started.elapsed().as_millis();
+    let rescan_ms = rescan_end_ns / 1_000_000;
+    let rescan_and_request_window_ms = rescan_started.elapsed().as_millis();
     let unchanged_rescan_stage_timings = statement_counts.scan_stage_values();
     let unchanged_rescan_and_foreground_sql_latency_window =
         statement_counts.take_query_latency_values(
@@ -2632,6 +2650,9 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
         }),
         json!({
             "foregroundDuringScan": scan_running_before_api,
+            "foregroundRequestTiming": request_timing_report(&foreground_timings, 0, rescan_end_ns),
+            "catalogListRequestTiming": request_timing_report(&catalog_timings, 0, rescan_end_ns),
+            "rescanAndRequestWindowMs": rescan_and_request_window_ms,
             "foregroundRequestCount": FOREGROUND_REQUESTS,
             "foregroundP95Ms": foreground_p95_ms,
             "foregroundPoolPressure": foreground_pool_pressure,
@@ -2798,8 +2819,13 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     let scan_started = Instant::now();
     let scan_worker = jobs.clone();
     let scan_job_id = scan_job.id.clone();
-    let scan_handle =
-        tokio::spawn(async move { scan_worker.run_to_completion(&scan_job_id, 500, None).await });
+    let scan_handle = tokio::spawn(async move {
+        scan_worker
+            .run_to_completion(&scan_job_id, 500, None)
+            .await
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>(scan_started.elapsed().as_nanos())
+    });
     tokio::task::yield_now().await;
     // The direct worker does not invalidate AppState's catalog cache. Wait for
     // a committed fixture item before the first request so an empty page is
@@ -2868,6 +2894,19 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
+    let page_ready_deadline = Instant::now() + Duration::from_secs(600);
+    loop {
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM media_items WHERE library_id = {library_id_placeholder} AND item_type = 'MOVIE'"
+        ))).bind(library.id.to_string()).fetch_one(database.pool()).await?;
+        if count >= 50 {
+            break;
+        }
+        if Instant::now() >= page_ready_deadline {
+            return Err("catalog page readiness timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     let scan_running_at_api_start = !scan_handle.is_finished();
     if !scan_running_at_api_start {
         return Err("LUX-304 scan completed before the scan-active catalog sample began".into());
@@ -2881,18 +2920,32 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     )
     .await?;
     let first_catalog_visible_total = first_catalog_page["total"].as_u64().unwrap_or_default();
-    let catalog_list_ms = measure_catalog_get_requests(
+    assert_eq!(
+        first_catalog_page["items"].as_array().map(Vec::len),
+        Some(50)
+    );
+    let catalog_timings = measure_timed_get_requests(
         &client,
         &catalog_list_url,
         &cookies,
         "LUX-304 progressive catalog list",
-        catalog_page_expectation,
+        Some(catalog_page_expectation),
+        scan_started,
     )
     .await?;
-    scan_handle
+    let catalog_list_ms: Vec<_> = catalog_timings
+        .iter()
+        .map(|sample| sample.elapsed_ns / 1_000_000)
+        .collect();
+    let scan_end_ns = scan_handle
         .await
-        .map_err(|error| std::io::Error::other(error.to_string()))??;
-    let scan_job_completion_ms = scan_started.elapsed().as_millis();
+        .map_err(std::io::Error::other)?
+        .map_err(std::io::Error::other)?;
+    let scan_job_completion_ms = scan_end_ns / 1_000_000;
+    let active_catalog_ms: Vec<_> = select_scan_active_requests(&catalog_timings, 0, scan_end_ns)
+        .iter()
+        .map(|sample| sample.elapsed_ns / 1_000_000)
+        .collect();
     let scan_finished_queue_snapshot = load_local_poster_queue_snapshot(
         database.pool(),
         &scan_job.id,
@@ -2904,7 +2957,7 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     let first_poster_indexed_ms = first_poster_indexed_handle
         .await
         .map_err(|error| std::io::Error::other(error.to_string()))??;
-    let catalog_list_p95_ms = percentile(&catalog_list_ms, 95);
+    let catalog_list_p95_ms = optional_percentile_ms(&active_catalog_ms);
 
     let require_detached_poster_queue = env::var("LUX_PERF_REQUIRE_DETACHED_POSTER_QUEUE")
         .map(|value| value != "0")
@@ -3041,6 +3094,9 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
             "firstCatalogVisibleTotal": first_catalog_visible_total,
             "firstPosterIndexedMs": first_poster_indexed_ms,
             "catalogListP95DuringScanMs": catalog_list_p95_ms,
+            "catalogListRequestTiming": request_timing_report(&catalog_timings, 0, scan_end_ns),
+            "catalogPageReadinessRule": "at least 50 committed movies before first HTTP page; pageSize=50 on both revisions",
+            "firstCatalogVisibleItemCount": first_catalog_page["items"].as_array().map(Vec::len),
             "catalogListRequestCount": catalog_list_ms.len(),
             "catalogListP95ScanFinishedImagePendingMs": scan_finished_image_pending_p95_ms,
             "catalogListScanFinishedImagePendingSampleStatus":
@@ -3609,13 +3665,28 @@ async fn measure_get_requests_checked(
     label: &str,
     expectation: Option<CatalogPageExpectation>,
 ) -> Result<Vec<u128>, Box<dyn std::error::Error>> {
+    Ok(
+        measure_timed_get_requests(client, url, cookies, label, expectation, Instant::now())
+            .await?
+            .iter()
+            .map(|request| request.elapsed_ns / 1_000_000)
+            .collect(),
+    )
+}
+
+async fn measure_timed_get_requests(
+    client: &reqwest::Client,
+    url: &str,
+    cookies: &str,
+    label: &str,
+    expectation: Option<CatalogPageExpectation>,
+    epoch: Instant,
+) -> Result<Vec<RequestTiming>, Box<dyn std::error::Error>> {
     let mut requests = Vec::with_capacity(FOREGROUND_REQUESTS);
     for _ in 0..FOREGROUND_REQUESTS {
         let client = client.clone();
         let url = url.to_owned();
         let cookies = cookies.to_owned();
-        let label = label.to_owned();
-        let expectation = expectation;
         requests.push(tokio::spawn(async move {
             let started = Instant::now();
             let response = client
@@ -3626,28 +3697,70 @@ async fn measure_get_requests_checked(
                 .map_err(|error| error.to_string())?;
             let status = response.status();
             let body = response.bytes().await.map_err(|error| error.to_string())?;
-            let elapsed_ms = started.elapsed().as_millis();
+            let timing = RequestTiming {
+                start_offset_ns: started.duration_since(epoch).as_nanos(),
+                elapsed_ns: started.elapsed().as_nanos(),
+            };
+            Ok::<_, String>((timing, status, body))
+        }));
+    }
+    let mut responses = Vec::with_capacity(FOREGROUND_REQUESTS);
+    for request in requests {
+        responses.push(
+            request
+                .await
+                .map_err(std::io::Error::other)?
+                .map_err(std::io::Error::other)?,
+        );
+    }
+    let label = label.to_owned();
+    // All timed requests have finished before parsing any response. JSON work
+    // also stays off the Tokio workers shared with the service under test.
+    Ok(tokio::task::spawn_blocking(move || {
+        let mut timings = Vec::with_capacity(responses.len());
+        for (timing, status, body) in responses {
             if status != reqwest::StatusCode::OK {
                 return Err(format!("{label} request returned {status}"));
             }
             if let Some(expectation) = expectation {
                 let page = serde_json::from_slice(&body)
                     .map_err(|error| format!("{label} returned invalid JSON: {error}"))?;
-                validate_fixture_catalog_page(&page, expectation).map_err(|error| {
-                    format!("{label} returned an invalid fixture page: {error}")
-                })?;
+                validate_fixture_catalog_page(&page, expectation)?;
             }
-            Ok::<u128, String>(elapsed_ms)
-        }));
-    }
-    let mut durations = Vec::with_capacity(FOREGROUND_REQUESTS);
-    for request in requests {
-        let result = request
-            .await
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        durations.push(result.map_err(std::io::Error::other)?);
-    }
-    Ok(durations)
+            timings.push(timing);
+        }
+        Ok::<_, String>(timings)
+    })
+    .await
+    .map_err(std::io::Error::other)?
+    .map_err(std::io::Error::other)?)
+}
+
+fn request_timing_report(
+    requests: &[RequestTiming],
+    scan_start_ns: u128,
+    scan_end_ns: u128,
+) -> serde_json::Value {
+    let active = select_scan_active_requests(requests, scan_start_ns, scan_end_ns);
+    let durations: Vec<_> = active
+        .iter()
+        .map(|request| request.elapsed_ns / 1_000_000)
+        .collect();
+    json!({
+        "scanStartOffsetNs": scan_start_ns,
+        "scanEndOffsetNs": scan_end_ns,
+        "requestCount": requests.len(),
+        "scanActiveRequestCount": active.len(),
+        "scanActiveP95Ms": optional_percentile_ms(&durations),
+        "sampleStatus": if active.is_empty() { "unavailable" } else { "available" },
+        "selectionRule": "start >= scanStart and bodyReceived <= scanEnd; no partial overlap",
+        "requests": requests.iter().enumerate().map(|(index, request)| json!({
+            "index": index,
+            "startOffsetNs": request.start_offset_ns,
+            "elapsedNs": request.elapsed_ns,
+            "endOffsetNs": request.start_offset_ns + request.elapsed_ns,
+        })).collect::<Vec<_>>(),
+    })
 }
 
 fn validate_fixture_catalog_page(
