@@ -21,6 +21,8 @@ export const changelogReleases: ChangelogRelease[] = [
       { kind: "changed", items: [
         "PostgreSQL 增量扫描的媒体源、缩略图和 STRM 探测查询复用目录前缀索引，减少逐条路径匹配的查询开销。",
         "增加软删除媒体条目的保留期清理，并回收已结束扫描的终态本地元数据批次，控制数据库历史记录增长。",
+        "手机管理页使用完整可用宽度并保留安全区留白；仪表盘电影和剧集数量卡片并排显示，其余概览卡片保持全宽。",
+        "切换账户深浅主题时同步更新浏览器主题色（theme-color），供 Safari 等支持该元数据的浏览器匹配页面外观。",
         "感谢 @anlostyle 持续贡献近期数据库相关修复与优化 PR，改善 PostgreSQL 兼容性、扫描查询效率和数据清理。",
       ] },
       { kind: "fixed", items: [
