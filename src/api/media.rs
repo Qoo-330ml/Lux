@@ -3481,6 +3481,8 @@ pub(super) fn lux_catalog_source_json(
         "editionName": source.edition_name,
         "qualityLabel": source.quality_label,
         "isDefault": source.is_default,
+        "versionKey": source.version_key(),
+        "partIndex": source.part_index(),
         "probeStatus": source.probe_status,
         "streams": source.streams.iter().map(|stream| json!({
             "index": stream.index,

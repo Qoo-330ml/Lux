@@ -96,6 +96,41 @@ describe("MediaDetailPage series hierarchy", () => {
     expect(container.querySelector(".lux-metadata-editor[role=dialog]")).not.toBeNull();
   });
 
+  it("lists the parts of one version as a single selectable version", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-1",
+      title: "分段电影",
+      itemType: "MOVIE",
+      mediaSources: [
+        { id: "a-cd1", editionName: "有码 4K cd1", versionKey: "有码 4k", partIndex: 1, isDefault: true },
+        { id: "a-cd2", editionName: "有码 4K cd2", versionKey: "有码 4k", partIndex: 2 },
+        { id: "b", editionName: "破解", versionKey: "破解", partIndex: null },
+      ],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({});
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/items/movie-1"]}>
+            <Routes>
+              <Route path="items/:itemId" element={<MediaDetailPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container.querySelector("#media-source-heading + span")?.textContent).toBe("2 个版本");
+  });
+
   it("shows portrait season cards on a multi-season detail", async () => {
     vi.spyOn(api, "item").mockResolvedValue(Object.assign({
       id: "series-1",
