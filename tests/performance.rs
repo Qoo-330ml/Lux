@@ -1817,7 +1817,13 @@ async fn lux_045_catalog_scan_benchmark() -> Result<(), Box<dyn std::error::Erro
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
@@ -2237,7 +2243,13 @@ async fn lux_270_manifest_job_scan_benchmark() -> Result<(), Box<dyn std::error:
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
@@ -2990,7 +3002,13 @@ async fn lux_304_progressive_poster_worker_benchmark() -> Result<(), Box<dyn std
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
         .pool_max_idle_per_host(FOREGROUND_REQUESTS)
