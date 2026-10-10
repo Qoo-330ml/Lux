@@ -9729,6 +9729,7 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 - [x] `MediaDetailPage` 自动化测试覆盖有效和缺失时间；现有详情内容及响应式元信息样式保持可用。
 - [x] 音频和字幕选择器在可用宽度至少 572px 时各保留 280px 并横向排列；更窄时上下排列，不发生重叠。
 - [x] 选择器标题、轨道数提示、已选轨道文字和下拉选项使用紧凑字号及控件高度；过长的已选轨道文字在选择框内省略。
+- [x] 版本选择器与音频、字幕选择器使用相同的 280px 最大宽度、38px 控件高度、标题字号和间距；已选版本单行省略，展开选项保留容器或版本说明。
 
 依赖：LUX-307。验证：`pnpm --dir web test -- media-detail`、`pnpm --dir web build`。
 
@@ -9739,6 +9740,8 @@ LUX-271 的原 60k 性能验收由 LUX-275 统一执行，避免单独 reader �
 追加（2026-09-29）：轨道选择器按可用宽度自动换列，两个控件能各保留 320px 时并排，窄于 657px 时堆叠。`node --test web/tests/detail-layout.test.mjs` 27 项通过，完整 Web 测试 75 个文件/529 项通过，`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过。测试仍输出既存 jsdom `load/pause` 告警；构建保留既存大 chunk 提示。
 
 追加（2026-09-30）：轨道选择器容器收窄为 572px，两列各 280px；每项明确限制宽度，长文本在框内省略，标签、已选文本和选项字号缩小，控件高 38px。Playwright 以 1400px、600px、320px 视口验证并排、堆叠和无页面横向溢出；`node --test web/tests/detail-layout.test.mjs` 27 项、`vitest run tests/media-detail.test.tsx` 26 项及完整 Web 测试 75 个文件/529 项通过，冻结锁文件安装和 Web 构建通过。测试仍输出 jsdom 媒体 `load/pause` 告警；构建有 Vite 大 chunk 提示。
+
+追加（2026-10-10）：版本选择器复用轨道选择器的标题、宽度、间距、控件和菜单样式；折叠时只显示单行版本标签，容器或版本说明保留在展开选项中。Playwright 本地模拟 API 的尺寸断言在旧实现下失败、修复后通过，320px、390px、768px、1024px 和 1440px 视口下版本与音频控件尺寸和字号一致且无页面横向溢出；浅色、深色和长版本标签检查通过，键盘切换版本同步更新播放链接及对应轨道并恢复焦点。详情布局 Node 29/29、详情 Vitest 26/26、完整 Node 134/134、Vitest 569/569、冻结锁文件安装、生产构建、Cargo fmt、全目标全 feature Clippy 和 `git diff --check` 通过；Web 测试仍有既存 jsdom 媒体 `load/pause` 告警。本机 `arm64`，Cargo 使用 Toshiba 共享 target；仅修改 Web 样式及结构，未运行 Rust 测试，验证不代表部署状态。
 
 #### LUX-309：配置目录日志分段归档与有界保留
 

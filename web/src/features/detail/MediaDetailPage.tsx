@@ -581,20 +581,21 @@ function MediaSourceSelector({
       aria-labelledby={sources.length > 1 ? "media-source-heading" : undefined}
       aria-label={sources.length > 1 ? undefined : "播放轨道选择"}
     >
-      {sources.length > 1 ? <>
+      {sources.length > 1 ? <div className="lux-track-selector">
         <div className="lux-section-heading">
           <h2 id="media-source-heading">选择版本</h2>
           <span>{sources.length} 个视频文件</span>
         </div>
-        <div className="lux-source-select">
+        <div className="lux-source-select lux-track-select">
           <LuxSelect
             value={selectedSourceId ?? sources[0]?.id ?? ""}
             options={options}
+            menuClassName="lux-track-select-menu"
             onChange={onSelect}
             aria-labelledby="media-source-heading"
           />
         </div>
-      </> : null}
+      </div> : null}
       {audioStreams.length || subtitleStreams.length ? (
         <div className="lux-track-selectors">
           {audioStreams.length ? (
