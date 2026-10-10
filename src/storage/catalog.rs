@@ -7081,6 +7081,53 @@ impl Database {
     }
 }
 
+/// Restricts a query over `filesystem_entries fe` to the entries touched by the paths of one
+/// incremental scan job (one `?` placeholder: the job id).
+///
+/// SQLite keeps the correlated `EXISTS`. PostgreSQL cannot use an index for the
+/// `substr(...) = path || '/'` form and evaluated it for every candidate entry (the STRM probe
+/// target count averaged about a minute on a library of several hundred thousand files), so there
+/// the matching entries are collected per scanned path with byte-order range operators served by
+/// `idx_filesystem_entries_dir_prefix` (same approach as the sidecar target lookup).
+fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
+    if backend == DatabaseBackend::Postgres {
+        "fe.id IN (
+                   SELECT matched.id
+                   FROM scan_job_paths sjp
+                   CROSS JOIN LATERAL (
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE sjp.relative_path = '.'
+                         AND entry.library_root_id = sjp.library_root_id
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                       UNION ALL
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE entry.library_root_id = sjp.library_root_id
+                         AND entry.relative_path = sjp.relative_path
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                       UNION ALL
+                       SELECT entry.id FROM filesystem_entries entry
+                       WHERE entry.library_root_id = sjp.library_root_id
+                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
+                         AND entry.relative_path ~>=~ (sjp.relative_path || '/')
+                         AND entry.relative_path ~<~ (sjp.relative_path || '0')
+                   ) matched
+                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+               )"
+    } else {
+        "EXISTS (
+                   SELECT 1 FROM scan_job_paths sjp
+                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
+                     AND sjp.library_root_id = fe.library_root_id
+                     AND (
+                           sjp.relative_path = '.'
+                           OR fe.relative_path = sjp.relative_path
+                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
+                              = sjp.relative_path || '/'
+                         )
+               )"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -7126,52 +7173,5 @@ mod tests {
         assert!(!query.contains("ROW_NUMBER()"));
         assert_eq!(query.matches("LIMIT ?").count(), 6);
         assert_eq!(query.matches("UNION ALL").count(), 3);
-    }
-}
-
-/// Restricts a query over `filesystem_entries fe` to the entries touched by the paths of one
-/// incremental scan job (one `?` placeholder: the job id).
-///
-/// SQLite keeps the correlated `EXISTS`. PostgreSQL cannot use an index for the
-/// `substr(...) = path || '/'` form and evaluated it for every candidate entry (the STRM probe
-/// target count averaged about a minute on a library of several hundred thousand files), so there
-/// the matching entries are collected per scanned path with byte-order range operators served by
-/// `idx_filesystem_entries_dir_prefix` (same approach as the sidecar target lookup).
-fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
-    if backend == DatabaseBackend::Postgres {
-        "fe.id IN (
-                   SELECT matched.id
-                   FROM scan_job_paths sjp
-                   CROSS JOIN LATERAL (
-                       SELECT entry.id FROM filesystem_entries entry
-                       WHERE sjp.relative_path = '.'
-                         AND entry.library_root_id = sjp.library_root_id
-                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
-                       UNION ALL
-                       SELECT entry.id FROM filesystem_entries entry
-                       WHERE entry.library_root_id = sjp.library_root_id
-                         AND entry.relative_path = sjp.relative_path
-                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
-                       UNION ALL
-                       SELECT entry.id FROM filesystem_entries entry
-                       WHERE entry.library_root_id = sjp.library_root_id
-                         AND entry.entry_kind = 'FILE' AND entry.is_missing = 0
-                         AND entry.relative_path ~>=~ (sjp.relative_path || '/')
-                         AND entry.relative_path ~<~ (sjp.relative_path || '0')
-                   ) matched
-                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-               )"
-    } else {
-        "EXISTS (
-                   SELECT 1 FROM scan_job_paths sjp
-                   WHERE sjp.job_id = ? AND sjp.processed_at IS NOT NULL
-                     AND sjp.library_root_id = fe.library_root_id
-                     AND (
-                           sjp.relative_path = '.'
-                           OR fe.relative_path = sjp.relative_path
-                           OR substr(fe.relative_path, 1, length(sjp.relative_path) + 1)
-                              = sjp.relative_path || '/'
-                         )
-               )"
     }
 }
