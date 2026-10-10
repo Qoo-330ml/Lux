@@ -68,6 +68,12 @@ struct CatalogPageExpectation {
     require_posters: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RequestTiming {
+    start_offset_ns: u128,
+    elapsed_ns: u128,
+}
+
 #[test]
 fn process_peak_rss_is_reported_in_bytes() {
     assert!(process_peak_rss_bytes().is_some_and(|bytes| bytes > 0));
@@ -133,6 +139,70 @@ fn performance_catalog_drain_page_matches_fixture_and_has_posters() {
         "total": 1
     });
     assert!(validate_fixture_catalog_page(&missing_fixture_item, expectation).is_err());
+}
+
+#[test]
+fn scan_active_request_samples_must_fit_entirely_inside_the_window() {
+    let requests = [
+        RequestTiming {
+            start_offset_ns: 99,
+            elapsed_ns: 1,
+        },
+        RequestTiming {
+            start_offset_ns: 100,
+            elapsed_ns: 100,
+        },
+        RequestTiming {
+            start_offset_ns: 150,
+            elapsed_ns: 151,
+        },
+        RequestTiming {
+            start_offset_ns: 200,
+            elapsed_ns: 100,
+        },
+        RequestTiming {
+            start_offset_ns: 250,
+            elapsed_ns: 51,
+        },
+    ];
+
+    assert_eq!(
+        select_scan_active_requests(&requests, 100, 300),
+        [requests[1], requests[3]]
+    );
+}
+
+#[test]
+fn scan_active_request_samples_are_unavailable_when_no_request_fits() {
+    let requests = [RequestTiming {
+        start_offset_ns: 50,
+        elapsed_ns: 51,
+    }];
+
+    assert!(select_scan_active_requests(&requests, 100, 300).is_empty());
+    assert_eq!(optional_percentile_ms(&[]), None);
+}
+
+fn select_scan_active_requests(
+    requests: &[RequestTiming],
+    scan_start_ns: u128,
+    scan_end_ns: u128,
+) -> Vec<RequestTiming> {
+    requests
+        .iter()
+        .copied()
+        .filter(|request| {
+            request.start_offset_ns >= scan_start_ns
+                && request
+                    .start_offset_ns
+                    .checked_add(request.elapsed_ns)
+                    .is_some_and(|end| end <= scan_end_ns)
+        })
+        .collect()
+}
+
+fn optional_percentile_ms(values: &[u128]) -> Option<u128> {
+    (!values.is_empty()).then(|| percentile(values, 95))
 }
 
 fn process_peak_rss_bytes() -> Option<u64> {
